@@ -4294,7 +4294,7 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    let sql_text = statement.to_string();
+                    let sql_text = effective_update.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
                     arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                         conn.compile_table_update(&effective_update)
@@ -4403,7 +4403,7 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    let sql_text = statement.to_string();
+                    let sql_text = effective_delete.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
                     arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                         conn.compile_table_delete(&effective_delete)
@@ -7060,6 +7060,18 @@ impl Connection {
         Ok(true)
     }
 
+    /// Abort and unregister the currently active concurrent session, if any.
+    fn abort_current_concurrent_session(&self) {
+        let Some(session_id) = self.concurrent_session_id.borrow_mut().take() else {
+            return;
+        };
+        let mut registry = lock_unpoisoned(&self.concurrent_registry);
+        if let Some(handle) = registry.get_mut(session_id) {
+            concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+        }
+        registry.remove(session_id);
+    }
+
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
     fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
@@ -7093,13 +7105,7 @@ impl Connection {
                         // Plan failed (SSI conflict, etc.) — abort under the
                         // mutex so we still hold sequencing invariants.
                         drop(_commit_guard);
-                        if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                            let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                            if let Some(handle) = registry.get_mut(session_id) {
-                                concurrent_abort(handle, &self.concurrent_lock_table, session_id);
-                            }
-                            registry.remove(session_id);
-                        }
+                        self.abort_current_concurrent_session();
                         self.txn_metrics_note_rollback();
                         let _ = txn.rollback(&cx);
                         *self.concurrent_txn.borrow_mut() = false;
@@ -7134,18 +7140,15 @@ impl Connection {
                     // We must rollback to ensure cleanup and propagate the error.
                     self.txn_metrics_note_rollback();
                     let _ = txn.rollback(&cx);
+                    if *self.concurrent_txn.borrow() {
+                        self.abort_current_concurrent_session();
+                    }
                     (Err(e), false)
                 }
             }
         } else {
             if *self.concurrent_txn.borrow() {
-                if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                    if let Some(handle) = registry.get_mut(session_id) {
-                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
-                    }
-                    registry.remove(session_id);
-                }
+                self.abort_current_concurrent_session();
             }
             self.txn_metrics_note_rollback();
             (txn.rollback(&cx), false)
@@ -41651,6 +41654,21 @@ mod autocommit_txn_tests {
     }
 
     #[test]
+    fn test_abort_current_concurrent_session_clears_registry_entry() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let started = conn.ensure_autocommit_txn().unwrap();
+        assert!(started);
+        assert!(conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 1);
+
+        conn.abort_current_concurrent_session();
+
+        assert!(!conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 0);
+    }
+
+    #[test]
     fn test_autocommit_read_mode_does_not_open_concurrent_session() {
         let conn = Connection::open(":memory:").unwrap();
         let started = conn
@@ -51282,6 +51300,64 @@ mod pager_routing_tests {
             rows[1].values()[0],
             SqliteValue::Text("adhoc-ok".to_owned())
         );
+    }
+
+    #[test]
+    fn test_statement_reuse_regression_update_order_limit_retargets_after_data_change() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sr_update_limit (id INTEGER PRIMARY KEY, score INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sr_update_limit VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let sql =
+            "UPDATE sr_update_limit SET score = score + 100 ORDER BY score ASC LIMIT 1;";
+        assert_eq!(conn.execute(sql).unwrap(), 1);
+        assert_eq!(conn.execute(sql).unwrap(), 1);
+
+        let rows = conn
+            .query("SELECT id, score FROM sr_update_limit ORDER BY id;")
+            .unwrap();
+        let observed = rows
+            .iter()
+            .map(|row| {
+                let id = match row.get(0) {
+                    Some(SqliteValue::Integer(value)) => *value,
+                    other => panic!("expected integer id, got {other:?}"),
+                };
+                let score = match row.get(1) {
+                    Some(SqliteValue::Integer(value)) => *value,
+                    other => panic!("expected integer score, got {other:?}"),
+                };
+                (id, score)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![(1, 110), (2, 120), (3, 30)]);
+    }
+
+    #[test]
+    fn test_statement_reuse_regression_delete_order_limit_retargets_after_data_change() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sr_delete_limit (id INTEGER PRIMARY KEY, score INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sr_delete_limit VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let sql = "DELETE FROM sr_delete_limit ORDER BY score ASC LIMIT 1;";
+        assert_eq!(conn.execute(sql).unwrap(), 1);
+        assert_eq!(conn.execute(sql).unwrap(), 1);
+
+        let rows = conn
+            .query("SELECT id FROM sr_delete_limit ORDER BY id;")
+            .unwrap();
+        let observed = rows
+            .iter()
+            .map(|row| match row.get(0) {
+                Some(SqliteValue::Integer(value)) => *value,
+                other => panic!("expected integer id, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![3]);
     }
 
     #[test]

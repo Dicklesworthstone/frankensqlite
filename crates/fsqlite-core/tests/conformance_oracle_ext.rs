@@ -20620,7 +20620,7 @@ fn test_conformance_window_exclude_semantics_s221b() {
         "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS excl_current FROM wex221b ORDER BY id",
         "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) AS excl_ties FROM wex221b ORDER BY id",
         "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) AS excl_group FROM wex221b ORDER BY id",
-        "SELECT id, grp, val, FIRST_VALUE(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS first_after_current FROM wex221b ORDER BY id",
+        "SELECT id, grp, val, FIRST_VALUE(val) OVER (PARTITION BY grp ORDER BY val, id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS first_after_current FROM wex221b ORDER BY id",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);

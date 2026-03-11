@@ -420,23 +420,38 @@ fn manual_target_rows_json(target: &SimpleTarget, table: &str) -> Vec<serde_json
         .unwrap_or_default()
 }
 
-const SQLITE_APPLY_ORACLE_SCRIPT: &str = r#"
+const SQLITE_SESSION_ORACLE_SCRIPT: &str = r#"
 import ctypes
 import ctypes.util
 import json
-import sqlite3
 import sys
+from pathlib import Path
 
-decision = sys.argv[1]
-seed_mode = sys.argv[2]
-db_path = sys.argv[3]
-changeset_path = sys.argv[4]
+mode = sys.argv[1]
 
 lib_path = ctypes.util.find_library("sqlite3")
 if not lib_path:
     raise SystemExit("libsqlite3_not_found")
 
 lib = ctypes.CDLL(lib_path)
+
+required_symbols = [
+    "sqlite3_open",
+    "sqlite3_close",
+    "sqlite3_errmsg",
+    "sqlite3_exec",
+    "sqlite3_free",
+    "sqlite3_libversion",
+    "sqlite3session_create",
+    "sqlite3session_attach",
+    "sqlite3session_changeset",
+    "sqlite3session_patchset",
+    "sqlite3session_delete",
+    "sqlite3changeset_apply_v2",
+]
+missing_symbols = [symbol for symbol in required_symbols if not hasattr(lib, symbol)]
+if missing_symbols:
+    raise SystemExit(f"sqlite_session_symbols_missing:{','.join(missing_symbols)}")
 
 SQLITE_OK = 0
 SQLITE_CHANGESET_OMIT = 0
@@ -457,16 +472,55 @@ CONFLICT_MAP = {
     5: "foreign_key",
 }
 
+EXEC_CALLBACK = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.POINTER(ctypes.c_char_p),
+)
+CONFLICT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+
+lib.sqlite3_libversion.argtypes = []
+lib.sqlite3_libversion.restype = ctypes.c_char_p
 lib.sqlite3_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
 lib.sqlite3_open.restype = ctypes.c_int
 lib.sqlite3_close.argtypes = [ctypes.c_void_p]
 lib.sqlite3_close.restype = ctypes.c_int
 lib.sqlite3_errmsg.argtypes = [ctypes.c_void_p]
 lib.sqlite3_errmsg.restype = ctypes.c_char_p
+lib.sqlite3_exec.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_char_p),
+]
+lib.sqlite3_exec.restype = ctypes.c_int
 lib.sqlite3_free.argtypes = [ctypes.c_void_p]
 lib.sqlite3_free.restype = None
-
-CONFLICT = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p)
+lib.sqlite3session_create.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_void_p),
+]
+lib.sqlite3session_create.restype = ctypes.c_int
+lib.sqlite3session_attach.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+lib.sqlite3session_attach.restype = ctypes.c_int
+lib.sqlite3session_changeset.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+lib.sqlite3session_changeset.restype = ctypes.c_int
+lib.sqlite3session_patchset.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+lib.sqlite3session_patchset.restype = ctypes.c_int
+lib.sqlite3session_delete.argtypes = [ctypes.c_void_p]
+lib.sqlite3session_delete.restype = None
 lib.sqlite3changeset_apply_v2.argtypes = [
     ctypes.c_void_p,
     ctypes.c_int,
@@ -480,69 +534,205 @@ lib.sqlite3changeset_apply_v2.argtypes = [
 ]
 lib.sqlite3changeset_apply_v2.restype = ctypes.c_int
 
-conn = sqlite3.connect(db_path)
-conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, balance INTEGER)")
-if seed_mode == "conflict":
-    conn.execute("INSERT INTO accounts VALUES (1, 'eve', 5)")
-    conn.execute("INSERT INTO accounts VALUES (2, 'robert', 60)")
-conn.commit()
-conn.close()
+def decode_errmsg(db):
+    message = lib.sqlite3_errmsg(db)
+    return message.decode("utf-8") if message else "unknown"
 
-db = ctypes.c_void_p()
-rc = lib.sqlite3_open(db_path.encode("utf-8"), ctypes.byref(db))
-if rc != SQLITE_OK:
-    raise SystemExit(f"sqlite3_open_failed:{rc}")
 
-changeset = open(changeset_path, "rb").read()
-buffer = ctypes.create_string_buffer(changeset)
-conflicts = []
+def fail_with_db(label, rc, db):
+    raise SystemExit(f"{label}:{rc}:{decode_errmsg(db)}")
 
-@CONFLICT
-def on_conflict(_ctx, kind, _iter_ptr):
-    conflicts.append(CONFLICT_MAP.get(kind, f"unknown_{kind}"))
-    return ACTION_MAP[decision]
 
-rebase = ctypes.c_void_p()
-rebase_size = ctypes.c_int()
-rc = lib.sqlite3changeset_apply_v2(
-    db,
-    len(changeset),
-    ctypes.cast(buffer, ctypes.c_void_p),
-    None,
-    on_conflict,
-    None,
-    ctypes.byref(rebase),
-    ctypes.byref(rebase_size),
-    0,
-)
-errmsg = lib.sqlite3_errmsg(db).decode("utf-8")
-if rebase.value:
-    lib.sqlite3_free(rebase)
-lib.sqlite3_close(db)
+def open_db(path):
+    db = ctypes.c_void_p()
+    rc = lib.sqlite3_open(path.encode("utf-8"), ctypes.byref(db))
+    if rc != SQLITE_OK:
+        fail_with_db("sqlite3_open_failed", rc, db)
+    return db
 
-conn = sqlite3.connect(db_path)
-rows = [
-    [
-        {"type": "integer", "value": row[0]},
-        {"type": "text", "value": row[1]},
-        {"type": "integer", "value": row[2]},
-    ]
-    for row in conn.execute("SELECT id, owner, balance FROM accounts ORDER BY id")
-]
-conn.close()
 
-print(
-    json.dumps(
-        {
-            "kind": "success" if rc == SQLITE_OK else "aborted",
-            "return_code": rc,
-            "error": None if rc == SQLITE_OK else errmsg,
-            "conflicts": conflicts,
-            "rows": rows,
-        }
+def exec_sql(db, sql):
+    err = ctypes.c_char_p()
+    rc = lib.sqlite3_exec(db, sql.encode("utf-8"), None, None, ctypes.byref(err))
+    if rc != SQLITE_OK:
+        message = err.value.decode("utf-8") if err.value else decode_errmsg(db)
+        raise SystemExit(f"sqlite3_exec_failed:{rc}:{message}")
+
+
+def fetch_account_rows(db):
+    raw_rows = []
+
+    @EXEC_CALLBACK
+    def on_row(_ctx, count, values, _columns):
+        raw_rows.append(
+            [values[index].decode("utf-8") if values[index] else None for index in range(count)]
+        )
+        return 0
+
+    err = ctypes.c_char_p()
+    rc = lib.sqlite3_exec(
+        db,
+        b"SELECT id, owner, balance FROM accounts ORDER BY id",
+        on_row,
+        None,
+        ctypes.byref(err),
     )
-)
+    if rc != SQLITE_OK:
+        message = err.value.decode("utf-8") if err.value else decode_errmsg(db)
+        raise SystemExit(f"sqlite3_select_failed:{rc}:{message}")
+    return [
+        [
+            {"type": "integer", "value": int(row[0])} if row[0] is not None else {"type": "null"},
+            {"type": "text", "value": row[1]} if row[1] is not None else {"type": "null"},
+            {"type": "integer", "value": int(row[2])} if row[2] is not None else {"type": "null"},
+        ]
+        for row in raw_rows
+    ]
+
+
+if mode == "probe":
+    print(
+        json.dumps(
+            {
+                "lib_path": lib_path,
+                "libversion": lib.sqlite3_libversion().decode("utf-8"),
+            }
+        )
+    )
+elif mode == "build":
+    db_path = sys.argv[2]
+    changeset_path = sys.argv[3]
+    patchset_path = sys.argv[4]
+
+    db = open_db(db_path)
+    session = ctypes.c_void_p()
+    try:
+        exec_sql(db, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, balance INTEGER)")
+        rc = lib.sqlite3session_create(db, b"main", ctypes.byref(session))
+        if rc != SQLITE_OK:
+            fail_with_db("sqlite3session_create_failed", rc, db)
+        rc = lib.sqlite3session_attach(session, b"accounts")
+        if rc != SQLITE_OK:
+            fail_with_db("sqlite3session_attach_failed", rc, db)
+        exec_sql(
+            db,
+            """
+            INSERT INTO accounts VALUES (1, 'alice', 100);
+            INSERT INTO accounts VALUES (2, 'bob', 50);
+            UPDATE accounts SET balance = 75 WHERE id = 2;
+            DELETE FROM accounts WHERE id = 1;
+            """,
+        )
+
+        changeset_size = ctypes.c_int()
+        changeset_ptr = ctypes.c_void_p()
+        rc = lib.sqlite3session_changeset(
+            session,
+            ctypes.byref(changeset_size),
+            ctypes.byref(changeset_ptr),
+        )
+        if rc != SQLITE_OK:
+            fail_with_db("sqlite3session_changeset_failed", rc, db)
+        try:
+            Path(changeset_path).write_bytes(
+                ctypes.string_at(changeset_ptr, changeset_size.value)
+            )
+        finally:
+            if changeset_ptr.value:
+                lib.sqlite3_free(changeset_ptr)
+
+        patchset_size = ctypes.c_int()
+        patchset_ptr = ctypes.c_void_p()
+        rc = lib.sqlite3session_patchset(
+            session,
+            ctypes.byref(patchset_size),
+            ctypes.byref(patchset_ptr),
+        )
+        if rc != SQLITE_OK:
+            fail_with_db("sqlite3session_patchset_failed", rc, db)
+        try:
+            Path(patchset_path).write_bytes(
+                ctypes.string_at(patchset_ptr, patchset_size.value)
+            )
+        finally:
+            if patchset_ptr.value:
+                lib.sqlite3_free(patchset_ptr)
+    finally:
+        if session.value:
+            lib.sqlite3session_delete(session)
+        lib.sqlite3_close(db)
+elif mode == "apply":
+    decision = sys.argv[2]
+    seed_mode = sys.argv[3]
+    db_path = sys.argv[4]
+    changeset_path = sys.argv[5]
+
+    db = open_db(db_path)
+    conflicts = []
+    try:
+        exec_sql(db, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT, balance INTEGER)")
+        if seed_mode == "conflict":
+            exec_sql(
+                db,
+                """
+                INSERT INTO accounts VALUES (1, 'eve', 5);
+                INSERT INTO accounts VALUES (2, 'robert', 60);
+                """,
+            )
+
+        changeset = Path(changeset_path).read_bytes()
+        buffer = ctypes.create_string_buffer(changeset)
+
+        @CONFLICT
+        def on_conflict(_ctx, kind, _iter_ptr):
+            conflicts.append(CONFLICT_MAP.get(kind, f"unknown_{kind}"))
+            return ACTION_MAP[decision]
+
+        rebase = ctypes.c_void_p()
+        rebase_size = ctypes.c_int()
+        rc = lib.sqlite3changeset_apply_v2(
+            db,
+            len(changeset),
+            ctypes.cast(buffer, ctypes.c_void_p),
+            None,
+            on_conflict,
+            None,
+            ctypes.byref(rebase),
+            ctypes.byref(rebase_size),
+            0,
+        )
+        rows = fetch_account_rows(db)
+        errmsg = decode_errmsg(db)
+        if rebase.value:
+            lib.sqlite3_free(rebase)
+
+        print(
+            json.dumps(
+                {
+                    "kind": "success" if rc == SQLITE_OK else "aborted",
+                    "return_code": rc,
+                    "error": None if rc == SQLITE_OK else errmsg,
+                    "conflicts": conflicts,
+                    "rows": rows,
+                }
+            )
+        )
+    finally:
+        lib.sqlite3_close(db)
+else:
+    raise SystemExit(f"unknown_mode:{mode}")
 "#;
+
+fn write_sqlite_session_oracle_script(temp_dir: &Path) -> Result<PathBuf, String> {
+    let script_path = temp_dir.join("sqlite_session_oracle.py");
+    fs::write(&script_path, SQLITE_SESSION_ORACLE_SCRIPT).map_err(|error| {
+        format!(
+            "bead_id={SESSION_EXTENSION_BEAD_ID} case=sqlite_session_script_write_failed path={} error={error}",
+            script_path.display()
+        )
+    })?;
+    Ok(script_path)
+}
 
 fn run_sqlite_apply_oracle(
     changeset_bytes: &[u8],
@@ -558,7 +748,7 @@ fn run_sqlite_apply_oracle(
     })?;
     let db_path = temp_dir.path().join("apply_oracle.db");
     let changeset_path = temp_dir.path().join("apply_oracle.changeset");
-    let script_path = temp_dir.path().join("sqlite_apply_oracle.py");
+    let script_path = write_sqlite_session_oracle_script(temp_dir.path())?;
 
     fs::write(&changeset_path, changeset_bytes).map_err(|error| {
         format!(
@@ -566,15 +756,9 @@ fn run_sqlite_apply_oracle(
             changeset_path.display()
         )
     })?;
-    fs::write(&script_path, SQLITE_APPLY_ORACLE_SCRIPT).map_err(|error| {
-        format!(
-            "bead_id={SESSION_EXTENSION_BEAD_ID} case=sqlite_apply_script_write_failed path={} error={error}",
-            script_path.display()
-        )
-    })?;
-
     let output = Command::new("python3")
         .arg(&script_path)
+        .arg("apply")
         .arg(decision.label())
         .arg(seed_mode.label())
         .arg(&db_path)

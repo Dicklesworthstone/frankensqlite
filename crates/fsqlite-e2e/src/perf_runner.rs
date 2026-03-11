@@ -152,8 +152,8 @@ pub const HOT_PATH_OPCODE_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_opcode
 /// Schema version for raw subsystem profile packs.
 pub const HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_subsystem_profile.v1";
 /// Schema version for structured D1 actionable hotspot ranking artifacts.
-pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1: &str =
-    "fsqlite-e2e.hot_path_actionable_ranking.v1";
+pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2: &str =
+    "fsqlite-e2e.hot_path_actionable_ranking.v2";
 /// Bead identifier for the hot-path profiling work.
 pub const HOT_PATH_PROFILE_BEAD_ID: &str = "bd-db300.4.1";
 /// Canonical scenario identifier for the mixed read/write hot path.
@@ -927,8 +927,7 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
         .saturating_add(report.parser.parse_multi_calls);
     let record_decode_activity_count = report
         .record_decode
-        .parse_record_calls
-        .saturating_add(report.record_decode.parse_record_into_calls)
+        .parse_record_into_calls
         .saturating_add(report.record_decode.parse_record_column_calls);
     let total_time_ns = parser_time_ns
         .saturating_add(report.record_decode.decode_time_ns)
@@ -939,8 +938,7 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
         );
     let total_allocator_pressure_bytes = report
         .allocator_pressure
-        .parser_sql_bytes
-        .saturating_add(report.allocator_pressure.decoded_value_heap_bytes_total)
+        .decoded_value_heap_bytes_total
         .saturating_add(report.allocator_pressure.result_value_heap_bytes_total);
 
     let mut entries = vec![
@@ -949,14 +947,11 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
             component: "parser_ast_churn".to_owned(),
             time_ns: parser_time_ns,
             time_share_basis_points: ratio_basis_points(parser_time_ns, total_time_ns),
-            allocator_pressure_bytes: report.allocator_pressure.parser_sql_bytes,
-            allocator_share_basis_points: ratio_basis_points(
-                report.allocator_pressure.parser_sql_bytes,
-                total_allocator_pressure_bytes,
-            ),
+            allocator_pressure_bytes: 0,
+            allocator_share_basis_points: 0,
             activity_count: parser_activity_count,
             rationale:
-                "parse, rewrite, and compile time plus parsed SQL bytes on the connection path"
+                "parse, rewrite, and compile time on the connection path; parser heap pressure is not directly instrumented"
                     .to_owned(),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -1102,7 +1097,7 @@ pub fn build_hot_path_actionable_ranking(
         .collect();
 
     HotPathActionableRanking {
-        schema_version: HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1.to_owned(),
+        schema_version: HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2.to_owned(),
         bead_id: report.bead_id.clone(),
         run_id: report.run_id.clone(),
         trace_id: report.trace_id.clone(),
@@ -1667,7 +1662,7 @@ mod tests {
         );
         assert_eq!(
             actionable_ranking.schema_version,
-            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1
+            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2
         );
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());

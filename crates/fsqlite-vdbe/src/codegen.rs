@@ -12041,16 +12041,16 @@ mod tests {
         codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Verify scan-based update: Rewind loop, read all columns,
-        // overwrite changed column (Variable for bind param), delete old row,
-        // then insert rewritten record.
+        // Rowid equality should use the direct SeekRowid fast path instead of
+        // scanning the whole table.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
                 Opcode::OpenWrite,
-                Opcode::Rewind,     // full scan
+                Opcode::Variable,   // target rowid
+                Opcode::SeekRowid,  // direct probe
                 Opcode::Column,     // read existing col a
                 Opcode::Column,     // read existing col b
                 Opcode::Variable,   // new value for b
@@ -12058,7 +12058,6 @@ mod tests {
                 Opcode::Delete,     // delete old row
                 Opcode::MakeRecord, // pack ALL columns
                 Opcode::Insert,     // write back
-                Opcode::Next,       // loop
                 Opcode::Close,
                 Opcode::Halt,
             ]
@@ -12162,17 +12161,17 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Verify two-pass delete: collect matching rowids, then delete.
+        // Rowid equality should use a direct probe in pass 1, then delete via
+        // the collected rowset in pass 2.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
                 Opcode::OpenWrite,
-                Opcode::Rewind,     // pass 1: scan
-                Opcode::Rowid,      // collect rowid
+                Opcode::Variable,   // target rowid
+                Opcode::SeekRowid,  // direct probe
                 Opcode::RowSetAdd,  // into rowset
-                Opcode::Next,       // continue scan
                 Opcode::RowSetRead, // pass 2: iterate collected rowids
                 Opcode::SeekRowid,  // seek to rowid
                 Opcode::Delete,     // delete row
@@ -14358,16 +14357,10 @@ mod tests {
         codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // The qualified alias "u.rowid" should emit OP_Rowid for the
-        // WHERE comparison, not silently skip the filter.
+        // The qualified alias "u.rowid" should resolve to the rowid fast path.
         assert!(has_opcodes(
             &prog,
-            &[
-                Opcode::Rewind,
-                Opcode::Rowid, // WHERE u.rowid comparison
-                Opcode::Variable,
-                Opcode::Ne, // filter non-matching rows
-            ]
+            &[Opcode::Variable, Opcode::SeekRowid]
         ));
     }
 
@@ -14846,17 +14839,56 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Bare rowid in DELETE WHERE Eq should emit Rowid + Ne filter (two-pass).
+        // Bare rowid in DELETE WHERE Eq should use the direct rowid probe path.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Variable,
+                Opcode::SeekRowid,  // direct probe
+                Opcode::RowSetAdd,
+                Opcode::RowSetRead, // pass 2: delete collected rows
+                Opcode::SeekRowid,
+                Opcode::Delete,
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_codegen_delete_where_shadowed_rowid_eq_uses_visible_column_filter() {
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = schema_with_visible_rowid_column();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Rewind,
-                Opcode::Rowid, // WHERE rowid comparison
+                Opcode::Column, // visible rowid column comparison
                 Opcode::Variable,
-                Opcode::Ne,    // filter non-matching rows
-                Opcode::Rowid, // collect matching rowid
+                Opcode::Ne,
+                Opcode::Rowid, // collect hidden rowid for deletion
                 Opcode::RowSetAdd,
-                Opcode::RowSetRead, // pass 2: delete collected rows
+                Opcode::RowSetRead,
                 Opcode::SeekRowid,
                 Opcode::Delete,
             ]

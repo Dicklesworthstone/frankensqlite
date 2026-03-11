@@ -3375,6 +3375,20 @@ impl VdbeEngine {
         }
 
         self.aggregates.clear();
+        self.results.clear();
+        self.table_index_meta.clear();
+        self.last_compare_result = None;
+        self.changes = 0;
+        self.last_insert_rowid = 0;
+        self.last_insert_cursor_id = None;
+        self.pending_insert_rollback = None;
+        self.conflict_skip_idx = false;
+        self.pending_idx_entries.clear();
+        self.rowsets.clear();
+        self.fk_counter = 0;
+        self.sequence_counters.clear();
+        self.cursor_root_pages.clear();
+        self.vtab_cursors.clear();
 
         // Load table-to-index cursor metadata for REPLACE conflict resolution.
         for (table_cursor, indexes) in program.table_index_meta() {
@@ -3405,7 +3419,7 @@ impl VdbeEngine {
         let start_time = Instant::now();
         let mut opcode_count: u64 = 0;
         let mut local_opcode_execution_totals = [0_u64; Opcode::COUNT + 1];
-        let result_rows_before = self.results.len();
+        let result_rows_before = 0;
 
         if statement_debug_enabled {
             tracing::debug!(
@@ -8751,6 +8765,80 @@ mod tests {
             .into_iter()
             .map(|v| v.into_vec())
             .collect()
+    }
+
+    #[test]
+    fn test_execute_reuse_clears_prior_results() {
+        let mut first_builder = ProgramBuilder::new();
+        first_builder.emit_op(Opcode::Integer, 11, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let first_program = first_builder.finish().expect("first program should build");
+
+        let mut second_builder = ProgramBuilder::new();
+        second_builder.emit_op(Opcode::Integer, 22, 1, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let second_program = second_builder.finish().expect("second program should build");
+
+        let mut engine =
+            VdbeEngine::new(first_program.register_count().max(second_program.register_count()));
+        assert_eq!(
+            engine.execute(&first_program).expect("first execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            engine.execute(&second_program).expect("second execution"),
+            ExecOutcome::Done
+        );
+
+        let results = engine
+            .results()
+            .iter()
+            .map(|row| row.clone().into_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(results, vec![vec![SqliteValue::Integer(22)]]);
+    }
+
+    #[test]
+    fn test_execute_reuse_resets_statement_accounting() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut insert_builder = ProgramBuilder::new();
+        let insert_end = insert_builder.emit_label();
+        insert_builder.emit_jump_to_label(Opcode::Init, 0, 0, insert_end, P4::None, 0);
+        insert_builder.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        insert_builder.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        insert_builder.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+        insert_builder.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        insert_builder.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        insert_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        insert_builder.resolve_label(insert_end);
+        let insert_program = insert_builder.finish().expect("insert program should build");
+
+        let mut noop_builder = ProgramBuilder::new();
+        noop_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let noop_program = noop_builder.finish().expect("noop program should build");
+
+        let mut engine =
+            VdbeEngine::new(insert_program.register_count().max(noop_program.register_count()));
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert_eq!(
+            engine.execute(&insert_program).expect("insert execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(engine.changes(), 1);
+        assert_eq!(engine.last_insert_rowid(), 1);
+
+        assert_eq!(
+            engine.execute(&noop_program).expect("noop execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(engine.changes(), 0);
+        assert_eq!(engine.last_insert_rowid(), 0);
     }
 
     /// Build and execute a program with the builtin function registry attached.

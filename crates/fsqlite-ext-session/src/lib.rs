@@ -1160,10 +1160,14 @@ impl SimpleTarget {
         F: FnMut(ConflictType, &ChangesetRow) -> ConflictAction,
     {
         let original_tables = self.tables.clone();
+        let mut touched_tables = Vec::new();
         let mut applied = 0usize;
         let mut skipped = 0usize;
 
         for tc in &changeset.tables {
+            if !touched_tables.iter().any(|name: &String| name == &tc.info.name) {
+                touched_tables.push(tc.info.name.clone());
+            }
             let rows = self.tables.entry(tc.info.name.clone()).or_default();
             for change in &tc.rows {
                 let result = match change.op {
@@ -1182,6 +1186,9 @@ impl SimpleTarget {
                     Ok(false) => skipped += 1,
                     Err(n) => {
                         self.tables = original_tables;
+                        for table_name in touched_tables {
+                            self.tables.entry(table_name).or_default();
+                        }
                         return ApplyOutcome::Aborted { applied: n };
                     }
                 }
