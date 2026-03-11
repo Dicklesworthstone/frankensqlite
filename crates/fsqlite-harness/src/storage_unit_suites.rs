@@ -33,13 +33,15 @@ mod pager_tests {
     fn test_pager() -> SimplePager<MemoryVfs> {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/stor-suite-test.db");
-        SimplePager::open(vfs, &path, PageSize::DEFAULT).expect("open test pager")
+        let cx = Cx::new();
+        SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT).expect("open test pager")
     }
 
     fn test_pager_with_size(page_size: PageSize) -> SimplePager<MemoryVfs> {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from(format!("/stor-suite-{}.db", page_size.get()));
-        SimplePager::open(vfs, &path, page_size).expect("open test pager")
+        let cx = Cx::new();
+        SimplePager::open_with_cx(&cx, vfs, &path, page_size).expect("open test pager")
     }
 
     // -- Transaction mode isolation --

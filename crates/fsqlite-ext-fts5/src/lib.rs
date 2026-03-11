@@ -659,45 +659,62 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             continue;
         }
 
-        // Check for prefix operator (trailing *).
-        if word.ends_with('*') {
-            let base = word.trim_end_matches('*');
-            if !base.is_empty() {
-                tokens.push(Fts5QueryToken {
-                    kind: Fts5QueryTokenKind::Prefix,
-                    lexeme: base.to_owned(),
-                });
-                continue;
-            }
-        }
-
-        // Check for column filter (word:).
-        if word.ends_with(':') {
-            let col_name = word.trim_end_matches(':');
-            if !col_name.is_empty() {
-                tokens.push(Fts5QueryToken {
-                    kind: Fts5QueryTokenKind::ColumnFilter,
-                    lexeme: col_name.to_owned(),
-                });
-                continue;
-            }
-        }
-
-        let upper = word.to_ascii_uppercase();
-        let kind = match upper.as_str() {
-            "OR" => Fts5QueryTokenKind::Or,
-            "NOT" => Fts5QueryTokenKind::Not,
-            "NEAR" => Fts5QueryTokenKind::Near,
-            _ => Fts5QueryTokenKind::Term,
-        };
-
-        tokens.push(Fts5QueryToken { kind, lexeme: word });
+        push_query_word_tokens(&word, &mut tokens);
     }
 
     if tokens.is_empty() {
         return Err(Fts5QueryError::EmptyQuery);
     }
     Ok(tokens)
+}
+
+fn push_query_word_tokens(word: &str, tokens: &mut Vec<Fts5QueryToken>) {
+    if word.ends_with(':') {
+        let col_name = word.trim_end_matches(':');
+        if !col_name.is_empty() {
+            tokens.push(Fts5QueryToken {
+                kind: Fts5QueryTokenKind::ColumnFilter,
+                lexeme: col_name.to_owned(),
+            });
+        }
+        return;
+    }
+
+    if let Some((column_name, remainder)) = word.split_once(':')
+        && !column_name.is_empty()
+        && !remainder.is_empty()
+    {
+        tokens.push(Fts5QueryToken {
+            kind: Fts5QueryTokenKind::ColumnFilter,
+            lexeme: column_name.to_owned(),
+        });
+        push_query_word_tokens(remainder, tokens);
+        return;
+    }
+
+    if word.ends_with('*') {
+        let base = word.trim_end_matches('*');
+        if !base.is_empty() {
+            tokens.push(Fts5QueryToken {
+                kind: Fts5QueryTokenKind::Prefix,
+                lexeme: base.to_owned(),
+            });
+            return;
+        }
+    }
+
+    let upper = word.to_ascii_uppercase();
+    let kind = match upper.as_str() {
+        "OR" => Fts5QueryTokenKind::Or,
+        "NOT" => Fts5QueryTokenKind::Not,
+        "NEAR" => Fts5QueryTokenKind::Near,
+        _ => Fts5QueryTokenKind::Term,
+    };
+
+    tokens.push(Fts5QueryToken {
+        kind,
+        lexeme: word.to_owned(),
+    });
 }
 
 fn validate_fts5_parentheses(tokens: &[Fts5QueryToken]) -> std::result::Result<(), Fts5QueryError> {
@@ -1124,7 +1141,11 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
     evaluate_expr_impl(index, expr, &[], None)
 }
 
-fn evaluate_expr_for_columns(index: &InvertedIndex, expr: &Fts5Expr, columns: &[String]) -> Vec<i64> {
+fn evaluate_expr_for_columns(
+    index: &InvertedIndex,
+    expr: &Fts5Expr,
+    columns: &[String],
+) -> Vec<i64> {
     evaluate_expr_impl(index, expr, columns, None)
 }
 
@@ -1308,14 +1329,17 @@ fn validate_column_filters(
             validate_column_filters(inner, columns)
         }
         Fts5Expr::InitialToken(inner) => validate_column_filters(inner, columns),
-        Fts5Expr::Term(_)
-        | Fts5Expr::Prefix(_)
-        | Fts5Expr::Phrase(_)
-        | Fts5Expr::Near(_, _) => Ok(()),
+        Fts5Expr::Term(_) | Fts5Expr::Prefix(_) | Fts5Expr::Phrase(_) | Fts5Expr::Near(_, _) => {
+            Ok(())
+        }
     }
 }
 
-fn evaluate_phrase(index: &InvertedIndex, words: &[String], allowed_columns: Option<&[u32]>) -> Vec<i64> {
+fn evaluate_phrase(
+    index: &InvertedIndex,
+    words: &[String],
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
     if words.is_empty() {
         return Vec::new();
     }
@@ -2260,6 +2284,26 @@ mod tests {
         let tokens = parse_fts5_query("title: hello").unwrap();
         assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
         assert_eq!(tokens[0].lexeme, "title");
+    }
+
+    #[test]
+    fn test_fts5_query_inline_column_filter() {
+        let tokens = parse_fts5_query("title:hello").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "title");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+        assert_eq!(tokens[1].lexeme, "hello");
+    }
+
+    #[test]
+    fn test_fts5_query_inline_column_filter_prefix() {
+        let tokens = parse_fts5_query("title:hel*").unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::ColumnFilter);
+        assert_eq!(tokens[0].lexeme, "title");
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Prefix);
+        assert_eq!(tokens[1].lexeme, "hel");
     }
 
     #[test]

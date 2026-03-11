@@ -331,7 +331,7 @@ pub fn json_error_position(input: &str) -> usize {
                     current_line += 1;
                     current_col = 1;
                 } else {
-                    current_col += ch.len_utf8();
+                    current_col += 1;
                 }
                 char_pos += 1;
             }
@@ -638,7 +638,7 @@ fn json_tree_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
     };
 
     let mut rows = Vec::new();
-    let mut next_id = 1_i64;
+    let mut next_id = 0_i64;
     append_tree_rows(
         &mut rows,
         target,
@@ -1100,6 +1100,7 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                         "invalid json path `{path}`: empty key segment"
                     )));
                 }
+                // ... rest of the dot case remains same ...
 
                 if bytes[idx] == b'"' {
                     let quoted_start = idx;
@@ -1694,25 +1695,39 @@ fn resolve_parent_for_edit<'a>(
         });
         match segment {
             PathSegment::Key(key) => {
-                if cursor.is_null() && matches!(mode, EditMode::Set | EditMode::Insert) {
-                    *cursor = Value::Object(Map::new());
+                if cursor.is_null() {
+                    if matches!(mode, EditMode::Set | EditMode::Insert) {
+                        *cursor = Value::Object(Map::new());
+                    } else {
+                        return None;
+                    }
                 }
 
-                let object = cursor.as_object_mut()?;
+                let object = match cursor {
+                    Value::Object(o) => o,
+                    _ => return None,
+                };
+
                 if !object.contains_key(key) {
                     if !matches!(mode, EditMode::Set | EditMode::Insert) {
                         return None;
                     }
                     object.insert(key.clone(), scaffold_for_next_segment(next_segment));
                 }
-                let next = object.get_mut(key)?;
-                cursor = next;
+                cursor = object.get_mut(key).expect("just inserted or checked");
             }
             PathSegment::Index(index) => {
-                if cursor.is_null() && matches!(mode, EditMode::Set | EditMode::Insert) {
-                    *cursor = Value::Array(Vec::new());
+                if cursor.is_null() {
+                    if matches!(mode, EditMode::Set | EditMode::Insert) {
+                        *cursor = Value::Array(Vec::new());
+                    } else {
+                        return None;
+                    }
                 }
-                let array = cursor.as_array_mut()?;
+                let array = match cursor {
+                    Value::Array(a) => a,
+                    _ => return None,
+                };
                 if *index > array.len() {
                     return None;
                 }
@@ -1722,28 +1737,36 @@ fn resolve_parent_for_edit<'a>(
                     }
                     array.push(scaffold_for_next_segment(next_segment));
                 }
-                let next = array.get_mut(*index)?;
-                cursor = next;
+                cursor = array.get_mut(*index).expect("just pushed or checked");
             }
             PathSegment::Append => {
-                if cursor.is_null() && matches!(mode, EditMode::Set | EditMode::Insert) {
-                    *cursor = Value::Array(Vec::new());
+                if cursor.is_null() {
+                    if matches!(mode, EditMode::Set | EditMode::Insert) {
+                        *cursor = Value::Array(Vec::new());
+                    } else {
+                        return None;
+                    }
                 }
-                let array = cursor.as_array_mut()?;
+                let array = match cursor {
+                    Value::Array(a) => a,
+                    _ => return None,
+                };
                 if !matches!(mode, EditMode::Set | EditMode::Insert) {
                     return None;
                 }
                 array.push(scaffold_for_next_segment(next_segment));
-                cursor = array.last_mut()?;
+                cursor = array.last_mut().expect("just pushed");
             }
             PathSegment::FromEnd(from_end) => {
-                let array = cursor.as_array_mut()?;
+                let array = match cursor {
+                    Value::Array(a) => a,
+                    _ => return None,
+                };
                 if *from_end == 0 || *from_end > array.len() {
                     return None;
                 }
                 let index = array.len() - *from_end;
-                let next = array.get_mut(index)?;
-                cursor = next;
+                cursor = array.get_mut(index).expect("checked length");
             }
         }
     }

@@ -11,6 +11,16 @@ pub use fsqlite_error::FrankenError;
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;
 
+#[cfg(feature = "session")]
+/// Manual session/changeset API facade re-exported from `fsqlite-ext-session`.
+pub mod session {
+    pub use fsqlite_ext_session::{
+        ApplyOutcome, ChangeOp, Changeset, ChangesetRow, ChangesetValue, ConflictAction,
+        ConflictType, Session, SimpleTarget, TableChangeset, TableInfo, changeset_varint_len,
+        extension_name,
+    };
+}
+
 pub mod compat;
 pub mod migrate;
 
@@ -121,10 +131,14 @@ mod tests {
         assert_eq!(runtime.config().worker_threads, 2);
         assert_eq!(runtime.config().io_poll_strategy, IoPollStrategy::Blocking);
 
-        let explicit_runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
-            worker_threads: 1,
-            io_poll_strategy: IoPollStrategy::Auto,
-        }));
+        let parent_cx = fsqlite_types::cx::Cx::new().with_trace_context(11, 0, 0);
+        let explicit_runtime = Arc::new(RuntimeContext::new_with_root_cx(
+            RuntimeConfig {
+                worker_threads: 1,
+                io_poll_strategy: IoPollStrategy::Auto,
+            },
+            &parent_cx,
+        ));
         let env = ConnectionEnv::new(Arc::clone(&explicit_runtime));
         let conn = Connection::open_with_env(":memory:", env).expect("connection should open");
         assert_eq!(conn.path(), ":memory:");
@@ -217,6 +231,27 @@ mod tests {
         let stmt = conn.prepare("SELECT 1 + 2;").unwrap();
         let explain = stmt.explain();
         assert!(!explain.is_empty());
+    }
+
+    #[cfg(feature = "session")]
+    #[test]
+    fn session_feature_reexports_manual_session_api() {
+        assert_eq!(super::session::extension_name(), "session");
+
+        let mut session = super::session::Session::new();
+        session.attach_table("users", 2, vec![true, false]);
+        session.record_insert(
+            "users",
+            vec![
+                super::session::ChangesetValue::Integer(1),
+                super::session::ChangesetValue::Text("alice".to_owned()),
+            ],
+        );
+
+        let encoded = session.changeset().encode();
+        let decoded = super::session::Changeset::decode(&encoded)
+            .expect("re-exported session API should round-trip changesets");
+        assert_eq!(decoded.encode(), encoded);
     }
 
     #[test]

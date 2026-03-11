@@ -3,11 +3,15 @@
 //! Bead: bd-1dus
 //!
 //! Measures INSERT throughput (rows/sec) for both `FrankenSQLite` and C `SQLite`
-//! across three transaction strategies:
+//! across three transaction strategies and two statement modes:
 //!
 //! 1. **Autocommit**: each INSERT is its own implicit transaction.
 //! 2. **Batched**: 10 batches of 1,000 INSERTs each, wrapped in explicit txns.
 //! 3. **Single transaction**: all 10,000 INSERTs in one BEGIN…COMMIT.
+//! 4. **Prepared vs ad-hoc**: each backend is measured both with a reused
+//!    prepared DML statement and with per-call ad-hoc execution so the parser
+//!    and codegen tax stays explicit instead of being accidentally folded into
+//!    a backend comparison.
 //!
 //! Both backends use identical PRAGMA settings (best-effort for in-memory) and
 //! verify final row counts to confirm correctness.
@@ -51,6 +55,47 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
 // ─── Schema helper ──────────────────────────────────────────────────────
 
 const CREATE_TABLE: &str = "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);";
+const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));";
+
+fn run_csqlite_prepared_inserts(conn: &rusqlite::Connection, start: i64, end: i64) {
+    let mut stmt = conn.prepare(INSERT_SQL).unwrap();
+    for i in start..end {
+        stmt.execute(rusqlite::params![i]).unwrap();
+    }
+}
+
+fn run_csqlite_ad_hoc_inserts(conn: &rusqlite::Connection, start: i64, end: i64) {
+    for i in start..end {
+        conn.execute(INSERT_SQL, rusqlite::params![i]).unwrap();
+    }
+}
+
+fn run_fsqlite_prepared_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
+    let stmt = conn.prepare(INSERT_SQL).unwrap();
+    for i in start..end {
+        stmt.execute_with_params(&[SqliteValue::Integer(i)])
+            .unwrap();
+    }
+}
+
+fn run_fsqlite_ad_hoc_inserts(conn: &fsqlite::Connection, start: i64, end: i64) {
+    for i in start..end {
+        conn.execute_with_params(INSERT_SQL, &[SqliteValue::Integer(i)])
+            .unwrap();
+    }
+}
+
+fn verify_row_count_csqlite(conn: &rusqlite::Connection) {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM bench", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, ROW_COUNT);
+}
+
+fn verify_row_count_fsqlite(conn: &fsqlite::Connection) {
+    let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
+}
 
 // ─── Criterion configuration ────────────────────────────────────────────
 
@@ -66,7 +111,7 @@ fn bench_write_autocommit(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(20));
     group.throughput(Throughput::Elements(10_000));
 
-    group.bench_function("csqlite", |b| {
+    group.bench_function("csqlite_prepared", |b| {
         b.iter_batched(
             || {
                 let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -75,22 +120,30 @@ fn bench_write_autocommit(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let mut stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137))")
-                    .unwrap();
-                for i in 0..ROW_COUNT {
-                    stmt.execute(rusqlite::params![i]).unwrap();
-                }
-                // Verify row count.
-                let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
-                let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
-                assert_eq!(count, ROW_COUNT);
+                run_csqlite_prepared_inserts(&conn, 0, ROW_COUNT);
+                verify_row_count_csqlite(&conn);
             },
             BatchSize::LargeInput,
         );
     });
 
-    group.bench_function("frankensqlite", |b| {
+    group.bench_function("csqlite_ad_hoc", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                apply_pragmas_csqlite(&conn);
+                conn.execute_batch(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                run_csqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
+                verify_row_count_csqlite(&conn);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite_prepared", |b| {
         b.iter_batched(
             || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
@@ -99,24 +152,24 @@ fn bench_write_autocommit(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                // FrankenSQLite's prepare() currently supports SELECT only,
-                // so we use conn.execute() with formatted SQL for INSERTs.
-                for i in 0..ROW_COUNT {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let val = f64::from(i as i32) * 0.137;
-                    conn.execute_with_params(
-                        "INSERT INTO bench VALUES (?, ?, ?)",
-                        &[
-                            fsqlite_types::value::SqliteValue::Integer(i),
-                            fsqlite_types::value::SqliteValue::Text(format!("data_{i}")),
-                            fsqlite_types::value::SqliteValue::Float(val),
-                        ],
-                    )
-                    .unwrap();
-                }
-                // Verify row count.
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
+                run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT);
+                verify_row_count_fsqlite(&conn);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite_ad_hoc", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
+                verify_row_count_fsqlite(&conn);
             },
             BatchSize::LargeInput,
         );
@@ -133,7 +186,7 @@ fn bench_write_batched(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(20));
     group.throughput(Throughput::Elements(10_000));
 
-    group.bench_function("csqlite", |b| {
+    group.bench_function("csqlite_prepared", |b| {
         b.iter_batched(
             || {
                 let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -142,26 +195,40 @@ fn bench_write_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
-                let mut stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137))")
-                    .unwrap();
                 for batch in 0..NUM_BATCHES {
                     conn.execute_batch("BEGIN").unwrap();
                     let start = batch * BATCH_SIZE;
-                    for i in start..start + BATCH_SIZE {
-                        stmt.execute(rusqlite::params![i]).unwrap();
-                    }
+                    run_csqlite_prepared_inserts(&conn, start, start + BATCH_SIZE);
                     conn.execute_batch("COMMIT").unwrap();
                 }
-                let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
-                let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
-                assert_eq!(count, ROW_COUNT);
+                verify_row_count_csqlite(&conn);
             },
             BatchSize::LargeInput,
         );
     });
 
-    group.bench_function("frankensqlite", |b| {
+    group.bench_function("csqlite_ad_hoc", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                apply_pragmas_csqlite(&conn);
+                conn.execute_batch(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                for batch in 0..NUM_BATCHES {
+                    conn.execute_batch("BEGIN").unwrap();
+                    let start = batch * BATCH_SIZE;
+                    run_csqlite_ad_hoc_inserts(&conn, start, start + BATCH_SIZE);
+                    conn.execute_batch("COMMIT").unwrap();
+                }
+                verify_row_count_csqlite(&conn);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite_prepared", |b| {
         b.iter_batched(
             || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
@@ -173,23 +240,31 @@ fn bench_write_batched(c: &mut Criterion) {
                 for batch in 0..NUM_BATCHES {
                     conn.execute("BEGIN").unwrap();
                     let start = batch * BATCH_SIZE;
-                    for i in start..start + BATCH_SIZE {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let val = f64::from(i as i32) * 0.137;
-                        conn.execute_with_params(
-                            "INSERT INTO bench VALUES (?, ?, ?)",
-                            &[
-                                fsqlite_types::value::SqliteValue::Integer(i),
-                                fsqlite_types::value::SqliteValue::Text(format!("data_{i}")),
-                                fsqlite_types::value::SqliteValue::Float(val),
-                            ],
-                        )
-                        .unwrap();
-                    }
+                    run_fsqlite_prepared_inserts(&conn, start, start + BATCH_SIZE);
                     conn.execute("COMMIT").unwrap();
                 }
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
+                verify_row_count_fsqlite(&conn);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite_ad_hoc", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                for batch in 0..NUM_BATCHES {
+                    conn.execute("BEGIN").unwrap();
+                    let start = batch * BATCH_SIZE;
+                    run_fsqlite_ad_hoc_inserts(&conn, start, start + BATCH_SIZE);
+                    conn.execute("COMMIT").unwrap();
+                }
+                verify_row_count_fsqlite(&conn);
             },
             BatchSize::LargeInput,
         );
@@ -206,7 +281,7 @@ fn bench_write_single_txn(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(20));
     group.throughput(Throughput::Elements(10_000));
 
-    group.bench_function("csqlite", |b| {
+    group.bench_function("csqlite_prepared", |b| {
         b.iter_batched(
             || {
                 let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -216,22 +291,33 @@ fn bench_write_single_txn(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute_batch("BEGIN").unwrap();
-                let mut stmt = conn
-                    .prepare("INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137))")
-                    .unwrap();
-                for i in 0..ROW_COUNT {
-                    stmt.execute(rusqlite::params![i]).unwrap();
-                }
+                run_csqlite_prepared_inserts(&conn, 0, ROW_COUNT);
                 conn.execute_batch("COMMIT").unwrap();
-                let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
-                let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
-                assert_eq!(count, ROW_COUNT);
+                verify_row_count_csqlite(&conn);
             },
             BatchSize::LargeInput,
         );
     });
 
-    group.bench_function("frankensqlite", |b| {
+    group.bench_function("csqlite_ad_hoc", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                apply_pragmas_csqlite(&conn);
+                conn.execute_batch(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute_batch("BEGIN").unwrap();
+                run_csqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
+                conn.execute_batch("COMMIT").unwrap();
+                verify_row_count_csqlite(&conn);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite_prepared", |b| {
         b.iter_batched(
             || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
@@ -241,22 +327,27 @@ fn bench_write_single_txn(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN").unwrap();
-                for i in 0..ROW_COUNT {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let val = f64::from(i as i32) * 0.137;
-                    conn.execute_with_params(
-                        "INSERT INTO bench VALUES (?, ?, ?)",
-                        &[
-                            fsqlite_types::value::SqliteValue::Integer(i),
-                            fsqlite_types::value::SqliteValue::Text(format!("data_{i}")),
-                            fsqlite_types::value::SqliteValue::Float(val),
-                        ],
-                    )
-                    .unwrap();
-                }
+                run_fsqlite_prepared_inserts(&conn, 0, ROW_COUNT);
                 conn.execute("COMMIT").unwrap();
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
+                verify_row_count_fsqlite(&conn);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite_ad_hoc", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute("BEGIN").unwrap();
+                run_fsqlite_ad_hoc_inserts(&conn, 0, ROW_COUNT);
+                conn.execute("COMMIT").unwrap();
+                verify_row_count_fsqlite(&conn);
             },
             BatchSize::LargeInput,
         );
