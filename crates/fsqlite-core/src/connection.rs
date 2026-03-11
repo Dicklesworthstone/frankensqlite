@@ -3578,7 +3578,12 @@ impl Connection {
         let op_cx = self.op_cx()?;
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
-                self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
+                self.execute_statement_dispatch_impl(
+                    &op_cx,
+                    statement.as_ref(),
+                    params,
+                    precompiled,
+                )
             })
         } else {
             self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
@@ -28779,9 +28784,7 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
 
         let statement = conn
-            .cached_parse_single(
-                "SELECT a.x FROM t AS a JOIN t AS b ON a.x = b.x ORDER BY a.x;",
-            )
+            .cached_parse_single("SELECT a.x FROM t AS a JOIN t AS b ON a.x = b.x ORDER BY a.x;")
             .unwrap();
 
         conn._shared_mvcc_state

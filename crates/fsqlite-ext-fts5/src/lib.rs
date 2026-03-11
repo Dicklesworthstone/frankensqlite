@@ -1121,10 +1121,28 @@ pub fn bm25_score(
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
+    evaluate_expr_impl(index, expr, &[], None)
+}
+
+fn evaluate_expr_for_columns(index: &InvertedIndex, expr: &Fts5Expr, columns: &[String]) -> Vec<i64> {
+    evaluate_expr_impl(index, expr, columns, None)
+}
+
+fn evaluate_expr_impl(
+    index: &InvertedIndex,
+    expr: &Fts5Expr,
+    columns: &[String],
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
     match expr {
         Fts5Expr::Term(term) => {
             let lower = term.to_lowercase();
-            let mut docs: Vec<i64> = index.get_postings(&lower).iter().map(|p| p.docid).collect();
+            let mut docs: Vec<i64> = index
+                .get_postings(&lower)
+                .iter()
+                .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
+                .map(|p| p.docid)
+                .collect();
             docs.sort_unstable();
             docs.dedup();
             docs
@@ -1134,32 +1152,34 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
             let mut docs: Vec<i64> = index
                 .get_prefix_postings(&lower)
                 .iter()
+                .filter(|posting| posting_matches_allowed_columns(posting.column, allowed_columns))
                 .map(|p| p.docid)
                 .collect();
             docs.sort_unstable();
             docs.dedup();
             docs
         }
-        Fts5Expr::Phrase(words) => evaluate_phrase(index, words),
+        Fts5Expr::Phrase(words) => evaluate_phrase(index, words, allowed_columns),
         Fts5Expr::And(left, right) => {
-            let left_docs = evaluate_expr(index, left);
-            let right_docs = evaluate_expr(index, right);
+            let left_docs = evaluate_expr_impl(index, left, columns, allowed_columns);
+            let right_docs = evaluate_expr_impl(index, right, columns, allowed_columns);
             intersect_sorted(&left_docs, &right_docs)
         }
         Fts5Expr::Or(left, right) => {
-            let left_docs = evaluate_expr(index, left);
-            let right_docs = evaluate_expr(index, right);
+            let left_docs = evaluate_expr_impl(index, left, columns, allowed_columns);
+            let right_docs = evaluate_expr_impl(index, right, columns, allowed_columns);
             union_sorted(&left_docs, &right_docs)
         }
         Fts5Expr::Not(left, right) => {
-            let left_docs = evaluate_expr(index, left);
-            let right_docs = evaluate_expr(index, right);
+            let left_docs = evaluate_expr_impl(index, left, columns, allowed_columns);
+            let right_docs = evaluate_expr_impl(index, right, columns, allowed_columns);
             difference_sorted(&left_docs, &right_docs)
         }
-        Fts5Expr::Near(terms, distance) => evaluate_near(index, terms, *distance),
-        Fts5Expr::ColumnFilter(_col, inner) => {
-            // Simplified: evaluate inner without column restriction for now
-            evaluate_expr(index, inner)
+        Fts5Expr::Near(terms, distance) => evaluate_near(index, terms, *distance, allowed_columns),
+        Fts5Expr::ColumnFilter(column_name, inner) => {
+            let resolved_columns = resolve_allowed_columns(columns, column_name);
+            let combined_columns = combine_allowed_columns(allowed_columns, &resolved_columns);
+            evaluate_expr_impl(index, inner, columns, Some(combined_columns.as_slice()))
         }
         Fts5Expr::InitialToken(inner) => {
             // For initial token (^), filter results to those where the term/phrase
@@ -1170,7 +1190,10 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
                     let mut docs: Vec<i64> = index
                         .get_postings(&lower)
                         .iter()
-                        .filter(|p| p.positions.contains(&0))
+                        .filter(|posting| {
+                            posting.positions.contains(&0)
+                                && posting_matches_allowed_columns(posting.column, allowed_columns)
+                        })
                         .map(|p| p.docid)
                         .collect();
                     docs.sort_unstable();
@@ -1182,7 +1205,10 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
                     let mut docs: Vec<i64> = index
                         .get_prefix_postings(&lower)
                         .iter()
-                        .filter(|p| p.positions.contains(&0))
+                        .filter(|posting| {
+                            posting.positions.contains(&0)
+                                && posting_matches_allowed_columns(posting.column, allowed_columns)
+                        })
                         .map(|p| p.docid)
                         .collect();
                     docs.sort_unstable();
@@ -1200,7 +1226,9 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
 
                     for first_p in first_postings {
                         // Optimization: if first word isn't at 0, this doc can't match ^phrase.
-                        if !first_p.positions.contains(&0) {
+                        if !first_p.positions.contains(&0)
+                            || !posting_matches_allowed_columns(first_p.column, allowed_columns)
+                        {
                             continue;
                         }
 
@@ -1226,13 +1254,68 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
                     result.sort_unstable();
                     result
                 }
-                _ => evaluate_expr(index, inner),
+                _ => evaluate_expr_impl(index, inner, columns, allowed_columns),
             }
         }
     }
 }
 
-fn evaluate_phrase(index: &InvertedIndex, words: &[String]) -> Vec<i64> {
+fn posting_matches_allowed_columns(column: u32, allowed_columns: Option<&[u32]>) -> bool {
+    match allowed_columns {
+        Some(allowed) => allowed.contains(&column),
+        None => true,
+    }
+}
+
+fn resolve_allowed_columns(columns: &[String], column_name: &str) -> Vec<u32> {
+    columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| {
+            if candidate.eq_ignore_ascii_case(column_name) {
+                u32::try_from(idx).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn combine_allowed_columns(existing: Option<&[u32]>, resolved: &[u32]) -> Vec<u32> {
+    match existing {
+        Some(existing) => existing
+            .iter()
+            .copied()
+            .filter(|column| resolved.contains(column))
+            .collect(),
+        None => resolved.to_vec(),
+    }
+}
+
+fn validate_column_filters(
+    expr: &Fts5Expr,
+    columns: &[String],
+) -> std::result::Result<(), Fts5QueryError> {
+    match expr {
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) | Fts5Expr::Not(left, right) => {
+            validate_column_filters(left, columns)?;
+            validate_column_filters(right, columns)
+        }
+        Fts5Expr::ColumnFilter(column_name, inner) => {
+            if resolve_allowed_columns(columns, column_name).is_empty() {
+                return Err(Fts5QueryError::InvalidColumnFilter(column_name.clone()));
+            }
+            validate_column_filters(inner, columns)
+        }
+        Fts5Expr::InitialToken(inner) => validate_column_filters(inner, columns),
+        Fts5Expr::Term(_)
+        | Fts5Expr::Prefix(_)
+        | Fts5Expr::Phrase(_)
+        | Fts5Expr::Near(_, _) => Ok(()),
+    }
+}
+
+fn evaluate_phrase(index: &InvertedIndex, words: &[String], allowed_columns: Option<&[u32]>) -> Vec<i64> {
     if words.is_empty() {
         return Vec::new();
     }
@@ -1248,12 +1331,16 @@ fn evaluate_phrase(index: &InvertedIndex, words: &[String]) -> Vec<i64> {
     // For each document that has the first word, check if subsequent words
     // appear in consecutive positions.
     for first_p in first_postings {
+        if !posting_matches_allowed_columns(first_p.column, allowed_columns) {
+            continue;
+        }
         'positions: for &start_pos in &first_p.positions {
             for (offset, word) in words.iter().enumerate().skip(1) {
                 let target_pos = start_pos + u32::try_from(offset).unwrap_or(u32::MAX);
                 let found = index.get_postings(word).iter().any(|p| {
                     p.docid == first_p.docid
                         && p.column == first_p.column
+                        && posting_matches_allowed_columns(p.column, allowed_columns)
                         && p.positions.contains(&target_pos)
                 });
                 if !found {
@@ -1270,7 +1357,12 @@ fn evaluate_phrase(index: &InvertedIndex, words: &[String]) -> Vec<i64> {
     result
 }
 
-fn evaluate_near(index: &InvertedIndex, terms: &[String], distance: u32) -> Vec<i64> {
+fn evaluate_near(
+    index: &InvertedIndex,
+    terms: &[String],
+    distance: u32,
+    allowed_columns: Option<&[u32]>,
+) -> Vec<i64> {
     if terms.len() < 2 {
         return Vec::new();
     }
@@ -1280,12 +1372,18 @@ fn evaluate_near(index: &InvertedIndex, terms: &[String], distance: u32) -> Vec<
     let mut result = Vec::new();
 
     for first_p in first_postings {
+        if !posting_matches_allowed_columns(first_p.column, allowed_columns) {
+            continue;
+        }
         let mut all_near = true;
 
         for term in &terms[1..] {
             let lower = term.to_lowercase();
             let found = index.get_postings(&lower).iter().any(|p| {
                 if p.docid != first_p.docid || p.column != first_p.column {
+                    return false;
+                }
+                if !posting_matches_allowed_columns(p.column, allowed_columns) {
                     return false;
                 }
                 // Check if any position pair is within distance.
@@ -1439,7 +1537,8 @@ impl Fts5Table {
     pub fn search(&self, query: &str) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
         let tokens = parse_fts5_query(query)?;
         let expr = build_expr(&tokens)?;
-        let matching_docs = evaluate_expr(&self.index, &expr);
+        validate_column_filters(&expr, &self.columns)?;
+        let matching_docs = evaluate_expr_for_columns(&self.index, &expr, &self.columns);
 
         // Extract query terms for BM25 scoring.
         let query_terms = extract_query_terms(&expr);
@@ -2459,6 +2558,36 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_table_search_column_filter() {
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+
+        table.insert_document(1, &["Rust title".to_owned(), "plain body".to_owned()]);
+        table.insert_document(2, &["Plain title".to_owned(), "rust body".to_owned()]);
+
+        let title_results = table.search("title:rust").unwrap();
+        assert_eq!(title_results.len(), 1);
+        assert_eq!(title_results[0].0, 1);
+
+        let body_results = table.search("body:rust").unwrap();
+        assert_eq!(body_results.len(), 1);
+        assert_eq!(body_results[0].0, 2);
+    }
+
+    #[test]
+    fn test_fts5_table_search_invalid_column_filter() {
+        let mut table = Fts5Table::with_columns(vec!["title".to_owned(), "body".to_owned()]);
+        table.insert_document(1, &["Rust title".to_owned(), "plain body".to_owned()]);
+
+        let error = table
+            .search("summary:rust")
+            .expect_err("unknown column filters should fail");
+        assert_eq!(
+            error,
+            Fts5QueryError::InvalidColumnFilter("summary".to_owned())
+        );
+    }
+
+    #[test]
     fn test_fts5_table_bm25_ranking_order() {
         let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
 
@@ -3148,14 +3277,17 @@ mod tests {
     fn test_evaluate_column_filter() {
         let mut index = InvertedIndex::new();
         let tok = Unicode61Tokenizer::new();
-        index.add_document(1, 0, &tok.tokenize("hello world"));
+        let columns = vec!["title".to_owned(), "body".to_owned()];
+        index.add_document(1, 0, &tok.tokenize("hello title"));
+        index.add_document(1, 1, &tok.tokenize("plain body"));
+        index.add_document(2, 0, &tok.tokenize("plain title"));
+        index.add_document(2, 1, &tok.tokenize("hello body"));
 
         let expr = Fts5Expr::ColumnFilter(
             "title".to_owned(),
             Box::new(Fts5Expr::Term("hello".to_owned())),
         );
-        let docs = evaluate_expr(&index, &expr);
-        // Simplified implementation doesn't filter by column.
+        let docs = evaluate_expr_for_columns(&index, &expr, &columns);
         assert_eq!(docs, vec![1]);
     }
 

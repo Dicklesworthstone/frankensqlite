@@ -112,3 +112,60 @@ fn fts5_highlight_and_snippet_available_in_frankensqlite() {
         other => panic!("snippet() must return text, got {other:?}"),
     }
 }
+
+#[test]
+fn fts5_match_column_filters_work_in_frankensqlite() {
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+
+    runner
+        .frank()
+        .execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body);")
+        .expect("FrankenSQLite should create FTS5 virtual tables");
+    runner
+        .frank()
+        .execute(
+            "INSERT INTO docs(rowid, subject, body) VALUES \
+             (1, 'Rust title', 'plain body'), \
+             (2, 'Plain title', 'rust body');",
+        )
+        .expect("FrankenSQLite FTS5 inserts should succeed");
+
+    let frank_subject_rows = runner
+        .frank()
+        .query("SELECT rowid FROM docs WHERE docs MATCH 'subject:rust';")
+        .expect("subject column filter should succeed");
+    assert_eq!(frank_subject_rows, vec![vec![SqlValue::Integer(1)]]);
+
+    let frank_body_rows = runner
+        .frank()
+        .query("SELECT rowid FROM docs WHERE docs MATCH 'body:rust';")
+        .expect("body column filter should succeed");
+    assert_eq!(frank_body_rows, vec![vec![SqlValue::Integer(2)]]);
+
+    if runner
+        .csqlite()
+        .execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body);")
+        .is_ok()
+    {
+        runner
+            .csqlite()
+            .execute(
+                "INSERT INTO docs(rowid, subject, body) VALUES \
+                 (1, 'Rust title', 'plain body'), \
+                 (2, 'Plain title', 'rust body');",
+            )
+            .expect("C SQLite FTS5 inserts should succeed when FTS5 is available");
+
+        let c_subject_rows = runner
+            .csqlite()
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'subject:rust';")
+            .expect("C SQLite subject column filter should succeed");
+        assert_eq!(c_subject_rows, frank_subject_rows);
+
+        let c_body_rows = runner
+            .csqlite()
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'body:rust';")
+            .expect("C SQLite body column filter should succeed");
+        assert_eq!(c_body_rows, frank_body_rows);
+    }
+}
