@@ -9,6 +9,7 @@ pub mod commit_marker;
 pub mod commit_repair;
 pub mod compat_persist;
 pub mod connection;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod db_fec;
 pub mod decode_proofs;
 pub mod ecs_replication;
@@ -19,10 +20,12 @@ pub mod lrc;
 pub mod native_index;
 pub mod permeation_map;
 pub mod por;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod raptorq_codec;
 pub mod raptorq_integration;
 pub mod region;
 pub mod remote_effects;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod repair_engine;
 pub mod repair_symbols;
 pub mod replication_receiver;
@@ -34,6 +37,7 @@ pub mod symbol_size_policy;
 pub mod tiered_storage;
 pub mod transaction;
 pub mod wal_adapter;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wal_fec_adapter;
 
 use std::num::NonZeroUsize;

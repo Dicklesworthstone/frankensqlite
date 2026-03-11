@@ -947,6 +947,9 @@ pub struct PreparedStatement<'conn> {
     /// Cached column count for deferred SELECT statements whose placeholder
     /// program does not contain a `ResultRow` opcode.
     deferred_query_column_count: Option<usize>,
+    /// Best-effort result column labels inferred at prepare time for SELECT
+    /// statements so higher layers can expose stable metadata.
+    column_names: Vec<String>,
     /// Reference to the parent Connection that prepared this statement.
     /// Used by `execute_with_params` to delegate DML execution through
     /// the Connection's full execution pipeline (triggers, constraints,
@@ -1280,6 +1283,12 @@ impl PreparedStatement<'_> {
             .find(|op| op.opcode == Opcode::ResultRow)
             .and_then(|op| usize::try_from(op.p2).ok())
             .unwrap_or(0)
+    }
+
+    /// Return best-effort result column labels inferred at prepare time.
+    #[must_use]
+    pub fn column_names(&self) -> &[String] {
+        &self.column_names
     }
 
     /// Execute and return affected/output row count.
@@ -5045,6 +5054,7 @@ impl Connection {
     /// Compile and wrap a statement into a `PreparedStatement`.
     fn compile_and_wrap(&self, sql: &str, statement: &Statement) -> Result<PreparedStatement<'_>> {
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
+        let prepared_column_names = self.prepared_statement_column_names(statement);
         match statement {
             Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
                 let placeholder_program =
@@ -5067,6 +5077,7 @@ impl Connection {
                     deferred_query_column_count: Some(
                         self.prepared_statement_column_count(statement),
                     ),
+                    column_names: prepared_column_names,
                     conn: self,
                 })
             }
@@ -5087,6 +5098,7 @@ impl Connection {
                     dml_statement: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
+                    column_names: prepared_column_names,
                     conn: self,
                 })
             }
@@ -5119,6 +5131,7 @@ impl Connection {
                     dml_statement: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
+                    column_names: prepared_column_names,
                     conn: self,
                 })
             }
@@ -5157,6 +5170,7 @@ impl Connection {
                         dml_statement: Some(Arc::new(statement.clone())),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
+                        column_names: prepared_column_names.clone(),
                         conn: self,
                     })
                 } else {
@@ -5181,6 +5195,7 @@ impl Connection {
                         dml_statement: Some(Arc::new(statement.clone())),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
+                        column_names: prepared_column_names.clone(),
                         conn: self,
                     })
                 }
@@ -5206,6 +5221,7 @@ impl Connection {
                     dml_statement: Some(Arc::new(statement.clone())),
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
+                    column_names: prepared_column_names,
                     conn: self,
                 })
             }
@@ -5244,6 +5260,18 @@ impl Connection {
             return 0;
         };
         self.select_result_column_count(select, &[], &mut Vec::new())
+    }
+
+    fn prepared_statement_column_names(&self, statement: &Statement) -> Vec<String> {
+        let Statement::Select(select) = statement else {
+            return Vec::new();
+        };
+        let inferred = infer_select_column_names(select);
+        if inferred.is_empty() {
+            return inferred;
+        }
+        let schema = self.schema.borrow();
+        resolve_cte_column_names_with_schema(&inferred, select, &schema)
     }
 
     fn select_result_column_count(
@@ -24363,6 +24391,7 @@ fn ssi_decision_cards_to_rows(cards: &[SsiDecisionCard]) -> Vec<Row> {
         .collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn hex_encode_blake3(bytes: [u8; 32]) -> String {
     use std::fmt::Write as _;
 
@@ -24601,6 +24630,7 @@ fn parse_ssi_decision_query(value: &fsqlite_ast::PragmaValue) -> Result<SsiDecis
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_raptorq_u64_component(raw: &str, label: &str) -> Result<u64> {
     raw.trim().parse::<u64>().map_err(|_| {
         FrankenError::Internal(format!(

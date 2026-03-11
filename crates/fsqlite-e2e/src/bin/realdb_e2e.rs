@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use rusqlite::{Connection, DatabaseName, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
 
@@ -37,8 +37,8 @@ use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
-    FsqliteHotPathProfileConfig, HotPathArtifactManifest, HotPathProfileReport,
-    build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
+    FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
+    HotPathProfileReport, build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
     build_hot_path_subsystem_profile, profile_fsqlite_mixed_read_write_hot_path,
     render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
 };
@@ -49,6 +49,8 @@ use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bundle.v1";
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
+const HOT_PATH_COMMAND_PACK_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_command_pack.v1";
+const HOT_PATH_COMMAND_PACK_NAME: &str = "command_pack.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunModeOptions {
@@ -101,6 +103,7 @@ fn shell_escape(raw: &str) -> String {
     format!("'{escaped}'")
 }
 
+#[derive(Debug, Clone, Copy)]
 struct HotProfileReplayCommand<'a> {
     db: &'a str,
     golden_dir: &'a Path,
@@ -111,6 +114,35 @@ struct HotProfileReplayCommand<'a> {
     output_dir: &'a Path,
     mvcc: bool,
     run_integrity_check: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HotPathEvidenceCommandPack {
+    schema_version: String,
+    bead_id: String,
+    run_id: String,
+    trace_id: String,
+    scenario_id: String,
+    fixture_id: String,
+    workload: String,
+    seed: u64,
+    scale: u32,
+    concurrency: u16,
+    concurrent_mode: bool,
+    artifact_root: String,
+    profiler_safe_replay_command: String,
+    full_validation_replay_command: String,
+    commands: Vec<HotPathEvidenceCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HotPathEvidenceCommand {
+    capture: String,
+    mode: String,
+    tool: String,
+    output_relpath: String,
+    command_line: String,
+    description: String,
 }
 
 fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> String {
@@ -157,6 +189,251 @@ fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> S
         rendered.push_str(" --integrity-check");
     }
     rendered
+}
+
+fn hot_path_output_path(output_dir: &Path, relpath: &str) -> String {
+    output_dir.join(relpath).display().to_string()
+}
+
+fn mkdir_prefixed_capture_command(output_dir: &Path, relpath: &str, body: String) -> String {
+    let parent = output_dir
+        .join(relpath)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| output_dir.to_path_buf());
+    format!(
+        "mkdir -p {} && {body}",
+        shell_escape(&parent.display().to_string())
+    )
+}
+
+fn format_hot_path_hyperfine_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    mkdir_prefixed_capture_command(
+        output_dir,
+        relpath,
+        format!(
+            "hyperfine --warmup 1 --runs 5 --export-json {} {}",
+            shell_escape(&output_path),
+            shell_escape(replay_command),
+        ),
+    )
+}
+
+fn format_hot_path_perf_record_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    mkdir_prefixed_capture_command(
+        output_dir,
+        relpath,
+        format!(
+            "perf record -g -o {} -- {replay_command}",
+            shell_escape(&output_path),
+        ),
+    )
+}
+
+fn format_hot_path_perf_sched_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    mkdir_prefixed_capture_command(
+        output_dir,
+        relpath,
+        format!(
+            "perf sched record -o {} -- {replay_command}",
+            shell_escape(&output_path),
+        ),
+    )
+}
+
+fn format_hot_path_strace_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    mkdir_prefixed_capture_command(
+        output_dir,
+        relpath,
+        format!(
+            "strace -f -o {} {replay_command}",
+            shell_escape(&output_path)
+        ),
+    )
+}
+
+fn format_hot_path_heaptrack_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    mkdir_prefixed_capture_command(
+        output_dir,
+        relpath,
+        format!(
+            "heaptrack -o {} {replay_command}",
+            shell_escape(&output_path)
+        ),
+    )
+}
+
+fn build_hot_path_command_pack(
+    report: &HotPathProfileReport,
+    replay_command: &HotProfileReplayCommand<'_>,
+) -> HotPathEvidenceCommandPack {
+    let profiler_safe_replay_command =
+        format_hot_profile_replay_command(&HotProfileReplayCommand {
+            run_integrity_check: false,
+            ..*replay_command
+        });
+    let full_validation_replay_command =
+        format_hot_profile_replay_command(&HotProfileReplayCommand {
+            run_integrity_check: true,
+            ..*replay_command
+        });
+    let mut commands = Vec::with_capacity(10);
+    for (mode, replay) in [
+        ("profiler_safe", profiler_safe_replay_command.as_str()),
+        ("full_validation", full_validation_replay_command.as_str()),
+    ] {
+        for (capture, tool, output_relpath, description, command_line) in [
+            (
+                "wall_clock",
+                "hyperfine",
+                format!("profiles/hyperfine.{mode}.json"),
+                format!("wall-clock benchmark replay for {mode} capture"),
+                format_hot_path_hyperfine_command(
+                    replay_command.output_dir,
+                    &format!("profiles/hyperfine.{mode}.json"),
+                    replay,
+                ),
+            ),
+            (
+                "on_cpu",
+                "perf-record",
+                format!("profiles/perf-record.{mode}.data"),
+                format!("sampled on-CPU profile for {mode} capture"),
+                format_hot_path_perf_record_command(
+                    replay_command.output_dir,
+                    &format!("profiles/perf-record.{mode}.data"),
+                    replay,
+                ),
+            ),
+            (
+                "scheduler",
+                "perf-sched-record",
+                format!("profiles/perf-sched.{mode}.data"),
+                format!("scheduler and off-CPU trace for {mode} capture"),
+                format_hot_path_perf_sched_command(
+                    replay_command.output_dir,
+                    &format!("profiles/perf-sched.{mode}.data"),
+                    replay,
+                ),
+            ),
+            (
+                "syscall",
+                "strace",
+                format!("logs/strace.{mode}.log"),
+                format!("syscall trace for {mode} capture"),
+                format_hot_path_strace_command(
+                    replay_command.output_dir,
+                    &format!("logs/strace.{mode}.log"),
+                    replay,
+                ),
+            ),
+            (
+                "allocation",
+                "heaptrack",
+                format!("profiles/heaptrack.{mode}.gz"),
+                format!("allocation profile for {mode} capture"),
+                format_hot_path_heaptrack_command(
+                    replay_command.output_dir,
+                    &format!("profiles/heaptrack.{mode}.gz"),
+                    replay,
+                ),
+            ),
+        ] {
+            commands.push(HotPathEvidenceCommand {
+                capture: capture.to_owned(),
+                mode: mode.to_owned(),
+                tool: tool.to_owned(),
+                output_relpath,
+                command_line,
+                description,
+            });
+        }
+    }
+
+    HotPathEvidenceCommandPack {
+        schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V1.to_owned(),
+        bead_id: report.bead_id.clone(),
+        run_id: report.run_id.clone(),
+        trace_id: report.trace_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        fixture_id: report.fixture_id.clone(),
+        workload: report.workload.clone(),
+        seed: report.seed,
+        scale: report.scale,
+        concurrency: report.concurrency,
+        concurrent_mode: report.concurrent_mode,
+        artifact_root: replay_command.output_dir.display().to_string(),
+        profiler_safe_replay_command,
+        full_validation_replay_command,
+        commands,
+    }
+}
+
+fn write_hot_path_command_pack(
+    output_dir: &Path,
+    command_pack: &HotPathEvidenceCommandPack,
+) -> io::Result<u64> {
+    let command_pack_json = serde_json::to_string_pretty(command_pack)
+        .map_err(|error| io::Error::other(format!("command pack JSON: {error}")))?;
+    fs::write(
+        output_dir.join(HOT_PATH_COMMAND_PACK_NAME),
+        command_pack_json.as_bytes(),
+    )?;
+    Ok(u64::try_from(command_pack_json.len()).unwrap_or(u64::MAX))
+}
+
+fn finalize_hot_path_manifest(
+    output_dir: &Path,
+    manifest: HotPathArtifactManifest,
+    extra_files: Vec<HotPathArtifactFile>,
+) -> io::Result<HotPathArtifactManifest> {
+    let mut files: Vec<HotPathArtifactFile> = manifest
+        .files
+        .into_iter()
+        .filter(|file| file.path != "manifest.json")
+        .collect();
+    for extra in extra_files {
+        if let Some(existing) = files.iter_mut().find(|file| file.path == extra.path) {
+            *existing = extra;
+        } else {
+            files.push(extra);
+        }
+    }
+    let mut disk_manifest = HotPathArtifactManifest { files, ..manifest };
+    let manifest_json = serde_json::to_string_pretty(&disk_manifest)
+        .map_err(|error| io::Error::other(format!("artifact manifest: {error}")))?;
+    fs::write(output_dir.join("manifest.json"), manifest_json.as_bytes())?;
+    disk_manifest.files.push(HotPathArtifactFile {
+        path: "manifest.json".to_owned(),
+        bytes: u64::try_from(manifest_json.len()).unwrap_or(u64::MAX),
+        description: "artifact manifest with replay metadata".to_owned(),
+    });
+    Ok(disk_manifest)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2600,7 +2877,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             .join("bd-db300.4.1")
             .join(format!("{db}_c{concurrency}_s{seed}"))
     });
-    let replay_command = format_hot_profile_replay_command(&HotProfileReplayCommand {
+    let replay_command = HotProfileReplayCommand {
         db: &db,
         golden_dir: &golden_dir,
         working_base: &working_base,
@@ -2610,7 +2887,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         output_dir: &output_dir,
         mvcc,
         run_integrity_check,
-    });
+    };
     let config = FsqliteHotPathProfileConfig {
         seed,
         scale,
@@ -2620,7 +2897,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             run_integrity_check,
             ..FsqliteExecConfig::default()
         },
-        replay_command,
+        replay_command: format_hot_profile_replay_command(&replay_command),
         golden_dir: Some(golden_dir.display().to_string()),
         working_base: Some(working_base.display().to_string()),
     };
@@ -2640,9 +2917,34 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             return 1;
         }
     };
+    let command_pack = build_hot_path_command_pack(&report, &replay_command);
+    let command_pack_bytes = match write_hot_path_command_pack(&output_dir, &command_pack) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: failed to write hot-path command pack: {error}");
+            return 1;
+        }
+    };
+    let manifest = match finalize_hot_path_manifest(
+        &output_dir,
+        manifest,
+        vec![HotPathArtifactFile {
+            path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+            bytes: command_pack_bytes,
+            description:
+                "structured replay/evidence capture commands for profiler-safe and full-validation runs"
+                    .to_owned(),
+        }],
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("error: failed to finalize hot-path manifest: {error}");
+            return 1;
+        }
+    };
 
     if emit_inline_bundle {
-        match serialize_hot_path_inline_bundle(&report, &manifest) {
+        match serialize_hot_path_inline_bundle(&report, &manifest, &command_pack) {
             Ok(json) => eprintln!("{HOT_PATH_INLINE_BUNDLE_PREFIX}{json}"),
             Err(error) => {
                 eprintln!("error: failed to serialize hot-path inline bundle: {error}");
@@ -2701,6 +3003,7 @@ OPTIONS:
 fn serialize_hot_path_inline_bundle(
     report: &HotPathProfileReport,
     manifest: &HotPathArtifactManifest,
+    command_pack: &HotPathEvidenceCommandPack,
 ) -> Result<String, serde_json::Error> {
     let opcode_profile = build_hot_path_opcode_profile(report);
     let subsystem_profile = build_hot_path_subsystem_profile(report);
@@ -2714,6 +3017,7 @@ fn serialize_hot_path_inline_bundle(
         "actionable_ranking": actionable_ranking,
         "summary_markdown": summary_markdown,
         "manifest": manifest,
+        "command_pack": command_pack,
     }))
 }
 
@@ -3950,11 +4254,49 @@ mod tests {
                     description: "ranking".to_owned(),
                 },
                 HotPathArtifactFile {
+                    path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+                    bytes: 1,
+                    description: "command pack".to_owned(),
+                },
+                HotPathArtifactFile {
                     path: "manifest.json".to_owned(),
                     bytes: 1,
                     description: "manifest".to_owned(),
                 },
             ],
+        }
+    }
+
+    fn sample_hot_path_command_pack() -> HotPathEvidenceCommandPack {
+        HotPathEvidenceCommandPack {
+            schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V1.to_owned(),
+            bead_id: "bd-db300.4.1".to_owned(),
+            run_id: "run-1".to_owned(),
+            trace_id: "trace-1".to_owned(),
+            scenario_id: "bd-db300.4.1.mixed_read_write".to_owned(),
+            fixture_id: "fixture-a".to_owned(),
+            workload: "mixed_read_write".to_owned(),
+            seed: 42,
+            scale: 50,
+            concurrency: 4,
+            concurrent_mode: true,
+            artifact_root: "/tmp/out".to_owned(),
+            profiler_safe_replay_command:
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
+                    .to_owned(),
+            full_validation_replay_command:
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc --integrity-check"
+                    .to_owned(),
+            commands: vec![HotPathEvidenceCommand {
+                capture: "wall_clock".to_owned(),
+                mode: "profiler_safe".to_owned(),
+                tool: "hyperfine".to_owned(),
+                output_relpath: "profiles/hyperfine.profiler_safe.json".to_owned(),
+                command_line:
+                    "mkdir -p /tmp/out/profiles && hyperfine --warmup 1 --runs 5 --export-json /tmp/out/profiles/hyperfine.profiler_safe.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc'"
+                        .to_owned(),
+                description: "wall-clock benchmark replay for profiler_safe capture".to_owned(),
+            }],
         }
     }
 
@@ -4081,7 +4423,8 @@ mod tests {
     fn serialize_hot_path_inline_bundle_includes_expected_sections() {
         let report = sample_hot_path_report();
         let manifest = sample_hot_path_manifest();
-        let text = serialize_hot_path_inline_bundle(&report, &manifest)
+        let command_pack = sample_hot_path_command_pack();
+        let text = serialize_hot_path_inline_bundle(&report, &manifest, &command_pack)
             .expect("inline bundle serialization should succeed");
         let value: Value = serde_json::from_str(&text).expect("bundle JSON must parse");
         assert_eq!(value["schema_version"], HOT_PATH_INLINE_BUNDLE_SCHEMA_V1);
@@ -4105,6 +4448,10 @@ mod tests {
             value["manifest"]["schema_version"],
             HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1
         );
+        assert_eq!(
+            value["command_pack"]["schema_version"],
+            HOT_PATH_COMMAND_PACK_SCHEMA_V1
+        );
         assert_eq!(value["manifest"]["fixture_id"], "fixture-a");
         assert_eq!(value["profile"]["concurrent_mode"], true);
         assert_eq!(value["profile"]["run_integrity_check"], false);
@@ -4114,6 +4461,10 @@ mod tests {
         assert_eq!(value["manifest"]["golden_dir"], "/tmp/golden");
         assert_eq!(value["opcode_profile"]["opcodes"][0]["opcode"], "Column");
         assert_eq!(
+            value["command_pack"]["commands"][0]["output_relpath"],
+            "profiles/hyperfine.profiler_safe.json"
+        );
+        assert_eq!(
             value["subsystem_profile"]["subsystem_ranking"][0]["subsystem"],
             "record_decode"
         );
@@ -4121,6 +4472,89 @@ mod tests {
             value["summary_markdown"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("## Ranked Hotspots"))
+        );
+    }
+
+    #[test]
+    fn build_hot_path_command_pack_emits_profiler_and_validation_commands() {
+        let report = sample_hot_path_report();
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out dir"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+
+        let pack = build_hot_path_command_pack(&report, &replay_command);
+        assert_eq!(pack.schema_version, HOT_PATH_COMMAND_PACK_SCHEMA_V1);
+        assert!(
+            pack.profiler_safe_replay_command
+                .contains("--output-dir '/tmp/out dir'")
+        );
+        assert!(
+            pack.full_validation_replay_command
+                .contains("--integrity-check")
+        );
+        assert_eq!(pack.commands.len(), 10);
+        assert!(pack.commands.iter().any(|command| {
+            command.capture == "wall_clock"
+                && command.mode == "profiler_safe"
+                && command.command_line.contains("hyperfine")
+        }));
+        assert!(pack.commands.iter().any(|command| {
+            command
+                .command_line
+                .contains("'/tmp/out dir/profiles/hyperfine.profiler_safe.json'")
+        }));
+        assert!(pack.commands.iter().any(|command| {
+            command.capture == "allocation"
+                && command.mode == "full_validation"
+                && command.output_relpath == "profiles/heaptrack.full_validation.gz"
+        }));
+    }
+
+    #[test]
+    fn finalize_hot_path_manifest_rewrites_disk_manifest_with_command_pack() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let manifest = sample_hot_path_manifest();
+        let finalized = finalize_hot_path_manifest(
+            tempdir.path(),
+            manifest,
+            vec![HotPathArtifactFile {
+                path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+                bytes: 77,
+                description: "command pack".to_owned(),
+            }],
+        )
+        .expect("manifest finalization should succeed");
+
+        let disk_manifest: HotPathArtifactManifest = serde_json::from_str(
+            &fs::read_to_string(tempdir.path().join("manifest.json"))
+                .expect("disk manifest should be readable"),
+        )
+        .expect("disk manifest should parse");
+        assert!(
+            disk_manifest
+                .files
+                .iter()
+                .any(|file| file.path == HOT_PATH_COMMAND_PACK_NAME)
+        );
+        assert!(
+            !disk_manifest
+                .files
+                .iter()
+                .any(|file| file.path == "manifest.json")
+        );
+        assert!(
+            finalized
+                .files
+                .iter()
+                .any(|file| file.path == "manifest.json" && file.bytes > 0)
         );
     }
 

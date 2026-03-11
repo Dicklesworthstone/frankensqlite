@@ -10,9 +10,9 @@ rust-version.workspace = true
 [dependencies]
 foldhash = "0.1"
 smallvec = { version = "1.13.2", features = ["const_generics", "union", "const_new"] }
-fsqlite-types = { path = "../fsqlite-types", version = "0.1" }
+fsqlite-types = { path = "../fsqlite-types", version = "0.1", default-features = false }
 fsqlite-error = { path = "../fsqlite-error", version = "0.1" }
-fsqlite-vfs = { workspace = true }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.2", default-features = false }
 xxhash-rust = { workspace = true }
 chacha20poly1305 = { workspace = true }
 argon2 = { workspace = true }

@@ -10,30 +10,42 @@
 //! On **load**, a real `.db` file is read via B-tree cursors and its
 //! contents are replayed into a fresh `MemDatabase` + schema vector.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use fsqlite_ast::{SortDirection, Statement};
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::BtreeCursorOps;
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_parser::Parser;
+use fsqlite_types::StrictColumnType;
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::cx::Cx;
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::record::{parse_record, serialize_record};
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{PageNumber, PageSize, StrictColumnType};
+#[cfg(not(target_arch = "wasm32"))]
+use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
-#[cfg(unix)]
+#[cfg(all(not(target_arch = "wasm32"), unix))]
 use fsqlite_vfs::UnixVfs as PlatformVfs;
-#[cfg(target_os = "windows")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs as PlatformVfs;
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_vfs::host_fs;
 
 /// SQLite file header magic bytes (first 16 bytes).
+#[cfg(not(target_arch = "wasm32"))]
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// Default page size used for newly-created databases.
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -57,6 +69,7 @@ pub struct LoadedState {
 /// Detect whether a file starts with the SQLite magic header.
 ///
 /// Returns `false` for non-existent, empty, or non-SQLite files.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn is_sqlite_format(path: &Path) -> bool {
     let Ok(data) = host_fs::read(path) else {
         return false;
@@ -75,6 +88,7 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// Returns an error on I/O failure or if the B-tree layer rejects an
 /// insertion (e.g. duplicate rowid in sqlite_master).
 #[allow(clippy::too_many_lines)]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn persist_to_sqlite(
     cx: &Cx,
     path: &Path,
@@ -202,6 +216,7 @@ pub fn persist_to_sqlite(
 /// Returns an error if the file is not a valid SQLite database, or on
 /// I/O / B-tree navigation failures.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let vfs = PlatformVfs::new();
     let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
@@ -368,6 +383,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Initialize a page as an empty leaf table B-tree page (type 0x0D).
+#[cfg(not(target_arch = "wasm32"))]
 fn init_leaf_table_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,

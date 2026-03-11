@@ -1,8 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::vtab::{
+    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexInfo, VirtualTable, VirtualTableCursor,
+    VtabModuleFactory,
+};
 use fsqlite_func::{FunctionRegistry, ScalarFunction};
-use fsqlite_types::SqliteValue;
+use fsqlite_types::{SqliteValue, cx::Cx};
 
 // ---------------------------------------------------------------------------
 // Public API — extension name
@@ -233,10 +238,11 @@ impl RtreeConfig {
 /// The real implementation would use a balanced tree with internal nodes,
 /// but this captures the correct query semantics and API surface for the
 /// extension crate.
+#[derive(Clone)]
 pub struct RtreeIndex {
     config: RtreeConfig,
     entries: Vec<RtreeEntry>,
-    geometry_registry: HashMap<String, Box<dyn RtreeGeometry>>,
+    geometry_registry: HashMap<String, Arc<dyn RtreeGeometry>>,
 }
 
 impl std::fmt::Debug for RtreeIndex {
@@ -337,7 +343,8 @@ impl RtreeIndex {
 
     /// Register a custom geometry callback.
     pub fn register_geometry(&mut self, name: &str, geom: Box<dyn RtreeGeometry>) {
-        self.geometry_registry.insert(name.to_owned(), geom);
+        self.geometry_registry
+            .insert(name.to_owned(), Arc::from(geom));
     }
 
     /// Query using a registered custom geometry callback.
@@ -371,6 +378,504 @@ impl RtreeIndex {
             .map(|e| (e, geom.query_func(&e.bbox.coords)))
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Virtual table adapter
+// ---------------------------------------------------------------------------
+
+const RTREE_SCAN_FULL: i32 = 0;
+const RTREE_SCAN_BBOX: i32 = 1;
+const RTREE_SCAN_GEOMETRY: i32 = 2;
+
+#[derive(Debug, Clone)]
+struct ParsedRtreeModuleArgs {
+    column_names: Vec<String>,
+    dimensions: usize,
+}
+
+fn parse_rtree_module_args(args: &[&str]) -> Result<ParsedRtreeModuleArgs> {
+    if args.len() < 3 {
+        return Err(FrankenError::function_error(
+            "rtree requires an id column plus at least one min/max coordinate pair",
+        ));
+    }
+    if args.len() % 2 == 0 {
+        return Err(FrankenError::function_error(
+            "rtree requires an odd number of arguments: id plus min/max coordinate pairs",
+        ));
+    }
+
+    let dimensions = (args.len() - 1) / 2;
+    if dimensions > MAX_DIMENSIONS {
+        return Err(FrankenError::function_error(format!(
+            "rtree supports at most {MAX_DIMENSIONS} dimensions",
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    let mut column_names = Vec::with_capacity(args.len());
+    for arg in args {
+        let column = arg
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
+        if column.is_empty() {
+            return Err(FrankenError::function_error(
+                "rtree column names must not be empty",
+            ));
+        }
+        if column.contains('=') {
+            return Err(FrankenError::function_error(
+                "rtree does not support option assignments in module arguments",
+            ));
+        }
+        let key = column.to_ascii_lowercase();
+        if !seen.insert(key) {
+            return Err(FrankenError::function_error(format!(
+                "rtree column '{column}' is declared more than once",
+            )));
+        }
+        column_names.push(column.to_owned());
+    }
+
+    Ok(ParsedRtreeModuleArgs {
+        column_names,
+        dimensions,
+    })
+}
+
+fn column_affinity(coord_type: RtreeCoordType, is_id: bool) -> char {
+    if is_id || matches!(coord_type, RtreeCoordType::Int32) {
+        'D'
+    } else {
+        'E'
+    }
+}
+
+fn parse_coordinate_value(value: &SqliteValue, coord_type: RtreeCoordType) -> Result<f64> {
+    match coord_type {
+        RtreeCoordType::Float32 => {
+            let coord = value.to_float();
+            if !coord.is_finite() {
+                return Err(FrankenError::function_error(
+                    "rtree coordinates must be finite",
+                ));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let narrowed = coord as f32;
+            Ok(f64::from(narrowed))
+        }
+        RtreeCoordType::Int32 => {
+            let narrowed = i32::try_from(value.to_integer()).map_err(|_| {
+                FrankenError::function_error("rtree_i32 coordinates must fit in signed 32-bit")
+            })?;
+            Ok(f64::from(narrowed))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RtreeVirtualTable {
+    index: RtreeIndex,
+}
+
+impl RtreeVirtualTable {
+    fn from_args(args: &[&str], coord_type: RtreeCoordType) -> Result<Self> {
+        let parsed = parse_rtree_module_args(args)?;
+        let config = RtreeConfig::new(parsed.dimensions, coord_type).ok_or_else(|| {
+            FrankenError::function_error("rtree dimensions must be between 1 and 5")
+        })?;
+        Ok(Self {
+            index: RtreeIndex::new(config),
+        })
+    }
+
+    fn next_rowid(&self) -> i64 {
+        self.index
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    fn parse_bbox_values(&self, values: &[SqliteValue]) -> Result<MBoundingBox> {
+        let expected = self.index.dimensions() * 2;
+        if values.len() != expected {
+            return Err(FrankenError::function_error(format!(
+                "rtree expected {expected} coordinate values, got {}",
+                values.len()
+            )));
+        }
+
+        let coords = values
+            .iter()
+            .map(|value| parse_coordinate_value(value, self.index.coord_type()))
+            .collect::<Result<Vec<_>>>()?;
+        MBoundingBox::new(coords).ok_or_else(|| {
+            FrankenError::function_error("rtree coordinates must form complete min/max pairs")
+        })
+    }
+
+    #[cfg(test)]
+    fn register_geometry(&mut self, name: &str, geom: Box<dyn RtreeGeometry>) {
+        self.index.register_geometry(name, geom);
+    }
+}
+
+impl VirtualTable for RtreeVirtualTable {
+    type Cursor = RtreeCursor;
+
+    fn create(_cx: &Cx, args: &[&str]) -> Result<Self> {
+        Self::from_args(args, RtreeCoordType::Float32)
+    }
+
+    fn connect(cx: &Cx, args: &[&str]) -> Result<Self> {
+        Self::create(cx, args)
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        let mut geometry_constraint = None;
+        let mut lower_bounds = vec![None; self.index.dimensions()];
+        let mut upper_bounds = vec![None; self.index.dimensions()];
+
+        for (index, constraint) in info.constraints.iter().enumerate() {
+            if !constraint.usable {
+                continue;
+            }
+
+            if constraint.op == ConstraintOp::Match {
+                geometry_constraint = Some(index);
+                continue;
+            }
+
+            let Ok(column_index) = usize::try_from(constraint.column) else {
+                continue;
+            };
+            if column_index == 0 {
+                continue;
+            }
+
+            let coord_index = column_index - 1;
+            let dimension = coord_index / 2;
+            if dimension >= self.index.dimensions() {
+                continue;
+            }
+
+            if coord_index % 2 == 0
+                && matches!(
+                    constraint.op,
+                    ConstraintOp::Le | ConstraintOp::Lt | ConstraintOp::Eq
+                )
+            {
+                upper_bounds[dimension] = Some(index);
+            } else if matches!(
+                constraint.op,
+                ConstraintOp::Ge | ConstraintOp::Gt | ConstraintOp::Eq
+            ) {
+                lower_bounds[dimension] = Some(index);
+            }
+        }
+
+        if lower_bounds.iter().all(Option::is_some) && upper_bounds.iter().all(Option::is_some) {
+            for dimension in 0..self.index.dimensions() {
+                let Some(lower_idx) = lower_bounds[dimension] else {
+                    continue;
+                };
+                info.constraint_usage[lower_idx].argv_index = i32::try_from(dimension * 2 + 1)
+                    .map_err(|error| {
+                        FrankenError::function_error(format!(
+                            "rtree lower-bound argv index overflow: {error}"
+                        ))
+                    })?;
+                info.constraint_usage[lower_idx].omit = true;
+
+                let Some(upper_idx) = upper_bounds[dimension] else {
+                    continue;
+                };
+                info.constraint_usage[upper_idx].argv_index = i32::try_from(dimension * 2 + 2)
+                    .map_err(|error| {
+                        FrankenError::function_error(format!(
+                            "rtree upper-bound argv index overflow: {error}"
+                        ))
+                    })?;
+                info.constraint_usage[upper_idx].omit = true;
+            }
+
+            info.idx_num = RTREE_SCAN_BBOX;
+            info.estimated_cost = 10.0;
+            info.estimated_rows = 64;
+            return Ok(());
+        }
+
+        if let Some(index) = geometry_constraint {
+            info.constraint_usage[index].argv_index = 1;
+            info.constraint_usage[index].omit = true;
+            info.idx_num = RTREE_SCAN_GEOMETRY;
+            info.estimated_cost = 25.0;
+            info.estimated_rows = 128;
+            return Ok(());
+        }
+
+        info.idx_num = RTREE_SCAN_FULL;
+        info.estimated_cost = 1_000_000.0;
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            info.estimated_rows = self.index.entries.len() as i64;
+        }
+        Ok(())
+    }
+
+    fn open(&self) -> Result<Self::Cursor> {
+        Ok(RtreeCursor {
+            index: self.index.clone(),
+            rows: Vec::new(),
+            pos: 0,
+        })
+    }
+
+    fn update(&mut self, _cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
+        if args.is_empty() {
+            return Err(FrankenError::function_error("rtree: empty update args"));
+        }
+
+        if args.len() == 1 && !args[0].is_null() {
+            let old_rowid = args[0].to_integer();
+            self.index.delete(old_rowid);
+            return Ok(None);
+        }
+
+        let old_rowid = args.first().and_then(SqliteValue::as_integer);
+        let new_rowid = args
+            .get(1)
+            .and_then(SqliteValue::as_integer)
+            .or(old_rowid)
+            .unwrap_or_else(|| self.next_rowid());
+
+        let coordinate_values = match args.len().saturating_sub(2) {
+            count if count == self.index.dimensions() * 2 => &args[2..],
+            count if count == self.index.dimensions() * 2 + 1 => {
+                if let Some(id_value) = args[2].as_integer() {
+                    if id_value != new_rowid {
+                        return Err(FrankenError::function_error(
+                            "rtree rowid must match the id column",
+                        ));
+                    }
+                }
+                &args[3..]
+            }
+            count => {
+                return Err(FrankenError::function_error(format!(
+                    "rtree update expected {} or {} payload values, got {count}",
+                    self.index.dimensions() * 2,
+                    self.index.dimensions() * 2 + 1
+                )));
+            }
+        };
+
+        let bbox = self.parse_bbox_values(coordinate_values)?;
+
+        if let Some(old_rowid) = old_rowid {
+            if old_rowid != new_rowid {
+                self.index.delete(old_rowid);
+                if !self.index.insert(RtreeEntry {
+                    id: new_rowid,
+                    bbox,
+                }) {
+                    return Err(FrankenError::function_error(
+                        "rtree update could not replace rowid",
+                    ));
+                }
+                return Ok(Some(new_rowid));
+            }
+
+            if !self.index.update(old_rowid, bbox.clone()) {
+                return Err(FrankenError::function_error(
+                    "rtree update referenced a missing rowid",
+                ));
+            }
+            return Ok(Some(new_rowid));
+        }
+
+        if !self.index.insert(RtreeEntry {
+            id: new_rowid,
+            bbox,
+        }) {
+            return Err(FrankenError::function_error(
+                "rtree insert failed because the rowid already exists",
+            ));
+        }
+        Ok(Some(new_rowid))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RtreeCursor {
+    index: RtreeIndex,
+    rows: Vec<RtreeEntry>,
+    pos: usize,
+}
+
+impl RtreeCursor {
+    fn current_row(&self) -> Result<&RtreeEntry> {
+        self.rows.get(self.pos).ok_or_else(|| {
+            FrankenError::function_error("rtree cursor is out of bounds for the current row")
+        })
+    }
+
+    fn coordinate_value(&self, coord: f64) -> Result<SqliteValue> {
+        match self.index.coord_type() {
+            RtreeCoordType::Float32 => Ok(SqliteValue::Float(coord)),
+            RtreeCoordType::Int32 => {
+                if !coord.is_finite() || coord < f64::from(i32::MIN) || coord > f64::from(i32::MAX)
+                {
+                    return Err(FrankenError::function_error(
+                        "rtree_i32 cursor produced an out-of-range coordinate",
+                    ));
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let coord_i32 = coord as i32;
+                Ok(SqliteValue::Integer(i64::from(coord_i32)))
+            }
+        }
+    }
+}
+
+impl VirtualTableCursor for RtreeCursor {
+    fn filter(
+        &mut self,
+        _cx: &Cx,
+        idx_num: i32,
+        _idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        self.pos = 0;
+        self.rows = match idx_num {
+            RTREE_SCAN_FULL => self.index.entries.clone(),
+            RTREE_SCAN_BBOX => {
+                let expected = self.index.dimensions() * 2;
+                if args.len() != expected {
+                    return Err(FrankenError::function_error(format!(
+                        "rtree bbox filter expected {expected} arguments, got {}",
+                        args.len()
+                    )));
+                }
+                let coords = args
+                    .iter()
+                    .map(|value| parse_coordinate_value(value, self.index.coord_type()))
+                    .collect::<Result<Vec<_>>>()?;
+                let query_bbox = MBoundingBox::new(coords).ok_or_else(|| {
+                    FrankenError::function_error(
+                        "rtree bbox filter arguments must form complete min/max pairs",
+                    )
+                })?;
+                self.index
+                    .range_query(&query_bbox)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            }
+            RTREE_SCAN_GEOMETRY => {
+                let geometry_name =
+                    args.first().and_then(SqliteValue::as_text).ok_or_else(|| {
+                        FrankenError::function_error(
+                            "rtree geometry filters require a geometry callback name",
+                        )
+                    })?;
+                self.index
+                    .geometry_query(geometry_name)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            }
+            _ => {
+                return Err(FrankenError::function_error(format!(
+                    "rtree does not recognize scan strategy {idx_num}",
+                )));
+            }
+        };
+        Ok(())
+    }
+
+    fn next(&mut self, _cx: &Cx) -> Result<()> {
+        if self.pos < self.rows.len() {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        self.pos >= self.rows.len()
+    }
+
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        let row = self.current_row()?;
+        if col == 0 {
+            ctx.set_value(SqliteValue::Integer(row.id));
+            return Ok(());
+        }
+
+        let coordinate_index = usize::try_from(col - 1).map_err(|error| {
+            FrankenError::function_error(format!("rtree column index conversion failed: {error}",))
+        })?;
+        if let Some(coord) = row.bbox.coords.get(coordinate_index) {
+            ctx.set_value(self.coordinate_value(*coord)?);
+        } else {
+            ctx.set_value(SqliteValue::Null);
+        }
+        Ok(())
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        Ok(self.current_row()?.id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RtreeFactory {
+    coord_type: RtreeCoordType,
+}
+
+impl RtreeFactory {
+    const fn new(coord_type: RtreeCoordType) -> Self {
+        Self { coord_type }
+    }
+}
+
+impl VtabModuleFactory for RtreeFactory {
+    fn create(&self, _cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+        let vtab = RtreeVirtualTable::from_args(args, self.coord_type)?;
+        Ok(Box::new(vtab))
+    }
+
+    fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+        self.create(cx, args)
+    }
+
+    fn column_info(&self, args: &[&str]) -> Vec<(String, char)> {
+        let Ok(parsed) = parse_rtree_module_args(args) else {
+            return Vec::new();
+        };
+        parsed
+            .column_names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (name, column_affinity(self.coord_type, index == 0)))
+            .collect()
+    }
+}
+
+/// Return a module factory for `CREATE VIRTUAL TABLE ... USING rtree(...)`.
+#[must_use]
+pub const fn rtree_module_factory() -> impl VtabModuleFactory {
+    RtreeFactory::new(RtreeCoordType::Float32)
+}
+
+/// Return a module factory for `CREATE VIRTUAL TABLE ... USING rtree_i32(...)`.
+#[must_use]
+pub const fn rtree_i32_module_factory() -> impl VtabModuleFactory {
+    RtreeFactory::new(RtreeCoordType::Int32)
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1496,11 @@ mod tests {
     use super::*;
     use fsqlite_error::FrankenError;
     use fsqlite_func::FunctionRegistry;
+    use fsqlite_func::vtab::{
+        ColumnContext, IndexConstraint, IndexInfo, VirtualTable, VirtualTableCursor,
+        VtabModuleFactory,
+    };
+    use fsqlite_types::cx::Cx;
 
     fn approx_eq(left: f64, right: f64) -> bool {
         (left - right).abs() < 1e-4
@@ -1011,6 +1521,39 @@ mod tests {
 
     fn blob_value(vertices: &[Point]) -> SqliteValue {
         SqliteValue::Blob(geopoly_blob(vertices))
+    }
+
+    fn collect_rtree_rows(
+        cursor: &mut RtreeCursor,
+        cx: &Cx,
+        column_count: usize,
+    ) -> Vec<Vec<SqliteValue>> {
+        let mut rows = Vec::new();
+        while !cursor.eof() {
+            let mut row = Vec::with_capacity(column_count);
+            for column in 0..column_count {
+                let mut ctx = ColumnContext::new();
+                cursor
+                    .column(&mut ctx, i32::try_from(column).unwrap())
+                    .unwrap();
+                row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
+            }
+            rows.push(row);
+            cursor.next(cx).unwrap();
+        }
+        rows
+    }
+
+    struct UpperRightGeometry;
+
+    impl RtreeGeometry for UpperRightGeometry {
+        fn query_func(&self, bbox: &[f64]) -> RtreeQueryResult {
+            if bbox.len() >= 4 && bbox[0] >= 5.0 && bbox[2] >= 5.0 {
+                RtreeQueryResult::Include
+            } else {
+                RtreeQueryResult::Exclude
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1716,6 +2259,284 @@ mod tests {
         let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
         let index = RtreeIndex::new(config);
         assert!(index.geometry_query_detailed("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_rtree_module_args_reject_incomplete_dimension_pair() {
+        let cx = Cx::new();
+        let factory = rtree_module_factory();
+        let err = match factory.create(&cx, &["id", "min_x"]) {
+            Ok(_) => panic!("incomplete rtree args should be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, FrankenError::FunctionError(_)));
+        assert!(err.to_string().contains("min/max coordinate pair"));
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_insert_and_full_scan() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        assert_eq!(
+            VirtualTable::update(
+                &mut table,
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Float(0.0),
+                    SqliteValue::Float(1.0),
+                    SqliteValue::Float(0.0),
+                    SqliteValue::Float(1.0),
+                ],
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            VirtualTable::update(
+                &mut table,
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Float(2.0),
+                    SqliteValue::Float(3.0),
+                    SqliteValue::Float(2.0),
+                    SqliteValue::Float(3.0),
+                ],
+            )
+            .unwrap(),
+            Some(2)
+        );
+
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ]
+        );
+        assert_eq!(rows[1][0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_bbox_filter() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(10),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ],
+        )
+        .unwrap();
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(20),
+                SqliteValue::Integer(20),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(5.0),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(5.0),
+            ],
+        )
+        .unwrap();
+
+        let mut info = IndexInfo::new(
+            vec![
+                IndexConstraint {
+                    column: 1,
+                    op: ConstraintOp::Le,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 2,
+                    op: ConstraintOp::Ge,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 3,
+                    op: ConstraintOp::Le,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 4,
+                    op: ConstraintOp::Ge,
+                    usable: true,
+                },
+            ],
+            Vec::new(),
+        );
+        VirtualTable::best_index(&table, &mut info).unwrap();
+        assert_eq!(info.idx_num, RTREE_SCAN_BBOX);
+
+        let mut cursor = table.open().unwrap();
+        cursor
+            .filter(
+                &cx,
+                info.idx_num,
+                None,
+                &[
+                    SqliteValue::Float(3.5),
+                    SqliteValue::Float(4.5),
+                    SqliteValue::Float(3.5),
+                    SqliteValue::Float(4.5),
+                ],
+            )
+            .unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SqliteValue::Integer(20));
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_geometry_filter() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+        table.register_geometry("upper_right", Box::new(UpperRightGeometry));
+
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ],
+        )
+        .unwrap();
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+                SqliteValue::Float(6.0),
+                SqliteValue::Float(7.0),
+                SqliteValue::Float(6.0),
+                SqliteValue::Float(7.0),
+            ],
+        )
+        .unwrap();
+
+        let mut cursor = table.open().unwrap();
+        cursor
+            .filter(
+                &cx,
+                RTREE_SCAN_GEOMETRY,
+                None,
+                &[SqliteValue::Text("upper_right".to_owned())],
+            )
+            .unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_rtree_i32_cursor_emits_integer_coordinates() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Int32,
+        )
+        .unwrap();
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(9),
+            ],
+        )
+        .unwrap();
+
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(9),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rtree_factory_column_info_matches_coord_type() {
+        let float_columns =
+            rtree_module_factory().column_info(&["id", "min_x", "max_x", "min_y", "max_y"]);
+        assert_eq!(
+            float_columns,
+            vec![
+                ("id".to_owned(), 'D'),
+                ("min_x".to_owned(), 'E'),
+                ("max_x".to_owned(), 'E'),
+                ("min_y".to_owned(), 'E'),
+                ("max_y".to_owned(), 'E'),
+            ]
+        );
+
+        let int_columns =
+            rtree_i32_module_factory().column_info(&["id", "min_x", "max_x", "min_y", "max_y"]);
+        assert_eq!(
+            int_columns,
+            vec![
+                ("id".to_owned(), 'D'),
+                ("min_x".to_owned(), 'D'),
+                ("max_x".to_owned(), 'D'),
+                ("min_y".to_owned(), 'D'),
+                ("max_y".to_owned(), 'D'),
+            ]
+        );
     }
 
     // ── Geopoly: edge cases ──────────────────────────────────────────────

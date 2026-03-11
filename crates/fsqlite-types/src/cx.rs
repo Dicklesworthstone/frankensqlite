@@ -160,7 +160,7 @@ mod native_cx_shim {
 }
 
 #[cfg(not(feature = "native"))]
-use native_cx_shim::{NativeCancelKind, NativeCancelReason, NativeCx};
+use native_cx_shim::NativeCx;
 
 use crate::eprocess::{EProcessDecision, EProcessOracle, EProcessSnapshot};
 
@@ -890,6 +890,10 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native_cx);
     }
 
+    /// Attach a native context shim in non-native builds.
+    #[cfg(not(feature = "native"))]
+    pub fn set_native_cx<T>(&self, _native_cx: T) {}
+
     /// Return the attached native asupersync context, if one exists.
     #[cfg(feature = "native")]
     #[must_use]
@@ -901,6 +905,13 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .clone()
     }
 
+    /// Return the attached native context shim, if one exists.
+    #[cfg(not(feature = "native"))]
+    #[must_use]
+    pub fn attached_native_cx(&self) -> Option<NativeCx> {
+        None
+    }
+
     /// Remove the currently attached native asupersync context.
     #[cfg(feature = "native")]
     pub fn clear_native_cx(&self) {
@@ -910,6 +921,10 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
+
+    /// Remove the currently attached native context shim.
+    #[cfg(not(feature = "native"))]
+    pub fn clear_native_cx(&self) {}
 
     #[must_use]
     fn maybe_cancel_via_eprocess(&self) -> bool {

@@ -1,0 +1,150 @@
+name: fsqlite-wasm CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the generated npm package to npmjs.org"
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/fsqlite-wasm-ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/fsqlite-wasm/**"
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Add wasm target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install wasm-pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install wasm-pack --locked
+
+      - name: Run host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p fsqlite-wasm --locked -- --nocapture
+
+      - name: Verify wasm32 build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p fsqlite-wasm --locked --target wasm32-unknown-unknown --release
+
+      - name: Build and pack npm artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/fsqlite-wasm"
+          pkg_dir="${artifact_root}/pkg"
+
+          mkdir -p "${artifact_root}"
+
+          pushd crates/fsqlite-wasm >/dev/null
+          wasm-pack build --target bundler --release --out-dir "../../${pkg_dir}"
+          popd >/dev/null
+
+          pushd "${pkg_dir}" >/dev/null
+          wasm-pack pack .
+          popd >/dev/null
+
+          {
+            echo "# fsqlite-wasm package summary"
+            echo
+            echo "- cargo_package: \`fsqlite-wasm\`"
+            echo "- npm_package_dir: \`${pkg_dir}\`"
+            echo "- build_target: \`bundler\`"
+            echo
+            echo "## Generated files"
+            find "${artifact_root}" -maxdepth 2 -type f | sort | sed 's#^#- `#; s#$#`#'
+          } > "${artifact_root}/summary.md"
+
+      - name: Upload fsqlite-wasm artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsqlite-wasm-package
+          path: artifacts/fsqlite-wasm/
+          retention-days: 21
+
+  npm-publish:
+    needs: build-test-package
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download fsqlite-wasm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: fsqlite-wasm-package
+          path: artifacts/fsqlite-wasm
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish npm package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "NPM_TOKEN is required for publish flows." >&2
+            exit 1
+          fi
+
+          pkg_dir="artifacts/fsqlite-wasm/pkg"
+          if [[ ! -f "${pkg_dir}/package.json" ]]; then
+            echo "Expected package metadata at ${pkg_dir}/package.json" >&2
+            exit 1
+          fi
+
+          pushd "${pkg_dir}" >/dev/null
+          npm publish --provenance --access public
+          popd >/dev/null

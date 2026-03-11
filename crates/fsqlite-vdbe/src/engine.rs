@@ -316,6 +316,7 @@ fn bloom_hash(val: &SqliteValue) -> u64 {
 }
 
 /// Approximate page size for spill accounting (4 KiB).
+#[cfg(not(target_arch = "wasm32"))]
 const SORTER_SPILL_PAGE_SIZE: usize = 4096;
 
 /// A sorted run that has been flushed to a temporary file.
@@ -401,6 +402,7 @@ impl SorterCursor {
     }
 
     /// Sort the in-memory rows, write them to a temp file, and clear them.
+    #[cfg(not(target_arch = "wasm32"))]
     fn spill_to_disk(&mut self) -> Result<()> {
         use std::io::Write;
 
@@ -473,6 +475,19 @@ impl SorterCursor {
         self.rows_sorted_total += record_count;
         self.rows.clear();
         self.memory_used = 0;
+        Ok(())
+    }
+
+    /// Browser builds do not have a portable temp-file story yet, so sorter
+    /// spill currently degrades to a pure in-memory sort path.
+    #[cfg(target_arch = "wasm32")]
+    fn spill_to_disk(&mut self) -> Result<()> {
+        self.spill_threshold = usize::MAX;
+        tracing::warn!(
+            rows = self.rows.len(),
+            bytes = self.memory_used,
+            "sorter spill requested on wasm; keeping rows in memory"
+        );
         Ok(())
     }
 

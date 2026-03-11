@@ -4,19 +4,43 @@ version = "0.1.0"
 description = "WebAssembly bindings for FrankenSQLite"
 edition.workspace = true
 license-file.workspace = true
+readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["tracing"]
+tracing = []
+
 [dependencies]
+console_error_panic_hook = "0.1"
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-planner = { workspace = true }
 fsqlite-func = { workspace = true }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "linux"))'.dependencies]
+fsqlite-core = { version = "0.1.1", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))'.dependencies]
+fsqlite-core = { version = "0.1.1", path = "../fsqlite-core", default-features = false, features = ["native"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fsqlite-core = { version = "0.1.1", path = "../fsqlite-core", default-features = false, features = ["wasm"] }
+tracing-wasm = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+getrandom = { version = "0.4.2", features = ["wasm_js"] }
+wasm-bindgen-test = "0.3"
 
 [lints]
 workspace = true

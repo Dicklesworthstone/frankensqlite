@@ -1,5 +1,8 @@
 //! WAL checksum primitives, integrity helpers, and native commit protocol.
 
+#[cfg(target_arch = "wasm32")]
+use std::path::Path;
+
 pub mod checkpoint;
 pub mod checkpoint_executor;
 pub mod checksum;
@@ -57,6 +60,10 @@ pub use telemetry::{
     WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
 pub use wal::{WalFile, WalGenerationIdentity};
+#[cfg(target_arch = "wasm32")]
+pub const DEFAULT_RAPTORQ_REPAIR_SYMBOLS: u8 = 2;
+#[cfg(target_arch = "wasm32")]
+pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
 #[cfg(not(target_arch = "wasm32"))]
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,
@@ -87,3 +94,16 @@ pub use wal_index::{
     parse_shm_header, simple_modulo_slot, usable_page_entries, wal_index_hash_slot,
     wal_index_hdr_copies_match, write_shm_header,
 };
+
+#[cfg(target_arch = "wasm32")]
+pub fn read_wal_fec_raptorq_repair_symbols(_sidecar_path: &Path) -> fsqlite_error::Result<u8> {
+    Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn persist_wal_fec_raptorq_repair_symbols(
+    _sidecar_path: &Path,
+    _value: u8,
+) -> fsqlite_error::Result<()> {
+    Ok(())
+}

@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { workspace = true }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.2", default-features = false }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }
