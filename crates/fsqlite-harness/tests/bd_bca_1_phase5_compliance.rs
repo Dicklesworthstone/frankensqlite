@@ -352,7 +352,7 @@ fn test_persistence_create_close_reopen() -> Result<(), String> {
     let expected = sample_page(0x2A, page_size);
 
     let page_no = {
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
             .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
         let mut txn = pager
             .begin(&cx, TransactionMode::Immediate)
@@ -367,7 +367,7 @@ fn test_persistence_create_close_reopen() -> Result<(), String> {
         page_no
     };
 
-    let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+    let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
         .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
     let txn = pager
         .begin(&cx, TransactionMode::ReadOnly)
@@ -395,7 +395,7 @@ fn test_btree_cursor_insert_reopen_roundtrip() -> Result<(), String> {
     let usable_size = PageSize::DEFAULT.usable(0);
 
     let root_page = {
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
             .map_err(|error| format!("open_pager_for_write_failed error={error}"))?;
         let mut txn = pager
             .begin(&cx, TransactionMode::Immediate)
@@ -436,7 +436,7 @@ fn test_btree_cursor_insert_reopen_roundtrip() -> Result<(), String> {
         root_page
     };
 
-    let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+    let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
         .map_err(|error| format!("open_pager_for_read_failed error={error}"))?;
     let mut txn = pager
         .begin(&cx, TransactionMode::ReadOnly)
@@ -481,7 +481,7 @@ fn test_journal_crash_recovery() -> Result<(), String> {
     let corrupted = sample_page(0x99, page_size);
 
     let page_no = {
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
             .map_err(|error| format!("open_pager_initial_failed error={error}"))?;
         let mut txn = pager
             .begin(&cx, TransactionMode::Immediate)
@@ -540,7 +540,7 @@ fn test_journal_crash_recovery() -> Result<(), String> {
             .map_err(|error| format!("write_journal_record_failed error={error}"))?;
     }
 
-    let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+    let reopened = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
         .map_err(|error| format!("reopen_pager_for_recovery_failed error={error}"))?;
     let read_txn = reopened
         .begin(&cx, TransactionMode::ReadOnly)
@@ -1356,7 +1356,7 @@ fn test_savepoints_nested() -> Result<(), String> {
     let page_size = PageSize::DEFAULT.as_usize();
 
     let page_no = {
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
             .map_err(|error| format!("open_pager_for_savepoint_test_failed error={error}"))?;
         let mut txn = pager
             .begin(&cx, TransactionMode::Immediate)
@@ -1401,7 +1401,7 @@ fn test_savepoints_nested() -> Result<(), String> {
         page_no
     };
 
-    let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
+    let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
         .map_err(|error| format!("open_pager_for_savepoint_readback_failed error={error}"))?;
     let read_txn = pager
         .begin(&cx, TransactionMode::ReadOnly)

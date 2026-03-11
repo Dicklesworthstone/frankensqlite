@@ -305,12 +305,14 @@ fn pager_scenario(dirty_pages: usize) -> Result<PagerScenarioReport, String> {
     let db_path = PathBuf::from(format!("/bd_db300_3_1_pager_{dirty_pages}.db"));
     let wal_path = PathBuf::from(format!("/bd_db300_3_1_pager_{dirty_pages}.db-wal"));
 
-    let pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).map_err(|error| {
-        format!(
-            "bead_id={BEAD_ID} case=pager_open path={} error={error}",
-            db_path.display()
-        )
-    })?;
+    let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &db_path, PageSize::DEFAULT).map_err(
+        |error| {
+            format!(
+                "bead_id={BEAD_ID} case=pager_open path={} error={error}",
+                db_path.display()
+            )
+        },
+    )?;
 
     let wal_file = tracing_wal_file(&vfs, &cx, &wal_path, true)?;
     let wal = WalFile::create(&cx, wal_file, PAGE_SIZE_U32, 0, wal_salts())
