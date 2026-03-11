@@ -14007,6 +14007,7 @@ impl Connection {
                     &select.order_by,
                     &expanded_columns,
                     &result_col_collations,
+                    self.collation_registry.as_ref(),
                 )?;
             } else {
                 // Re-iterate groups to compute extra ORDER BY values.
@@ -14115,6 +14116,7 @@ impl Connection {
                     &select.order_by,
                     &ext_columns,
                     &result_col_collations,
+                    self.collation_registry.as_ref(),
                 )?;
 
                 // Trim extra columns.
@@ -15047,6 +15049,7 @@ impl Connection {
                     &select.order_by,
                     &expanded_columns,
                     &result_col_collations,
+                    self.collation_registry.as_ref(),
                 )?;
             } else {
                 let mut result_idx = 0;
@@ -15149,6 +15152,7 @@ impl Connection {
                     &select.order_by,
                     &ext_columns,
                     &result_col_collations,
+                    self.collation_registry.as_ref(),
                 )?;
 
                 for row in &mut result {
@@ -15952,6 +15956,7 @@ impl Connection {
                     &select.order_by,
                     &expanded_columns,
                     &result_col_collations,
+                    self.collation_registry.as_ref(),
                 )?;
             } else {
                 // Evaluate extra ORDER BY expressions from raw row data.
@@ -15977,6 +15982,7 @@ impl Connection {
                     &select.order_by,
                     &ext_columns,
                     &result_col_collations,
+                    self.collation_registry.as_ref(),
                 )?;
 
                 for row in &mut result {
@@ -16053,7 +16059,13 @@ impl Connection {
         if !select.order_by.is_empty() {
             // For compound SELECT, ORDER BY references output column positions (1-based).
             if let SelectCore::Select { columns, .. } = &select.body.select {
-                sort_rows_by_order_terms(&mut result, &select.order_by, columns, &[])?;
+                sort_rows_by_order_terms(
+                    &mut result,
+                    &select.order_by,
+                    columns,
+                    &[],
+                    self.collation_registry.as_ref(),
+                )?;
             }
         }
 
@@ -16445,7 +16457,7 @@ impl Connection {
     fn execute_join_select(
         &self,
         select: &SelectStatement,
-        _params: Option<&[SqliteValue]>,
+        params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let SelectCore::Select {
             columns,
@@ -16718,7 +16730,9 @@ impl Connection {
         if let Some(where_expr) = where_clause {
             let mut filtered = Vec::with_capacity(combined.len());
             for row in combined {
-                if eval_join_predicate(where_expr, &row, &col_map)? {
+                let predicate =
+                    self.eval_expr_with_subqueries(where_expr, &row, &col_map, params)?;
+                if is_sqlite_truthy(&predicate) {
                     filtered.push(row);
                 }
             }
@@ -16918,6 +16932,7 @@ impl Connection {
                 &select.order_by,
                 &expanded_columns,
                 &result_col_collations,
+                self.collation_registry.as_ref(),
             )?;
         }
 
@@ -22864,12 +22879,7 @@ fn cmp_sqlite_values_collated(
     collation_registry: &Mutex<CollationRegistry>,
 ) -> std::cmp::Ordering {
     if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
-        return compare_text_bytes_collated(
-            at.as_bytes(),
-            bt.as_bytes(),
-            coll,
-            collation_registry,
-        );
+        return compare_text_bytes_collated(at.as_bytes(), bt.as_bytes(), coll, collation_registry);
     }
     cmp_sqlite_values(a, b)
 }
@@ -22886,8 +22896,7 @@ fn group_keys_equal_collated(
     }
     a.iter().zip(b.iter()).enumerate().all(|(i, (av, bv))| {
         let coll = collations.get(i).and_then(|c| c.as_deref());
-        cmp_sqlite_values_collated(av, bv, coll, collation_registry)
-            == std::cmp::Ordering::Equal
+        cmp_sqlite_values_collated(av, bv, coll, collation_registry) == std::cmp::Ordering::Equal
     })
 }
 
@@ -22946,8 +22955,9 @@ fn sort_rows_by_order_terms(
     order_by: &[OrderingTerm],
     columns: &[ResultColumn],
     col_collations: &[Option<String>],
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> Result<()> {
-    let resolved: Vec<(usize, bool, NullsOrder)> = order_by
+    let resolved: Vec<(usize, bool, NullsOrder, Option<String>)> = order_by
         .iter()
         .map(|term| {
             // Try integer position reference first (ORDER BY 1, 2).
@@ -23002,21 +23012,25 @@ fn sort_rows_by_order_terms(
             let nulls = term
                 .nulls
                 .unwrap_or_else(|| default_nulls_order(term.direction));
-            Ok((idx, desc, nulls))
+            let coll = match &term.expr {
+                Expr::Collate { collation, .. } => Some(collation.clone()),
+                _ => col_collations.get(idx).cloned().flatten(),
+            };
+            Ok((idx, desc, nulls, coll))
         })
         .collect::<Result<Vec<_>>>()?;
 
     rows.sort_by(|a, b| {
-        for &(idx, desc, nulls) in &resolved {
-            let av = &a.values()[idx];
-            let bv = &b.values()[idx];
+        for (idx, desc, nulls, coll) in &resolved {
+            let av = &a.values()[*idx];
+            let bv = &b.values()[*idx];
             let a_null = av.is_null();
             let b_null = bv.is_null();
             if a_null || b_null {
                 if a_null && b_null {
                     continue;
                 }
-                let ord = match (a_null, nulls) {
+                let ord = match (a_null, *nulls) {
                     (true, NullsOrder::First) | (false, NullsOrder::Last) => {
                         std::cmp::Ordering::Less
                     }
@@ -23026,9 +23040,8 @@ fn sort_rows_by_order_terms(
                 };
                 return ord;
             }
-            let coll = col_collations.get(idx).and_then(|c| c.as_deref());
-            let ord = cmp_sqlite_values_collated(av, bv, coll, self.collation_registry.as_ref());
-            let ord = if desc { ord.reverse() } else { ord };
+            let ord = cmp_sqlite_values_collated(av, bv, coll.as_deref(), collation_registry);
+            let ord = if *desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -35917,7 +35930,7 @@ mod tests {
         };
         let describe_root_page_layout = |conn: &Connection| -> String {
             let cx = Cx::new();
-            let mut txn = conn
+            let txn = conn
                 .pager
                 .begin(&cx, fsqlite_pager::TransactionMode::ReadOnly)
                 .unwrap();
@@ -36040,7 +36053,7 @@ mod tests {
                         );
                         assert_eq!(
                             pager_after_first_step,
-                            Some(vec![SqliteValue::Integer(1)]),
+                            Some(vec![SqliteValue::Null, SqliteValue::Integer(1)]),
                             "bd-rjc first sequential update corrupted pager view: query_after_first_step={query_after_first_step:?} sqlite_after_first_step={sqlite_after_first_step:?} root_page_layout_after_first_step={root_page_layout_after_first_step}"
                         );
                         assert_eq!(
@@ -50479,7 +50492,7 @@ mod pager_routing_tests {
         let rows = conn
             .query(
                 "SELECT a.word \
-                 FROM words AS a JOIN words AS b ON a.rowid = b.rowid \
+                 FROM words AS a JOIN words AS b ON a.word = b.word \
                  ORDER BY a.word COLLATE german;",
             )
             .unwrap();
@@ -57082,6 +57095,49 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} EXISTS subquery conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Regression: JOIN materialization used `eval_join_predicate()` for the
+    /// final WHERE pass, which rejected correlated EXISTS/NOT EXISTS nodes
+    /// even though the connection-level evaluator already supports them.
+    #[test]
+    fn test_join_where_not_exists_uses_subquery_evaluator() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO regions VALUES (1, 'East');",
+            "INSERT INTO regions VALUES (2, 'West');",
+            "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT, region_id INTEGER);",
+            "INSERT INTO departments VALUES (1, 'Engineering', 1);",
+            "INSERT INTO departments VALUES (2, 'Sales', 1);",
+            "INSERT INTO departments VALUES (3, 'Support', 2);",
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER);",
+            "INSERT INTO employees VALUES (1, 'Alice', 1);",
+            "INSERT INTO employees VALUES (2, 'Bob', 1);",
+            "INSERT INTO employees VALUES (3, 'Carol', 2);",
+        ];
+        for statement in &setup {
+            fconn.execute(statement).unwrap();
+            rconn.execute_batch(statement).unwrap();
+        }
+
+        let queries = [
+            "SELECT d.name, r.name FROM departments d JOIN regions r ON r.id = d.region_id WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id) ORDER BY d.name",
+            "SELECT d.name, r.name FROM departments d JOIN regions r ON r.id = d.region_id WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.name LIKE 'A%') ORDER BY d.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for mismatch in &mismatches {
+                eprintln!("{mismatch}\n");
+            }
+            panic!(
+                "{} JOIN + EXISTS conformance mismatches found",
                 mismatches.len()
             );
         }

@@ -335,6 +335,7 @@ struct SpillRun {
 }
 
 impl SorterCursor {
+    #[cfg(test)]
     fn new(
         key_columns: usize,
         sort_key_orders: Vec<SortKeyOrder>,

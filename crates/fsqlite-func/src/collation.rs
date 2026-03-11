@@ -110,6 +110,16 @@ pub struct CollationRegistry {
     collations: HashMap<String, Arc<dyn CollationFunction>>,
 }
 
+impl std::fmt::Debug for CollationRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names = self.collations.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        f.debug_struct("CollationRegistry")
+            .field("collations", &names)
+            .finish()
+    }
+}
+
 impl Default for CollationRegistry {
     fn default() -> Self {
         Self::new()
@@ -177,17 +187,11 @@ impl CollationRegistry {
     /// sorted order.
     #[must_use]
     pub fn names(&self) -> Vec<String> {
-        let mut names = vec![
-            "BINARY".to_owned(),
-            "NOCASE".to_owned(),
-            "RTRIM".to_owned(),
-        ];
+        let mut names = vec!["BINARY".to_owned(), "NOCASE".to_owned(), "RTRIM".to_owned()];
         let mut custom: Vec<String> = self
             .collations
             .keys()
-            .filter(|name| {
-                !matches!(name.as_str(), "BINARY" | "NOCASE" | "RTRIM")
-            })
+            .filter(|name| !matches!(name.as_str(), "BINARY" | "NOCASE" | "RTRIM"))
             .cloned()
             .collect();
         custom.sort_unstable_by_key(|name| name.to_ascii_uppercase());
