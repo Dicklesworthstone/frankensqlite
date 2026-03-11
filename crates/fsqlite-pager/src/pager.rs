@@ -677,6 +677,7 @@ struct PublishedPagerUpdate {
 
 #[derive(Debug)]
 struct PublishedPagerState {
+    publish_lock: Mutex<()>,
     sequence: AtomicU64,
     visible_commit_seq: AtomicU64,
     db_size: AtomicU32,
@@ -697,6 +698,7 @@ impl PublishedPagerState {
         freelist_count: usize,
     ) -> Self {
         Self {
+            publish_lock: Mutex::new(()),
             sequence: AtomicU64::new(2),
             visible_commit_seq: AtomicU64::new(visible_commit_seq.get()),
             db_size: AtomicU32::new(db_size),
@@ -756,6 +758,51 @@ impl PublishedPagerState {
     }
 
     fn publish<F>(&self, cx: &Cx, update: PublishedPagerUpdate, mutate_pages: F)
+    where
+        F: FnOnce(&mut HashMap<PageNumber, PageData, foldhash::fast::FixedState>),
+    {
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.publish_locked(cx, update, mutate_pages);
+    }
+
+    fn publish_observed_page(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        page_no: PageNumber,
+        page: PageData,
+    ) -> bool {
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_visible_commit_seq =
+            CommitSeq::new(self.visible_commit_seq.load(AtomicOrdering::Acquire));
+        if current_visible_commit_seq > update.visible_commit_seq {
+            tracing::trace!(
+                target: "fsqlite.snapshot_publication",
+                trace_id = cx.trace_id(),
+                run_id = "pager-publication",
+                scenario_id = "stale_read_publish_skip",
+                page_no = page_no.get(),
+                observed_commit_seq = update.visible_commit_seq.get(),
+                visible_commit_seq = current_visible_commit_seq.get(),
+                publication_mode = SNAPSHOT_PUBLICATION_MODE,
+                "skipping stale published page observation"
+            );
+            return false;
+        }
+
+        self.publish_locked(cx, update, |pages| {
+            pages.insert(page_no, page);
+        });
+        true
+    }
+
+    fn publish_locked<F>(&self, cx: &Cx, update: PublishedPagerUpdate, mutate_pages: F)
     where
         F: FnOnce(&mut HashMap<PageNumber, PageData, foldhash::fast::FixedState>),
     {
@@ -999,6 +1046,7 @@ where
         let original_db_size = inner.db_size;
         let journal_mode = inner.journal_mode;
         let pool = inner.cache.pool().clone();
+        let published_visible_commit_seq = self.published.snapshot().visible_commit_seq;
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -1006,6 +1054,7 @@ where
             journal_path: Self::journal_path(&self.db_path),
             inner: Arc::clone(&self.inner),
             published: Arc::clone(&self.published),
+            published_visible_commit_seq,
             write_set: HashMap::new(),
             write_pages_sorted: Vec::new(),
             freed_pages: Vec::new(),
@@ -1543,6 +1592,7 @@ pub struct SimpleTransaction<V: Vfs> {
     journal_path: PathBuf,
     inner: Arc<Mutex<PagerInner<V::File>>>,
     published: Arc<PublishedPagerState>,
+    published_visible_commit_seq: CommitSeq,
     write_set: HashMap<PageNumber, PageBuf>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
@@ -1837,7 +1887,7 @@ where
 
         let read_start = Instant::now();
         let mut published_retry_count = 0_usize;
-        loop {
+        while self.published.snapshot().visible_commit_seq == self.published_visible_commit_seq {
             let snapshot = self.published.snapshot();
             if page_no.get() > snapshot.db_size {
                 let confirm = self.published.snapshot();
@@ -1905,22 +1955,20 @@ where
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         let data = inner.read_page_copy(cx, page_no)?;
         let page = PageData::from_vec(data);
-        if page_no.get() <= inner.db_size {
-            self.published.publish(
-                cx,
-                PublishedPagerUpdate {
-                    visible_commit_seq: inner.commit_seq,
-                    db_size: inner.db_size,
-                    journal_mode: inner.journal_mode,
-                    freelist_count: inner.freelist.len(),
-                    checkpoint_active: inner.checkpoint_active,
-                },
-                |pages| {
-                    pages.insert(page_no, page.clone());
-                },
-            );
-        }
+        let publish_update = PublishedPagerUpdate {
+            visible_commit_seq: inner.commit_seq,
+            db_size: inner.db_size,
+            journal_mode: inner.journal_mode,
+            freelist_count: inner.freelist.len(),
+            checkpoint_active: inner.checkpoint_active,
+        };
+        let publish_page =
+            page_no.get() <= inner.db_size && inner.commit_seq == self.published_visible_commit_seq;
         drop(inner);
+        if publish_page {
+            self.published
+                .publish_observed_page(cx, publish_update, page_no, page.clone());
+        }
         Ok(page)
     }
 
@@ -8665,6 +8713,94 @@ mod tests {
             pager.published_page_hits(),
             published_hits_before + 1,
             "bead_id={BEAD_ID} case=publication_hit_counter"
+        );
+    }
+
+    #[test]
+    fn test_observed_page_publication_populates_snapshot_plane() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(7), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_no = PageNumber::new(2).unwrap();
+        let page = PageData::from_vec(vec![0xAB; PageSize::DEFAULT.as_usize()]);
+
+        let published_page = published.publish_observed_page(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(7),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_no,
+            page.clone(),
+        );
+
+        assert!(
+            published_page,
+            "bead_id={BEAD_ID} case=observed_page_publication_applies"
+        );
+        assert_eq!(
+            published.try_get_page(page_no),
+            Some(page),
+            "bead_id={BEAD_ID} case=observed_page_visible"
+        );
+        assert_eq!(
+            published.snapshot().visible_commit_seq,
+            CommitSeq::new(7),
+            "bead_id={BEAD_ID} case=observed_page_keeps_commit_seq"
+        );
+    }
+
+    #[test]
+    fn test_observed_page_publication_skips_stale_commit_regression() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(7), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_no = PageNumber::new(2).unwrap();
+        let current_page = PageData::from_vec(vec![0xCC; PageSize::DEFAULT.as_usize()]);
+
+        published.publish(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            |pages| {
+                pages.insert(page_no, current_page.clone());
+            },
+        );
+
+        let stale_publish_applied = published.publish_observed_page(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(7),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_no,
+            PageData::from_vec(vec![0x11; PageSize::DEFAULT.as_usize()]),
+        );
+
+        assert!(
+            !stale_publish_applied,
+            "bead_id={BEAD_ID} case=stale_observed_page_publication_skipped"
+        );
+        assert_eq!(
+            published.snapshot().visible_commit_seq,
+            CommitSeq::new(8),
+            "bead_id={BEAD_ID} case=stale_publication_preserves_commit_seq"
+        );
+        assert_eq!(
+            published.try_get_page(page_no),
+            Some(current_page),
+            "bead_id={BEAD_ID} case=stale_publication_preserves_page"
         );
     }
 

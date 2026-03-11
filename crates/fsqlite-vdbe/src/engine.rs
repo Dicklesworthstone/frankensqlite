@@ -31,9 +31,9 @@ use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::{
-    CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError, TimeTravelSnapshot,
-    TimeTravelTarget, VersionStore, concurrent_read_page, concurrent_write_page,
-    create_time_travel_snapshot,
+    CommitIndex, CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError,
+    TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_read_page,
+    concurrent_write_page, create_time_travel_snapshot,
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
@@ -713,6 +713,8 @@ struct ConcurrentContext {
     registry: Arc<Mutex<ConcurrentRegistry>>,
     /// Shared reference to the page-level lock table.
     lock_table: Arc<InProcessPageLockTable>,
+    /// Shared reference to the FCW commit index.
+    commit_index: Arc<CommitIndex>,
     /// Busy-timeout budget used when contending on page-level locks.
     busy_timeout_ms: u64,
 }
@@ -753,6 +755,7 @@ impl SharedTxnPageIo {
         session_id: u64,
         registry: Arc<Mutex<ConcurrentRegistry>>,
         lock_table: Arc<InProcessPageLockTable>,
+        commit_index: Arc<CommitIndex>,
         busy_timeout_ms: u64,
     ) -> Self {
         Self {
@@ -761,6 +764,7 @@ impl SharedTxnPageIo {
                 session_id,
                 registry,
                 lock_table,
+                commit_index,
                 busy_timeout_ms,
             }),
         }
@@ -923,6 +927,44 @@ impl PageWriter for SharedTxnPageIo {
 
             loop {
                 let page_data = page_data_base.clone();
+                let (txn_id, snapshot_high, conflicting_commit_seq) = {
+                    let guard = ctx
+                        .registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "MVCC session {} not found in registry during write",
+                            ctx.session_id
+                        ))
+                    })?;
+                    let snapshot_high = handle.snapshot().high;
+                    let conflicting_commit_seq = (!handle.write_set().contains_key(&page_no))
+                        .then(|| ctx.commit_index.latest(page_no))
+                        .flatten()
+                        .filter(|seq| *seq > snapshot_high);
+                    (
+                        handle.txn_token().id.get(),
+                        snapshot_high.get(),
+                        conflicting_commit_seq,
+                    )
+                };
+
+                if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                    tracing::warn!(
+                        txn_id,
+                        commit_seq = conflicting_commit_seq.get(),
+                        snapshot_high,
+                        page_id = page_no.get(),
+                        visibility_decision = "write_snapshot_stale",
+                        conflict_reason = "fcw_base_drift",
+                        "mvcc write rejected due to stale snapshot"
+                    );
+                    return Err(FrankenError::BusySnapshot {
+                        conflicting_pages: page_no.get().to_string(),
+                    });
+                }
+
                 let (write_result, txn_id, snapshot_high) = {
                     let mut guard = ctx
                         .registry
@@ -3218,6 +3260,7 @@ impl VdbeEngine {
         session_id: u64,
         registry: Arc<Mutex<ConcurrentRegistry>>,
         lock_table: Arc<InProcessPageLockTable>,
+        commit_index: Arc<CommitIndex>,
         busy_timeout_ms: u64,
     ) {
         self.txn_page_io = Some(SharedTxnPageIo::with_concurrent(
@@ -3225,6 +3268,7 @@ impl VdbeEngine {
             session_id,
             registry,
             lock_table,
+            commit_index,
             busy_timeout_ms,
         ));
         self.storage_cursors_enabled = true;
@@ -12736,7 +12780,15 @@ mod tests {
         // SharedTxnPageIo::write_page will fail before touching pager state.
         let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
         let lock_table = Arc::new(InProcessPageLockTable::new());
-        engine.set_transaction_concurrent(Box::new(txn), 999, registry, lock_table, 5000);
+        let commit_index = Arc::new(CommitIndex::new());
+        engine.set_transaction_concurrent(
+            Box::new(txn),
+            999,
+            registry,
+            lock_table,
+            commit_index,
+            5000,
+        );
 
         let opened = engine.open_storage_cursor(0, root, true);
         assert!(
