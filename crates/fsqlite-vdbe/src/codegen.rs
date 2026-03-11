@@ -10592,6 +10592,35 @@ fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Public helpers for cross-crate partial-index support
+// ---------------------------------------------------------------------------
+
+/// Emit VDBE bytecode that evaluates `where_expr` against the current row of
+/// `cursor` (which scans `table`) and jumps to `skip_label` when the predicate
+/// is **not** satisfied.  Used by `backfill_index` in `fsqlite-core` to skip
+/// rows that don't match a partial index WHERE clause.
+pub fn emit_scan_filter(
+    b: &mut ProgramBuilder,
+    where_expr: &Expr,
+    cursor: i32,
+    table: &TableSchema,
+    skip_label: Label,
+) {
+    let scan = ScanCtx {
+        cursor,
+        table,
+        table_alias: None,
+        schema: None,
+        register_base: None,
+        secondary: None,
+    };
+    let filter_reg = b.alloc_temp();
+    emit_expr(b, where_expr, filter_reg, Some(&scan));
+    b.emit_jump_to_label(Opcode::IfNot, filter_reg, 1, skip_label, P4::None, 0);
+    b.free_temp(filter_reg);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
