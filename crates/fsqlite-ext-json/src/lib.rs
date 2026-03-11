@@ -33,6 +33,10 @@ const JSON_VALID_JSON5_FLAG: u8 = 0x02;
 const JSON_VALID_JSONB_SUPERFICIAL_FLAG: u8 = 0x04;
 const JSON_VALID_JSONB_STRICT_FLAG: u8 = 0x08;
 const JSON_PRETTY_DEFAULT_INDENT_WIDTH: usize = 4;
+/// Output columns for the `json_each` / `json_tree` table-valued functions.
+pub const JSON_TABLE_COLUMN_NAMES: [&str; 8] = [
+    "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
+];
 
 const JSONB_NULL_TYPE: u8 = 0x0;
 const JSONB_TRUE_TYPE: u8 = 0x1;

@@ -34,9 +34,14 @@ use fsqlite_ast::{
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_ext_fts5::Fts5Table;
+use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
+use fsqlite_ext_misc::GenerateSeriesTable;
 use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
 use fsqlite_func::collation::CollationRegistry;
-use fsqlite_func::vtab::{ErasedVtabInstance, VtabModuleFactory};
+use fsqlite_func::vtab::{
+    ColumnContext, ErasedVtabInstance, VtabModuleFactory, module_factory_from,
+};
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
     get_total_changes,
@@ -762,7 +767,28 @@ fn default_function_registry(
     fsqlite_ext_fts5::register_fts5_scalars(&mut registry);
     fsqlite_ext_icu::register_icu_scalars(&mut registry);
     fsqlite_ext_icu::register_icu_load_collation(&mut registry, Arc::clone(collation_registry));
+    fsqlite_ext_misc::register_misc_scalars(&mut registry);
     Arc::new(registry)
+}
+
+const GENERATE_SERIES_TABLE_COLUMN_NAMES: [&str; 4] = ["value", "start", "stop", "step"];
+
+fn default_vtab_module_registry() -> HashMap<String, Box<dyn VtabModuleFactory>> {
+    let mut modules: HashMap<String, Box<dyn VtabModuleFactory>> = HashMap::new();
+    modules.insert("FTS5".to_owned(), Box::new(module_factory_from::<Fts5Table>()));
+    modules.insert(
+        "JSON_EACH".to_owned(),
+        Box::new(module_factory_from::<JsonEachVtab>()),
+    );
+    modules.insert(
+        "JSON_TREE".to_owned(),
+        Box::new(module_factory_from::<JsonTreeVtab>()),
+    );
+    modules.insert(
+        "GENERATE_SERIES".to_owned(),
+        Box::new(module_factory_from::<GenerateSeriesTable>()),
+    );
+    modules
 }
 
 /// Map a SQL type name to its SQLite affinity byte (§3.1 Type Affinity Rules).
@@ -824,6 +850,9 @@ pub struct PreparedStatement<'conn> {
     /// Schema cookie captured at prepare time (bd-3mmj). Used by the
     /// engine's `ReadCookie` opcode and prepared-statement invalidation.
     schema_cookie: u32,
+    /// Local schema-generation marker captured at prepare time so prepared
+    /// statements invalidate on same-connection DDL before any memdb reload.
+    schema_generation: u64,
     /// For DML statements (INSERT/UPDATE/DELETE), the parsed AST is stored
     /// here so that `Connection::execute_prepared` can re-dispatch without
     /// re-parsing.  `None` for SELECT statements (which use the compiled
@@ -962,11 +991,22 @@ impl PreparedStatement<'_> {
         self.db.is_some() || self.dml_statement.is_some() || self.deferred_query_statement.is_some()
     }
 
+    fn dispatch_precompiled_program(&self) -> Option<&VdbeProgram> {
+        if self.dml_statement.is_some() && self.db.is_some() {
+            Some(&self.program)
+        } else {
+            None
+        }
+    }
+
     fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
         if self.requires_schema_validation() {
             self.conn.refresh_prepared_schema_state(cx)?;
         }
-        if self.requires_schema_validation() && self.conn.schema_cookie() != self.schema_cookie {
+        if self.requires_schema_validation()
+            && (self.conn.schema_cookie() != self.schema_cookie
+                || self.conn.schema_generation() != self.schema_generation)
+        {
             return Err(FrankenError::SchemaChanged);
         }
         Ok(())
@@ -1467,6 +1507,7 @@ struct DbSnapshot {
     original_ddl_sql: HashMap<String, String>,
     next_master_rowid: i64,
     schema_cookie: u32,
+    schema_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1789,6 +1830,9 @@ pub struct Connection {
     /// prepare time; the Transaction opcode compares the current cookie
     /// against the cached value and returns `SchemaChanged` on mismatch.
     schema_cookie: RefCell<u32>,
+    /// Connection-local prepared-statement invalidation marker. This bumps on
+    /// both local DDL and cross-connection schema reloads.
+    schema_generation: Cell<u64>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
@@ -1982,6 +2026,7 @@ impl Connection {
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
+            schema_generation: Cell::new(0),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             // MVCC conflict observability (bd-t6sv2.1)
@@ -2019,7 +2064,7 @@ impl Connection {
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
             // Virtual table module registry (bd-196x4)
-            vtab_modules: RefCell::new(HashMap::new()),
+            vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
             // Parse cache (br-legjy.7.3)
             parse_cache: RefCell::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
@@ -2877,7 +2922,8 @@ impl Connection {
             } else {
                 Some(params)
             };
-            let rows = self.execute_statement_impl(dml.as_ref(), p, Some(&stmt.program))?;
+            let rows =
+                self.execute_statement_impl(dml.as_ref(), p, stmt.dispatch_precompiled_program())?;
             let is_dml = matches!(
                 dml.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -3493,9 +3539,9 @@ impl Connection {
                     }
                     Ok(rows)
                 } else if (has_group_by(select) || has_implicit_aggregation(select))
-                    && (has_joins(select) || has_subquery_source(select))
+                    && (has_joins(select) || has_fallback_from_source(select))
                 {
-                    // GROUP BY (or implicit aggregation) + JOIN/subquery source:
+                    // GROUP BY (or implicit aggregation) + JOIN/non-table source:
                     // materialize the join as a temp table, then GROUP BY on that.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
@@ -3553,10 +3599,10 @@ impl Connection {
                         apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
-                } else if has_joins(select) || has_subquery_source(select) {
+                } else if has_joins(select) || has_fallback_from_source(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
-                    // Also handles subquery in FROM (derived tables) even
-                    // without explicit JOINs.
+                    // Also handles non-table FROM sources (derived tables,
+                    // table-valued functions) even without explicit JOINs.
                     self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
@@ -4597,7 +4643,7 @@ impl Connection {
                                 if *conflict == ConflictAction::Replace {
                                     conflicting_rowids.push(mem_row.0);
                                 } else {
-                                    unique_violation_col = Some(idx.columns.join(", "));
+                                    unique_violation_col = Some(idx.key_label());
                                 }
                                 break;
                             }
@@ -4741,6 +4787,7 @@ impl Connection {
                     pager: None,
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
+                    schema_generation: self.schema_generation(),
                     dml_statement: None,
                     deferred_query_statement: Some(Arc::new(statement.clone())),
                     deferred_query_column_count: Some(
@@ -4761,6 +4808,7 @@ impl Connection {
                     pager: None,
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
+                    schema_generation: self.schema_generation(),
                     dml_statement: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
@@ -4786,6 +4834,7 @@ impl Connection {
                     pager: Some(self.pager.clone()),
                     post_distinct_limit: if distinct { limit_clause } else { None },
                     schema_cookie: self.schema_cookie(),
+                    schema_generation: self.schema_generation(),
                     dml_statement: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
@@ -4819,6 +4868,7 @@ impl Connection {
                         pager: Some(self.pager.clone()),
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
+                        schema_generation: self.schema_generation(),
                         dml_statement: Some(Arc::new(statement.clone())),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
@@ -4838,6 +4888,7 @@ impl Connection {
                         pager: None,
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
+                        schema_generation: self.schema_generation(),
                         dml_statement: Some(Arc::new(statement.clone())),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
@@ -4860,6 +4911,7 @@ impl Connection {
                     pager: None,
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
+                    schema_generation: self.schema_generation(),
                     dml_statement: Some(Arc::new(statement.clone())),
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
@@ -4879,7 +4931,7 @@ impl Connection {
 
         let expression_only = is_expression_only_select(select);
         let has_grouping = has_group_by(select) || has_implicit_aggregation(select);
-        let has_join_like_source = has_joins(select) || has_subquery_source(select);
+        let has_join_like_source = has_joins(select) || has_fallback_from_source(select);
 
         statement_contains_rewritable_subquery(statement)
             || select.with.is_some()
@@ -4985,7 +5037,9 @@ impl Connection {
                 .select_result_column_count(query, visible_ctes, active_ctes)
                 .max(infer_select_column_names(query).len())
                 .max(1),
-            TableOrSubquery::TableFunction { .. } => 1,
+            TableOrSubquery::TableFunction { name, .. } => {
+                table_function_column_names(name).map_or(1, |cols| cols.len())
+            }
             TableOrSubquery::ParenJoin(from) => {
                 self.from_clause_result_column_count(from, visible_ctes, active_ctes)
             }
@@ -7179,7 +7233,7 @@ impl Connection {
             PageSize::DEFAULT.get(),
             false,
         );
-        let n_key_columns = index.columns.len();
+        let n_key_columns = index.key_term_count();
         let mut row_count = 0_u64;
         let mut distinct_counts = vec![0_u64; n_key_columns];
         let mut prev_fields: Option<Vec<SqliteValue>> = None;
@@ -7835,6 +7889,8 @@ impl Connection {
                             ),
                             root_page: idx_root,
                             columns: vec![col.name.clone()],
+                            key_expressions: vec![col.name.clone()],
+                            where_clause: None,
                             is_unique: true,
                         });
                     }
@@ -7870,6 +7926,11 @@ impl Connection {
                                     ),
                                     root_page: idx_root,
                                     columns: col_names,
+                                    key_expressions: idx_cols
+                                        .iter()
+                                        .map(|indexed| indexed.expr.to_string())
+                                        .collect(),
+                                    where_clause: None,
                                     is_unique: true,
                                 });
                             }
@@ -8776,13 +8837,19 @@ impl Connection {
     }
 
     fn backfill_index(&self, table: &TableSchema, index: &IndexSchema) -> Result<()> {
+        if index.where_clause.is_some() || index.columns.len() != index.key_term_count() {
+            return Err(FrankenError::NotImplemented(
+                "REINDEX/CREATE INDEX backfill for expression or partial indexes is not yet supported"
+                    .to_owned(),
+            ));
+        }
         let idx_col_positions: Vec<usize> = index
             .columns
             .iter()
             .filter_map(|column| table.column_index(column))
             .collect();
         let n_idx_cols = idx_col_positions.len();
-        let columns_label = format!("{}.{}", table.name, index.columns.join(", "));
+        let columns_label = format!("{}.{}", table.name, index.key_label());
         let program = Self::compile_index_backfill(
             table.root_page,
             index.root_page,
@@ -8851,6 +8918,12 @@ impl Connection {
     fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
+
+        if stmt.where_clause.is_some() {
+            return Err(FrankenError::NotImplemented(
+                "partial CREATE INDEX backfill is not yet supported".to_owned(),
+            ));
+        }
 
         // Phase 1: Validate schema (with borrow)
         {
@@ -8931,6 +9004,12 @@ impl Connection {
             table.indexes.push(IndexSchema {
                 name: index_name.clone(),
                 columns: col_names,
+                key_expressions: stmt
+                    .columns
+                    .iter()
+                    .map(|indexed| indexed.expr.to_string())
+                    .collect(),
+                where_clause: None,
                 root_page,
                 is_unique: stmt.unique,
             });
@@ -10197,6 +10276,7 @@ impl Connection {
             original_ddl_sql: self.original_ddl_sql.borrow().clone(),
             next_master_rowid: *self.next_master_rowid.borrow(),
             schema_cookie: *self.schema_cookie.borrow(),
+            schema_generation: self.schema_generation.get(),
         }
     }
 
@@ -10212,6 +10292,7 @@ impl Connection {
         (*self.original_ddl_sql.borrow_mut()).clone_from(&snap.original_ddl_sql);
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
+        self.schema_generation.set(snap.schema_generation);
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -14210,6 +14291,14 @@ impl Connection {
                     }
                 }
             }
+            TableOrSubquery::TableFunction { name, alias, .. } => {
+                let label = alias.as_deref().unwrap_or(name);
+                if let Some(cols) = table_function_column_names(name) {
+                    for col in cols {
+                        col_map.push((label.to_owned(), (*col).to_owned(), false));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -14494,7 +14583,15 @@ impl Connection {
                         .map(|e| self.eval_expr_with_subqueries(e, row, col_map, params))
                         .collect::<Result<Vec<_>>>()?,
                 };
-                Ok(eval_scalar_fn(&name.to_uppercase(), &arg_vals))
+                if let Some(scalar) = self
+                    .func_registry
+                    .borrow()
+                    .find_scalar(name, arg_vals.len() as i32)
+                {
+                    scalar.invoke(&arg_vals)
+                } else {
+                    Ok(eval_scalar_fn(name, &arg_vals))
+                }
             }
             Expr::Between {
                 expr: e,
@@ -14559,6 +14656,73 @@ impl Connection {
             }
             _ => eval_join_expr(expr, row, col_map),
         }
+    }
+
+    fn execute_table_function_rows(
+        &self,
+        name: &str,
+        args: &[Expr],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let empty_row: Vec<SqliteValue> = Vec::new();
+        let empty_col_map: Vec<(String, String, bool)> = Vec::new();
+        let arg_values = args
+            .iter()
+            .map(|arg| self.eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params))
+            .collect::<Result<Vec<_>>>()?;
+
+        let column_count = table_function_column_names(name).map_or_else(
+            || {
+                Err(FrankenError::NotImplemented(format!(
+                    "table-valued function {name} is not supported",
+                )))
+            },
+            |columns| Ok(columns.len()),
+        )?;
+
+        let module_key = name.to_ascii_uppercase();
+        let cx = self.op_cx()?;
+        let instance = {
+            let modules = self.vtab_modules.borrow();
+            let factory = modules.get(&module_key).ok_or_else(|| {
+                FrankenError::NotImplemented(format!(
+                    "table-valued function {name} is not supported — no module registered",
+                ))
+            })?;
+            factory.connect(&cx, &[])?
+        };
+
+        self.scan_erased_table_function_vtab(instance.as_ref(), &arg_values, column_count)
+    }
+
+    fn scan_erased_table_function_vtab(
+        &self,
+        vtab: &dyn ErasedVtabInstance,
+        args: &[SqliteValue],
+        column_count: usize,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let cx = self.op_cx()?;
+        let mut cursor = vtab.open_cursor()?;
+        cursor.erased_filter(&cx, 0, None, args)?;
+
+        let mut rows = Vec::new();
+        while !cursor.erased_eof() {
+            let mut row = Vec::with_capacity(column_count);
+            for col in 0..column_count {
+                let mut ctx = ColumnContext::new();
+                let col_idx = i32::try_from(col).map_err(|_| {
+                    FrankenError::Internal(format!(
+                        "table-valued function column index overflow: {col}",
+                    ))
+                })?;
+                cursor.erased_column(&mut ctx, col_idx)?;
+                row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
+            }
+            rows.push(row);
+            cursor.erased_next(&cx)?;
+        }
+
+        Ok(rows)
     }
 
     /// Execute a GROUP BY aggregate SELECT via post-execution processing:
@@ -16473,14 +16637,15 @@ impl Connection {
 
         // ── 1. Resolve all table sources (primary + joined tables) ──
         let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(1 + from.joins.len());
-        // Preloaded rows for subquery sources (index-aligned with table_sources).
+        // Preloaded rows for subquery/table-function sources (index-aligned
+        // with table_sources).
         let mut preloaded: Vec<Option<Vec<Vec<SqliteValue>>>> = Vec::new();
 
         {
             let schema = self.schema.borrow();
 
             // Helper closure: resolve a TableOrSubquery into a JoinTableSource
-            // and optional preloaded rows (for subqueries).
+            // and optional preloaded rows (for subqueries/table functions).
             let resolve_source =
                 |source: &TableOrSubquery,
                  schema: &[TableSchema]|
@@ -16520,8 +16685,27 @@ impl Connection {
                                 Some(Vec::new()),
                             ))
                         }
+                        TableOrSubquery::TableFunction { name, alias, .. } => {
+                            let col_names = table_function_column_names(name)
+                                .ok_or_else(|| {
+                                    FrankenError::NotImplemented(format!(
+                                        "table-valued function {name} is not supported",
+                                    ))
+                                })?
+                                .iter()
+                                .map(|col| (*col).to_owned())
+                                .collect();
+                            Ok((
+                                JoinTableSource {
+                                    table_name: name.clone(),
+                                    alias: alias.clone(),
+                                    col_names,
+                                },
+                                Some(Vec::new()),
+                            ))
+                        }
                         _ => Err(FrankenError::NotImplemented(
-                            "only named tables and subqueries are supported in JOIN".to_owned(),
+                            "only named tables, table-valued functions, and subqueries are supported in JOIN".to_owned(),
                         )),
                     }
                 };
@@ -16539,36 +16723,43 @@ impl Connection {
             }
         }
 
-        // Execute subqueries now that the schema borrow is dropped.
-        // Collect all subquery sources (from.source + from.joins[*].table).
+        // Execute subqueries / table-valued functions now that the schema
+        // borrow is dropped. Collect all such sources in source order.
         let all_sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
             .chain(from.joins.iter().map(|j| &j.table))
             .collect();
         for (i, pre) in preloaded.iter_mut().enumerate() {
             if pre.is_some() {
-                if let TableOrSubquery::Subquery { query, .. } = all_sources[i] {
-                    let rows =
-                        self.execute_statement(&Statement::Select(query.as_ref().clone()), None)?;
-                    let row_data: Vec<Vec<SqliteValue>> =
-                        rows.iter().map(|r| r.values().to_vec()).collect();
-                    // If col_names contains "*" (unresolved star), resolve it
-                    // by recursively inferring column names from the subquery.
-                    if table_sources[i]
-                        .col_names
-                        .iter()
-                        .any(|n| n == "*" || n.ends_with(".*"))
-                    {
-                        let resolved = resolve_subquery_star_columns(query, &self.schema.borrow());
-                        if !resolved.is_empty() {
-                            table_sources[i].col_names = resolved;
-                        } else {
-                            // Fallback: use actual result width with generic names.
-                            let width = row_data.first().map_or(0, Vec::len);
-                            table_sources[i].col_names =
-                                (0..width).map(|j| format!("_c{j}")).collect();
+                match all_sources[i] {
+                    TableOrSubquery::Subquery { query, .. } => {
+                        let rows = self
+                            .execute_statement(&Statement::Select(query.as_ref().clone()), None)?;
+                        let row_data: Vec<Vec<SqliteValue>> =
+                            rows.iter().map(|r| r.values().to_vec()).collect();
+                        // If col_names contains "*" (unresolved star), resolve it
+                        // by recursively inferring column names from the subquery.
+                        if table_sources[i]
+                            .col_names
+                            .iter()
+                            .any(|n| n == "*" || n.ends_with(".*"))
+                        {
+                            let resolved =
+                                resolve_subquery_star_columns(query, &self.schema.borrow());
+                            if !resolved.is_empty() {
+                                table_sources[i].col_names = resolved;
+                            } else {
+                                // Fallback: use actual result width with generic names.
+                                let width = row_data.first().map_or(0, Vec::len);
+                                table_sources[i].col_names =
+                                    (0..width).map(|j| format!("_c{j}")).collect();
+                            }
                         }
+                        *pre = Some(row_data);
                     }
-                    *pre = Some(row_data);
+                    TableOrSubquery::TableFunction { name, args, .. } => {
+                        *pre = Some(self.execute_table_function_rows(name, args, params)?);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -17496,6 +17687,7 @@ impl Connection {
                     session_id,
                     registry: Arc::clone(&self.concurrent_registry),
                     lock_table: Arc::clone(&self.concurrent_lock_table),
+                    commit_index: Arc::clone(&self.concurrent_commit_index),
                     #[allow(clippy::cast_sign_loss)]
                     busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
                 })
@@ -17577,6 +17769,8 @@ impl Connection {
     fn increment_schema_cookie(&self) {
         let mut cookie = self.schema_cookie.borrow_mut();
         *cookie = cookie.wrapping_add(1);
+        self.schema_generation
+            .set(self.schema_generation.get().wrapping_add(1));
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
         self.compiled_cache.borrow_mut().clear();
@@ -17594,6 +17788,11 @@ impl Connection {
     /// Read the current schema cookie value.
     pub fn schema_cookie(&self) -> u32 {
         *self.schema_cookie.borrow()
+    }
+
+    #[must_use]
+    pub fn schema_generation(&self) -> u64 {
+        self.schema_generation.get()
     }
 
     /// Number of entries in the compiled bytecode cache (bd-1dp9.6.7.2.2).
@@ -17623,6 +17822,9 @@ impl Connection {
 
     #[allow(clippy::too_many_lines)]
     fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
+        let bound_publication = self.bind_pager_publication(cx, "memdb_reload")?;
+        let bound_visible_commit_seq = bound_publication.snapshot.visible_commit_seq;
+
         // Open a read transaction to see the committed state.
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
 
@@ -17644,11 +17846,12 @@ impl Connection {
             self.rowid_alias_columns.borrow_mut().clear();
             self.autoincrement_tables.borrow_mut().clear();
             self.sqlite_sequence_cache.borrow_mut().clear();
+            self.original_ddl_sql.borrow_mut().clear();
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
+            self.schema_generation.set(0);
             *self.change_counter.borrow_mut() = 0;
-            *self.memdb_visible_commit_seq.borrow_mut() =
-                self.pager.published_snapshot().visible_commit_seq;
+            *self.memdb_visible_commit_seq.borrow_mut() = bound_visible_commit_seq;
             self.memdb_rows_loaded.set(hydrate_rows);
             return Ok(());
         }
@@ -17691,10 +17894,12 @@ impl Connection {
         let mut new_db = MemDatabase::new();
         let mut new_triggers = Vec::new();
         let mut new_views: Vec<ViewDef> = Vec::new();
-        let mut pending_indexes: Vec<(String, String, i32, Vec<String>, bool)> = Vec::new();
+        let mut pending_indexes: Vec<(String, String, i32, ReconstructedIndexDefinition)> =
+            Vec::new();
         let mut new_alias_map = HashMap::new();
         let mut new_autoincrement_tables = HashSet::new();
         let mut new_sqlite_sequence_cache = HashMap::new();
+        let mut new_original_ddl_sql = HashMap::new();
 
         for entry in &master_entries {
             if entry.len() < 5 {
@@ -17710,6 +17915,11 @@ impl Connection {
                     SqliteValue::Text(s) => s.clone(),
                     _ => continue,
                 };
+                let trigger_name = match &entry[1] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                new_original_ddl_sql.insert(trigger_name.to_ascii_lowercase(), create_sql.clone());
                 if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
                     new_triggers.push(TriggerDef::from_create_statement(&stmt, create_sql));
                 }
@@ -17735,7 +17945,9 @@ impl Connection {
                 }
                 let maybe_index_definition = match &entry[4] {
                     SqliteValue::Text(create_sql) => {
-                        parse_index_columns_from_create_sql(create_sql)
+                        new_original_ddl_sql
+                            .insert(index_name.to_ascii_lowercase(), create_sql.clone());
+                        parse_index_definition_from_create_sql(create_sql)
                     }
                     SqliteValue::Null => infer_implicit_index_definition_from_master_entries(
                         &master_entries,
@@ -17744,7 +17956,7 @@ impl Connection {
                     ),
                     _ => None,
                 };
-                let Some((indexed_columns, is_unique)) = maybe_index_definition else {
+                let Some(index_definition) = maybe_index_definition else {
                     let reason = match &entry[4] {
                         SqliteValue::Null => {
                             "implicit index has NULL sql and could not be inferred from table schema"
@@ -17758,16 +17970,10 @@ impl Connection {
                         "schema reload cannot safely proceed: failed to reconstruct index `{index_name}` on table `{table_name}` ({reason})"
                     )));
                 };
-                if indexed_columns.is_empty() {
+                if index_definition.key_term_count() == 0 {
                     continue;
                 }
-                pending_indexes.push((
-                    index_name,
-                    table_name,
-                    root_page,
-                    indexed_columns,
-                    is_unique,
-                ));
+                pending_indexes.push((index_name, table_name, root_page, index_definition));
                 continue;
             }
 
@@ -17777,6 +17983,11 @@ impl Connection {
                     SqliteValue::Text(s) => s.clone(),
                     _ => continue,
                 };
+                let view_name = match &entry[1] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                new_original_ddl_sql.insert(view_name.to_ascii_lowercase(), create_sql.clone());
                 if let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql) {
                     new_views.push(ViewDef {
                         name: stmt.name.name.clone(),
@@ -17803,6 +18014,7 @@ impl Connection {
                 SqliteValue::Text(s) => s.clone(),
                 _ => continue,
             };
+            new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.clone());
 
             // Stock SQLite virtual tables (FTS5, rtree, etc.) have
             // rootpage=0 in sqlite_master and CREATE SQL beginning with
@@ -17993,7 +18205,7 @@ impl Connection {
         }
 
         // Attach indexes after all table schemas are available.
-        for (index_name, table_name, root_page, columns, is_unique) in pending_indexes {
+        for (index_name, table_name, root_page, index_definition) in pending_indexes {
             if let Some(table) = new_schema
                 .iter_mut()
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name))
@@ -18008,8 +18220,10 @@ impl Connection {
                 table.indexes.push(IndexSchema {
                     name: index_name,
                     root_page,
-                    columns,
-                    is_unique,
+                    columns: index_definition.columns,
+                    key_expressions: index_definition.key_expressions,
+                    where_clause: index_definition.where_clause,
+                    is_unique: index_definition.is_unique,
                 });
                 if !new_db.tables.contains_key(&root_page) {
                     new_db.create_table_at(root_page, 0);
@@ -18051,6 +18265,7 @@ impl Connection {
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
         *self.sqlite_sequence_cache.borrow_mut() = new_sqlite_sequence_cache;
+        *self.original_ddl_sql.borrow_mut() = new_original_ddl_sql;
         #[allow(clippy::cast_possible_wrap)]
         {
             *self.next_master_rowid.borrow_mut() = max_master_rowid.saturating_add(1).max(1);
@@ -18060,10 +18275,14 @@ impl Connection {
             pragma_state.user_version = i64::from(user_version);
             pragma_state.application_id = i64::from(application_id);
         }
+        let old_schema_cookie = *self.schema_cookie.borrow();
         *self.schema_cookie.borrow_mut() = schema_cookie;
+        if old_schema_cookie != schema_cookie {
+            self.schema_generation
+                .set(self.schema_generation.get().wrapping_add(1));
+        }
         *self.change_counter.borrow_mut() = change_counter;
-        *self.memdb_visible_commit_seq.borrow_mut() =
-            self.pager.published_snapshot().visible_commit_seq;
+        *self.memdb_visible_commit_seq.borrow_mut() = bound_visible_commit_seq;
         self.memdb_rows_loaded.set(hydrate_rows);
 
         Ok(())
@@ -18573,6 +18792,39 @@ fn has_subquery_source(select: &SelectStatement) -> bool {
         }
     }
     false
+}
+
+/// Check if the FROM source contains a table-valued function that requires
+/// the fallback execution path instead of the table-only VDBE path.
+fn has_table_function_source(select: &SelectStatement) -> bool {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = &select.body.select
+    {
+        if matches!(from.source, TableOrSubquery::TableFunction { .. }) {
+            return true;
+        }
+        for join in &from.joins {
+            if matches!(join.table, TableOrSubquery::TableFunction { .. }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_fallback_from_source(select: &SelectStatement) -> bool {
+    has_subquery_source(select) || has_table_function_source(select)
+}
+
+fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
+    if name.eq_ignore_ascii_case("json_each") || name.eq_ignore_ascii_case("json_tree") {
+        return Some(&JSON_TABLE_COLUMN_NAMES);
+    }
+    if name.eq_ignore_ascii_case("generate_series") {
+        return Some(&GENERATE_SERIES_TABLE_COLUMN_NAMES);
+    }
+    None
 }
 
 /// Detect whether a SELECT contains at least one MATCH operator.
@@ -19105,14 +19357,23 @@ fn fk_action_sql(action: FkActionType) -> &'static str {
 
 fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
     let unique = if index.is_unique { "UNIQUE " } else { "" };
-    let cols = index
-        .columns
-        .iter()
-        .map(|c| format!("\"{}\"", c))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let cols = if index.key_expressions.is_empty() {
+        index
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        index.key_expressions.join(", ")
+    };
+    let where_clause = index
+        .where_clause
+        .as_ref()
+        .map(|predicate| format!(" WHERE {predicate}"))
+        .unwrap_or_default();
     format!(
-        "CREATE {unique}INDEX \"{}\" ON \"{}\"({})",
+        "CREATE {unique}INDEX \"{}\" ON \"{}\"({}){where_clause}",
         index.name, table_name, cols
     )
 }
@@ -19196,6 +19457,11 @@ fn resolve_subquery_star_columns(select: &SelectStatement, schema: &[TableSchema
                     TableOrSubquery::Subquery { query, .. } => {
                         let sub_cols = resolve_subquery_star_columns(query, schema);
                         result.extend(sub_cols);
+                    }
+                    TableOrSubquery::TableFunction { name, .. } => {
+                        if let Some(cols) = table_function_column_names(name) {
+                            result.extend(cols.iter().map(|col| (*col).to_owned()));
+                        }
                     }
                     _ => {}
                 }
@@ -21288,21 +21554,28 @@ struct NormalizedIndexedColumnTerm {
     direction: Option<SortDirection>,
 }
 
-fn parse_index_columns_from_create_sql(create_sql: &str) -> Option<(Vec<String>, bool)> {
-    match parse_single_statement(create_sql).ok()? {
-        Statement::CreateIndex(stmt) => {
-            let columns = stmt
-                .columns
-                .iter()
-                .filter_map(normalize_indexed_column_term)
-                .map(|term| term.column_name)
-                .collect::<Vec<_>>();
-            if columns.is_empty() {
-                None
-            } else {
-                Some((columns, stmt.unique))
-            }
+#[derive(Debug, Clone)]
+struct ReconstructedIndexDefinition {
+    columns: Vec<String>,
+    key_expressions: Vec<String>,
+    where_clause: Option<String>,
+    is_unique: bool,
+}
+
+impl ReconstructedIndexDefinition {
+    #[must_use]
+    fn key_term_count(&self) -> usize {
+        if self.key_expressions.is_empty() {
+            self.columns.len()
+        } else {
+            self.key_expressions.len()
         }
+    }
+}
+
+fn parse_index_definition_from_create_sql(create_sql: &str) -> Option<ReconstructedIndexDefinition> {
+    match parse_single_statement(create_sql).ok()? {
+        Statement::CreateIndex(stmt) => index_definition_from_create_index_statement(&stmt),
         _ => None,
     }
 }
@@ -21311,7 +21584,7 @@ fn infer_implicit_index_definition_from_master_entries(
     master_entries: &[Vec<SqliteValue>],
     table_name: &str,
     index_name: &str,
-) -> Option<(Vec<String>, bool)> {
+) -> Option<ReconstructedIndexDefinition> {
     let ordinal = parse_autoindex_ordinal(index_name, table_name)?;
     let table_create_sql = master_entries.iter().find_map(|entry| {
         if entry.len() < 5 {
@@ -21354,7 +21627,7 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
 
 fn implicit_index_definitions_from_create_table_sql(
     create_table_sql: &str,
-) -> Option<Vec<(Vec<String>, bool)>> {
+) -> Option<Vec<ReconstructedIndexDefinition>> {
     let statement = parse_single_statement(create_table_sql).ok()?;
     let Statement::CreateTable(create_stmt) = statement else {
         return None;
@@ -21388,7 +21661,12 @@ fn implicit_index_definitions_from_create_table_sql(
                 })
         });
         if has_unique_constraint && !is_ipk {
-            definitions.push((vec![column.name.clone()], true));
+            definitions.push(ReconstructedIndexDefinition {
+                columns: vec![column.name.clone()],
+                key_expressions: vec![column.name.clone()],
+                where_clause: None,
+                is_unique: true,
+            });
         }
     }
 
@@ -21400,23 +21678,55 @@ fn implicit_index_definitions_from_create_table_sql(
             columns: idx_cols, ..
         } = constraint.kind
         {
-            let column_names: Vec<String> = idx_cols
+            let key_expressions = idx_cols
                 .iter()
-                .filter_map(|ic| {
-                    if let Expr::Column(col_ref, _) = &ic.expr {
-                        Some(col_ref.column.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !column_names.is_empty() {
-                definitions.push((column_names, true));
+                .map(|indexed| indexed.expr.to_string())
+                .collect::<Vec<_>>();
+            if !key_expressions.is_empty() {
+                definitions.push(ReconstructedIndexDefinition {
+                    columns: extract_simple_index_columns(&idx_cols),
+                    key_expressions,
+                    where_clause: None,
+                    is_unique: true,
+                });
             }
         }
     }
 
     Some(definitions)
+}
+
+fn index_definition_from_create_index_statement(
+    stmt: &fsqlite_ast::CreateIndexStatement,
+) -> Option<ReconstructedIndexDefinition> {
+    let key_expressions = stmt
+        .columns
+        .iter()
+        .map(|indexed| indexed.expr.to_string())
+        .collect::<Vec<_>>();
+    if key_expressions.is_empty() {
+        return None;
+    }
+    Some(ReconstructedIndexDefinition {
+        columns: extract_simple_index_columns(&stmt.columns),
+        key_expressions,
+        where_clause: stmt.where_clause.as_ref().map(ToString::to_string),
+        is_unique: stmt.unique,
+    })
+}
+
+fn extract_simple_index_columns(indexed_terms: &[fsqlite_ast::IndexedColumn]) -> Vec<String> {
+    indexed_terms
+        .iter()
+        .map(normalize_indexed_column_term)
+        .collect::<Option<Vec<_>>>()
+        .map(|terms| {
+            terms
+                .into_iter()
+                .map(|term| term.column_name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 /// Normalize an indexed-column AST node into execution/persistence metadata.
@@ -23231,6 +23541,7 @@ struct ConcurrentExecContext {
     session_id: u64,
     registry: Arc<Mutex<ConcurrentRegistry>>,
     lock_table: Arc<InProcessPageLockTable>,
+    commit_index: Arc<CommitIndex>,
     busy_timeout_ms: u64,
 }
 
@@ -23304,6 +23615,7 @@ fn execute_table_program_with_db(
                 ctx.session_id,
                 ctx.registry,
                 ctx.lock_table,
+                ctx.commit_index,
                 ctx.busy_timeout_ms,
             );
         } else {
@@ -28903,6 +29215,31 @@ mod tests {
     }
 
     #[test]
+    fn test_prepared_statement_json_each_uses_dispatch_path() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn
+            .prepare("SELECT * FROM json_each(json_array(10, 20)) ORDER BY key;")
+            .unwrap();
+
+        assert!(
+            stmt.deferred_query_statement.is_some(),
+            "table-valued JSON functions should stay on the fallback dispatch path"
+        );
+        assert_eq!(stmt.column_count(), 8);
+
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values().len(), 8);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(10));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[6], SqliteValue::Text("$[0]".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(20));
+        assert_eq!(rows[1].values()[6], SqliteValue::Text("$[1]".to_owned()));
+    }
+
+    #[test]
     fn test_prepared_statement_table_query_with_params_uses_pager_txn() {
         let conn = Connection::open(":memory:").unwrap();
         conn.set_reject_mem_fallback(true);
@@ -33681,6 +34018,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_default_extension_vtab_modules_are_bootstrapped() {
+        let conn = Connection::open(":memory:").unwrap();
+        let modules = conn.vtab_modules.borrow();
+        assert!(modules.contains_key("FTS5"));
+        assert!(modules.contains_key("JSON_EACH"));
+        assert!(modules.contains_key("JSON_TREE"));
+        assert!(modules.contains_key("GENERATE_SERIES"));
+    }
+
+    #[test]
+    fn test_misc_scalar_functions_available_via_registry() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT length(uuid()), decimal_add('1.25', '2.5');")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(36),
+                SqliteValue::Text("3.75".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_generate_series_table_function_available_via_registry() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT value FROM generate_series(2, 6, 2);")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(2)],
+                vec![SqliteValue::Integer(4)],
+                vec![SqliteValue::Integer(6)],
+            ],
+        );
+    }
+
     // ── BETWEEN expression tests ────────────────────────────────────────
 
     #[test]
@@ -34907,6 +35287,195 @@ mod tests {
         assert_eq!(
             snapshot_high, latest_commit_seq,
             "file-backed BEGIN must refresh the pager publication plane before binding its MVCC snapshot"
+        );
+
+        conn_b.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_begin_refreshes_execution_image_before_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("begin_execution_image_refresh.db");
+        let path_str = path.to_str().unwrap();
+
+        let conn_a = Connection::open(path_str).unwrap();
+        conn_a
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        conn_a.execute("INSERT INTO t VALUES (1, 0);").unwrap();
+
+        let conn_b = Connection::open(path_str).unwrap();
+        assert_eq!(
+            conn_b
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
+            SqliteValue::Integer(0),
+            "seed read should populate conn_b's execution image with the original row"
+        );
+
+        conn_a.execute("UPDATE t SET v = 1 WHERE id = 1;").unwrap();
+        let latest_commit_seq = conn_a.pager.published_snapshot().visible_commit_seq;
+
+        conn_b.execute("BEGIN;").unwrap();
+        assert_eq!(
+            conn_b.current_concurrent_snapshot_seq(),
+            Some(latest_commit_seq.get()),
+            "BEGIN should bind conn_b to the latest published commit sequence"
+        );
+        assert_eq!(
+            conn_b
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
+            SqliteValue::Integer(1),
+            "BEGIN should refresh conn_b's execution image before the concurrent UPDATE reads the row"
+        );
+
+        conn_b
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .unwrap();
+        conn_b.execute("COMMIT;").unwrap();
+
+        assert_eq!(
+            conn_a
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
+            SqliteValue::Integer(2),
+            "conn_b should increment from the refreshed committed value, not overwrite from a stale base"
+        );
+    }
+
+    #[test]
+    fn test_begin_after_busy_snapshot_rollback_refreshes_execution_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("begin_after_busy_snapshot_refresh.db");
+        let path_str = path.to_str().unwrap();
+
+        let conn_a = Connection::open(path_str).unwrap();
+        conn_a
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        conn_a.execute("INSERT INTO t VALUES (1, 0);").unwrap();
+
+        let conn_b = Connection::open(path_str).unwrap();
+        assert_eq!(
+            conn_b
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
+            SqliteValue::Integer(0),
+            "seed read should populate conn_b's execution image before the conflict cycle"
+        );
+
+        conn_a
+            .execute("BEGIN;")
+            .unwrap_or_else(|err| panic!("first writer BEGIN failed unexpectedly: {err:?}"));
+        conn_b
+            .execute("BEGIN;")
+            .unwrap_or_else(|err| panic!("second writer BEGIN failed unexpectedly: {err:?}"));
+
+        conn_a
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .unwrap_or_else(|err| {
+                panic!("first writer UPDATE before conflict cycle failed: {err:?}")
+            });
+        conn_b
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .unwrap_or_else(|err| {
+                panic!("second writer UPDATE before conflict cycle failed: {err:?}")
+            });
+
+        conn_a
+            .execute("COMMIT;")
+            .unwrap_or_else(|err| panic!("first writer COMMIT failed unexpectedly: {err:?}"));
+
+        let busy_snapshot = conn_b
+            .execute("COMMIT;")
+            .expect_err("second writer should hit BusySnapshot after stale-snapshot conflict");
+        assert!(
+            matches!(busy_snapshot, FrankenError::BusySnapshot { .. }),
+            "expected BusySnapshot after same-row concurrent commit, got {busy_snapshot:?}"
+        );
+        conn_b.execute("ROLLBACK;").unwrap_or_else(|err| {
+            panic!("losing writer ROLLBACK after BusySnapshot failed: {err:?}")
+        });
+
+        conn_a
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .unwrap_or_else(|err| {
+                panic!("winner UPDATE after loser rollback failed unexpectedly: {err:?}")
+            });
+        let latest_commit_seq = conn_a.pager.published_snapshot().visible_commit_seq;
+
+        conn_b.execute("BEGIN;").unwrap_or_else(|err| {
+            panic!("retry BEGIN after BusySnapshot + ROLLBACK failed: {err:?}")
+        });
+        assert_eq!(
+            conn_b.current_concurrent_snapshot_seq(),
+            Some(latest_commit_seq.get()),
+            "retry BEGIN after BusySnapshot must bind to the latest published commit sequence"
+        );
+        assert_eq!(
+            conn_b
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
+            SqliteValue::Integer(2),
+            "retry BEGIN after BusySnapshot + ROLLBACK must refresh conn_b's execution image"
+        );
+
+        conn_b
+            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+            .unwrap_or_else(|err| {
+                panic!("retrying loser UPDATE after refreshed BEGIN failed: {err:?}")
+            });
+        conn_b
+            .execute("COMMIT;")
+            .unwrap_or_else(|err| panic!("retrying loser COMMIT failed unexpectedly: {err:?}"));
+
+        assert_eq!(
+            conn_a
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
+            SqliteValue::Integer(3),
+            "retry path should apply the next increment on top of the latest committed value"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_transaction_keeps_repeatable_read_after_external_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeatable_read_after_external_commit.db");
+        let path_str = path.to_str().unwrap();
+
+        let conn_a = Connection::open(path_str).unwrap();
+        conn_a
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        conn_a.execute("INSERT INTO t VALUES (1, 0);").unwrap();
+
+        let conn_b = Connection::open(path_str).unwrap();
+        conn_b.execute("BEGIN;").unwrap();
+        assert_eq!(
+            conn_b.query_row("SELECT v FROM t WHERE id = 1;").unwrap().values()[0],
+            SqliteValue::Integer(0),
+            "reader should observe the pre-commit value at transaction start"
+        );
+
+        conn_a.execute("UPDATE t SET v = 1 WHERE id = 1;").unwrap();
+        assert_eq!(
+            conn_a.query_row("SELECT v FROM t WHERE id = 1;").unwrap().values()[0],
+            SqliteValue::Integer(1),
+            "writer should publish the new committed value"
+        );
+
+        assert_eq!(
+            conn_b.query_row("SELECT v FROM t WHERE id = 1;").unwrap().values()[0],
+            SqliteValue::Integer(0),
+            "concurrent transaction must keep its begin-time snapshot even after another connection commits"
         );
 
         conn_b.execute("ROLLBACK;").unwrap();
@@ -40883,6 +41452,92 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_reopen_preserves_partial_expression_index_and_enforces_uniqueness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("expression_partial_index_reload.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE agents (
+                        id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        is_active INTEGER NOT NULL DEFAULT 1
+                     );
+                     CREATE UNIQUE INDEX uq_agents_name_ci
+                        ON agents(lower(name))
+                        WHERE is_active = 1;
+                     INSERT INTO agents(name, is_active) VALUES ('Alpha', 1);
+                     INSERT INTO agents(name, is_active) VALUES ('Dormant', 0);",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        {
+            let schema = conn.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case("agents"))
+                .expect("agents table should load");
+            let index = table
+                .indexes
+                .iter()
+                .find(|idx| idx.name.eq_ignore_ascii_case("uq_agents_name_ci"))
+                .expect("partial expression index should reload");
+            assert!(
+                index.columns.is_empty(),
+                "expression index should not be exposed as a simple column index"
+            );
+            assert_eq!(index.key_expressions.len(), 1);
+            assert_eq!(index.key_expressions[0].to_ascii_lowercase(), "lower(name)");
+            assert_eq!(
+                index.where_clause
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("is_active = 1")
+            );
+        }
+
+        let sql_rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';",
+            )
+            .unwrap();
+        assert_eq!(sql_rows.len(), 1);
+        let sql_text = sql_rows[0].values()[0].to_text();
+        assert!(
+            sql_text.to_ascii_lowercase().contains("lower(name)")
+                && sql_text.to_ascii_lowercase().contains("where is_active = 1"),
+            "sqlite_master SQL should round-trip the expression and predicate: {sql_text}"
+        );
+
+        conn.execute("INSERT INTO agents(name, is_active) VALUES ('beta', 1);")
+            .unwrap();
+        let dup_err = conn
+            .execute("INSERT INTO agents(name, is_active) VALUES ('ALPHA', 1);")
+            .expect_err("active duplicate should violate the partial expression index");
+        let dup_msg = dup_err.to_string().to_ascii_lowercase();
+        assert!(
+            dup_msg.contains("agents") || dup_msg.contains("unique"),
+            "unexpected duplicate error: {dup_msg}"
+        );
+
+        conn.execute("INSERT INTO agents(name, is_active) VALUES ('ALPHA', 0);")
+            .unwrap();
+
+        let quick_check_rows = conn.query("PRAGMA quick_check;").unwrap();
+        assert_eq!(quick_check_rows.len(), 1);
+        assert_eq!(
+            quick_check_rows[0].values()[0],
+            SqliteValue::Text("ok".to_owned())
+        );
+    }
+
+    #[test]
     fn test_drop_index_after_reopen_removes_sqlite_master_entry() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("drop_index_reopen.db");
@@ -44125,36 +44780,200 @@ mod pager_routing_tests {
             .unwrap();
         conn1.execute("COMMIT;").unwrap();
 
-        // conn2 writes the same row and tries to commit — should fail.
-        conn2
-            .execute("UPDATE conflict_tbl SET val = 200 WHERE id = 1;")
-            .unwrap();
-        let commit_result = conn2.execute("COMMIT;");
+        // conn2 writes the same row against a stale snapshot. The transient
+        // conflict may surface at UPDATE time or COMMIT time.
+        let update_result = conn2.execute("UPDATE conflict_tbl SET val = 200 WHERE id = 1;");
 
-        match commit_result {
+        match update_result {
             Err(err) => {
                 assert!(
                     err.is_transient(),
-                    "commit conflict must be a transient error: {err}"
+                    "stale concurrent write must be a transient error: {err}"
                 );
             }
             Ok(_) => {
-                // In some configurations the commit may succeed (serialized mode
-                // or if pages didn't overlap at page level). Verify the final
-                // value is consistent.
-                let final_val = conn1
-                    .query("SELECT val FROM conflict_tbl WHERE id = 1;")
-                    .unwrap();
-                let v = match final_val[0].values()[0] {
-                    SqliteValue::Integer(v) => v,
-                    _ => panic!("expected integer"),
-                };
-                assert!(
-                    v == 100 || v == 200,
-                    "final value must be from one committer: {v}"
-                );
+                let commit_result = conn2.execute("COMMIT;");
+                if let Err(err) = commit_result {
+                    assert!(
+                        err.is_transient(),
+                        "commit conflict must be a transient error: {err}"
+                    );
+                }
             }
         }
+
+        let final_val = conn1
+            .query("SELECT val FROM conflict_tbl WHERE id = 1;")
+            .unwrap();
+        let v = match final_val[0].values()[0] {
+            SqliteValue::Integer(v) => v,
+            _ => panic!("expected integer"),
+        };
+        assert!(
+            v == 100 || v == 200,
+            "final value must be from one committer: {v}"
+        );
+    }
+
+    #[test]
+    fn test_busy_snapshot_retry_rebinds_latest_row_before_rewrite_bd_rjc() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("busy_snapshot_retry_rebind.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        let table_root_page = {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| table.root_page)
+                .expect("table t should exist after CREATE TABLE");
+            conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+                .unwrap();
+            root_page
+        };
+        let table_root_pgno = fsqlite_types::PageNumber::new(
+            u32::try_from(table_root_page).expect("root page should fit in u32"),
+        )
+        .expect("root page should be valid");
+
+        let read_active_row = |conn: &Connection| -> Vec<SqliteValue> {
+            let mut active_txn = conn.active_txn.borrow_mut();
+            let txn = active_txn
+                .as_mut()
+                .expect("active transaction should exist while probing staged row");
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                fsqlite_btree::TransactionPageIo::new(txn.as_mut()),
+                table_root_pgno,
+                u32::try_from(fsqlite_types::PageSize::DEFAULT.as_usize())
+                    .expect("page size should fit in u32"),
+                true,
+            );
+            let seek = cursor
+                .table_move_to(&Cx::new(), 1)
+                .expect("staged row lookup should succeed");
+            assert!(seek.is_found(), "staged row must remain present");
+            let payload = cursor
+                .payload(&Cx::new())
+                .expect("staged row payload should be readable");
+            fsqlite_types::record::parse_record(&payload)
+                .expect("staged row payload should decode as a SQLite record")
+        };
+
+        let conn1 = Connection::open(&db).unwrap();
+        let conn2 = Connection::open(&db).unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        assert_eq!(
+            conn1
+                .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_active_row(&conn1),
+            vec![SqliteValue::Null, SqliteValue::Integer(1)],
+            "first writer should stage v=1"
+        );
+
+        let loser_err = match conn2.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
+            Ok(changes) => {
+                assert_eq!(changes, 1, "second writer should affect one row when UPDATE wins");
+                assert_eq!(
+                    read_active_row(&conn2),
+                    vec![SqliteValue::Null, SqliteValue::Integer(1)],
+                    "second writer should initially stage the same stale increment"
+                );
+                conn1.execute("COMMIT;").unwrap();
+                let loser_commit = conn2.execute("COMMIT;");
+                assert!(
+                    loser_commit.is_err(),
+                    "losing writer must fail transiently instead of silently overwriting"
+                );
+                loser_commit.unwrap_err()
+            }
+            Err(err) => {
+                conn1.execute("COMMIT;").unwrap();
+                err
+            }
+        };
+        let winner_commit_seq = conn1
+            .concurrent_commit_index
+            .latest(table_root_pgno)
+            .expect("winner commit should publish commit-index entry");
+        assert!(
+            loser_err.is_transient(),
+            "losing writer should surface as transient retryable error: {loser_err}"
+        );
+
+        conn2.execute("ROLLBACK;").unwrap();
+
+        let visible_after_rollback = conn2.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
+        assert_eq!(
+            visible_after_rollback.get(0),
+            Some(&SqliteValue::Integer(1)),
+            "loser connection must see winner state after rollback"
+        );
+
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+        let retry_session_id = conn2
+            .concurrent_session_id
+            .borrow()
+            .expect("retry BEGIN CONCURRENT should create a fresh session");
+        let retry_snapshot_high = {
+            let registry = lock_unpoisoned(&conn2.concurrent_registry);
+            registry
+                .get(retry_session_id)
+                .expect("retry session handle should exist")
+                .snapshot()
+                .high
+        };
+        assert!(
+            retry_snapshot_high >= winner_commit_seq,
+            "retry BEGIN CONCURRENT bound stale snapshot_high={} winner_commit_seq={}",
+            retry_snapshot_high.get(),
+            winner_commit_seq.get()
+        );
+
+        assert_eq!(
+            conn2
+                .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
+                .unwrap(),
+            1
+        );
+        let retry_staged_row = read_active_row(&conn2);
+        assert_eq!(
+            retry_staged_row,
+            vec![SqliteValue::Null, SqliteValue::Integer(2)],
+            "retrying loser must re-read committed row before rewrite; snapshot_high={} winner_commit_seq={} latest_commit_index={:?}",
+            retry_snapshot_high.get(),
+            winner_commit_seq.get(),
+            conn2
+                .concurrent_commit_index
+                .latest(table_root_pgno)
+                .map(|seq| seq.get())
+        );
+
+        conn2.execute("COMMIT;").unwrap();
+
+        let final_row = conn1.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
+        assert_eq!(
+            final_row.get(0),
+            Some(&SqliteValue::Integer(2)),
+            "retrying loser should advance the row to 2 after rebinding"
+        );
     }
 
     // =========================================================================
@@ -74799,6 +75618,34 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} recursive cte tree walk mismatches", mismatches2.len());
+        }
+    }
+
+    /// Oracle: JSON1 table-valued functions in FROM clauses.
+    #[test]
+    fn test_conformance_json_table_valued_functions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // SQLite documents json_each/json_tree id values as internal
+            // housekeeping numbers. Conformance here compares the stable
+            // visible columns while still exercising table-valued execution.
+            "SELECT key, value, type, atom, fullkey, path FROM json_each(json_array(10, 20)) ORDER BY key",
+            "SELECT jt.fullkey, jt.atom FROM json_tree('{\"a\":{\"b\":1},\"c\":[2]}') AS jt WHERE jt.atom IS NOT NULL ORDER BY jt.id",
+            "SELECT key, type, path FROM json_each('{\"a\":1,\"b\":2}') AS j ORDER BY j.key",
+            "SELECT key, value, type, atom, fullkey, path FROM (SELECT * FROM json_each('[3,4]')) AS sub ORDER BY key",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for mismatch in &mismatches {
+                eprintln!("{mismatch}\n");
+            }
+            panic!(
+                "{} JSON table-valued conformance mismatches found",
+                mismatches.len()
+            );
         }
     }
 
