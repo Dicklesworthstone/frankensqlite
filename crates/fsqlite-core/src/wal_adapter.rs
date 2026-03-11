@@ -11,13 +11,15 @@
 use std::collections::HashMap;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_pager::traits::{PreparedWalFrameBatch, PreparedWalFrameMeta, WalFrameRef};
+use fsqlite_pager::traits::{
+    PreparedWalChecksumTransform, PreparedWalFrameBatch, PreparedWalFrameMeta, WalFrameRef,
+};
 use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use fsqlite_wal::checksum::WalSalts;
+use fsqlite_wal::checksum::{WAL_FRAME_HEADER_SIZE, WalChecksumTransform, WalSalts};
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
@@ -393,6 +395,26 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             })
             .collect();
         let frame_bytes = self.wal.prepare_frame_bytes(&wal_frames)?;
+        let checksum_transforms = frame_bytes
+            .chunks_exact(self.wal.frame_size())
+            .map(|frame| {
+                WalChecksumTransform::for_wal_frame(
+                    frame,
+                    self.wal.page_size(),
+                    self.wal.big_endian_checksum(),
+                )
+            })
+            .map(|result| {
+                result.map(|transform| PreparedWalChecksumTransform {
+                    a11: transform.a11,
+                    a12: transform.a12,
+                    a21: transform.a21,
+                    a22: transform.a22,
+                    c1: transform.c1,
+                    c2: transform.c2,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let frame_metas = frames
             .iter()
             .map(|frame| PreparedWalFrameMeta {
@@ -403,8 +425,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
         Ok(Some(PreparedWalFrameBatch {
             frame_size: self.wal.frame_size(),
-            page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+            page_data_offset: WAL_FRAME_HEADER_SIZE,
             frame_metas,
+            checksum_transforms,
             frame_bytes,
         }))
     }
@@ -412,7 +435,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     fn append_prepared_frames(
         &mut self,
         cx: &Cx,
-        prepared: &PreparedWalFrameBatch,
+        prepared: &mut PreparedWalFrameBatch,
     ) -> Result<()> {
         if prepared.frame_count() == 0 {
             return Ok(());
@@ -424,9 +447,23 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             self.wal.refresh(cx)?;
         }
 
-        let mut frame_bytes = prepared.frame_bytes.clone();
-        self.wal
-            .append_prepared_frame_bytes(cx, &mut frame_bytes, prepared.frame_count())?;
+        let checksum_transforms = prepared
+            .checksum_transforms
+            .iter()
+            .map(|transform| WalChecksumTransform {
+                a11: transform.a11,
+                a12: transform.a12,
+                a21: transform.a21,
+                a22: transform.a22,
+                c1: transform.c1,
+                c2: transform.c2,
+            })
+            .collect::<Vec<_>>();
+        self.wal.append_prepared_frame_bytes(
+            cx,
+            &mut prepared.frame_bytes,
+            &checksum_transforms,
+        )?;
         self.refresh_before_append = false;
 
         if let Some(hook) = &mut self.fec_hook {
@@ -914,6 +951,77 @@ mod tests {
             );
             assert_eq!(
                 single_data, batch_data,
+                "frame payload {frame_index} must match"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adapter_prepared_batch_append_checksum_chain_matches_single_append() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_prepared = MemoryVfs::new();
+
+        let mut adapter_single = make_adapter(&vfs_single, &cx);
+        let mut adapter_prepared = make_adapter(&vfs_prepared, &cx);
+
+        let pages: Vec<Vec<u8>> = (0..4u8).map(sample_page).collect();
+        let commit_sizes = [0_u32, 0, 0, 4];
+
+        for (index, page) in pages.iter().enumerate() {
+            adapter_single
+                .append_frame(
+                    &cx,
+                    u32::try_from(index + 1).expect("page number fits u32"),
+                    page,
+                    commit_sizes[index],
+                )
+                .expect("single append");
+        }
+
+        let batch_frames: Vec<_> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| WalFrameRef {
+                page_number: u32::try_from(index + 1).expect("page number fits u32"),
+                page_data: page,
+                db_size_if_commit: commit_sizes[index],
+            })
+            .collect();
+        let mut prepared = adapter_prepared
+            .prepare_append_frames(&batch_frames)
+            .expect("prepare append")
+            .expect("prepared batch");
+        adapter_prepared
+            .append_prepared_frames(&cx, &mut prepared)
+            .expect("append prepared");
+
+        assert_eq!(
+            adapter_single.frame_count(),
+            adapter_prepared.frame_count(),
+            "prepared adapter append must preserve frame count"
+        );
+        assert_eq!(
+            adapter_single.wal.running_checksum(),
+            adapter_prepared.wal.running_checksum(),
+            "prepared adapter append must preserve checksum chain"
+        );
+
+        for frame_index in 0..pages.len() {
+            let (single_header, single_data) = adapter_single
+                .wal
+                .read_frame(&cx, frame_index)
+                .expect("read single frame");
+            let (prepared_header, prepared_data) = adapter_prepared
+                .wal
+                .read_frame(&cx, frame_index)
+                .expect("read prepared frame");
+            assert_eq!(
+                single_header, prepared_header,
+                "frame header {frame_index} must match"
+            );
+            assert_eq!(
+                single_data, prepared_data,
                 "frame payload {frame_index} must match"
             );
         }

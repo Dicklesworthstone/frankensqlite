@@ -21,8 +21,9 @@ use tracing::{debug, error};
 
 use crate::checksum::{
     SqliteWalChecksum, WAL_FORMAT_VERSION, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WAL_MAGIC_LE,
-    WalFrameHeader, WalHeader, WalSalts, compute_wal_frame_checksum, read_wal_header_checksum,
-    wal_header_checksum, write_wal_frame_checksum, write_wal_frame_salts,
+    WalChecksumTransform, WalFrameHeader, WalHeader, WalSalts, compute_wal_frame_checksum,
+    read_wal_header_checksum, wal_header_checksum, write_wal_frame_checksum,
+    write_wal_frame_checksum_fields, write_wal_frame_salts,
 };
 
 #[inline]
@@ -62,11 +63,11 @@ pub struct WalFile<F: VfsFile> {
     running_checksum: SqliteWalChecksum,
     /// Number of valid frames currently in the WAL.
     frame_count: usize,
-    /// Reusable contiguous assembly scratch for append paths.
+    /// Reusable contiguous scratch for direct append paths.
     ///
     /// Ownership is per-`WalFile` handle. Append methods already require
-    /// `&mut self`, so reuse is serialized per handle and safe under
-    /// concurrent writers that use distinct WAL handles.
+    /// `&mut self`, so reuse stays serialized per handle without reintroducing
+    /// any cross-writer coordination.
     frame_scratch: Vec<u8>,
 }
 
@@ -387,6 +388,24 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn frame_scratch_len(&self) -> usize {
+        self.frame_scratch.len()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn frame_scratch_capacity(&self) -> usize {
+        self.frame_scratch.capacity()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn frame_scratch_ptr(&self) -> *const u8 {
+        self.frame_scratch.as_ptr()
+    }
+
     /// Create a new WAL file, writing the 32-byte header.
     ///
     /// The file should already be opened via the VFS. This overwrites any
@@ -635,29 +654,36 @@ impl<F: VfsFile> WalFile<F> {
 
         // Build the frame: header + page data.
         let frame_size = self.frame_size();
-        let mut frame = vec![0u8; frame_size];
-
-        // Write page number and db_size into the first 8 bytes.
-        frame[..4].copy_from_slice(&page_number.to_be_bytes());
-        frame[4..8].copy_from_slice(&db_size_if_commit.to_be_bytes());
-
-        // Write salts.
-        write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], self.header.salts)?;
-
-        // Copy page data.
-        frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page_data);
-
-        // Compute and write checksum (updates bytes 16..24 of the frame header).
-        let new_checksum = write_wal_frame_checksum(
-            &mut frame,
-            self.page_size,
-            self.running_checksum,
-            self.big_endian_checksum,
-        )?;
-
-        // Write to file.
+        let page_size = self.page_size;
+        let salts = self.header.salts;
+        let running_checksum = self.running_checksum;
+        let big_endian_checksum = self.big_endian_checksum;
         let offset = self.frame_offset(self.frame_count);
-        self.file.write(cx, &frame, offset)?;
+
+        let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
+        frame_scratch.resize(frame_size, 0);
+        let append_result = (|| -> Result<SqliteWalChecksum> {
+            let frame = &mut frame_scratch[..frame_size];
+
+            // Write page number and db_size into the first 8 bytes.
+            frame[..4].copy_from_slice(&page_number.to_be_bytes());
+            frame[4..8].copy_from_slice(&db_size_if_commit.to_be_bytes());
+
+            // Write salts.
+            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)?;
+
+            // Copy page data.
+            frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(page_data);
+
+            // Compute and write checksum (updates bytes 16..24 of the frame header).
+            let new_checksum =
+                write_wal_frame_checksum(frame, page_size, running_checksum, big_endian_checksum)?;
+
+            self.file.write(cx, frame, offset)?;
+            Ok(new_checksum)
+        })();
+        self.frame_scratch = frame_scratch;
+        let new_checksum = append_result?;
 
         self.running_checksum = new_checksum;
         self.frame_count += 1;
@@ -732,16 +758,17 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Finalize checksums for a previously prepared frame buffer and append it.
     ///
-    /// `prepared_frame_bytes` must contain `frame_count` frame records in WAL
-    /// frame layout with page number, db_size, salts, and payload already
-    /// serialized. The checksum bytes are overwritten in-place using the live
-    /// rolling checksum seed from this WAL handle.
+    /// `prepared_frame_bytes` must contain `frame_transforms.len()` frame
+    /// records in WAL frame layout with page number, db_size, salts, and
+    /// payload already serialized. The checksum bytes are overwritten in-place
+    /// using the live rolling checksum seed from this WAL handle.
     pub fn append_prepared_frame_bytes(
         &mut self,
         cx: &Cx,
         prepared_frame_bytes: &mut [u8],
-        frame_count: usize,
+        frame_transforms: &[WalChecksumTransform],
     ) -> Result<()> {
+        let frame_count = frame_transforms.len();
         if frame_count == 0 {
             return Ok(());
         }
@@ -768,13 +795,13 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         let mut running_checksum = self.running_checksum;
-        for frame_slice in prepared_frame_bytes.chunks_exact_mut(frame_size) {
-            running_checksum = write_wal_frame_checksum(
-                frame_slice,
-                self.page_size,
-                running_checksum,
-                self.big_endian_checksum,
-            )?;
+        for (frame_slice, frame_transform) in prepared_frame_bytes
+            .chunks_exact_mut(frame_size)
+            .zip(frame_transforms.iter())
+        {
+            write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], self.header.salts)?;
+            running_checksum = frame_transform.apply(running_checksum);
+            write_wal_frame_checksum_fields(frame_slice, running_checksum)?;
         }
 
         let start_frame_index = self.frame_count;
@@ -816,8 +843,49 @@ impl<F: VfsFile> WalFile<F> {
             return Ok(());
         }
 
-        let mut frame_buf = self.prepare_frame_bytes(frames)?;
-        self.append_prepared_frame_bytes(cx, &mut frame_buf, frames.len())
+        let frame_size = self.frame_size();
+        let total_bytes = frames
+            .len()
+            .checked_mul(frame_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        let page_size = self.page_size;
+        let salts = self.header.salts;
+        let big_endian_checksum = self.big_endian_checksum;
+
+        let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
+        frame_scratch.resize(total_bytes, 0);
+        let append_result = (|| -> Result<()> {
+            for (idx, frame) in frames.iter().enumerate() {
+                if frame.page_data.len() != page_size {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "page data size mismatch in batch frame {idx}: expected {page_size}, got {}",
+                            frame.page_data.len()
+                        ),
+                    });
+                }
+
+                let buf_offset = idx
+                    .checked_mul(frame_size)
+                    .ok_or(FrankenError::DatabaseFull)?;
+                let frame_slice = &mut frame_scratch[buf_offset..buf_offset + frame_size];
+
+                frame_slice[..4].copy_from_slice(&frame.page_number.to_be_bytes());
+                frame_slice[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
+                write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], salts)?;
+                frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(frame.page_data);
+            }
+
+            let frame_transforms = frame_scratch
+                .chunks_exact(frame_size)
+                .map(|frame| {
+                    WalChecksumTransform::for_wal_frame(frame, page_size, big_endian_checksum)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.append_prepared_frame_bytes(cx, &mut frame_scratch, &frame_transforms)
+        })();
+        self.frame_scratch = frame_scratch;
+        append_result
     }
 
     /// Read a frame by 0-based index, returning header and page data.
@@ -947,6 +1015,7 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
         self.frame_count = 0;
+        self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
         debug!(
@@ -980,13 +1049,35 @@ impl<F: VfsFile> WalFile<F> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::traits::Vfs;
+    use serde_json::{Value, json};
 
     use super::*;
 
     const PAGE_SIZE: u32 = 4096;
+    const TRACK_C_SCRATCH_BENCH_BEAD_ID: &str = "bd-db300.3.4.3";
+    const TRACK_C_SCRATCH_BENCH_WARMUP_ITERS: usize = 4;
+    const TRACK_C_SCRATCH_BENCH_MEASURE_ITERS: usize = 12;
+
+    #[derive(Clone, Copy)]
+    enum TrackCScratchBenchMode {
+        FreshAllocBaseline,
+        ScratchReuseCandidate,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TrackCScratchBenchRun {
+        elapsed_ns: u64,
+        explicit_fresh_buffer_allocations: usize,
+        scratch_capacity_growth_events: usize,
+        peak_scratch_capacity_bytes: usize,
+        frame_buffer_bytes_per_operation: usize,
+        operations_per_sample: usize,
+    }
 
     fn test_cx() -> Cx {
         Cx::default()
@@ -1015,6 +1106,264 @@ mod tests {
             .open(cx, Some(std::path::Path::new("test.db-wal")), flags)
             .expect("open WAL file");
         file
+    }
+
+    fn track_c_scratch_run_summary(runs: &[TrackCScratchBenchRun]) -> Value {
+        let mut elapsed_samples: Vec<_> = runs.iter().map(|run| run.elapsed_ns).collect();
+        elapsed_samples.sort_unstable();
+        let sample_count = elapsed_samples.len();
+        let min_ns = elapsed_samples.first().copied().unwrap_or(0);
+        let median_ns = if sample_count == 0 {
+            0
+        } else {
+            elapsed_samples[sample_count / 2]
+        };
+        let max_ns = elapsed_samples.last().copied().unwrap_or(0);
+        let mean_ns = if sample_count == 0 {
+            0.0
+        } else {
+            let total_ns: u128 = elapsed_samples.iter().map(|ns| u128::from(*ns)).sum();
+            (total_ns as f64) / (sample_count as f64)
+        };
+        let explicit_fresh_buffer_allocations = runs
+            .iter()
+            .map(|run| run.explicit_fresh_buffer_allocations)
+            .max()
+            .unwrap_or(0);
+        let scratch_capacity_growth_events = runs
+            .iter()
+            .map(|run| run.scratch_capacity_growth_events)
+            .max()
+            .unwrap_or(0);
+        let peak_scratch_capacity_bytes = runs
+            .iter()
+            .map(|run| run.peak_scratch_capacity_bytes)
+            .max()
+            .unwrap_or(0);
+        let frame_buffer_bytes_per_operation = runs
+            .first()
+            .map(|run| run.frame_buffer_bytes_per_operation)
+            .unwrap_or(0);
+        let operations_per_sample = runs
+            .first()
+            .map(|run| run.operations_per_sample)
+            .unwrap_or(0);
+
+        json!({
+            "samples_ns": elapsed_samples,
+            "min_ns": min_ns,
+            "median_ns": median_ns,
+            "max_ns": max_ns,
+            "mean_ns": mean_ns,
+            "explicit_fresh_buffer_allocations_per_sample": explicit_fresh_buffer_allocations,
+            "scratch_capacity_growth_events_per_sample": scratch_capacity_growth_events,
+            "peak_scratch_capacity_bytes": peak_scratch_capacity_bytes,
+            "frame_buffer_bytes_per_operation": frame_buffer_bytes_per_operation,
+            "operations_per_sample": operations_per_sample,
+            "frame_buffer_bytes_requested_per_sample": explicit_fresh_buffer_allocations
+                .saturating_mul(frame_buffer_bytes_per_operation),
+        })
+    }
+
+    fn append_frames_fresh_alloc<F: VfsFile>(
+        wal: &mut WalFile<F>,
+        cx: &Cx,
+        frames: &[WalAppendFrameRef<'_>],
+    ) -> Result<()> {
+        let frame_size = wal.frame_size();
+        let mut frame_buf = wal.prepare_frame_bytes(frames)?;
+        let frame_transforms = frame_buf
+            .chunks_exact(frame_size)
+            .map(|frame| {
+                WalChecksumTransform::for_wal_frame(
+                    frame,
+                    wal.page_size(),
+                    wal.big_endian_checksum(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        wal.append_prepared_frame_bytes(cx, &mut frame_buf, &frame_transforms)
+    }
+
+    fn track_c_measure_single_frame_case(
+        mode: TrackCScratchBenchMode,
+        operations: usize,
+    ) -> TrackCScratchBenchRun {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let pages: Vec<Vec<u8>> = (0..operations)
+            .map(|i| sample_page(u8::try_from(i % 251).expect("modulo fits u8")))
+            .collect();
+        let frame_buffer_bytes_per_operation = wal.frame_size();
+        let mut explicit_fresh_buffer_allocations = 0usize;
+        let mut scratch_capacity_growth_events = 0usize;
+        let mut previous_scratch_capacity = 0usize;
+
+        let start = Instant::now();
+        for (idx, page) in pages.iter().enumerate() {
+            let page_number = u32::try_from(idx).expect("index fits u32") + 1;
+            match mode {
+                TrackCScratchBenchMode::FreshAllocBaseline => {
+                    let frames = [WalAppendFrameRef {
+                        page_number,
+                        page_data: page,
+                        db_size_if_commit: page_number,
+                    }];
+                    append_frames_fresh_alloc(&mut wal, &cx, &frames).expect("append baseline");
+                    explicit_fresh_buffer_allocations += 1;
+                }
+                TrackCScratchBenchMode::ScratchReuseCandidate => {
+                    wal.append_frame(&cx, page_number, page, page_number)
+                        .expect("append candidate");
+                    let scratch_capacity = wal.frame_scratch_capacity();
+                    if scratch_capacity > previous_scratch_capacity {
+                        scratch_capacity_growth_events += 1;
+                        previous_scratch_capacity = scratch_capacity;
+                    }
+                }
+            }
+        }
+
+        TrackCScratchBenchRun {
+            elapsed_ns: u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            explicit_fresh_buffer_allocations,
+            scratch_capacity_growth_events,
+            peak_scratch_capacity_bytes: wal.frame_scratch_capacity(),
+            frame_buffer_bytes_per_operation,
+            operations_per_sample: operations,
+        }
+    }
+
+    fn track_c_measure_batch_case<const N: usize>(
+        mode: TrackCScratchBenchMode,
+        operations: usize,
+    ) -> TrackCScratchBenchRun {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let pages_per_operation: Vec<[Vec<u8>; N]> = (0..operations)
+            .map(|operation_idx| {
+                std::array::from_fn(|frame_idx| {
+                    sample_page(
+                        u8::try_from((operation_idx * N + frame_idx) % 251)
+                            .expect("modulo fits u8"),
+                    )
+                })
+            })
+            .collect();
+        let frame_buffer_bytes_per_operation = wal
+            .frame_size()
+            .checked_mul(N)
+            .expect("frame bytes per operation fit usize");
+        let mut explicit_fresh_buffer_allocations = 0usize;
+        let mut scratch_capacity_growth_events = 0usize;
+        let mut previous_scratch_capacity = 0usize;
+
+        let start = Instant::now();
+        for (operation_idx, pages) in pages_per_operation.iter().enumerate() {
+            let page_base = u32::try_from(
+                operation_idx
+                    .checked_mul(N)
+                    .expect("operation frame base fits usize"),
+            )
+            .expect("frame base fits u32")
+                + 1;
+            let commit_db_size = page_base + u32::try_from(N).expect("N fits u32") - 1;
+            let frames: [WalAppendFrameRef<'_>; N] =
+                std::array::from_fn(|frame_idx| WalAppendFrameRef {
+                    page_number: page_base
+                        + u32::try_from(frame_idx).expect("frame index fits u32"),
+                    page_data: &pages[frame_idx],
+                    db_size_if_commit: if frame_idx + 1 == N {
+                        commit_db_size
+                    } else {
+                        0
+                    },
+                });
+
+            match mode {
+                TrackCScratchBenchMode::FreshAllocBaseline => {
+                    append_frames_fresh_alloc(&mut wal, &cx, &frames).expect("append baseline");
+                    explicit_fresh_buffer_allocations += 1;
+                }
+                TrackCScratchBenchMode::ScratchReuseCandidate => {
+                    wal.append_frames(&cx, &frames).expect("append candidate");
+                    let scratch_capacity = wal.frame_scratch_capacity();
+                    if scratch_capacity > previous_scratch_capacity {
+                        scratch_capacity_growth_events += 1;
+                        previous_scratch_capacity = scratch_capacity;
+                    }
+                }
+            }
+        }
+
+        TrackCScratchBenchRun {
+            elapsed_ns: u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            explicit_fresh_buffer_allocations,
+            scratch_capacity_growth_events,
+            peak_scratch_capacity_bytes: wal.frame_scratch_capacity(),
+            frame_buffer_bytes_per_operation,
+            operations_per_sample: operations,
+        }
+    }
+
+    fn track_c_scratch_case_report(
+        scenario_id: &str,
+        frames_per_operation: usize,
+        operations_per_sample: usize,
+        baseline_measure: impl Fn() -> TrackCScratchBenchRun,
+        candidate_measure: impl Fn() -> TrackCScratchBenchRun,
+    ) -> Value {
+        for _ in 0..TRACK_C_SCRATCH_BENCH_WARMUP_ITERS {
+            let _ = baseline_measure();
+            let _ = candidate_measure();
+        }
+
+        let baseline_runs: Vec<_> = (0..TRACK_C_SCRATCH_BENCH_MEASURE_ITERS)
+            .map(|_| baseline_measure())
+            .collect();
+        let candidate_runs: Vec<_> = (0..TRACK_C_SCRATCH_BENCH_MEASURE_ITERS)
+            .map(|_| candidate_measure())
+            .collect();
+        let baseline_summary = track_c_scratch_run_summary(&baseline_runs);
+        let candidate_summary = track_c_scratch_run_summary(&candidate_runs);
+        let baseline_median = baseline_summary["median_ns"].as_u64().unwrap_or(0);
+        let candidate_median = candidate_summary["median_ns"].as_u64().unwrap_or(0);
+        let baseline_allocations = baseline_summary["explicit_fresh_buffer_allocations_per_sample"]
+            .as_u64()
+            .unwrap_or(0);
+        let candidate_growths = candidate_summary["scratch_capacity_growth_events_per_sample"]
+            .as_u64()
+            .unwrap_or(0);
+        let baseline_requested_bytes = baseline_summary["frame_buffer_bytes_requested_per_sample"]
+            .as_u64()
+            .unwrap_or(0);
+        let candidate_peak_scratch_bytes = candidate_summary["peak_scratch_capacity_bytes"]
+            .as_u64()
+            .unwrap_or(0);
+
+        json!({
+            "scenario_id": scenario_id,
+            "frames_per_operation": frames_per_operation,
+            "operations_per_sample": operations_per_sample,
+            "fresh_alloc_baseline": baseline_summary,
+            "scratch_reuse_candidate": candidate_summary,
+            "fresh_buffer_allocations_avoided_per_sample": baseline_allocations.saturating_sub(candidate_growths),
+            "buffer_bytes_saved_vs_fresh_requested_per_sample": baseline_requested_bytes.saturating_sub(candidate_peak_scratch_bytes),
+            "speedup_vs_baseline_median": if candidate_median == 0 {
+                0.0
+            } else {
+                (baseline_median as f64) / (candidate_median as f64)
+            },
+            "faster_variant_by_median": if candidate_median <= baseline_median {
+                "scratch_reuse_candidate"
+            } else {
+                "fresh_alloc_baseline"
+            },
+        })
     }
 
     #[test]
@@ -2086,6 +2435,426 @@ mod tests {
             let (batch_header, batch_data) = wal_batch.read_frame(&cx, i).expect("read batch");
             assert_eq!(single_header, batch_header, "frame header {i} must match");
             assert_eq!(single_data, batch_data, "frame payload {i} must match");
+        }
+    }
+
+    #[test]
+    fn test_append_frame_reuses_frame_scratch_between_calls() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        wal.append_frame(&cx, 1, &sample_page(0x11), 0)
+            .expect("append first");
+        let scratch_len = wal.frame_scratch_len();
+        let scratch_capacity = wal.frame_scratch_capacity();
+        let scratch_ptr = wal.frame_scratch_ptr();
+
+        wal.append_frame(&cx, 2, &sample_page(0x22), 2)
+            .expect("append second");
+
+        assert_eq!(
+            wal.frame_scratch_len(),
+            wal.frame_size(),
+            "single-frame append should keep one frame sized scratch"
+        );
+        assert_eq!(
+            wal.frame_scratch_len(),
+            scratch_len,
+            "single-frame scratch length should stay constant across appends"
+        );
+        assert_eq!(
+            wal.frame_scratch_capacity(),
+            scratch_capacity,
+            "single-frame scratch should retain its allocation"
+        );
+        assert_eq!(
+            wal.frame_scratch_ptr(),
+            scratch_ptr,
+            "single-frame scratch should reuse the same backing buffer"
+        );
+    }
+
+    #[test]
+    fn test_batch_append_reuses_frame_scratch_between_calls() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let first_pages: Vec<Vec<u8>> = (0..3u8).map(sample_page).collect();
+        let first_frames: Vec<_> = (0..3)
+            .map(|i| WalAppendFrameRef {
+                page_number: u32::try_from(i).expect("index fits u32") + 1,
+                page_data: &first_pages[i],
+                db_size_if_commit: 0,
+            })
+            .collect();
+        wal.append_frames(&cx, &first_frames)
+            .expect("append first batch");
+        let scratch_capacity = wal.frame_scratch_capacity();
+        let scratch_ptr = wal.frame_scratch_ptr();
+
+        let second_pages: Vec<Vec<u8>> = (0..2u8).map(|i| sample_page(i + 10)).collect();
+        let second_frames: Vec<_> = (0..2)
+            .map(|i| WalAppendFrameRef {
+                page_number: u32::try_from(i).expect("index fits u32") + 10,
+                page_data: &second_pages[i],
+                db_size_if_commit: if i == 1 { 11 } else { 0 },
+            })
+            .collect();
+        wal.append_frames(&cx, &second_frames)
+            .expect("append second batch");
+
+        assert_eq!(
+            wal.frame_scratch_len(),
+            second_frames.len() * wal.frame_size(),
+            "batch scratch length should track the active batch size"
+        );
+        assert_eq!(
+            wal.frame_scratch_capacity(),
+            scratch_capacity,
+            "smaller follow-on batches should retain the existing scratch allocation"
+        );
+        assert_eq!(
+            wal.frame_scratch_ptr(),
+            scratch_ptr,
+            "smaller follow-on batches should reuse the same backing buffer"
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_frame_scratch_len_without_dropping_capacity() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let reset_salts = WalSalts {
+            salt1: 0xABCD_EF01,
+            salt2: 0x1020_3040,
+        };
+
+        let pages: Vec<Vec<u8>> = (0..4u8).map(sample_page).collect();
+        let frames: Vec<_> = (0..4)
+            .map(|i| WalAppendFrameRef {
+                page_number: u32::try_from(i).expect("index fits u32") + 1,
+                page_data: &pages[i],
+                db_size_if_commit: if i == 3 { 4 } else { 0 },
+            })
+            .collect();
+        wal.append_frames(&cx, &frames).expect("append batch");
+        let scratch_capacity = wal.frame_scratch_capacity();
+        let scratch_ptr = wal.frame_scratch_ptr();
+
+        wal.reset(&cx, 1, reset_salts, false).expect("reset WAL");
+
+        assert_eq!(
+            wal.frame_scratch_len(),
+            0,
+            "reset should leave scratch empty for the next append cycle"
+        );
+        assert_eq!(
+            wal.frame_scratch_capacity(),
+            scratch_capacity,
+            "reset should preserve scratch capacity for reuse"
+        );
+        assert_eq!(
+            wal.frame_scratch_ptr(),
+            scratch_ptr,
+            "reset should keep the existing scratch allocation alive"
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark evidence only"]
+    fn wal_frame_scratch_benchmark_report() {
+        let cases = vec![
+            track_c_scratch_case_report(
+                "single_frame_256_ops",
+                1,
+                256,
+                || {
+                    track_c_measure_single_frame_case(
+                        TrackCScratchBenchMode::FreshAllocBaseline,
+                        256,
+                    )
+                },
+                || {
+                    track_c_measure_single_frame_case(
+                        TrackCScratchBenchMode::ScratchReuseCandidate,
+                        256,
+                    )
+                },
+            ),
+            track_c_scratch_case_report(
+                "batch_8_frames_64_ops",
+                8,
+                64,
+                || track_c_measure_batch_case::<8>(TrackCScratchBenchMode::FreshAllocBaseline, 64),
+                || {
+                    track_c_measure_batch_case::<8>(
+                        TrackCScratchBenchMode::ScratchReuseCandidate,
+                        64,
+                    )
+                },
+            ),
+            track_c_scratch_case_report(
+                "batch_32_frames_16_ops",
+                32,
+                16,
+                || track_c_measure_batch_case::<32>(TrackCScratchBenchMode::FreshAllocBaseline, 16),
+                || {
+                    track_c_measure_batch_case::<32>(
+                        TrackCScratchBenchMode::ScratchReuseCandidate,
+                        16,
+                    )
+                },
+            ),
+        ];
+
+        let report = json!({
+            "schema_version": "fsqlite.track_c.wal_scratch_benchmark.v1",
+            "bead_id": TRACK_C_SCRATCH_BENCH_BEAD_ID,
+            "parent_bead_id": "bd-db300.3.4",
+            "measured_operation": "wal_frame_assembly_and_append",
+            "warmup_iterations": TRACK_C_SCRATCH_BENCH_WARMUP_ITERS,
+            "measurement_iterations": TRACK_C_SCRATCH_BENCH_MEASURE_ITERS,
+            "vfs": "memory",
+            "baseline_variant": "fresh_frame_buffer_per_operation",
+            "candidate_variant": "reusable_wal_handle_frame_scratch",
+            "cases": cases,
+        });
+
+        println!("BEGIN_BD_DB300_3_4_3_REPORT");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!("END_BD_DB300_3_4_3_REPORT");
+    }
+
+    #[test]
+    fn test_prepared_batch_append_checksum_chain_matches_single_append() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_prepared = MemoryVfs::new();
+        let page_size = usize::try_from(PAGE_SIZE).expect("page size fits usize");
+
+        let pages: Vec<Vec<u8>> = (0..6u8).map(sample_page).collect();
+        let page_nums: Vec<u32> = (1..=6u32).collect();
+        let commit_sizes: Vec<u32> = vec![0, 0, 3, 0, 0, 6];
+
+        let file_single = open_wal_file(&vfs_single, &cx);
+        let mut wal_single =
+            WalFile::create(&cx, file_single, PAGE_SIZE, 0, test_salts()).expect("create single");
+        for i in 0..6 {
+            wal_single
+                .append_frame(&cx, page_nums[i], &pages[i], commit_sizes[i])
+                .expect("append single");
+        }
+
+        let file_prepared = open_wal_file(&vfs_prepared, &cx);
+        let mut wal_prepared = WalFile::create(&cx, file_prepared, PAGE_SIZE, 0, test_salts())
+            .expect("create prepared");
+        let frames: Vec<_> = (0..6)
+            .map(|i| WalAppendFrameRef {
+                page_number: page_nums[i],
+                page_data: &pages[i],
+                db_size_if_commit: commit_sizes[i],
+            })
+            .collect();
+        let mut prepared_bytes = wal_prepared
+            .prepare_frame_bytes(&frames)
+            .expect("prepare frame bytes");
+        let frame_transforms = prepared_bytes
+            .chunks_exact(wal_prepared.frame_size())
+            .map(|frame| {
+                WalChecksumTransform::for_wal_frame(
+                    frame,
+                    page_size,
+                    wal_prepared.big_endian_checksum(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .expect("compute frame transforms");
+        wal_prepared
+            .append_prepared_frame_bytes(&cx, &mut prepared_bytes, &frame_transforms)
+            .expect("append prepared batch");
+
+        assert_eq!(
+            wal_single.frame_count(),
+            wal_prepared.frame_count(),
+            "prepared append must preserve frame count"
+        );
+        assert_eq!(
+            wal_single.running_checksum(),
+            wal_prepared.running_checksum(),
+            "prepared append must preserve checksum chain"
+        );
+
+        for i in 0..6 {
+            let (single_header, single_data) = wal_single.read_frame(&cx, i).expect("read single");
+            let (prepared_header, prepared_data) =
+                wal_prepared.read_frame(&cx, i).expect("read prepared");
+            assert_eq!(
+                single_header, prepared_header,
+                "frame header {i} must match"
+            );
+            assert_eq!(single_data, prepared_data, "frame payload {i} must match");
+        }
+    }
+
+    #[test]
+    fn test_prepared_batch_reseeds_after_intervening_growth() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_prepared = MemoryVfs::new();
+        let page_size = usize::try_from(PAGE_SIZE).expect("page size fits usize");
+
+        let pages: Vec<Vec<u8>> = (0..3u8).map(sample_page).collect();
+        let page_nums: Vec<u32> = (1..=3u32).collect();
+        let commit_sizes: Vec<u32> = vec![0, 0, 3];
+        let intervening_page = sample_page(0xAA);
+
+        let file_single = open_wal_file(&vfs_single, &cx);
+        let mut wal_single =
+            WalFile::create(&cx, file_single, PAGE_SIZE, 0, test_salts()).expect("create single");
+        wal_single
+            .append_frame(&cx, 99, &intervening_page, 0)
+            .expect("append intervening single");
+        for i in 0..3 {
+            wal_single
+                .append_frame(&cx, page_nums[i], &pages[i], commit_sizes[i])
+                .expect("append single");
+        }
+
+        let file_prepared = open_wal_file(&vfs_prepared, &cx);
+        let mut wal_prepared = WalFile::create(&cx, file_prepared, PAGE_SIZE, 0, test_salts())
+            .expect("create prepared");
+        let frames: Vec<_> = (0..3)
+            .map(|i| WalAppendFrameRef {
+                page_number: page_nums[i],
+                page_data: &pages[i],
+                db_size_if_commit: commit_sizes[i],
+            })
+            .collect();
+        let mut prepared_bytes = wal_prepared
+            .prepare_frame_bytes(&frames)
+            .expect("prepare frame bytes");
+        let frame_transforms = prepared_bytes
+            .chunks_exact(wal_prepared.frame_size())
+            .map(|frame| {
+                WalChecksumTransform::for_wal_frame(
+                    frame,
+                    page_size,
+                    wal_prepared.big_endian_checksum(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .expect("compute frame transforms");
+        wal_prepared
+            .append_frame(&cx, 99, &intervening_page, 0)
+            .expect("append intervening prepared");
+        wal_prepared
+            .append_prepared_frame_bytes(&cx, &mut prepared_bytes, &frame_transforms)
+            .expect("append prepared batch");
+
+        assert_eq!(
+            wal_single.frame_count(),
+            wal_prepared.frame_count(),
+            "prepared append after growth must preserve frame count"
+        );
+        assert_eq!(
+            wal_single.running_checksum(),
+            wal_prepared.running_checksum(),
+            "prepared append after growth must rebind to the live checksum seed"
+        );
+
+        for i in 0..wal_single.frame_count() {
+            let (single_header, single_data) = wal_single.read_frame(&cx, i).expect("read single");
+            let (prepared_header, prepared_data) =
+                wal_prepared.read_frame(&cx, i).expect("read prepared");
+            assert_eq!(
+                single_header, prepared_header,
+                "frame header {i} must match"
+            );
+            assert_eq!(single_data, prepared_data, "frame payload {i} must match");
+        }
+    }
+
+    #[test]
+    fn test_prepared_batch_rewrites_salts_after_reset() {
+        let cx = test_cx();
+        let vfs_fresh = MemoryVfs::new();
+        let vfs_reset = MemoryVfs::new();
+        let page_size = usize::try_from(PAGE_SIZE).expect("page size fits usize");
+        let reset_salts = WalSalts {
+            salt1: 0x0102_0304,
+            salt2: 0xA0B0_C0D0,
+        };
+
+        let pages: Vec<Vec<u8>> = (0..2u8).map(sample_page).collect();
+        let page_nums: Vec<u32> = (1..=2u32).collect();
+        let commit_sizes: Vec<u32> = vec![0, 2];
+
+        let file_fresh = open_wal_file(&vfs_fresh, &cx);
+        let mut wal_fresh =
+            WalFile::create(&cx, file_fresh, PAGE_SIZE, 7, reset_salts).expect("create fresh");
+        for i in 0..2 {
+            wal_fresh
+                .append_frame(&cx, page_nums[i], &pages[i], commit_sizes[i])
+                .expect("append fresh");
+        }
+
+        let file_reset = open_wal_file(&vfs_reset, &cx);
+        let mut wal_reset =
+            WalFile::create(&cx, file_reset, PAGE_SIZE, 0, test_salts()).expect("create reset");
+        let frames: Vec<_> = (0..2)
+            .map(|i| WalAppendFrameRef {
+                page_number: page_nums[i],
+                page_data: &pages[i],
+                db_size_if_commit: commit_sizes[i],
+            })
+            .collect();
+        let mut prepared_bytes = wal_reset
+            .prepare_frame_bytes(&frames)
+            .expect("prepare frame bytes");
+        let frame_transforms = prepared_bytes
+            .chunks_exact(wal_reset.frame_size())
+            .map(|frame| {
+                WalChecksumTransform::for_wal_frame(
+                    frame,
+                    page_size,
+                    wal_reset.big_endian_checksum(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .expect("compute frame transforms");
+        wal_reset
+            .reset(&cx, 7, reset_salts, false)
+            .expect("reset WAL");
+        wal_reset
+            .append_prepared_frame_bytes(&cx, &mut prepared_bytes, &frame_transforms)
+            .expect("append prepared batch");
+
+        assert_eq!(
+            wal_fresh.frame_count(),
+            wal_reset.frame_count(),
+            "prepared append after reset must preserve frame count"
+        );
+        assert_eq!(
+            wal_fresh.running_checksum(),
+            wal_reset.running_checksum(),
+            "prepared append after reset must rebind to the reset checksum seed"
+        );
+
+        for i in 0..2 {
+            let (fresh_header, fresh_data) = wal_fresh.read_frame(&cx, i).expect("read fresh");
+            let (reset_header, reset_data) = wal_reset.read_frame(&cx, i).expect("read reset");
+            assert_eq!(fresh_header, reset_header, "frame header {i} must match");
+            assert_eq!(
+                fresh_header.salts, reset_salts,
+                "frame {i} must use reset salts"
+            );
+            assert_eq!(fresh_data, reset_data, "frame payload {i} must match");
         }
     }
 

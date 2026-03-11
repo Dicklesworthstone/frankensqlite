@@ -43,6 +43,135 @@ pub struct SqliteWalChecksum {
     pub s2: u32,
 }
 
+/// Affine transform for SQLite's rolling WAL checksum.
+///
+/// Processing aligned WAL bytes maps an incoming `(s1, s2)` seed to a new pair
+/// via an affine transform over wrapping `u32` arithmetic. That lets callers
+/// precompute frame-local checksum work before they know the authoritative
+/// publish-time seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalChecksumTransform {
+    pub a11: u32,
+    pub a12: u32,
+    pub a21: u32,
+    pub a22: u32,
+    pub c1: u32,
+    pub c2: u32,
+}
+
+impl WalChecksumTransform {
+    /// Identity transform.
+    #[must_use]
+    pub const fn identity() -> Self {
+        Self {
+            a11: 1,
+            a12: 0,
+            a21: 0,
+            a22: 1,
+            c1: 0,
+            c2: 0,
+        }
+    }
+
+    #[must_use]
+    fn from_checksum_words(x0: u32, x1: u32) -> Self {
+        Self {
+            a11: 1,
+            a12: 1,
+            a21: 1,
+            a22: 2,
+            c1: x0,
+            c2: x0.wrapping_add(x1),
+        }
+    }
+
+    /// Apply this transform to a running checksum seed.
+    #[must_use]
+    pub fn apply(self, seed: SqliteWalChecksum) -> SqliteWalChecksum {
+        SqliteWalChecksum {
+            s1: self
+                .a11
+                .wrapping_mul(seed.s1)
+                .wrapping_add(self.a12.wrapping_mul(seed.s2))
+                .wrapping_add(self.c1),
+            s2: self
+                .a21
+                .wrapping_mul(seed.s1)
+                .wrapping_add(self.a22.wrapping_mul(seed.s2))
+                .wrapping_add(self.c2),
+        }
+    }
+
+    /// Compose `next` after `self`.
+    #[must_use]
+    pub fn then(self, next: Self) -> Self {
+        Self {
+            a11: next
+                .a11
+                .wrapping_mul(self.a11)
+                .wrapping_add(next.a12.wrapping_mul(self.a21)),
+            a12: next
+                .a11
+                .wrapping_mul(self.a12)
+                .wrapping_add(next.a12.wrapping_mul(self.a22)),
+            a21: next
+                .a21
+                .wrapping_mul(self.a11)
+                .wrapping_add(next.a22.wrapping_mul(self.a21)),
+            a22: next
+                .a21
+                .wrapping_mul(self.a12)
+                .wrapping_add(next.a22.wrapping_mul(self.a22)),
+            c1: next
+                .a11
+                .wrapping_mul(self.c1)
+                .wrapping_add(next.a12.wrapping_mul(self.c2))
+                .wrapping_add(next.c1),
+            c2: next
+                .a21
+                .wrapping_mul(self.c1)
+                .wrapping_add(next.a22.wrapping_mul(self.c2))
+                .wrapping_add(next.c2),
+        }
+    }
+
+    /// Build the transform for aligned WAL checksum bytes.
+    pub fn from_aligned_bytes(data: &[u8], big_endian_checksum_words: bool) -> Result<Self> {
+        if data.len() % 8 != 0 {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL checksum transform input must be 8-byte aligned, got {} bytes",
+                    data.len()
+                ),
+            });
+        }
+
+        let mut transform = Self::identity();
+        for chunk in data.chunks_exact(8) {
+            let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
+            let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
+            transform = transform.then(Self::from_checksum_words(x0, x1));
+        }
+
+        Ok(transform)
+    }
+
+    /// Build the transform for one WAL frame.
+    pub fn for_wal_frame(
+        frame: &[u8],
+        page_size: usize,
+        big_endian_checksum_words: bool,
+    ) -> Result<Self> {
+        ensure_frame_len(frame, page_size)?;
+        let header = Self::from_aligned_bytes(&frame[..8], big_endian_checksum_words)?;
+        let payload = Self::from_aligned_bytes(
+            &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size],
+            big_endian_checksum_words,
+        )?;
+        Ok(header.then(payload))
+    }
+}
+
 /// WAL salts copied into frame headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WalSalts {
@@ -1182,9 +1311,19 @@ pub fn write_wal_frame_checksum(
 ) -> Result<SqliteWalChecksum> {
     let checksum =
         compute_wal_frame_checksum(frame, page_size, previous, big_endian_checksum_words)?;
+    write_wal_frame_checksum_fields(frame, checksum)?;
+    Ok(checksum)
+}
+
+/// Write an already-computed WAL frame checksum into the frame header.
+pub fn write_wal_frame_checksum_fields(
+    frame: &mut [u8],
+    checksum: SqliteWalChecksum,
+) -> Result<()> {
+    ensure_min_len(frame, WAL_FRAME_HEADER_SIZE, "WAL frame")?;
     write_be_u32_at(frame, WAL_FRAME_CKSUM1_OFFSET, checksum.s1);
     write_be_u32_at(frame, WAL_FRAME_CKSUM2_OFFSET, checksum.s2);
-    Ok(checksum)
+    Ok(())
 }
 
 /// Read frame DB-size commit marker.
@@ -1641,6 +1780,41 @@ mod tests {
             validate_wal_chain(&wal_bytes, PAGE_SIZE, false).expect("invalid chain should parse");
         assert_eq!(invalid.reason, Some(WalChainInvalidReason::SaltMismatch));
         assert_eq!(invalid.first_invalid_frame, Some(0));
+    }
+
+    #[test]
+    fn test_wal_checksum_transform_matches_frame_checksum() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 5,
+            salts: WalSalts {
+                salt1: 0x1234_5678,
+                salt2: 0x9ABC_DEF0,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let header_bytes = header.to_bytes().expect("header should serialize");
+        let seed = read_wal_header_checksum(&header_bytes).expect("header checksum should read");
+
+        let mut frame = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+        frame[..4].copy_from_slice(&7_u32.to_be_bytes());
+        frame[4..8].copy_from_slice(&7_u32.to_be_bytes());
+        write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], header.salts)
+            .expect("frame salts should write");
+        frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&sample_page(0x55));
+
+        let transform =
+            WalChecksumTransform::for_wal_frame(&frame, PAGE_SIZE, false).expect("transform");
+        let transformed = transform.apply(seed);
+        let computed =
+            compute_wal_frame_checksum(&frame, PAGE_SIZE, seed, false).expect("checksum");
+
+        assert_eq!(
+            transformed, computed,
+            "precomputed frame transform must match direct checksum evaluation"
+        );
     }
 
     #[test]

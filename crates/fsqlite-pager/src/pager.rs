@@ -1732,7 +1732,7 @@ where
     ) -> Result<()> {
         if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
         {
-            let prepared_batch = {
+            let mut prepared_batch = {
                 let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                     FrankenError::internal("WAL mode active but no WAL backend installed")
                 })?;
@@ -1747,7 +1747,7 @@ where
             let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
-            if let Some(prepared_batch) = prepared_batch.as_ref() {
+            if let Some(prepared_batch) = prepared_batch.as_mut() {
                 wal.append_prepared_frames(cx, prepared_batch)?;
             } else {
                 wal.append_frames(cx, &batch.frames)?;
@@ -2930,6 +2930,232 @@ mod tests {
         let path = PathBuf::from("/observed-lock.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, observed_lock_level)
+    }
+
+    #[derive(Debug, Default)]
+    struct ExclusiveLockMetrics {
+        owner: Option<u64>,
+        acquired_at: Option<Instant>,
+        acquisition_count: usize,
+        hold_samples_ns: Vec<u64>,
+        wait_samples_ns: Vec<u64>,
+    }
+
+    #[derive(Clone)]
+    struct BlockingObservedLockVfs {
+        inner: MemoryVfs,
+        observed_lock_level: Arc<Mutex<LockLevel>>,
+        next_handle_id: StdArc<AtomicU64>,
+        exclusive_metrics: StdArc<(StdMutex<ExclusiveLockMetrics>, StdCondvar)>,
+    }
+
+    impl BlockingObservedLockVfs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                observed_lock_level: Arc::new(Mutex::new(LockLevel::None)),
+                next_handle_id: StdArc::new(AtomicU64::new(1)),
+                exclusive_metrics: StdArc::new((
+                    StdMutex::new(ExclusiveLockMetrics::default()),
+                    StdCondvar::new(),
+                )),
+            }
+        }
+
+        fn observed_lock_level(&self) -> Arc<Mutex<LockLevel>> {
+            Arc::clone(&self.observed_lock_level)
+        }
+
+        fn wait_for_exclusive_acquisitions(&self, target: usize) {
+            let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
+            let mut metrics = metrics_lock.lock().unwrap();
+            while metrics.acquisition_count < target {
+                metrics = metrics_ready.wait(metrics).unwrap();
+            }
+        }
+
+        fn exclusive_hold_samples_ns(&self) -> Vec<u64> {
+            let (metrics_lock, _) = &*self.exclusive_metrics;
+            metrics_lock.lock().unwrap().hold_samples_ns.clone()
+        }
+
+        fn exclusive_wait_samples_ns(&self) -> Vec<u64> {
+            let (metrics_lock, _) = &*self.exclusive_metrics;
+            metrics_lock.lock().unwrap().wait_samples_ns.clone()
+        }
+
+        fn clear_exclusive_metrics(&self) {
+            let (metrics_lock, _) = &*self.exclusive_metrics;
+            let mut metrics = metrics_lock.lock().unwrap();
+            *metrics = ExclusiveLockMetrics::default();
+        }
+    }
+
+    struct BlockingObservedLockFile {
+        inner: MemoryFile,
+        observed_lock_level: Arc<Mutex<LockLevel>>,
+        handle_id: u64,
+        lock_level: LockLevel,
+        exclusive_metrics: StdArc<(StdMutex<ExclusiveLockMetrics>, StdCondvar)>,
+    }
+
+    impl BlockingObservedLockFile {
+        fn release_exclusive_hold(&self) {
+            let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
+            let mut metrics = metrics_lock.lock().unwrap();
+            if metrics.owner == Some(self.handle_id) {
+                if let Some(acquired_at) = metrics.acquired_at.take() {
+                    metrics
+                        .hold_samples_ns
+                        .push(u64::try_from(acquired_at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                }
+                metrics.owner = None;
+                metrics_ready.notify_all();
+            }
+        }
+    }
+
+    impl Vfs for BlockingObservedLockVfs {
+        type File = BlockingObservedLockFile;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&std::path::Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
+            Ok((
+                BlockingObservedLockFile {
+                    inner,
+                    observed_lock_level: self.observed_lock_level(),
+                    handle_id: self.next_handle_id.fetch_add(1, AtomicOrdering::Relaxed),
+                    lock_level: LockLevel::None,
+                    exclusive_metrics: StdArc::clone(&self.exclusive_metrics),
+                },
+                actual_flags,
+            ))
+        }
+
+        fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &std::path::Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+    }
+
+    impl VfsFile for BlockingObservedLockFile {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.release_exclusive_hold();
+            let result = self.inner.close(cx);
+            if result.is_ok() {
+                self.lock_level = LockLevel::None;
+                *self.observed_lock_level.lock().unwrap() = LockLevel::None;
+            }
+            result
+        }
+
+        fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset)
+        }
+
+        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            self.inner.write(cx, buf, offset)
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
+                let wait_started = Instant::now();
+                let (metrics_lock, metrics_ready) = &*self.exclusive_metrics;
+                let mut metrics = metrics_lock.lock().unwrap();
+                while metrics.owner.is_some() && metrics.owner != Some(self.handle_id) {
+                    metrics = metrics_ready.wait(metrics).unwrap();
+                }
+                metrics
+                    .wait_samples_ns
+                    .push(u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                metrics.owner = Some(self.handle_id);
+                metrics.acquired_at = Some(Instant::now());
+                metrics.acquisition_count = metrics.acquisition_count.saturating_add(1);
+                metrics_ready.notify_all();
+            }
+
+            self.inner.lock(cx, level)?;
+            if self.lock_level < level {
+                self.lock_level = level;
+            }
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            if self.lock_level >= LockLevel::Exclusive && level < LockLevel::Exclusive {
+                self.release_exclusive_hold();
+            }
+
+            self.inner.unlock(cx, level)?;
+            if self.lock_level > level {
+                self.lock_level = level;
+            }
+            *self.observed_lock_level.lock().unwrap() = self.lock_level;
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn device_characteristics(&self) -> u32 {
+            self.inner.device_characteristics()
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
     }
 
     #[derive(Debug)]
@@ -4592,24 +4818,34 @@ mod tests {
 
     // ── WAL mode integration tests ──────────────────────────────────────
 
+    use fsqlite_wal::checksum::{WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
     use fsqlite_wal::wal::WalAppendFrameRef;
     use fsqlite_wal::{WalFile, WalSalts};
     use serde_json::json;
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::sync::{Arc as StdArc, Condvar as StdCondvar, Mutex as StdMutex};
     use std::time::Instant;
 
     /// (page_number, page_data, db_size_if_commit)
     type WalFrame = (u32, Vec<u8>, u32);
     type SharedFrames = StdArc<StdMutex<Vec<WalFrame>>>;
     type SharedCounter = StdArc<StdMutex<usize>>;
+    type SharedLockLevels = StdArc<StdMutex<Vec<LockLevel>>>;
     const TRACK_C_BATCH_BENCH_BEAD_ID: &str = "bd-db300.3.1.4";
     const TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID: &str = "bd-db300.3.2.1";
+    const TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID: &str = "bd-db300.3.2.3";
     const TRACK_C_BATCH_BENCH_WARMUP_ITERS: usize = 5;
     const TRACK_C_BATCH_BENCH_MEASURE_ITERS: usize = 25;
     const TRACK_C_BATCH_BENCH_CASES: [(&str, usize); 3] = [
         ("page1_plus_1_new_page", 2),
         ("page1_plus_7_new_pages", 8),
         ("page1_plus_31_new_pages", 32),
+    ];
+    const TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS: usize = 5;
+    const TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS: usize = 20;
+    const TRACK_C_PUBLISH_WINDOW_BENCH_CASES: [(&str, usize); 3] = [
+        ("interior_only_1_dirty_page", 1),
+        ("interior_only_7_dirty_pages", 7),
+        ("interior_only_31_dirty_pages", 31),
     ];
     const TRACK_C_METADATA_BENCH_BEAD_ID: &str = "bd-db300.3.3.3";
     const TRACK_C_METADATA_BENCH_WARMUP_ITERS: usize = 5;
@@ -4659,6 +4895,50 @@ mod tests {
         }
     }
 
+    struct PreparedBatchObservedWalBackend {
+        frames: SharedFrames,
+        append_frames_calls: SharedCounter,
+        append_prepared_calls: SharedCounter,
+        prepare_lock_levels: SharedLockLevels,
+        append_lock_levels: SharedLockLevels,
+        observed_lock_level: Arc<Mutex<LockLevel>>,
+    }
+
+    impl PreparedBatchObservedWalBackend {
+        fn new(
+            observed_lock_level: Arc<Mutex<LockLevel>>,
+        ) -> (
+            Self,
+            SharedFrames,
+            SharedCounter,
+            SharedCounter,
+            SharedLockLevels,
+            SharedLockLevels,
+        ) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let append_frames_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let append_prepared_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let prepare_lock_levels: SharedLockLevels = StdArc::new(StdMutex::new(Vec::new()));
+            let append_lock_levels: SharedLockLevels = StdArc::new(StdMutex::new(Vec::new()));
+
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                    append_frames_calls: StdArc::clone(&append_frames_calls),
+                    append_prepared_calls: StdArc::clone(&append_prepared_calls),
+                    prepare_lock_levels: StdArc::clone(&prepare_lock_levels),
+                    append_lock_levels: StdArc::clone(&append_lock_levels),
+                    observed_lock_level,
+                },
+                frames,
+                append_frames_calls,
+                append_prepared_calls,
+                prepare_lock_levels,
+                append_lock_levels,
+            )
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum TrackCBatchMode {
         SingleFrame,
@@ -4670,6 +4950,21 @@ mod tests {
             match self {
                 Self::SingleFrame => "single_frame",
                 Self::Batched => "batch_append",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TrackCPublishWindowMode {
+        InlinePrepareBaseline,
+        PreparedCandidate,
+    }
+
+    impl TrackCPublishWindowMode {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::InlinePrepareBaseline => "inline_prepare_baseline",
+                Self::PreparedCandidate => "prepared_candidate",
             }
         }
     }
@@ -4694,6 +4989,11 @@ mod tests {
         mode: TrackCBatchMode,
     }
 
+    struct TrackCPublishWindowBenchWalBackend {
+        wal: WalFile<BlockingObservedLockFile>,
+        mode: TrackCPublishWindowMode,
+    }
+
     impl TrackCBenchmarkWalBackend {
         fn new(vfs: &MemoryVfs, cx: &Cx, path: &std::path::Path, mode: TrackCBatchMode) -> Self {
             let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
@@ -4706,6 +5006,30 @@ mod tests {
                 WalSalts {
                     salt1: 0xDB30_0314,
                     salt2: 0xC1C1_C1C1,
+                },
+            )
+            .unwrap();
+            Self { wal, mode }
+        }
+    }
+
+    impl TrackCPublishWindowBenchWalBackend {
+        fn new(
+            vfs: &BlockingObservedLockVfs,
+            cx: &Cx,
+            path: &std::path::Path,
+            mode: TrackCPublishWindowMode,
+        ) -> Self {
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+            let (file, _) = vfs.open(cx, Some(path), flags).unwrap();
+            let wal = WalFile::create(
+                cx,
+                file,
+                PageSize::DEFAULT.get(),
+                0,
+                WalSalts {
+                    salt1: 0xDB30_0323,
+                    salt2: 0xC2C3_C2C3,
                 },
             )
             .unwrap();
@@ -4754,6 +5078,156 @@ mod tests {
                     self.wal.append_frames(cx, &wal_frames)
                 }
             }
+        }
+
+        fn read_page(
+            &mut self,
+            _cx: &Cx,
+            _page_number: u32,
+        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn sync(&mut self, cx: &Cx) -> fsqlite_error::Result<()> {
+            self.wal.sync(cx, SyncFlags::NORMAL)
+        }
+
+        fn frame_count(&self) -> usize {
+            self.wal.frame_count()
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+            let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
+            Ok(crate::traits::CheckpointResult {
+                total_frames,
+                frames_backfilled: 0,
+                completed: false,
+                wal_was_reset: false,
+            })
+        }
+    }
+
+    impl crate::traits::WalBackend for TrackCPublishWindowBenchWalBackend {
+        fn append_frame(
+            &mut self,
+            cx: &Cx,
+            page_number: u32,
+            page_data: &[u8],
+            db_size_if_commit: u32,
+        ) -> fsqlite_error::Result<()> {
+            self.wal
+                .append_frame(cx, page_number, page_data, db_size_if_commit)
+        }
+
+        fn append_frames(
+            &mut self,
+            cx: &Cx,
+            frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<()> {
+            let wal_frames: Vec<_> = frames
+                .iter()
+                .map(|frame| WalAppendFrameRef {
+                    page_number: frame.page_number,
+                    page_data: frame.page_data,
+                    db_size_if_commit: frame.db_size_if_commit,
+                })
+                .collect();
+            self.wal.append_frames(cx, &wal_frames)
+        }
+
+        fn prepare_append_frames(
+            &mut self,
+            frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+            if matches!(self.mode, TrackCPublishWindowMode::InlinePrepareBaseline) {
+                return Ok(None);
+            }
+
+            if frames.is_empty() {
+                return Ok(None);
+            }
+
+            let wal_frames: Vec<_> = frames
+                .iter()
+                .map(|frame| WalAppendFrameRef {
+                    page_number: frame.page_number,
+                    page_data: frame.page_data,
+                    db_size_if_commit: frame.db_size_if_commit,
+                })
+                .collect();
+            let frame_size = WAL_FRAME_HEADER_SIZE + wal_frames[0].page_data.len();
+            let frame_metas = wal_frames
+                .iter()
+                .map(|frame| crate::traits::PreparedWalFrameMeta {
+                    page_number: frame.page_number,
+                    db_size_if_commit: frame.db_size_if_commit,
+                })
+                .collect();
+            let frame_bytes = self.wal.prepare_frame_bytes(&wal_frames)?;
+            let checksum_transforms = wal_frames
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let frame_start = index
+                        .checked_mul(frame_size)
+                        .expect("frame start fits usize");
+                    let frame_end = frame_start
+                        .checked_add(frame_size)
+                        .expect("frame end fits usize");
+                    let transform = WalChecksumTransform::for_wal_frame(
+                        &frame_bytes[frame_start..frame_end],
+                        self.wal.page_size(),
+                        self.wal.big_endian_checksum(),
+                    )?;
+                    Ok(crate::traits::PreparedWalChecksumTransform {
+                        a11: transform.a11,
+                        a12: transform.a12,
+                        a21: transform.a21,
+                        a22: transform.a22,
+                        c1: transform.c1,
+                        c2: transform.c2,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(Some(crate::traits::PreparedWalFrameBatch {
+                frame_size,
+                page_data_offset: WAL_FRAME_HEADER_SIZE,
+                frame_metas,
+                checksum_transforms,
+                frame_bytes,
+            }))
+        }
+
+        fn append_prepared_frames(
+            &mut self,
+            cx: &Cx,
+            prepared: &mut crate::traits::PreparedWalFrameBatch,
+        ) -> fsqlite_error::Result<()> {
+            let checksum_transforms: Vec<_> = prepared
+                .checksum_transforms
+                .iter()
+                .map(|transform| WalChecksumTransform {
+                    a11: transform.a11,
+                    a12: transform.a12,
+                    a21: transform.a21,
+                    a22: transform.a22,
+                    c1: transform.c1,
+                    c2: transform.c2,
+                })
+                .collect();
+            self.wal.append_prepared_frame_bytes(
+                cx,
+                &mut prepared.frame_bytes,
+                &checksum_transforms,
+            )
         }
 
         fn read_page(
@@ -4963,6 +5437,189 @@ mod tests {
             .collect()
     }
 
+    fn track_c_seed_existing_pages_blocking(
+        pager: &SimplePager<BlockingObservedLockVfs>,
+        cx: &Cx,
+        page_count: usize,
+    ) {
+        assert!(page_count > 0);
+        let mut txn = pager.begin(cx, TransactionMode::Immediate).unwrap();
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        for page_idx in 0..page_count {
+            let page_no = txn.allocate_page(cx).unwrap();
+            let fill = u8::try_from((page_idx % 251) + 1).unwrap();
+            txn.write_page(cx, page_no, &vec![fill; page_bytes])
+                .unwrap();
+        }
+        txn.commit(cx).unwrap();
+    }
+
+    fn track_c_write_existing_page_range(
+        txn: &mut SimpleTransaction<BlockingObservedLockVfs>,
+        cx: &Cx,
+        start_page_no: u32,
+        page_count: usize,
+        fill_offset: usize,
+    ) {
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        for page_idx in 0..page_count {
+            let page_no =
+                PageNumber::new(start_page_no + u32::try_from(page_idx).unwrap()).unwrap();
+            let fill = u8::try_from(((page_idx + fill_offset) % 251) + 1).unwrap();
+            txn.write_page(cx, page_no, &vec![fill; page_bytes])
+                .unwrap();
+        }
+    }
+
+    fn track_c_publish_window_prepared_commit(
+        mode: TrackCPublishWindowMode,
+        dirty_pages: usize,
+    ) -> (
+        Cx,
+        SimpleTransaction<BlockingObservedLockVfs>,
+        BlockingObservedLockVfs,
+    ) {
+        assert!(dirty_pages > 0);
+
+        let cx = Cx::new();
+        let vfs = BlockingObservedLockVfs::new();
+        let db_path = PathBuf::from(format!(
+            "/track_c_publish_window_hold_{}_{}.db",
+            mode.as_str(),
+            dirty_pages
+        ));
+        let wal_path = PathBuf::from(format!(
+            "/track_c_publish_window_hold_{}_{}.db-wal",
+            mode.as_str(),
+            dirty_pages
+        ));
+
+        let seed_pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        track_c_seed_existing_pages_blocking(&seed_pager, &cx, dirty_pages);
+        drop(seed_pager);
+
+        let pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let backend = TrackCPublishWindowBenchWalBackend::new(&vfs, &cx, &wal_path, mode);
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        vfs.clear_exclusive_metrics();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        track_c_write_existing_page_range(&mut txn, &cx, 2, dirty_pages, 37);
+        (cx, txn, vfs)
+    }
+
+    fn track_c_measure_publish_window_hold_ns(
+        mode: TrackCPublishWindowMode,
+        dirty_pages: usize,
+    ) -> Vec<u64> {
+        let total_iters =
+            TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS + TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS;
+        let mut samples = Vec::with_capacity(TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS);
+
+        for iter_idx in 0..total_iters {
+            let (cx, mut txn, vfs) = track_c_publish_window_prepared_commit(mode, dirty_pages);
+            txn.commit(&cx).unwrap();
+            let hold_ns = *vfs.exclusive_hold_samples_ns().last().unwrap_or(&0);
+            if iter_idx >= TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS {
+                samples.push(hold_ns);
+            }
+        }
+
+        samples
+    }
+
+    fn track_c_open_contending_pagers(
+        mode: TrackCPublishWindowMode,
+        dirty_pages: usize,
+    ) -> (
+        BlockingObservedLockVfs,
+        SimplePager<BlockingObservedLockVfs>,
+        SimplePager<BlockingObservedLockVfs>,
+    ) {
+        assert!(dirty_pages > 0);
+
+        let vfs = BlockingObservedLockVfs::new();
+        let db_path = PathBuf::from(format!(
+            "/track_c_publish_window_contention_{}_{}.db",
+            mode.as_str(),
+            dirty_pages
+        ));
+        let wal_path = PathBuf::from(format!(
+            "/track_c_publish_window_contention_{}_{}.db-wal",
+            mode.as_str(),
+            dirty_pages
+        ));
+        let seed_cx = Cx::new();
+        let seed_pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        track_c_seed_existing_pages_blocking(&seed_pager, &seed_cx, dirty_pages.saturating_mul(2));
+        drop(seed_pager);
+
+        let pager_a = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let pager_b = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let cx_a = Cx::new();
+        let cx_b = Cx::new();
+        pager_a
+            .set_wal_backend(Box::new(TrackCPublishWindowBenchWalBackend::new(
+                &vfs, &cx_a, &wal_path, mode,
+            )))
+            .unwrap();
+        pager_b
+            .set_wal_backend(Box::new(TrackCPublishWindowBenchWalBackend::new(
+                &vfs, &cx_b, &wal_path, mode,
+            )))
+            .unwrap();
+        pager_a.set_journal_mode(&cx_a, JournalMode::Wal).unwrap();
+        pager_b.set_journal_mode(&cx_b, JournalMode::Wal).unwrap();
+        vfs.clear_exclusive_metrics();
+        (vfs, pager_a, pager_b)
+    }
+
+    fn track_c_measure_competing_writer_stall_ns(
+        mode: TrackCPublishWindowMode,
+        dirty_pages: usize,
+    ) -> Vec<u64> {
+        let total_iters =
+            TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS + TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS;
+        let mut samples = Vec::with_capacity(TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS);
+
+        for iter_idx in 0..total_iters {
+            let (vfs, pager_a, pager_b) = track_c_open_contending_pagers(mode, dirty_pages);
+            let writer_a = std::thread::spawn(move || {
+                let cx = Cx::new();
+                let mut txn = pager_a.begin(&cx, TransactionMode::Immediate).unwrap();
+                track_c_write_existing_page_range(&mut txn, &cx, 2, dirty_pages, 53);
+                txn.commit(&cx).unwrap();
+            });
+
+            vfs.wait_for_exclusive_acquisitions(1);
+
+            let cx_b = Cx::new();
+            let mut txn_b = pager_b.begin(&cx_b, TransactionMode::Immediate).unwrap();
+            let contender_start_page = u32::try_from(dirty_pages).unwrap() + 2;
+            track_c_write_existing_page_range(
+                &mut txn_b,
+                &cx_b,
+                contender_start_page,
+                dirty_pages,
+                97,
+            );
+            txn_b.commit(&cx_b).unwrap();
+            writer_a.join().unwrap();
+
+            let stall_ns = vfs
+                .exclusive_wait_samples_ns()
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            if iter_idx >= TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS {
+                samples.push(stall_ns);
+            }
+        }
+
+        samples
+    }
+
     fn track_c_percentile_ns(sorted_samples: &[u64], percentile: usize) -> u64 {
         let last_idx = sorted_samples.len().saturating_sub(1);
         let rank = last_idx.saturating_mul(percentile).div_ceil(100);
@@ -5092,6 +5749,147 @@ mod tests {
         ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
             let total_frames = u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
                 fsqlite_error::FrankenError::internal("mock wal frame count exceeds u32")
+            })?;
+            Ok(crate::traits::CheckpointResult {
+                total_frames,
+                frames_backfilled: total_frames,
+                completed: true,
+                wal_was_reset: false,
+            })
+        }
+    }
+
+    impl crate::traits::WalBackend for PreparedBatchObservedWalBackend {
+        fn append_frame(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+            page_data: &[u8],
+            db_size_if_commit: u32,
+        ) -> fsqlite_error::Result<()> {
+            self.frames
+                .lock()
+                .unwrap()
+                .push((page_number, page_data.to_vec(), db_size_if_commit));
+            Ok(())
+        }
+
+        fn append_frames(
+            &mut self,
+            _cx: &Cx,
+            frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<()> {
+            *self.append_frames_calls.lock().unwrap() += 1;
+
+            let mut written = self.frames.lock().unwrap();
+            for frame in frames {
+                written.push((
+                    frame.page_number,
+                    frame.page_data.to_vec(),
+                    frame.db_size_if_commit,
+                ));
+            }
+            Ok(())
+        }
+
+        fn prepare_append_frames(
+            &mut self,
+            frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+            self.prepare_lock_levels
+                .lock()
+                .unwrap()
+                .push(*self.observed_lock_level.lock().unwrap());
+
+            if frames.is_empty() {
+                return Ok(None);
+            }
+
+            let frame_size =
+                fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE + frames[0].page_data.len();
+            let mut frame_bytes = Vec::with_capacity(frame_size * frames.len());
+            let mut frame_metas = Vec::with_capacity(frames.len());
+            let mut checksum_transforms = Vec::with_capacity(frames.len());
+            for frame in frames {
+                frame_metas.push(crate::traits::PreparedWalFrameMeta {
+                    page_number: frame.page_number,
+                    db_size_if_commit: frame.db_size_if_commit,
+                });
+                checksum_transforms.push(crate::traits::PreparedWalChecksumTransform {
+                    a11: 0,
+                    a12: 0,
+                    a21: 0,
+                    a22: 0,
+                    c1: 0,
+                    c2: 0,
+                });
+                frame_bytes
+                    .extend_from_slice(&[0_u8; fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE]);
+                frame_bytes.extend_from_slice(frame.page_data);
+            }
+
+            Ok(Some(crate::traits::PreparedWalFrameBatch {
+                frame_size,
+                page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+                frame_metas,
+                checksum_transforms,
+                frame_bytes,
+            }))
+        }
+
+        fn append_prepared_frames(
+            &mut self,
+            _cx: &Cx,
+            prepared: &mut crate::traits::PreparedWalFrameBatch,
+        ) -> fsqlite_error::Result<()> {
+            self.append_lock_levels
+                .lock()
+                .unwrap()
+                .push(*self.observed_lock_level.lock().unwrap());
+            *self.append_prepared_calls.lock().unwrap() += 1;
+
+            let mut written = self.frames.lock().unwrap();
+            for frame in prepared.frame_refs() {
+                written.push((
+                    frame.page_number,
+                    frame.page_data.to_vec(),
+                    frame.db_size_if_commit,
+                ));
+            }
+            Ok(())
+        }
+
+        fn read_page(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            let frames = self.frames.lock().unwrap();
+            Ok(frames
+                .iter()
+                .rev()
+                .find(|(pn, _, _)| *pn == page_number)
+                .map(|(_, data, _)| data.clone()))
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            self.frames.lock().unwrap().len()
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
+                fsqlite_error::FrankenError::internal("observed wal frame count exceeds u32")
             })?;
             Ok(crate::traits::CheckpointResult {
                 total_frames,
@@ -5429,6 +6227,118 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_preparation_happens_before_exclusive_publish_lock() {
+        let (pager, observed_lock_level) = observed_lock_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let (
+            backend,
+            frames,
+            append_frames_calls,
+            append_prepared_calls,
+            prepare_lock_levels,
+            append_lock_levels,
+        ) = PreparedBatchObservedWalBackend::new(Arc::clone(&observed_lock_level));
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let new_page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, PageNumber::ONE, &vec![0x11; ps])
+            .unwrap();
+        txn.write_page(&cx, new_page, &vec![0x22; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert_eq!(
+            *append_frames_calls.lock().unwrap(),
+            0,
+            "bead_id=bd-db300.3.2 case=prepared_path_skips_fallback_append"
+        );
+        assert_eq!(
+            *append_prepared_calls.lock().unwrap(),
+            1,
+            "bead_id=bd-db300.3.2 case=prepared_path_uses_prepared_append"
+        );
+        assert_eq!(
+            prepare_lock_levels.lock().unwrap().as_slice(),
+            &[LockLevel::Reserved],
+            "bead_id=bd-db300.3.2 case=prepare_runs_before_exclusive_publish"
+        );
+        assert_eq!(
+            append_lock_levels.lock().unwrap().as_slice(),
+            &[LockLevel::Exclusive],
+            "bead_id=bd-db300.3.2 case=prepared_append_runs_inside_exclusive_publish"
+        );
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            2,
+            "bead_id=bd-db300.3.2 case=prepared_path_preserves_frame_count"
+        );
+        assert_eq!(
+            frames[0].0,
+            PageNumber::ONE.get(),
+            "bead_id=bd-db300.3.2 case=prepared_path_preserves_sorted_page_one"
+        );
+        assert_eq!(
+            frames[1].0,
+            new_page.get(),
+            "bead_id=bd-db300.3.2 case=prepared_path_preserves_sorted_commit_frame"
+        );
+    }
+
+    #[test]
+    fn test_publish_window_measurement_captures_exclusive_hold_sample() {
+        let (cx, mut txn, vfs) =
+            track_c_publish_window_prepared_commit(TrackCPublishWindowMode::PreparedCandidate, 7);
+        txn.commit(&cx).unwrap();
+
+        let hold_samples = vfs.exclusive_hold_samples_ns();
+        assert_eq!(
+            hold_samples.len(),
+            1,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=hold_sample_count"
+        );
+        assert!(
+            hold_samples[0] > 0,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=hold_sample_positive"
+        );
+    }
+
+    #[test]
+    fn test_publish_window_contention_measurement_captures_competing_writer_wait() {
+        let (vfs, pager_a, pager_b) =
+            track_c_open_contending_pagers(TrackCPublishWindowMode::PreparedCandidate, 7);
+        let writer_a = std::thread::spawn(move || {
+            let cx = Cx::new();
+            let mut txn = pager_a.begin(&cx, TransactionMode::Immediate).unwrap();
+            track_c_write_existing_page_range(&mut txn, &cx, 2, 7, 53);
+            txn.commit(&cx).unwrap();
+        });
+
+        vfs.wait_for_exclusive_acquisitions(1);
+
+        let cx_b = Cx::new();
+        let mut txn_b = pager_b.begin(&cx_b, TransactionMode::Immediate).unwrap();
+        track_c_write_existing_page_range(&mut txn_b, &cx_b, 9, 7, 97);
+        txn_b.commit(&cx_b).unwrap();
+        writer_a.join().unwrap();
+
+        let wait_samples = vfs.exclusive_wait_samples_ns();
+        assert_eq!(
+            wait_samples.len(),
+            2,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=wait_sample_count"
+        );
+        assert!(
+            wait_samples.iter().copied().max().unwrap_or(0) > 0,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID} case=contending_writer_wait_positive"
+        );
+    }
+
+    #[test]
     fn test_collect_wal_commit_batch_keeps_sorted_order_and_single_commit_boundary() {
         let page_three = PageNumber::new(3).unwrap();
         let mut write_set = HashMap::new();
@@ -5529,6 +6439,92 @@ mod tests {
 
     #[test]
     #[ignore = "benchmark evidence only"]
+    fn wal_publish_window_shrink_benchmark_report() {
+        let cases: Vec<_> = TRACK_C_PUBLISH_WINDOW_BENCH_CASES
+            .iter()
+            .map(|(scenario_id, dirty_pages)| {
+                let baseline_hold_samples = track_c_measure_publish_window_hold_ns(
+                    TrackCPublishWindowMode::InlinePrepareBaseline,
+                    *dirty_pages,
+                );
+                let candidate_hold_samples = track_c_measure_publish_window_hold_ns(
+                    TrackCPublishWindowMode::PreparedCandidate,
+                    *dirty_pages,
+                );
+                let baseline_stall_samples = track_c_measure_competing_writer_stall_ns(
+                    TrackCPublishWindowMode::InlinePrepareBaseline,
+                    *dirty_pages,
+                );
+                let candidate_stall_samples = track_c_measure_competing_writer_stall_ns(
+                    TrackCPublishWindowMode::PreparedCandidate,
+                    *dirty_pages,
+                );
+
+                let baseline_hold_summary = track_c_sample_summary(&baseline_hold_samples);
+                let candidate_hold_summary = track_c_sample_summary(&candidate_hold_samples);
+                let baseline_stall_summary = track_c_sample_summary(&baseline_stall_samples);
+                let candidate_stall_summary = track_c_sample_summary(&candidate_stall_samples);
+
+                let baseline_hold_median =
+                    baseline_hold_summary["median_ns"].as_u64().unwrap_or(0);
+                let candidate_hold_median =
+                    candidate_hold_summary["median_ns"].as_u64().unwrap_or(0);
+                let baseline_stall_median =
+                    baseline_stall_summary["median_ns"].as_u64().unwrap_or(0);
+                let candidate_stall_median =
+                    candidate_stall_summary["median_ns"].as_u64().unwrap_or(0);
+
+                json!({
+                    "scenario_id": scenario_id,
+                    "dirty_pages": dirty_pages,
+                    "exclusive_window_hold_baseline": baseline_hold_summary,
+                    "exclusive_window_hold_candidate": candidate_hold_summary,
+                    "contending_writer_stall_baseline": baseline_stall_summary,
+                    "contending_writer_stall_candidate": candidate_stall_summary,
+                    "hold_reduction_ratio_median": if baseline_hold_median == 0 {
+                        0.0
+                    } else {
+                        1.0 - (candidate_hold_median as f64 / baseline_hold_median as f64)
+                    },
+                    "stall_reduction_ratio_median": if baseline_stall_median == 0 {
+                        0.0
+                    } else {
+                        1.0 - (candidate_stall_median as f64 / baseline_stall_median as f64)
+                    },
+                    "faster_variant_by_hold_median": if candidate_hold_median <= baseline_hold_median {
+                        "prepared_candidate"
+                    } else {
+                        "inline_prepare_baseline"
+                    },
+                    "faster_variant_by_stall_median": if candidate_stall_median <= baseline_stall_median {
+                        "prepared_candidate"
+                    } else {
+                        "inline_prepare_baseline"
+                    },
+                })
+            })
+            .collect();
+
+        let report = json!({
+            "schema_version": "fsqlite.track_c.publish_window_benchmark.v1",
+            "bead_id": TRACK_C_PUBLISH_WINDOW_BENCH_BEAD_ID,
+            "parent_bead_id": "bd-db300.3.2",
+            "measured_operation": "pager_commit_wal_publish_window",
+            "warmup_iterations": TRACK_C_PUBLISH_WINDOW_BENCH_WARMUP_ITERS,
+            "measurement_iterations": TRACK_C_PUBLISH_WINDOW_BENCH_MEASURE_ITERS,
+            "vfs": "blocking_memory_vfs",
+            "baseline_variant": "inline_prepare_under_exclusive_lock",
+            "candidate_variant": "prepared_batch_before_exclusive_lock",
+            "cases": cases,
+        });
+
+        println!("BEGIN_BD_DB300_3_2_3_REPORT");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!("END_BD_DB300_3_2_3_REPORT");
+    }
+
+    #[test]
+    #[ignore = "benchmark evidence only"]
     fn wal_commit_batch_benchmark_report() {
         let cases: Vec<_> = TRACK_C_BATCH_BENCH_CASES
             .iter()
@@ -5591,13 +6587,43 @@ mod tests {
     #[test]
     #[ignore = "inventory evidence only"]
     fn wal_publish_window_inventory_report() {
-        let outside_window = vec![json!({
-            "component": "collect_wal_commit_batch",
-            "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
-            "classification": "already_outside_publish_window",
-            "move_candidate": "not_applicable",
-            "rationale": "frame ordering, commit-marker boundary, and new_db_size derivation happen before EXCLUSIVE lock acquisition",
-        })];
+        let outside_window = vec![
+            json!({
+                "component": "collect_wal_commit_batch",
+                "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+                "classification": "already_outside_publish_window",
+                "move_candidate": "not_applicable",
+                "rationale": "frame ordering, commit-marker boundary, and new_db_size derivation happen before EXCLUSIVE lock acquisition",
+            }),
+            json!({
+                "component": "wal_adapter_frame_ref_copy",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::prepare_append_frames",
+                "classification": "pure_copy",
+                "move_candidate": "completed",
+                "rationale": "borrowed WalFrameRef values are copied into owned batch metadata before the exclusive publish window starts",
+            }),
+            json!({
+                "component": "wal_batch_buffer_allocation",
+                "location": "crates/fsqlite-wal/src/wal.rs::prepare_frame_bytes",
+                "classification": "allocation",
+                "move_candidate": "completed",
+                "rationale": "contiguous frame buffer allocation now happens in the prepare phase before EXCLUSIVE lock acquisition",
+            }),
+            json!({
+                "component": "wal_header_and_payload_copy",
+                "location": "crates/fsqlite-wal/src/wal.rs::prepare_frame_bytes",
+                "classification": "pure_copy",
+                "move_candidate": "completed",
+                "rationale": "page-number/db-size stamping, salt staging, and payload copies are fully serialized before publish time",
+            }),
+            json!({
+                "component": "wal_checksum_transform_precompute",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::prepare_append_frames",
+                "classification": "pure_compute",
+                "move_candidate": "completed",
+                "rationale": "per-frame checksum transforms are now derived outside the lock so publish only rebinds the live seed",
+            }),
+        ];
 
         let inside_window = vec![
             json!({
@@ -5609,59 +6635,38 @@ mod tests {
             }),
             json!({
                 "component": "wal_refresh_before_append",
-                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_frames",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_prepared_frames",
                 "classification": "state_refresh_read_only",
                 "move_candidate": "conditional",
                 "rationale": "refresh chooses append offset/checksum seed but is still read/refresh work rather than durable publication",
             }),
             json!({
-                "component": "wal_adapter_frame_ref_copy",
-                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_frames",
-                "classification": "pure_copy",
-                "move_candidate": "yes",
-                "rationale": "borrowed WalFrameRef values are copied into owned WalAppendFrameRef structs before the real WAL write",
-            }),
-            json!({
-                "component": "wal_batch_buffer_allocation",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
-                "classification": "allocation",
-                "move_candidate": "yes",
-                "rationale": "contiguous frame buffer allocation is preparatory memory work, not durable state transition",
-            }),
-            json!({
-                "component": "wal_header_and_payload_copy",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
-                "classification": "pure_copy",
-                "move_candidate": "yes",
-                "rationale": "header field writes, salt stamping, and page payload copies assemble bytes for the later single write",
-            }),
-            json!({
-                "component": "wal_checksum_preparation",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
-                "classification": "pure_compute",
-                "move_candidate": "yes",
-                "rationale": "rolling checksum calculation over the prepared batch is deterministic compute over in-memory bytes",
+                "component": "wal_checksum_seed_rebind",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_prepared_frames",
+                "classification": "publish_seed_binding",
+                "move_candidate": "no",
+                "rationale": "publish still has to bind the authoritative post-refresh seed and rewrite checksum header words before the single durable write",
             }),
             json!({
                 "component": "wal_file_write",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_prepared_frame_bytes",
                 "classification": "durable_state_transition",
                 "move_candidate": "no",
                 "rationale": "single contiguous file write is the core serialized append that must observe the authoritative WAL end",
             }),
             json!({
                 "component": "wal_state_advance_after_write",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_prepared_frame_bytes",
                 "classification": "durable_state_transition",
                 "move_candidate": "no",
                 "rationale": "frame_count/running_checksum advancement must match the durable append that just occurred",
             }),
             json!({
                 "component": "fec_hook_on_frame",
-                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_frames",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_prepared_frames",
                 "classification": "post_append_compute",
                 "move_candidate": "yes",
-                "rationale": "FEC hook work is explicitly non-fatal and currently runs after append while the publish window is still open",
+                "rationale": "FEC hook work remains explicitly non-fatal and still runs after append while the publish window is open",
             }),
             json!({
                 "component": "wal_sync",
