@@ -9,6 +9,7 @@
 //!   WAL executor's [`CheckpointTarget`] trait (WAL -> pager direction).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::traits::{
@@ -75,38 +76,59 @@ impl WalPageLookupResolution {
             }
         }
     }
+
+    #[must_use]
+    const fn fallback_reason(self) -> &'static str {
+        match self {
+            Self::AuthoritativeHit { .. } | Self::AuthoritativeMiss => "none",
+            Self::PartialIndexFallbackHit { .. } | Self::PartialIndexFallbackMiss => {
+                "partial_index_cap"
+            }
+        }
+    }
+}
+
+/// Immutable visibility snapshot published for one WAL generation.
+///
+/// Readers pin one of these snapshots at transaction start so page lookups stay
+/// bound to a stable committed horizon even if later commits advance the active
+/// publication plane.
+#[derive(Debug, Clone)]
+struct WalPublishedSnapshot {
+    publication_seq: u64,
+    generation: WalGenerationIdentity,
+    last_commit_frame: Option<usize>,
+    page_index: Arc<HashMap<u32, usize>>,
+    index_is_partial: bool,
+}
+
+impl WalPublishedSnapshot {
+    #[must_use]
+    fn empty(publication_seq: u64, generation: WalGenerationIdentity) -> Self {
+        Self {
+            publication_seq,
+            generation,
+            last_commit_frame: None,
+            page_index: Arc::new(HashMap::new()),
+            index_is_partial: false,
+        }
+    }
 }
 
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
     /// Guard so commit-time append refresh runs only once per commit batch.
     refresh_before_append: bool,
-    /// Whether read visibility is pinned to a transaction-bounded snapshot.
-    read_snapshot_pinned: bool,
-    /// Highest committed frame visible to the current read snapshot.
-    ///
-    /// `Some(idx)` means committed frames `0..=idx` are visible.
-    /// `None` means the snapshot saw no committed frame.
-    read_snapshot_last_commit: Option<usize>,
+    /// Active commit-published visibility plane for the current WAL generation.
+    published_snapshot: WalPublishedSnapshot,
+    /// Monotonic publication sequence assigned to the next published snapshot.
+    next_publication_seq: u64,
+    /// Transaction-bounded read snapshot pinned at `begin_transaction()`.
+    read_snapshot: Option<WalPublishedSnapshot>,
     /// Optional FEC commit hook for encoding repair symbols on commit.
     fec_hook: Option<FecCommitHook>,
     /// Accumulated FEC commit results (for later sidecar persistence).
     fec_pending: Vec<FecCommitResult>,
-    /// O(1) page lookup index: page_number -> most recent frame index.
-    page_index: HashMap<u32, usize>,
-    /// Last committed frame index the page index has been built up to (inclusive).
-    /// `None` means the index has never been built.
-    index_built_to: Option<usize>,
-    /// WAL generation identity at the time the index was built.
-    ///
-    /// This must include both `checkpoint_seq` and salts so same-salt resets do
-    /// not create an ABA hazard for the cached page index.
-    index_generation: Option<WalGenerationIdentity>,
-    /// `true` when the page index hit the capacity cap and some pages were not
-    /// indexed.  When this is set, a miss in the HashMap cannot be trusted ---
-    /// the page may exist in the WAL but simply wasn't indexed.  In that case,
-    /// `read_page` falls back to a backwards linear scan.
-    index_is_partial: bool,
     /// Maximum number of unique pages the index will track.  Defaults to
     /// [`PAGE_INDEX_MAX_ENTRIES`].  Overridable in tests to exercise the
     /// partial-index fallback path without writing 64K+ frames.
@@ -117,17 +139,15 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Wrap an existing [`WalFile`] in the adapter (FEC disabled).
     #[must_use]
     pub fn new(wal: WalFile<F>) -> Self {
+        let generation = wal.generation_identity();
         Self {
             wal,
             refresh_before_append: true,
-            read_snapshot_pinned: false,
-            read_snapshot_last_commit: None,
+            published_snapshot: WalPublishedSnapshot::empty(0, generation),
+            next_publication_seq: 1,
+            read_snapshot: None,
             fec_hook: None,
             fec_pending: Vec::new(),
-            page_index: HashMap::new(),
-            index_built_to: None,
-            index_generation: None,
-            index_is_partial: false,
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
     }
@@ -135,17 +155,15 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Wrap an existing [`WalFile`] with an FEC commit hook.
     #[must_use]
     pub fn with_fec_hook(wal: WalFile<F>, hook: FecCommitHook) -> Self {
+        let generation = wal.generation_identity();
         Self {
             wal,
             refresh_before_append: true,
-            read_snapshot_pinned: false,
-            read_snapshot_last_commit: None,
+            published_snapshot: WalPublishedSnapshot::empty(0, generation),
+            next_publication_seq: 1,
+            read_snapshot: None,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
-            page_index: HashMap::new(),
-            index_built_to: None,
-            index_generation: None,
-            index_is_partial: false,
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
     }
@@ -164,91 +182,157 @@ impl<F: VfsFile> WalBackendAdapter<F> {
 
     /// Mutably borrow the inner [`WalFile`].
     ///
-    /// Invalidates the page index since the caller may mutate WAL state.
+    /// Invalidates the publication plane since the caller may mutate WAL state.
     pub fn inner_mut(&mut self) -> &mut WalFile<F> {
-        self.invalidate_page_index();
+        self.invalidate_publication();
         &mut self.wal
     }
 
-    /// Discard the page index, forcing a full rebuild on next `read_page`.
-    fn invalidate_page_index(&mut self) {
-        self.page_index.clear();
-        self.index_built_to = None;
-        self.index_generation = None;
-        self.index_is_partial = false;
+    /// Discard published and pinned snapshots after external WAL mutation.
+    fn invalidate_publication(&mut self) {
+        self.read_snapshot = None;
+        self.published_snapshot = WalPublishedSnapshot::empty(
+            self.published_snapshot.publication_seq,
+            self.published_snapshot.generation,
+        );
     }
 
-    /// Ensure the page index covers all committed frames up to `last_commit_frame`.
+    /// Publish an immutable visibility snapshot for the current committed WAL prefix.
     ///
-    /// Performs incremental extension when possible, or a full rebuild when WAL
-    /// salts change or the commit horizon shrinks (e.g., after checkpoint reset).
-    fn ensure_page_index(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
-        let current_generation = self.wal.generation_identity();
-
-        // Detect WAL generation change (salts differ -> full rebuild).
-        let needs_full_rebuild = match self.index_generation {
-            Some(saved) => saved != current_generation,
-            None => true,
-        };
-
-        if needs_full_rebuild {
-            self.page_index.clear();
-            self.index_built_to = None;
-            self.index_is_partial = false;
-            self.index_generation = Some(current_generation);
-            self.build_index_range(cx, 0, last_commit_frame)?;
-            self.index_built_to = Some(last_commit_frame);
+    /// The commit path advances this plane directly, and readers pin a clone of
+    /// the published snapshot instead of mutating shared lookup state under an
+    /// active transaction.
+    fn publish_visible_snapshot(
+        &mut self,
+        cx: &Cx,
+        last_commit_frame: Option<usize>,
+        scenario_id: &'static str,
+    ) -> Result<()> {
+        let generation = self.wal.generation_identity();
+        if self.published_snapshot.generation == generation
+            && self.published_snapshot.last_commit_frame == last_commit_frame
+        {
             return Ok(());
         }
 
-        match self.index_built_to {
-            Some(built_to) if built_to == last_commit_frame => {
-                // Already up to date.
-                Ok(())
-            }
-            Some(built_to) if built_to < last_commit_frame => {
-                // Incremental extend: scan only the new frames.
-                self.build_index_range(cx, built_to + 1, last_commit_frame)?;
-                self.index_built_to = Some(last_commit_frame);
-                Ok(())
-            }
-            Some(_) => {
-                // WAL shrank (e.g., after checkpoint reset) -> full rebuild.
-                self.page_index.clear();
-                self.index_is_partial = false;
-                self.build_index_range(cx, 0, last_commit_frame)?;
-                self.index_built_to = Some(last_commit_frame);
-                Ok(())
-            }
+        let previous = self.published_snapshot.clone();
+        let mut page_index = if previous.generation == generation {
+            previous.page_index.as_ref().clone()
+        } else {
+            HashMap::new()
+        };
+        let mut index_is_partial = if previous.generation == generation {
+            previous.index_is_partial
+        } else {
+            false
+        };
+
+        let frame_delta_count = match (previous.last_commit_frame, last_commit_frame) {
+            (Some(prev), Some(curr)) if curr >= prev => curr.saturating_sub(prev),
+            (Some(_), Some(curr)) => curr.saturating_add(1),
+            (None, Some(curr)) => curr.saturating_add(1),
+            (Some(prev), None) => prev.saturating_add(1),
+            (None, None) => 0,
+        };
+
+        match last_commit_frame {
             None => {
-                // First build.
-                self.build_index_range(cx, 0, last_commit_frame)?;
-                self.index_built_to = Some(last_commit_frame);
-                Ok(())
+                page_index.clear();
+                index_is_partial = false;
+            }
+            Some(current_last_commit) => {
+                let start = match (
+                    previous.generation == generation,
+                    previous.last_commit_frame,
+                ) {
+                    (true, Some(previous_last_commit))
+                        if previous_last_commit < current_last_commit =>
+                    {
+                        previous_last_commit.saturating_add(1)
+                    }
+                    (true, Some(previous_last_commit))
+                        if previous_last_commit == current_last_commit =>
+                    {
+                        current_last_commit.saturating_add(1)
+                    }
+                    _ => {
+                        page_index.clear();
+                        index_is_partial = false;
+                        0
+                    }
+                };
+                if start <= current_last_commit {
+                    self.build_index_range(
+                        cx,
+                        &mut page_index,
+                        &mut index_is_partial,
+                        start,
+                        current_last_commit,
+                    )?;
+                }
             }
         }
+
+        let publication_seq = self.next_publication_seq;
+        self.next_publication_seq = self.next_publication_seq.saturating_add(1);
+        let latest_frame_entries = page_index.len();
+        self.published_snapshot = WalPublishedSnapshot {
+            publication_seq,
+            generation,
+            last_commit_frame,
+            page_index: Arc::new(page_index),
+            index_is_partial,
+        };
+
+        tracing::trace!(
+            target: "fsqlite.wal_publication",
+            trace_id = cx.trace_id(),
+            run_id = "wal-publication",
+            scenario_id,
+            wal_generation = generation.checkpoint_seq,
+            wal_salt1 = generation.salts.salt1,
+            wal_salt2 = generation.salts.salt2,
+            publication_seq,
+            frame_delta_count,
+            latest_frame_entries,
+            snapshot_age = 0_u64,
+            lookup_mode = "published_visibility_map",
+            fallback_reason = if index_is_partial {
+                "partial_index_cap"
+            } else {
+                "none"
+            },
+            "published WAL visibility snapshot"
+        );
+
+        Ok(())
     }
 
     /// Resolve the most recent visible frame for `page_number`.
     ///
-    /// The normal contract is `Authoritative*`: the in-memory page index fully
+    /// The normal contract is `Authoritative*`: the published page index fully
     /// covers the visible WAL generation, so a miss means the page is absent.
     /// `PartialIndexFallback*` is a bounded slow-path used only when the capped
     /// index is known to be incomplete.
     fn resolve_visible_frame(
         &mut self,
         cx: &Cx,
+        snapshot: &WalPublishedSnapshot,
         page_number: u32,
-        last_commit_frame: usize,
     ) -> Result<WalPageLookupResolution> {
-        match self.page_index.get(&page_number) {
+        match snapshot.page_index.get(&page_number) {
             Some(&frame_index) => Ok(WalPageLookupResolution::AuthoritativeHit { frame_index }),
-            None if !self.index_is_partial => Ok(WalPageLookupResolution::AuthoritativeMiss),
-            None => match self.scan_backwards_for_page(cx, page_number, last_commit_frame)? {
-                Some(frame_index) => {
-                    Ok(WalPageLookupResolution::PartialIndexFallbackHit { frame_index })
+            None if !snapshot.index_is_partial => Ok(WalPageLookupResolution::AuthoritativeMiss),
+            None => match snapshot.last_commit_frame {
+                Some(last_commit_frame) => {
+                    match self.scan_backwards_for_page(cx, page_number, last_commit_frame)? {
+                        Some(frame_index) => {
+                            Ok(WalPageLookupResolution::PartialIndexFallbackHit { frame_index })
+                        }
+                        None => Ok(WalPageLookupResolution::PartialIndexFallbackMiss),
+                    }
                 }
-                None => Ok(WalPageLookupResolution::PartialIndexFallbackMiss),
+                None => Ok(WalPageLookupResolution::AuthoritativeMiss),
             },
         }
     }
@@ -257,20 +341,27 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     ///
     /// Since we scan forward, later frames naturally overwrite earlier entries
     /// for the same page number, ensuring "newest frame wins" semantics.
-    fn build_index_range(&mut self, cx: &Cx, start: usize, end: usize) -> Result<()> {
+    fn build_index_range(
+        &mut self,
+        cx: &Cx,
+        page_index: &mut HashMap<u32, usize>,
+        index_is_partial: &mut bool,
+        start: usize,
+        end: usize,
+    ) -> Result<()> {
         for frame_index in start..=end {
             let header = self.wal.read_frame_header(cx, frame_index)?;
             // Only insert if we haven't hit the capacity cap, or if this page
             // is already tracked (update is free).
-            if self.page_index.len() < self.page_index_cap
-                || self.page_index.contains_key(&header.page_number)
+            if page_index.len() < self.page_index_cap
+                || page_index.contains_key(&header.page_number)
             {
-                self.page_index.insert(header.page_number, frame_index);
+                page_index.insert(header.page_number, frame_index);
             } else {
                 // A page was dropped because the index is full -- mark it as
                 // partial so that `read_page` knows a HashMap miss cannot be
                 // trusted and must fall back to a linear scan.
-                self.index_is_partial = true;
+                *index_is_partial = true;
             }
         }
         Ok(())
@@ -322,7 +413,16 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     fn set_page_index_cap(&mut self, cap: usize) {
         self.page_index_cap = cap;
         // Invalidate so the next read rebuilds with the new cap.
-        self.invalidate_page_index();
+        self.invalidate_publication();
+    }
+
+    fn publish_latest_committed_snapshot(
+        &mut self,
+        cx: &Cx,
+        scenario_id: &'static str,
+    ) -> Result<()> {
+        let last_commit_frame = self.wal.last_commit_frame(cx)?;
+        self.publish_visible_snapshot(cx, last_commit_frame, scenario_id)
     }
 }
 
@@ -341,8 +441,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // Establish a transaction-bounded snapshot once, instead of doing an
         // expensive refresh for every page read.
         self.wal.refresh(cx)?;
-        self.read_snapshot_last_commit = self.wal.last_commit_frame(cx)?;
-        self.read_snapshot_pinned = true;
+        self.publish_latest_committed_snapshot(cx, "begin_transaction")?;
+        self.read_snapshot = Some(self.published_snapshot.clone());
         self.refresh_before_append = true;
         Ok(())
     }
@@ -382,6 +482,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     warn!(error = %e, "FEC encoding failed; commit proceeds without repair symbols");
                 }
             }
+        }
+
+        if db_size_if_commit != 0 {
+            self.publish_latest_committed_snapshot(cx, "append_frame_commit")?;
         }
 
         Ok(())
@@ -435,6 +539,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     }
                 }
             }
+        }
+
+        if frames.iter().any(|frame| frame.db_size_if_commit != 0) {
+            self.publish_latest_committed_snapshot(cx, "append_frames_commit")?;
         }
 
         Ok(())
@@ -556,36 +664,43 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
         }
 
+        if prepared
+            .frame_metas
+            .iter()
+            .any(|frame| frame.db_size_if_commit != 0)
+        {
+            self.publish_latest_committed_snapshot(cx, "append_prepared_frames_commit")?;
+        }
+
         Ok(())
     }
 
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-        // Restrict visibility to committed frames only.  If a transaction
-        // snapshot is pinned, keep the commit horizon stable until the next
-        // begin_transaction() call.
-        let last_commit_frame = if self.read_snapshot_pinned {
-            let Some(pinned) = self.read_snapshot_last_commit else {
-                return Ok(None);
-            };
-            pinned
+        let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
+            snapshot
         } else {
-            let Some(current) = self.wal.last_commit_frame(cx)? else {
-                return Ok(None);
-            };
-            current
+            self.publish_latest_committed_snapshot(cx, "read_page_unpinned")?;
+            self.published_snapshot.clone()
         };
+        if snapshot.last_commit_frame.is_none() {
+            return Ok(None);
+        }
+        let snapshot_age = self
+            .published_snapshot
+            .publication_seq
+            .saturating_sub(snapshot.publication_seq);
 
-        // Build or extend the O(1) page index covering all committed frames.
-        self.ensure_page_index(cx, last_commit_frame)?;
-        let generation = self.wal.generation_identity();
-        let resolution = self.resolve_visible_frame(cx, page_number, last_commit_frame)?;
+        let resolution = self.resolve_visible_frame(cx, &snapshot, page_number)?;
         let Some(frame_index) = resolution.frame_index() else {
             debug!(
                 page_number,
-                wal_checkpoint_seq = generation.checkpoint_seq,
-                wal_salt1 = generation.salts.salt1,
-                wal_salt2 = generation.salts.salt2,
+                wal_checkpoint_seq = snapshot.generation.checkpoint_seq,
+                wal_salt1 = snapshot.generation.salts.salt1,
+                wal_salt2 = snapshot.generation.salts.salt2,
+                publication_seq = snapshot.publication_seq,
+                snapshot_age,
                 lookup_mode = resolution.lookup_mode(),
+                fallback_reason = resolution.fallback_reason(),
                 "WAL adapter: page absent from current generation"
             );
             return Ok(None);
@@ -611,26 +726,27 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         debug!(
             page_number,
             frame_index,
-            wal_checkpoint_seq = generation.checkpoint_seq,
-            wal_salt1 = generation.salts.salt1,
-            wal_salt2 = generation.salts.salt2,
+            wal_checkpoint_seq = snapshot.generation.checkpoint_seq,
+            wal_salt1 = snapshot.generation.salts.salt1,
+            wal_salt2 = snapshot.generation.salts.salt2,
+            publication_seq = snapshot.publication_seq,
+            snapshot_age,
             lookup_mode = resolution.lookup_mode(),
+            fallback_reason = resolution.fallback_reason(),
             "WAL adapter: resolved page from current WAL generation"
         );
         Ok(Some(data))
     }
 
     fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
-        let last_commit_frame = if self.read_snapshot_pinned {
-            let Some(pinned) = self.read_snapshot_last_commit else {
-                return Ok(0);
-            };
-            pinned
+        let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
+            snapshot
         } else {
-            let Some(current) = self.wal.last_commit_frame(cx)? else {
-                return Ok(0);
-            };
-            current
+            self.publish_latest_committed_snapshot(cx, "committed_txns_since_page")?;
+            self.published_snapshot.clone()
+        };
+        let Some(last_commit_frame) = snapshot.last_commit_frame else {
+            return Ok(0);
         };
 
         let mut last_page_frame = None;
@@ -725,8 +841,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // and invalidate the page index (salts changed).
         if result.wal_was_reset {
             self.fec_discard();
-            self.invalidate_page_index();
+            self.invalidate_publication();
         }
+
+        self.publish_latest_committed_snapshot(cx, "checkpoint")?;
 
         Ok(CheckpointResult {
             total_frames,
@@ -1399,6 +1517,79 @@ mod tests {
         assert_eq!(adapter.read_page(&cx, 2).expect("read page 2"), Some(page2));
     }
 
+    #[test]
+    fn test_commit_append_publishes_visibility_snapshot() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let p1 = sample_page(0x41);
+        let p2 = sample_page(0x42);
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("append commit");
+
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "commit append should publish the visible commit horizon"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.len(),
+            2,
+            "published snapshot should track both committed pages"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.get(&2),
+            Some(&1),
+            "published snapshot must map each page to its latest committed frame"
+        );
+    }
+
+    #[test]
+    fn test_prepared_append_publishes_visibility_snapshot() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let p1 = sample_page(0x51);
+        let p2 = sample_page(0x52);
+        let frames = [
+            WalFrameRef {
+                page_number: 1,
+                page_data: &p1,
+                db_size_if_commit: 0,
+            },
+            WalFrameRef {
+                page_number: 2,
+                page_data: &p2,
+                db_size_if_commit: 2,
+            },
+        ];
+        let mut prepared = adapter
+            .prepare_append_frames(&frames)
+            .expect("prepare append")
+            .expect("prepared batch");
+        adapter
+            .append_prepared_frames(&cx, &mut prepared)
+            .expect("append prepared");
+
+        assert_eq!(
+            adapter.published_snapshot.last_commit_frame,
+            Some(1),
+            "prepared commit append should publish the visible commit horizon"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.len(),
+            2,
+            "prepared commit append should publish all committed pages"
+        );
+        assert_eq!(
+            adapter.published_snapshot.page_index.get(&2),
+            Some(&1),
+            "prepared commit append must map each page to its latest committed frame"
+        );
+    }
+
     // -- Partial index fallback tests --
 
     #[test]
@@ -1468,7 +1659,7 @@ mod tests {
 
         // Verify the index was indeed marked partial.
         assert!(
-            adapter.index_is_partial,
+            adapter.published_snapshot.index_is_partial,
             "index_is_partial should be true when cap is exceeded"
         );
     }
@@ -1530,24 +1721,25 @@ mod tests {
             .expect("last commit")
             .expect("commit exists");
         adapter
-            .ensure_page_index(&cx, last_commit)
-            .expect("build index");
+            .publish_visible_snapshot(&cx, Some(last_commit), "lookup_contract_test")
+            .expect("build published snapshot");
+        let snapshot = adapter.published_snapshot.clone();
 
         assert_eq!(
             adapter
-                .resolve_visible_frame(&cx, 1, last_commit)
+                .resolve_visible_frame(&cx, &snapshot, 1)
                 .expect("resolve indexed page"),
             WalPageLookupResolution::AuthoritativeHit { frame_index: 0 }
         );
         assert_eq!(
             adapter
-                .resolve_visible_frame(&cx, 2, last_commit)
+                .resolve_visible_frame(&cx, &snapshot, 2)
                 .expect("resolve fallback page"),
             WalPageLookupResolution::PartialIndexFallbackHit { frame_index: 1 }
         );
         assert_eq!(
             adapter
-                .resolve_visible_frame(&cx, 99, last_commit)
+                .resolve_visible_frame(&cx, &snapshot, 99)
                 .expect("resolve missing page"),
             WalPageLookupResolution::PartialIndexFallbackMiss
         );

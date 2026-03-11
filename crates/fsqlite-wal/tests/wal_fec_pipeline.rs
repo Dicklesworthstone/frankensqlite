@@ -116,6 +116,7 @@ fn test_bd_1hi_10_unit_compliance_gate() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 8,
                 per_symbol_delay: Duration::from_millis(2),
@@ -187,6 +188,7 @@ fn test_repair_generation_pipelined() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 16,
                 per_symbol_delay: Duration::from_millis(20),
@@ -245,6 +247,7 @@ fn test_repair_generation_off_commit_path() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 8,
                 per_symbol_delay: Duration::from_millis(80),
@@ -285,6 +288,7 @@ fn test_repair_generation_catches_up() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 32,
                 per_symbol_delay: Duration::from_millis(5),
@@ -337,6 +341,7 @@ fn test_repair_generation_backpressure_queue_full() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 1,
                 per_symbol_delay: Duration::from_millis(120),
@@ -379,6 +384,7 @@ fn test_repair_generation_shutdown_drains_pending_jobs() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 16,
                 per_symbol_delay: Duration::from_millis(10),
@@ -447,6 +453,7 @@ fn test_repair_generation_commit_path_overhead_under_one_percent() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 256,
                 per_symbol_delay: Duration::from_millis(12),
@@ -492,6 +499,7 @@ fn test_repair_generation_cancel_safe() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 4,
                 per_symbol_delay: Duration::from_millis(100),
@@ -526,6 +534,60 @@ fn test_repair_generation_cancel_safe() {
 }
 
 #[test]
+fn test_pipeline_worker_inherits_parent_cancellation() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("parent-cancel.wal-fec");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
+
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            &cx,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 4,
+                per_symbol_delay: Duration::from_millis(100),
+            },
+        )
+        .expect("pipeline should start");
+
+        let item_a = sample_work_item(&sidecar_path, 1, 4, 4, 19, b"parent-cancel-a", 1_700);
+        let item_b = sample_work_item(&sidecar_path, 5, 4, 4, 23, b"parent-cancel-b", 1_704);
+        pipeline.enqueue(item_a).expect("enqueue A should succeed");
+        pipeline.enqueue(item_b).expect("enqueue B should succeed");
+        sleep(wall_now(), Duration::from_millis(35)).await;
+
+        cx.cancel();
+        let err = pipeline
+            .shutdown(&cx)
+            .await
+            .expect_err("shutdown should surface inherited parent cancellation");
+        assert!(
+            err.to_string()
+                .contains("wal-fec repair worker task cancelled after processing work"),
+            "expected inherited parent-cancellation failure, got {err}"
+        );
+
+        let stats = pipeline.stats();
+        assert_eq!(
+            stats.pending_jobs, 0,
+            "queued work should be drained on failure"
+        );
+        assert!(
+            stats.canceled_jobs >= 1,
+            "in-flight or queued work should be counted as canceled after parent cancellation"
+        );
+
+        let scan = scan_wal_fec(&sidecar_path).expect("scan should succeed");
+        assert!(
+            scan.groups.is_empty(),
+            "parent cancellation must avoid partially written wal-fec groups"
+        );
+    });
+}
+
+#[test]
 fn test_e2e_bd_1hi_10_compliance() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("e2e.wal-fec");
@@ -536,6 +598,7 @@ fn test_e2e_bd_1hi_10_compliance() {
         let cx = test_cx();
         let mut pipeline = WalFecRepairPipeline::start(
             &handle,
+            &cx,
             WalFecRepairPipelineConfig {
                 queue_capacity: 8,
                 per_symbol_delay: Duration::from_millis(2),

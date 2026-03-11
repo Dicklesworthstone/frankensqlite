@@ -1496,7 +1496,11 @@ pub struct WalFecRepairPipeline {
 
 impl WalFecRepairPipeline {
     /// Start the pipeline worker on an existing asupersync runtime.
-    pub fn start(runtime: &RuntimeHandle, config: WalFecRepairPipelineConfig) -> Result<Self> {
+    pub fn start(
+        runtime: &RuntimeHandle,
+        parent_cx: &Cx,
+        config: WalFecRepairPipelineConfig,
+    ) -> Result<Self> {
         if config.queue_capacity == 0 {
             return Err(FrankenError::WalCorrupt {
                 detail: "wal-fec repair pipeline queue_capacity must be >= 1".to_owned(),
@@ -1520,10 +1524,12 @@ impl WalFecRepairPipeline {
             worker_failure: Arc::clone(&worker_failure),
         };
 
+        let worker_cx = parent_cx.create_child();
         let worker_handle = runtime
             .try_spawn(run_repair_pipeline_worker(
                 rx,
                 worker_state,
+                worker_cx,
                 config.per_symbol_delay,
             ))
             .map_err(|err| FrankenError::WalCorrupt {
@@ -1651,6 +1657,7 @@ impl Drop for WalFecRepairPipeline {
 async fn run_repair_pipeline_worker(
     mut receiver: mpsc::Receiver<WalFecPipelineMessage>,
     state: WalFecRepairWorkerState,
+    worker_cx: Cx,
     per_symbol_delay: Duration,
 ) {
     let Some(native_worker_cx) = NativeCx::current() else {
@@ -1659,13 +1666,12 @@ async fn run_repair_pipeline_worker(
             "wal-fec repair worker task missing native runtime Cx".to_owned(),
         );
         drain_abandoned_work(
-            &receiver,
+            &mut receiver,
             state.pending_jobs.as_ref(),
             state.canceled_jobs.as_ref(),
         );
         return;
     };
-    let worker_cx = Cx::new();
     worker_cx.set_native_cx(native_worker_cx.clone());
 
     loop {
@@ -1682,7 +1688,7 @@ async fn run_repair_pipeline_worker(
                     "wal-fec repair worker task cancelled before the queue drained".to_owned(),
                 );
                 drain_abandoned_work(
-                    &receiver,
+                    &mut receiver,
                     state.pending_jobs.as_ref(),
                     state.canceled_jobs.as_ref(),
                 );
@@ -1694,10 +1700,14 @@ async fn run_repair_pipeline_worker(
             WalFecPipelineMessage::Work(work_item) => {
                 let group_id = work_item.meta.group_id();
                 let cancel_flag_for_work = Arc::clone(&state.cancel_flag);
+                let work_cx = worker_cx.create_child();
+                let native_worker_cx_for_work = native_worker_cx.clone();
                 let outcome = spawn_blocking(move || {
+                    work_cx.set_native_cx(native_worker_cx_for_work);
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         process_repair_work_item(
                             &work_item,
+                            &work_cx,
                             cancel_flag_for_work.as_ref(),
                             per_symbol_delay,
                         )
@@ -1737,7 +1747,7 @@ async fn run_repair_pipeline_worker(
                         record_worker_failure(&state.worker_failure, detail.clone());
                         error!(group_id = %group_id, "{detail}");
                         drain_abandoned_work(
-                            &receiver,
+                            &mut receiver,
                             state.pending_jobs.as_ref(),
                             state.canceled_jobs.as_ref(),
                         );
@@ -1751,7 +1761,7 @@ async fn run_repair_pipeline_worker(
                         "wal-fec repair worker task cancelled after processing work".to_owned(),
                     );
                     drain_abandoned_work(
-                        &receiver,
+                        &mut receiver,
                         state.pending_jobs.as_ref(),
                         state.canceled_jobs.as_ref(),
                     );
@@ -1776,12 +1786,22 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+trait ReceiverTryRecvCompat<T> {
+    fn try_recv_compat(&mut self) -> std::result::Result<T, mpsc::RecvError>;
+}
+
+impl<T> ReceiverTryRecvCompat<T> for mpsc::Receiver<T> {
+    fn try_recv_compat(&mut self) -> std::result::Result<T, mpsc::RecvError> {
+        self.try_recv()
+    }
+}
+
 fn drain_abandoned_work(
-    receiver: &mpsc::Receiver<WalFecPipelineMessage>,
+    receiver: &mut mpsc::Receiver<WalFecPipelineMessage>,
     pending_jobs: &AtomicUsize,
     canceled_jobs: &AtomicUsize,
 ) {
-    while let Ok(WalFecPipelineMessage::Work(_)) = receiver.try_recv() {
+    while let Ok(WalFecPipelineMessage::Work(_)) = receiver.try_recv_compat() {
         pending_jobs.fetch_sub(1, Ordering::SeqCst);
         canceled_jobs.fetch_add(1, Ordering::SeqCst);
     }
@@ -1792,7 +1812,7 @@ pub fn generate_wal_fec_repair_symbols(
     meta: &WalFecGroupMeta,
     source_pages: &[Vec<u8>],
 ) -> Result<Vec<SymbolRecord>> {
-    match generate_wal_fec_repair_symbols_inner(meta, source_pages, None, Duration::ZERO)? {
+    match generate_wal_fec_repair_symbols_inner(meta, source_pages, None, None, Duration::ZERO)? {
         Some(symbols) => {
             crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_encode();
             Ok(symbols)
@@ -1805,22 +1825,24 @@ pub fn generate_wal_fec_repair_symbols(
 
 fn process_repair_work_item(
     work_item: &WalFecRepairWorkItem,
+    cx: &Cx,
     cancel_flag: &AtomicBool,
     per_symbol_delay: Duration,
 ) -> Result<WalFecWorkOutcome> {
-    if cancel_flag.load(Ordering::SeqCst) {
+    if cancel_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
         return Ok(WalFecWorkOutcome::Canceled);
     }
     let Some(repair_symbols) = generate_wal_fec_repair_symbols_inner(
         &work_item.meta,
         &work_item.source_pages,
+        Some(cx),
         Some(cancel_flag),
         per_symbol_delay,
     )?
     else {
         return Ok(WalFecWorkOutcome::Canceled);
     };
-    if cancel_flag.load(Ordering::SeqCst) {
+    if cancel_flag.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
         return Ok(WalFecWorkOutcome::Canceled);
     }
     let group = WalFecGroupRecord::new(work_item.meta.clone(), repair_symbols)?;
@@ -1831,6 +1853,7 @@ fn process_repair_work_item(
 fn generate_wal_fec_repair_symbols_inner(
     meta: &WalFecGroupMeta,
     source_pages: &[Vec<u8>],
+    cx: Option<&Cx>,
     cancel_flag: Option<&AtomicBool>,
     per_symbol_delay: Duration,
 ) -> Result<Option<Vec<SymbolRecord>>> {
@@ -1858,6 +1881,11 @@ fn generate_wal_fec_repair_symbols_inner(
     let mut symbols = Vec::with_capacity(r_repair);
 
     for repair_index in 0..r_repair {
+        if let Some(cx) = cx {
+            if cx.checkpoint().is_err() {
+                return Ok(None);
+            }
+        }
         if let Some(flag) = cancel_flag {
             if flag.load(Ordering::SeqCst) {
                 return Ok(None);
@@ -3446,7 +3474,7 @@ mod tests {
         let meta = WalFecGroupMeta::from_init(init).expect("from_init");
 
         let symbols =
-            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, None, Duration::ZERO)
                 .expect("encode should succeed")
                 .expect("should not be cancelled");
 
@@ -3475,7 +3503,7 @@ mod tests {
         let meta = WalFecGroupMeta::from_init(init).expect("from_init");
 
         let repair_symbols =
-            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, None, Duration::ZERO)
                 .expect("encode")
                 .expect("not cancelled");
 
@@ -3510,7 +3538,7 @@ mod tests {
         let meta = WalFecGroupMeta::from_init(init).expect("from_init");
 
         let repair_symbols =
-            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, None, Duration::ZERO)
                 .expect("encode")
                 .expect("not cancelled");
 
@@ -3546,12 +3574,12 @@ mod tests {
         let meta = WalFecGroupMeta::from_init(init).expect("from_init");
 
         let symbols1 =
-            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, None, Duration::ZERO)
                 .expect("encode 1")
                 .expect("not cancelled");
 
         let symbols2 =
-            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, None, Duration::ZERO)
                 .expect("encode 2")
                 .expect("not cancelled");
 
