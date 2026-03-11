@@ -8118,7 +8118,6 @@ fn test_conformance_delete_with_correlated_not_exists_s68d() {
 }
 
 #[test]
-#[ignore = "multi-table FK DELETE CASCADE does not propagate — known gap"]
 fn test_conformance_multi_table_delete_cascade_s68d() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -12949,7 +12948,6 @@ fn test_conformance_complex_nested_subquery_s69az() {
 // ── s69ba: FK ON DELETE CASCADE chain ──
 
 #[test]
-#[ignore = "multi-level FK DELETE CASCADE does not propagate to child tables"]
 fn test_conformance_fk_cascade_chain_s69ba() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -13492,7 +13490,6 @@ fn test_conformance_dml_sequence_s69bp() {
 // ── s69bq: FK ON DELETE CASCADE with multi-level chain ──
 
 #[test]
-#[ignore = "multi-level FK DELETE CASCADE does not propagate to grandchild tables"]
 fn test_conformance_fk_delete_cascade_chain_s69bq() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

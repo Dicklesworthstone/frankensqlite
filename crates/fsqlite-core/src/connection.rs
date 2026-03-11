@@ -68,7 +68,7 @@ use fsqlite_types::{
 };
 use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
-    codegen_delete, codegen_insert, codegen_select, codegen_update,
+    codegen_delete, codegen_insert, codegen_select, codegen_update, emit_scan_filter,
 };
 use fsqlite_vdbe::engine::{
     ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, VdbeMetricsSnapshot,
@@ -83,12 +83,14 @@ use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
+#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_wal::{
-    WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairSeverityBucket, WalFile,
-    WalSalts, query_raptorq_repair_evidence, raptorq_repair_events_snapshot,
+    WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairSeverityBucket,
+    query_raptorq_repair_evidence, raptorq_repair_events_snapshot,
     raptorq_repair_evidence_snapshot, raptorq_repair_metrics_snapshot,
     reset_raptorq_repair_telemetry,
 };
+use fsqlite_wal::{WalFile, WalSalts};
 
 // MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
@@ -186,6 +188,16 @@ fn perform_begin_busy_retry_handoff(wait: BeginBusyRetryWait) {
 /// level consumes significantly more stack space than C. A practical limit of
 /// 100 prevents stack overflow while still allowing deep trigger chains.
 const MAX_TRIGGER_DEPTH: usize = 100;
+
+/// Maximum depth for FK CASCADE propagation.
+///
+/// Multi-level cascades (e.g., grandparent -> parent -> child) require
+/// recursive FK enforcement.  This limit prevents infinite recursion from
+/// self-referencing or circular FK chains.  SQLite uses
+/// `SQLITE_MAX_TRIGGER_DEPTH` for the same purpose; we use a separate
+/// bound because FK cascades run through `execute_statement`, not the
+/// trigger machinery.
+const MAX_FK_CASCADE_DEPTH: usize = 50;
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static FSQLITE_PARSE_SINGLE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -849,6 +861,14 @@ fn default_vtab_module_registry() -> HashMap<String, Box<dyn VtabModuleFactory>>
         "GENERATE_SERIES".to_owned(),
         Box::new(module_factory_from::<GenerateSeriesTable>()),
     );
+    modules.insert(
+        "RTREE".to_owned(),
+        Box::new(fsqlite_ext_rtree::rtree_module_factory()),
+    );
+    modules.insert(
+        "RTREE_I32".to_owned(),
+        Box::new(fsqlite_ext_rtree::rtree_i32_module_factory()),
+    );
     modules
 }
 
@@ -892,7 +912,7 @@ impl Row {
 /// A prepared SQL statement.
 pub struct PreparedStatement<'conn> {
     sql: String,
-    program: VdbeProgram,
+    program: Arc<VdbeProgram>,
     func_registry: Option<Arc<FunctionRegistry>>,
     expression_postprocess: Option<ExpressionPostprocess>,
     distinct: bool,
@@ -1056,7 +1076,7 @@ impl PreparedStatement<'_> {
 
     fn dispatch_precompiled_program(&self) -> Option<&VdbeProgram> {
         if self.dml_statement.is_some() && self.db.is_some() {
-            Some(&self.program)
+            Some(self.program.as_ref())
         } else {
             None
         }
@@ -1116,7 +1136,9 @@ impl PreparedStatement<'_> {
         // that exact execution path so prepared reads observe the connection's
         // uncommitted writes, concurrent session state, and MVCC snapshot.
         if self.conn.active_txn.borrow().is_some() {
-            let (rows, _, _) = self.conn.execute_table_program(&self.program, params)?;
+            let (rows, _, _) = self
+                .conn
+                .execute_table_program(self.program.as_ref(), params)?;
             return Ok(rows);
         }
 
@@ -1138,7 +1160,7 @@ impl PreparedStatement<'_> {
             })
             .transpose()?;
         let (result, mut txn_back) = execute_table_program_with_db(
-            &self.program,
+            self.program.as_ref(),
             params,
             registry,
             &self.conn.collation_registry,
@@ -1180,7 +1202,7 @@ impl PreparedStatement<'_> {
             self.execute_table_query(&op_cx, None)?
         } else {
             execute_program_with_postprocess(
-                &self.program,
+                self.program.as_ref(),
                 None,
                 self.func_registry.as_ref(),
                 Some(&self.conn.collation_registry),
@@ -1219,7 +1241,7 @@ impl PreparedStatement<'_> {
             self.execute_table_query(&op_cx, Some(params))?
         } else {
             execute_program_with_postprocess(
-                &self.program,
+                self.program.as_ref(),
                 Some(params),
                 self.func_registry.as_ref(),
                 Some(&self.conn.collation_registry),
@@ -2828,6 +2850,7 @@ impl Connection {
         let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_aggregate(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
+        self.compiled_cache.borrow_mut().clear();
     }
 
     /// Register a custom window function.
@@ -2852,6 +2875,7 @@ impl Connection {
         let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_window(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
+        self.compiled_cache.borrow_mut().clear();
     }
 
     /// Register a virtual-table module factory under the given name.
@@ -4166,8 +4190,10 @@ impl Connection {
 
                 // FK enforcement on UPDATE:
                 // 1. Parent-side: check old values aren't orphaning children
+                //    (uses cascade-propagation gate so multi-level cascades work)
                 // 2. Child-side: check new FK values have valid parents
-                if self.fk_enforcement_enabled() {
+                //    (uses strict gate — not needed during cascade operations)
+                if self.fk_cascade_propagation_enabled() {
                     let rows_to_check = if !trigger_rows.is_empty() {
                         trigger_rows
                             .iter()
@@ -4186,7 +4212,11 @@ impl Connection {
                             self.execute_fk_update_action(action)?;
                         }
                         // Child-side: validate new FK values against parent tables.
-                        self.check_fk_parent_exists(table_name, new_values)?;
+                        // Only check when NOT inside a cascade action, because
+                        // the cascade itself is modifying parent data.
+                        if self.fk_enforcement_enabled() {
+                            self.check_fk_parent_exists(table_name, new_values)?;
+                        }
                     }
                 }
 
@@ -4282,7 +4312,10 @@ impl Connection {
                 }
 
                 // FK enforcement on DELETE: check/cascade for each row.
-                if self.fk_enforcement_enabled() {
+                // Use `fk_cascade_propagation_enabled` (not `fk_enforcement_enabled`)
+                // so that multi-level cascades propagate through intermediate
+                // tables (e.g., grandparent -> parent -> child).
+                if self.fk_cascade_propagation_enabled() {
                     let rows_to_check = if !trigger_old_rows.is_empty() {
                         trigger_old_rows.clone()
                     } else {
@@ -5014,9 +5047,10 @@ impl Connection {
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         match statement {
             Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
-                let placeholder_program = ProgramBuilder::new().finish().map_err(|e| {
-                    FrankenError::Internal(format!("failed to build placeholder program: {e}"))
-                })?;
+                let placeholder_program =
+                    Arc::new(ProgramBuilder::new().finish().map_err(|e| {
+                        FrankenError::Internal(format!("failed to build placeholder program: {e}"))
+                    })?);
                 Ok(PreparedStatement {
                     sql: sql.to_owned(),
                     program: placeholder_program,
@@ -5037,7 +5071,7 @@ impl Connection {
                 })
             }
             Statement::Select(select) if is_expression_only_select(select) => {
-                let program = compile_expression_select(select)?;
+                let program = Arc::new(compile_expression_select(select)?);
                 let expression_postprocess = Some(build_expression_postprocess(select));
                 Ok(PreparedStatement {
                     sql: sql.to_owned(),
@@ -5062,9 +5096,14 @@ impl Connection {
                 let program = if distinct && limit_clause.is_some() {
                     let mut unbounded = select.clone();
                     unbounded.limit = None;
-                    self.compile_table_select(&unbounded)?
+                    let compiled_sql = Statement::Select(unbounded.clone()).to_string();
+                    let compiled_sql_key = Self::sql_hash(&compiled_sql);
+                    self.compile_with_cache(compiled_sql_key, &compiled_sql, |conn| {
+                        conn.compile_table_select(&unbounded)
+                    })?
                 } else {
-                    self.compile_table_select(select)?
+                    let sql_key = Self::sql_hash(sql);
+                    self.compile_with_cache(sql_key, sql, |conn| conn.compile_table_select(select))?
                 };
                 Ok(PreparedStatement {
                     sql: sql.to_owned(),
@@ -5100,7 +5139,10 @@ impl Connection {
                 );
 
                 if is_simple_values {
-                    let program = self.compile_table_insert(insert)?;
+                    let sql_key = Self::sql_hash(sql);
+                    let program = self.compile_with_cache(sql_key, sql, |conn| {
+                        conn.compile_table_insert(insert)
+                    })?;
                     Ok(PreparedStatement {
                         sql: sql.to_owned(),
                         program,
@@ -5119,9 +5161,12 @@ impl Connection {
                     })
                 } else {
                     // Complex INSERT...SELECT: placeholder, full dispatch.
-                    let placeholder_program = ProgramBuilder::new().finish().map_err(|e| {
-                        FrankenError::Internal(format!("failed to build placeholder program: {e}"))
-                    })?;
+                    let placeholder_program =
+                        Arc::new(ProgramBuilder::new().finish().map_err(|e| {
+                            FrankenError::Internal(format!(
+                                "failed to build placeholder program: {e}"
+                            ))
+                        })?);
                     Ok(PreparedStatement {
                         sql: sql.to_owned(),
                         program: placeholder_program,
@@ -5143,9 +5188,10 @@ impl Connection {
             Statement::Update(_) | Statement::Delete(_) => {
                 // UPDATE/DELETE still use full execute_statement dispatch
                 // because their execution requires complex materialization.
-                let placeholder_program = ProgramBuilder::new().finish().map_err(|e| {
-                    FrankenError::Internal(format!("failed to build placeholder program: {e}"))
-                })?;
+                let placeholder_program =
+                    Arc::new(ProgramBuilder::new().finish().map_err(|e| {
+                        FrankenError::Internal(format!("failed to build placeholder program: {e}"))
+                    })?);
                 Ok(PreparedStatement {
                     sql: sql.to_owned(),
                     program: placeholder_program,
@@ -9081,9 +9127,9 @@ impl Connection {
     }
 
     fn backfill_index(&self, table: &TableSchema, index: &IndexSchema) -> Result<()> {
-        if index.where_clause.is_some() || index.columns.len() != index.key_term_count() {
+        if index.columns.len() != index.key_term_count() {
             return Err(FrankenError::NotImplemented(
-                "REINDEX/CREATE INDEX backfill for expression or partial indexes is not yet supported"
+                "REINDEX/CREATE INDEX backfill for expression indexes is not yet supported"
                     .to_owned(),
             ));
         }
@@ -9094,13 +9140,23 @@ impl Connection {
             .collect();
         let n_idx_cols = idx_col_positions.len();
         let columns_label = format!("{}.{}", table.name, index.key_label());
+        let where_expr = index
+            .where_clause
+            .as_deref()
+            .map(fsqlite_parser::expr::parse_expr)
+            .transpose()
+            .map_err(|e| {
+                FrankenError::Internal(format!("failed to parse partial index WHERE: {e}"))
+            })?;
         let program = Self::compile_index_backfill(
+            table,
             table.root_page,
             index.root_page,
             &idx_col_positions,
             index.is_unique,
             n_idx_cols,
             &columns_label,
+            where_expr.as_ref(),
         )?;
         self.execute_table_program(&program, None).map(|_| ())
     }
@@ -9208,12 +9264,6 @@ impl Connection {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
 
-        if stmt.where_clause.is_some() {
-            return Err(FrankenError::NotImplemented(
-                "partial CREATE INDEX backfill is not yet supported".to_owned(),
-            ));
-        }
-
         // Phase 1: Validate schema (with borrow)
         {
             let schema = self.schema.borrow();
@@ -9298,7 +9348,7 @@ impl Connection {
                     .iter()
                     .map(|indexed| indexed.expr.to_string())
                     .collect(),
-                where_clause: None,
+                where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
                 root_page,
                 is_unique: stmt.unique,
             });
@@ -9342,16 +9392,19 @@ impl Connection {
     /// every existing row.  Used by `execute_create_index` to backfill.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn compile_index_backfill(
+        table: &TableSchema,
         table_root: i32,
         index_root: i32,
         idx_col_positions: &[usize],
         is_unique: bool,
         n_idx_cols: usize,
         columns_label: &str,
+        where_expr: Option<&fsqlite_ast::Expr>,
     ) -> Result<VdbeProgram> {
         let mut b = ProgramBuilder::new();
         let halt_label = b.emit_label();
         let loop_label = b.emit_label();
+        let next_label = b.emit_label();
         let end_label = b.emit_label();
 
         // Init → end_label (past-the-end, so Init falls through).
@@ -9371,6 +9424,12 @@ impl Connection {
 
         // Loop label.
         b.resolve_label(loop_label);
+
+        // For partial indexes, evaluate WHERE clause and skip rows that
+        // don't satisfy the predicate.
+        if let Some(predicate) = where_expr {
+            emit_scan_filter(&mut b, predicate, 0, table, next_label);
+        }
 
         // Allocate registers for index key: (indexed_cols..., rowid).
         let key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
@@ -9414,6 +9473,10 @@ impl Connection {
             P4::None
         };
         b.emit_op(Opcode::IdxInsert, 1, rec_reg, p3, p4, p5);
+
+        // next_label: WHERE-clause skip target — rows that fail the partial
+        // index predicate jump here, bypassing IdxInsert.
+        b.resolve_label(next_label);
 
         // Next → loop back.
         b.emit_jump_to_label(Opcode::Next, 0, 0, loop_label, P4::None, 0);
@@ -9538,9 +9601,21 @@ impl Connection {
 
     // ── Foreign Key enforcement helpers (bd-thqgm) ─────────────────────
 
-    /// Returns `true` when `PRAGMA foreign_keys` is currently ON.
+    /// Returns `true` when `PRAGMA foreign_keys` is currently ON and we are
+    /// NOT inside a CASCADE action.  Used for INSERT parent-existence checks
+    /// and UPDATE parent-side/child-side FK checks, which should NOT fire
+    /// during a CASCADE operation.
     fn fk_enforcement_enabled(&self) -> bool {
         self.pragma_state.borrow().foreign_keys && self.fk_cascade_depth.get() == 0
+    }
+
+    /// Returns `true` when `PRAGMA foreign_keys` is ON, regardless of cascade
+    /// depth.  Used for DELETE FK cascade propagation so that multi-level
+    /// cascades (grandparent -> parent -> child) work correctly.
+    /// Bounded by `MAX_FK_CASCADE_DEPTH` to prevent infinite recursion.
+    fn fk_cascade_propagation_enabled(&self) -> bool {
+        self.pragma_state.borrow().foreign_keys
+            && self.fk_cascade_depth.get() < MAX_FK_CASCADE_DEPTH
     }
 
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
@@ -13255,6 +13330,7 @@ impl Connection {
                 Ok(ssi_decision_cards_to_rows(&cards))
             }
             // ── RaptorQ repair observability PRAGMAs (bd-t6sv2.3) ──────────
+            #[cfg(not(target_arch = "wasm32"))]
             "fsqlite.raptorq_stats" | "raptorq_stats" | "fsqlite_raptorq_stats" => {
                 let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
                 let snapshot = raptorq_repair_metrics_snapshot();
@@ -13315,6 +13391,7 @@ impl Connection {
                     },
                 ])
             }
+            #[cfg(not(target_arch = "wasm32"))]
             "fsqlite.raptorq_events" | "raptorq_events" | "fsqlite_raptorq_events" => {
                 let limit = if let Some(ref value) = pragma.value {
                     parse_pragma_nonnegative_usize(value, "raptorq_events limit")?
@@ -13342,6 +13419,7 @@ impl Connection {
                     .collect::<Vec<_>>();
                 Ok(rows)
             }
+            #[cfg(not(target_arch = "wasm32"))]
             "fsqlite.raptorq_repair_evidence"
             | "raptorq_repair_evidence"
             | "fsqlite_raptorq_repair_evidence" => {
@@ -13356,6 +13434,7 @@ impl Connection {
                 let cards = query_raptorq_repair_evidence(&query);
                 Ok(raptorq_repair_evidence_cards_to_rows(&cards))
             }
+            #[cfg(not(target_arch = "wasm32"))]
             "fsqlite.raptorq_reset" | "raptorq_reset" | "fsqlite_raptorq_reset" => {
                 reset_raptorq_repair_telemetry();
                 Ok(vec![Row {
@@ -13896,12 +13975,14 @@ impl Connection {
 
     /// Returns a snapshot of retained RaptorQ repair evidence cards.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn raptorq_repair_evidence_snapshot(&self) -> Vec<WalFecRepairEvidenceCard> {
         raptorq_repair_evidence_snapshot(0)
     }
 
     /// Query RaptorQ repair evidence cards by page/frame, severity bucket, and/or time range.
     #[must_use]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn query_raptorq_repair_evidence_cards(
         &self,
         query: &WalFecRepairEvidenceQuery,
@@ -24292,6 +24373,7 @@ fn hex_encode_blake3(bytes: [u8; 32]) -> String {
     encoded
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn raptorq_repair_evidence_cards_to_rows(cards: &[WalFecRepairEvidenceCard]) -> Vec<Row> {
     cards
         .iter()
@@ -24527,6 +24609,7 @@ fn parse_raptorq_u64_component(raw: &str, label: &str) -> Result<u64> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_raptorq_repair_evidence_query_spec(spec: &str) -> Result<WalFecRepairEvidenceQuery> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
@@ -24608,6 +24691,7 @@ fn parse_raptorq_repair_evidence_query_spec(spec: &str) -> Result<WalFecRepairEv
     Ok(query)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_raptorq_repair_evidence_query(
     value: &fsqlite_ast::PragmaValue,
 ) -> Result<WalFecRepairEvidenceQuery> {
@@ -34427,6 +34511,33 @@ mod tests {
         assert!(modules.contains_key("JSON_EACH"));
         assert!(modules.contains_key("JSON_TREE"));
         assert!(modules.contains_key("GENERATE_SERIES"));
+        assert!(modules.contains_key("RTREE"));
+        assert!(modules.contains_key("RTREE_I32"));
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_module_is_registered_for_create() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x, min_y, max_y);")
+            .unwrap();
+
+        assert!(
+            conn.vtab_instances.borrow().contains_key("SPATIAL"),
+            "rtree CREATE VIRTUAL TABLE should register a live virtual-table instance"
+        );
+
+        let rows = conn
+            .query("SELECT name, sql FROM sqlite_master WHERE name = 'spatial';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("spatial".to_owned()));
+        let SqliteValue::Text(sql) = &rows[0].values()[1] else {
+            panic!("sqlite_master.sql should be TEXT");
+        };
+        assert!(
+            sql.to_ascii_uppercase().contains("USING RTREE"),
+            "expected CREATE VIRTUAL TABLE SQL, got {sql}"
+        );
     }
 
     #[test]
@@ -49827,6 +49938,95 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_table_select_prepare_reuses_compiled_program_until_schema_change() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_sel_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_sel_reuse VALUES (1, 'alpha'), (2, 'beta');")
+            .unwrap();
+
+        let sql = "SELECT val FROM prep_sel_reuse WHERE id = ?1";
+        let stmt1 = conn.prepare(sql).unwrap();
+        let stmt2 = conn.prepare(sql).unwrap();
+
+        assert!(
+            stmt1.db.is_some(),
+            "table SELECT should compile to a real program"
+        );
+        assert!(
+            stmt2.db.is_some(),
+            "table SELECT should compile to a real program"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stmt1.program, &stmt2.program),
+            "repeated prepare() should reuse the cached compiled SELECT program"
+        );
+
+        let row = stmt2
+            .query_row_with_params(&[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Text("beta".to_owned()));
+
+        conn.execute("CREATE TABLE prep_sel_reuse_bump (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let stmt3 = conn.prepare(sql).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&stmt1.program, &stmt3.program),
+            "schema change should invalidate the cached compiled SELECT program"
+        );
+    }
+
+    #[test]
+    fn test_prepared_simple_insert_prepare_reuses_compiled_program() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_ins_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let sql = "INSERT INTO prep_ins_reuse (id, val) VALUES (?1, ?2)";
+        let stmt1 = conn.prepare(sql).unwrap();
+        let stmt2 = conn.prepare(sql).unwrap();
+
+        assert!(
+            stmt1.db.is_some(),
+            "simple VALUES INSERT should compile to a reusable program"
+        );
+        assert!(
+            stmt2.db.is_some(),
+            "simple VALUES INSERT should compile to a reusable program"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stmt1.program, &stmt2.program),
+            "repeated prepare() should reuse the cached compiled INSERT program"
+        );
+
+        assert_eq!(
+            stmt1
+                .execute_with_params(&[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alpha".to_owned()),
+                ])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stmt2
+                .execute_with_params(&[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("beta".to_owned()),
+                ])
+                .unwrap(),
+            1
+        );
+
+        let rows = conn
+            .query("SELECT val FROM prep_ins_reuse ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".to_owned()));
+    }
+
+    #[test]
     fn test_prepared_insert_reuse_semantic_parity_with_execute() {
         // Verify that prepared INSERT produces identical results to
         // Connection::execute for the same data.
@@ -50653,6 +50853,114 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+    }
+
+    #[test]
+    fn test_compiled_cache_invalidated_by_aggregate_and_window_registration() {
+        struct Product;
+
+        impl fsqlite_func::AggregateFunction for Product {
+            type State = i64;
+
+            fn initial_state(&self) -> Self::State {
+                1
+            }
+
+            fn step(
+                &self,
+                state: &mut Self::State,
+                args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                *state *= args[0].to_integer();
+                Ok(())
+            }
+
+            fn finalize(&self, state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(state))
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                "product"
+            }
+        }
+
+        struct MovingSum;
+
+        impl fsqlite_func::WindowFunction for MovingSum {
+            type State = i64;
+
+            fn initial_state(&self) -> Self::State {
+                0
+            }
+
+            fn step(
+                &self,
+                state: &mut Self::State,
+                args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                *state += args[0].to_integer();
+                Ok(())
+            }
+
+            fn inverse(
+                &self,
+                state: &mut Self::State,
+                args: &[SqliteValue],
+            ) -> fsqlite_error::Result<()> {
+                *state -= args[0].to_integer();
+                Ok(())
+            }
+
+            fn value(&self, state: &Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(*state))
+            }
+
+            fn finalize(&self, state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+                Ok(SqliteValue::Integer(state))
+            }
+
+            fn num_args(&self) -> i32 {
+                1
+            }
+
+            fn name(&self) -> &str {
+                "moving_sum"
+            }
+        }
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_udf (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO cc_udf VALUES (2), (3);").unwrap();
+
+        conn.query("SELECT SUM(v) FROM cc_udf;").unwrap();
+        assert!(
+            conn.compiled_cache_len() > 0,
+            "aggregate query should populate compiled cache"
+        );
+
+        conn.register_aggregate_function(Product);
+        assert_eq!(
+            conn.compiled_cache_len(),
+            0,
+            "aggregate registration must clear compiled cache"
+        );
+
+        conn.query("SELECT SUM(v) FROM cc_udf;").unwrap();
+        assert!(
+            conn.compiled_cache_len() > 0,
+            "compiled cache should repopulate after aggregate registration"
+        );
+
+        conn.register_window_function(MovingSum);
+        assert_eq!(
+            conn.compiled_cache_len(),
+            0,
+            "window registration must clear compiled cache"
+        );
     }
 
     #[test]
@@ -77791,5 +78099,112 @@ mod pager_routing_tests {
             SqliteValue::Integer(1),
             "child_b FK column was incorrectly set to NULL during non-PK UPDATE"
         );
+    }
+
+    /// Regression test for issue #31: child rows disappear immediately after
+    /// insert with foreign_keys=ON + ON DELETE CASCADE when the parent table
+    /// uses a TEXT PRIMARY KEY.
+    #[test]
+    fn test_issue31_child_rows_survive_insert_text_pk_cascade() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id TEXT PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id TEXT NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent (id, name) VALUES ('p1', 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child (id, parent_id, val) VALUES (1, 'p1', 'c1');")
+            .unwrap();
+        conn.execute("INSERT INTO child (id, parent_id, val) VALUES (2, 'p1', 'c2');")
+            .unwrap();
+
+        // Issue #31: children must still exist right after inserting them.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM child WHERE parent_id = 'p1';")
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "issue #31: child rows disappeared after INSERT with TEXT PK + ON DELETE CASCADE"
+        );
+    }
+
+    /// Regression test for issue #31: multi-level FK CASCADE propagation.
+    ///
+    /// Deleting a grandparent row should cascade through parent to child via
+    /// ON DELETE CASCADE at each level.
+    #[test]
+    fn test_issue31_multi_level_fk_cascade_propagation() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE grandparent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE parent (
+                id INTEGER PRIMARY KEY,
+                gp_id INTEGER REFERENCES grandparent(id) ON DELETE CASCADE,
+                name TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                p_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                name TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO grandparent VALUES (1, 'GP1'), (2, 'GP2');")
+            .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1, 1, 'P1'), (2, 1, 'P2'), (3, 2, 'P3');")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO child VALUES (1, 1, 'C1'), (2, 1, 'C2'), (3, 2, 'C3'), (4, 3, 'C4');",
+        )
+        .unwrap();
+
+        // Delete GP1: should cascade to P1, P2, then to C1, C2, C3.
+        conn.execute("DELETE FROM grandparent WHERE id = 1;")
+            .unwrap();
+
+        // Only GP2 survives.
+        let rows = conn.query("SELECT COUNT(*) FROM grandparent;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+
+        // Only P3 (referencing GP2) survives.
+        let rows = conn.query("SELECT COUNT(*) FROM parent;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(1),
+            "parent rows not cascaded correctly"
+        );
+
+        // Only C4 (referencing P3) survives.
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(1),
+            "multi-level FK CASCADE did not propagate from grandparent to child"
+        );
+
+        // Verify the surviving rows are the correct ones.
+        let rows = conn.query("SELECT id FROM grandparent;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        let rows = conn.query("SELECT id FROM parent;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+        let rows = conn.query("SELECT id FROM child;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(4));
     }
 }
