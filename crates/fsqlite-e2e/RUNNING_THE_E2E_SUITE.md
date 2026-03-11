@@ -176,9 +176,12 @@ cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
 ```
 
 These modes keep the JSONL schema stable. The record still uses
-`RunRecordV1`, but `environment.capture_mode` becomes `suppressed` and the
-post-run `integrity_check_ok` field is omitted. Default runs remain full
-correctness runs with captured environment metadata.
+`RunRecordV1`. For profiler-safe runs, `run_mode.profile_only_effective`
+becomes `true`, `run_mode.run_integrity_check` becomes `false`,
+`run_mode.capture_environment_metadata` becomes `false`,
+`environment.capture_mode` becomes `suppressed`, and the post-run
+`integrity_check_ok` field is omitted. Default runs remain full correctness
+runs with captured environment metadata.
 
 ### Interpreting Results
 

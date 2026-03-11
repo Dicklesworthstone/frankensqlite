@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::methodology::{EnvironmentMeta, MethodologyMeta};
+use crate::methodology::{EnvironmentCaptureMode, EnvironmentMeta, MethodologyMeta};
 
 /// JSON schema version for the E2E report format.
 ///
@@ -73,6 +73,39 @@ impl E2eReport {
     }
 }
 
+/// Explicit run-mode behavior carried by machine-readable run records.
+///
+/// This lets downstream tools distinguish full-validation runs from lower-
+/// overhead profiler-safe runs without reverse-engineering the meaning of a
+/// suppressed environment block and nullable integrity-check result.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RunModeProvenance {
+    /// True when the serialized behavior matches `--profile-only`, either via
+    /// the explicit flag or an equivalent pair of granular skip flags.
+    pub profile_only_effective: bool,
+    /// Whether the run performed post-run `PRAGMA integrity_check`.
+    pub run_integrity_check: bool,
+    /// Whether the run captured benchmark environment metadata.
+    pub capture_environment_metadata: bool,
+}
+
+impl RunModeProvenance {
+    #[must_use]
+    pub fn from_environment_and_report(
+        environment: &EnvironmentMeta,
+        report: &EngineRunReport,
+    ) -> Self {
+        let capture_environment_metadata =
+            environment.capture_mode == EnvironmentCaptureMode::Captured;
+        let run_integrity_check = report.correctness.integrity_check_ok.is_some();
+        Self {
+            profile_only_effective: !capture_environment_metadata && !run_integrity_check,
+            run_integrity_check,
+            capture_environment_metadata,
+        }
+    }
+}
+
 /// A single JSONL record for a single-engine run.
 ///
 /// This is intentionally a "flat" record suitable for append-only JSONL logs.
@@ -85,6 +118,9 @@ pub struct RunRecordV1 {
     pub methodology: MethodologyMeta,
     /// Environment snapshot captured at benchmark time for reproducibility.
     pub environment: EnvironmentMeta,
+    /// Explicit run-mode behavior derived from the serialized record contents.
+    #[serde(default)]
+    pub run_mode: RunModeProvenance,
     pub engine: EngineInfo,
     pub fixture_id: String,
     pub golden_path: Option<String>,
@@ -114,11 +150,14 @@ pub struct RunRecordV1Args {
 impl RunRecordV1 {
     #[must_use]
     pub fn new(args: RunRecordV1Args) -> Self {
+        let run_mode =
+            RunModeProvenance::from_environment_and_report(&args.environment, &args.report);
         Self {
             schema_version: RUN_RECORD_SCHEMA_V1.to_owned(),
             recorded_unix_ms: args.recorded_unix_ms,
             methodology: MethodologyMeta::current(),
             environment: args.environment,
+            run_mode,
             engine: args.engine,
             fixture_id: args.fixture_id,
             golden_path: args.golden_path,
@@ -682,11 +721,59 @@ mod tests {
             parsed.environment.capture_mode,
             EnvironmentCaptureMode::Captured
         );
+        assert!(!parsed.run_mode.profile_only_effective);
+        assert!(parsed.run_mode.run_integrity_check);
+        assert!(parsed.run_mode.capture_environment_metadata);
         assert!(!parsed.environment.arch.is_empty());
         assert_eq!(parsed.engine.name, "sqlite3");
         assert_eq!(parsed.concurrency, 4);
         assert_eq!(parsed.ops_count, 10);
         assert_eq!(parsed.report.wall_time_ms, 123);
+    }
+
+    #[test]
+    fn run_record_marks_profile_only_equivalent_behavior_explicitly() {
+        let report = EngineRunReport {
+            wall_time_ms: 42,
+            ops_total: 7,
+            ops_per_sec: 3.5_f64,
+            retries: 0,
+            aborts: 0,
+            correctness: cr(None, None, None, None),
+            latency_ms: None,
+            error: None,
+            hot_path_profile: None,
+        };
+
+        let record = RunRecordV1::new(RunRecordV1Args {
+            recorded_unix_ms: 1_700_000_000_000,
+            environment: crate::methodology::EnvironmentMeta::suppressed("release-perf"),
+            engine: EngineInfo {
+                name: "fsqlite".to_owned(),
+                sqlite_version: None,
+                fsqlite_git: None,
+            },
+            fixture_id: "fixture-a".to_owned(),
+            golden_path: Some("/abs/golden.db".to_owned()),
+            golden_sha256: Some("deadbeef".to_owned()),
+            workload: "mixed_read_write".to_owned(),
+            concurrency: 8,
+            ops_count: 10,
+            report,
+        });
+
+        assert!(record.run_mode.profile_only_effective);
+        assert!(!record.run_mode.run_integrity_check);
+        assert!(!record.run_mode.capture_environment_metadata);
+
+        let line = record.to_jsonl_line().unwrap();
+        let parsed: RunRecordV1 = serde_json::from_str(&line).unwrap();
+        assert!(parsed.run_mode.profile_only_effective);
+        assert_eq!(
+            parsed.environment.capture_mode,
+            EnvironmentCaptureMode::Suppressed
+        );
+        assert_eq!(parsed.report.correctness.integrity_check_ok, None);
     }
 
     #[test]

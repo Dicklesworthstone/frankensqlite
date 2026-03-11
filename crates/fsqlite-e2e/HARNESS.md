@@ -244,6 +244,10 @@ report.aborts              Transaction aborts
 report.correctness.*       Correctness tier results (see below)
 report.error               null if clean, error string otherwise
 environment.capture_mode   "captured" by default, "suppressed" for profiler-only runs
+run_mode.profile_only_effective   true when the emitted record is profiler-safe
+run_mode.run_integrity_check      whether post-run integrity_check executed
+run_mode.capture_environment_metadata
+                                  whether host/environment probing ran
 ```
 
 For lower-overhead profiler runs, `realdb-e2e run` supports:
@@ -254,7 +258,9 @@ For lower-overhead profiler runs, `realdb-e2e run` supports:
   should be controlled independently.
 
 Default runs are unchanged: they still emit a full `RunRecordV1` with captured
-environment metadata and integrity-check results.
+environment metadata and integrity-check results. Profiler-safe records also
+carry an explicit `run_mode` block so downstream scripts do not need to infer
+mode from nullable correctness fields alone.
 
 ### Correctness Tiers
 

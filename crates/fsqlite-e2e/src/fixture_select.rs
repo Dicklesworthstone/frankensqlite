@@ -12,7 +12,7 @@
 //! - **Size range filtering**: `--min-size 1MB`, `--max-size 100MB`.
 //! - **Feature filtering**: `--requires-wal`, `--header-ok`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +79,13 @@ pub const REQUIRED_PLACEMENT_PROFILE_IDS: [&str; 3] = [
     PLACEMENT_PROFILE_RECOMMENDED_PINNED,
     PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
 ];
+
+const BUNDLE_DIR_ROW_ID_PLACEHOLDER: &str = "{row_id}";
+const BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER: &str = "{fixture_id}";
+const BUNDLE_DIR_MODE_PLACEHOLDER: &str = "{mode}";
+const BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER: &str = "{placement_profile_id}";
+const BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER: &str = "{source_revision}";
+const BUNDLE_DIR_BEADS_HASH_PLACEHOLDER: &str = "{beads_hash}";
 
 /// Stable hardware-class id for portable x86_64 Linux baseline hosts.
 pub const HARDWARE_CLASS_LINUX_X86_64_ANY: &str = "linux_x86_64_any";
@@ -398,12 +405,18 @@ pub fn render_benchmark_bundle_dir(
 ) -> String {
     contract
         .bundle_dir_template
-        .replace("{row_id}", &cell.row_id)
-        .replace("{fixture_id}", &cell.fixture_id)
-        .replace("{mode}", cell.mode.as_str())
-        .replace("{placement_profile_id}", &cell.placement_profile_id)
-        .replace("{source_revision}", &short_hash(source_revision))
-        .replace("{beads_hash}", &short_hash(beads_hash))
+        .replace(BUNDLE_DIR_ROW_ID_PLACEHOLDER, &cell.row_id)
+        .replace(BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER, &cell.fixture_id)
+        .replace(BUNDLE_DIR_MODE_PLACEHOLDER, cell.mode.as_str())
+        .replace(
+            BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER,
+            &cell.placement_profile_id,
+        )
+        .replace(
+            BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER,
+            &short_hash(source_revision),
+        )
+        .replace(BUNDLE_DIR_BEADS_HASH_PLACEHOLDER, &short_hash(beads_hash))
 }
 
 /// Materialize the artifact bundle path for one expanded cell.
@@ -547,7 +560,7 @@ pub fn validate_beads_benchmark_campaign(
         }
     }
     for required_profile_id in REQUIRED_PLACEMENT_PROFILE_IDS {
-        if !placement_ids.contains_key(required_profile_id) {
+        if !placement_ids.contains(required_profile_id) {
             errors.push(format!(
                 "campaign must define required placement profile {:?}",
                 required_profile_id
@@ -587,7 +600,7 @@ pub fn validate_beads_benchmark_campaign(
         }
     }
     for required_hardware_id in REQUIRED_HARDWARE_CLASS_IDS {
-        if !hardware_ids.contains_key(required_hardware_id) {
+        if !hardware_ids.contains(required_hardware_id) {
             errors.push(format!(
                 "campaign must define required hardware class {:?}",
                 required_hardware_id
@@ -657,7 +670,7 @@ pub fn validate_beads_benchmark_campaign(
                     fixture.working_copy_size_bytes,
                     metadata.len(),
                     working_copy.display()
-                ))
+                ));
             }
             Ok(_) => {}
             Err(e) => errors.push(format!(
@@ -706,7 +719,7 @@ pub fn validate_beads_benchmark_campaign(
             ));
         }
         for fixture_id in &row.fixtures {
-            if !fixture_ids.contains_key(fixture_id.as_str()) {
+            if !fixture_ids.contains(fixture_id.as_str()) {
                 errors.push(format!(
                     "row {} references unknown fixture {:?}",
                     row.row_id, fixture_id
@@ -757,32 +770,32 @@ pub fn validate_beads_benchmark_campaign(
         }
 
         for variant in &row.placement_variants {
-            if !placement_ids.contains_key(variant.placement_profile_id.as_str()) {
+            if !placement_ids.contains(variant.placement_profile_id.as_str()) {
                 errors.push(format!(
                     "row {} references unknown placement profile {:?}",
                     row.row_id, variant.placement_profile_id
                 ));
             }
-            if !hardware_ids.contains_key(variant.hardware_class_id.as_str()) {
+            if !hardware_ids.contains(variant.hardware_class_id.as_str()) {
                 errors.push(format!(
                     "row {} references unknown hardware class {:?}",
                     row.row_id, variant.hardware_class_id
                 ));
             }
         }
-        if !retry_ids.contains_key(row.retry_policy_id.as_str()) {
+        if !retry_ids.contains(row.retry_policy_id.as_str()) {
             errors.push(format!(
                 "row {} references unknown retry policy {:?}",
                 row.row_id, row.retry_policy_id
             ));
         }
-        if !build_ids.contains_key(row.build_profile_id.as_str()) {
+        if !build_ids.contains(row.build_profile_id.as_str()) {
             errors.push(format!(
                 "row {} references unknown build profile {:?}",
                 row.row_id, row.build_profile_id
             ));
         }
-        if !seed_ids.contains_key(row.seed_policy_id.as_str()) {
+        if !seed_ids.contains(row.seed_policy_id.as_str()) {
             errors.push(format!(
                 "row {} references unknown seed policy {:?}",
                 row.row_id, row.seed_policy_id
@@ -791,12 +804,12 @@ pub fn validate_beads_benchmark_campaign(
     }
 
     for placeholder in [
-        "{row_id}",
-        "{fixture_id}",
-        "{mode}",
-        "{placement_profile_id}",
-        "{source_revision}",
-        "{beads_hash}",
+        BUNDLE_DIR_ROW_ID_PLACEHOLDER,
+        BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER,
+        BUNDLE_DIR_MODE_PLACEHOLDER,
+        BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER,
+        BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER,
+        BUNDLE_DIR_BEADS_HASH_PLACEHOLDER,
     ] {
         if !campaign
             .artifact_contract
@@ -820,18 +833,18 @@ fn unique_ids<'a>(
     ids: impl Iterator<Item = &'a str>,
     label: &str,
     errors: &mut Vec<String>,
-) -> BTreeMap<&'a str, ()> {
-    let mut map = BTreeMap::new();
+) -> BTreeSet<&'a str> {
+    let mut ids_set = BTreeSet::new();
     for id in ids {
         if id.trim().is_empty() {
             errors.push(format!("{label} must not be empty"));
             continue;
         }
-        if map.insert(id, ()).is_some() {
+        if !ids_set.insert(id) {
             errors.push(format!("duplicate {label}: {id}"));
         }
     }
-    map
+    ids_set
 }
 
 fn sha256_hex_file(path: &Path) -> Result<String, String> {
