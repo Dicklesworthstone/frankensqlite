@@ -403,6 +403,73 @@ impl ChangesetRow {
         ))
     }
 
+    /// Decode one patchset row starting at `pos`.
+    ///
+    /// Patchset UPDATE rows only store primary-key old values. Non-PK old
+    /// values are reconstructed as [`ChangesetValue::Undefined`] so the
+    /// decoded row can reuse the normal apply path.
+    pub fn decode_patchset(
+        data: &[u8],
+        pos: usize,
+        col_count: usize,
+        pk_flags: &[bool],
+    ) -> Option<(Self, usize)> {
+        if pk_flags.len() != col_count {
+            return None;
+        }
+
+        let op = ChangeOp::from_byte(*data.get(pos)?)?;
+        let mut offset = pos + 1;
+
+        let decode_n = |data: &[u8], offset: &mut usize, n: usize| -> Option<Vec<ChangesetValue>> {
+            let mut vals = Vec::with_capacity(n);
+            for _ in 0..n {
+                let (v, consumed) = ChangesetValue::decode(data, *offset)?;
+                *offset += consumed;
+                vals.push(v);
+            }
+            Some(vals)
+        };
+
+        let (old_values, new_values) = match op {
+            ChangeOp::Insert => {
+                let new_values = decode_n(data, &mut offset, col_count)?;
+                (Vec::new(), new_values)
+            }
+            ChangeOp::Delete => {
+                let old_values = decode_n(data, &mut offset, col_count)?;
+                (old_values, Vec::new())
+            }
+            ChangeOp::Update => {
+                let pk_count = pk_flags.iter().filter(|&&is_pk| is_pk).count();
+                if pk_count == 0 {
+                    return None;
+                }
+                let pk_old_values = decode_n(data, &mut offset, pk_count)?;
+                let mut old_values = Vec::with_capacity(col_count);
+                let mut pk_iter = pk_old_values.into_iter();
+                for is_pk in pk_flags {
+                    if *is_pk {
+                        old_values.push(pk_iter.next()?);
+                    } else {
+                        old_values.push(ChangesetValue::Undefined);
+                    }
+                }
+                let new_values = decode_n(data, &mut offset, col_count)?;
+                (old_values, new_values)
+            }
+        };
+
+        Some((
+            Self {
+                op,
+                old_values,
+                new_values,
+            },
+            offset - pos,
+        ))
+    }
+
     /// Invert this change: INSERT becomes DELETE, DELETE becomes INSERT,
     /// UPDATE swaps old and new values.
     #[must_use]
@@ -504,6 +571,25 @@ impl Changeset {
             // Read rows until we hit another table header or end of data.
             while pos < data.len() && data[pos] != TABLE_HEADER_BYTE {
                 let (row, consumed) = ChangesetRow::decode_changeset(data, pos, info.column_count)?;
+                pos += consumed;
+                rows.push(row);
+            }
+            tables.push(TableChangeset { info, rows });
+        }
+        Some(Self { tables })
+    }
+
+    /// Decode a patchset from its binary representation.
+    pub fn decode_patchset(data: &[u8]) -> Option<Self> {
+        let mut tables = Vec::new();
+        let mut pos = 0;
+        while pos < data.len() {
+            let (info, consumed) = TableInfo::decode(data, pos)?;
+            pos += consumed;
+            let mut rows = Vec::new();
+            while pos < data.len() && data[pos] != TABLE_HEADER_BYTE {
+                let (row, consumed) =
+                    ChangesetRow::decode_patchset(data, pos, info.column_count, &info.pk_flags)?;
                 pos += consumed;
                 rows.push(row);
             }
@@ -1405,6 +1491,140 @@ mod tests {
         let patchset_bytes = session.patchset();
         // For INSERT, patchset and changeset are identical.
         assert_eq!(changeset_bytes, patchset_bytes);
+    }
+
+    #[test]
+    fn test_patchset_decode_rehydrates_pk_old_values() {
+        let mut session = Session::new();
+        session.attach_table("t", 3, vec![true, false, false]);
+        session.record_update(
+            "t",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        );
+
+        let patchset_bytes = session.patchset();
+        let decoded = Changeset::decode_patchset(&patchset_bytes).unwrap();
+        let row = &decoded.tables[0].rows[0];
+
+        assert_eq!(decoded.encode_patchset(), patchset_bytes);
+        assert_eq!(
+            row.old_values,
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Undefined,
+                ChangesetValue::Undefined,
+            ]
+        );
+        assert_eq!(
+            row.new_values,
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Undefined,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_patchset_decode_truncated_update_returns_none() {
+        let mut session = Session::new();
+        session.attach_table("t", 3, vec![true, false, false]);
+        session.record_update(
+            "t",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        );
+
+        let mut patchset_bytes = session.patchset();
+        patchset_bytes.pop();
+        assert!(Changeset::decode_patchset(&patchset_bytes).is_none());
+    }
+
+    #[test]
+    fn test_patchset_apply_matches_changeset_apply() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+        );
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Integer(50),
+            ],
+        );
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Integer(50),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Undefined,
+                ChangesetValue::Integer(75),
+            ],
+        );
+        session.record_delete(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+        );
+
+        let changeset = session.changeset();
+        let decoded_patchset = Changeset::decode_patchset(&session.patchset()).unwrap();
+
+        let mut changeset_target = SimpleTarget::default();
+        let mut patchset_target = SimpleTarget::default();
+        let changeset_outcome = changeset_target.apply(&changeset, |_, _| ConflictAction::Abort);
+        let patchset_outcome =
+            patchset_target.apply(&decoded_patchset, |_, _| ConflictAction::Abort);
+
+        assert_eq!(
+            changeset_outcome,
+            ApplyOutcome::Success {
+                applied: 4,
+                skipped: 0,
+            }
+        );
+        assert_eq!(patchset_outcome, changeset_outcome);
+        assert_eq!(patchset_target.tables, changeset_target.tables);
+        assert_eq!(
+            changeset_target.tables["accounts"],
+            vec![vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("bob".to_owned()),
+                SqliteValue::Integer(75),
+            ]]
+        );
     }
 
     // -----------------------------------------------------------------------
