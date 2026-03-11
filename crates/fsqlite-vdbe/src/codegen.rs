@@ -143,9 +143,66 @@ pub struct IndexSchema {
     /// Root page number.
     pub root_page: i32,
     /// Indexed column names (leftmost first).
+    ///
+    /// This is populated only when every key term is a plain column
+    /// reference. Expression indexes keep their executable term SQL in
+    /// `key_expressions` and leave `columns` empty so planner fast paths do
+    /// not accidentally treat them as simple column-lookup indexes.
     pub columns: Vec<String>,
+    /// Executable SQL for each key term in storage order.
+    pub key_expressions: Vec<String>,
+    /// Optional partial-index predicate as SQL text.
+    pub where_clause: Option<String>,
     /// Whether this index enforces a UNIQUE constraint.
     pub is_unique: bool,
+}
+
+impl IndexSchema {
+    /// Number of logical key terms before the trailing rowid suffix.
+    #[must_use]
+    pub fn key_term_count(&self) -> usize {
+        if self.key_expressions.is_empty() {
+            self.columns.len()
+        } else {
+            self.key_expressions.len()
+        }
+    }
+
+    /// Return the SQL fragment for the `key_pos`th key term.
+    #[must_use]
+    pub fn key_term_sql(&self, key_pos: usize) -> Option<&str> {
+        if self.key_expressions.is_empty() {
+            self.columns.get(key_pos).map(String::as_str)
+        } else {
+            self.key_expressions.get(key_pos).map(String::as_str)
+        }
+    }
+
+    /// Whether planner / lookup fast paths may safely treat this as a simple
+    /// non-partial column index.
+    #[must_use]
+    pub fn supports_direct_column_lookup(&self) -> bool {
+        self.where_clause.is_none()
+            && !self.columns.is_empty()
+            && self.columns.len() == self.key_term_count()
+    }
+
+    /// Whether REPLACE cleanup metadata can reconstruct the key from raw row
+    /// payload columns alone.
+    #[must_use]
+    pub fn supports_replace_cleanup_meta(&self) -> bool {
+        self.supports_direct_column_lookup()
+    }
+
+    /// Human-readable key label for diagnostics / constraint errors.
+    #[must_use]
+    pub fn key_label(&self) -> String {
+        if self.key_expressions.is_empty() {
+            self.columns.join(", ")
+        } else {
+            self.key_expressions.join(", ")
+        }
+    }
 }
 
 /// A foreign key constraint definition stored on the child table.
@@ -225,7 +282,9 @@ impl TableSchema {
     #[must_use]
     pub fn index_for_column(&self, col_name: &str) -> Option<&IndexSchema> {
         self.indexes.iter().find(|idx| {
-            idx.columns
+            idx.supports_direct_column_lookup()
+                && idx
+                    .columns
                 .first()
                 .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
         })
@@ -296,7 +355,10 @@ fn find_upsert_target_index<'a>(
     }
     // Check if the target matches a UNIQUE index (not the PK).
     for (idx_offset, index) in table.indexes.iter().enumerate() {
-        if !index.is_unique || index.columns.len() != target_cols.len() {
+        if !index.is_unique
+            || !index.supports_direct_column_lookup()
+            || index.columns.len() != target_cols.len()
+        {
             continue;
         }
         let all_match = target_cols
@@ -6771,6 +6833,45 @@ fn parse_default_expr(default_sql: &str) -> Option<Expr> {
     }
 }
 
+fn emit_index_predicate_guard(
+    b: &mut ProgramBuilder,
+    index: &IndexSchema,
+    scan_ctx: &ScanCtx<'_>,
+    skip_label: Label,
+) {
+    let Some(where_sql) = index.where_clause.as_deref() else {
+        return;
+    };
+    let Some(predicate) = parse_default_expr(where_sql) else {
+        // Invalid persisted predicate metadata should not panic compilation.
+        // Conservatively skip maintenance for this row.
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, skip_label, P4::None, 0);
+        return;
+    };
+    let result_reg = b.alloc_reg();
+    emit_expr(b, &predicate, result_reg, Some(scan_ctx));
+    // Partial indexes include only rows where the predicate is true.
+    b.emit_jump_to_label(Opcode::IfNot, result_reg, 1, skip_label, P4::None, 0);
+}
+
+fn emit_index_key_term(
+    b: &mut ProgramBuilder,
+    index: &IndexSchema,
+    key_pos: usize,
+    dest_reg: i32,
+    scan_ctx: &ScanCtx<'_>,
+) {
+    let Some(term_sql) = index.key_term_sql(key_pos) else {
+        b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
+        return;
+    };
+    if let Some(expr) = parse_default_expr(term_sql) {
+        emit_expr(b, &expr, dest_reg, Some(scan_ctx));
+    } else {
+        b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
+    }
+}
+
 /// Evaluate STORED generated column expressions during INSERT/UPDATE.
 ///
 /// For each column with `generated_stored == Some(true)`, parses the stored
@@ -6932,19 +7033,26 @@ fn emit_index_inserts(
 ) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
-        let n_idx_cols = index.columns.len();
+        let n_idx_cols = index.key_term_count();
+        let skip_label = b.emit_label();
+        let scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(col_regs),
+            secondary: None,
+        };
+
+        emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
 
         // Allocate registers for index key: (indexed_cols..., rowid).
         let idx_key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
 
-        // Copy indexed column values to key registers.
-        for (key_pos, col_name) in index.columns.iter().enumerate() {
-            // Find column position in table schema.
-            if let Some(col_idx) = table.column_index(col_name) {
-                let src_reg = col_regs + col_idx as i32;
-                let dst_reg = idx_key_regs + key_pos as i32;
-                b.emit_op(Opcode::Copy, src_reg, dst_reg, 0, P4::None, 0);
-            }
+        // Evaluate indexed key terms into the key registers.
+        for key_pos in 0..n_idx_cols {
+            let dst_reg = idx_key_regs + key_pos as i32;
+            emit_index_key_term(b, index, key_pos, dst_reg, &scan_ctx);
         }
 
         // Append rowid as the final key component.
@@ -6973,7 +7081,7 @@ fn emit_index_inserts(
         };
         let p4_name = if index.is_unique {
             // Include table name for the error message.
-            P4::Table(format!("{}.{}", table.name, index.columns.join(", ")))
+            P4::Table(format!("{}.{}", table.name, index.key_label()))
         } else {
             P4::Table(index.name.clone())
         };
@@ -6985,6 +7093,8 @@ fn emit_index_inserts(
             p4_name,
             p5_unique,
         );
+
+        b.resolve_label(skip_label);
     }
 }
 
@@ -7003,29 +7113,26 @@ fn emit_index_inserts(
 fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor: i32) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
-        let n_idx_cols = index.columns.len();
+        let n_idx_cols = index.key_term_count();
+        let skip_label = b.emit_label();
+        let scan_ctx = ScanCtx {
+            cursor: table_cursor,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: None,
+            secondary: None,
+        };
+
+        emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
 
         // Allocate registers for index key: (indexed_cols..., rowid).
         let idx_key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
 
-        // Read indexed column values from the cursor.
-        for (key_pos, col_name) in index.columns.iter().enumerate() {
-            if let Some(col_idx) = table.column_index(col_name) {
-                let dst_reg = idx_key_regs + key_pos as i32;
-                // Check if this column is the INTEGER PRIMARY KEY (rowid alias).
-                if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
-                    b.emit_op(Opcode::Rowid, table_cursor, dst_reg, 0, P4::None, 0);
-                } else {
-                    b.emit_op(
-                        Opcode::Column,
-                        table_cursor,
-                        col_idx as i32,
-                        dst_reg,
-                        P4::None,
-                        0,
-                    );
-                }
-            }
+        // Re-evaluate indexed key terms from the current row.
+        for key_pos in 0..n_idx_cols {
+            let dst_reg = idx_key_regs + key_pos as i32;
+            emit_index_key_term(b, index, key_pos, dst_reg, &scan_ctx);
         }
 
         // Read rowid and append as the final key component.
@@ -7041,6 +7148,8 @@ fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor:
             P4::Table(index.name.clone()),
             0,
         );
+
+        b.resolve_label(skip_label);
     }
 }
 
@@ -7053,6 +7162,7 @@ fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_
         .indexes
         .iter()
         .enumerate()
+        .filter(|(_, index)| index.supports_replace_cleanup_meta())
         .map(|(idx_offset, index)| {
             let cursor_id = table_cursor + 1 + idx_offset as i32;
             let column_indices: Vec<usize> = index
@@ -10524,6 +10634,8 @@ mod tests {
                 name: "idx_t_b".to_owned(),
                 root_page: 3,
                 columns: vec!["b".to_owned()],
+                key_expressions: vec!["b".to_owned()],
+                where_clause: None,
                 is_unique: false,
             }],
             strict: false,
@@ -11381,6 +11493,8 @@ mod tests {
                     name: "idx_t_a".to_owned(),
                     root_page: 4,
                     columns: vec!["a".to_owned()],
+                    key_expressions: vec!["a".to_owned()],
+                    where_clause: None,
                     is_unique: false,
                 }],
                 strict: false,
