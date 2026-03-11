@@ -17,6 +17,7 @@ use fsqlite_harness::extension_parity_matrix::{
     MATRIX_SCHEMA_VERSION, SurfaceKind, compute_extension_coverage,
 };
 use fsqlite_harness::parity_taxonomy::ParityStatus;
+use fsqlite::{Connection, FrankenError, SqliteValue};
 
 // ── 1. Extension module catalog ──────────────────────────────────────────────
 
@@ -450,6 +451,130 @@ fn tag_based_entry_filtering() {
     // Non-existent tag returns empty.
     let none = matrix.entries_by_tags(&["nonexistent_tag_xyz"]);
     assert!(none.is_empty(), "nonexistent tag should match nothing");
+}
+
+#[test]
+fn connection_runtime_state_tags_document_extension_reachability() {
+    let matrix = ExtensionParityMatrix::canonical();
+
+    let wired = matrix.entries_by_tags(&["connection-runtime-wired"]);
+    assert!(
+        wired.iter().any(|entry| entry.name == "json_each()"),
+        "json_each() should be tagged as connection-runtime-wired"
+    );
+    assert!(
+        wired.iter().any(|entry| entry.name == "FTS5 virtual table"),
+        "FTS5 virtual table should be tagged as connection-runtime-wired"
+    );
+    assert!(
+        wired.iter().any(|entry| entry.name == "icu_load_collation()"),
+        "icu_load_collation() should be tagged as connection-runtime-wired"
+    );
+    assert!(
+        wired.iter().any(|entry| entry.name == "generate_series()"),
+        "generate_series() should be tagged as connection-runtime-wired"
+    );
+
+    let unwired = matrix.entries_by_tags(&["connection-runtime-unwired"]);
+    assert!(
+        unwired.iter().any(|entry| entry.name == "FTS3 virtual table"),
+        "FTS3 virtual table should be tagged as connection-runtime-unwired"
+    );
+    assert!(
+        unwired.iter().any(|entry| entry.name == "rtree virtual table"),
+        "rtree virtual table should be tagged as connection-runtime-unwired"
+    );
+    assert!(
+        unwired.iter().any(|entry| entry.name == "decimal_sum()"),
+        "decimal_sum() should be tagged as connection-runtime-unwired"
+    );
+
+    let api_only = matrix.entries_by_tags(&["library-api-only"]);
+    assert!(
+        !api_only.is_empty(),
+        "session surfaces should be tagged as library-api-only"
+    );
+    assert!(
+        api_only
+            .iter()
+            .all(|entry| entry.module == ExtensionModule::Session),
+        "library-api-only tag should currently be reserved for session APIs"
+    );
+}
+
+#[test]
+fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path() {
+    let conn = Connection::open(":memory:").expect("in-memory connection should open");
+
+    let json_rows = conn
+        .query(r#"SELECT key, value FROM json_each('{"a":10,"b":20}') ORDER BY key;"#)
+        .expect("json_each() should dispatch through the connection path");
+    assert_eq!(json_rows.len(), 2);
+    assert_eq!(
+        json_rows[0].values(),
+        &[
+            SqliteValue::Text("a".to_owned()),
+            SqliteValue::Integer(10),
+        ]
+    );
+    assert_eq!(
+        json_rows[1].values(),
+        &[
+            SqliteValue::Text("b".to_owned()),
+            SqliteValue::Integer(20),
+        ]
+    );
+
+    let series_rows = conn
+        .query("SELECT value FROM generate_series(1, 5, 2);")
+        .expect("generate_series() should dispatch through the connection path");
+    assert_eq!(series_rows.len(), 3);
+    assert_eq!(series_rows[0].values(), &[SqliteValue::Integer(1)]);
+    assert_eq!(series_rows[1].values(), &[SqliteValue::Integer(3)]);
+    assert_eq!(series_rows[2].values(), &[SqliteValue::Integer(5)]);
+
+    conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)")
+        .expect("FTS5 virtual table should be creatable via default registry wiring");
+    conn.execute("INSERT INTO docs(rowid, title, body) VALUES (1, 'hello', 'world')")
+        .expect("FTS5 insert should succeed");
+    let fts_rows = conn
+        .query("SELECT rowid FROM docs WHERE docs MATCH 'world';")
+        .expect("FTS5 MATCH should dispatch through the connection path");
+    assert_eq!(fts_rows.len(), 1);
+    assert_eq!(fts_rows[0].values(), &[SqliteValue::Integer(1)]);
+
+    let icu_rows = conn
+        .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
+        .expect("ICU and misc scalar functions should be reachable");
+    assert_eq!(icu_rows.len(), 1);
+    assert_eq!(icu_rows[0].values()[0], SqliteValue::Text("STRASSE".to_owned()));
+    match &icu_rows[0].values()[1] {
+        SqliteValue::Text(uuid) => assert_eq!(uuid.len(), 36, "uuid() should return RFC4122 text"),
+        other => panic!("uuid() should return text, got {other:?}"),
+    }
+}
+
+#[test]
+fn connection_runtime_unwired_extension_surfaces_fail_closed() {
+    let conn = Connection::open(":memory:").expect("in-memory connection should open");
+
+    let fts3_err = conn
+        .execute("CREATE VIRTUAL TABLE docs_fts3 USING fts3(content)")
+        .expect_err("FTS3 should fail closed until runtime wiring is implemented");
+    assert!(matches!(fts3_err, FrankenError::NotImplemented(_)));
+    assert!(
+        fts3_err.to_string().contains("no module registered"),
+        "expected missing-module error for FTS3, got {fts3_err}"
+    );
+
+    let rtree_err = conn
+        .execute("CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)")
+        .expect_err("R-tree should fail closed until runtime wiring is implemented");
+    assert!(matches!(rtree_err, FrankenError::NotImplemented(_)));
+    assert!(
+        rtree_err.to_string().contains("no module registered"),
+        "expected missing-module error for R-tree, got {rtree_err}"
+    );
 }
 
 // ── 12. Parity status scoring ────────────────────────────────────────────────

@@ -1231,6 +1231,21 @@ impl ExtensionParityMatrix {
                 entry.acceptance_tests.extend(tests.iter().cloned());
             }
         };
+        let tag_named_entries =
+            |entries: &mut BTreeMap<String, ContractEntry>, names: &[&str], tag: &str| {
+                for entry in entries
+                    .values_mut()
+                    .filter(|entry| names.iter().any(|name| entry.name == *name))
+                {
+                    entry.tags.insert(tag.to_owned());
+                }
+            };
+        let tag_module =
+            |entries: &mut BTreeMap<String, ContractEntry>, module: ExtensionModule, tag: &str| {
+                for entry in entries.values_mut().filter(|entry| entry.module == module) {
+                    entry.tags.insert(tag.to_owned());
+                }
+            };
 
         attach_tests(
             &mut entries,
@@ -1251,16 +1266,33 @@ impl ExtensionParityMatrix {
                     "json1_contract_rows_match_csqlite",
                     true,
                 ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_wired_extension_surfaces_dispatch_through_connection_path",
+                    false,
+                ),
             ],
         );
         attach_tests(
             &mut entries,
             ExtensionModule::Fts3,
-            &[acceptance(
-                "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
-                "fts3_query_parsing_on_stored_content",
-                false,
-            )],
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "fts3_query_parsing_on_stored_content",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_unwired_extension_surfaces_fail_closed",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_state_tags_document_extension_reachability",
+                    false,
+                ),
+            ],
         );
         attach_tests(
             &mut entries,
@@ -1274,6 +1306,11 @@ impl ExtensionParityMatrix {
                 acceptance(
                     "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
                     "fts5_source_id_available_in_frankensqlite",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_wired_extension_surfaces_dispatch_through_connection_path",
                     false,
                 ),
             ],
@@ -1297,6 +1334,16 @@ impl ExtensionParityMatrix {
                     "rtree_spatial_scenario_rows_match_csqlite",
                     true,
                 ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_unwired_extension_surfaces_fail_closed",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_state_tags_document_extension_reachability",
+                    false,
+                ),
             ],
         );
         attach_tests(
@@ -1318,6 +1365,11 @@ impl ExtensionParityMatrix {
                     "session_changeset_blob_roundtrip_rows_match_csqlite",
                     true,
                 ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_state_tags_document_extension_reachability",
+                    false,
+                ),
             ],
         );
         attach_tests(
@@ -1332,6 +1384,11 @@ impl ExtensionParityMatrix {
                 acceptance(
                     "crates/fsqlite-harness/tests/bd_1dp9_5_3_rtree_session_icu_misc_wave.rs",
                     "test_unit_icu_collation_and_case_invariants",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_wired_extension_surfaces_dispatch_through_connection_path",
                     false,
                 ),
             ],
@@ -1355,8 +1412,53 @@ impl ExtensionParityMatrix {
                     "test_unit_misc_decimal_and_uuid_conversion_invariants",
                     false,
                 ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_wired_extension_surfaces_dispatch_through_connection_path",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_state_tags_document_extension_reachability",
+                    false,
+                ),
             ],
         );
+
+        tag_named_entries(
+            &mut entries,
+            &[
+                "json()",
+                "json_valid()",
+                "json_extract()",
+                "json_type()",
+                "json_set()",
+                "json_insert()",
+                "json_replace()",
+                "json_remove()",
+                "json_patch()",
+                "json_array()",
+                "json_object()",
+                "json_quote()",
+                "json_each()",
+                "json_tree()",
+                "FTS5 virtual table",
+                "FTS5 MATCH operator",
+                "ICU collation registration",
+                "icu_load_collation()",
+                "generate_series()",
+                "uuid()",
+            ],
+            "connection-runtime-wired",
+        );
+        tag_named_entries(
+            &mut entries,
+            &["decimal_sum()", "dbstat virtual table", "dbpage virtual table"],
+            "connection-runtime-unwired",
+        );
+        tag_module(&mut entries, ExtensionModule::Fts3, "connection-runtime-unwired");
+        tag_module(&mut entries, ExtensionModule::Rtree, "connection-runtime-unwired");
+        tag_module(&mut entries, ExtensionModule::Session, "library-api-only");
 
         Self {
             schema_version: MATRIX_SCHEMA_VERSION,
