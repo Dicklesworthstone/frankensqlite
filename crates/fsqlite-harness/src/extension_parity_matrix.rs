@@ -961,16 +961,56 @@ impl ExtensionParityMatrix {
         add(
             ExtensionModule::Rtree,
             SurfaceKind::ScalarFunction,
+            "geopoly_blob()",
+            "Encode a polygon into the Geopoly blob format",
+            ParityStatus::Partial,
+            &["ext-rtree"],
+            Some(15),
+            None,
+            &["ext", "rtree", "geopoly"],
+        );
+        add(
+            ExtensionModule::Rtree,
+            SurfaceKind::ScalarFunction,
+            "geopoly_json()",
+            "Normalize a polygon into Geopoly JSON text",
+            ParityStatus::Partial,
+            &["ext-rtree"],
+            Some(15),
+            None,
+            &["ext", "rtree", "geopoly"],
+        );
+        add(
+            ExtensionModule::Rtree,
+            SurfaceKind::ScalarFunction,
+            "geopoly_svg()",
+            "Render a polygon as an SVG path",
+            ParityStatus::Partial,
+            &["ext-rtree"],
+            Some(15),
+            None,
+            &["ext", "rtree", "geopoly"],
+        );
+        add(
+            ExtensionModule::Rtree,
+            SurfaceKind::ScalarFunction,
+            "geopoly_area()",
+            "Compute polygon area using the shoelace formula",
+            ParityStatus::Partial,
+            &["ext-rtree"],
+            Some(15),
+            None,
+            &["ext", "rtree", "geopoly"],
+        );
+        add(
+            ExtensionModule::Rtree,
+            SurfaceKind::ScalarFunction,
             "geopoly_overlap()",
             "Test whether two polygons overlap",
-            ParityStatus::Missing,
-            &["ext-rtree", "ext-geopoly"],
+            ParityStatus::Partial,
+            &["ext-rtree"],
             Some(15),
-            Some(OmissionRationale {
-                reason: "Dependent on Geopoly virtual table implementation".to_owned(),
-                introduced_version: Some("3.25.0".to_owned()),
-                future_candidate: true,
-            }),
+            None,
             &["ext", "rtree", "geopoly"],
         );
         add(
@@ -978,14 +1018,10 @@ impl ExtensionParityMatrix {
             SurfaceKind::ScalarFunction,
             "geopoly_within()",
             "Test whether one polygon is within another",
-            ParityStatus::Missing,
-            &["ext-rtree", "ext-geopoly"],
+            ParityStatus::Partial,
+            &["ext-rtree"],
             Some(15),
-            Some(OmissionRationale {
-                reason: "Dependent on Geopoly virtual table implementation".to_owned(),
-                introduced_version: Some("3.25.0".to_owned()),
-                future_candidate: true,
-            }),
+            None,
             &["ext", "rtree", "geopoly"],
         );
 
@@ -1313,6 +1349,11 @@ impl ExtensionParityMatrix {
                     "connection_runtime_state_tags_document_extension_reachability",
                     false,
                 ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_t6sv2_14_extension_compatibility_matrix.rs",
+                    "connection_runtime_wired_extension_surfaces_dispatch_through_connection_path",
+                    false,
+                ),
             ],
         );
         attach_tests(
@@ -1474,6 +1515,12 @@ impl ExtensionParityMatrix {
                 "uuid()",
                 "uuid_str()",
                 "uuid_blob()",
+                "geopoly_blob()",
+                "geopoly_json()",
+                "geopoly_svg()",
+                "geopoly_area()",
+                "geopoly_overlap()",
+                "geopoly_within()",
             ],
             "connection-runtime-wired",
         );
@@ -1491,9 +1538,14 @@ impl ExtensionParityMatrix {
             ExtensionModule::Fts3,
             "connection-runtime-unwired",
         );
-        tag_module(
+        tag_named_entries(
             &mut entries,
-            ExtensionModule::Rtree,
+            &[
+                "rtree virtual table",
+                "R-tree range query",
+                "R-tree containment query",
+                "Geopoly virtual table",
+            ],
             "connection-runtime-unwired",
         );
         tag_module(&mut entries, ExtensionModule::Session, "library-api-only");
@@ -2184,7 +2236,17 @@ mod tests {
     #[test]
     fn runtime_wired_scalar_contract_entries_are_present() {
         let matrix = ExtensionParityMatrix::canonical();
-        for name in ["fts5_source_id()", "uuid_str()", "uuid_blob()"] {
+        for name in [
+            "fts5_source_id()",
+            "uuid_str()",
+            "uuid_blob()",
+            "geopoly_blob()",
+            "geopoly_json()",
+            "geopoly_svg()",
+            "geopoly_area()",
+            "geopoly_overlap()",
+            "geopoly_within()",
+        ] {
             let entry = matrix
                 .entries
                 .values()
@@ -2203,26 +2265,48 @@ mod tests {
     }
 
     #[test]
-    fn geopoly_is_missing_with_rationale() {
+    fn geopoly_virtual_table_remains_missing_but_scalar_surface_is_partial() {
         let matrix = ExtensionParityMatrix::canonical();
-        let geopoly: Vec<_> = matrix
+        let geopoly_vtab = matrix
             .entries
             .values()
-            .filter(|e| e.tags.contains("geopoly"))
-            .collect();
+            .find(|entry| entry.name == "Geopoly virtual table")
+            .expect("missing Geopoly virtual table contract entry");
+        assert_eq!(geopoly_vtab.status, ParityStatus::Missing);
         assert!(
-            geopoly.len() >= 2,
-            "Expected >= 2 geopoly entries, got {}",
-            geopoly.len()
+            geopoly_vtab.omission.is_some(),
+            "Geopoly virtual table should retain an omission rationale"
         );
-        for entry in &geopoly {
+
+        for name in [
+            "geopoly_blob()",
+            "geopoly_json()",
+            "geopoly_svg()",
+            "geopoly_area()",
+            "geopoly_overlap()",
+            "geopoly_within()",
+        ] {
+            let entry = matrix
+                .entries
+                .values()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing Geopoly scalar contract entry for {name}"));
             assert_eq!(
                 entry.status,
-                ParityStatus::Missing,
-                "Geopoly entry {} should be missing",
+                ParityStatus::Partial,
+                "Geopoly scalar entry {} should be partial",
                 entry.name
             );
-            assert!(entry.omission.is_some());
+            assert!(
+                entry.omission.is_none(),
+                "Geopoly scalar entry {} should not carry an omission rationale",
+                entry.name
+            );
+            assert!(
+                entry.tags.contains("connection-runtime-wired"),
+                "Geopoly scalar entry {} should be tagged as connection-runtime-wired",
+                entry.name
+            );
         }
     }
 

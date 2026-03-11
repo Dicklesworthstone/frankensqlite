@@ -6,7 +6,9 @@ R-tree and Geopoly spatial index extension for FrankenSQLite.
 
 This crate implements the R-tree spatial indexing extension, providing multi-dimensional bounding box queries (1-5 dimensions) and the Geopoly polygon extension built on top of R-tree. It corresponds to SQLite's R*-tree module and Geopoly extension.
 
-This is a leaf crate in the fsqlite workspace dependency graph. It depends on `fsqlite-types` and `fsqlite-error` and has no dependency on the core query engine, making it usable independently for spatial data structures.
+This is a leaf crate in the fsqlite workspace dependency graph. It depends on `fsqlite-types`, `fsqlite-error`, and `fsqlite-func`, and has no dependency on the core query engine, making it usable independently for spatial data structures.
+
+In addition to the direct Rust geometry helpers, the crate now exposes SQL-oriented Geopoly scalar wrappers plus a `register_geopoly_scalars()` helper for wiring those functions into a `FunctionRegistry`.
 
 ## Key Types
 
@@ -33,9 +35,12 @@ This is a leaf crate in the fsqlite workspace dependency graph. It depends on `f
 - `geopoly_regular` - Generate a regular polygon (triangle, hexagon, etc.)
 - `geopoly_xform` - Apply a 2D affine transformation to polygon vertices
 - `geopoly_ccw` - Normalize polygon winding to counter-clockwise
+- `GeopolyBlobFunc`, `GeopolyJsonFunc`, `GeopolySvgFunc`, `GeopolyAreaFunc`, `GeopolyOverlapFunc`, `GeopolyWithinFunc` - `ScalarFunction` wrappers for runtime registration
+- `register_geopoly_scalars` - Register the current Geopoly scalar-function surface into a `FunctionRegistry`
 
 ## Dependencies
 
+- `fsqlite-func`
 - `fsqlite-types`
 - `fsqlite-error`
 

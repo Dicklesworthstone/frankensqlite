@@ -476,6 +476,10 @@ fn connection_runtime_state_tags_document_extension_reachability() {
         wired.iter().any(|entry| entry.name == "generate_series()"),
         "generate_series() should be tagged as connection-runtime-wired"
     );
+    assert!(
+        wired.iter().any(|entry| entry.name == "geopoly_overlap()"),
+        "geopoly_overlap() should be tagged as connection-runtime-wired"
+    );
 
     let unwired = matrix.entries_by_tags(&["connection-runtime-unwired"]);
     assert!(
@@ -493,6 +497,12 @@ fn connection_runtime_state_tags_document_extension_reachability() {
     assert!(
         unwired.iter().any(|entry| entry.name == "decimal_sum()"),
         "decimal_sum() should be tagged as connection-runtime-unwired"
+    );
+    assert!(
+        unwired
+            .iter()
+            .any(|entry| entry.name == "Geopoly virtual table"),
+        "Geopoly virtual table should be tagged as connection-runtime-unwired"
     );
 
     let api_only = matrix.entries_by_tags(&["library-api-only"]);
@@ -558,6 +568,28 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         SqliteValue::Text(uuid) => assert_eq!(uuid.len(), 36, "uuid() should return RFC4122 text"),
         other => panic!("uuid() should return text, got {other:?}"),
     }
+
+    let geopoly_rows = conn
+        .query(
+            "SELECT \
+                geopoly_json(geopoly_blob('[[0,0],[2,0],[2,2],[0,2]]')), \
+                geopoly_svg('[[0,0],[2,0],[2,2],[0,2]]'), \
+                geopoly_area('[[0,0],[2,0],[2,2],[0,2]]'), \
+                geopoly_overlap('[[0,0],[2,0],[2,2],[0,2]]', '[[1,1],[3,1],[3,3],[1,3]]'), \
+                geopoly_within('[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5]]', '[[0,0],[2,0],[2,2],[0,2]]');",
+        )
+        .expect("Geopoly scalar functions should dispatch through the connection path");
+    assert_eq!(geopoly_rows.len(), 1);
+    assert_eq!(
+        geopoly_rows[0].values(),
+        &[
+            SqliteValue::Text("[[0,0],[2,0],[2,2],[0,2],[0,0]]".to_owned()),
+            SqliteValue::Text("M 0 0 L 2 0 L 2 2 L 0 2 Z".to_owned()),
+            SqliteValue::Float(4.0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(1),
+        ]
+    );
 }
 
 #[test]
@@ -580,6 +612,15 @@ fn connection_runtime_unwired_extension_surfaces_fail_closed() {
     assert!(
         rtree_err.to_string().contains("no module registered"),
         "expected missing-module error for R-tree, got {rtree_err}"
+    );
+
+    let geopoly_err = conn
+        .execute("CREATE VIRTUAL TABLE regions USING geopoly(_shape)")
+        .expect_err("Geopoly virtual table should fail closed until runtime wiring exists");
+    assert!(matches!(geopoly_err, FrankenError::NotImplemented(_)));
+    assert!(
+        geopoly_err.to_string().contains("no module registered"),
+        "expected missing-module error for Geopoly, got {geopoly_err}"
     );
 }
 

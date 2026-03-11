@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::{FunctionRegistry, ScalarFunction};
+use fsqlite_types::SqliteValue;
+
 // ---------------------------------------------------------------------------
 // Public API — extension name
 // ---------------------------------------------------------------------------
@@ -698,6 +702,220 @@ pub fn geopoly_xform(
 }
 
 // ---------------------------------------------------------------------------
+// Geopoly scalar function wrappers
+// ---------------------------------------------------------------------------
+
+fn invalid_arity(function_name: &str, expected: &str, actual: usize) -> FrankenError {
+    FrankenError::function_error(format!("{function_name} requires {expected}, got {actual}"))
+}
+
+const fn value_kind(value: &SqliteValue) -> &'static str {
+    match value {
+        SqliteValue::Null => "null",
+        SqliteValue::Integer(_) => "integer",
+        SqliteValue::Float(_) => "real",
+        SqliteValue::Text(_) => "text",
+        SqliteValue::Blob(_) => "blob",
+    }
+}
+
+fn polygon_arg(
+    function_name: &str,
+    value: &SqliteValue,
+    index: usize,
+) -> Result<Option<Vec<Point>>> {
+    match value {
+        SqliteValue::Null => Ok(None),
+        SqliteValue::Text(text) => geopoly_json_decode(text).map(Some).ok_or_else(|| {
+            FrankenError::function_error(format!(
+                "{function_name}: argument {} must be a valid geopoly JSON coordinate array",
+                index + 1
+            ))
+        }),
+        SqliteValue::Blob(blob) => geopoly_blob_decode(blob).map(Some).ok_or_else(|| {
+            FrankenError::function_error(format!(
+                "{function_name}: argument {} must be a valid geopoly blob",
+                index + 1
+            ))
+        }),
+        other => Err(FrankenError::function_error(format!(
+            "{function_name}: argument {} must be text or blob, got {}",
+            index + 1,
+            value_kind(other)
+        ))),
+    }
+}
+
+fn unary_polygon(function_name: &str, args: &[SqliteValue]) -> Result<Option<Vec<Point>>> {
+    if args.len() != 1 {
+        return Err(invalid_arity(
+            function_name,
+            "exactly 1 argument",
+            args.len(),
+        ));
+    }
+    polygon_arg(function_name, &args[0], 0)
+}
+
+fn binary_polygons(
+    function_name: &str,
+    args: &[SqliteValue],
+) -> Result<Option<(Vec<Point>, Vec<Point>)>> {
+    if args.len() != 2 {
+        return Err(invalid_arity(
+            function_name,
+            "exactly 2 arguments",
+            args.len(),
+        ));
+    }
+    let Some(lhs) = polygon_arg(function_name, &args[0], 0)? else {
+        return Ok(None);
+    };
+    let Some(rhs) = polygon_arg(function_name, &args[1], 1)? else {
+        return Ok(None);
+    };
+    Ok(Some((lhs, rhs)))
+}
+
+/// `geopoly_blob(X)`: encode a geopoly JSON/text/blob polygon into blob form.
+pub struct GeopolyBlobFunc;
+
+impl ScalarFunction for GeopolyBlobFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some(vertices) = unary_polygon(self.name(), args)? else {
+            return Ok(SqliteValue::Null);
+        };
+        Ok(SqliteValue::Blob(geopoly_blob(&vertices)))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "geopoly_blob"
+    }
+}
+
+/// `geopoly_json(X)`: normalize a geopoly polygon into JSON text form.
+pub struct GeopolyJsonFunc;
+
+impl ScalarFunction for GeopolyJsonFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some(vertices) = unary_polygon(self.name(), args)? else {
+            return Ok(SqliteValue::Null);
+        };
+        Ok(SqliteValue::Text(geopoly_json(&vertices)))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "geopoly_json"
+    }
+}
+
+/// `geopoly_svg(X)`: render a geopoly polygon as an SVG path.
+pub struct GeopolySvgFunc;
+
+impl ScalarFunction for GeopolySvgFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some(vertices) = unary_polygon(self.name(), args)? else {
+            return Ok(SqliteValue::Null);
+        };
+        Ok(SqliteValue::Text(geopoly_svg(&vertices)))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "geopoly_svg"
+    }
+}
+
+/// `geopoly_area(X)`: compute polygon area using the shoelace formula.
+pub struct GeopolyAreaFunc;
+
+impl ScalarFunction for GeopolyAreaFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some(vertices) = unary_polygon(self.name(), args)? else {
+            return Ok(SqliteValue::Null);
+        };
+        Ok(SqliteValue::Float(geopoly_area(&vertices)))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "geopoly_area"
+    }
+}
+
+/// `geopoly_overlap(X, Y)`: test whether two polygons overlap.
+pub struct GeopolyOverlapFunc;
+
+impl ScalarFunction for GeopolyOverlapFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some((lhs, rhs)) = binary_polygons(self.name(), args)? else {
+            return Ok(SqliteValue::Null);
+        };
+        Ok(SqliteValue::Integer(if geopoly_overlap(&lhs, &rhs) {
+            1
+        } else {
+            0
+        }))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "geopoly_overlap"
+    }
+}
+
+/// `geopoly_within(X, Y)`: test whether `X` is contained in `Y`.
+pub struct GeopolyWithinFunc;
+
+impl ScalarFunction for GeopolyWithinFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let Some((inner, outer)) = binary_polygons(self.name(), args)? else {
+            return Ok(SqliteValue::Null);
+        };
+        Ok(SqliteValue::Integer(if geopoly_within(&inner, &outer) {
+            1
+        } else {
+            0
+        }))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "geopoly_within"
+    }
+}
+
+/// Register the current Geopoly scalar-function surface into a registry.
+pub fn register_geopoly_scalars(registry: &mut FunctionRegistry) {
+    registry.register_scalar(GeopolyBlobFunc);
+    registry.register_scalar(GeopolyJsonFunc);
+    registry.register_scalar(GeopolySvgFunc);
+    registry.register_scalar(GeopolyAreaFunc);
+    registry.register_scalar(GeopolyOverlapFunc);
+    registry.register_scalar(GeopolyWithinFunc);
+}
+
+// ---------------------------------------------------------------------------
 // Internal geometry helpers
 // ---------------------------------------------------------------------------
 
@@ -771,6 +989,8 @@ fn signed_twice_area(vertices: &[Point]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_error::FrankenError;
+    use fsqlite_func::FunctionRegistry;
 
     fn approx_eq(left: f64, right: f64) -> bool {
         (left - right).abs() < 1e-4
@@ -785,6 +1005,14 @@ mod tests {
         ]
     }
 
+    fn json_value(vertices: &[Point]) -> SqliteValue {
+        SqliteValue::Text(geopoly_json(vertices))
+    }
+
+    fn blob_value(vertices: &[Point]) -> SqliteValue {
+        SqliteValue::Blob(geopoly_blob(vertices))
+    }
+
     // -------------------------------------------------------------------
     // Extension name
     // -------------------------------------------------------------------
@@ -795,6 +1023,26 @@ mod tests {
             .strip_prefix("fsqlite-ext-")
             .expect("extension crates should use fsqlite-ext-* naming");
         assert_eq!(extension_name(), expected);
+    }
+
+    #[test]
+    fn test_register_geopoly_scalars_registers_function_surface() {
+        let mut registry = FunctionRegistry::new();
+        register_geopoly_scalars(&mut registry);
+
+        for (name, arity) in [
+            ("geopoly_blob", 1),
+            ("geopoly_json", 1),
+            ("geopoly_svg", 1),
+            ("geopoly_area", 1),
+            ("geopoly_overlap", 2),
+            ("geopoly_within", 2),
+        ] {
+            assert!(
+                registry.find_scalar(name, arity).is_some(),
+                "expected {name}/{arity} to be registered"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1212,6 +1460,101 @@ mod tests {
         assert_eq!(blob[1], 4);
         assert_eq!(blob[2], 0);
         assert_eq!(blob[3], 0);
+    }
+
+    #[test]
+    fn test_geopoly_blob_func_encodes_json_polygon() {
+        let polygon = square(0.0, 0.0, 2.0);
+        let value = GeopolyBlobFunc
+            .invoke(&[json_value(&polygon)])
+            .expect("blob wrapper should succeed");
+        let SqliteValue::Blob(blob) = value else {
+            panic!("expected blob result");
+        };
+        let decoded = geopoly_blob_decode(&blob).expect("blob result should decode");
+        assert_eq!(decoded, polygon);
+    }
+
+    #[test]
+    fn test_geopoly_json_func_accepts_blob_polygon() {
+        let polygon = square(1.0, 2.0, 3.0);
+        let value = GeopolyJsonFunc
+            .invoke(&[blob_value(&polygon)])
+            .expect("json wrapper should succeed");
+        assert_eq!(value, SqliteValue::Text(geopoly_json(&polygon)));
+    }
+
+    #[test]
+    fn test_geopoly_area_func_returns_polygon_area() {
+        let polygon = square(0.0, 0.0, 4.0);
+        let value = GeopolyAreaFunc
+            .invoke(&[json_value(&polygon)])
+            .expect("area wrapper should succeed");
+        assert_eq!(value, SqliteValue::Float(16.0));
+    }
+
+    #[test]
+    fn test_geopoly_overlap_func_accepts_mixed_blob_and_json() {
+        let lhs = square(0.0, 0.0, 4.0);
+        let rhs = square(2.0, 2.0, 4.0);
+        let disjoint = square(10.0, 10.0, 1.0);
+
+        assert_eq!(
+            GeopolyOverlapFunc
+                .invoke(&[json_value(&lhs), blob_value(&rhs)])
+                .expect("overlap wrapper should succeed"),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            GeopolyOverlapFunc
+                .invoke(&[blob_value(&lhs), json_value(&disjoint)])
+                .expect("disjoint overlap wrapper should succeed"),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_geopoly_within_func_returns_integer_truth_value() {
+        let outer = square(0.0, 0.0, 10.0);
+        let inner = square(2.0, 2.0, 3.0);
+        let outside = square(-1.0, -1.0, 3.0);
+
+        assert_eq!(
+            GeopolyWithinFunc
+                .invoke(&[json_value(&inner), blob_value(&outer)])
+                .expect("within wrapper should succeed"),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            GeopolyWithinFunc
+                .invoke(&[blob_value(&outside), json_value(&outer)])
+                .expect("outside wrapper should succeed"),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_geopoly_scalar_wrappers_propagate_null() {
+        assert!(
+            GeopolyAreaFunc
+                .invoke(&[SqliteValue::Null])
+                .expect("null should propagate")
+                .is_null()
+        );
+        assert!(
+            GeopolyOverlapFunc
+                .invoke(&[SqliteValue::Null, json_value(&square(0.0, 0.0, 1.0))])
+                .expect("null lhs should propagate")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn test_geopoly_scalar_wrappers_reject_malformed_text() {
+        let error = GeopolyJsonFunc
+            .invoke(&[SqliteValue::Text("not json".to_owned())])
+            .expect_err("malformed polygon text should fail");
+        assert!(matches!(error, FrankenError::FunctionError(_)));
     }
 
     // -------------------------------------------------------------------

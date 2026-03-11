@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite_e2e::comparison::ComparisonRunner;
-use fsqlite_ext_session::{ChangesetValue, Session};
+use fsqlite_ext_session::{
+    ApplyOutcome, Changeset, ChangesetValue, ConflictAction, Session, SimpleTarget,
+};
 use serde_json::json;
 
 const BEAD_ID: &str = "bd-1dp9.5.3";
@@ -53,6 +55,24 @@ fn format_hex(blob: &[u8]) -> String {
         let _ = write!(hex, "{byte:02X}");
     }
     hex
+}
+
+fn sql_quote(text: &str) -> String {
+    text.replace('\'', "''")
+}
+
+fn apply_outcome_json(outcome: &ApplyOutcome) -> serde_json::Value {
+    match outcome {
+        ApplyOutcome::Success { applied, skipped } => json!({
+            "kind": "success",
+            "applied": applied,
+            "skipped": skipped,
+        }),
+        ApplyOutcome::Aborted { applied } => json!({
+            "kind": "aborted",
+            "applied": applied,
+        }),
+    }
 }
 
 #[test]
@@ -164,16 +184,91 @@ fn session_changeset_blob_roundtrip_rows_match_csqlite() -> Result<(), String> {
             ChangesetValue::Integer(50),
         ],
     );
-    let changeset_blob = session.changeset().encode();
-    let hex_blob = format_hex(&changeset_blob);
-    let insert_sql = format!("INSERT INTO change_log VALUES (1, X'{hex_blob}')");
+    session.record_update(
+        "accounts",
+        vec![
+            ChangesetValue::Integer(2),
+            ChangesetValue::Text("bob".to_owned()),
+            ChangesetValue::Integer(50),
+        ],
+        vec![
+            ChangesetValue::Undefined,
+            ChangesetValue::Undefined,
+            ChangesetValue::Integer(75),
+        ],
+    );
+    session.record_delete(
+        "accounts",
+        vec![
+            ChangesetValue::Integer(1),
+            ChangesetValue::Text("alice".to_owned()),
+            ChangesetValue::Integer(100),
+        ],
+    );
+
+    let changeset = session.changeset();
+    let changeset_blob = changeset.encode();
+    let patchset_blob = session.patchset();
+    let decoded_changeset = Changeset::decode(&changeset_blob)
+        .ok_or_else(|| format!("bead_id={BEAD_ID} case=changeset_decode_failed"))?;
+    let decoded_patchset = Changeset::decode_patchset(&patchset_blob)
+        .ok_or_else(|| format!("bead_id={BEAD_ID} case=patchset_decode_failed"))?;
+
+    let mut changeset_target = SimpleTarget::default();
+    let mut patchset_target = SimpleTarget::default();
+    let changeset_outcome =
+        changeset_target.apply(&decoded_changeset, |_, _| ConflictAction::Abort);
+    let patchset_outcome = patchset_target.apply(&decoded_patchset, |_, _| ConflictAction::Abort);
+
+    if changeset_target.tables != patchset_target.tables {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=session_semantic_state_mismatch changeset_state={:?} patchset_state={:?}",
+            changeset_target.tables, patchset_target.tables
+        ));
+    }
+
+    let final_state = format!(
+        "{:?}",
+        changeset_target
+            .tables
+            .get("accounts")
+            .cloned()
+            .unwrap_or_default()
+    );
+    let changeset_semantics = serde_json::to_string(&json!({
+        "kind": "changeset",
+        "apply_outcome": apply_outcome_json(&changeset_outcome),
+        "final_state": &final_state,
+    }))
+    .map_err(|error| {
+        format!("bead_id={BEAD_ID} case=changeset_semantics_serialize_failed error={error}")
+    })?;
+    let patchset_semantics = serde_json::to_string(&json!({
+        "kind": "patchset",
+        "apply_outcome": apply_outcome_json(&patchset_outcome),
+        "final_state": &final_state,
+    }))
+    .map_err(|error| {
+        format!("bead_id={BEAD_ID} case=patchset_semantics_serialize_failed error={error}")
+    })?;
+
+    let changeset_hex = format_hex(&changeset_blob);
+    let patchset_hex = format_hex(&patchset_blob);
     let run_id = format!("bd-1dp9.5.3-e2e-session-seed-{SESSION_E2E_SEED}");
 
     let statements = vec![
-        "CREATE TABLE change_log (id INTEGER PRIMARY KEY, payload BLOB)".to_owned(),
-        insert_sql,
-        "SELECT length(payload) FROM change_log WHERE id = 1".to_owned(),
-        "SELECT hex(payload) FROM change_log WHERE id = 1".to_owned(),
+        "CREATE TABLE change_log (id INTEGER PRIMARY KEY, kind TEXT, payload BLOB, semantics TEXT)"
+            .to_owned(),
+        format!(
+            "INSERT INTO change_log VALUES (1, 'changeset', X'{changeset_hex}', '{}')",
+            sql_quote(&changeset_semantics)
+        ),
+        format!(
+            "INSERT INTO change_log VALUES (2, 'patchset', X'{patchset_hex}', '{}')",
+            sql_quote(&patchset_semantics)
+        ),
+        "SELECT kind, length(payload), hex(payload), semantics FROM change_log ORDER BY id"
+            .to_owned(),
     ];
 
     let runner = ComparisonRunner::new_in_memory()
@@ -195,6 +290,14 @@ fn session_changeset_blob_roundtrip_rows_match_csqlite() -> Result<(), String> {
         "first_divergence_index": first_divergence_index,
         "first_divergence_present": first_divergence_index.is_some(),
         "changeset_blob_len": changeset_blob.len(),
+        "patchset_blob_len": patchset_blob.len(),
+        "changeset_semantics": serde_json::from_str::<serde_json::Value>(&changeset_semantics).map_err(|error| {
+            format!("bead_id={BEAD_ID} case=changeset_semantics_parse_failed error={error}")
+        })?,
+        "patchset_semantics": serde_json::from_str::<serde_json::Value>(&patchset_semantics).map_err(|error| {
+            format!("bead_id={BEAD_ID} case=patchset_semantics_parse_failed error={error}")
+        })?,
+        "states_match": changeset_target.tables == patchset_target.tables,
         "logical_hash": {
             "frank_sha256": hash.frank_sha256,
             "csqlite_sha256": hash.csqlite_sha256,

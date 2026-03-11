@@ -31,6 +31,7 @@ fsqlite-ext-json = { workspace = true }
 fsqlite-ext-fts5 = { workspace = true }
 fsqlite-ext-icu = { workspace = true }
 fsqlite-ext-misc = { workspace = true }
+fsqlite-ext-rtree = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
