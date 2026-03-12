@@ -1686,6 +1686,7 @@ mod tests {
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
         assert!(!actionable_ranking.cost_components.is_empty());
+        assert_eq!(actionable_ranking.allocator_pressure.len(), 3);
         assert_eq!(
             actionable_ranking.top_opcodes,
             opcode_profile
@@ -1718,6 +1719,43 @@ mod tests {
         assert!(component_names.contains(&"parser_ast_churn"));
         assert!(component_names.contains(&"record_decode"));
         assert!(component_names.contains(&"row_materialization"));
+        assert!(actionable_ranking
+            .allocator_pressure
+            .iter()
+            .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty()));
+
+        let parser_component = actionable_ranking
+            .cost_components
+            .iter()
+            .find(|entry| entry.component == "parser_ast_churn")
+            .unwrap();
+        assert_eq!(
+            parser_component.mapped_beads,
+            vec!["bd-db300.4.2".to_owned(), "bd-db300.4.2.1".to_owned()]
+        );
+        assert!(!parser_component.implication.is_empty());
+
+        let record_decode_component = actionable_ranking
+            .cost_components
+            .iter()
+            .find(|entry| entry.component == "record_decode")
+            .unwrap();
+        assert_eq!(
+            record_decode_component.mapped_beads,
+            vec!["bd-db300.4.3".to_owned(), "bd-db300.4.4".to_owned()]
+        );
+        assert!(!record_decode_component.implication.is_empty());
+
+        let row_materialization_component = actionable_ranking
+            .cost_components
+            .iter()
+            .find(|entry| entry.component == "row_materialization")
+            .unwrap();
+        assert_eq!(
+            row_materialization_component.mapped_beads,
+            vec!["bd-db300.4.3".to_owned(), "bd-db300.4.3.1".to_owned()]
+        );
+        assert!(!row_materialization_component.implication.is_empty());
     }
 
     #[test]

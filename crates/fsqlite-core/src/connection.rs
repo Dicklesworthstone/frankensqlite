@@ -2409,6 +2409,185 @@ impl Connection {
         .map(Some)
     }
 
+    fn attached_target_schema(&self, name: &QualifiedName) -> Result<Option<String>> {
+        let Some(schema) = name.schema.as_deref() else {
+            return Ok(None);
+        };
+        if is_builtin_schema(schema) {
+            return Ok(None);
+        }
+
+        if self.attached_schemas.borrow().find(schema).is_some() {
+            return Ok(Some(attached_schema_key(schema)));
+        }
+
+        Err(FrankenError::Internal(format!(
+            "no such database: {schema}"
+        )))
+    }
+
+    fn reject_attached_target_write_in_explicit_transaction(
+        &self,
+        action: &'static str,
+        schema: &str,
+    ) -> Result<()> {
+        if *self.in_transaction.borrow() {
+            return Err(FrankenError::NotImplemented(format!(
+                "{action} against attached schema {schema} inside explicit transactions/savepoints is not yet supported"
+            )));
+        }
+        Ok(())
+    }
+
+    fn attached_table_supports_last_insert_rowid(&self, table_name: &str) -> bool {
+        join_table_supports_hidden_rowid(table_name, &self.original_ddl_sql.borrow())
+    }
+
+    fn apply_attached_insert_tracking(&self, changes: usize, last_insert_rowid: Option<i64>) {
+        self.reset_statement_change_count();
+        self.record_statement_changes(changes);
+        if let Some(rowid) = last_insert_rowid {
+            self.record_last_insert_rowid(rowid);
+        }
+    }
+
+    fn maybe_execute_attached_target_statement(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Vec<Row>>> {
+        match statement {
+            Statement::CreateTable(create) => {
+                let Some(target_schema) = self.attached_target_schema(&create.name)? else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "CREATE TABLE",
+                    create.name.schema.as_deref().unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = create.clone();
+                rewritten.name.schema = None;
+                tracing::debug!(
+                    schema = %target_schema,
+                    table = %create.name.name,
+                    "delegating attached-schema CREATE TABLE to attached connection"
+                );
+                self.with_attached_connection(&target_schema, |conn| {
+                    conn.execute_statement(&Statement::CreateTable(rewritten), params)
+                })
+                .map(Some)
+            }
+            Statement::Insert(insert) => {
+                let Some(target_schema) = self.attached_target_schema(&insert.table)? else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "INSERT",
+                    insert.table.schema.as_deref().unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = insert.clone();
+                rewritten.table.schema = None;
+                tracing::debug!(
+                    schema = %target_schema,
+                    table = %insert.table.name,
+                    "delegating attached-schema INSERT target"
+                );
+                match &rewritten.source {
+                    fsqlite_ast::InsertSource::Select(select_stmt) => {
+                        let source_rows =
+                            self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
+                        let (affected, last_insert_rowid) =
+                            self.with_attached_connection(&target_schema, |conn| {
+                                let affected = conn.execute_insert_select_materialized_rows(
+                                    &rewritten,
+                                    &source_rows,
+                                )?;
+                                let last_insert_rowid = (affected > 0
+                                    && conn.attached_table_supports_last_insert_rowid(
+                                        &rewritten.table.name,
+                                    ))
+                                .then(|| conn.current_last_insert_rowid());
+                                Ok((affected, last_insert_rowid))
+                            })?;
+                        self.apply_attached_insert_tracking(affected, last_insert_rowid);
+                        Ok(Some(Vec::new()))
+                    }
+                    _ => {
+                        let (rows, changes, last_insert_rowid) =
+                            self.with_attached_connection(&target_schema, |conn| {
+                                let rows =
+                                    conn.execute_statement(&Statement::Insert(rewritten), params)?;
+                                let changes = *conn.last_changes.borrow();
+                                let last_insert_rowid = (changes > 0
+                                    && conn.attached_table_supports_last_insert_rowid(
+                                        &insert.table.name,
+                                    ))
+                                .then(|| conn.current_last_insert_rowid());
+                                Ok((rows, changes, last_insert_rowid))
+                            })?;
+                        self.apply_attached_insert_tracking(changes, last_insert_rowid);
+                        Ok(Some(rows))
+                    }
+                }
+            }
+            Statement::Update(update) => {
+                let target_schema = {
+                    let registry = self.attached_schemas.borrow();
+                    determine_attached_update_schema(update, &registry)?
+                };
+                let Some(target_schema) = target_schema else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "UPDATE",
+                    update.table.name.schema.as_deref().unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = update.clone();
+                strip_attached_schema_from_update(&mut rewritten, &target_schema);
+                tracing::debug!(
+                    schema = %target_schema,
+                    table = %update.table.name.name,
+                    "delegating attached-schema UPDATE target"
+                );
+                let (rows, changes) = self.with_attached_connection(&target_schema, |conn| {
+                    let rows = conn.execute_statement(&Statement::Update(rewritten), params)?;
+                    Ok((rows, *conn.last_changes.borrow()))
+                })?;
+                self.reset_statement_change_count();
+                self.record_statement_changes(changes);
+                Ok(Some(rows))
+            }
+            Statement::Delete(delete) => {
+                let target_schema = {
+                    let registry = self.attached_schemas.borrow();
+                    determine_attached_delete_schema(delete, &registry)?
+                };
+                let Some(target_schema) = target_schema else {
+                    return Ok(None);
+                };
+                self.reject_attached_target_write_in_explicit_transaction(
+                    "DELETE",
+                    delete.table.name.schema.as_deref().unwrap_or(&target_schema),
+                )?;
+                let mut rewritten = delete.clone();
+                strip_attached_schema_from_delete(&mut rewritten, &target_schema);
+                tracing::debug!(
+                    schema = %target_schema,
+                    table = %delete.table.name.name,
+                    "delegating attached-schema DELETE target"
+                );
+                let (rows, changes) = self.with_attached_connection(&target_schema, |conn| {
+                    let rows = conn.execute_statement(&Statement::Delete(rewritten), params)?;
+                    Ok((rows, *conn.last_changes.borrow()))
+                })?;
+                self.reset_statement_change_count();
+                self.record_statement_changes(changes);
+                Ok(Some(rows))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn has_live_vtab_instance(&self, table_name: &str) -> bool {
         self.vtab_instances
             .borrow()
@@ -2440,6 +2619,12 @@ impl Connection {
         }
     }
 
+    fn has_staged_dropped_live_vtab(&self, table_name: &str) -> bool {
+        self.dropped_vtab_instances
+            .borrow()
+            .contains_key(&table_name.to_ascii_uppercase())
+    }
+
     fn note_live_vtab_created(&self, table_name: &str) {
         if !self.transactional_live_vtab_registry_active() {
             return;
@@ -2463,15 +2648,14 @@ impl Connection {
             return instance.destroy(cx);
         }
 
-        let replaced = self
-            .dropped_vtab_instances
-            .borrow_mut()
-            .insert(key.clone(), instance);
-        if replaced.is_some() {
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+        if dropped_instances.contains_key(&key) {
             return Err(FrankenError::Internal(format!(
                 "dropped virtual table registry already contains {table_name}"
             )));
         }
+        dropped_instances.insert(key.clone(), instance);
+        drop(dropped_instances);
         self.live_vtab_registry_undo
             .borrow_mut()
             .push(LiveVtabRegistryUndo::Dropped { table_name: key });
@@ -2657,6 +2841,7 @@ impl Connection {
                             &mut dropped_instances,
                             applied,
                         ) {
+                            let _ = applied_instance.rollback_to(cx, level);
                             let _ = applied_instance.release(cx, level);
                         }
                     }
@@ -4638,6 +4823,9 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
     ) -> Result<Vec<Row>> {
+        if let Some(rows) = self.maybe_execute_attached_target_statement(statement, params)? {
+            return Ok(rows);
+        }
         self.reject_unsupported_attached_target_schema(statement)?;
         match statement {
             Statement::CreateTable(create) => {
@@ -5576,12 +5764,16 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
-        if !insert.upsert.is_empty() || !insert.returning.is_empty() {
-            return Err(FrankenError::NotImplemented(
-                "INSERT ... SELECT fallback does not support UPSERT/RETURNING".to_owned(),
-            ));
-        }
+        let source_rows = self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
+        self.execute_insert_select_materialized_rows(insert, &source_rows)
+    }
 
+    fn materialize_insert_select_source_rows(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
         // If the INSERT has a WITH clause (CTEs), transfer it to the SELECT
         // so execute_statement will materialize the CTEs before evaluation.
         let effective_select = if let Some(ref with) = insert.with {
@@ -5591,7 +5783,19 @@ impl Connection {
         } else {
             select_stmt.clone()
         };
-        let source_rows = self.execute_statement(&Statement::Select(effective_select), params)?;
+        self.execute_statement(&Statement::Select(effective_select), params)
+    }
+
+    fn execute_insert_select_materialized_rows(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        source_rows: &[Row],
+    ) -> Result<usize> {
+        if !insert.upsert.is_empty() || !insert.returning.is_empty() {
+            return Err(FrankenError::NotImplemented(
+                "INSERT ... SELECT fallback does not support UPSERT/RETURNING".to_owned(),
+            ));
+        }
         if source_rows.is_empty() {
             return Ok(0);
         }
@@ -5628,8 +5832,6 @@ impl Connection {
             .map(|idx| format!("?{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        // Include the conflict clause if present so that each INSERT
-        // row is handled with the correct conflict resolution.
         let conflict_clause = match &insert.or_conflict {
             Some(fsqlite_ast::ConflictAction::Replace) => "OR REPLACE ",
             Some(fsqlite_ast::ConflictAction::Ignore) => "OR IGNORE ",
@@ -5641,8 +5843,6 @@ impl Connection {
         let insert_sql =
             format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});");
 
-        // Execute row-by-row inside an internal pager savepoint so that if one
-        // row fails we preserve statement-level atomicity in explicit txns.
         let cx = self.op_cx()?;
         let internal_savepoint = if self.active_txn.borrow().is_some() {
             let mut suffix = 0u64;
@@ -5690,7 +5890,7 @@ impl Connection {
         };
 
         let mut statement_result: Result<usize> = Ok(0);
-        for row in &source_rows {
+        for row in source_rows {
             let mut ordered_values = self.evaluate_default_row_from_sqls(&default_sqls)?;
             for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
                 ordered_values[target_idx] = row.values()[source_idx].clone();
@@ -9937,6 +10137,11 @@ impl Connection {
             )));
         }
         drop(schema);
+        if self.has_staged_dropped_live_vtab(&table_name) {
+            return Err(FrankenError::NotImplemented(format!(
+                "recreating live virtual table {table_name} in the same transaction after DROP is not yet supported",
+            )));
+        }
 
         // Try the registered module registry first, then fall back to FTS5.
         let modules = self.vtab_modules.borrow();
@@ -21039,36 +21244,80 @@ fn determine_attached_select_schema(
 ) -> Result<Option<String>> {
     let mut usage = AttachedSelectUsage::default();
     visit_select_qualified_names(select, &mut |name| {
-        match name.schema.as_deref() {
-            None => usage.mixed_with_main_or_unqualified = true,
-            Some(schema) if is_builtin_schema(schema) => {
-                usage.mixed_with_main_or_unqualified = true;
-            }
-            Some(schema) if registry.find(schema).is_some() => {
-                usage.attached_schemas.insert(attached_schema_key(schema));
-            }
-            Some(schema) => {
-                return Err(FrankenError::Internal(format!(
-                    "no such database: {schema}"
-                )));
-            }
-        }
-        Ok(())
+        note_attached_schema_usage(name, registry, &mut usage)
     })?;
+    resolve_attached_schema_usage(
+        usage,
+        "queries spanning multiple attached schemas are not yet supported",
+        "queries mixing attached schemas with main/temp or unqualified tables are not yet supported",
+    )
+}
 
+fn determine_attached_update_schema(
+    update: &fsqlite_ast::UpdateStatement,
+    registry: &SchemaRegistry,
+) -> Result<Option<String>> {
+    let mut usage = AttachedSelectUsage::default();
+    visit_update_qualified_names(update, &mut |name| {
+        note_attached_schema_usage(name, registry, &mut usage)
+    })?;
+    resolve_attached_schema_usage(
+        usage,
+        "statements spanning multiple attached schemas are not yet supported",
+        "statements mixing attached schemas with main/temp or unqualified tables are not yet supported",
+    )
+}
+
+fn determine_attached_delete_schema(
+    delete: &fsqlite_ast::DeleteStatement,
+    registry: &SchemaRegistry,
+) -> Result<Option<String>> {
+    let mut usage = AttachedSelectUsage::default();
+    visit_delete_qualified_names(delete, &mut |name| {
+        note_attached_schema_usage(name, registry, &mut usage)
+    })?;
+    resolve_attached_schema_usage(
+        usage,
+        "statements spanning multiple attached schemas are not yet supported",
+        "statements mixing attached schemas with main/temp or unqualified tables are not yet supported",
+    )
+}
+
+fn note_attached_schema_usage(
+    name: &QualifiedName,
+    registry: &SchemaRegistry,
+    usage: &mut AttachedSelectUsage,
+) -> Result<()> {
+    match name.schema.as_deref() {
+        None => usage.mixed_with_main_or_unqualified = true,
+        Some(schema) if is_builtin_schema(schema) => {
+            usage.mixed_with_main_or_unqualified = true;
+        }
+        Some(schema) if registry.find(schema).is_some() => {
+            usage.attached_schemas.insert(attached_schema_key(schema));
+        }
+        Some(schema) => {
+            return Err(FrankenError::Internal(format!(
+                "no such database: {schema}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_attached_schema_usage(
+    usage: AttachedSelectUsage,
+    multi_message: &str,
+    mixed_message: &str,
+) -> Result<Option<String>> {
     if usage.attached_schemas.is_empty() {
         return Ok(None);
     }
     if usage.attached_schemas.len() > 1 {
-        return Err(FrankenError::NotImplemented(
-            "queries spanning multiple attached schemas are not yet supported".to_owned(),
-        ));
+        return Err(FrankenError::NotImplemented(multi_message.to_owned()));
     }
     if usage.mixed_with_main_or_unqualified {
-        return Err(FrankenError::NotImplemented(
-            "queries mixing attached schemas with main/temp or unqualified tables are not yet supported"
-                .to_owned(),
-        ));
+        return Err(FrankenError::NotImplemented(mixed_message.to_owned()));
     }
     Ok(usage.attached_schemas.into_iter().next())
 }
@@ -21090,6 +21339,36 @@ fn select_references_non_main_schema(select: &SelectStatement) -> bool {
 
 fn strip_attached_schema_from_select(select: &mut SelectStatement, target_schema: &str) {
     visit_select_qualified_names_mut(select, &mut |name| {
+        if name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case(target_schema))
+        {
+            name.schema = None;
+        }
+    });
+}
+
+fn strip_attached_schema_from_update(
+    update: &mut fsqlite_ast::UpdateStatement,
+    target_schema: &str,
+) {
+    visit_update_qualified_names_mut(update, &mut |name| {
+        if name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case(target_schema))
+        {
+            name.schema = None;
+        }
+    });
+}
+
+fn strip_attached_schema_from_delete(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    target_schema: &str,
+) {
+    visit_delete_qualified_names_mut(delete, &mut |name| {
         if name
             .schema
             .as_deref()
@@ -21200,6 +21479,16 @@ fn visit_table_or_subquery_qualified_names(
             }
             Ok(())
         }
+    }
+}
+
+fn visit_result_column_qualified_names(
+    column: &ResultColumn,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    match column {
+        ResultColumn::Expr { expr, .. } => visit_expr_qualified_names(expr, f),
+        ResultColumn::Star | ResultColumn::TableStar(_) => Ok(()),
     }
 }
 
@@ -21596,6 +21885,124 @@ fn visit_frame_bound_qualified_names_mut(
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
         | FrameBound::UnboundedFollowing => {}
+    }
+}
+
+fn visit_update_qualified_names(
+    update: &fsqlite_ast::UpdateStatement,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    f(&update.table.name)?;
+    for assignment in &update.assignments {
+        visit_expr_qualified_names(&assignment.value, f)?;
+    }
+    if let Some(from) = &update.from {
+        visit_table_or_subquery_qualified_names(&from.source, f)?;
+        for join in &from.joins {
+            visit_table_or_subquery_qualified_names(&join.table, f)?;
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                visit_expr_qualified_names(expr, f)?;
+            }
+        }
+    }
+    if let Some(where_expr) = update.where_clause.as_ref() {
+        visit_expr_qualified_names(where_expr, f)?;
+    }
+    for column in &update.returning {
+        visit_result_column_qualified_names(column, f)?;
+    }
+    for term in &update.order_by {
+        visit_expr_qualified_names(&term.expr, f)?;
+    }
+    if let Some(limit) = &update.limit {
+        visit_expr_qualified_names(&limit.limit, f)?;
+        if let Some(offset) = limit.offset.as_ref() {
+            visit_expr_qualified_names(offset, f)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_update_qualified_names_mut(
+    update: &mut fsqlite_ast::UpdateStatement,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    f(&mut update.table.name);
+    for assignment in &mut update.assignments {
+        visit_expr_qualified_names_mut(&mut assignment.value, f);
+    }
+    if let Some(from) = &mut update.from {
+        visit_table_or_subquery_qualified_names_mut(&mut from.source, f);
+        for join in &mut from.joins {
+            visit_table_or_subquery_qualified_names_mut(&mut join.table, f);
+            if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                visit_expr_qualified_names_mut(expr, f);
+            }
+        }
+    }
+    if let Some(where_expr) = update.where_clause.as_mut() {
+        visit_expr_qualified_names_mut(where_expr, f);
+    }
+    for column in &mut update.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            visit_expr_qualified_names_mut(expr, f);
+        }
+    }
+    for term in &mut update.order_by {
+        visit_expr_qualified_names_mut(&mut term.expr, f);
+    }
+    if let Some(limit) = &mut update.limit {
+        visit_expr_qualified_names_mut(&mut limit.limit, f);
+        if let Some(offset) = limit.offset.as_mut() {
+            visit_expr_qualified_names_mut(offset, f);
+        }
+    }
+}
+
+fn visit_delete_qualified_names(
+    delete: &fsqlite_ast::DeleteStatement,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    f(&delete.table.name)?;
+    if let Some(where_expr) = delete.where_clause.as_ref() {
+        visit_expr_qualified_names(where_expr, f)?;
+    }
+    for column in &delete.returning {
+        visit_result_column_qualified_names(column, f)?;
+    }
+    for term in &delete.order_by {
+        visit_expr_qualified_names(&term.expr, f)?;
+    }
+    if let Some(limit) = &delete.limit {
+        visit_expr_qualified_names(&limit.limit, f)?;
+        if let Some(offset) = limit.offset.as_ref() {
+            visit_expr_qualified_names(offset, f)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_delete_qualified_names_mut(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    f(&mut delete.table.name);
+    if let Some(where_expr) = delete.where_clause.as_mut() {
+        visit_expr_qualified_names_mut(where_expr, f);
+    }
+    for column in &mut delete.returning {
+        if let ResultColumn::Expr { expr, .. } = column {
+            visit_expr_qualified_names_mut(expr, f);
+        }
+    }
+    for term in &mut delete.order_by {
+        visit_expr_qualified_names_mut(&mut term.expr, f);
+    }
+    if let Some(limit) = &mut delete.limit {
+        visit_expr_qualified_names_mut(&mut limit.limit, f);
+        if let Some(offset) = limit.offset.as_mut() {
+            visit_expr_qualified_names_mut(offset, f);
+        }
     }
 }
 
@@ -31739,6 +32146,7 @@ mod tests {
         txn_state: TransactionalVtabState<TxnAwareVtabSnapshot>,
         hook_log: Vec<String>,
         fail_sync: bool,
+        fail_savepoint_at: Option<i32>,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -31792,6 +32200,7 @@ mod tests {
                 txn_state: TransactionalVtabState::default(),
                 hook_log: Vec::new(),
                 fail_sync: false,
+                fail_savepoint_at: None,
             })
         }
 
@@ -31871,6 +32280,11 @@ mod tests {
 
         fn savepoint(&mut self, _cx: &Cx, n: i32) -> Result<()> {
             self.record_hook(format!("savepoint:{n}"));
+            if self.fail_savepoint_at == Some(n) {
+                return Err(FrankenError::Internal(format!(
+                    "txn-aware test vtab forced savepoint failure at level {n}",
+                )));
+            }
             self.txn_state.savepoint(n, self.snapshot_state());
             Ok(())
         }
@@ -35196,6 +35610,8 @@ mod tests {
                  FROM issues INDEXED BY idx_issues_list_active_order
                  WHERE status NOT IN ('closed', 'tombstone')
                    AND ((is_template = 0) OR is_template IS NULL)
+                   AND status = 'open'
+                   AND is_template = 0
                  ORDER BY priority, created_at DESC",
             )
             .unwrap()
@@ -35773,6 +36189,8 @@ mod tests {
                  FROM issues INDEXED BY idx_issues_list_active_order
                  WHERE status NOT IN ('closed', 'tombstone')
                    AND ((is_template = 0) OR is_template IS NULL)
+                   AND status = 'open'
+                   AND is_template = 0
                  ORDER BY priority, created_at DESC",
             )
             .unwrap()
@@ -40271,6 +40689,43 @@ mod tests {
     }
 
     #[test]
+    fn test_live_vtab_recreate_same_name_after_drop_in_transaction_is_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('keep');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DROP TABLE vt;").unwrap();
+        let err = conn
+            .execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .expect_err("same-name recreate should be rejected while the dropped VTAB is staged");
+        assert!(matches!(err, FrankenError::NotImplemented(_)));
+        assert!(
+            conn.dropped_vtab_instances.borrow().contains_key("VT"),
+            "rejected same-name recreate must keep the dropped VTAB staged for rollback/commit"
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+        let rows = conn
+            .query("SELECT rowid, value FROM vt ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("keep".to_owned()),
+            ]],
+            "ROLLBACK must restore the original VTAB after a rejected same-name recreate",
+        );
+    }
+
+    #[test]
     fn test_live_vtab_drop_autocommit_unregisters_instance() {
         let conn = Connection::open(":memory:").unwrap();
         conn.register_module(
@@ -40343,6 +40798,48 @@ mod tests {
                 .is_empty(),
             "rejected live VTAB rename must not rewrite sqlite_master"
         );
+    }
+
+    #[test]
+    fn test_live_vtab_savepoint_failure_rolls_back_prior_vtab_savepoint_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE vt2 USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO vt1(value) VALUES ('left');").unwrap();
+        conn.execute("INSERT INTO vt2(value) VALUES ('right');").unwrap();
+        with_txn_test_vtab(&conn, "vt2", |vtab| vtab.fail_savepoint_at = Some(0));
+
+        let err = conn
+            .execute("SAVEPOINT sp_fail;")
+            .expect_err("savepoint should fail when one VTAB savepoint hook errors");
+        assert!(
+            err.to_string().contains("savepoint"),
+            "unexpected SAVEPOINT error: {err}",
+        );
+
+        let hook_log = with_txn_test_vtab(&conn, "vt1", |vtab| vtab.hook_log.clone());
+        assert!(
+            hook_log.contains(&"savepoint:0".to_owned()),
+            "expected vt1 savepoint hook before sibling failure: {hook_log:?}",
+        );
+        assert!(
+            hook_log.contains(&"rollback_to:0".to_owned()),
+            "failed savepoint setup must roll back earlier VTAB savepoints: {hook_log:?}",
+        );
+        assert!(
+            hook_log.contains(&"release:0".to_owned()),
+            "failed savepoint setup must release earlier VTAB savepoints after rollback: {hook_log:?}",
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
@@ -59056,16 +59553,216 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_attached_schema_write_target_is_rejected() {
+    fn test_create_table_in_attached_schema_writes_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap();
+
+        let rows = conn.query("SELECT id, value FROM aux.t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+
+        let aux = rusqlite::Connection::open(&aux_path).unwrap();
+        let table_count: i64 = aux
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        let persisted_rows: Vec<(i64, String)> = aux
+            .prepare("SELECT id, value FROM t ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(persisted_rows, vec![(1, "alpha".to_owned())]);
+    }
+
+    #[test]
+    fn test_insert_into_attached_schema_updates_change_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+
+        assert_eq!(conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap(), 1);
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_attached_insert_is_rejected_inside_explicit_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let aux = rusqlite::Connection::open(&aux_path).unwrap();
+        aux.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", [])
+            .unwrap();
+        drop(aux);
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
 
         let err = conn
-            .execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY);")
-            .expect_err(
-                "attached CREATE TABLE should be rejected until multi-pager routing exists",
-            );
-        assert!(matches!(err, FrankenError::NotImplemented(_)));
+            .execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .expect_err("attached INSERT inside BEGIN should stay rejected");
+        assert!(matches!(err, FrankenError::NotImplemented(message) if message.contains("explicit transactions/savepoints")));
+
+        conn.execute("ROLLBACK;").unwrap();
+
+        let aux = rusqlite::Connection::open(&aux_path).unwrap();
+        let row_count: i64 = aux
+            .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0);
+    }
+
+    #[test]
+    fn test_insert_into_attached_schema_selects_from_other_attached_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db1_path = dir.path().join("db1.db");
+        let db2_path = dir.path().join("db2.db");
+        let db1_path_sql = db1_path.to_string_lossy().replace('\'', "''");
+        let db2_path_sql = db2_path.to_string_lossy().replace('\'', "''");
+        let db2_path_str = db2_path.to_string_lossy().into_owned();
+
+        let db2 = Connection::open(&db2_path_str).unwrap();
+        db2.execute("CREATE TABLE src (id INTEGER, value TEXT);")
+            .unwrap();
+        db2.execute("INSERT INTO src VALUES (1, 'left');").unwrap();
+        db2.execute("INSERT INTO src VALUES (2, 'right');").unwrap();
+        drop(db2);
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{db1_path_sql}' AS db1;"))
+            .unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{db2_path_sql}' AS db2;"))
+            .unwrap();
+        conn.execute("CREATE TABLE db1.dest (id INTEGER, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO db1.dest SELECT id, value FROM db2.src;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, value FROM db1.dest ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("left".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("right".to_owned()));
+
+        let db1 = rusqlite::Connection::open(&db1_path).unwrap();
+        let persisted_rows: Vec<(i64, String)> = db1
+            .prepare("SELECT id, value FROM dest ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            persisted_rows,
+            vec![(1, "left".to_owned()), (2, "right".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_update_attached_schema_with_subquery_writes_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');").unwrap();
+
+        conn.execute(
+            "UPDATE aux.t SET value = 'gamma' WHERE id IN (SELECT id FROM aux.t WHERE value = 'beta');",
+        )
+        .unwrap();
+
+        let rows = conn.query("SELECT id, value FROM aux.t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("gamma".to_owned()));
+
+        let aux = rusqlite::Connection::open(&aux_path).unwrap();
+        let persisted_rows: Vec<(i64, String)> = aux
+            .prepare("SELECT id, value FROM t ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            persisted_rows,
+            vec![(1, "alpha".to_owned()), (2, "gamma".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_delete_from_attached_schema_with_subquery_writes_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');").unwrap();
+
+        conn.execute(
+            "DELETE FROM aux.t WHERE id IN (SELECT id FROM aux.t WHERE value = 'alpha');",
+        )
+        .unwrap();
+
+        let rows = conn.query("SELECT id, value FROM aux.t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("beta".to_owned()));
+
+        let aux = rusqlite::Connection::open(&aux_path).unwrap();
+        let persisted_rows: Vec<(i64, String)> = aux
+            .prepare("SELECT id, value FROM t ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(persisted_rows, vec![(2, "beta".to_owned())]);
     }
 
     // ── PRAGMA introspection tests ───────────────────────────────────────

@@ -51,6 +51,17 @@ fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Interrupt)
 }
 
+#[inline]
+fn vtab_exec_outcome(opcode: &str, err: FrankenError) -> Result<ExecOutcome> {
+    if matches!(err, FrankenError::Interrupt) {
+        return Err(FrankenError::Interrupt);
+    }
+    Ok(ExecOutcome::Error {
+        code: 1,
+        message: format!("{opcode} error: {err}"),
+    })
+}
+
 // ── In-Memory Table Store ──────────────────────────────────────────────────
 //
 // Phase 4 in-memory cursor backend. Allows the VDBE engine to execute
@@ -2456,6 +2467,72 @@ fn hash_program(program: &VdbeProgram) -> u64 {
         }
     }
 
+    fn mix_len(hash: &mut u64, len: usize) {
+        mix(hash, &u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+    }
+
+    fn mix_p4(hash: &mut u64, p4: &P4) {
+        match p4 {
+            P4::None => mix(hash, &[0]),
+            P4::Int(value) => {
+                mix(hash, &[1]);
+                mix(hash, &value.to_le_bytes());
+            }
+            P4::Int64(value) => {
+                mix(hash, &[2]);
+                mix(hash, &value.to_le_bytes());
+            }
+            P4::Real(value) => {
+                mix(hash, &[3]);
+                mix(hash, &value.to_bits().to_le_bytes());
+            }
+            P4::Str(value) => {
+                mix(hash, &[4]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+            P4::Blob(value) => {
+                mix(hash, &[5]);
+                mix_len(hash, value.len());
+                mix(hash, value);
+            }
+            P4::Collation(value) => {
+                mix(hash, &[6]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+            P4::FuncName(value) => {
+                mix(hash, &[7]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+            P4::Table(value) => {
+                mix(hash, &[8]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+            P4::Index(value) => {
+                mix(hash, &[9]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+            P4::Affinity(value) => {
+                mix(hash, &[10]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+            P4::TimeTravelCommitSeq(value) => {
+                mix(hash, &[11]);
+                mix(hash, &value.to_le_bytes());
+            }
+            P4::TimeTravelTimestamp(value) => {
+                mix(hash, &[12]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+            }
+        }
+    }
+
     let mut hash = FNV_OFFSET;
     mix(&mut hash, &program.register_count().to_le_bytes());
     for op in program.ops() {
@@ -2463,6 +2540,7 @@ fn hash_program(program: &VdbeProgram) -> u64 {
         mix(&mut hash, &op.p1.to_le_bytes());
         mix(&mut hash, &op.p2.to_le_bytes());
         mix(&mut hash, &op.p3.to_le_bytes());
+        mix_p4(&mut hash, &op.p4);
         mix(&mut hash, &op.p5.to_le_bytes());
     }
     hash
@@ -6512,6 +6590,7 @@ impl VdbeEngine {
                         true
                     };
 
+                    observe_execution_cancellation(&self.execution_cx)?;
                     if should_step {
                         ctx.func.step(&mut ctx.state, args)?;
                     }
@@ -6545,6 +6624,7 @@ impl VdbeEngine {
                         })?;
 
                     let accum_reg = op.p1;
+                    observe_execution_cancellation(&self.execution_cx)?;
                     let result = match self.aggregates.remove(&accum_reg) {
                         Some(ctx) => {
                             if !Arc::ptr_eq(&ctx.func, &func) {
@@ -6605,6 +6685,7 @@ impl VdbeEngine {
                         }
                     });
 
+                    observe_execution_cancellation(&self.execution_cx)?;
                     ctx.func.inverse(&mut ctx.state, args)?;
                     observe_execution_cancellation(&self.execution_cx)?;
                     pc += 1;
@@ -6640,6 +6721,7 @@ impl VdbeEngine {
                     })?;
 
                     let accum_reg = op.p1;
+                    observe_execution_cancellation(&self.execution_cx)?;
                     let result = match self.window_contexts.get(&accum_reg) {
                         Some(ctx) => ctx.func.value(&ctx.state)?,
                         None => func.value(&func.initial_state())?,
@@ -6683,6 +6765,7 @@ impl VdbeEngine {
                         })?;
 
                     let args = self.collect_reg_range(first_arg_reg, arg_count);
+                    observe_execution_cancellation(&self.execution_cx)?;
                     let result = func.invoke(&args)?;
                     observe_execution_cancellation(&self.execution_cx)?;
 
@@ -7001,10 +7084,7 @@ impl VdbeEngine {
                                         .insert(cursor_id, VtabCursorState { cursor });
                                 }
                                 Err(e) => {
-                                    break ExecOutcome::Error {
-                                        code: 1,
-                                        message: format!("VOpen error: {e}"),
-                                    };
+                                    break vtab_exec_outcome("VOpen", e)?;
                                 }
                             }
                         }
@@ -7023,6 +7103,7 @@ impl VdbeEngine {
                     let cx = self.derive_execution_cx();
 
                     if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
+                        observe_execution_cancellation(&cx)?;
                         let n_args = match &op.p4 {
                             P4::Int(n) => *n as usize,
                             _ => 0,
@@ -7038,12 +7119,9 @@ impl VdbeEngine {
                             .collect();
                         let idx_num = op.p5 as i32;
                         if let Err(e) = state.cursor.filter(&cx, idx_num, None, &args) {
-                            break ExecOutcome::Error {
-                                code: 1,
-                                message: format!("VFilter error: {e}"),
-                            };
+                            break vtab_exec_outcome("VFilter", e)?;
                         }
-                        observe_execution_cancellation(&self.execution_cx)?;
+                        observe_execution_cancellation(&cx)?;
                         if state.cursor.eof() {
                             #[allow(clippy::cast_sign_loss)]
                             {
@@ -7065,12 +7143,10 @@ impl VdbeEngine {
                     let dest = op.p3;
 
                     if let Some(state) = self.vtab_cursors.get(&cursor_id) {
+                        observe_execution_cancellation(&self.execution_cx)?;
                         let mut ctx = ColumnContext::new();
                         if let Err(e) = state.cursor.column(&mut ctx, col) {
-                            break ExecOutcome::Error {
-                                code: 1,
-                                message: format!("VColumn error: {e}"),
-                            };
+                            break vtab_exec_outcome("VColumn", e)?;
                         }
                         observe_execution_cancellation(&self.execution_cx)?;
                         #[allow(clippy::cast_sign_loss)]
@@ -7092,13 +7168,11 @@ impl VdbeEngine {
                     let cx = self.derive_execution_cx();
 
                     if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
+                        observe_execution_cancellation(&cx)?;
                         if let Err(e) = state.cursor.next(&cx) {
-                            break ExecOutcome::Error {
-                                code: 1,
-                                message: format!("VNext error: {e}"),
-                            };
+                            break vtab_exec_outcome("VNext", e)?;
                         }
-                        observe_execution_cancellation(&self.execution_cx)?;
+                        observe_execution_cancellation(&cx)?;
                         if !state.cursor.eof() {
                             #[allow(clippy::cast_sign_loss)]
                             {
@@ -7127,22 +7201,20 @@ impl VdbeEngine {
                                 .unwrap_or(SqliteValue::Null)
                         })
                         .collect();
+                    observe_execution_cancellation(&cx)?;
                     let vtab_update_result =
                         if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
                             match vtab.vtab_update(&cx, &args) {
                                 Ok(Some(rowid)) => SqliteValue::Integer(rowid),
                                 Ok(None) => SqliteValue::Null,
                                 Err(e) => {
-                                    break ExecOutcome::Error {
-                                        code: 1,
-                                        message: format!("VUpdate error: {e}"),
-                                    };
+                                    break vtab_exec_outcome("VUpdate", e)?;
                                 }
                             }
                         } else {
                             SqliteValue::Null
                         };
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_execution_cancellation(&cx)?;
                     #[allow(clippy::cast_sign_loss)]
                     if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
                         *reg = vtab_update_result;
@@ -7155,15 +7227,13 @@ impl VdbeEngine {
                     // P1 = cursor number identifying the vtab instance.
                     let cursor_id = op.p1;
                     let cx = self.derive_execution_cx();
+                    observe_execution_cancellation(&cx)?;
                     if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
                         if let Err(e) = vtab.begin(&cx) {
-                            break ExecOutcome::Error {
-                                code: 1,
-                                message: format!("VBegin error: {e}"),
-                            };
+                            break vtab_exec_outcome("VBegin", e)?;
                         }
                     }
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_execution_cancellation(&cx)?;
                     pc += 1;
                 }
 
@@ -7215,19 +7285,17 @@ impl VdbeEngine {
                     // P4 = new table name (via P4::Str)
                     let cursor_id = op.p1;
                     let cx = self.derive_execution_cx();
+                    observe_execution_cancellation(&cx)?;
                     if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
                         let new_name = match &op.p4 {
                             P4::Str(s) => s.as_str(),
                             _ => "",
                         };
                         if let Err(e) = vtab.rename(&cx, new_name) {
-                            break ExecOutcome::Error {
-                                code: 1,
-                                message: format!("VRename error: {e}"),
-                            };
+                            break vtab_exec_outcome("VRename", e)?;
                         }
                     }
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_execution_cancellation(&cx)?;
                     pc += 1;
                 }
 
@@ -8839,6 +8907,7 @@ mod tests {
 
     use super::*;
     use crate::ProgramBuilder;
+    use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
@@ -13874,6 +13943,62 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_scaffold_distinguishes_programs_that_only_differ_in_p4() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_enabled = vdbe_jit_enabled();
+        let prev_threshold = vdbe_jit_hot_threshold();
+        let prev_capacity = vdbe_jit_cache_capacity();
+
+        set_vdbe_jit_enabled(true);
+        let _ = set_vdbe_jit_hot_threshold(1);
+        let _ = set_vdbe_jit_cache_capacity(8);
+        reset_vdbe_jit_metrics();
+        let before = vdbe_jit_metrics_snapshot();
+
+        let alpha_rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, 1, 0, P4::Str("alpha".to_owned()), 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            alpha_rows,
+            vec![vec![SqliteValue::Text("alpha".to_owned())]]
+        );
+
+        let beta_rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, 1, 0, P4::Str("beta".to_owned()), 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(beta_rows, vec![vec![SqliteValue::Text("beta".to_owned())]]);
+
+        let after = vdbe_jit_metrics_snapshot();
+        let delta_compilations = after.jit_compilations_total - before.jit_compilations_total;
+        let delta_cache_hits = after.jit_cache_hits_total - before.jit_cache_hits_total;
+        assert!(
+            delta_compilations >= 2,
+            "expected both distinct P4 programs to compile separately, got {delta_compilations}",
+        );
+        assert_eq!(
+            delta_cache_hits, 0,
+            "programs that only differ in P4 must not alias in the JIT cache",
+        );
+
+        reset_vdbe_jit_metrics();
+        set_vdbe_jit_enabled(prev_enabled);
+        let _ = set_vdbe_jit_hot_threshold(prev_threshold);
+        let _ = set_vdbe_jit_cache_capacity(prev_capacity);
+    }
+
+    #[test]
     fn test_sorter_spill_to_disk_under_low_threshold() {
         // Set an artificially low spill threshold to trigger disk spill
         // with a small dataset, then verify the external merge produces
@@ -14853,10 +14978,13 @@ mod tests {
     // ── Virtual Table opcodes ──────────────────────────────────
 
     /// Mock virtual table cursor for testing VTable opcodes.
+    #[derive(Clone)]
     struct MockVtabCursor {
         rows: Vec<Vec<SqliteValue>>,
         pos: usize,
         filtered: bool,
+        cancel_on_filter: bool,
+        interrupt_on_filter: bool,
         cancel_on_column: Option<Cx>,
     }
 
@@ -14866,6 +14994,30 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                cancel_on_filter: false,
+                interrupt_on_filter: false,
+                cancel_on_column: None,
+            }
+        }
+
+        fn with_filter_child_cancel(rows: Vec<Vec<SqliteValue>>) -> Self {
+            Self {
+                rows,
+                pos: 0,
+                filtered: false,
+                cancel_on_filter: true,
+                interrupt_on_filter: false,
+                cancel_on_column: None,
+            }
+        }
+
+        fn with_filter_interrupt(rows: Vec<Vec<SqliteValue>>) -> Self {
+            Self {
+                rows,
+                pos: 0,
+                filtered: false,
+                cancel_on_filter: false,
+                interrupt_on_filter: true,
                 cancel_on_column: None,
             }
         }
@@ -14875,19 +15027,27 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                cancel_on_filter: false,
+                interrupt_on_filter: false,
                 cancel_on_column: Some(cancel_cx),
             }
         }
     }
 
-    impl ErasedVtabCursor for MockVtabCursor {
+    impl VirtualTableCursor for MockVtabCursor {
         fn filter(
             &mut self,
-            _cx: &Cx,
+            cx: &Cx,
             _idx_num: i32,
             _idx_str: Option<&str>,
             _args: &[SqliteValue],
         ) -> Result<()> {
+            if self.interrupt_on_filter {
+                return Err(FrankenError::Interrupt);
+            }
+            if self.cancel_on_filter {
+                cx.cancel();
+            }
             self.pos = 0;
             self.filtered = true;
             Ok(())
@@ -14919,7 +15079,57 @@ mod tests {
         }
     }
 
-    /// Helper: build a program, register a vtab cursor, then execute.
+    struct MockVtab {
+        cursor_template: MockVtabCursor,
+        cancel_on_begin: bool,
+        interrupt_on_begin: bool,
+    }
+
+    impl MockVtab {
+        fn new(cursor_template: MockVtabCursor) -> Self {
+            Self {
+                cursor_template,
+                cancel_on_begin: false,
+                interrupt_on_begin: false,
+            }
+        }
+
+        fn with_begin_interrupt(cursor_template: MockVtabCursor) -> Self {
+            Self {
+                cursor_template,
+                cancel_on_begin: false,
+                interrupt_on_begin: true,
+            }
+        }
+    }
+
+    impl VirtualTable for MockVtab {
+        type Cursor = MockVtabCursor;
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Ok(Self::new(MockVtabCursor::new(Vec::new())))
+        }
+
+        fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(self.cursor_template.clone())
+        }
+
+        fn begin(&mut self, cx: &Cx) -> Result<()> {
+            if self.interrupt_on_begin {
+                return Err(FrankenError::Interrupt);
+            }
+            if self.cancel_on_begin {
+                cx.cancel();
+            }
+            Ok(())
+        }
+    }
+
+    /// Helper: build a program, register a vtab instance, then execute.
     fn run_vtab_program(
         cursor_id: i32,
         cursor: MockVtabCursor,
@@ -14929,7 +15139,7 @@ mod tests {
         build(&mut b);
         let prog = b.finish().expect("program should build");
         let mut engine = VdbeEngine::new(prog.register_count());
-        engine.register_vtab_cursor(cursor_id, Box::new(cursor));
+        engine.register_vtab_instance(cursor_id, Box::new(MockVtab::new(cursor)));
         let outcome = engine.execute(&prog).expect("execution should succeed");
         (
             engine
@@ -15060,6 +15270,7 @@ mod tests {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
             let after_scan = b.emit_label();
             b.emit_jump_to_label(Opcode::VFilter, 0, 0, after_scan, P4::Int(0), 0);
             b.emit_op(Opcode::Integer, 999, r_out, 0, P4::None, 0);
@@ -15075,6 +15286,71 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_observes_execution_cx_cancellation_immediately_after_vfilter_opcode() {
+        let root_cx = Cx::new();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_out = b.alloc_reg();
+        b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::VFilter, 0, 0, done, P4::Int(0), 0);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
+        let vtab = MockVtab::new(MockVtabCursor::with_filter_child_cancel(vec![vec![
+            SqliteValue::Integer(7),
+        ]]));
+        engine.register_vtab_instance(0, Box::new(vtab));
+
+        let err = engine
+            .execute(&prog)
+            .expect_err("cancellation should be observed before VFilter advances execution");
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(engine.take_results().is_empty());
+    }
+
+    #[test]
+    fn test_vfilter_propagates_interrupt_from_cursor() {
+        let root_cx = Cx::new();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_out = b.alloc_reg();
+        b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::VFilter, 0, 0, done, P4::Int(0), 0);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
+        let vtab =
+            MockVtab::new(MockVtabCursor::with_filter_interrupt(vec![vec![SqliteValue::Integer(
+                7,
+            )]]));
+        engine.register_vtab_instance(0, Box::new(vtab));
+
+        let err = engine
+            .execute(&prog)
+            .expect_err("VFilter interrupt should propagate without being wrapped");
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(engine.take_results().is_empty());
+    }
+
+    #[test]
     fn test_vfilter_vcolumn_vnext_scan_loop() {
         let cursor = MockVtabCursor::new(vec![
             vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
@@ -15087,6 +15363,7 @@ mod tests {
             let r2 = b.alloc_reg();
             let done_label = b.emit_label();
             let loop_label = b.emit_label();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::VFilter, 0, 0, done_label, P4::Int(0), 0);
             b.resolve_label(loop_label);
             b.emit_op(Opcode::VColumn, 0, 0, r1, P4::None, 0);
@@ -15172,24 +15449,28 @@ mod tests {
     #[test]
     fn test_execute_observes_execution_cx_cancellation_immediately_after_vcolumn_opcode() {
         let root_cx = Cx::new();
-        let cursor = MockVtabCursor::with_column_cancel(
-            vec![vec![SqliteValue::Integer(7)]],
-            root_cx.clone(),
-        );
 
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
+        let done = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         let r_out = b.alloc_reg();
+        b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::VFilter, 0, 0, done, P4::Int(0), 0);
         b.emit_op(Opcode::VColumn, 0, 0, r_out, P4::None, 0);
         b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.resolve_label(done);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
 
         let mut engine =
             VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
-        engine.register_vtab_cursor(0, Box::new(cursor));
+        let vtab = MockVtab::new(MockVtabCursor::with_column_cancel(
+            vec![vec![SqliteValue::Integer(7)]],
+            root_cx.clone(),
+        ));
+        engine.register_vtab_instance(0, Box::new(vtab));
 
         let err = engine
             .execute(&prog)

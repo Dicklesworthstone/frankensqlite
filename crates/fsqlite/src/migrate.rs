@@ -151,12 +151,8 @@ impl MigrationRunner {
         }
     }
 
-    fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
-        let rows = conn.query_with_params(
-            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
-            &[SqliteValue::Integer(version)],
-        )?;
-        Ok(!rows.is_empty())
+    fn current_version_at_least(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
+        Ok(Self::read_current_version(conn)? >= version)
     }
 
     /// Applies a single migration inside a BEGIN IMMEDIATE/COMMIT transaction.
@@ -166,16 +162,19 @@ impl MigrationRunner {
     /// `false` when another connection finished it first.
     fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
         conn.execute("BEGIN IMMEDIATE;")?;
-        if Self::version_is_applied(conn, migration.version)? {
-            conn.execute("COMMIT;")?;
-            return Ok(false);
-        }
-
-        match Self::apply_one_inner(conn, migration) {
-            Ok(()) => {
+        let result = (|| -> Result<bool, FrankenError> {
+            if Self::current_version_at_least(conn, migration.version)? {
                 conn.execute("COMMIT;")?;
-                Ok(true)
+                return Ok(false);
             }
+
+            Self::apply_one_inner(conn, migration)?;
+            conn.execute("COMMIT;")?;
+            Ok(true)
+        })();
+
+        match result {
+            Ok(applied) => Ok(applied),
             Err(err) => {
                 // Best-effort rollback; ignore rollback errors since
                 // the original error is more informative.
@@ -321,6 +320,10 @@ mod tests {
         // V1 should have succeeded, V2 should have failed.
         // Since V1 committed before V2 started, V1 is permanent.
         assert!(err.is_err());
+        assert!(
+            !conn.in_transaction(),
+            "failed migration should not leave an open transaction behind"
+        );
 
         // V1 should be recorded.
         let runner2 = MigrationRunner::new().add(
@@ -462,6 +465,42 @@ mod tests {
         assert_eq!(
             rows[0].get(1),
             Some(&SqliteValue::Text("create_items".to_owned()))
+        );
+    }
+
+    #[test]
+    fn apply_one_skips_when_database_is_already_at_a_higher_version() {
+        let conn = mem_conn();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
+            );",
+        )
+        .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO _schema_migrations(version, name) VALUES (?1, ?2);",
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("already_applied".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        let migration = Migration {
+            version: 1,
+            name: "outdated",
+            up_sql: "CREATE TABLE should_not_exist (id INTEGER PRIMARY KEY);",
+        };
+
+        let applied = MigrationRunner::apply_one(&conn, &migration).unwrap();
+        assert!(!applied);
+        assert!(
+            conn.query("SELECT name FROM sqlite_master WHERE name = 'should_not_exist';")
+                .unwrap()
+                .is_empty(),
+            "older migration should not apply after the database has already advanced",
         );
     }
 
