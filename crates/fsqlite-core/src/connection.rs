@@ -8873,8 +8873,13 @@ impl Connection {
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
             let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+            let pending_commit_pages = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
+                txn.pending_commit_pages()?
+            } else {
+                Vec::new()
+            };
             let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
-                match self.plan_concurrent_commit() {
+                match self.plan_concurrent_commit(&pending_commit_pages) {
                     Ok(plan) => plan,
                     Err(e) => {
                         // Plan failed (SSI conflict, etc.) — abort under the
@@ -12884,14 +12889,8 @@ impl Connection {
         &self,
         registry: &mut ConcurrentRegistry,
         session_id: u64,
+        pending_commit_pages: &[PageNumber],
     ) -> Result<()> {
-        let pending_commit_pages = self
-            .active_txn
-            .borrow()
-            .as_ref()
-            .map(|txn| txn.pending_commit_pages())
-            .transpose()?
-            .unwrap_or_default();
         if pending_commit_pages.is_empty() {
             return Ok(());
         }
@@ -12899,7 +12898,7 @@ impl Connection {
         let handle = registry
             .get_mut(session_id)
             .ok_or_else(|| FrankenError::Internal("MVCC session invalid or inactive".to_owned()))?;
-        for page in pending_commit_pages {
+        for &page in pending_commit_pages {
             if handle.tracks_write_conflict_page(page) {
                 continue;
             }
@@ -12924,6 +12923,7 @@ impl Connection {
     fn plan_concurrent_commit_with_registry(
         &self,
         registry: &mut ConcurrentRegistry,
+        pending_commit_pages: &[PageNumber],
     ) -> Result<Option<PreparedConcurrentCommit>> {
         // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
         // Validate FCW/SSI preconditions first, but delay commit-side
@@ -12939,7 +12939,7 @@ impl Connection {
         let assigned_commit_seq =
             CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
 
-        self.track_pending_commit_pages_with_registry(registry, session_id)?;
+        self.track_pending_commit_pages_with_registry(registry, session_id, pending_commit_pages)?;
 
         let (snapshot, active_conflicts) = match registry.get(session_id) {
             Some(handle) if handle.is_active() => {
@@ -13156,9 +13156,12 @@ impl Connection {
         *self.concurrent_session_id.borrow_mut() = None;
     }
 
-    fn plan_concurrent_commit(&self) -> Result<Option<PreparedConcurrentCommit>> {
+    fn plan_concurrent_commit(
+        &self,
+        pending_commit_pages: &[PageNumber],
+    ) -> Result<Option<PreparedConcurrentCommit>> {
         let mut registry = lock_unpoisoned(&self.concurrent_registry);
-        self.plan_concurrent_commit_with_registry(&mut registry)
+        self.plan_concurrent_commit_with_registry(&mut registry, pending_commit_pages)
     }
 
     fn finalize_concurrent_commit(&self, plan: PreparedConcurrentCommit, committed_seq: CommitSeq) {
@@ -13224,20 +13227,35 @@ impl Connection {
         // We use a scope to limit the mutable borrow of active_txn.
         let (commit_result, committed_write) = {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let mut txn_guard = self.active_txn.borrow_mut();
-            let txn_has_pending_writes = txn_guard
-                .as_ref()
-                .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
-            let concurrent_commit_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes
-            {
-                self.plan_concurrent_commit()?
+            let is_concurrent_txn = *self.concurrent_txn.borrow();
+            let (txn_has_pending_writes, pending_commit_pages) = {
+                let txn_guard = self.active_txn.borrow();
+                let txn_has_pending_writes = txn_guard
+                    .as_ref()
+                    .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
+                let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
+                    txn_guard
+                        .as_ref()
+                        .map(|txn| txn.pending_commit_pages())
+                        .transpose()?
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                (txn_has_pending_writes, pending_commit_pages)
+            };
+            let concurrent_commit_plan = if is_concurrent_txn && txn_has_pending_writes {
+                self.plan_concurrent_commit(&pending_commit_pages)?
             } else {
                 None
             };
-            let commit_res = if let Some(txn) = txn_guard.as_mut() {
-                txn.commit(&cx)
-            } else {
-                Ok(())
+            let commit_res = {
+                let mut txn_guard = self.active_txn.borrow_mut();
+                if let Some(txn) = txn_guard.as_mut() {
+                    txn.commit(&cx)
+                } else {
+                    Ok(())
+                }
             };
 
             if matches!(commit_res, Ok(())) {
@@ -36379,6 +36397,329 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_mail_message_recipient_churn_stays_sqlite_compatible() {
+        const SEED_MESSAGES: usize = 192;
+        const CHURN_TXNS: usize = 192;
+        const AGENT_COUNT: usize = 24;
+        const RECIPIENTS_PER_MESSAGE: usize = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("agent_mail_message_recipient_churn.db");
+        let db_str = db_path.to_string_lossy().to_string();
+        let body_pad = "payloadblock".repeat(12);
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        conn.execute(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                sender_id INTEGER NOT NULL REFERENCES agents(id),
+                thread_id TEXT,
+                subject TEXT NOT NULL,
+                body_md TEXT NOT NULL,
+                importance TEXT NOT NULL DEFAULT 'normal',
+                ack_required INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER NOT NULL,
+                attachments TEXT NOT NULL DEFAULT '[]',
+                recipients_json TEXT NOT NULL DEFAULT '{}'
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL REFERENCES messages(id),
+                agent_id INTEGER NOT NULL REFERENCES agents(id),
+                kind TEXT NOT NULL DEFAULT 'to',
+                read_ts INTEGER,
+                ack_ts INTEGER,
+                PRIMARY KEY(message_id, agent_id)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE inbox_stats (
+                agent_id INTEGER PRIMARY KEY,
+                total_count INTEGER NOT NULL,
+                unread_count INTEGER NOT NULL,
+                ack_pending_count INTEGER NOT NULL,
+                last_message_ts INTEGER
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE INDEX idx_messages_project_created ON messages(project_id, created_ts);",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_messages_project_sender_created
+             ON messages(project_id, sender_id, created_ts);",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_messages_thread_id ON messages(thread_id);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_messages_importance ON messages(importance);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_messages_created_ts ON messages(created_ts);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_msg_thread_created ON messages(thread_id, created_ts);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_msg_project_importance_created
+             ON messages(project_id, importance, created_ts);",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_message_recipients_agent ON message_recipients(agent_id);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_message_recipients_agent_message
+             ON message_recipients(agent_id, message_id);",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_mr_agent_ack ON message_recipients(agent_id, ack_ts);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_mr_ack_message ON message_recipients(ack_ts, message_id);")
+            .unwrap();
+
+        conn.execute(
+            "CREATE TRIGGER trg_inbox_stats_insert
+             AFTER INSERT ON message_recipients
+             BEGIN
+               INSERT OR IGNORE INTO inbox_stats
+                 (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+               VALUES (
+                 NEW.agent_id,
+                 0,
+                 0,
+                 0,
+                 (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id)
+               );
+               UPDATE inbox_stats
+               SET total_count = total_count + 1,
+                   unread_count = unread_count + 1,
+                   ack_pending_count = ack_pending_count +
+                     COALESCE((SELECT m.ack_required FROM messages m WHERE m.id = NEW.message_id), 0),
+                   last_message_ts = COALESCE(
+                     (SELECT m.created_ts FROM messages m WHERE m.id = NEW.message_id),
+                     last_message_ts
+                   )
+               WHERE agent_id = NEW.agent_id;
+             END;",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO projects(id, slug) VALUES (1, 'project-1');")
+            .unwrap();
+        for agent_id in 1..=AGENT_COUNT {
+            conn.execute(&format!(
+                "INSERT INTO agents(id, project_id, name, last_active_ts)
+                 VALUES ({agent_id}, 1, 'agent-{agent_id:02}', 1700000000);"
+            ))
+            .unwrap();
+        }
+
+        let mut live_message_ids = std::collections::VecDeque::new();
+        let mut next_message_id = 1_i64;
+        for seed_idx in 0..SEED_MESSAGES {
+            let message_id = next_message_id;
+            next_message_id += 1;
+            live_message_ids.push_back(message_id);
+
+            let sender_id = i64::try_from((seed_idx % AGENT_COUNT) + 1).unwrap();
+            let thread_id = format!("thread-{:02}", seed_idx % 17);
+            let subject = format!("seed subject {seed_idx:03}");
+            let body_md = format!("seed body {seed_idx:03} {body_pad}");
+            let importance = match seed_idx % 3 {
+                0 => "normal",
+                1 => "high",
+                _ => "urgent",
+            };
+            let ack_required = if seed_idx % 2 == 0 { 1 } else { 0 };
+            let created_ts = 1_700_000_000_i64 + i64::try_from(seed_idx).unwrap();
+
+            conn.execute(&format!(
+                "INSERT INTO messages(
+                    id, project_id, sender_id, thread_id, subject, body_md,
+                    importance, ack_required, created_ts, attachments, recipients_json
+                 ) VALUES (
+                    {message_id},
+                    1,
+                    {sender_id},
+                    '{thread_id}',
+                    '{subject}',
+                    '{body_md}',
+                    '{importance}',
+                    {ack_required},
+                    {created_ts},
+                    '[]',
+                    '{{}}'
+                 );"
+            ))
+            .unwrap();
+
+            for recipient_offset in 0..RECIPIENTS_PER_MESSAGE {
+                let agent_id =
+                    i64::try_from(((seed_idx + recipient_offset) % AGENT_COUNT) + 1).unwrap();
+                let kind = if recipient_offset == 0 { "to" } else { "cc" };
+                conn.execute(&format!(
+                    "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts)
+                     VALUES ({message_id}, {agent_id}, '{kind}', NULL, NULL);"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        for txn_idx in 0..CHURN_TXNS {
+            let delete_id = live_message_ids.pop_front().unwrap();
+            let message_id = next_message_id;
+            next_message_id += 1;
+            live_message_ids.push_back(message_id);
+
+            let sender_id = i64::try_from((txn_idx % AGENT_COUNT) + 1).unwrap();
+            let thread_id = format!("thread-{:02}", txn_idx % 17);
+            let subject = format!("churn subject {txn_idx:03}");
+            let body_md = format!("churn body {txn_idx:03} {body_pad}");
+            let importance = match (txn_idx + 1) % 3 {
+                0 => "normal",
+                1 => "high",
+                _ => "urgent",
+            };
+            let ack_required = if txn_idx % 2 == 0 { 1 } else { 0 };
+            let created_ts = 1_800_000_000_i64 + i64::try_from(txn_idx).unwrap();
+            let read_agent = i64::try_from(((txn_idx * 3) % AGENT_COUNT) + 1).unwrap();
+            let ack_agent = i64::try_from(((txn_idx * 3 + 1) % AGENT_COUNT) + 1).unwrap();
+
+            conn.execute("BEGIN CONCURRENT;").unwrap();
+            conn.execute(&format!(
+                "DELETE FROM message_recipients WHERE message_id = {delete_id};"
+            ))
+            .unwrap();
+            conn.execute(&format!(
+                "DELETE FROM messages WHERE id = {delete_id} AND project_id = 1;"
+            ))
+            .unwrap();
+            conn.execute("DELETE FROM inbox_stats;").unwrap();
+            conn.execute(
+                "INSERT INTO inbox_stats
+                   (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+                 SELECT
+                   r.agent_id,
+                   COUNT(*) AS total_count,
+                   SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count,
+                   SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END)
+                     AS ack_pending_count,
+                   MAX(m.created_ts) AS last_message_ts
+                 FROM message_recipients r
+                 JOIN messages m ON m.id = r.message_id
+                 GROUP BY r.agent_id;",
+            )
+            .unwrap();
+
+            conn.execute(&format!(
+                "INSERT INTO messages(
+                    id, project_id, sender_id, thread_id, subject, body_md,
+                    importance, ack_required, created_ts, attachments, recipients_json
+                 ) VALUES (
+                    {message_id},
+                    1,
+                    {sender_id},
+                    '{thread_id}',
+                    '{subject}',
+                    '{body_md}',
+                    '{importance}',
+                    {ack_required},
+                    {created_ts},
+                    '[]',
+                    '{{}}'
+                 );"
+            ))
+            .unwrap();
+
+            for recipient_offset in 0..RECIPIENTS_PER_MESSAGE {
+                let agent_id =
+                    i64::try_from(((txn_idx * 3 + recipient_offset) % AGENT_COUNT) + 1).unwrap();
+                let kind = if recipient_offset == 0 { "to" } else { "cc" };
+                conn.execute(&format!(
+                    "INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts)
+                     VALUES ({message_id}, {agent_id}, '{kind}', NULL, NULL);"
+                ))
+                .unwrap();
+            }
+
+            conn.execute(&format!(
+                "UPDATE message_recipients
+                 SET read_ts = {created_ts}
+                 WHERE agent_id = {read_agent} AND message_id = {message_id};"
+            ))
+            .unwrap();
+            conn.execute(&format!(
+                "UPDATE message_recipients
+                 SET read_ts = {created_ts}, ack_ts = {}
+                 WHERE agent_id = {ack_agent} AND message_id = {message_id};",
+                created_ts + 1
+            ))
+            .unwrap();
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "Agent Mail-style message/recipient churn must preserve SQLite compatibility"
+        );
+
+        for agent_id in 1..=i64::try_from(AGENT_COUNT).unwrap() {
+            let indexed_count: i64 = sqlite
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM message_recipients INDEXED BY idx_message_recipients_agent
+                     WHERE agent_id = ?1",
+                    [agent_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fullscan_count: i64 = sqlite
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM message_recipients NOT INDEXED
+                     WHERE agent_id = ?1",
+                    [agent_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                indexed_count, fullscan_count,
+                "forced recipient-agent index lookup must match full scan for agent {agent_id}"
+            );
+        }
+    }
+
+    #[test]
     fn test_comments_ipk_payload_stays_sqlite_compatible() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("comments_ipk_payload.db");
@@ -54156,6 +54497,37 @@ mod pager_routing_tests {
             "RATCHET: file-backed BEGIN must create concurrent session or mark concurrent txn"
         );
         conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_ratchet_file_backed_concurrent_commit_with_writes_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ratchet_commit.db");
+        let path_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(path_str).unwrap();
+        conn.execute("CREATE TABLE ratchet_commit (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO ratchet_commit VALUES (1, 42);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        assert!(
+            conn.active_txn.borrow().is_none(),
+            "concurrent COMMIT should release the pager transaction handle"
+        );
+        assert!(
+            !conn.has_concurrent_session(),
+            "concurrent COMMIT should clear the session handle"
+        );
+
+        let rows = conn
+            .query("SELECT v FROM ratchet_commit WHERE id = 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(42)));
     }
 
     #[test]

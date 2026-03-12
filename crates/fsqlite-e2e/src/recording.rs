@@ -534,9 +534,10 @@ fn event_to_json(event: &RecordingEvent) -> String {
         } => {
             let preset_val = preset
                 .as_deref()
-                .map_or_else(|| "null".to_owned(), |p| format!("\"{p}\""));
+                .map_or_else(|| "null".to_owned(), |p| format!("\"{}\"", json_escape(p)));
             format!(
-                "{{\"kind\":\"session_start\",\"seed\":{seed},\"preset\":{preset_val},\"timestamp\":\"{timestamp}\"}}"
+                "{{\"kind\":\"session_start\",\"seed\":{seed},\"preset\":{preset_val},\"timestamp\":\"{}\"}}",
+                json_escape(timestamp)
             )
         }
         RecordingEvent::PhaseStart { name, description } => {
@@ -597,7 +598,7 @@ fn event_to_json(event: &RecordingEvent) -> String {
 fn summary_to_json(summary: &RecordingSummary) -> String {
     let preset_val = summary
         .as_preset_str()
-        .map_or_else(|| "null".to_owned(), |p| format!("\"{p}\""));
+        .map_or_else(|| "null".to_owned(), |p| format!("\"{}\"", json_escape(p)));
     format!(
         "{{\n  \"seed\": {},\n  \"preset\": {},\n  \"duration_ms\": {},\n  \"total_events\": {},\n  \"outcome\": \"{}\",\n  \"output_dir\": \"{}\"\n}}",
         summary.seed,
@@ -670,8 +671,32 @@ fn epoch_ms() -> u64 {
 
 /// ISO-ish timestamp from epoch milliseconds.
 fn epoch_iso(ms: u64) -> String {
-    // Simple format without chrono dependency.
-    format!("{}", ms / 1000)
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let days_since_epoch = secs / 86_400;
+    let time_of_day = secs % 86_400;
+    let hours = time_of_day / 3_600;
+    let minutes = (time_of_day % 3_600) / 60;
+    let seconds = time_of_day % 60;
+    let (year, month, day) = days_to_ymd(days_since_epoch);
+
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Civil calendar algorithm (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -892,6 +917,29 @@ mod tests {
     }
 
     #[test]
+    fn test_session_start_json_serialisation_escapes_strings() {
+        let event = RecordingEvent::SessionStart {
+            seed: 42,
+            preset: Some("demo\"preset".to_owned()),
+            timestamp: "1970-01-01T00:00:00.000Z\nnext".to_owned(),
+        };
+        let json = event_to_json(&event);
+        assert!(json.contains("demo\\\"preset"));
+        assert!(json.contains("1970-01-01T00:00:00.000Z\\nnext"));
+        assert!(!json.contains("timestamp\":\"1970-01-01T00:00:00.000Z\nnext\""));
+    }
+
+    #[test]
+    fn test_epoch_iso_epoch() {
+        assert_eq!(epoch_iso(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn test_epoch_iso_known_offset() {
+        assert_eq!(epoch_iso(86_401_234), "1970-01-02T00:00:01.234Z");
+    }
+
+    #[test]
     fn test_stable_run_dir() {
         let base = Path::new("runs");
         let dir = stable_run_dir(base, RecordingPreset::PerfScaling, 42);
@@ -966,6 +1014,20 @@ mod tests {
     }
 
     #[test]
+    fn test_summary_json_escapes_preset() {
+        let summary = RecordingSummary {
+            seed: 42,
+            preset: Some("demo\"preset".to_owned()),
+            duration_ms: 123,
+            total_events: 4,
+            outcome: "ok".to_owned(),
+            output_dir: PathBuf::from("/tmp/test"),
+        };
+        let json = summary_to_json(&summary);
+        assert!(json.contains("\"preset\": \"demo\\\"preset\""));
+    }
+
+    #[test]
     fn test_recording_help_text() {
         let help = recording_help_text();
         assert!(help.contains("--record"));
@@ -984,6 +1046,24 @@ mod tests {
         let mut session = RecordingSession::start(config).unwrap();
         session.warning("something odd happened");
         assert_eq!(session.event_count(), 2); // SessionStart + Warning
+    }
+
+    #[test]
+    fn test_session_start_timestamp_is_iso8601_utc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = RecordingConfig {
+            output_dir: dir.path().to_path_buf(),
+            ..RecordingConfig::default()
+        };
+        let session = RecordingSession::start(config).unwrap();
+        let TimestampedEvent { event, .. } = &session.events()[0];
+        let RecordingEvent::SessionStart { timestamp, .. } = event else {
+            panic!("expected session_start event");
+        };
+
+        assert!(timestamp.contains('T'));
+        assert!(timestamp.ends_with('Z'));
+        assert_eq!(timestamp.len(), "1970-01-01T00:00:00.000Z".len());
     }
 
     #[test]

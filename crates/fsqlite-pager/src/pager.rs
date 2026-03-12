@@ -449,22 +449,32 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
         return Ok(());
     }
 
-    // Use next_page as the upper bound to preserve pages allocated from EOF by
-    // rolled-back concurrent transactions.  Those pages have numbers > db_size
-    // (never flushed to disk) but < next_page (validly allocated space).
+    // Use next_page as the normalization bound so we keep valid in-memory EOF
+    // pages returned by aborted concurrent transactions. Those pages were
+    // never part of the durable file image, so they must not be serialized
+    // into page-1 freelist metadata until db_size grows to include them.
     let upper_bound = inner.next_page.saturating_sub(1).max(inner.db_size);
-    let freelist = normalize_freelist(&inner.freelist, upper_bound);
-    inner.freelist.clone_from(&freelist);
+    inner.freelist = normalize_freelist(&inner.freelist, upper_bound);
+    let durable_freelist: Vec<PageNumber> = inner
+        .freelist
+        .iter()
+        .copied()
+        .filter(|page| page.get() <= inner.db_size)
+        .collect();
 
     let ps = inner.page_size.as_usize();
-    let total_free = freelist.len() as u32;
+    let total_free = durable_freelist.len() as u32;
 
-    let (first_trunk, trunk_pages) = if freelist.is_empty() {
+    let (first_trunk, trunk_pages) = if durable_freelist.is_empty() {
         (0u32, Vec::<u32>::new())
     } else {
         let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
-        let trunk_count = freelist.len().div_ceil(max_leaf_entries + 1);
-        let trunks: Vec<u32> = freelist.iter().take(trunk_count).map(|p| p.get()).collect();
+        let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
+        let trunks: Vec<u32> = durable_freelist
+            .iter()
+            .take(trunk_count)
+            .map(|p| p.get())
+            .collect();
         (trunks[0], trunks)
     };
 
@@ -474,7 +484,7 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
 
         for (idx, trunk_pg) in trunk_pages.iter().enumerate() {
             let next = trunk_pages.get(idx + 1).copied().unwrap_or(0);
-            let remaining = freelist.len().saturating_sub(leaf_index);
+            let remaining = durable_freelist.len().saturating_sub(leaf_index);
             let take = remaining.min(max_leaf_entries);
 
             let mut buf = inner.cache.pool().acquire()?;
@@ -485,7 +495,7 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
             buf[4..8].copy_from_slice(&(take as u32).to_be_bytes());
 
             for i in 0..take {
-                let leaf = freelist[leaf_index + i].get();
+                let leaf = durable_freelist[leaf_index + i].get();
                 let base = 8 + i * 4;
                 buf[base..base + 4].copy_from_slice(&leaf.to_be_bytes());
             }
@@ -2272,15 +2282,20 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        if self.mode == TransactionMode::Concurrent {
-            // Concurrent transactions read against a fixed snapshot. Pages at
-            // or below db_size are part of the committed image for some
-            // snapshot, so reusing them from the live global freelist is not
-            // safe without versioned freelist metadata. Pages above db_size are
-            // different: they only exist because an earlier concurrent
-            // transaction allocated EOF pages and then rolled back, so reusing
-            // them cannot violate snapshot visibility and avoids page-count
-            // holes.
+        let committed_freelist_is_snapshot_pinned =
+            self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
+
+        if committed_freelist_is_snapshot_pinned {
+            // Concurrent writers always read against a fixed snapshot. So do
+            // immediate/deferred writers when another local transaction is
+            // still active, because that older reader snapshot can still
+            // observe the committed image being replaced. In both cases, pages
+            // at or below db_size are part of some still-visible committed
+            // state and cannot be safely reused from the live global freelist
+            // without versioned freelist metadata. Pages above db_size are
+            // different: they only exist because an earlier transaction
+            // allocated EOF pages and then rolled back, so reusing them cannot
+            // violate snapshot visibility and avoids page-count holes.
             if let Some(idx) = inner
                 .freelist
                 .iter()
@@ -2564,9 +2579,9 @@ where
                 // even if they lie beyond the current db_size. Otherwise
                 // next_page skips over them permanently and a later commit can
                 // grow page_count past those holes, yielding "Page N: never
-                // used" corruption. serialize_freelist_to_write_set() already
-                // knows how to preserve beyond-db_size freelist entries until a
-                // future commit reuses them or grows the file.
+                // used" corruption. The durable freelist serialized into page
+                // 1 filters those EOF-only pages back out, because SQLite
+                // forbids freelist entries beyond db_size.
                 return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
             }
         }
@@ -8219,6 +8234,92 @@ mod tests {
             "bead_id={BEAD_ID} case=concurrent_allocate_must_not_reuse_global_freelist_pages"
         );
         concurrent.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_immediate_allocate_ignores_global_freelist_pages_while_reader_active() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = seed.allocate_page(&cx).unwrap();
+        let p3 = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+        seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+        seed.commit(&cx).unwrap();
+
+        let mut free_txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        free_txn.free_page(&cx, p2).unwrap();
+        free_txn.commit(&cx).unwrap();
+
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let snapshot_page = reader.get_page(&cx, p3).unwrap();
+        assert_eq!(
+            snapshot_page.as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=reader_snapshot_established_before_writer_allocate"
+        );
+
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let allocated = writer.allocate_page(&cx).unwrap();
+        assert_eq!(
+            allocated.get(),
+            p3.get() + 1,
+            "bead_id={BEAD_ID} case=immediate_allocate_must_not_reuse_snapshot_pinned_global_freelist_pages"
+        );
+        writer.rollback(&cx).unwrap();
+        reader.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_commit_filters_beyond_db_size_freelist_entries_from_durable_state() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = seed.allocate_page(&cx).unwrap();
+        let p3 = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+        seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+        seed.commit(&cx).unwrap();
+
+        let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let p4 = abandoned.allocate_page(&cx).unwrap();
+        abandoned.write_page(&cx, p4, &vec![0x33; ps]).unwrap();
+        abandoned.rollback(&cx).unwrap();
+
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                inner.freelist.contains(&p4),
+                "bead_id={BEAD_ID} case=aborted_eof_page_retained_in_memory"
+            );
+        }
+
+        let mut free_txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        free_txn.free_page(&cx, p2).unwrap();
+        free_txn.commit(&cx).unwrap();
+
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let committed_page = reader.get_page(&cx, p3).unwrap();
+        assert_eq!(
+            committed_page.as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=durable_refresh_survives_filtered_beyond_db_size_freelist"
+        );
+        reader.commit(&cx).unwrap();
+
+        let inner = pager.inner.lock().unwrap();
+        assert!(
+            inner.freelist.contains(&p2),
+            "bead_id={BEAD_ID} case=durable_freelist_keeps_committed_free_page"
+        );
+        assert!(
+            !inner.freelist.contains(&p4),
+            "bead_id={BEAD_ID} case=durable_freelist_drops_beyond_db_size_page"
+        );
     }
 
     #[test]
