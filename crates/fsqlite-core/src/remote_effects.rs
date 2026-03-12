@@ -721,7 +721,7 @@ impl Executor {
 
             loop {
                 if cx.checkpoint().is_err() {
-                    self.bulkhead.cancel_entry(entry_id);
+                    self.bulkhead.cancel_entry(entry_id, asupersync::Time::from_nanos(0));
                     let snapshot = self.snapshot();
                     warn!(
                         bead_id = BEAD_ID,
