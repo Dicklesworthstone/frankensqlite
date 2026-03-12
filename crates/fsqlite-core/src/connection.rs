@@ -5445,6 +5445,7 @@ impl Connection {
                 }
 
                 let table_name = &insert.table.name;
+                self.reject_without_rowid_dml(table_name, "INSERT")?;
                 let insert_event = fsqlite_ast::TriggerEvent::Insert;
                 let is_live_vtab = self.has_live_vtab_instance(table_name);
                 if is_live_vtab {
@@ -5657,6 +5658,7 @@ impl Connection {
                 let (effective_update, _limited_row_count_hint) =
                     self.materialize_update_limit_scope(update, params)?;
                 let table_name = &effective_update.table.name.name;
+                self.reject_without_rowid_dml(table_name, "UPDATE")?;
                 // Collect columns being updated for UPDATE OF trigger matching.
                 let update_cols: Vec<String> = effective_update
                     .assignments
@@ -5789,6 +5791,7 @@ impl Connection {
                 let (effective_delete, _limited_row_count_hint) =
                     self.materialize_delete_limit_scope(delete, params)?;
                 let table_name = &effective_delete.table.name.name;
+                self.reject_without_rowid_dml(table_name, "DELETE")?;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
                 let has_before_delete = self.has_matching_triggers(
                     table_name,
@@ -6623,6 +6626,8 @@ impl Connection {
                 // cached program without re-running codegen each call.
                 // INSERT...SELECT with complex subqueries still gets a
                 // placeholder and falls back to full execute_statement.
+                let requires_deferred_dispatch =
+                    self.prepared_insert_requires_deferred_dispatch(insert)?;
                 let is_simple_values = matches!(
                     &insert.source,
                     fsqlite_ast::InsertSource::Values(_) | fsqlite_ast::InsertSource::DefaultValues
@@ -6633,7 +6638,7 @@ impl Connection {
                        && sel.body.compounds.is_empty()
                 );
 
-                if is_simple_values {
+                if is_simple_values && !requires_deferred_dispatch {
                     let sql_key = Self::sql_hash(sql);
                     let program = self.compile_with_cache(sql_key, sql, |conn| {
                         conn.compile_table_insert(insert)
@@ -6670,7 +6675,9 @@ impl Connection {
                         conn: self,
                     })
                 } else {
-                    // Complex INSERT...SELECT: placeholder, full dispatch.
+                    // Attached-target or complex INSERT statements must stay on
+                    // the deferred path so execution can route through the
+                    // statement dispatcher instead of main-schema bytecode.
                     let placeholder_program =
                         Arc::new(ProgramBuilder::new().finish().map_err(|e| {
                             FrankenError::Internal(format!(
@@ -6699,7 +6706,9 @@ impl Connection {
                 }
             }
             Statement::Update(update) => {
-                if Self::prepared_update_supports_precompiled_program(update) {
+                if Self::prepared_update_supports_precompiled_program(update)
+                    && !self.prepared_update_requires_deferred_dispatch(update)?
+                {
                     let sql_key = Self::sql_hash(sql);
                     let program = self.compile_with_cache(sql_key, sql, |conn| {
                         conn.compile_table_update(update)
@@ -6752,7 +6761,9 @@ impl Connection {
                 }
             }
             Statement::Delete(delete) => {
-                if Self::prepared_delete_supports_precompiled_program(delete) {
+                if Self::prepared_delete_supports_precompiled_program(delete)
+                    && !self.prepared_delete_requires_deferred_dispatch(delete)?
+                {
                     let sql_key = Self::sql_hash(sql);
                     let program = self.compile_with_cache(sql_key, sql, |conn| {
                         conn.compile_table_delete(delete)
@@ -6837,6 +6848,29 @@ impl Connection {
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case(table_name))
             .is_some_and(|table| table.foreign_keys.is_empty())
+    }
+
+    fn prepared_insert_requires_deferred_dispatch(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<bool> {
+        Ok(self.attached_target_schema(&insert.table)?.is_some())
+    }
+
+    fn prepared_update_requires_deferred_dispatch(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+    ) -> Result<bool> {
+        let registry = self.attached_schemas.borrow();
+        Ok(determine_attached_update_schema(update, &registry)?.is_some())
+    }
+
+    fn prepared_delete_requires_deferred_dispatch(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+    ) -> Result<bool> {
+        let registry = self.attached_schemas.borrow();
+        Ok(determine_attached_delete_schema(delete, &registry)?.is_some())
     }
 
     fn prepared_update_supports_precompiled_program(update: &fsqlite_ast::UpdateStatement) -> bool {
@@ -9940,10 +9974,6 @@ impl Connection {
     /// in-memory table, and insert a row into sqlite_master on page 1.
     #[allow(clippy::too_many_lines)]
     fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
-        if create.without_rowid {
-            return Err(FrankenError::Unsupported);
-        }
-
         let table_name = create.name.name.clone();
 
         // Check for duplicate table names.
@@ -9962,7 +9992,10 @@ impl Connection {
         drop(schema);
 
         match &create.body {
-            CreateTableBody::Columns { columns, .. } => {
+            CreateTableBody::Columns {
+                columns,
+                constraints,
+            } => {
                 // Detect INTEGER PRIMARY KEY column (rowid alias) and whether
                 // it carries AUTOINCREMENT.
                 let mut is_autoincrement = false;
@@ -9994,6 +10027,26 @@ impl Connection {
                         None
                     }
                 });
+                let has_primary_key = rowid_col_idx.is_some()
+                    || columns.iter().any(|col| {
+                        col.constraints
+                            .iter()
+                            .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }))
+                    })
+                    || constraints
+                        .iter()
+                        .any(|tc| matches!(tc.kind, TableConstraintKind::PrimaryKey { .. }));
+                if create.without_rowid && !has_primary_key {
+                    return Err(FrankenError::NotImplemented(
+                        "CREATE TABLE ... WITHOUT ROWID requires a PRIMARY KEY".to_owned(),
+                    ));
+                }
+                if create.without_rowid && is_autoincrement {
+                    return Err(FrankenError::NotImplemented(
+                        "AUTOINCREMENT on WITHOUT ROWID tables is not yet supported".to_owned(),
+                    ));
+                }
+
                 let col_infos: Vec<ColumnInfo> = columns
                     .iter()
                     .enumerate()
@@ -10077,15 +10130,21 @@ impl Connection {
                         })
                     })
                     .collect::<Result<_>>()?;
-                if let Some(idx) = rowid_col_idx {
+                if !create.without_rowid
+                    && let Some(idx) = rowid_col_idx
+                {
                     self.rowid_alias_columns
                         .borrow_mut()
                         .insert(table_name.to_ascii_lowercase(), idx);
                 }
                 // Collect implicit UNIQUE indexes from column constraints.
                 let mut implicit_indexes = Vec::new();
-                for col in &col_infos {
-                    if col.unique && !col.is_ipk {
+                for (decl_col, col) in columns.iter().zip(&col_infos) {
+                    let column_primary_key = decl_col
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                    if col.unique && !col.is_ipk && !(create.without_rowid && column_primary_key) {
                         let idx_root = self.allocate_index_root_page()?;
                         self.db.borrow_mut().create_table_at(idx_root, 0);
                         implicit_indexes.push(IndexSchema {
@@ -10104,56 +10163,60 @@ impl Connection {
                     }
                 }
                 // Collect implicit UNIQUE indexes from table-level constraints.
-                if let CreateTableBody::Columns { constraints, .. } = &create.body {
-                    for tc in constraints {
-                        if let TableConstraintKind::Unique {
-                            columns: idx_cols, ..
-                        }
-                        | TableConstraintKind::PrimaryKey {
-                            columns: idx_cols, ..
-                        } = &tc.kind
-                        {
-                            let col_names: Vec<String> = idx_cols
-                                .iter()
-                                .filter_map(|ic| {
-                                    if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr {
-                                        Some(col_ref.column.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            if !col_names.is_empty() {
-                                let idx_root = self.allocate_index_root_page()?;
-                                self.db.borrow_mut().create_table_at(idx_root, 0);
-                                implicit_indexes.push(IndexSchema {
-                                    name: format!(
-                                        "sqlite_autoindex_{}_{}",
-                                        table_name,
-                                        implicit_indexes.len() + 1
-                                    ),
-                                    root_page: idx_root,
-                                    columns: col_names,
-                                    key_expressions: idx_cols
-                                        .iter()
-                                        .map(|indexed| indexed.expr.to_string())
-                                        .collect(),
-                                    key_sort_directions: idx_cols
-                                        .iter()
-                                        .map(|indexed| {
-                                            indexed.direction.unwrap_or(SortDirection::Asc)
-                                        })
-                                        .collect(),
-                                    where_clause: None,
-                                    is_unique: true,
-                                });
-                            }
+                for tc in constraints {
+                    let is_primary_key = matches!(tc.kind, TableConstraintKind::PrimaryKey { .. });
+                    if create.without_rowid && is_primary_key {
+                        continue;
+                    }
+                    if let TableConstraintKind::Unique {
+                        columns: idx_cols, ..
+                    }
+                    | TableConstraintKind::PrimaryKey {
+                        columns: idx_cols, ..
+                    } = &tc.kind
+                    {
+                        let col_names: Vec<String> = idx_cols
+                            .iter()
+                            .filter_map(|ic| {
+                                if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr {
+                                    Some(col_ref.column.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !col_names.is_empty() {
+                            let idx_root = self.allocate_index_root_page()?;
+                            self.db.borrow_mut().create_table_at(idx_root, 0);
+                            implicit_indexes.push(IndexSchema {
+                                name: format!(
+                                    "sqlite_autoindex_{}_{}",
+                                    table_name,
+                                    implicit_indexes.len() + 1
+                                ),
+                                root_page: idx_root,
+                                columns: col_names,
+                                key_expressions: idx_cols
+                                    .iter()
+                                    .map(|indexed| indexed.expr.to_string())
+                                    .collect(),
+                                key_sort_directions: idx_cols
+                                    .iter()
+                                    .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+                                    .collect(),
+                                where_clause: None,
+                                is_unique: true,
+                            });
                         }
                     }
                 }
 
                 let num_columns = col_infos.len();
-                let root_page = self.allocate_root_page()?;
+                let root_page = if create.without_rowid {
+                    self.allocate_index_root_page()?
+                } else {
+                    self.allocate_root_page()?
+                };
                 self.db.borrow_mut().create_table_at(root_page, num_columns);
 
                 // Register UNIQUE column groups with MemTable for in-memory
@@ -10170,36 +10233,37 @@ impl Connection {
                             }
                         }
                         // Table-level UNIQUE/PRIMARY KEY constraints.
-                        if let CreateTableBody::Columns { constraints, .. } = &create.body {
-                            for tc in constraints {
-                                if let TableConstraintKind::Unique {
-                                    columns: idx_cols, ..
-                                }
-                                | TableConstraintKind::PrimaryKey {
-                                    columns: idx_cols, ..
-                                } = &tc.kind
-                                {
-                                    let col_indices: Vec<usize> = idx_cols
-                                        .iter()
-                                        .filter_map(|ic| {
-                                            if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr
-                                            {
-                                                col_infos.iter().position(|c| {
-                                                    c.name.eq_ignore_ascii_case(&col_ref.column)
-                                                })
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-                                    if !col_indices.is_empty() {
-                                        // Skip if this is an IPK-only primary key (already
-                                        // enforced by rowid uniqueness).
-                                        let all_ipk =
-                                            col_indices.iter().all(|&i| col_infos[i].is_ipk);
-                                        if !all_ipk {
-                                            mem_table.add_unique_column_group(col_indices);
+                        for tc in constraints {
+                            let is_primary_key =
+                                matches!(tc.kind, TableConstraintKind::PrimaryKey { .. });
+                            if create.without_rowid && is_primary_key {
+                                continue;
+                            }
+                            if let TableConstraintKind::Unique {
+                                columns: idx_cols, ..
+                            }
+                            | TableConstraintKind::PrimaryKey {
+                                columns: idx_cols, ..
+                            } = &tc.kind
+                            {
+                                let col_indices: Vec<usize> = idx_cols
+                                    .iter()
+                                    .filter_map(|ic| {
+                                        if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr {
+                                            col_infos.iter().position(|c| {
+                                                c.name.eq_ignore_ascii_case(&col_ref.column)
+                                            })
+                                        } else {
+                                            None
                                         }
+                                    })
+                                    .collect();
+                                if !col_indices.is_empty() {
+                                    // Skip if this is an IPK-only primary key (already
+                                    // enforced by rowid uniqueness).
+                                    let all_ipk = col_indices.iter().all(|&i| col_infos[i].is_ipk);
+                                    if !all_ipk {
+                                        mem_table.add_unique_column_group(col_indices);
                                     }
                                 }
                             }
@@ -10217,24 +10281,22 @@ impl Connection {
                         }
                     }
                 }
-                if let CreateTableBody::Columns { constraints, .. } = &create.body {
-                    for tc in constraints {
-                        if let TableConstraintKind::ForeignKey {
-                            columns: fk_cols,
-                            clause,
-                        } = &tc.kind
-                        {
-                            let child_indices: Vec<usize> = fk_cols
-                                .iter()
-                                .filter_map(|name| {
-                                    col_infos
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(name))
-                                })
-                                .collect();
-                            if !child_indices.is_empty() {
-                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
-                            }
+                for tc in constraints {
+                    if let TableConstraintKind::ForeignKey {
+                        columns: fk_cols,
+                        clause,
+                    } = &tc.kind
+                    {
+                        let child_indices: Vec<usize> = fk_cols
+                            .iter()
+                            .filter_map(|name| {
+                                col_infos
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(name))
+                            })
+                            .collect();
+                        if !child_indices.is_empty() {
+                            fk_defs.push(fk_clause_to_def(&child_indices, clause));
                         }
                     }
                 }
@@ -10249,11 +10311,9 @@ impl Connection {
                         }
                     }
                 }
-                if let CreateTableBody::Columns { constraints, .. } = &create.body {
-                    for tc in constraints {
-                        if let TableConstraintKind::Check(ref expr) = tc.kind {
-                            check_defs.push(format!("{expr}"));
-                        }
+                for tc in constraints {
+                    if let TableConstraintKind::Check(ref expr) = tc.kind {
+                        check_defs.push(format!("{expr}"));
                     }
                 }
 
@@ -16318,6 +16378,22 @@ impl Connection {
         builder.finish()
     }
 
+    fn table_declares_without_rowid(&self, table_name: &str) -> bool {
+        self.original_ddl_sql
+            .borrow()
+            .get(&table_name.to_ascii_lowercase())
+            .is_some_and(|sql| is_without_rowid_table_sql(sql))
+    }
+
+    fn reject_without_rowid_dml(&self, table_name: &str, verb: &str) -> Result<()> {
+        if self.table_declares_without_rowid(table_name) {
+            return Err(FrankenError::NotImplemented(format!(
+                "{verb} on WITHOUT ROWID tables is not yet supported"
+            )));
+        }
+        Ok(())
+    }
+
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
     /// GROUP BY aggregation directly on the joined rows.
     #[allow(clippy::too_many_lines)]
@@ -20190,6 +20266,7 @@ impl Connection {
 
     /// Compile an INSERT through the VDBE codegen.
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
+        self.reject_without_rowid_dml(&insert.table.name, "INSERT")?;
         // Resolve any subqueries inside VALUES expressions before VDBE codegen,
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
@@ -20261,6 +20338,7 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
+        self.reject_without_rowid_dml(&update.table.name.name, "UPDATE")?;
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
@@ -20278,6 +20356,7 @@ impl Connection {
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
+        self.reject_without_rowid_dml(&delete.table.name.name, "DELETE")?;
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
@@ -20826,6 +20905,7 @@ impl Connection {
             // Parse the CREATE TABLE to extract column info.
             let columns = crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql);
             let num_columns = columns.len();
+            let without_rowid = is_without_rowid_table_sql(&create_sql);
             let is_autoincrement = crate::compat_persist::is_autoincrement_table_sql(&create_sql);
 
             // Track rowid alias columns (INTEGER PRIMARY KEY).
@@ -20833,7 +20913,7 @@ impl Connection {
             // record payload - it IS the rowid. We need to insert the rowid at this
             // position when loading data.
             let ipk_col_idx = columns.iter().position(|c| c.is_ipk);
-            if let Some(idx) = ipk_col_idx {
+            if !without_rowid && let Some(idx) = ipk_col_idx {
                 new_alias_map.insert(name.to_ascii_lowercase(), idx);
                 if is_autoincrement {
                     new_autoincrement_tables.insert(name.to_ascii_lowercase());
@@ -28601,7 +28681,7 @@ fn is_virtual_table_sql(sql: &str) -> bool {
 }
 
 fn is_without_rowid_table_sql(sql: &str) -> bool {
-    sql.to_ascii_uppercase().contains("WITHOUT ROWID")
+    crate::compat_persist::is_without_rowid_table_sql(sql)
 }
 
 fn should_ignore_expected_master_row_for_integrity(row: &[SqliteValue]) -> Result<bool> {
@@ -48813,6 +48893,177 @@ mod root_page_allocation_tests {
 }
 
 // =========================================================================
+// WITHOUT ROWID runtime tests (bd-1bac2)
+// =========================================================================
+#[cfg(test)]
+mod without_rowid_runtime_tests {
+    use super::*;
+    use fsqlite_pager::traits::TransactionMode;
+    use fsqlite_types::PageNumber;
+
+    #[test]
+    fn test_create_without_rowid_table_uses_index_root_and_skips_rowid_alias_registration() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
+            .unwrap();
+
+        let root_page = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("wr"))
+            .map(|table| table.root_page)
+            .expect("WITHOUT ROWID table root page");
+        assert!(
+            !conn.rowid_alias_columns.borrow().contains_key("wr"),
+            "WITHOUT ROWID tables must not register rowid aliases"
+        );
+
+        let cx = Cx::new();
+        let txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let page_no = PageNumber::new(u32::try_from(root_page).unwrap()).unwrap();
+        let page = txn.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            page.as_ref()[0],
+            0x0A,
+            "WITHOUT ROWID table root page should be a leaf index b-tree"
+        );
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'wr';")
+            .unwrap();
+        let SqliteValue::Text(sql) = &rows[0].values()[0] else {
+            panic!("sqlite_master.sql should be TEXT");
+        };
+        assert!(sql.to_ascii_uppercase().contains("WITHOUT ROWID"));
+    }
+
+    #[test]
+    fn test_create_without_rowid_table_requires_primary_key() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .execute("CREATE TABLE wr (id INTEGER, payload TEXT) WITHOUT ROWID;")
+            .unwrap_err();
+        match err {
+            FrankenError::NotImplemented(message) => {
+                assert!(message.contains("requires a PRIMARY KEY"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_without_rowid_dml_reports_not_implemented() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
+            .unwrap();
+
+        for (sql, verb) in [
+            ("INSERT INTO wr VALUES (1, 'x');", "INSERT"),
+            ("UPDATE wr SET payload = 'y' WHERE id = 1;", "UPDATE"),
+            ("DELETE FROM wr WHERE id = 1;", "DELETE"),
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            match err {
+                FrankenError::NotImplemented(message) => {
+                    assert!(
+                        message.contains(&format!("{verb} on WITHOUT ROWID tables")),
+                        "unexpected {verb} diagnostic: {message}"
+                    );
+                }
+                other => panic!("unexpected {verb} error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_without_rowid_insert_error_does_not_fire_before_trigger_side_effects() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
+            .unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER wr_bi BEFORE INSERT ON wr BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        let err = conn.execute("INSERT INTO wr VALUES (1, 'x');").unwrap_err();
+        match err {
+            FrankenError::NotImplemented(message) => {
+                assert!(message.contains("INSERT on WITHOUT ROWID tables"));
+            }
+            other => panic!("unexpected INSERT error: {other:?}"),
+        }
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "rejected WITHOUT ROWID INSERT must not fire BEFORE trigger side effects"
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_update_delete_errors_do_not_fire_before_trigger_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_trigger_side_effects.db");
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn.execute_batch(
+                "CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;
+                 CREATE TABLE log (msg TEXT);
+                 CREATE TRIGGER wr_bu BEFORE UPDATE ON wr BEGIN INSERT INTO log VALUES ('update'); END;
+                 CREATE TRIGGER wr_bd BEFORE DELETE ON wr BEGIN INSERT INTO log VALUES ('delete'); END;
+                 INSERT INTO wr VALUES (1, 'x');",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+        for (sql, verb) in [
+            ("UPDATE wr SET payload = 'y' WHERE id = 1;", "UPDATE"),
+            ("DELETE FROM wr WHERE id = 1;", "DELETE"),
+        ] {
+            let err = conn.execute(sql).unwrap_err();
+            match err {
+                FrankenError::NotImplemented(message) => {
+                    assert!(
+                        message.contains(&format!("{verb} on WITHOUT ROWID tables")),
+                        "unexpected {verb} diagnostic: {message}"
+                    );
+                }
+                other => panic!("unexpected {verb} error: {other:?}"),
+            }
+        }
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "rejected WITHOUT ROWID UPDATE/DELETE must not fire BEFORE trigger side effects"
+        );
+    }
+
+    #[test]
+    fn test_reopen_without_rowid_table_does_not_restore_rowid_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_reload.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        assert!(
+            !conn.rowid_alias_columns.borrow().contains_key("wr"),
+            "WITHOUT ROWID tables must not restore rowid aliases on reopen"
+        );
+    }
+}
+
+// =========================================================================
 // 5B.5 – autocommit pager transaction wrapping tests (bd-14dj)
 // =========================================================================
 #[cfg(test)]
@@ -61633,6 +61884,132 @@ mod pager_routing_tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(persisted_rows, vec![(2, "beta".to_owned())]);
+    }
+
+    #[test]
+    fn test_prepare_insert_into_attached_schema_uses_deferred_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO aux.t (id, value) VALUES (?1, ?2)")
+            .unwrap();
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
+        assert!(
+            stmt.dispatch_precompiled_program().is_none(),
+            "attached-target INSERT should not reuse a main-schema compiled program"
+        );
+
+        conn.execute_prepared_with_params(
+            &stmt,
+            &[SqliteValue::Integer(1), SqliteValue::Text("aux".to_owned())],
+        )
+        .unwrap();
+
+        let main_rows = conn.query("SELECT id, value FROM t ORDER BY id;").unwrap();
+        assert!(main_rows.is_empty(), "main table should stay untouched");
+
+        let aux_rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
+        assert_eq!(aux_rows.len(), 1);
+        assert_eq!(aux_rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(aux_rows[0].values()[1], SqliteValue::Text("aux".to_owned()));
+    }
+
+    #[test]
+    fn test_prepare_update_against_attached_schema_uses_deferred_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("UPDATE aux.t SET value = ?1 WHERE id = ?2")
+            .unwrap();
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
+        assert!(
+            stmt.db.is_none(),
+            "attached-target UPDATE should skip main-schema precompilation"
+        );
+
+        let affected = conn
+            .execute_prepared_with_params(
+                &stmt,
+                &[
+                    SqliteValue::Text("beta".to_owned()),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let aux_rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
+        assert_eq!(aux_rows.len(), 1);
+        assert_eq!(aux_rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(
+            aux_rows[0].values()[1],
+            SqliteValue::Text("beta".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_prepare_delete_against_attached_schema_uses_deferred_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+
+        let stmt = conn.prepare("DELETE FROM aux.t WHERE id = ?1").unwrap();
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
+        assert!(
+            stmt.db.is_none(),
+            "attached-target DELETE should skip main-schema precompilation"
+        );
+
+        let affected = conn
+            .execute_prepared_with_params(&stmt, &[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let aux_rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
+        assert!(aux_rows.is_empty(), "attached row should be deleted");
     }
 
     // ── PRAGMA introspection tests ───────────────────────────────────────

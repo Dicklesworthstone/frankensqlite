@@ -180,6 +180,19 @@ pub fn resolve_single_table_result_columns(
     core: &SelectCore,
     table_columns: &[String],
 ) -> Result<Vec<ResultColumn>, SingleTableProjectionError> {
+    resolve_single_table_result_columns_with_options(core, table_columns, true)
+}
+
+/// Resolve result columns for a single-table SELECT with explicit control over
+/// whether hidden rowid aliases (`rowid`, `_rowid_`, `oid`) are available.
+///
+/// `WITHOUT ROWID` tables should pass `supports_hidden_rowid = false` so hidden
+/// aliases are rejected unless a visible column of the same name exists.
+pub fn resolve_single_table_result_columns_with_options(
+    core: &SelectCore,
+    table_columns: &[String],
+    supports_hidden_rowid: bool,
+) -> Result<Vec<ResultColumn>, SingleTableProjectionError> {
     let SelectCore::Select { columns, from, .. } = core else {
         return Err(SingleTableProjectionError::NotSelectCore);
     };
@@ -223,8 +236,8 @@ pub fn resolve_single_table_result_columns(
                         });
                     }
                 }
-                if !column_exists_ignore_case(table_columns, &col_ref.column)
-                    && !is_rowid_alias_name(&col_ref.column)
+                if !(column_exists_ignore_case(table_columns, &col_ref.column)
+                    || supports_hidden_rowid && is_rowid_alias_name(&col_ref.column))
                 {
                     return Err(SingleTableProjectionError::ColumnNotFound {
                         column: col_ref.column.clone(),
@@ -3845,6 +3858,56 @@ mod tests {
     }
 
     #[test]
+    fn test_single_table_projection_rejects_hidden_rowid_aliases_when_disabled() {
+        let core = select_core_single_table(
+            vec![
+                ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
+                    alias: None,
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        ColumnRef {
+                            table: Some("tt".to_owned()),
+                            column: "_rowid_".to_owned(),
+                        },
+                        Span::ZERO,
+                    ),
+                    alias: None,
+                },
+            ],
+            "t",
+            Some("tt"),
+        );
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let err = resolve_single_table_result_columns_with_options(&core, &table_columns, false)
+            .expect_err("WITHOUT ROWID tables should reject hidden rowid aliases");
+        assert_eq!(
+            err,
+            SingleTableProjectionError::ColumnNotFound {
+                column: "rowid".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn test_single_table_projection_still_accepts_visible_rowid_column_when_disabled() {
+        let core = select_core_single_table(
+            vec![ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
+                alias: None,
+            }],
+            "t",
+            None,
+        );
+        let table_columns = vec!["rowid".to_owned(), "payload".to_owned()];
+        let resolved =
+            resolve_single_table_result_columns_with_options(&core, &table_columns, false)
+                .expect("visible rowid-named columns should still resolve");
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
     fn test_compound_order_by_uses_first_alias() {
         // SELECT 1 AS a UNION SELECT 2 AS b ORDER BY a
         // → a is in the first SELECT at col 0
@@ -4648,8 +4711,8 @@ mod tests {
         let cost_if_only_last = 1.0_f64 // small full scan cost
             + 10.0 * 10.0 // medium scanned 10 times
             + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)
-        // The plan's total cost should be larger than this naive estimate
-        // because large is actually scanned 10*100=1000 times.
+                             // The plan's total cost should be larger than this naive estimate
+                             // because large is actually scanned 10*100=1000 times.
         assert!(
             plan_sml.total_cost > cost_if_only_last,
             "3-way join cost should scale by cumulative rows, not just last table: plan_cost={} bug_cost={}",
@@ -6900,7 +6963,7 @@ mod tests {
         assert_eq!(order.len(), 3);
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
-        // Small table should be chosen first (lower cost).
+                            // Small table should be chosen first (lower cost).
         assert_eq!(order[0], 0); // "x" has fewest pages.
     }
 

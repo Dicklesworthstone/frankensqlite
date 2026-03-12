@@ -15,30 +15,30 @@ use std::path::Path;
 
 use fsqlite_ast::{SortDirection, Statement};
 #[cfg(not(target_arch = "wasm32"))]
-use fsqlite_btree::BtreeCursorOps;
-#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::cursor::TransactionPageIo;
+#[cfg(not(target_arch = "wasm32"))]
+use fsqlite_btree::BtreeCursorOps;
 use fsqlite_error::{FrankenError, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_parser::Parser;
-use fsqlite_types::StrictColumnType;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::cx::Cx;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::record::{parse_record, serialize_record};
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::value::SqliteValue;
+use fsqlite_types::StrictColumnType;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
+#[cfg(not(target_arch = "wasm32"))]
+use fsqlite_vfs::host_fs;
 #[cfg(all(not(target_arch = "wasm32"), unix))]
 use fsqlite_vfs::UnixVfs as PlatformVfs;
 #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs as PlatformVfs;
-#[cfg(not(target_arch = "wasm32"))]
-use fsqlite_vfs::host_fs;
 
 /// SQLite file header magic bytes (first 16 bytes).
 #[cfg(not(target_arch = "wasm32"))]
@@ -392,7 +392,7 @@ fn init_leaf_table_page(
 ) -> Result<()> {
     let mut page = vec![0u8; page_size];
     page[0] = 0x0D; // Leaf table
-    // cell_count = 0 (bytes 3..5)
+                    // cell_count = 0 (bytes 3..5)
     page[3..5].copy_from_slice(&0u16.to_be_bytes());
     // cell content area starts at end of page
     #[allow(clippy::cast_possible_truncation)]
@@ -514,6 +514,7 @@ const fn affinity_char_to_type(affinity: char) -> &'static str {
 /// Used by `load_from_sqlite` and `reload_memdb_from_pager` (bd-1ene).
 pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
     let is_strict = is_strict_table_sql(sql);
+    let is_without_rowid = is_without_rowid_table_sql(sql);
     // Find the parenthesized column list.
     let Some(open) = sql.find('(') else {
         return Vec::new();
@@ -538,7 +539,8 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             let type_decl = extract_type_declaration(&tokens);
             let affinity = type_to_affinity(&type_decl);
             let upper = col_def.to_ascii_uppercase();
-            let is_ipk = upper.contains("PRIMARY KEY")
+            let is_ipk = !is_without_rowid
+                && upper.contains("PRIMARY KEY")
                 && !upper.contains("PRIMARY KEY DESC")
                 && type_decl.eq_ignore_ascii_case("INTEGER");
             let type_name = if type_decl.is_empty() {
@@ -622,6 +624,29 @@ fn is_virtual_table_sql(sql: &str) -> bool {
     sql.trim_start()
         .to_ascii_uppercase()
         .starts_with("CREATE VIRTUAL TABLE")
+}
+
+#[must_use]
+pub fn is_without_rowid_table_sql(sql: &str) -> bool {
+    let Some(close_paren) = sql.rfind(')') else {
+        return false;
+    };
+    let tail = &sql[close_paren + 1..];
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for ch in tail.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch.to_ascii_uppercase());
+        } else if !token.is_empty() {
+            tokens.push(std::mem::take(&mut token));
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+        .windows(2)
+        .any(|window| window[0] == "WITHOUT" && window[1] == "ROWID")
 }
 
 fn parse_virtual_table_columns_from_sql(sql: &str) -> Option<Vec<ColumnInfo>> {
@@ -1381,6 +1406,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_columns_from_create_sql_without_rowid_integer_pk_is_not_ipk() {
+        let sql = "CREATE TABLE wr (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert!(!cols[0].is_ipk);
+        assert!(cols[0].unique);
+        assert_eq!(cols[1].name, "body");
+    }
+
+    #[test]
     fn test_parse_columns_from_create_sql_keeps_quoted_keyword_column_name() {
         let sql = r#"CREATE TABLE t ("primary" TEXT, value INTEGER)"#;
         let cols = parse_columns_from_create_sql(sql);
@@ -1606,6 +1642,19 @@ mod tests {
         ));
         assert!(!is_strict_table_sql(
             "CREATE TABLE s (id INTEGER, body TEXT) WITHOUT ROWID"
+        ));
+    }
+
+    #[test]
+    fn test_is_without_rowid_table_sql_detects_option() {
+        assert!(is_without_rowid_table_sql(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID"
+        ));
+        assert!(is_without_rowid_table_sql(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID, STRICT;"
+        ));
+        assert!(!is_without_rowid_table_sql(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, body TEXT) STRICT"
         ));
     }
 
