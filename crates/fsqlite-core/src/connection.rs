@@ -8865,6 +8865,32 @@ impl Connection {
             txn
         };
 
+        let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+        if ok && !self.live_vtab_transactions.borrow().is_empty() {
+            if let Err(sync_error) = self.live_vtab_sync_all(&cx) {
+                if *self.concurrent_txn.borrow() {
+                    self.abort_current_concurrent_session();
+                }
+                self.txn_metrics_note_rollback();
+                let rollback_result = txn.rollback(&cx);
+                let rollback_succeeded = rollback_result.is_ok();
+                let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+                let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                *self.concurrent_txn.borrow_mut() = false;
+                *self.concurrent_session_id.borrow_mut() = None;
+                self.txn_metrics_mark_finished();
+                if txn_has_pending_writes && rollback_succeeded {
+                    self.reload_memdb_from_pager(&cx)?;
+                }
+                vtab_rollback_result?;
+                registry_rollback_result?;
+                return Err(match rollback_result {
+                    Ok(()) => sync_error,
+                    Err(rollback_error) => rollback_error,
+                });
+            }
+        }
+
         // bd-rjc fix: plan_concurrent_commit() must be called under
         // commit_write_mutex to prevent another connection from advancing
         // next_commit_seq between plan (which reads it) and finalize (which
@@ -8872,13 +8898,13 @@ impl Connection {
         // corrupting the MVCC commit index.
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
-            let pending_commit_pages = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
+            let is_concurrent_txn = *self.concurrent_txn.borrow();
+            let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
                 txn.pending_commit_pages()?
             } else {
                 Vec::new()
             };
-            let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
+            let concurrent_plan = if is_concurrent_txn && txn_has_pending_writes {
                 match self.plan_concurrent_commit(&pending_commit_pages) {
                     Ok(plan) => plan,
                     Err(e) => {
@@ -8908,34 +8934,6 @@ impl Connection {
             } else {
                 None
             };
-            if !self.live_vtab_transactions.borrow().is_empty() {
-                match self.live_vtab_sync_all(&cx) {
-                    Ok(()) => {}
-                    Err(sync_error) => {
-                        drop(_commit_guard);
-                        if *self.concurrent_txn.borrow() {
-                            self.abort_current_concurrent_session();
-                        }
-                        self.txn_metrics_note_rollback();
-                        let rollback_result = txn.rollback(&cx);
-                        let rollback_succeeded = rollback_result.is_ok();
-                        let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                        let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
-                        *self.concurrent_txn.borrow_mut() = false;
-                        *self.concurrent_session_id.borrow_mut() = None;
-                        self.txn_metrics_mark_finished();
-                        if txn_has_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(&cx)?;
-                        }
-                        vtab_rollback_result?;
-                        registry_rollback_result?;
-                        return Err(match rollback_result {
-                            Ok(()) => sync_error,
-                            Err(rollback_error) => rollback_error,
-                        });
-                    }
-                }
-            }
             match txn.commit(&cx) {
                 Ok(()) => {
                     if txn_has_pending_writes {
@@ -36339,6 +36337,8 @@ mod tests {
                  FROM issues NOT INDEXED
                  WHERE status NOT IN ('closed', 'tombstone')
                    AND ((is_template = 0) OR is_template IS NULL)
+                   AND status = 'open'
+                   AND is_template = 0
                  ORDER BY priority, created_at DESC",
             )
             .unwrap()
@@ -36715,6 +36715,58 @@ mod tests {
             assert_eq!(
                 indexed_count, fullscan_count,
                 "forced recipient-agent index lookup must match full scan for agent {agent_id}"
+            );
+
+            let indexed_message_ids = sqlite
+                .prepare(
+                    "SELECT message_id
+                     FROM message_recipients INDEXED BY idx_message_recipients_agent_message
+                     WHERE agent_id = ?1
+                     ORDER BY message_id",
+                )
+                .unwrap()
+                .query_map([agent_id], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let fullscan_message_ids = sqlite
+                .prepare(
+                    "SELECT message_id
+                     FROM message_recipients NOT INDEXED
+                     WHERE agent_id = ?1
+                     ORDER BY message_id",
+                )
+                .unwrap()
+                .query_map([agent_id], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                indexed_message_ids, fullscan_message_ids,
+                "forced recipient agent+message index lookup must match full scan for agent {agent_id}"
+            );
+
+            let indexed_ack_pending: i64 = sqlite
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM message_recipients INDEXED BY idx_mr_agent_ack
+                     WHERE agent_id = ?1 AND ack_ts IS NULL",
+                    [agent_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let fullscan_ack_pending: i64 = sqlite
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM message_recipients NOT INDEXED
+                     WHERE agent_id = ?1 AND ack_ts IS NULL",
+                    [agent_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                indexed_ack_pending, fullscan_ack_pending,
+                "forced recipient ack index lookup must match full scan for agent {agent_id}"
             );
         }
     }
@@ -42080,6 +42132,51 @@ mod tests {
         assert!(
             rows.is_empty(),
             "implicit transaction rollback must restore live VTAB state"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_autocommit_sync_failure_rolls_back_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_sync = true);
+
+        let err = conn
+            .execute("INSERT INTO vt(value) VALUES ('sync fail');")
+            .expect_err("autocommit VTAB sync failure should abort the implicit transaction");
+        assert!(
+            err.to_string().contains("virtual table VT sync failed")
+                || err.to_string().contains("virtual table vt sync failed"),
+            "unexpected autocommit error: {err}",
+        );
+        assert!(
+            !*conn.in_transaction.borrow(),
+            "sync failure should abort the implicit transaction"
+        );
+
+        let rows = conn.query("SELECT rowid, value FROM vt;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "implicit transaction rollback must restore live VTAB state after sync failure"
+        );
+
+        let hook_log = with_txn_test_vtab(&conn, "vt", |vtab| vtab.hook_log.clone());
+        assert!(
+            hook_log.contains(&"sync".to_owned()),
+            "expected sync hook before autocommit failure: {hook_log:?}"
+        );
+        assert!(
+            hook_log.contains(&"rollback".to_owned()),
+            "sync failure should roll back the live VTAB in autocommit: {hook_log:?}"
+        );
+        assert!(
+            !hook_log.contains(&"commit".to_owned()),
+            "failed autocommit must not finalize the live VTAB: {hook_log:?}"
         );
     }
 

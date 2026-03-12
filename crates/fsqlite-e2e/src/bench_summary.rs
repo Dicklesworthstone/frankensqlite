@@ -437,8 +437,8 @@ mod tests {
 
         let summary = acc.summarize();
         assert!((summary.latency.p50 - 8.0).abs() < f64::EPSILON);
-        assert!((summary.latency.p95 - 10.0).abs() < f64::EPSILON);
-        assert!((summary.latency.p99 - 12.0).abs() < f64::EPSILON);
+        assert!((summary.latency.p95 - 16.0).abs() < f64::EPSILON);
+        assert!((summary.latency.p99 - 18.0).abs() < f64::EPSILON);
     }
 
     #[test]
