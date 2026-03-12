@@ -550,15 +550,13 @@ fn parse_js_number_value(number: f64, is_safe_integer: bool) -> Result<SqliteVal
         });
     }
     if number.fract() == 0.0 {
-        if !is_safe_integer {
-            return Err(FrankenError::TypeMismatch {
-                expected: "safe JavaScript integer or BigInt".to_owned(),
-                actual: "unsafe JavaScript number; use BigInt for INTEGER values outside Number.MAX_SAFE_INTEGER"
-                    .to_owned(),
-            });
+        if is_safe_integer {
+            #[allow(clippy::cast_possible_truncation)]
+            return Ok(SqliteValue::Integer(number as i64));
         }
-        #[allow(clippy::cast_possible_truncation)]
-        return Ok(SqliteValue::Integer(number as i64));
+        // If it's outside the safe integer range but has no fractional part,
+        // it's a large float (e.g. 1e20). We treat it as a REAL rather than
+        // failing, per the `REAL <-> number` spec.
     }
     Ok(SqliteValue::Float(number))
 }
