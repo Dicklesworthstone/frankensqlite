@@ -16,6 +16,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/fsqlite-wasm/**"
+      - "scripts/build_fsqlite_wasm_package.sh"
+      - "LICENSE"
   release:
     types:
       - published
@@ -78,21 +80,19 @@ jobs:
           pkg_dir="${artifact_root}/pkg"
 
           mkdir -p "${artifact_root}"
+          ./scripts/build_fsqlite_wasm_package.sh "${pkg_dir}"
 
-          pushd crates/fsqlite-wasm >/dev/null
-          wasm-pack build --target bundler --release --out-dir "../../${pkg_dir}"
-          popd >/dev/null
-
-          pushd "${pkg_dir}" >/dev/null
-          wasm-pack pack .
-          popd >/dev/null
+          package_name="$(jq -r '.name' "${pkg_dir}/package.json")"
+          packed_file="$(find "${pkg_dir}" -maxdepth 1 -type f -name '*.tgz' -printf '%f\n' | sort | head -n 1)"
 
           {
             echo "# fsqlite-wasm package summary"
             echo
             echo "- cargo_package: \`fsqlite-wasm\`"
+            echo "- npm_package_name: \`${package_name}\`"
             echo "- npm_package_dir: \`${pkg_dir}\`"
-            echo "- build_target: \`bundler\`"
+            echo "- build_target: \`${FSQLITE_WASM_TARGET:-bundler}\`"
+            echo "- packed_archive: \`${packed_file}\`"
             echo
             echo "## Generated files"
             find "${artifact_root}" -maxdepth 2 -type f | sort | sed 's#^#- `#; s#$#`#'

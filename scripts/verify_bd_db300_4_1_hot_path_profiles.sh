@@ -53,6 +53,7 @@ HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
 HOT_PATH_OPCODE_PROFILE_SCHEMA="fsqlite-e2e.hot_path_opcode_profile.v1"
 HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA="fsqlite-e2e.hot_path_subsystem_profile.v1"
 HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v2"
+HOT_PATH_CAMPAIGN_RANKING_SCHEMA="fsqlite-e2e.hot_path_campaign_ranking.v2"
 HOT_PATH_INLINE_BUNDLE_SCHEMA="fsqlite-e2e.hot_path_inline_bundle.v1"
 HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
 
@@ -427,6 +428,49 @@ build_actionable_ranking() {
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
         '
+        def confidence_fields($entries; $expected_runs; $expected_modes; $expected_fixtures):
+            ($entries | length) as $evidence_runs
+            | ($entries | map(.mode_id) | unique | length) as $mode_coverage_count
+            | ($entries | map(.fixture_id) | unique | length) as $fixture_coverage_count
+            | ($entries | map(.rank) | min) as $rank_min
+            | ($entries | map(.rank) | max) as $rank_max
+            | (if $rank_max > 1
+               then (1.0 - (($rank_max - $rank_min) / ($rank_max - 1)))
+               else 1.0
+               end) as $rank_stability
+            | (
+                10000
+                * (
+                    0.45 * ($evidence_runs / $expected_runs)
+                    + 0.20 * ($mode_coverage_count / $expected_modes)
+                    + 0.20 * ($fixture_coverage_count / $expected_fixtures)
+                    + 0.15 * $rank_stability
+                )
+                | round
+              ) as $confidence_score_basis_points
+            | {
+                confidence_score_basis_points: $confidence_score_basis_points,
+                confidence_label: (
+                    if $confidence_score_basis_points >= 8500 then "high"
+                    elif $confidence_score_basis_points >= 6500 then "medium"
+                    else "low"
+                    end
+                ),
+                confidence_rationale: (
+                    "observed in \($evidence_runs)/\($expected_runs) runs across "
+                    + "\($mode_coverage_count)/\($expected_modes) modes and "
+                    + "\($fixture_coverage_count)/\($expected_fixtures) fixtures; "
+                    + "rank spread \($rank_min)-\($rank_max)"
+                ),
+                evidence_runs: $evidence_runs,
+                expected_runs: $expected_runs,
+                mode_coverage_count: $mode_coverage_count,
+                expected_mode_count: $expected_modes,
+                fixture_coverage_count: $fixture_coverage_count,
+                expected_fixture_count: $expected_fixtures,
+                rank_min: $rank_min,
+                rank_max: $rank_max
+            };
         def named_entries:
             [ .[] as $run
               | $run.actionable_ranking.named_hotspots[]
@@ -463,8 +507,12 @@ build_actionable_ranking() {
                     scenario_id: $run.scenario_id
                 }
             ];
+        (length | if . > 0 then . else 1 end) as $expected_runs
+        | ((map(.mode_id) | unique | length) | if . > 0 then . else 1 end) as $expected_modes
+        | ((map(.fixture_id) | unique | length) | if . > 0 then . else 1 end) as $expected_fixtures
+        |
         {
-            schema_version: "fsqlite-e2e.hot_path_campaign_ranking.v1",
+            schema_version: "fsqlite-e2e.hot_path_campaign_ranking.v2",
             bead_id: $bead_id,
             run_id: $run_id,
             generated_at: $generated_at,
@@ -492,7 +540,7 @@ build_actionable_ranking() {
                         | sort_by(.metric_value)
                         | reverse
                     )
-                })
+                } + confidence_fields(.; $expected_runs; $expected_modes; $expected_fixtures))
                 | sort_by(.avg_metric_value)
                 | reverse
                 | to_entries
@@ -521,7 +569,7 @@ build_actionable_ranking() {
                         | sort_by(.metric_value)
                         | reverse
                     )
-                })
+                } + confidence_fields(.; $expected_runs; $expected_modes; $expected_fixtures))
                 | sort_by(.avg_metric_value)
                 | reverse
                 | to_entries
@@ -559,7 +607,7 @@ build_actionable_ranking() {
                         | sort_by([.time_ns, .allocator_pressure_bytes])
                         | reverse
                     )
-                })
+                } + confidence_fields(.; $expected_runs; $expected_modes; $expected_fixtures))
                 | sort_by([.avg_time_ns, .avg_allocator_pressure_bytes])
                 | reverse
                 | to_entries
@@ -616,7 +664,7 @@ build_summary_md() {
     hotspot_summary="$(jq -r '
         .named_hotspots[:5]
         | map(
-            "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) -> \(.run_breakdown[0].implication)"
+            "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) confidence=\(.confidence_label) (\(.confidence_score_basis_points)bp) -> \(.run_breakdown[0].implication)"
           )
         | .[]
     ' "${ACTIONABLE_RANKING_JSON}")"
@@ -625,7 +673,7 @@ build_summary_md() {
     allocator_summary="$(jq -r '
         .allocator_pressure[:3]
         | map(
-            "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) -> \(.run_breakdown[0].implication)"
+            "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) confidence=\(.confidence_label) (\(.confidence_score_basis_points)bp) -> \(.run_breakdown[0].implication)"
           )
         | .[]
     ' "${ACTIONABLE_RANKING_JSON}")"
@@ -634,7 +682,7 @@ build_summary_md() {
     cost_component_summary="$(jq -r '
         .cost_components[:3]
         | map(
-            "- rank \(.rank): `\(.component)` avg_time_ns=\(.avg_time_ns) avg_time_share_bps=\(.avg_time_share_basis_points) avg_allocator_pressure_bytes=\(.avg_allocator_pressure_bytes) avg_allocator_share_bps=\(.avg_allocator_share_basis_points) max_activity_count=\(.max_activity_count) -> \(.run_breakdown[0].implication)"
+            "- rank \(.rank): `\(.component)` avg_time_ns=\(.avg_time_ns) avg_time_share_bps=\(.avg_time_share_basis_points) avg_allocator_pressure_bytes=\(.avg_allocator_pressure_bytes) avg_allocator_share_bps=\(.avg_allocator_share_basis_points) max_activity_count=\(.max_activity_count) confidence=\(.confidence_label) (\(.confidence_score_basis_points)bp) -> \(.run_breakdown[0].implication)"
           )
         | .[]
     ' "${ACTIONABLE_RANKING_JSON}")"
@@ -708,7 +756,7 @@ build_report_json() {
         --arg subsystem_profile_packs "${SUBSYSTEM_PROFILE_PACKS_JSON}" \
         --arg scenario_profiles "${SCENARIO_PROFILES_JSON}" \
         --arg actionable_ranking "${ACTIONABLE_RANKING_JSON}" \
-        --arg benchmark_context "${BENCHMARK_CONTEXT_JSON}" \
+        --arg benchmark_context_path "${BENCHMARK_CONTEXT_JSON}" \
         --arg summary_md "${SUMMARY_MD}" \
         --arg report_json "${REPORT_JSON}" \
         --arg workload "${WORKLOAD_ID}" \
@@ -719,7 +767,7 @@ build_report_json() {
         --argjson seed "${SEED}" \
         --argjson scale "${SCALE}" \
         --argjson expected_runs "${expected_runs}" \
-        --slurpfile benchmark_context "${BENCHMARK_CONTEXT_JSON}" \
+        --slurpfile benchmark_context_doc "${BENCHMARK_CONTEXT_JSON}" \
         '
         {
             schema_version: $schema_version,
@@ -737,7 +785,7 @@ build_report_json() {
             fixture_ids: ($fixture_ids_csv | split(",") | map(select(length > 0))),
             mode_ids: ($mode_ids_csv | split(",") | map(select(length > 0))),
             expected_runs: $expected_runs,
-            completed_runs: ($benchmark_context[0].completed_runs // null),
+            completed_runs: ($benchmark_context_doc[0].completed_runs // null),
             replay: {
                 command: $replay_command
             },
@@ -748,7 +796,7 @@ build_report_json() {
                 subsystem_profile_packs: $subsystem_profile_packs,
                 scenario_profiles: $scenario_profiles,
                 actionable_ranking: $actionable_ranking,
-                benchmark_context: $benchmark_context,
+                benchmark_context: $benchmark_context_path,
                 summary_md: $summary_md,
                 report_json: $report_json
             },
@@ -795,6 +843,7 @@ build_opcode_profile_packs
 build_subsystem_profile_packs
 build_benchmark_context
 build_actionable_ranking
+require_json_schema "${ACTIONABLE_RANKING_JSON}" "${HOT_PATH_CAMPAIGN_RANKING_SCHEMA}"
 build_summary_md
 build_report_json
 
@@ -802,6 +851,9 @@ jq -e '.runs | length >= 1' "${SCENARIO_PROFILES_JSON}" >/dev/null
 jq -e '.named_hotspots | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.cost_components | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.allocator_pressure | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.named_hotspots | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.cost_components | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.allocator_pressure | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.runs | length == '"${expected_runs}" "${BENCHMARK_CONTEXT_JSON}" >/dev/null
 
 log_event "INFO" "complete" "inline D1 hot-path campaign completed"

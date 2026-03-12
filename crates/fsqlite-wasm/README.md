@@ -27,7 +27,9 @@ The helper script:
 - runs `wasm-pack build`
 - normalizes the generated `package.json` to the `@frankensqlite/core` package name
 - copies README/license files into the output package
+- validates the generated `.wasm`, `.js`, and `.d.ts` artifacts exist
 - runs `npm pack` so the result is ready for registry or local install testing
+- enforces a packed tarball size budget of 2 MiB by default (`FSQLITE_WASM_MAX_PACKED_BYTES=0` disables the guard)
 
 ## Expected Package Contents
 
