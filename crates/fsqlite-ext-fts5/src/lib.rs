@@ -1810,6 +1810,8 @@ impl VirtualTable for Fts5Table {
             results: Vec::new(),
             position: 0,
             columns: self.columns.clone(),
+            index: self.index.clone(),
+            documents: self.documents.clone(),
         })
     }
 
@@ -1912,6 +1914,10 @@ pub struct Fts5Cursor {
     position: usize,
     /// Column names.
     columns: Vec<String>,
+    /// Snapshot of the inverted index at cursor-open time.
+    index: InvertedIndex,
+    /// Snapshot of stored documents at cursor-open time.
+    documents: HashMap<i64, Vec<String>>,
 }
 
 impl VirtualTableCursor for Fts5Cursor {
@@ -1928,12 +1934,55 @@ impl VirtualTableCursor for Fts5Cursor {
         if idx_num == 1 {
             // MATCH query: args[0] is the query string.
             if let Some(query_val) = args.first() {
-                let _query = query_val.to_text();
-                // Results populated by the table during filter setup.
-                // In a real implementation, the cursor would reference the
-                // table's index. For our implementation, results are set
-                // externally via `set_results`.
+                let query = query_val.to_text();
+
+                // Parse the query into tokens, build an expression tree,
+                // evaluate against the inverted index, and score with BM25.
+                let tokens = parse_fts5_query(&query).map_err(|e| {
+                    FrankenError::function_error(format!("fts5 query error: {e}"))
+                })?;
+                let expr = build_expr(&tokens).map_err(|e| {
+                    FrankenError::function_error(format!("fts5 query error: {e}"))
+                })?;
+                validate_column_filters(&expr, &self.columns).map_err(|e| {
+                    FrankenError::function_error(format!("fts5 query error: {e}"))
+                })?;
+
+                let matching_docs =
+                    evaluate_expr_for_columns(&self.index, &expr, &self.columns);
+
+                // Extract query terms for BM25 scoring.
+                let query_terms = extract_query_terms(&expr);
+                let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
+
+                self.results = matching_docs
+                    .into_iter()
+                    .map(|docid| {
+                        let score =
+                            bm25_score(&self.index, docid, &query_terms, &weights);
+                        let columns = self
+                            .documents
+                            .get(&docid)
+                            .cloned()
+                            .unwrap_or_default();
+                        (docid, score, columns)
+                    })
+                    .collect();
+
+                // Sort by score (lower = better in FTS5 convention).
+                self.results.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
+        } else {
+            // Full table scan (idx_num == 0): return all documents.
+            let mut rows: Vec<(i64, f64, Vec<String>)> = self
+                .documents
+                .iter()
+                .map(|(rowid, cols)| (*rowid, 0.0, cols.clone()))
+                .collect();
+            rows.sort_by_key(|(rowid, _, _)| *rowid);
+            self.results = rows;
         }
 
         Ok(())
@@ -3606,6 +3655,8 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            index: InvertedIndex::new(),
+            documents: HashMap::new(),
         };
 
         assert!(cursor.eof());
@@ -3634,6 +3685,8 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            index: InvertedIndex::new(),
+            documents: HashMap::new(),
         };
 
         cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
