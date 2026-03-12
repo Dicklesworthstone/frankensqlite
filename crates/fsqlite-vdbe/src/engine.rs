@@ -48,13 +48,13 @@ const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 256;
 
 #[inline]
 fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
-    cx.checkpoint().map_err(|_| FrankenError::Interrupt)
+    cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
 #[inline]
 fn vtab_exec_outcome(opcode: &str, err: FrankenError) -> Result<ExecOutcome> {
-    if matches!(err, FrankenError::Interrupt) {
-        return Err(FrankenError::Interrupt);
+    if matches!(err, FrankenError::Abort) {
+        return Err(FrankenError::Abort);
     }
     Ok(ExecOutcome::Error {
         code: 1,
@@ -8980,7 +8980,7 @@ mod tests {
         let mut engine =
             VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
         let err = engine.execute(&program).unwrap_err();
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(
             engine.results().is_empty(),
             "cancelled execute should not emit rows"
@@ -9119,7 +9119,7 @@ mod tests {
             .execute(&program)
             .expect_err("cancelled execution context should abort before opcode dispatch");
 
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
     }
 
     #[test]
@@ -9153,7 +9153,7 @@ mod tests {
         let err = engine
             .execute(&program)
             .expect_err("cancellation should be observed before dispatch continues");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(engine.results().is_empty());
     }
 
@@ -15043,7 +15043,7 @@ mod tests {
             _args: &[SqliteValue],
         ) -> Result<()> {
             if self.interrupt_on_filter {
-                return Err(FrankenError::Interrupt);
+                return Err(FrankenError::Abort);
             }
             if self.cancel_on_filter {
                 cx.cancel();
@@ -15128,7 +15128,7 @@ mod tests {
 
         fn begin(&mut self, cx: &Cx) -> Result<()> {
             if self.interrupt_on_begin {
-                return Err(FrankenError::Interrupt);
+                return Err(FrankenError::Abort);
             }
             if self.cancel_on_begin {
                 cx.cancel();
@@ -15321,7 +15321,7 @@ mod tests {
         let err = engine
             .execute(&prog)
             .expect_err("cancellation should be observed before VFilter advances execution");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(engine.take_results().is_empty());
     }
 
@@ -15354,7 +15354,7 @@ mod tests {
         let err = engine
             .execute(&prog)
             .expect_err("VFilter interrupt should propagate without being wrapped");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(engine.take_results().is_empty());
     }
 
@@ -15447,7 +15447,7 @@ mod tests {
         let err = engine
             .execute(&prog)
             .expect_err("VBegin child cancellation should abort execution immediately");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(engine.take_results().is_empty());
     }
 
@@ -15474,7 +15474,7 @@ mod tests {
         let err = engine
             .execute(&prog)
             .expect_err("VBegin interrupt should propagate without being wrapped");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(engine.take_results().is_empty());
     }
 
@@ -15537,7 +15537,7 @@ mod tests {
         let err = engine
             .execute(&prog)
             .expect_err("cancellation should be observed before VColumn publishes a value");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(engine.take_results().is_empty());
     }
 

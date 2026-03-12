@@ -35,7 +35,7 @@ use tracing::{Level, debug, trace, warn};
 
 #[inline]
 fn observe_cursor_cancellation(cx: &Cx) -> Result<()> {
-    cx.checkpoint().map_err(|_| FrankenError::Interrupt)
+    cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
 // ---------------------------------------------------------------------------
@@ -3101,7 +3101,7 @@ mod tests {
             .first(&cx)
             .expect_err("cancelled context should abort before leaf descent");
 
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
     }
 
     #[test]
@@ -3118,7 +3118,7 @@ mod tests {
             .table_move_to(&cx, 5)
             .expect_err("binary search should observe cancellation after page load");
 
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
     }
 
     #[test]
@@ -3134,7 +3134,7 @@ mod tests {
             .index_move_to(&cx, b"bravo")
             .expect_err("index binary search should observe cancellation after page load");
 
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
     }
 
     #[test]
@@ -3189,7 +3189,7 @@ mod tests {
         let err = cursor
             .table_move_to(&cancelled_cx, 10)
             .expect_err("cancellation should interrupt the in-node search loop");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
 
         let recovery_cx = Cx::new();
         assert!(cursor.table_move_to(&recovery_cx, 10).unwrap().is_found());
@@ -3214,7 +3214,7 @@ mod tests {
         let err = cursor
             .first(&cancelled_cx)
             .expect_err("cancellation should interrupt multi-page descent");
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
 
         let recovery_cx = Cx::new();
         assert!(cursor.first(&recovery_cx).unwrap());
@@ -5024,7 +5024,7 @@ mod tests {
         cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
 
         let err = cursor.table_move_to(&cx, 2).unwrap_err();
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert!(
             cursor.stack.is_empty(),
             "cancelled seek should not mutate stack"
@@ -5047,7 +5047,7 @@ mod tests {
         cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
 
         let err = cursor.next(&cx).unwrap_err();
-        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(matches!(err, FrankenError::Abort));
         assert_eq!(
             cursor.rowid(&Cx::new()).unwrap(),
             1,

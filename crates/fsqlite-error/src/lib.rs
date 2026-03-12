@@ -576,7 +576,7 @@ mod tests {
             ErrorCode::Error
         );
         assert_eq!(FrankenError::Busy.error_code(), ErrorCode::Busy);
-        assert_eq!(FrankenError::Interrupt.error_code(), ErrorCode::Interrupt);
+        assert_eq!(FrankenError::Abort.error_code(), ErrorCode::Abort);
         assert_eq!(
             FrankenError::DatabaseCorrupt {
                 detail: String::new()
