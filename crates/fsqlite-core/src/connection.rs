@@ -4432,8 +4432,17 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &insert_event,
                 );
+                let mut live_insert_rows = if is_live_vtab {
+                    Some(self.collect_live_vtab_insert_rows(insert, params)?)
+                } else {
+                    None
+                };
                 let mut trigger_new_rows = if has_before_insert || has_after_insert {
-                    self.collect_insert_trigger_rows(insert, params)?
+                    if let Some(rows) = live_insert_rows.as_ref() {
+                        rows.iter().map(|row| row.values.clone()).collect()
+                    } else {
+                        self.collect_insert_trigger_rows(insert, params)?
+                    }
                 } else {
                     Vec::new()
                 };
@@ -4463,31 +4472,40 @@ impl Connection {
                 }
 
                 if is_live_vtab {
-                    let mut inserted_rows = if has_before_insert || has_after_insert {
-                        trigger_new_rows.clone()
-                    } else {
-                        self.collect_insert_trigger_rows(insert, params)?
+                    let mut live_insert_rows = live_insert_rows
+                        .take()
+                        .unwrap_or_else(Vec::new);
+                    let patch_first_column_with_rowid = {
+                        let key = table_name.to_ascii_uppercase();
+                        self.vtab_instances
+                            .borrow()
+                            .get(&key)
+                            .is_some_and(|instance| instance.as_any().is::<RtreeVirtualTable>())
                     };
                     let inserted_rowids =
-                        self.execute_live_vtab_insert_rows(table_name, &inserted_rows)?;
+                        self.execute_live_vtab_insert_rows(table_name, &live_insert_rows)?;
 
                     if has_after_insert {
-                        for (row, rowid) in inserted_rows.iter_mut().zip(inserted_rowids.iter()) {
-                            if row.first().is_some_and(|value| value.is_null()) {
-                                row[0] = SqliteValue::Integer(*rowid);
+                        if patch_first_column_with_rowid {
+                            for (row, rowid) in
+                                live_insert_rows.iter_mut().zip(inserted_rowids.iter())
+                            {
+                                if row.values.first().is_some_and(|value| value.is_null()) {
+                                    row.values[0] = SqliteValue::Integer(*rowid);
+                                }
                             }
                         }
-                        for new_values in &inserted_rows {
+                        for row in &live_insert_rows {
                             self.fire_after_triggers(
                                 table_name,
                                 &insert_event,
                                 None,
-                                Some(new_values),
+                                Some(&row.values),
                             )?;
                         }
                     }
 
-                    self.record_statement_changes(inserted_rows.len());
+                    self.record_statement_changes(live_insert_rows.len());
                     return Ok(Vec::new());
                 }
 
@@ -6427,10 +6445,122 @@ impl Connection {
             .unwrap_or_default())
     }
 
+    fn collect_live_vtab_insert_rows(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<LiveVtabInsertRow>> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|tbl| tbl.name.eq_ignore_ascii_case(&insert.table.name))
+            .ok_or_else(|| {
+                FrankenError::Internal(format!("table not found: {}", insert.table.name))
+            })?
+            .clone();
+        drop(schema);
+
+        let table_columns: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        let default_sqls = self.collect_insert_default_sqls(&insert.table.name)?;
+        if default_sqls.len() != table_columns.len() {
+            return Err(FrankenError::Internal(format!(
+                "live virtual-table INSERT default row width {} does not match table width {}",
+                default_sqls.len(),
+                table_columns.len()
+            )));
+        }
+
+        let source_targets = if insert.columns.is_empty() {
+            (0..table_columns.len()).map(Some).collect::<Vec<_>>()
+        } else {
+            let mut hidden_rowid_seen = false;
+            let mut targets = Vec::with_capacity(insert.columns.len());
+            for column in &insert.columns {
+                if let Some(idx) = table.column_index(column) {
+                    targets.push(Some(idx));
+                    continue;
+                }
+                if is_rowid_alias(column) {
+                    if hidden_rowid_seen {
+                        return Err(FrankenError::Internal(format!(
+                            "column '{column}' specified multiple hidden rowid aliases for table '{}'",
+                            insert.table.name
+                        )));
+                    }
+                    hidden_rowid_seen = true;
+                    targets.push(None);
+                    continue;
+                }
+                return Err(FrankenError::Internal(format!(
+                    "column '{column}' not found in table '{}'",
+                    insert.table.name
+                )));
+            }
+            targets
+        };
+
+        let build_row = |source_values: &[SqliteValue], context: &str| -> Result<LiveVtabInsertRow> {
+            if source_values.len() != source_targets.len() {
+                return Err(FrankenError::Internal(format!(
+                    "{context}: column count mismatch (source has {}, target expects {})",
+                    source_values.len(),
+                    source_targets.len()
+                )));
+            }
+
+            let mut row = self.evaluate_default_row_from_sqls(&default_sqls)?;
+            let mut explicit_rowid = None;
+            for (source_idx, target_idx) in source_targets.iter().copied().enumerate() {
+                if let Some(target_idx) = target_idx {
+                    row[target_idx] = source_values[source_idx].clone();
+                } else {
+                    explicit_rowid = Some(source_values[source_idx].clone());
+                }
+            }
+
+            Ok(LiveVtabInsertRow {
+                explicit_rowid,
+                values: row,
+            })
+        };
+
+        match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => rows
+                .iter()
+                .enumerate()
+                .map(|(row_idx, row_exprs)| {
+                    let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
+                    build_row(
+                        &source_values,
+                        &format!("live virtual-table INSERT VALUES row {}", row_idx + 1),
+                    )
+                })
+                .collect(),
+            fsqlite_ast::InsertSource::Select(select) => {
+                let source_rows =
+                    self.execute_statement(&Statement::Select(*select.clone()), params)?;
+                source_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(row_idx, row)| {
+                        build_row(
+                            row.values(),
+                            &format!("live virtual-table INSERT SELECT row {}", row_idx + 1),
+                        )
+                    })
+                    .collect()
+            }
+            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![build_row(
+                &[],
+                "live virtual-table INSERT DEFAULT VALUES",
+            )?]),
+        }
+    }
+
     fn execute_live_vtab_insert_rows(
         &self,
         table_name: &str,
-        rows: &[Vec<SqliteValue>],
+        rows: &[LiveVtabInsertRow],
     ) -> Result<Vec<i64>> {
         let cx = self.op_cx()?;
         let key = table_name.to_ascii_uppercase();
@@ -6441,15 +6571,18 @@ impl Connection {
 
         let mut inserted_rowids = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut args = Vec::with_capacity(row.len() + 2);
+            let mut args = Vec::with_capacity(row.values.len() + 2);
             args.push(SqliteValue::Null);
             let new_rowid = if instance.as_any().is::<RtreeVirtualTable>() {
-                row.first().cloned().unwrap_or(SqliteValue::Null)
+                row.explicit_rowid
+                    .clone()
+                    .or_else(|| row.values.first().cloned())
+                    .unwrap_or(SqliteValue::Null)
             } else {
-                SqliteValue::Null
+                row.explicit_rowid.clone().unwrap_or(SqliteValue::Null)
             };
             args.push(new_rowid);
-            args.extend(row.iter().cloned());
+            args.extend(row.values.iter().cloned());
             let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
                 FrankenError::Internal(format!(
                     "virtual table {table_name} did not return a rowid for INSERT",
@@ -8900,6 +9033,7 @@ impl Connection {
                             root_page: idx_root,
                             columns: vec![col.name.clone()],
                             key_expressions: vec![col.name.clone()],
+                            key_sort_directions: vec![SortDirection::Asc],
                             where_clause: None,
                             is_unique: true,
                         });
@@ -8939,6 +9073,12 @@ impl Connection {
                                     key_expressions: idx_cols
                                         .iter()
                                         .map(|indexed| indexed.expr.to_string())
+                                        .collect(),
+                                    key_sort_directions: idx_cols
+                                        .iter()
+                                        .map(|indexed| {
+                                            indexed.direction.unwrap_or(SortDirection::Asc)
+                                        })
                                         .collect(),
                                     where_clause: None,
                                     is_unique: true,
@@ -10065,6 +10205,10 @@ impl Connection {
                     .columns
                     .iter()
                     .map(|indexed| indexed.expr.to_string())
+                    .collect(),
+                key_sort_directions: indexed_terms
+                    .iter()
+                    .map(|term| term.direction.unwrap_or(SortDirection::Asc))
                     .collect(),
                 where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
                 root_page,
@@ -22904,6 +23048,7 @@ struct NormalizedIndexedColumnTerm {
 struct ReconstructedIndexDefinition {
     columns: Vec<String>,
     key_expressions: Vec<String>,
+    key_sort_directions: Vec<SortDirection>,
     where_clause: Option<String>,
     is_unique: bool,
 }
@@ -23012,6 +23157,7 @@ fn implicit_index_definitions_from_create_table_sql(
             definitions.push(ReconstructedIndexDefinition {
                 columns: vec![column.name.clone()],
                 key_expressions: vec![column.name.clone()],
+                key_sort_directions: vec![SortDirection::Asc],
                 where_clause: None,
                 is_unique: true,
             });
@@ -23034,6 +23180,10 @@ fn implicit_index_definitions_from_create_table_sql(
                 definitions.push(ReconstructedIndexDefinition {
                     columns: extract_simple_index_columns(&idx_cols),
                     key_expressions,
+                    key_sort_directions: idx_cols
+                        .iter()
+                        .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+                        .collect(),
                     where_clause: None,
                     is_unique: true,
                 });
@@ -23058,6 +23208,11 @@ fn index_definition_from_create_index_statement(
     Some(ReconstructedIndexDefinition {
         columns: extract_simple_index_columns(&stmt.columns),
         key_expressions,
+        key_sort_directions: stmt
+            .columns
+            .iter()
+            .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+            .collect(),
         where_clause: stmt.where_clause.as_ref().map(ToString::to_string),
         is_unique: stmt.unique,
     })
@@ -28080,6 +28235,12 @@ struct LiveVtabScanPlan {
     residual_where: Option<Expr>,
 }
 
+#[derive(Debug, Clone)]
+struct LiveVtabInsertRow {
+    explicit_rowid: Option<SqliteValue>,
+    values: Vec<SqliteValue>,
+}
+
 /// Perform a single join step: combine left-side rows with right-side rows.
 #[allow(clippy::too_many_lines)]
 fn execute_single_join(
@@ -32085,6 +32246,65 @@ mod tests {
         assert_eq!(
             table.indexes[0].columns,
             vec!["name".to_string(), "created_ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_desc_partial_index_stays_sqlite_compatible_after_issue_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("desc_partial_index_issue_updates.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                is_template INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_issues_list_active_order
+             ON issues(priority, created_at DESC)
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND ((is_template = 0) OR is_template IS NULL);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO issues(id, priority, created_at, status, is_template)
+             VALUES
+                ('a', 1, '2026-03-11 10:00:00', 'open', 0),
+                ('b', 1, '2026-03-11 11:00:00', 'open', NULL),
+                ('c', 2, '2026-03-11 12:00:00', 'closed', 0);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE issues
+             SET status = 'open', created_at = '2026-03-11 13:00:00'
+             WHERE id = 'c';",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE issues
+             SET status = 'closed'
+             WHERE id = 'a';",
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "descending partial index maintenance should stay SQLite-compatible"
         );
     }
 
@@ -36224,6 +36444,30 @@ mod tests {
             docs.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
+                SqliteValue::Text("Hello".to_owned()),
+                SqliteValue::Text("Rust world".to_owned()),
+            ]],
+        );
+    }
+
+    #[test]
+    fn test_fts5_live_vtab_insert_select_with_explicit_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO docs(rowid, subject, body) SELECT 7, 'Hello', 'Rust world';",
+        )
+        .unwrap();
+
+        let docs = conn
+            .query("SELECT rowid, subject, body FROM docs ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            docs.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(7),
                 SqliteValue::Text("Hello".to_owned()),
                 SqliteValue::Text("Rust world".to_owned()),
             ]],
