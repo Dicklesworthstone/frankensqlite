@@ -285,6 +285,11 @@ pub struct BtCursor<P> {
     usable_size: u32,
     /// Whether this is a table (intkey) or index (blobkey) B-tree.
     is_table: bool,
+    /// Per-key descending flags for index cursors.
+    ///
+    /// The implicit trailing rowid suffix always sorts ascending, so this
+    /// vector covers only the logical key terms before the rowid.
+    index_desc_flags: Vec<bool>,
     /// Page stack from root to current leaf.
     stack: Vec<StackEntry>,
     /// Whether the cursor is at EOF (past the last entry).
@@ -328,11 +333,24 @@ impl<P: PageReader> BtCursor<P> {
     /// Create a new cursor positioned before the first entry (at EOF).
     #[must_use]
     pub fn new(pager: P, root_page: PageNumber, usable_size: u32, is_table: bool) -> Self {
+        Self::new_with_index_desc(pager, root_page, usable_size, is_table, Vec::new())
+    }
+
+    /// Create a new cursor with explicit descending metadata for index keys.
+    #[must_use]
+    pub fn new_with_index_desc(
+        pager: P,
+        root_page: PageNumber,
+        usable_size: u32,
+        is_table: bool,
+        index_desc_flags: Vec<bool>,
+    ) -> Self {
         Self {
             pager,
             root_page,
             usable_size,
             is_table,
+            index_desc_flags,
             stack: Vec::with_capacity(BTREE_MAX_DEPTH as usize),
             at_eof: true,
             read_witnesses: Vec::new(),
@@ -1092,13 +1110,7 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-
-            let ord = match (parse_record(&key), &parsed_target) {
-                (Some(k_vals), Some(t_vals)) => k_vals
-                    .partial_cmp(t_vals)
-                    .unwrap_or_else(|| key.as_slice().cmp(target)),
-                _ => key.as_slice().cmp(target),
-            };
+            let ord = self.compare_index_key_bytes(&key, target, &parsed_target);
 
             match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
@@ -1130,13 +1142,7 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-
-            let ord = match (parse_record(&key), &parsed_target) {
-                (Some(k_vals), Some(t_vals)) => k_vals
-                    .partial_cmp(t_vals)
-                    .unwrap_or_else(|| key.as_slice().cmp(target)),
-                _ => key.as_slice().cmp(target),
-            };
+            let ord = self.compare_index_key_bytes(&key, target, &parsed_target);
 
             // Note: target vs key comparison direction
             match ord {
@@ -1146,6 +1152,38 @@ impl<P: PageReader> BtCursor<P> {
             }
         }
         Ok(BinarySearchResult::NotFound(lo))
+    }
+
+    fn compare_index_key_bytes(
+        &self,
+        lhs_bytes: &[u8],
+        rhs_bytes: &[u8],
+        parsed_rhs: &Option<Vec<fsqlite_types::SqliteValue>>,
+    ) -> std::cmp::Ordering {
+        match (parse_record(lhs_bytes), parsed_rhs) {
+            (Some(lhs_vals), Some(rhs_vals)) => self
+                .compare_index_key_values(&lhs_vals, rhs_vals)
+                .unwrap_or_else(|| lhs_bytes.cmp(rhs_bytes)),
+            _ => lhs_bytes.cmp(rhs_bytes),
+        }
+    }
+
+    fn compare_index_key_values(
+        &self,
+        lhs: &[fsqlite_types::SqliteValue],
+        rhs: &[fsqlite_types::SqliteValue],
+    ) -> Option<std::cmp::Ordering> {
+        let shared_len = lhs.len().min(rhs.len());
+        for idx in 0..shared_len {
+            let mut ord = lhs[idx].partial_cmp(&rhs[idx])?;
+            if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return Some(ord);
+            }
+        }
+        Some(lhs.len().cmp(&rhs.len()))
     }
 
     /// Advance to the next entry. Returns false if at EOF.

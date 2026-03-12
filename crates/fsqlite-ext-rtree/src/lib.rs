@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::vtab::{
-    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexInfo, VirtualTable, VirtualTableCursor,
-    VtabModuleFactory,
+    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexInfo, TransactionalVtabState,
+    VirtualTable, VirtualTableCursor, VtabModuleFactory,
 };
 use fsqlite_func::{FunctionRegistry, ScalarFunction};
 use fsqlite_types::{SqliteValue, cx::Cx};
@@ -491,6 +491,12 @@ fn parse_coordinate_value(value: &SqliteValue, coord_type: RtreeCoordType) -> Re
 #[derive(Debug, Clone)]
 pub struct RtreeVirtualTable {
     index: RtreeIndex,
+    txn_state: TransactionalVtabState<RtreeVirtualTableSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct RtreeVirtualTableSnapshot {
+    index: RtreeIndex,
 }
 
 impl RtreeVirtualTable {
@@ -501,7 +507,18 @@ impl RtreeVirtualTable {
         })?;
         Ok(Self {
             index: RtreeIndex::new(config),
+            txn_state: TransactionalVtabState::default(),
         })
+    }
+
+    fn snapshot_state(&self) -> RtreeVirtualTableSnapshot {
+        RtreeVirtualTableSnapshot {
+            index: self.index.clone(),
+        }
+    }
+
+    fn restore_state(&mut self, snapshot: RtreeVirtualTableSnapshot) {
+        self.index = snapshot.index;
     }
 
     fn next_rowid(&self) -> i64 {
@@ -641,6 +658,15 @@ impl VirtualTable for RtreeVirtualTable {
         })
     }
 
+    fn begin(&mut self, _cx: &Cx) -> Result<()> {
+        self.txn_state.begin(self.snapshot_state());
+        Ok(())
+    }
+
+    fn sync_txn(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
     fn update(&mut self, _cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
         if args.is_empty() {
             return Err(FrankenError::function_error("rtree: empty update args"));
@@ -725,6 +751,35 @@ impl VirtualTable for RtreeVirtualTable {
             return Err(FrankenError::PrimaryKeyViolation);
         }
         Ok(Some(new_rowid))
+    }
+
+    fn commit(&mut self, _cx: &Cx) -> Result<()> {
+        self.txn_state.commit();
+        Ok(())
+    }
+
+    fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+        if let Some(snapshot) = self.txn_state.rollback() {
+            self.restore_state(snapshot);
+        }
+        Ok(())
+    }
+
+    fn savepoint(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+        self.txn_state.savepoint(n, self.snapshot_state());
+        Ok(())
+    }
+
+    fn release(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+        self.txn_state.release(n);
+        Ok(())
+    }
+
+    fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+        if let Some(snapshot) = self.txn_state.rollback_to(n) {
+            self.restore_state(snapshot);
+        }
+        Ok(())
     }
 }
 

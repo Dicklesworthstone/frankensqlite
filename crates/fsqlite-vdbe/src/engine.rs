@@ -2711,6 +2711,8 @@ pub struct VdbeEngine {
     /// When a row has fewer columns than the schema expects, defaults from this
     /// map are applied instead of returning NULL.
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
+    /// Per-index descending flags keyed by index root page number.
+    index_desc_flags_by_root_page: HashMap<i32, Vec<bool>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
     /// Open virtual table cursors keyed by cursor number.
@@ -3052,6 +3054,7 @@ impl VdbeEngine {
             table_column_count_by_root_page: HashMap::new(),
             sequence_counters: HashMap::new(),
             column_defaults_by_root_page: HashMap::new(),
+            index_desc_flags_by_root_page: HashMap::new(),
             cursor_root_pages: HashMap::new(),
             vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
@@ -3112,6 +3115,13 @@ impl VdbeEngine {
 
     fn derive_execution_cx(&self) -> Cx {
         self.execution_cx.create_child()
+    }
+
+    fn index_desc_flags_for_root(&self, root_page: i32) -> Vec<bool> {
+        self.index_desc_flags_by_root_page
+            .get(&root_page)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
@@ -3363,6 +3373,11 @@ impl VdbeEngine {
         map: HashMap<i32, Vec<Option<SqliteValue>>>,
     ) {
         self.column_defaults_by_root_page = map;
+    }
+
+    /// Provide per-index descending flags keyed by index root page.
+    pub fn set_index_desc_flags_by_root_page(&mut self, map: HashMap<i32, Vec<bool>>) {
+        self.index_desc_flags_by_root_page = map;
     }
 
     /// Execute a VDBE program to completion.
@@ -3714,9 +3729,19 @@ impl VdbeEngine {
                     // Preserve the cursor's table-vs-index type from
                     // the original cursor so index cursors remain correct.
                     let is_table_btree = old_sc.cursor.is_table_btree();
+                    let index_desc_flags = if is_table_btree {
+                        Vec::new()
+                    } else {
+                        self.index_desc_flags_for_root(root_page)
+                    };
                     let page_size_u32 = self.page_size.get();
-                    let new_cursor =
-                        BtCursor::new(tt_page_io, root_pgno, page_size_u32, is_table_btree);
+                    let new_cursor = BtCursor::new_with_index_desc(
+                        tt_page_io,
+                        root_pgno,
+                        page_size_u32,
+                        is_table_btree,
+                        index_desc_flags,
+                    );
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -6249,12 +6274,15 @@ impl VdbeEngine {
                         } else {
                             sc.target_vals_buf.len()
                         };
-
-                        let cmp = compare_sorter_keys(
+                        let root_page =
+                            self.cursor_root_pages.get(&cursor_id).copied().unwrap_or_default();
+                        let desc_flags = self.index_desc_flags_for_root(root_page);
+                        let cmp = compare_index_prefix_keys(
                             &sc.cur_vals_buf,
                             &sc.target_vals_buf,
                             n_compare,
-                            &[], // TODO: Collations?
+                            &desc_flags,
+                            &[], // TODO: Per-index collations are not yet threaded here.
                             self.collation_registry.as_ref(),
                         );
 
@@ -6284,10 +6312,12 @@ impl VdbeEngine {
                             } else {
                                 probe_fields.len()
                             };
-                            let cmp = compare_sorter_keys(
+                            let desc_flags = self.index_desc_flags_for_root(cursor.root_page);
+                            let cmp = compare_index_prefix_keys(
                                 &row.values,
                                 &probe_fields,
                                 n_compare,
+                                &desc_flags,
                                 &[],
                                 self.collation_registry.as_ref(),
                             );
@@ -7641,11 +7671,16 @@ impl VdbeEngine {
                     };
                     (is_table, None)
                 };
-                let cursor = BtCursor::new(
+                let cursor = BtCursor::new_with_index_desc(
                     page_io.clone(),
                     root_pgno,
                     self.page_size.get(),
                     is_table_btree,
+                    if is_table_btree {
+                        Vec::new()
+                    } else {
+                        self.index_desc_flags_for_root(root_page)
+                    },
                 );
                 self.storage_cursors.insert(
                     cursor_id,
@@ -7715,11 +7750,16 @@ impl VdbeEngine {
                     );
                     return false;
                 }
-                let cursor = BtCursor::new(
+                let cursor = BtCursor::new_with_index_desc(
                     page_io.clone(),
                     root_pgno,
                     self.page_size.get(),
                     is_table_btree,
+                    if is_table_btree {
+                        Vec::new()
+                    } else {
+                        self.index_desc_flags_for_root(root_page)
+                    },
                 );
                 self.storage_cursors.insert(
                     cursor_id,
@@ -7813,7 +7853,17 @@ impl VdbeEngine {
             MemPageStore::with_empty_index(root_pgno, self.page_size.get())
         };
         let cx = self.derive_execution_cx();
-        let mut cursor = BtCursor::new(store, root_pgno, self.page_size.get(), is_table_btree);
+        let mut cursor = BtCursor::new_with_index_desc(
+            store,
+            root_pgno,
+            self.page_size.get(),
+            is_table_btree,
+            if is_table_btree {
+                Vec::new()
+            } else {
+                self.index_desc_flags_for_root(root_page)
+            },
+        );
         // Populate cursor from MemDatabase if available.
         if is_table_btree
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
@@ -8220,6 +8270,39 @@ fn compare_sorter_keys(
         match cmp_values_collated(lhs_value, rhs_value, coll, collation_registry) {
             Ordering::Equal => {}
             non_equal => return non_equal,
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_index_prefix_keys(
+    lhs: &[SqliteValue],
+    rhs: &[SqliteValue],
+    key_columns: usize,
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+    collation_registry: &Mutex<CollationRegistry>,
+) -> Ordering {
+    let key_count = key_columns.max(1);
+    for idx in 0..key_count {
+        let Some(lhs_value) = lhs.get(idx) else {
+            return if rhs.get(idx).is_some() {
+                Ordering::Less
+            } else {
+                break;
+            };
+        };
+        let Some(rhs_value) = rhs.get(idx) else {
+            return Ordering::Greater;
+        };
+
+        let coll = collations.get(idx).and_then(|c| c.as_deref());
+        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll, collation_registry);
+        if desc_flags.get(idx).copied().unwrap_or(false) {
+            ord = ord.reverse();
+        }
+        if ord != Ordering::Equal {
+            return ord;
         }
     }
     Ordering::Equal
@@ -13034,6 +13117,76 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_open_storage_cursor_txn_index_honors_desc_key_metadata() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::record::{parse_record, serialize_record};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(MemDatabase::new());
+        engine.set_transaction(Box::new(txn));
+        engine.set_index_desc_flags_by_root_page(HashMap::from([(256, vec![true])]));
+
+        assert!(
+            engine.open_storage_cursor(0, 256, true),
+            "writable txn-backed index cursor should open on a fresh root page"
+        );
+
+        let sc = engine.storage_cursors.get_mut(&0).unwrap();
+        let early_key = serialize_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]);
+        let late_key = serialize_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]);
+        sc.cursor.index_insert(&sc.cx, &early_key).unwrap();
+        sc.cursor.index_insert(&sc.cx, &late_key).unwrap();
+
+        assert!(sc.cursor.first(&sc.cx).unwrap());
+        let first_values = parse_record(&sc.cursor.payload(&sc.cx).unwrap()).unwrap();
+        assert_eq!(
+            first_values,
+            vec![SqliteValue::Integer(20), SqliteValue::Integer(2)],
+            "descending index cursor should order the larger key first"
+        );
+
+        assert!(sc.cursor.next(&sc.cx).unwrap());
+        let second_values = parse_record(&sc.cursor.payload(&sc.cx).unwrap()).unwrap();
+        assert_eq!(
+            second_values,
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(1)],
+            "descending index cursor should keep the smaller key after the larger one"
+        );
+
+        engine.storage_cursors.clear();
+        let _txn = engine
+            .take_transaction()
+            .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_compare_index_prefix_keys_honors_desc_flags() {
+        let registry = Mutex::new(CollationRegistry::new());
+        let lhs = vec![SqliteValue::Integer(20), SqliteValue::Integer(2)];
+        let rhs = vec![SqliteValue::Integer(10), SqliteValue::Integer(1)];
+
+        assert_eq!(
+            compare_index_prefix_keys(&lhs, &rhs, 1, &[true], &[], &registry),
+            Ordering::Less,
+            "descending index comparison should treat the larger key as earlier"
+        );
+        assert_eq!(
+            compare_index_prefix_keys(&lhs, &rhs, 1, &[false], &[], &registry),
+            Ordering::Greater,
+            "ascending index comparison should keep natural integer ordering"
+        );
+        assert_eq!(
+            compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &registry),
+            Ordering::Less,
+            "zero key_columns should still compare the leading term"
+        );
     }
 
     #[test]

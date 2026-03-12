@@ -9,7 +9,9 @@ use std::collections::HashMap;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
-use fsqlite_func::vtab::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
+use fsqlite_func::vtab::{
+    ColumnContext, IndexInfo, TransactionalVtabState, VirtualTable, VirtualTableCursor,
+};
 use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx;
 use tracing::debug;
@@ -963,7 +965,7 @@ pub struct Posting {
 }
 
 /// In-memory inverted index for FTS5.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InvertedIndex {
     /// term -> list of postings
     index: HashMap<String, Vec<Posting>>,
@@ -1512,7 +1514,7 @@ fn difference_sorted(a: &[i64], b: &[i64]) -> Vec<i64> {
 // ---------------------------------------------------------------------------
 
 /// FTS5 virtual table: full-text search index.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fts5Table {
     /// Column names.
     columns: Vec<String>,
@@ -1525,6 +1527,17 @@ pub struct Fts5Table {
     /// Stored document content: docid -> (col0, col1, ...).
     documents: HashMap<i64, Vec<String>>,
     /// Next auto-generated rowid.
+    next_rowid: i64,
+    /// Snapshot-backed transaction/savepoint state for live VTAB writes.
+    txn_state: TransactionalVtabState<Fts5TableSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct Fts5TableSnapshot {
+    config: Fts5Config,
+    tokenizer_name: String,
+    index: InvertedIndex,
+    documents: HashMap<i64, Vec<String>>,
     next_rowid: i64,
 }
 
@@ -1539,7 +1552,26 @@ impl Fts5Table {
             index: InvertedIndex::new(),
             documents: HashMap::new(),
             next_rowid: 1,
+            txn_state: TransactionalVtabState::default(),
         }
+    }
+
+    fn snapshot_state(&self) -> Fts5TableSnapshot {
+        Fts5TableSnapshot {
+            config: self.config,
+            tokenizer_name: self.tokenizer_name.clone(),
+            index: self.index.clone(),
+            documents: self.documents.clone(),
+            next_rowid: self.next_rowid,
+        }
+    }
+
+    fn restore_state(&mut self, snapshot: Fts5TableSnapshot) {
+        self.config = snapshot.config;
+        self.tokenizer_name = snapshot.tokenizer_name;
+        self.index = snapshot.index;
+        self.documents = snapshot.documents;
+        self.next_rowid = snapshot.next_rowid;
     }
 
     /// Insert a document into the FTS5 table.
@@ -1781,6 +1813,15 @@ impl VirtualTable for Fts5Table {
         })
     }
 
+    fn begin(&mut self, _cx: &Cx) -> Result<()> {
+        self.txn_state.begin(self.snapshot_state());
+        Ok(())
+    }
+
+    fn sync_txn(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
     fn update(&mut self, _cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
         if args.is_empty() {
             return Err(FrankenError::function_error("fts5: empty update args"));
@@ -1830,6 +1871,35 @@ impl VirtualTable for Fts5Table {
 
         self.insert_document(new_rowid, &col_values);
         Ok(None)
+    }
+
+    fn commit(&mut self, _cx: &Cx) -> Result<()> {
+        self.txn_state.commit();
+        Ok(())
+    }
+
+    fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+        if let Some(snapshot) = self.txn_state.rollback() {
+            self.restore_state(snapshot);
+        }
+        Ok(())
+    }
+
+    fn savepoint(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+        self.txn_state.savepoint(n, self.snapshot_state());
+        Ok(())
+    }
+
+    fn release(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+        self.txn_state.release(n);
+        Ok(())
+    }
+
+    fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+        if let Some(snapshot) = self.txn_state.rollback_to(n) {
+            self.restore_state(snapshot);
+        }
+        Ok(())
     }
 }
 

@@ -1205,6 +1205,7 @@ impl PreparedStatement<'_> {
         let rowid_alias_col_by_root_page = self.conn.rowid_alias_column_by_root_page();
         let table_column_count_by_root_page = self.conn.table_column_count_by_root_page();
         let col_defaults_by_root_page = self.conn.column_defaults_by_root_page();
+        let index_desc_flags_by_root_page = self.conn.index_desc_flags_by_root_page();
         let txn = self
             .pager
             .as_ref()
@@ -1227,6 +1228,7 @@ impl PreparedStatement<'_> {
             rowid_alias_col_by_root_page,
             table_column_count_by_root_page,
             col_defaults_by_root_page,
+            index_desc_flags_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.conn.version_store)),
             PageSize::new(self.conn.pragma_state.borrow().page_size).unwrap(),
@@ -2087,6 +2089,9 @@ pub struct Connection {
     /// Each entry is created by `execute_create_virtual_table` and registered
     /// with the VDBE engine before program execution.
     vtab_instances: RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
+    /// Live virtual tables that currently participate in this connection's
+    /// transaction/savepoint stack.
+    live_vtab_transactions: RefCell<HashSet<String>>,
     // ── Parse cache (br-legjy.7.3) ──────────────────────────────────────────
     /// LRU-bounded cache of parsed SQL ASTs keyed by SQL text hash.
     /// Avoids re-parsing the same SQL string on repeated query/execute calls.
@@ -2234,6 +2239,7 @@ impl Connection {
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
+            live_vtab_transactions: RefCell::new(HashSet::new()),
             // Parse cache (br-legjy.7.3)
             parse_cache: RefCell::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
             parse_cache_cookie: RefCell::new(0),
@@ -2289,6 +2295,180 @@ impl Connection {
         has_primary_live_vtab_source_inner(select, |table_name| {
             self.has_live_vtab_instance(table_name)
         })
+    }
+
+    fn active_live_vtab_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .live_vtab_transactions
+            .borrow()
+            .iter()
+            .cloned()
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn current_live_vtab_savepoint_depth(&self) -> usize {
+        self.savepoints.borrow().len() + self.internal_statement_savepoint_depth.get()
+    }
+
+    fn savepoint_level_from_depth(depth: usize) -> Result<i32> {
+        i32::try_from(depth).map_err(|_| {
+            FrankenError::Internal(format!("virtual-table savepoint depth overflow: {depth}"))
+        })
+    }
+
+    fn next_live_vtab_savepoint_level(&self) -> Result<i32> {
+        Self::savepoint_level_from_depth(self.current_live_vtab_savepoint_depth())
+    }
+
+    fn current_live_vtab_savepoint_level(&self) -> Result<i32> {
+        let depth = self.current_live_vtab_savepoint_depth();
+        let level = depth.checked_sub(1).ok_or_else(|| {
+            FrankenError::Internal(
+                "virtual-table savepoint requested with no active level".to_owned(),
+            )
+        })?;
+        Self::savepoint_level_from_depth(level)
+    }
+
+    fn begin_live_vtab_transaction_if_needed(
+        &self,
+        table_name: &str,
+        instance: &mut dyn ErasedVtabInstance,
+        cx: &Cx,
+    ) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        if self.live_vtab_transactions.borrow().contains(&key) {
+            return Ok(());
+        }
+
+        instance.begin(cx).map_err(|error| {
+            FrankenError::Internal(format!("virtual table {table_name} begin failed: {error}"))
+        })?;
+
+        if self.current_live_vtab_savepoint_depth() > 0 {
+            let level = self.current_live_vtab_savepoint_level()?;
+            if let Err(error) = instance.savepoint(cx, level) {
+                let rollback_error = instance.rollback(cx).err();
+                return Err(match rollback_error {
+                    Some(rollback_error) => FrankenError::Internal(format!(
+                        "virtual table {table_name} savepoint catch-up failed at level {level}: {error}; rollback failed: {rollback_error}"
+                    )),
+                    None => FrankenError::Internal(format!(
+                        "virtual table {table_name} savepoint catch-up failed at level {level}: {error}"
+                    )),
+                });
+            }
+        }
+
+        self.live_vtab_transactions.borrow_mut().insert(key);
+        Ok(())
+    }
+
+    fn live_vtab_sync_all(&self, cx: &Cx) -> Result<()> {
+        let names = self.active_live_vtab_names();
+        let mut instances = self.vtab_instances.borrow_mut();
+        for table_name in names {
+            if let Some(instance) = instances.get_mut(&table_name) {
+                instance.sync_txn(cx).map_err(|error| {
+                    FrankenError::Internal(format!(
+                        "virtual table {table_name} sync failed: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn live_vtab_savepoint_all(&self, cx: &Cx, level: i32) -> Result<()> {
+        let names = self.active_live_vtab_names();
+        let mut instances = self.vtab_instances.borrow_mut();
+        let mut completed = Vec::new();
+        for table_name in names {
+            if let Some(instance) = instances.get_mut(&table_name) {
+                if let Err(error) = instance.savepoint(cx, level) {
+                    for applied in &completed {
+                        if let Some(applied_instance) = instances.get_mut(applied) {
+                            let _ = applied_instance.release(cx, level);
+                        }
+                    }
+                    return Err(FrankenError::Internal(format!(
+                        "virtual table {table_name} savepoint({level}) failed: {error}"
+                    )));
+                }
+                completed.push(table_name);
+            }
+        }
+        Ok(())
+    }
+
+    fn live_vtab_release_all(&self, cx: &Cx, level: i32) -> Result<()> {
+        let names = self.active_live_vtab_names();
+        let mut instances = self.vtab_instances.borrow_mut();
+        for table_name in names {
+            if let Some(instance) = instances.get_mut(&table_name) {
+                instance.release(cx, level).map_err(|error| {
+                    FrankenError::Internal(format!(
+                        "virtual table {table_name} release({level}) failed: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn live_vtab_rollback_to_all(&self, cx: &Cx, level: i32) -> Result<()> {
+        let names = self.active_live_vtab_names();
+        let mut instances = self.vtab_instances.borrow_mut();
+        for table_name in names {
+            if let Some(instance) = instances.get_mut(&table_name) {
+                instance.rollback_to(cx, level).map_err(|error| {
+                    FrankenError::Internal(format!(
+                        "virtual table {table_name} rollback_to({level}) failed: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn live_vtab_commit_all_best_effort(&self, cx: &Cx) {
+        let names = self.active_live_vtab_names();
+        let mut instances = self.vtab_instances.borrow_mut();
+        for table_name in &names {
+            if let Some(instance) = instances.get_mut(table_name)
+                && let Err(error) = instance.commit(cx)
+            {
+                tracing::error!(
+                    table = %table_name,
+                    error = %error,
+                    "virtual-table commit finalizer failed after durable commit"
+                );
+            }
+        }
+        self.live_vtab_transactions.borrow_mut().clear();
+    }
+
+    fn live_vtab_rollback_all(&self, cx: &Cx) -> Result<()> {
+        let names = self.active_live_vtab_names();
+        let mut instances = self.vtab_instances.borrow_mut();
+        let mut first_error = None;
+        for table_name in &names {
+            if let Some(instance) = instances.get_mut(table_name)
+                && let Err(error) = instance.rollback(cx)
+                && first_error.is_none()
+            {
+                first_error = Some(FrankenError::Internal(format!(
+                    "virtual table {table_name} rollback failed: {error}"
+                )));
+            }
+        }
+        self.live_vtab_transactions.borrow_mut().clear();
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Plan a scan against a live virtual-table instance by consulting
@@ -3009,16 +3189,26 @@ impl Connection {
         let trace_registration = self.trace_registration.get_mut().clone();
 
         let cx = self.teardown_cx();
-        let active_txn = self.active_txn.get_mut();
-        let txn_was_open = *self.in_transaction.get_mut() || active_txn.is_some();
+        let live_vtab_txn_open = !self.live_vtab_transactions.get_mut().is_empty();
+        let had_active_txn = self.active_txn.get_mut().is_some();
+        let txn_was_open = *self.in_transaction.get_mut() || had_active_txn || live_vtab_txn_open;
 
         if txn_was_open {
-            if let Some(txn) = active_txn.as_mut() {
+            // Rollback the active transaction first, then release the mutable
+            // borrow so that `self.live_vtab_rollback_all` can borrow below.
+            if let Some(txn) = self.active_txn.get_mut().as_mut() {
                 if best_effort {
                     let _ = txn.rollback(&cx);
                 } else {
                     txn.rollback(&cx)?;
                 }
+            }
+            let _ = self.active_txn.get_mut().take();
+
+            if best_effort {
+                let _ = self.live_vtab_rollback_all(&cx);
+            } else {
+                self.live_vtab_rollback_all(&cx)?;
             }
 
             // Only tear down the concurrent session once rollback has
@@ -3034,8 +3224,6 @@ impl Connection {
                     registry.remove(session_id);
                 }
             }
-
-            let _ = active_txn.take();
             *self.concurrent_session_id.get_mut() = None;
             *self.in_transaction.get_mut() = false;
             *self.implicit_txn.get_mut() = false;
@@ -3853,12 +4041,29 @@ impl Connection {
         } else {
             None
         };
+        let live_vtab_level = self.current_live_vtab_savepoint_level()?;
+        if let Err(error) = self.live_vtab_savepoint_all(&cx, live_vtab_level) {
+            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                let _ = txn.rollback_to_savepoint(&cx, &savepoint_name);
+                let _ = txn.release_savepoint(&cx, &savepoint_name);
+            }
+            if let Some(concurrent_snap) = concurrent_snapshot.as_ref()
+                && let Some(session_id) = *self.concurrent_session_id.borrow()
+            {
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                if let Some(handle) = registry.get_mut(session_id) {
+                    let _ = concurrent_rollback_to_savepoint(handle, concurrent_snap);
+                }
+            }
+            return Err(error);
+        }
 
         match body() {
             Ok(value) => {
                 if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
                     txn.release_savepoint(&cx, &savepoint_name)?;
                 }
+                self.live_vtab_release_all(&cx, live_vtab_level)?;
                 Ok(value)
             }
             Err(statement_error) => {
@@ -3909,6 +4114,15 @@ impl Connection {
                                 .to_owned(),
                         );
                     }
+                }
+                if let Err(err) = self.live_vtab_rollback_to_all(&cx, live_vtab_level) {
+                    cleanup_errors.push(format!(
+                        "virtual-table rollback_to({live_vtab_level}) failed: {err}"
+                    ));
+                } else if let Err(err) = self.live_vtab_release_all(&cx, live_vtab_level) {
+                    cleanup_errors.push(format!(
+                        "virtual-table release({live_vtab_level}) failed: {err}"
+                    ));
                 }
 
                 if pager_rollback_succeeded {
@@ -4472,9 +4686,7 @@ impl Connection {
                 }
 
                 if is_live_vtab {
-                    let mut live_insert_rows = live_insert_rows
-                        .take()
-                        .unwrap_or_else(Vec::new);
+                    let mut live_insert_rows = live_insert_rows.take().unwrap_or_else(Vec::new);
                     let patch_first_column_with_rowid = {
                         let key = table_name.to_ascii_uppercase();
                         self.vtab_instances
@@ -6499,30 +6711,31 @@ impl Connection {
             targets
         };
 
-        let build_row = |source_values: &[SqliteValue], context: &str| -> Result<LiveVtabInsertRow> {
-            if source_values.len() != source_targets.len() {
-                return Err(FrankenError::Internal(format!(
-                    "{context}: column count mismatch (source has {}, target expects {})",
-                    source_values.len(),
-                    source_targets.len()
-                )));
-            }
-
-            let mut row = self.evaluate_default_row_from_sqls(&default_sqls)?;
-            let mut explicit_rowid = None;
-            for (source_idx, target_idx) in source_targets.iter().copied().enumerate() {
-                if let Some(target_idx) = target_idx {
-                    row[target_idx] = source_values[source_idx].clone();
-                } else {
-                    explicit_rowid = Some(source_values[source_idx].clone());
+        let build_row =
+            |source_values: &[SqliteValue], context: &str| -> Result<LiveVtabInsertRow> {
+                if source_values.len() != source_targets.len() {
+                    return Err(FrankenError::Internal(format!(
+                        "{context}: column count mismatch (source has {}, target expects {})",
+                        source_values.len(),
+                        source_targets.len()
+                    )));
                 }
-            }
 
-            Ok(LiveVtabInsertRow {
-                explicit_rowid,
-                values: row,
-            })
-        };
+                let mut row = self.evaluate_default_row_from_sqls(&default_sqls)?;
+                let mut explicit_rowid = None;
+                for (source_idx, target_idx) in source_targets.iter().copied().enumerate() {
+                    if let Some(target_idx) = target_idx {
+                        row[target_idx] = source_values[source_idx].clone();
+                    } else {
+                        explicit_rowid = Some(source_values[source_idx].clone());
+                    }
+                }
+
+                Ok(LiveVtabInsertRow {
+                    explicit_rowid,
+                    values: row,
+                })
+            };
 
         match &insert.source {
             fsqlite_ast::InsertSource::Values(rows) => rows
@@ -6568,6 +6781,7 @@ impl Connection {
         let instance = instances.get_mut(&key).ok_or_else(|| {
             FrankenError::Internal(format!("virtual table not found: {table_name}"))
         })?;
+        self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), &cx)?;
 
         let mut inserted_rowids = Vec::with_capacity(rows.len());
         for row in rows {
@@ -7826,6 +8040,7 @@ impl Connection {
         let mut txn = {
             let mut guard = self.active_txn.borrow_mut();
             let Some(txn) = guard.take() else {
+                self.live_vtab_transactions.borrow_mut().clear();
                 *self.concurrent_txn.borrow_mut() = false;
                 *self.concurrent_session_id.borrow_mut() = None;
                 self.txn_metrics_mark_finished();
@@ -7869,6 +8084,32 @@ impl Connection {
                 } else {
                     None
                 };
+                if !self.live_vtab_transactions.borrow().is_empty() {
+                    match self.live_vtab_sync_all(&cx) {
+                        Ok(()) => {}
+                        Err(sync_error) => {
+                            drop(_commit_guard);
+                            if *self.concurrent_txn.borrow() {
+                                self.abort_current_concurrent_session();
+                            }
+                            self.txn_metrics_note_rollback();
+                            let rollback_result = txn.rollback(&cx);
+                            let rollback_succeeded = rollback_result.is_ok();
+                            let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+                            *self.concurrent_txn.borrow_mut() = false;
+                            *self.concurrent_session_id.borrow_mut() = None;
+                            self.txn_metrics_mark_finished();
+                            if txn_has_pending_writes && rollback_succeeded {
+                                self.reload_memdb_from_pager(&cx)?;
+                            }
+                            vtab_rollback_result?;
+                            return Err(match rollback_result {
+                                Ok(()) => sync_error,
+                                Err(rollback_error) => rollback_error,
+                            });
+                        }
+                    }
+                }
                 match txn.commit(&cx) {
                     Ok(()) => {
                         if txn_has_pending_writes {
@@ -7883,6 +8124,7 @@ impl Connection {
                                 },
                             );
                         }
+                        self.live_vtab_commit_all_best_effort(&cx);
                         (Ok(()), txn_has_pending_writes, false)
                     }
                     Err(e) => {
@@ -7891,12 +8133,16 @@ impl Connection {
                         self.txn_metrics_note_rollback();
                         let rollback_result = txn.rollback(&cx);
                         let rollback_succeeded = rollback_result.is_ok();
+                        let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
                         if *self.concurrent_txn.borrow() {
                             self.abort_current_concurrent_session();
                         }
                         (
                             match rollback_result {
-                                Ok(()) => Err(e),
+                                Ok(()) => match vtab_rollback_result {
+                                    Ok(()) => Err(e),
+                                    Err(vtab_error) => Err(vtab_error),
+                                },
                                 Err(rollback_error) => Err(rollback_error),
                             },
                             false,
@@ -7912,8 +8158,12 @@ impl Connection {
                 self.txn_metrics_note_rollback();
                 let rollback_result = txn.rollback(&cx);
                 let rollback_succeeded = rollback_result.is_ok();
+                let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
                 (
-                    rollback_result,
+                    match rollback_result {
+                        Ok(()) => vtab_rollback_result,
+                        Err(rollback_error) => Err(rollback_error),
+                    },
                     false,
                     txn_has_pending_writes && rollback_succeeded,
                 )
@@ -8845,6 +9095,22 @@ impl Connection {
         schema
             .iter()
             .map(|table| (table.root_page, table.columns.len()))
+            .collect()
+    }
+
+    fn index_desc_flags_by_root_page(&self) -> HashMap<i32, Vec<bool>> {
+        let schema = self.schema.borrow();
+        schema
+            .iter()
+            .flat_map(|table| table.indexes.iter())
+            .map(|index| {
+                (
+                    index.root_page,
+                    (0..index.key_term_count())
+                        .map(|key_pos| index.key_term_descending(key_pos))
+                        .collect(),
+                )
+            })
             .collect()
     }
 
@@ -11981,6 +12247,48 @@ impl Connection {
         }
 
         let cx = self.op_cx()?;
+        if !self.live_vtab_transactions.borrow().is_empty() {
+            if let Err(sync_error) = self.live_vtab_sync_all(&cx) {
+                let txn_has_pending_writes = self
+                    .active_txn
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
+
+                if *self.concurrent_txn.borrow() {
+                    self.abort_current_concurrent_session();
+                }
+
+                self.txn_metrics_note_rollback();
+                let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
+                    txn.rollback(&cx)
+                } else {
+                    Ok(())
+                };
+                let rollback_succeeded = rollback_result.is_ok();
+                let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+                let reload_result = if txn_has_pending_writes && rollback_succeeded {
+                    self.reload_memdb_from_pager(&cx)
+                } else {
+                    Ok(())
+                };
+
+                *self.txn_snapshot.borrow_mut() = None;
+                self.savepoints.borrow_mut().clear();
+                *self.in_transaction.borrow_mut() = false;
+                *self.implicit_txn.borrow_mut() = false;
+                *self.concurrent_txn.borrow_mut() = false;
+                *self.concurrent_session_id.borrow_mut() = None;
+                self.txn_metrics_mark_finished();
+                self.db.borrow_mut().commit_undo();
+                self.maybe_gc_tick();
+
+                rollback_result?;
+                reload_result?;
+                vtab_rollback_result?;
+                return Err(sync_error);
+            }
+        }
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
@@ -12025,6 +12333,7 @@ impl Connection {
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
+        self.live_vtab_commit_all_best_effort(&cx);
         self.txn_metrics_mark_finished();
 
         // Discard rollback snapshot and savepoints — changes are committed.
@@ -12172,6 +12481,8 @@ impl Connection {
                 })?;
                 drop(registry);
             }
+            let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
+            let live_vtab_result = self.live_vtab_rollback_to_all(&cx, live_vtab_level);
 
             {
                 let mut savepoints = self.savepoints.borrow_mut();
@@ -12184,6 +12495,7 @@ impl Connection {
 
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
+            live_vtab_result?;
         } else {
             // Full ROLLBACK: restore to transaction start.
             // 5D.2 (bd-1ene): Use pager rollback and reload from committed state.
@@ -12215,6 +12527,7 @@ impl Connection {
             } else {
                 Ok(())
             };
+            let live_vtab_result = self.live_vtab_rollback_all(&cx);
 
             // Reload MemDatabase from pager's committed state.
             // This replaces the snapshot-restore approach with reading the
@@ -12238,6 +12551,7 @@ impl Connection {
 
             rollback_result?;
             reload_result?;
+            live_vtab_result?;
         }
         Ok(())
     }
@@ -12418,6 +12732,22 @@ impl Connection {
         } else {
             None
         };
+        let live_vtab_level = self.next_live_vtab_savepoint_level()?;
+        if let Err(error) = self.live_vtab_savepoint_all(&cx, live_vtab_level) {
+            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                let _ = txn.rollback_to_savepoint(&cx, name);
+                let _ = txn.release_savepoint(&cx, name);
+            }
+            if let Some(concurrent_snap) = concurrent_snapshot.as_ref()
+                && let Some(session_id) = *self.concurrent_session_id.borrow()
+            {
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                if let Some(handle) = registry.get_mut(session_id) {
+                    let _ = concurrent_rollback_to_savepoint(handle, concurrent_snap);
+                }
+            }
+            return Err(error);
+        }
 
         self.savepoints.borrow_mut().push(SavepointEntry {
             name: name.to_owned(),
@@ -12451,6 +12781,8 @@ impl Connection {
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
             txn.release_savepoint(&cx, &canonical_name)?;
         }
+        let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
+        self.live_vtab_release_all(&cx, live_vtab_level)?;
 
         let mut savepoints = self.savepoints.borrow_mut();
         // RELEASE removes the named savepoint and all savepoints created after it.
@@ -12697,6 +13029,24 @@ impl Connection {
         }
         key_values.push(SqliteValue::Integer(rowid));
         Ok(serialize_record(&key_values))
+    }
+
+    fn compare_index_key_values_for_integrity(
+        index: &IndexSchema,
+        lhs: &[SqliteValue],
+        rhs: &[SqliteValue],
+    ) -> Option<std::cmp::Ordering> {
+        let shared_len = lhs.len().min(rhs.len());
+        for idx in 0..shared_len {
+            let mut ord = lhs[idx].partial_cmp(&rhs[idx])?;
+            if index.key_term_descending(idx) {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return Some(ord);
+            }
+        }
+        Some(lhs.len().cmp(&rhs.len()))
     }
 
     fn record_integrity_page_owner(
@@ -13303,16 +13653,20 @@ impl Connection {
                         })?;
 
                     let mut actual_rowids = HashSet::new();
-                    let mut cursor = fsqlite_btree::BtCursor::new(
+                    let mut cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                         TransactionPageIo::new(txn),
                         index_root,
                         page_size.get(),
                         false,
+                        (0..index.key_term_count())
+                            .map(|key_pos| index.key_term_descending(key_pos))
+                            .collect(),
                     );
+                    let mut prev_payload: Option<Vec<u8>> = None;
                     if cursor.first(cx)? {
                         loop {
                             let payload = cursor.payload(cx)?;
-                            parse_record(&payload).ok_or_else(|| {
+                            let payload_values = parse_record(&payload).ok_or_else(|| {
                                 FrankenError::DatabaseCorrupt {
                                     detail: format!(
                                         "index `{}` contains an invalid key record payload",
@@ -13320,6 +13674,30 @@ impl Connection {
                                     ),
                                 }
                             })?;
+                            if let Some(prev_payload) = prev_payload.as_ref() {
+                                let prev_values = parse_record(prev_payload).ok_or_else(|| {
+                                    FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "index `{}` contains an invalid key record payload",
+                                            index.name
+                                        ),
+                                    }
+                                })?;
+                                let ordering = Self::compare_index_key_values_for_integrity(
+                                    index,
+                                    &prev_values,
+                                    &payload_values,
+                                )
+                                .unwrap_or_else(|| prev_payload.as_slice().cmp(payload.as_slice()));
+                                if ordering != std::cmp::Ordering::Less {
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "index `{}` entries are out of order for their declared key directions",
+                                            index.name
+                                        ),
+                                    });
+                                }
+                            }
                             let rowid = cursor.rowid(cx)?;
                             let Some(expected_payload) = expected_keys.get(&rowid) else {
                                 return Err(FrankenError::DatabaseCorrupt {
@@ -13345,6 +13723,7 @@ impl Connection {
                                     ),
                                 });
                             }
+                            prev_payload = Some(payload);
                             if !cursor.next(cx)? {
                                 break;
                             }
@@ -13405,21 +13784,52 @@ impl Connection {
                         ),
                     })?;
 
-                let mut cursor = fsqlite_btree::BtCursor::new(
+                let mut cursor = fsqlite_btree::BtCursor::new_with_index_desc(
                     TransactionPageIo::new(txn),
                     index_root,
                     page_size.get(),
                     false,
+                    (0..index.key_term_count())
+                        .map(|key_pos| index.key_term_descending(key_pos))
+                        .collect(),
                 );
+                let mut prev_payload: Option<Vec<u8>> = None;
                 if cursor.first(cx)? {
                     loop {
                         let payload = cursor.payload(cx)?;
-                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "index `{}` contains an invalid key record payload",
-                                index.name
-                            ),
+                        let payload_values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{}` contains an invalid key record payload",
+                                    index.name
+                                ),
+                            }
                         })?;
+                        if let Some(prev_payload) = prev_payload.as_ref() {
+                            let prev_values = parse_record(prev_payload).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` contains an invalid key record payload",
+                                        index.name
+                                    ),
+                                }
+                            })?;
+                            let ordering = Self::compare_index_key_values_for_integrity(
+                                index,
+                                &prev_values,
+                                &payload_values,
+                            )
+                            .unwrap_or_else(|| prev_payload.as_slice().cmp(payload.as_slice()));
+                            if ordering != std::cmp::Ordering::Less {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` entries are out of order for their declared key directions",
+                                        index.name
+                                    ),
+                                });
+                            }
+                        }
+                        prev_payload = Some(payload);
                         if !cursor.next(cx)? {
                             break;
                         }
@@ -19012,6 +19422,7 @@ impl Connection {
         let rowid_alias_col_by_root_page = self.rowid_alias_column_by_root_page();
         let table_column_count_by_root_page = self.table_column_count_by_root_page();
         let col_defaults_by_root_page = self.column_defaults_by_root_page();
+        let index_desc_flags_by_root_page = self.index_desc_flags_by_root_page();
 
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
@@ -19049,6 +19460,7 @@ impl Connection {
             rowid_alias_col_by_root_page,
             table_column_count_by_root_page,
             col_defaults_by_root_page,
+            index_desc_flags_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.version_store)),
             PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
@@ -19567,6 +19979,7 @@ impl Connection {
                     root_page,
                     columns: index_definition.columns,
                     key_expressions: index_definition.key_expressions,
+                    key_sort_directions: index_definition.key_sort_directions,
                     where_clause: index_definition.where_clause,
                     is_unique: index_definition.is_unique,
                 });
@@ -25151,6 +25564,7 @@ fn execute_table_program_with_db(
     rowid_alias_col_by_root_page: HashMap<i32, usize>,
     table_column_count_by_root_page: HashMap<i32, usize>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
+    index_desc_flags_by_root_page: HashMap<i32, Vec<bool>>,
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
     page_size: PageSize,
@@ -25182,6 +25596,7 @@ fn execute_table_program_with_db(
     engine
         .set_table_column_count_by_root_page(table_column_count_by_root_page.into_iter().collect());
     engine.set_column_defaults_by_root_page(column_defaults_by_root_page.into_iter().collect());
+    engine.set_index_desc_flags_by_root_page(index_desc_flags_by_root_page.into_iter().collect());
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
     // Time-travel support: pass the MVCC version store so SetSnapshot can
@@ -30277,7 +30692,11 @@ mod tests {
     };
     use fsqlite_ast::Statement;
     use fsqlite_btree::BtreeCursorOps;
-    use fsqlite_error::FrankenError;
+    use fsqlite_error::{FrankenError, Result};
+    use fsqlite_func::vtab::{
+        ColumnContext as VtabColumnContext, IndexInfo as VtabIndexInfo, TransactionalVtabState,
+        VirtualTable, VirtualTableCursor, module_factory_from,
+    };
     use fsqlite_types::LockLevel;
     use fsqlite_types::cx::Cx;
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -30295,6 +30714,206 @@ mod tests {
     impl Connection {
         pub(crate) fn open_in_memory() -> std::result::Result<Self, FrankenError> {
             Self::open(":memory:")
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TxnAwareVtabSnapshot {
+        rows: Vec<(i64, String)>,
+        next_rowid: i64,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TxnAwareTestVtab {
+        rows: Vec<(i64, String)>,
+        next_rowid: i64,
+        txn_state: TransactionalVtabState<TxnAwareVtabSnapshot>,
+        hook_log: Vec<String>,
+        fail_sync: bool,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TxnAwareTestCursor {
+        rows: Vec<(i64, String)>,
+        pos: usize,
+    }
+
+    impl TxnAwareTestVtab {
+        fn snapshot_state(&self) -> TxnAwareVtabSnapshot {
+            TxnAwareVtabSnapshot {
+                rows: self.rows.clone(),
+                next_rowid: self.next_rowid,
+            }
+        }
+
+        fn restore_state(&mut self, snapshot: TxnAwareVtabSnapshot) {
+            self.rows = snapshot.rows;
+            self.next_rowid = snapshot.next_rowid;
+        }
+
+        fn record_hook(&mut self, hook: impl Into<String>) {
+            self.hook_log.push(hook.into());
+        }
+    }
+
+    fn with_txn_test_vtab<T>(
+        conn: &Connection,
+        table_name: &str,
+        f: impl FnOnce(&mut TxnAwareTestVtab) -> T,
+    ) -> T {
+        let key = table_name.to_ascii_uppercase();
+        let mut instances = conn.vtab_instances.borrow_mut();
+        let instance = instances
+            .get_mut(&key)
+            .unwrap_or_else(|| panic!("missing live vtab instance {key}"));
+        let vtab = instance
+            .as_any_mut()
+            .downcast_mut::<TxnAwareTestVtab>()
+            .unwrap_or_else(|| panic!("live vtab {key} is not TxnAwareTestVtab"));
+        f(vtab)
+    }
+
+    impl VirtualTable for TxnAwareTestVtab {
+        type Cursor = TxnAwareTestCursor;
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Ok(Self {
+                rows: Vec::new(),
+                next_rowid: 1,
+                txn_state: TransactionalVtabState::default(),
+                hook_log: Vec::new(),
+                fail_sync: false,
+            })
+        }
+
+        fn best_index(&self, _info: &mut VtabIndexInfo) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(TxnAwareTestCursor {
+                rows: self.rows.clone(),
+                pos: 0,
+            })
+        }
+
+        fn update(&mut self, _cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
+            self.record_hook("update");
+            if args.is_empty() {
+                return Err(FrankenError::Internal(
+                    "txn-aware test vtab received no args".to_owned(),
+                ));
+            }
+            if args.len() == 1 && !args[0].is_null() {
+                let rowid = args[0].to_integer();
+                self.rows.retain(|(existing, _)| *existing != rowid);
+                return Ok(None);
+            }
+            let value = args.get(2).map(SqliteValue::to_text).ok_or_else(|| {
+                FrankenError::Internal("txn-aware test vtab missing value".to_owned())
+            })?;
+            if value.eq_ignore_ascii_case("boom") {
+                return Err(FrankenError::Internal(
+                    "txn-aware test vtab forced failure".to_owned(),
+                ));
+            }
+            let rowid = args
+                .get(1)
+                .and_then(SqliteValue::as_integer)
+                .unwrap_or_else(|| {
+                    let next = self.next_rowid;
+                    self.next_rowid += 1;
+                    next
+                });
+            self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
+            self.rows.push((rowid, value));
+            Ok(Some(rowid))
+        }
+
+        fn begin(&mut self, _cx: &Cx) -> Result<()> {
+            self.record_hook("begin");
+            self.txn_state.begin(self.snapshot_state());
+            Ok(())
+        }
+
+        fn sync_txn(&mut self, _cx: &Cx) -> Result<()> {
+            self.record_hook("sync");
+            if self.fail_sync {
+                return Err(FrankenError::Internal(
+                    "txn-aware test vtab forced sync failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn commit(&mut self, _cx: &Cx) -> Result<()> {
+            self.record_hook("commit");
+            self.txn_state.commit();
+            Ok(())
+        }
+
+        fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+            self.record_hook("rollback");
+            if let Some(snapshot) = self.txn_state.rollback() {
+                self.restore_state(snapshot);
+            }
+            Ok(())
+        }
+
+        fn savepoint(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+            self.record_hook(format!("savepoint:{n}"));
+            self.txn_state.savepoint(n, self.snapshot_state());
+            Ok(())
+        }
+
+        fn release(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+            self.record_hook(format!("release:{n}"));
+            self.txn_state.release(n);
+            Ok(())
+        }
+
+        fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+            self.record_hook(format!("rollback_to:{n}"));
+            if let Some(snapshot) = self.txn_state.rollback_to(n) {
+                self.restore_state(snapshot);
+            }
+            Ok(())
+        }
+    }
+
+    impl VirtualTableCursor for TxnAwareTestCursor {
+        fn filter(
+            &mut self,
+            _cx: &Cx,
+            _idx_num: i32,
+            _idx_str: Option<&str>,
+            _args: &[SqliteValue],
+        ) -> Result<()> {
+            self.pos = 0;
+            Ok(())
+        }
+
+        fn next(&mut self, _cx: &Cx) -> Result<()> {
+            self.pos = self.pos.saturating_add(1);
+            Ok(())
+        }
+
+        fn eof(&self) -> bool {
+            self.pos >= self.rows.len()
+        }
+
+        fn column(&self, ctx: &mut VtabColumnContext, col: i32) -> Result<()> {
+            let Some((_, value)) = self.rows.get(self.pos) else {
+                return Ok(());
+            };
+            if col == 0 {
+                ctx.set_value(SqliteValue::Text(value.clone()));
+            }
+            Ok(())
+        }
+
+        fn rowid(&self) -> Result<i64> {
+            Ok(self.rows.get(self.pos).map_or(0, |(rowid, _)| *rowid))
         }
     }
 
@@ -32305,6 +32924,92 @@ mod tests {
         assert_eq!(
             integrity_check, "ok",
             "descending partial index maintenance should stay SQLite-compatible"
+        );
+    }
+
+    #[test]
+    fn test_comments_ipk_payload_stays_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("comments_ipk_payload.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute(
+            "CREATE TABLE comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_comments_issue ON comments(issue_id);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_comments_created_at ON comments(created_at);")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO comments(issue_id, author, text, created_at)
+             VALUES ('bd-1', 'Dicklesworthstone', 'first comment', '2026-03-12T00:00:00Z');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO comments(issue_id, author, text, created_at)
+             VALUES ('bd-2', 'ScarletFalcon', 'second comment', '2026-03-12T00:01:00Z');",
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "INTEGER PRIMARY KEY payload layout should remain SQLite-compatible"
+        );
+
+        let rows = sqlite
+            .prepare(
+                "SELECT id, issue_id, author, text, created_at
+                 FROM comments
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "bd-1".to_owned(),
+                    "Dicklesworthstone".to_owned(),
+                    "first comment".to_owned(),
+                    "2026-03-12T00:00:00Z".to_owned(),
+                ),
+                (
+                    2,
+                    "bd-2".to_owned(),
+                    "ScarletFalcon".to_owned(),
+                    "second comment".to_owned(),
+                    "2026-03-12T00:01:00Z".to_owned(),
+                ),
+            ],
+            "external SQLite should decode the same comment rows without column shifting"
         );
     }
 
@@ -36315,6 +37020,208 @@ mod tests {
     }
 
     #[test]
+    fn test_live_vtab_explicit_rollback_restores_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('rolled back');")
+            .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT rowid, value FROM vt;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "full rollback must restore live VTAB state"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_savepoint_rollback_restores_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('keep');")
+            .unwrap();
+        conn.execute("SAVEPOINT sp_inner;").unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('drop');")
+            .unwrap();
+        conn.execute("ROLLBACK TO sp_inner;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, value FROM vt ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("keep".to_owned()),
+            ]],
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_statement_savepoint_rolls_back_partial_write() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let err = conn.execute("INSERT INTO vt(value) VALUES ('ok'), ('boom');");
+        assert!(err.is_err(), "statement should fail on injected VTAB error");
+        conn.execute("INSERT INTO vt(value) VALUES ('after');")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, value FROM vt ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("after".to_owned()),
+            ]],
+            "failed multi-row live VTAB write must not leak earlier row mutations",
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_autocommit_error_rolls_back_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        let err = conn.execute("INSERT INTO vt(value) VALUES ('ok'), ('boom');");
+        assert!(
+            err.is_err(),
+            "autocommit VTAB write should fail on injected error"
+        );
+
+        let rows = conn.query("SELECT rowid, value FROM vt;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "implicit transaction rollback must restore live VTAB state"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_late_enlistment_uses_single_current_savepoint_catchup() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp_outer;").unwrap();
+        conn.execute("SAVEPOINT sp_inner;").unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('late');")
+            .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let hook_log = with_txn_test_vtab(&conn, "vt", |vtab| vtab.hook_log.clone());
+        let savepoints = hook_log
+            .iter()
+            .filter(|hook| hook.starts_with("savepoint:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            savepoints,
+            vec!["savepoint:2".to_owned()],
+            "late VTAB enlistment should catch up only to the current savepoint level",
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_sync_failure_aborts_explicit_commit() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('sync fail');")
+            .unwrap();
+        with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_sync = true);
+
+        let err = conn
+            .execute("COMMIT;")
+            .expect_err("sync failure should abort COMMIT");
+        assert!(
+            err.to_string().contains("virtual table VT sync failed")
+                || err.to_string().contains("virtual table vt sync failed"),
+            "unexpected COMMIT error: {err}",
+        );
+        assert!(
+            !*conn.in_transaction.borrow(),
+            "sync failure should abort the explicit transaction"
+        );
+
+        let rows = conn.query("SELECT rowid, value FROM vt;").unwrap();
+        assert!(rows.is_empty(), "sync failure must restore live VTAB state");
+
+        let hook_log = with_txn_test_vtab(&conn, "vt", |vtab| vtab.hook_log.clone());
+        assert!(
+            hook_log.contains(&"sync".to_owned()),
+            "expected sync hook before COMMIT failure: {hook_log:?}"
+        );
+        assert!(
+            hook_log.contains(&"rollback".to_owned()),
+            "sync failure should roll back the live VTAB: {hook_log:?}"
+        );
+        assert!(
+            !hook_log.contains(&"commit".to_owned()),
+            "failed COMMIT must not finalize the live VTAB: {hook_log:?}"
+        );
+    }
+
+    #[test]
+    fn test_fts5_live_vtab_rollback_restores_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO docs(subject, body) VALUES ('Hello', 'Rust world')")
+            .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, subject, body FROM docs;")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "FTS5 rollback must restore live VTAB state"
+        );
+    }
+
+    #[test]
     fn test_rtree_virtual_table_module_is_registered_for_create() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x, min_y, max_y);")
@@ -36456,10 +37363,8 @@ mod tests {
         conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
             .unwrap();
 
-        conn.execute(
-            "INSERT INTO docs(rowid, subject, body) SELECT 7, 'Hello', 'Rust world';",
-        )
-        .unwrap();
+        conn.execute("INSERT INTO docs(rowid, subject, body) SELECT 7, 'Hello', 'Rust world';")
+            .unwrap();
 
         let docs = conn
             .query("SELECT rowid, subject, body FROM docs ORDER BY rowid;")
@@ -44339,6 +45244,59 @@ mod schema_loading_tests {
             rows[1].get(4).and_then(SqliteValue::as_text),
             Some("2026-03-10T17:23:44+00:00"),
         );
+    }
+
+    #[test]
+    fn test_reopened_autoincrement_table_insert_preserves_explicit_column_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("comments_insert_reopen.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute(
+                "INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('bd-issue', 'GraniteLynx', 'payload should not shift', '2026-03-12T02:00:00+00:00');",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let row = sqlite
+            .query_row(
+                "SELECT id, issue_id, author, text, created_at FROM comments",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, "bd-issue");
+        assert_eq!(row.2, "GraniteLynx");
+        assert_eq!(row.3, "payload should not shift");
+        assert_eq!(row.4, "2026-03-12T02:00:00+00:00");
     }
 
     #[test]

@@ -151,6 +151,11 @@ pub struct IndexSchema {
     pub columns: Vec<String>,
     /// Executable SQL for each key term in storage order.
     pub key_expressions: Vec<String>,
+    /// Sort direction for each logical key term.
+    ///
+    /// Empty means "all ASC" for legacy callers/tests that do not yet
+    /// populate per-term ordering metadata.
+    pub key_sort_directions: Vec<SortDirection>,
     /// Optional partial-index predicate as SQL text.
     pub where_clause: Option<String>,
     /// Whether this index enforces a UNIQUE constraint.
@@ -176,6 +181,15 @@ impl IndexSchema {
         } else {
             self.key_expressions.get(key_pos).map(String::as_str)
         }
+    }
+
+    /// Whether the `key_pos`th logical key term sorts descending.
+    #[must_use]
+    pub fn key_term_descending(&self, key_pos: usize) -> bool {
+        matches!(
+            self.key_sort_directions.get(key_pos),
+            Some(SortDirection::Desc)
+        )
     }
 
     /// Whether planner / lookup fast paths may safely treat this as a simple
@@ -10666,6 +10680,7 @@ mod tests {
                 root_page: 3,
                 columns: vec!["b".to_owned()],
                 key_expressions: vec!["b".to_owned()],
+                key_sort_directions: vec![],
                 where_clause: None,
                 is_unique: false,
             }],
@@ -11580,6 +11595,7 @@ mod tests {
                     root_page: 4,
                     columns: vec!["a".to_owned()],
                     key_expressions: vec!["a".to_owned()],
+                    key_sort_directions: vec![],
                     where_clause: None,
                     is_unique: false,
                 }],

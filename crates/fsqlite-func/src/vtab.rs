@@ -147,6 +147,89 @@ impl ColumnContext {
     }
 }
 
+/// Snapshot-backed transaction/savepoint state for mutable virtual tables.
+///
+/// Virtual table implementations that keep their authoritative state in memory
+/// can use this helper to participate in connection-level `BEGIN`/`COMMIT`/
+/// `ROLLBACK` and savepoint recovery without wiring their own savepoint stack.
+#[derive(Debug, Clone)]
+pub struct TransactionalVtabState<S: Clone> {
+    base_snapshot: Option<S>,
+    savepoints: Vec<(i32, S)>,
+}
+
+impl<S: Clone> Default for TransactionalVtabState<S> {
+    fn default() -> Self {
+        Self {
+            base_snapshot: None,
+            savepoints: Vec::new(),
+        }
+    }
+}
+
+impl<S: Clone> TransactionalVtabState<S> {
+    /// Mark the start of a virtual-table transaction.
+    pub fn begin(&mut self, snapshot: S) {
+        if self.base_snapshot.is_none() {
+            self.base_snapshot = Some(snapshot);
+            self.savepoints.clear();
+        }
+    }
+
+    /// Drop all transactional snapshots after a successful commit.
+    pub fn commit(&mut self) {
+        self.base_snapshot = None;
+        self.savepoints.clear();
+    }
+
+    /// Return the transaction-begin snapshot for a full rollback.
+    pub fn rollback(&mut self) -> Option<S> {
+        let snapshot = self.base_snapshot.take();
+        self.savepoints.clear();
+        snapshot
+    }
+
+    /// Record the current state at savepoint `level`.
+    pub fn savepoint(&mut self, level: i32, snapshot: S) {
+        if self.base_snapshot.is_none() {
+            return;
+        }
+        self.savepoints.retain(|(existing, _)| *existing < level);
+        self.savepoints.push((level, snapshot));
+    }
+
+    /// Drop savepoint snapshots at `level` and deeper.
+    pub fn release(&mut self, level: i32) {
+        if self.base_snapshot.is_none() {
+            return;
+        }
+        self.savepoints.retain(|(existing, _)| *existing < level);
+    }
+
+    /// Return the snapshot recorded for savepoint `level`, keeping that
+    /// savepoint active and discarding deeper ones.
+    ///
+    /// If the virtual table joined the transaction after outer savepoints were
+    /// already active, SQLite only gives it a snapshot for the current level.
+    /// Falling back to the transaction-begin snapshot lets `ROLLBACK TO` an
+    /// older savepoint restore the correct pre-transaction state.
+    pub fn rollback_to(&mut self, level: i32) -> Option<S> {
+        if self.base_snapshot.is_none() {
+            return None;
+        }
+        let snapshot = self
+            .savepoints
+            .iter()
+            .rfind(|(existing, _)| *existing == level)
+            .map(|(_, snapshot)| snapshot.clone())
+            .or_else(|| self.base_snapshot.clone());
+        if snapshot.is_some() {
+            self.savepoints.retain(|(existing, _)| *existing <= level);
+        }
+        snapshot
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VirtualTable trait
 // ---------------------------------------------------------------------------
@@ -336,10 +419,18 @@ pub trait ErasedVtabInstance: Send + Sync {
     fn update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>>;
     /// Begin a virtual table transaction.
     fn begin(&mut self, cx: &Cx) -> Result<()>;
+    /// Sync a virtual table transaction.
+    fn sync_txn(&mut self, cx: &Cx) -> Result<()>;
     /// Commit a virtual table transaction.
     fn commit(&mut self, cx: &Cx) -> Result<()>;
     /// Roll back a virtual table transaction.
     fn rollback(&mut self, cx: &Cx) -> Result<()>;
+    /// Create a savepoint at level `n`.
+    fn savepoint(&mut self, cx: &Cx, n: i32) -> Result<()>;
+    /// Release savepoint at level `n`.
+    fn release(&mut self, cx: &Cx, n: i32) -> Result<()>;
+    /// Roll back to savepoint at level `n`.
+    fn rollback_to(&mut self, cx: &Cx, n: i32) -> Result<()>;
     /// Destroy the virtual table.
     fn destroy(&mut self, cx: &Cx) -> Result<()>;
     /// Rename the virtual table.
@@ -417,11 +508,23 @@ where
     fn begin(&mut self, cx: &Cx) -> Result<()> {
         VirtualTable::begin(self, cx)
     }
+    fn sync_txn(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTable::sync_txn(self, cx)
+    }
     fn commit(&mut self, cx: &Cx) -> Result<()> {
         VirtualTable::commit(self, cx)
     }
     fn rollback(&mut self, cx: &Cx) -> Result<()> {
         VirtualTable::rollback(self, cx)
+    }
+    fn savepoint(&mut self, cx: &Cx, n: i32) -> Result<()> {
+        VirtualTable::savepoint(self, cx, n)
+    }
+    fn release(&mut self, cx: &Cx, n: i32) -> Result<()> {
+        VirtualTable::release(self, cx, n)
+    }
+    fn rollback_to(&mut self, cx: &Cx, n: i32) -> Result<()> {
+        VirtualTable::rollback_to(self, cx, n)
     }
     fn destroy(&mut self, cx: &Cx) -> Result<()> {
         VirtualTable::destroy(self, cx)
@@ -683,6 +786,83 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HookSnapshot {
+        version: i32,
+    }
+
+    struct HookAwareVtab {
+        version: i32,
+        syncs: usize,
+        tx_state: TransactionalVtabState<HookSnapshot>,
+    }
+
+    impl VirtualTable for HookAwareVtab {
+        type Cursor = ReadOnlyCursor;
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Ok(Self {
+                version: 7,
+                syncs: 0,
+                tx_state: TransactionalVtabState::default(),
+            })
+        }
+
+        fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(ReadOnlyCursor)
+        }
+
+        fn begin(&mut self, _cx: &Cx) -> Result<()> {
+            self.tx_state.begin(HookSnapshot {
+                version: self.version,
+            });
+            Ok(())
+        }
+
+        fn sync_txn(&mut self, _cx: &Cx) -> Result<()> {
+            self.syncs += 1;
+            Ok(())
+        }
+
+        fn savepoint(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+            self.tx_state.savepoint(
+                n,
+                HookSnapshot {
+                    version: self.version,
+                },
+            );
+            Ok(())
+        }
+
+        fn release(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+            self.tx_state.release(n);
+            Ok(())
+        }
+
+        fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
+            if let Some(snapshot) = self.tx_state.rollback_to(n) {
+                self.version = snapshot.version;
+            }
+            Ok(())
+        }
+
+        fn commit(&mut self, _cx: &Cx) -> Result<()> {
+            self.tx_state.commit();
+            Ok(())
+        }
+
+        fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+            if let Some(snapshot) = self.tx_state.rollback() {
+                self.version = snapshot.version;
+            }
+            Ok(())
+        }
+    }
+
     // -- Tests --
 
     #[test]
@@ -850,5 +1030,64 @@ mod tests {
         assert_eq!(info.idx_num, 0);
         assert!(info.idx_str.is_none());
         assert!(!info.order_by_consumed);
+    }
+
+    #[test]
+    fn test_transactional_vtab_state_tracks_savepoints() {
+        let mut state = TransactionalVtabState::default();
+
+        state.begin(1_i32);
+        state.savepoint(0, 2);
+        state.savepoint(1, 3);
+        assert_eq!(state.rollback_to(1), Some(3));
+        state.release(1);
+        assert_eq!(state.rollback(), Some(1));
+        assert_eq!(state.rollback(), None);
+    }
+
+    #[test]
+    fn test_transactional_vtab_state_uses_base_for_late_enlistment() {
+        let mut state = TransactionalVtabState::default();
+
+        state.begin(7_i32);
+        state.savepoint(2, 9);
+
+        assert_eq!(state.rollback_to(1), Some(7));
+        assert_eq!(state.rollback(), Some(7));
+    }
+
+    #[test]
+    fn test_erased_vtab_instance_forwards_transaction_hooks() {
+        let cx = Cx::new();
+        let mut erased: Box<dyn ErasedVtabInstance> =
+            Box::new(HookAwareVtab::connect(&cx, &[]).unwrap());
+
+        erased.begin(&cx).unwrap();
+        {
+            let hook = erased
+                .as_any_mut()
+                .downcast_mut::<HookAwareVtab>()
+                .expect("hook-aware vtab");
+            hook.version = 9;
+        }
+        erased.savepoint(&cx, 0).unwrap();
+        {
+            let hook = erased
+                .as_any_mut()
+                .downcast_mut::<HookAwareVtab>()
+                .expect("hook-aware vtab");
+            hook.version = 11;
+        }
+        erased.rollback_to(&cx, 0).unwrap();
+        erased.release(&cx, 0).unwrap();
+        erased.sync_txn(&cx).unwrap();
+        erased.rollback(&cx).unwrap();
+
+        let hook = erased
+            .as_any_mut()
+            .downcast_mut::<HookAwareVtab>()
+            .expect("hook-aware vtab");
+        assert_eq!(hook.version, 7);
+        assert_eq!(hook.syncs, 1);
     }
 }

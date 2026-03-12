@@ -95,6 +95,10 @@ impl MigrationRunner {
     /// Each migration runs inside a transaction: if any statement fails,
     /// the entire migration is rolled back and the error is returned.
     ///
+    /// The runner re-checks each version from inside an `IMMEDIATE`
+    /// transaction so that concurrent initializers on the same database
+    /// serialize instead of racing to apply the same migration.
+    ///
     /// # Errors
     ///
     /// Returns `FrankenError` if any SQL statement fails or the tracking
@@ -110,8 +114,9 @@ impl MigrationRunner {
         )?;
 
         // Read the current maximum version.
-        let current_version = Self::read_current_version(conn)?;
-        let was_fresh = current_version == 0;
+        let initial_version = Self::read_current_version(conn)?;
+        let was_fresh = initial_version == 0;
+        let mut current_version = initial_version;
 
         let mut applied = Vec::new();
 
@@ -120,19 +125,15 @@ impl MigrationRunner {
                 continue;
             }
 
-            Self::apply_one(conn, migration)?;
-            applied.push(migration.version);
+            if Self::apply_one(conn, migration)? {
+                applied.push(migration.version);
+            }
+            current_version = Self::read_current_version(conn)?;
         }
-
-        let final_version = if let Some(&last) = applied.last() {
-            last
-        } else {
-            current_version
-        };
 
         Ok(MigrationResult {
             applied,
-            current: final_version,
+            current: current_version,
             was_fresh,
         })
     }
@@ -150,19 +151,38 @@ impl MigrationRunner {
         }
     }
 
-    /// Applies a single migration inside a BEGIN/COMMIT transaction.
+    fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
+        let rows = conn.query_with_params(
+            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+            &[SqliteValue::Integer(version)],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    /// Applies a single migration inside a BEGIN IMMEDIATE/COMMIT transaction.
     /// On failure, issues ROLLBACK before propagating the error.
-    fn apply_one(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
-        conn.execute("BEGIN;")?;
-        let result = Self::apply_one_inner(conn, migration);
-        if result.is_err() {
-            // Best-effort rollback; ignore rollback errors since
-            // the original error is more informative.
-            let _ = conn.execute("ROLLBACK;");
-        } else {
+    ///
+    /// Returns `true` when this connection actually applied the migration and
+    /// `false` when another connection finished it first.
+    fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
+        conn.execute("BEGIN IMMEDIATE;")?;
+        if Self::version_is_applied(conn, migration.version)? {
             conn.execute("COMMIT;")?;
+            return Ok(false);
         }
-        result
+
+        match Self::apply_one_inner(conn, migration) {
+            Ok(()) => {
+                conn.execute("COMMIT;")?;
+                Ok(true)
+            }
+            Err(err) => {
+                // Best-effort rollback; ignore rollback errors since
+                // the original error is more informative.
+                let _ = conn.execute("ROLLBACK;");
+                Err(err)
+            }
+        }
     }
 
     /// Executes migration SQL and records the version, without transaction management.
@@ -189,6 +209,8 @@ impl Default for MigrationRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn mem_conn() -> Connection {
         Connection::open(":memory:").expect("in-memory connection should open")
@@ -378,6 +400,69 @@ mod tests {
             Some(SqliteValue::Text(s)) if s == "add_index" => {}
             other => panic!("expected Text('add_index'), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn concurrent_apply_one_serializes_same_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("migration_apply_one_race.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let migration = Migration {
+            version: 1,
+            name: "create_items",
+            up_sql: "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+        };
+
+        {
+            let conn = Connection::open(&db_path_str).unwrap();
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _schema_migrations (\
+                    version INTEGER PRIMARY KEY, \
+                    name TEXT NOT NULL, \
+                    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
+                );",
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let db_path_str = db_path_str.clone();
+                let barrier = Arc::clone(&barrier);
+                let migration = migration.clone();
+                thread::spawn(move || {
+                    let conn = Connection::open(&db_path_str).unwrap();
+                    assert_eq!(MigrationRunner::read_current_version(&conn).unwrap(), 0);
+                    barrier.wait();
+                    MigrationRunner::apply_one(&conn, &migration).unwrap()
+                })
+            })
+            .collect();
+
+        let mut applied_count = 0;
+        let mut skipped_count = 0;
+        for handle in handles {
+            if handle.join().unwrap() {
+                applied_count += 1;
+            } else {
+                skipped_count += 1;
+            }
+        }
+
+        assert_eq!(applied_count, 1);
+        assert_eq!(skipped_count, 1);
+
+        let conn = Connection::open(&db_path_str).unwrap();
+        let rows = conn
+            .query("SELECT version, name FROM _schema_migrations ORDER BY version;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
+        assert_eq!(
+            rows[0].get(1),
+            Some(&SqliteValue::Text("create_items".to_owned()))
+        );
     }
 
     #[test]
