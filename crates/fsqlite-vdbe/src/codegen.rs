@@ -60,6 +60,12 @@ const OE_FAIL: u16 = 3;
 const OE_IGNORE: u16 = 4;
 /// REPLACE conflicting row (delete old, insert new).
 const OE_REPLACE: u16 = 5;
+/// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes that are part
+/// of an UPDATE rewrite.
+///
+/// This intentionally lives above the low 4 OE_* bits because this engine
+/// encodes conflict handling directly in `p5`, unlike SQLite's native layout.
+const OPFLAG_ISUPDATE: u16 = 0x10;
 
 /// Convert AST `ConflictAction` to p5 OE_* flag value.
 fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
@@ -5378,7 +5384,7 @@ fn codegen_insert_values(
                         update_rec,
                         update_rowid_reg,
                         P4::Table(table.name.clone()),
-                        OE_REPLACE,
+                        OE_REPLACE | OPFLAG_ISUPDATE,
                     );
                     emit_index_inserts(
                         b,
@@ -5420,7 +5426,7 @@ fn codegen_insert_values(
                         update_rec,
                         update_rowid_reg,
                         P4::Table(table.name.clone()),
-                        OE_REPLACE,
+                        OE_REPLACE | OPFLAG_ISUPDATE,
                     );
                     emit_index_inserts(
                         b,
@@ -6016,7 +6022,7 @@ pub fn codegen_update(
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
 
-    let _where_placeholder_count: u32 = stmt
+    let where_placeholder_count: u32 = stmt
         .where_clause
         .as_ref()
         .map_or(0, count_anon_placeholders);
@@ -6169,7 +6175,14 @@ pub fn codegen_update(
 
     // UPDATE is delete+insert: remove the current row first, then insert the
     // rewritten record (possibly at a new rowid).
-    b.emit_op(Opcode::Delete, table_cursor, 0, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::Delete,
+        table_cursor,
+        0,
+        0,
+        P4::None,
+        OPFLAG_ISUPDATE,
+    );
 
     // Determine destination rowid for re-insertion.
     let mut rowid_reg = matched_rowid_reg;
@@ -6243,7 +6256,7 @@ pub fn codegen_update(
         rec_reg,
         rowid_reg,
         P4::Table(table.name.clone()),
-        oe_flag,
+        oe_flag | OPFLAG_ISUPDATE,
     );
 
     // Index maintenance (bd-2f9t): Insert NEW index entries after table insert.
@@ -6255,7 +6268,7 @@ pub fn codegen_update(
         // RETURNING appears after WHERE in SQL textual order; restore the
         // post-WHERE placeholder index so RETURNING placeholders don't collide
         // with SET placeholder numbering.
-        b.set_next_anon_placeholder(set_placeholder_count + 1);
+        b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
         emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
     }
 
@@ -6456,6 +6469,10 @@ fn codegen_update_from(
         .iter()
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
+    let where_placeholder_count: u32 = stmt
+        .where_clause
+        .as_ref()
+        .map_or(0, count_anon_placeholders);
 
     // WHERE filter.
     let skip_label = b.emit_label();
@@ -6510,7 +6527,14 @@ fn codegen_update_from(
     b.emit_op(Opcode::Rowid, target_cursor, old_rowid_reg, 0, P4::None, 0);
 
     // Delete old row.
-    b.emit_op(Opcode::Delete, target_cursor, 0, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::Delete,
+        target_cursor,
+        0,
+        0,
+        P4::None,
+        OPFLAG_ISUPDATE,
+    );
 
     // Determine destination rowid.
     let mut rowid_reg = old_rowid_reg;
@@ -6579,7 +6603,7 @@ fn codegen_update_from(
         rec_reg,
         rowid_reg,
         P4::Table(target.name.clone()),
-        oe_flag,
+        oe_flag | OPFLAG_ISUPDATE,
     );
 
     // Insert new index entries.
@@ -6587,6 +6611,7 @@ fn codegen_update_from(
 
     // RETURNING clause.
     if !stmt.returning.is_empty() {
+        b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
         emit_returning(b, target_cursor, target, &stmt.returning, rowid_reg)?;
     }
 
@@ -12113,25 +12138,47 @@ mod tests {
 
         // Rowid equality should use the direct SeekRowid fast path instead of
         // scanning the whole table.
-        assert!(has_opcodes(
-            &prog,
-            &[
-                Opcode::Init,
-                Opcode::Transaction,
-                Opcode::OpenWrite,
-                Opcode::Variable,   // target rowid
-                Opcode::SeekRowid,  // direct probe
-                Opcode::Column,     // read existing col a
-                Opcode::Column,     // read existing col b
-                Opcode::Variable,   // new value for b
-                Opcode::Rowid,      // get current rowid
-                Opcode::Delete,     // delete old row
-                Opcode::MakeRecord, // pack ALL columns
-                Opcode::Insert,     // write back
-                Opcode::Close,
-                Opcode::Halt,
-            ]
-        ));
+        let ops = prog.ops();
+        let seek_pos = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekRowid)
+            .expect("UPDATE by rowid must probe directly with SeekRowid");
+        let delete_pos = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Delete)
+            .expect("UPDATE must delete the old row before reinserting");
+        let delete = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Delete)
+            .expect("Delete opcode should exist");
+        let insert_pos = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Insert)
+            .expect("UPDATE must reinsert the rewritten row");
+        let insert = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert)
+            .expect("Insert opcode should exist");
+        assert!(
+            seek_pos < delete_pos && delete_pos < insert_pos,
+            "UPDATE by rowid should seek first, then delete, then reinsert"
+        );
+        assert!(
+            ops.iter()
+                .skip(seek_pos)
+                .any(|op| op.opcode == Opcode::Column),
+            "UPDATE should read the non-IPK column from the current row"
+        );
+        assert_eq!(
+            delete.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE delete must carry OPFLAG_ISUPDATE so conflict restore can recover the old row"
+        );
+        assert_eq!(
+            insert.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE insert must carry OPFLAG_ISUPDATE so runtime last_insert_rowid() handling stays SQLite-compatible"
+        );
 
         // MakeRecord should have 2 columns (the full record).
         let mr = prog
@@ -12194,6 +12241,16 @@ mod tests {
             .iter()
             .position(|&op| op == Opcode::Delete)
             .expect("Delete opcode should exist");
+        let delete = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Delete)
+            .expect("Delete opcode should exist");
+        let insert = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert)
+            .expect("Insert opcode should exist");
         let insert_pos = ops
             .iter()
             .position(|&op| op == Opcode::Insert)
@@ -12201,6 +12258,16 @@ mod tests {
         assert!(
             delete_pos < insert_pos,
             "Delete must execute before Insert in UPDATE rewrite"
+        );
+        assert_eq!(
+            delete.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE delete must carry OPFLAG_ISUPDATE so conflict restore can recover the old row"
+        );
+        assert_eq!(
+            insert.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE insert must carry OPFLAG_ISUPDATE so runtime last_insert_rowid() handling stays SQLite-compatible"
         );
     }
 
@@ -12349,9 +12416,29 @@ mod tests {
             .iter()
             .position(|op| op.opcode == Opcode::Delete)
             .expect("Delete opcode should exist");
+        let delete = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Delete)
+            .expect("Delete opcode should exist");
+        let insert = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert)
+            .expect("Insert opcode should exist");
         assert!(
             rowset_add_pos < delete_pos,
             "UPDATE must collect rowids before deleting rows from a scan cursor"
+        );
+        assert_eq!(
+            delete.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE delete must carry OPFLAG_ISUPDATE so conflict restore can recover the old row"
+        );
+        assert_eq!(
+            insert.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE insert must carry OPFLAG_ISUPDATE so runtime last_insert_rowid() handling stays SQLite-compatible"
         );
     }
 

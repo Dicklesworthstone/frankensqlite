@@ -5443,6 +5443,47 @@ fn test_conformance_group_concat_variants() {
     }
 }
 
+/// GROUP_CONCAT / STRING_AGG with in-aggregate ORDER BY and expression separators.
+#[test]
+fn test_conformance_group_concat_ordered_aggregate_arguments() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE gc_ord(grp TEXT, val TEXT, sep TEXT, priority INTEGER)",
+        "CREATE TABLE grp_lookup(grp TEXT PRIMARY KEY)",
+        "INSERT INTO grp_lookup VALUES('a'),('b')",
+        "INSERT INTO gc_ord VALUES \
+            ('a','banana',', ',2), \
+            ('a','apple',' / ',1), \
+            ('a','cherry',' + ',3), \
+            ('b','dog','-',2), \
+            ('b','cat','|',1), \
+            ('b',NULL,'?',3)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "SELECT GROUP_CONCAT(val, sep ORDER BY priority) FROM gc_ord WHERE grp = 'a'",
+        "SELECT GROUP_CONCAT(val ORDER BY priority DESC) FROM gc_ord WHERE grp = 'a'",
+        "SELECT grp, STRING_AGG(val, sep ORDER BY priority DESC) FROM gc_ord GROUP BY grp ORDER BY grp",
+        "SELECT g.grp, GROUP_CONCAT(gc_ord.val, gc_ord.sep ORDER BY gc_ord.priority) FROM grp_lookup g JOIN gc_ord ON gc_ord.grp = g.grp GROUP BY g.grp ORDER BY g.grp",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for mismatch in &mismatches {
+            eprintln!("{mismatch}\n");
+        }
+        panic!(
+            "{} ordered GROUP_CONCAT/STRING_AGG mismatches",
+            mismatches.len()
+        );
+    }
+}
+
 /// COALESCE chains, nested COALESCE, COALESCE with aggregates
 #[test]
 fn test_conformance_coalesce_chains() {

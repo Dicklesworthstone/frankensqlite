@@ -116,20 +116,18 @@ impl MigrationRunner {
         // Read the current maximum version.
         let initial_version = Self::read_current_version(conn)?;
         let was_fresh = initial_version == 0;
-        let mut current_version = initial_version;
-
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
-            if migration.version <= current_version {
+            if Self::version_is_applied(conn, migration.version)? {
                 continue;
             }
 
             if Self::apply_one(conn, migration)? {
                 applied.push(migration.version);
             }
-            current_version = Self::read_current_version(conn)?;
         }
+        let current_version = Self::read_current_version(conn)?;
 
         Ok(MigrationResult {
             applied,
@@ -151,8 +149,12 @@ impl MigrationRunner {
         }
     }
 
-    fn current_version_at_least(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
-        Ok(Self::read_current_version(conn)? >= version)
+    fn version_is_applied(conn: &Connection, version: i64) -> Result<bool, FrankenError> {
+        let rows = conn.query_with_params(
+            "SELECT 1 FROM _schema_migrations WHERE version = ?1 LIMIT 1;",
+            &[SqliteValue::Integer(version)],
+        )?;
+        Ok(!rows.is_empty())
     }
 
     /// Applies a single migration inside a BEGIN IMMEDIATE/COMMIT transaction.
@@ -163,7 +165,7 @@ impl MigrationRunner {
     fn apply_one(conn: &Connection, migration: &Migration) -> Result<bool, FrankenError> {
         conn.execute("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<bool, FrankenError> {
-            if Self::current_version_at_least(conn, migration.version)? {
+            if Self::version_is_applied(conn, migration.version)? {
                 conn.execute("COMMIT;")?;
                 return Ok(false);
             }
@@ -469,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_one_skips_when_database_is_already_at_a_higher_version() {
+    fn apply_one_runs_missing_lower_version_even_if_higher_version_exists() {
         let conn = mem_conn();
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _schema_migrations (\
@@ -495,12 +497,69 @@ mod tests {
         };
 
         let applied = MigrationRunner::apply_one(&conn, &migration).unwrap();
-        assert!(!applied);
+        assert!(applied);
         assert!(
-            conn.query("SELECT name FROM sqlite_master WHERE name = 'should_not_exist';")
+            !conn
+                .query("SELECT name FROM sqlite_master WHERE name = 'should_not_exist';")
                 .unwrap()
                 .is_empty(),
-            "older migration should not apply after the database has already advanced",
+            "missing lower-version migration should still run even if a higher version row already exists",
+        );
+        let versions = conn
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
+            .unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|row| row.get(0).unwrap().to_integer())
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "runner must preserve non-contiguous/mixed-binary migration histories instead of treating MAX(version) as authoritative",
+        );
+    }
+
+    #[test]
+    fn run_applies_missing_lower_version_even_if_higher_version_exists() {
+        let conn = mem_conn();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL\
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO _schema_migrations(version, name) VALUES (2, 'second');")
+            .unwrap();
+
+        let result = MigrationRunner::new()
+            .add(
+                1,
+                "create_sparse",
+                "CREATE TABLE sparse_fixed (id INTEGER PRIMARY KEY);",
+            )
+            .add(
+                2,
+                "noop_second",
+                "CREATE TABLE should_not_run (id INTEGER PRIMARY KEY);",
+            )
+            .run(&conn)
+            .unwrap();
+
+        assert_eq!(result.applied, vec![1]);
+        assert_eq!(result.current, 2);
+        assert!(!result.was_fresh);
+        assert!(
+            !conn
+                .query("SELECT name FROM sqlite_master WHERE name = 'sparse_fixed';")
+                .unwrap()
+                .is_empty(),
+            "public runner should repair sparse histories by applying the missing lower migration",
+        );
+        assert!(
+            conn.query("SELECT name FROM sqlite_master WHERE name = 'should_not_run';")
+                .unwrap()
+                .is_empty(),
+            "already-applied higher migration must stay skipped",
         );
     }
 

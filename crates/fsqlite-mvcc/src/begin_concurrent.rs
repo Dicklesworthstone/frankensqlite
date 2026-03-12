@@ -67,6 +67,16 @@ pub struct ConcurrentHandle {
     snapshot: Snapshot,
     /// Pages written by this transaction, keyed by page number.
     write_set: HashMap<PageNumber, PageData>,
+    /// Pages freed by this transaction.
+    ///
+    /// These pages may have no staged payload bytes, but they still need to
+    /// participate in FCW/SSI/commit-index tracking so stale concurrent
+    /// writers cannot commit against a tree that removed them.
+    freed_pages: HashSet<PageNumber>,
+    /// Pages that participate in the write-conflict surface without staged
+    /// payload bytes, such as page 1 when allocation/free changes metadata
+    /// later materialized by the pager commit path.
+    conflict_only_pages: HashSet<PageNumber>,
     /// Set of page-level locks held by this transaction.
     page_locks: HashSet<PageNumber>,
     /// Transaction state (Active / Committed / Aborted).
@@ -92,6 +102,21 @@ pub struct ConcurrentHandle {
     marked_for_abort: Cell<bool>,
 }
 
+/// Snapshot of one page's local concurrent tracking state.
+///
+/// This is used to restore the in-memory MVCC bookkeeping if the underlying
+/// pager rejects a write/free after we already updated the concurrent handle.
+/// SSI witnesses are intentionally not rolled back; that remains a safe
+/// overapproximation just like savepoint rollback.
+#[derive(Debug, Clone)]
+pub struct ConcurrentPageState {
+    page: PageNumber,
+    staged_data: Option<PageData>,
+    was_freed: bool,
+    was_conflict_only: bool,
+    held_lock: bool,
+}
+
 impl ConcurrentHandle {
     /// Create a new concurrent handle with the given snapshot and token.
     #[must_use]
@@ -99,6 +124,8 @@ impl ConcurrentHandle {
         Self {
             snapshot,
             write_set: HashMap::new(),
+            freed_pages: HashSet::new(),
+            conflict_only_pages: HashSet::new(),
             page_locks: HashSet::new(),
             state: TransactionState::Active,
             read_set: HashSet::new(),
@@ -128,7 +155,12 @@ impl ConcurrentHandle {
     /// Returns the set of pages in the write set.
     #[must_use]
     pub fn write_set_pages(&self) -> Vec<PageNumber> {
-        self.write_set.keys().copied().collect()
+        let mut pages = self.write_set.keys().copied().collect::<Vec<_>>();
+        pages.extend(self.freed_pages.iter().copied());
+        pages.extend(self.conflict_only_pages.iter().copied());
+        pages.sort_unstable();
+        pages.dedup();
+        pages
     }
 
     /// Returns the number of pages in the write set.
@@ -141,6 +173,18 @@ impl ConcurrentHandle {
     #[must_use]
     pub fn write_set(&self) -> &HashMap<PageNumber, PageData> {
         &self.write_set
+    }
+
+    #[must_use]
+    pub fn is_page_freed(&self, page: PageNumber) -> bool {
+        self.freed_pages.contains(&page)
+    }
+
+    #[must_use]
+    pub fn tracks_write_conflict_page(&self, page: PageNumber) -> bool {
+        self.write_set.contains_key(&page)
+            || self.freed_pages.contains(&page)
+            || self.conflict_only_pages.contains(&page)
     }
 
     /// Returns the set of page locks held.
@@ -313,10 +357,15 @@ impl ActiveTxnView for ConcurrentHandle {
 
         let page = match witness_key_page(key) {
             Some(p) => p,
-            None => return !self.write_set.is_empty() || !self.global_write_witnesses.is_empty(),
+            None => {
+                return (!self.write_set.is_empty()
+                    || !self.freed_pages.is_empty()
+                    || !self.conflict_only_pages.is_empty())
+                    || !self.global_write_witnesses.is_empty();
+            }
         };
 
-        if !self.write_set.contains_key(&page) {
+        if !self.tracks_write_conflict_page(page) {
             return false;
         }
 
@@ -360,6 +409,10 @@ pub struct ConcurrentSavepoint {
     pub name: String,
     /// Snapshot of the write set at savepoint creation time.
     write_set_snapshot: HashMap<PageNumber, PageData>,
+    /// Snapshot of pages freed at savepoint creation time.
+    freed_pages_snapshot: HashSet<PageNumber>,
+    /// Snapshot of conflict-only pages at savepoint creation time.
+    conflict_only_pages_snapshot: HashSet<PageNumber>,
     /// Number of pages in write_set at savepoint creation.
     write_set_len: usize,
 }
@@ -573,8 +626,109 @@ pub fn concurrent_write_page(
         handle.page_locks.remove(&page);
         return Err(MvccError::Busy);
     }
+    handle.freed_pages.remove(&page);
+    handle.conflict_only_pages.remove(&page);
     handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
     handle.write_set.insert(page, data);
+    Ok(())
+}
+
+/// Capture the local concurrent tracking state for a page.
+#[must_use]
+pub fn concurrent_page_state(handle: &ConcurrentHandle, page: PageNumber) -> ConcurrentPageState {
+    ConcurrentPageState {
+        page,
+        staged_data: handle.write_set.get(&page).cloned(),
+        was_freed: handle.freed_pages.contains(&page),
+        was_conflict_only: handle.conflict_only_pages.contains(&page),
+        held_lock: handle.page_locks.contains(&page),
+    }
+}
+
+/// Restore a page's local concurrent tracking state after a failed pager write.
+pub fn concurrent_restore_page_state(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    state: &ConcurrentPageState,
+) -> Result<(), MvccError> {
+    if !handle.is_active() {
+        return Err(MvccError::InvalidState);
+    }
+    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+
+    if let Some(data) = &state.staged_data {
+        handle.write_set.insert(state.page, data.clone());
+    } else {
+        handle.write_set.remove(&state.page);
+    }
+
+    if state.was_freed {
+        handle.freed_pages.insert(state.page);
+    } else {
+        handle.freed_pages.remove(&state.page);
+    }
+
+    if state.was_conflict_only {
+        handle.conflict_only_pages.insert(state.page);
+    } else {
+        handle.conflict_only_pages.remove(&state.page);
+    }
+
+    if state.held_lock {
+        handle.page_locks.insert(state.page);
+    } else {
+        handle.page_locks.remove(&state.page);
+        lock_table.release(state.page, txn_id);
+    }
+
+    Ok(())
+}
+
+/// Track a page in the write-conflict surface without staging payload bytes.
+pub fn concurrent_track_write_conflict_page(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    page: PageNumber,
+) -> Result<(), MvccError> {
+    if !handle.is_active() {
+        return Err(MvccError::InvalidState);
+    }
+    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
+        handle.page_locks.remove(&page);
+        return Err(MvccError::Busy);
+    }
+    if !handle.write_set.contains_key(&page) && !handle.freed_pages.contains(&page) {
+        handle.conflict_only_pages.insert(page);
+    }
+    handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    Ok(())
+}
+
+/// Record that a page was freed within a concurrent transaction.
+///
+/// The page remains part of the write-conflict surface even though it no
+/// longer has staged payload bytes.
+pub fn concurrent_free_page(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    page: PageNumber,
+) -> Result<(), MvccError> {
+    if !handle.is_active() {
+        return Err(MvccError::InvalidState);
+    }
+    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
+        handle.page_locks.remove(&page);
+        return Err(MvccError::Busy);
+    }
+    handle.write_set.remove(&page);
+    handle.conflict_only_pages.remove(&page);
+    handle.freed_pages.insert(page);
+    handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
     Ok(())
 }
 
@@ -586,6 +740,12 @@ pub fn concurrent_write_page(
 #[must_use]
 pub fn concurrent_read_page(handle: &ConcurrentHandle, page: PageNumber) -> Option<&PageData> {
     handle.write_set.get(&page)
+}
+
+/// Whether the page has been freed by this concurrent transaction.
+#[must_use]
+pub fn concurrent_page_is_freed(handle: &ConcurrentHandle, page: PageNumber) -> bool {
+    handle.is_page_freed(page)
 }
 
 /// Validate the write set against the commit index using first-committer-wins.
@@ -601,7 +761,7 @@ pub fn validate_first_committer_wins(
     let mut conflicting_pages = Vec::new();
     let mut max_conflicting_seq = CommitSeq::ZERO;
 
-    for &page in handle.write_set.keys() {
+    for page in handle.write_set_pages() {
         if let Some(committed_seq) = commit_index.latest(page) {
             if committed_seq > snapshot_seq {
                 conflicting_pages.push(page);
@@ -766,8 +926,12 @@ impl ActiveTxnView for HandleView<'_> {
             WitnessKey::Page(p)
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.handle.write_set.contains_key(p),
-            WitnessKey::Custom { .. } => !self.handle.write_set.is_empty(), // Conservative fallback
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.handle.tracks_write_conflict_page(*p),
+            WitnessKey::Custom { .. } => {
+                !self.handle.write_set.is_empty()
+                    || !self.handle.freed_pages.is_empty()
+                    || !self.handle.conflict_only_pages.is_empty()
+            } // Conservative fallback
         }
     }
 
@@ -868,8 +1032,9 @@ pub fn concurrent_commit(
                 return Err((MvccError::BusySnapshot, FcwResult::Clean));
             }
 
-            // Commit: update commit index for all written pages.
-            for &page in handle.write_set.keys() {
+            // Commit: update commit index for every tracked write-conflict page,
+            // including structural frees that no longer have staged bytes.
+            for page in handle.write_set_pages() {
                 commit_index.update(page, assign_commit_seq);
             }
             // Release all page locks.
@@ -928,7 +1093,7 @@ pub fn prepare_concurrent_commit_with_ssi(
 
         let read_keys = handle.read_witness_keys();
         let write_keys = handle.write_witness_keys();
-        let write_set_pages = handle.write_set.keys().copied().collect::<Vec<_>>();
+        let write_set_pages = handle.write_set_pages();
 
         (
             handle.token(),
@@ -1273,6 +1438,8 @@ pub fn concurrent_savepoint(
     Ok(ConcurrentSavepoint {
         name: name.to_owned(),
         write_set_snapshot: handle.write_set.clone(),
+        freed_pages_snapshot: handle.freed_pages.clone(),
+        conflict_only_pages_snapshot: handle.conflict_only_pages.clone(),
         write_set_len: handle.write_set.len(),
     })
 }
@@ -1290,6 +1457,10 @@ pub fn concurrent_rollback_to_savepoint(
         return Err(MvccError::InvalidState);
     }
     handle.write_set.clone_from(&savepoint.write_set_snapshot);
+    handle.freed_pages.clone_from(&savepoint.freed_pages_snapshot);
+    handle
+        .conflict_only_pages
+        .clone_from(&savepoint.conflict_only_pages_snapshot);
     Ok(())
 }
 
@@ -1311,9 +1482,11 @@ mod tests {
 
     use super::{
         ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_commit,
-        concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
-        concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
-        prepare_concurrent_commit_with_ssi, validate_first_committer_wins,
+        concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
+        concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
+        concurrent_savepoint, concurrent_track_write_conflict_page, concurrent_write_page,
+        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
+        validate_first_committer_wins,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -1510,6 +1683,29 @@ mod tests {
             .expect("commit succeeds");
     }
 
+    #[test]
+    fn test_savepoint_within_concurrent_restores_freed_pages() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+
+        let handle = registry.get(s1).expect("handle");
+        let sp = concurrent_savepoint(handle, "sp1").unwrap();
+
+        let handle = registry.get_mut(s1).expect("handle");
+        concurrent_free_page(handle, &lock_table, s1, test_page(1)).unwrap();
+        assert!(concurrent_page_is_freed(handle, test_page(1)));
+
+        concurrent_rollback_to_savepoint(handle, &sp).unwrap();
+        assert!(!concurrent_page_is_freed(handle, test_page(1)));
+        assert!(concurrent_read_page(handle, test_page(1)).is_some());
+        assert_eq!(handle.write_set_pages(), vec![test_page(1)]);
+    }
+
     // -----------------------------------------------------------------------
     // Test 5: Read from local write set vs MVCC fallback.
     // -----------------------------------------------------------------------
@@ -1533,6 +1729,100 @@ mod tests {
         let handle = registry.get(s1).expect("handle");
         assert!(concurrent_read_page(handle, test_page(5)).is_some());
         assert!(concurrent_read_page(handle, test_page(6)).is_none());
+    }
+
+    #[test]
+    fn test_concurrent_free_page_removes_local_read_and_still_tracks_conflict_page() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+        concurrent_free_page(handle, &lock_table, s1, test_page(5)).unwrap();
+
+        assert!(concurrent_page_is_freed(handle, test_page(5)));
+        assert!(concurrent_read_page(handle, test_page(5)).is_none());
+        assert_eq!(handle.write_set_len(), 0);
+        assert_eq!(handle.write_set_pages(), vec![test_page(5)]);
+    }
+
+    #[test]
+    fn test_validate_first_committer_wins_considers_freed_pages() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let handle = registry.get_mut(s1).expect("handle");
+        concurrent_free_page(handle, &lock_table, s1, test_page(5)).unwrap();
+
+        commit_index.update(test_page(5), CommitSeq::new(11));
+        assert_eq!(
+            validate_first_committer_wins(handle, &commit_index),
+            FcwResult::Conflict {
+                conflicting_pages: vec![test_page(5)],
+                conflicting_commit_seq: CommitSeq::new(11),
+            }
+        );
+    }
+
+    #[test]
+    fn test_restore_page_state_releases_new_lock_and_clears_failed_free() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let handle = registry.get_mut(s1).expect("handle");
+        let saved = concurrent_page_state(handle, test_page(8));
+
+        concurrent_free_page(handle, &lock_table, s1, test_page(8)).unwrap();
+        assert!(concurrent_page_is_freed(handle, test_page(8)));
+
+        concurrent_restore_page_state(handle, &lock_table, s1, &saved).unwrap();
+        assert!(!concurrent_page_is_freed(handle, test_page(8)));
+        assert!(concurrent_read_page(handle, test_page(8)).is_none());
+        assert!(!handle.held_locks().contains(&test_page(8)));
+
+        let other_txn = fsqlite_types::TxnId::new(999).unwrap();
+        assert!(
+            lock_table.try_acquire(test_page(8), other_txn).is_ok(),
+            "restoring clean state must release the transient page lock"
+        );
+        assert!(lock_table.release(test_page(8), other_txn));
+    }
+
+    #[test]
+    fn test_concurrent_commit_updates_commit_index_for_freed_pages() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let handle = registry.get_mut(s1).expect("handle");
+        concurrent_free_page(handle, &lock_table, s1, test_page(11)).unwrap();
+
+        concurrent_commit(handle, &commit_index, &lock_table, s1, CommitSeq::new(11))
+            .expect("commit should succeed");
+
+        assert_eq!(commit_index.latest(test_page(11)), Some(CommitSeq::new(11)));
+    }
+
+    #[test]
+    fn test_concurrent_commit_updates_commit_index_for_conflict_only_pages() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let handle = registry.get_mut(s1).expect("handle");
+        concurrent_track_write_conflict_page(handle, &lock_table, s1, PageNumber::ONE).unwrap();
+
+        concurrent_commit(handle, &commit_index, &lock_table, s1, CommitSeq::new(11))
+            .expect("commit should succeed");
+
+        assert_eq!(commit_index.latest(PageNumber::ONE), Some(CommitSeq::new(11)));
     }
 
     // -----------------------------------------------------------------------

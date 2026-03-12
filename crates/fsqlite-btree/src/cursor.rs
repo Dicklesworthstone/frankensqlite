@@ -1671,7 +1671,7 @@ impl<P: PageWriter> BtCursor<P> {
                     if let Some((rowid, _)) = read_varint(&cell_data[n..]) {
                         #[allow(clippy::cast_possible_wrap)]
                         let rowid = rowid as i64;
-                        if let Ok(Some(_new_pgno)) = balance::balance_quick(
+                        match balance::balance_quick(
                             cx,
                             &mut self.pager,
                             parent_page_no,
@@ -1680,11 +1680,15 @@ impl<P: PageWriter> BtCursor<P> {
                             rowid,
                             self.usable_size,
                         ) {
-                            self.note_split_event();
-                            // Invalidate cursor stack as tree structure changed.
-                            self.stack.clear();
-                            self.at_eof = true;
-                            return Ok(());
+                            Ok(Some(_new_pgno)) => {
+                                self.note_split_event();
+                                // Invalidate cursor stack as tree structure changed.
+                                self.stack.clear();
+                                self.at_eof = true;
+                                return Ok(());
+                            }
+                            Ok(None) => {}
+                            Err(err) => return Err(err),
                         }
                     }
                 }

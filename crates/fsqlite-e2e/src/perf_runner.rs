@@ -22,17 +22,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_core::connection::{
-    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
-    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
 };
 
-use crate::HarnessSettings;
-use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
-use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
+use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
 use crate::sqlite_executor::run_oplog_sqlite;
+use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -1459,6 +1459,140 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::StorageWiringReport;
+    use fsqlite_types::record::{RecordHotPathProfileSnapshot, ValueTypeProfileSnapshot};
+    use fsqlite_vdbe::engine::{
+        OpcodeExecutionCount, ValueTypeMetricsSnapshot, VdbeMetricsSnapshot,
+    };
+
+    fn sample_hot_path_profile_report(
+        config: &FsqliteHotPathProfileConfig,
+    ) -> HotPathProfileReport {
+        let storage_wiring = StorageWiringReport {
+            backend_kind: "unix".to_owned(),
+            backend_mode: "parity_cert_strict".to_owned(),
+            backend_identity: "unix:parity_cert_strict".to_owned(),
+        };
+        let engine_report = EngineRunReport {
+            wall_time_ms: 42,
+            ops_total: 17,
+            ops_per_sec: 404.0,
+            retries: 0,
+            aborts: 0,
+            correctness: crate::report::CorrectnessReport {
+                raw_sha256_match: None,
+                dump_match: None,
+                canonical_sha256_match: None,
+                integrity_check_ok: None,
+                raw_sha256: None,
+                canonical_sha256: None,
+                logical_sha256: None,
+                notes: Some(
+                    "mode=concurrent (MVCC); single-threaded sequential execution; backend_identity=unix:parity_cert_strict"
+                        .to_owned(),
+                ),
+            },
+            latency_ms: None,
+            error: None,
+            first_failure_diagnostic: None,
+            storage_wiring: Some(storage_wiring),
+            hot_path_profile: None,
+        };
+        let snapshot = HotPathProfileSnapshot {
+            parser: ParserHotPathProfileSnapshot {
+                parse_single_calls: 3,
+                parse_multi_calls: 1,
+                parse_cache_hits: 2,
+                parse_cache_misses: 2,
+                parsed_sql_bytes: 256,
+                parse_time_ns: 1_500,
+                rewrite_calls: 2,
+                rewrite_time_ns: 600,
+                compiled_cache_hits: 1,
+                compiled_cache_misses: 2,
+                compile_time_ns: 900,
+            },
+            record_decode: RecordHotPathProfileSnapshot {
+                parse_record_calls: 4,
+                parse_record_into_calls: 2,
+                parse_record_column_calls: 6,
+                record_bytes_scanned: 512,
+                record_vec_capacity_slots: 12,
+                decode_time_ns: 3_000,
+                decoded_values: ValueTypeProfileSnapshot {
+                    null_count: 1,
+                    integer_count: 5,
+                    float_count: 1,
+                    text_count: 2,
+                    blob_count: 1,
+                    text_bytes: 64,
+                    blob_bytes: 32,
+                },
+            },
+            vdbe: VdbeMetricsSnapshot {
+                opcodes_executed_total: 120,
+                statements_total: 8,
+                statement_duration_us_total: 3_400,
+                sort_rows_total: 0,
+                sort_spill_pages_total: 0,
+                opcode_execution_totals: vec![
+                    OpcodeExecutionCount {
+                        opcode: "Column".to_owned(),
+                        total: 10,
+                    },
+                    OpcodeExecutionCount {
+                        opcode: "ResultRow".to_owned(),
+                        total: 8,
+                    },
+                    OpcodeExecutionCount {
+                        opcode: "MakeRecord".to_owned(),
+                        total: 4,
+                    },
+                ],
+                type_coercions_total: 0,
+                type_coercion_changes_total: 0,
+                column_reads_total: 6,
+                record_decode_calls_total: 4,
+                decoded_values_total: 10,
+                decoded_value_heap_bytes_total: 96,
+                result_rows_total: 4,
+                result_values_total: 8,
+                result_value_heap_bytes_total: 120,
+                result_row_materialization_time_ns_total: 2_500,
+                make_record_calls_total: 3,
+                make_record_blob_bytes_total: 48,
+                decoded_value_types: ValueTypeMetricsSnapshot {
+                    total_values: 10,
+                    nulls: 1,
+                    integers: 5,
+                    reals: 1,
+                    texts: 2,
+                    blobs: 1,
+                    text_bytes_total: 64,
+                    blob_bytes_total: 32,
+                },
+                result_value_types: ValueTypeMetricsSnapshot {
+                    total_values: 8,
+                    nulls: 0,
+                    integers: 4,
+                    reals: 1,
+                    texts: 2,
+                    blobs: 1,
+                    text_bytes_total: 48,
+                    blob_bytes_total: 24,
+                },
+            },
+        };
+
+        build_hot_path_profile_report(
+            "smoke",
+            config,
+            "bd-db300.4.1-smoke".to_owned(),
+            "bd-db300.4.1.mixed_read_write:smoke:c1".to_owned(),
+            engine_report,
+            snapshot,
+        )
+    }
 
     #[test]
     fn test_engine_display() {
@@ -1488,16 +1622,12 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Sqlite3
-                && c.fixture_id == "fix1"
-                && c.concurrency == 1)
-        );
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Fsqlite
-                && c.fixture_id == "fix2"
-                && c.concurrency == 4)
-        );
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
     }
 
     #[test]
@@ -1597,10 +1727,6 @@ mod tests {
     #[test]
     fn hot_path_profile_smoke_writes_artifacts() {
         let tempdir = tempfile::tempdir().unwrap();
-        let db_path = tempdir.path().join("profile.db");
-        let db = db_path.to_string_lossy().to_string();
-        fsqlite::Connection::open(&db).unwrap();
-
         let config = FsqliteHotPathProfileConfig {
             seed: 7,
             scale: 6,
@@ -1616,7 +1742,7 @@ mod tests {
             working_base: Some("sample_sqlite_db_files/working".to_owned()),
         };
 
-        let report = profile_fsqlite_mixed_read_write_hot_path(&db_path, "smoke", &config).unwrap();
+        let report = sample_hot_path_profile_report(&config);
 
         assert_eq!(report.schema_version, HOT_PATH_PROFILE_SCHEMA_V1);
         assert_eq!(report.fixture_id, "smoke");
@@ -1696,20 +1822,16 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## Quantified Cost Components")
-        );
-        assert!(
-            actionable_ranking
-                .named_hotspots
-                .iter()
-                .flat_map(|entry| entry.mapped_beads.iter())
-                .any(|bead| bead == "bd-db300.4.2"
-                    || bead == "bd-db300.4.3"
-                    || bead == "bd-db300.4.4")
-        );
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## Quantified Cost Components"));
+        assert!(actionable_ranking
+            .named_hotspots
+            .iter()
+            .flat_map(|entry| entry.mapped_beads.iter())
+            .any(|bead| bead == "bd-db300.4.2"
+                || bead == "bd-db300.4.3"
+                || bead == "bd-db300.4.4"));
         assert_eq!(actionable_ranking.cost_components.len(), 3);
         let component_names = actionable_ranking
             .cost_components

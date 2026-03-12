@@ -452,6 +452,13 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// writes, even if the transaction had previously upgraded to writer mode.
     fn has_pending_writes(&self) -> bool;
 
+    /// Return the full set of pages this transaction would mutate if it
+    /// committed right now, including commit-time metadata synthesis such as
+    /// freelist trunk rewrites.
+    fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        Ok(Vec::new())
+    }
+
     /// Roll back this transaction, discarding the write-set.
     ///
     /// Rollback is infallible in the MVCC model (we simply discard the
@@ -593,6 +600,10 @@ impl TransactionHandle for MockTransaction {
         false
     }
 
+    fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        Ok(Vec::new())
+    }
+
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
@@ -725,6 +736,12 @@ impl TransactionHandle for MemoryMockTransaction {
 
     fn has_pending_writes(&self) -> bool {
         !self.committed && !self.pages.is_empty()
+    }
+
+    fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        let mut pages = self.pages.keys().copied().collect::<Vec<_>>();
+        pages.sort_unstable();
+        Ok(pages)
     }
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {

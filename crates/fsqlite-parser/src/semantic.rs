@@ -1625,6 +1625,37 @@ mod tests {
         assert!(shadowed.is_rowid_alias("id"));
     }
 
+    #[test]
+    fn test_table_rowid_alias_disabled_for_without_rowid_tables() {
+        let mut schema = Schema::new();
+        schema.add_table(TableDef {
+            name: "wr".to_owned(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_owned(),
+                    affinity: TypeAffinity::Integer,
+                    is_ipk: true,
+                    not_null: true,
+                },
+                ColumnDef {
+                    name: "payload".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                },
+            ],
+            without_rowid: true,
+            strict: false,
+        });
+
+        let wr = schema.find_table("wr").unwrap();
+        assert!(!wr.is_rowid_alias("rowid"));
+        assert!(!wr.is_rowid_alias("_rowid_"));
+        assert!(!wr.is_rowid_alias("oid"));
+        assert!(!wr.is_rowid_alias("id"));
+        assert!(wr.has_column("id"));
+    }
+
     // ── Scope tests ──
 
     #[test]

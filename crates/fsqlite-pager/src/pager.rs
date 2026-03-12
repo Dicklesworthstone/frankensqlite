@@ -1892,6 +1892,37 @@ impl<V: Vfs> SimpleTransaction<V> {
             db_growth: max_written > current_db_size,
         }
     }
+
+    fn predicted_commit_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
+        let mut pages = self.write_pages_sorted.clone();
+        let freelist_dirty = self.freelist_metadata_dirty();
+
+        if freelist_dirty && inner.db_size != 0 {
+            let upper_bound = inner.next_page.saturating_sub(1).max(inner.db_size);
+            let mut freelist = inner.freelist.clone();
+            return_pages_to_freelist(&mut freelist, self.freed_pages.iter().copied());
+            let freelist = normalize_freelist(&freelist, upper_bound);
+            if !freelist.is_empty() {
+                let max_leaf_entries = (inner.page_size.as_usize() / 4).saturating_sub(2).max(1);
+                let trunk_count = freelist.len().div_ceil(max_leaf_entries + 1);
+                pages.extend(freelist.into_iter().take(trunk_count));
+            }
+        }
+
+        let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+        let must_write_page1 = if self.journal_mode == JournalMode::Wal {
+            wal_page1_plan.requires_page_one_rewrite()
+        } else {
+            !self.write_set.is_empty() || freelist_dirty
+        };
+        if must_write_page1 {
+            pages.push(PageNumber::ONE);
+        }
+
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
 }
 
 fn cleanup_child_cx(cx: &Cx) -> Cx {
@@ -2241,7 +2272,25 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        if let Some(page) = inner.freelist.pop() {
+        if self.mode == TransactionMode::Concurrent {
+            // Concurrent transactions read against a fixed snapshot. Pages at
+            // or below db_size are part of the committed image for some
+            // snapshot, so reusing them from the live global freelist is not
+            // safe without versioned freelist metadata. Pages above db_size are
+            // different: they only exist because an earlier concurrent
+            // transaction allocated EOF pages and then rolled back, so reusing
+            // them cannot violate snapshot visibility and avoids page-count
+            // holes.
+            if let Some(idx) = inner
+                .freelist
+                .iter()
+                .position(|page| page.get() > inner.db_size)
+            {
+                let page = inner.freelist.swap_remove(idx);
+                self.allocated_from_freelist.push(page);
+                return Ok(page);
+            }
+        } else if let Some(page) = inner.freelist.pop() {
             self.allocated_from_freelist.push(page);
             return Ok(page);
         }
@@ -2436,7 +2485,18 @@ where
     }
 
     fn has_pending_writes(&self) -> bool {
-        !self.write_set.is_empty() || !self.freed_pages.is_empty()
+        !self.write_set.is_empty() || self.freelist_metadata_dirty()
+    }
+
+    fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        if !self.has_pending_writes() {
+            return Ok(Vec::new());
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(self.predicted_commit_pages_with_inner(&inner))
     }
 
     fn rollback(&mut self, cx: &Cx) -> Result<()> {
@@ -8103,6 +8163,60 @@ mod tests {
             inner.db_size, 3,
             "bead_id={BEAD_ID} case=concurrent_rollback_does_not_skip_page_numbers"
         );
+    }
+
+    #[test]
+    fn test_concurrent_allocate_ignores_global_freelist_pages() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = seed.allocate_page(&cx).unwrap();
+        let p3 = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+        seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+        seed.commit(&cx).unwrap();
+
+        let mut free_txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        free_txn.free_page(&cx, p2).unwrap();
+        free_txn.commit(&cx).unwrap();
+
+        let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let allocated = concurrent.allocate_page(&cx).unwrap();
+        assert_eq!(
+            allocated.get(),
+            p3.get() + 1,
+            "bead_id={BEAD_ID} case=concurrent_allocate_must_not_reuse_global_freelist_pages"
+        );
+        concurrent.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_allocate_reuses_beyond_db_size_freelist_pages() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let p2 = abandoned.allocate_page(&cx).unwrap();
+        let p3 = abandoned.allocate_page(&cx).unwrap();
+        abandoned.write_page(&cx, p2, &vec![0x33; ps]).unwrap();
+        abandoned.write_page(&cx, p3, &vec![0x44; ps]).unwrap();
+        abandoned.rollback(&cx).unwrap();
+
+        let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let reused1 = concurrent.allocate_page(&cx).unwrap();
+        let reused2 = concurrent.allocate_page(&cx).unwrap();
+        assert!(
+            reused1 != reused2 && [p2, p3].contains(&reused1) && [p2, p3].contains(&reused2),
+            "bead_id={BEAD_ID} case=concurrent_allocate_reuses_beyond_db_size_freelist_pages reused=({}, {}) expected=({}, {})",
+            reused1.get(),
+            reused2.get(),
+            p2.get(),
+            p3.get()
+        );
+        concurrent.rollback(&cx).unwrap();
     }
 
     #[test]

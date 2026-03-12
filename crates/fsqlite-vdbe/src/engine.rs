@@ -32,8 +32,10 @@ use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::{
     CommitIndex, CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError,
-    TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_read_page,
-    concurrent_write_page, create_time_travel_snapshot,
+    TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_free_page,
+    concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
+    concurrent_restore_page_state, concurrent_track_write_conflict_page, concurrent_write_page,
+    create_time_travel_snapshot,
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
@@ -45,6 +47,12 @@ use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnTy
 use crate::VdbeProgram;
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 256;
+/// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes emitted from
+/// UPDATE rewrites.
+///
+/// The low 4 bits of `Insert.p5` are reserved for OE_* conflict behavior in
+/// this engine, so the UPDATE marker must live above them.
+const OPFLAG_ISUPDATE: u16 = 0x10;
 
 #[inline]
 fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
@@ -874,6 +882,144 @@ fn perform_busy_retry_handoff(wait: BusyRetryWait) {
     }
 }
 
+fn track_concurrent_conflict_only_page(
+    cx: &Cx,
+    ctx: &ConcurrentContext,
+    page_no: PageNumber,
+    operation: &str,
+) -> Result<()> {
+    let started = Instant::now();
+    let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+    let mut handoff = BusyRetryHandoff::default();
+
+    loop {
+        observe_execution_cancellation(cx)?;
+        let (txn_id, snapshot_high, conflicting_commit_seq) = {
+            let guard = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "MVCC session {} not found in registry during {operation}",
+                    ctx.session_id
+                ))
+            })?;
+            let snapshot_high = handle.snapshot().high;
+            let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
+                .then(|| ctx.commit_index.latest(page_no))
+                .flatten()
+                .filter(|seq| *seq > snapshot_high);
+            (
+                handle.txn_token().id.get(),
+                snapshot_high.get(),
+                conflicting_commit_seq,
+            )
+        };
+
+        if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+            tracing::warn!(
+                txn_id,
+                commit_seq = conflicting_commit_seq.get(),
+                snapshot_high,
+                page_id = page_no.get(),
+                visibility_decision = "conflict_only_snapshot_stale",
+                conflict_reason = "fcw_base_drift",
+                operation,
+                "mvcc conflict-only page rejected due to stale snapshot"
+            );
+            return Err(FrankenError::BusySnapshot {
+                conflicting_pages: page_no.get().to_string(),
+            });
+        }
+
+        let (track_result, txn_id, snapshot_high) = {
+            let mut guard = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "MVCC session {} not found in registry during {operation}",
+                    ctx.session_id
+                ))
+            })?;
+            let txn_id = handle.txn_token().id.get();
+            let snapshot_high = handle.snapshot().high.get();
+            let track_result = concurrent_track_write_conflict_page(
+                handle,
+                &ctx.lock_table,
+                ctx.session_id,
+                page_no,
+            );
+            (track_result, txn_id, snapshot_high)
+        };
+
+        match track_result {
+            Ok(()) => {
+                tracing::debug!(
+                    txn_id,
+                    commit_seq = snapshot_high,
+                    snapshot_high,
+                    page_id = page_no.get(),
+                    visibility_decision = "conflict_only_tracked",
+                    conflict_reason = "none",
+                    operation,
+                    "mvcc conflict-only page tracked"
+                );
+                return Ok(());
+            }
+            Err(MvccError::Busy) => {
+                let Some(wait) = handoff.next_wait(started, deadline) else {
+                    tracing::warn!(
+                        txn_id,
+                        commit_seq = snapshot_high,
+                        snapshot_high,
+                        page_id = page_no.get(),
+                        visibility_decision = "conflict_only_busy_timeout",
+                        conflict_reason = "page_lock_busy",
+                        operation,
+                        retry_policy = "bounded_handoff",
+                        "mvcc conflict-only page exceeded busy timeout"
+                    );
+                    return Err(FrankenError::Busy);
+                };
+
+                tracing::warn!(
+                    txn_id,
+                    commit_seq = snapshot_high,
+                    snapshot_high,
+                    page_id = page_no.get(),
+                    visibility_decision = "conflict_only_retry",
+                    conflict_reason = "page_lock_busy",
+                    operation,
+                    retry_policy = "bounded_handoff",
+                    retry_attempt = wait.attempt,
+                    retry_spin_loops = wait.spin_loops,
+                    retry_yielded = wait.yielded,
+                    "mvcc conflict-only page contention detected"
+                );
+                perform_busy_retry_handoff(wait);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    txn_id,
+                    commit_seq = snapshot_high,
+                    snapshot_high,
+                    page_id = page_no.get(),
+                    visibility_decision = "conflict_only_abort",
+                    conflict_reason = %e,
+                    operation,
+                    "mvcc conflict-only page tracking failed"
+                );
+                return Err(FrankenError::Internal(format!(
+                    "MVCC conflict-only page tracking failed: {e}"
+                )));
+            }
+        }
+    }
+}
+
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         if let Some(ctx) = &self.concurrent {
@@ -891,6 +1037,15 @@ impl PageReader for SharedTxnPageIo {
             })?;
             let txn_id = handle.txn_token().id.get();
             let snapshot_high = handle.snapshot().high.get();
+            if concurrent_page_is_freed(handle, page_no) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "page {} was freed earlier in concurrent transaction {}",
+                        page_no.get(),
+                        txn_id
+                    ),
+                });
+            }
             let write_set_page = concurrent_read_page(handle, page_no).cloned();
             handle.record_read(page_no);
 
@@ -941,7 +1096,7 @@ impl PageReader for SharedTxnPageIo {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(handle) = guard.get(ctx.session_id) {
-                return handle.write_set().contains_key(&page_no);
+                return handle.tracks_write_conflict_page(page_no);
             }
         }
         false
@@ -951,6 +1106,23 @@ impl PageReader for SharedTxnPageIo {
 impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         // bd-kivg / 5E.2: Acquire page-level lock and record in write set if concurrent.
+        let prior_page_state = self
+            .concurrent
+            .as_ref()
+            .map(|ctx| {
+                let guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing in registry before write_page",
+                        ctx.session_id
+                    ))
+                })?;
+                Ok::<_, FrankenError>(concurrent_page_state(handle, page_no))
+            })
+            .transpose()?;
         if let Some(ref ctx) = self.concurrent {
             let started = Instant::now();
             let deadline = Duration::from_millis(ctx.busy_timeout_ms);
@@ -973,7 +1145,7 @@ impl PageWriter for SharedTxnPageIo {
                         ))
                     })?;
                     let snapshot_high = handle.snapshot().high;
-                    let conflicting_commit_seq = (!handle.write_set().contains_key(&page_no))
+                    let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
                         .then(|| ctx.commit_index.latest(page_no))
                         .flatten()
                         .filter(|seq| *seq > snapshot_high);
@@ -1083,15 +1255,325 @@ impl PageWriter for SharedTxnPageIo {
             }
         }
         // Persist to the underlying transaction.
-        self.txn.borrow_mut().write_page(cx, page_no, data)
+        let write_result = self.txn.borrow_mut().write_page(cx, page_no, data);
+        if let Err(write_error) = write_result {
+            if let (Some(ctx), Some(prior_page_state)) =
+                (&self.concurrent, prior_page_state.as_ref())
+            {
+                let mut guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing during write rollback",
+                        ctx.session_id
+                    ))
+                })?;
+                if let Err(restore_error) = concurrent_restore_page_state(
+                    handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    prior_page_state,
+                ) {
+                    return Err(FrankenError::Internal(format!(
+                        "pager write_page failed: {write_error}; MVCC state restore failed: {restore_error}"
+                    )));
+                }
+            }
+            return Err(write_error);
+        }
+        Ok(())
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        self.txn.borrow_mut().allocate_page(cx)
+        let page_one_state = self
+            .concurrent
+            .as_ref()
+            .map(|ctx| {
+                let guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing in registry before allocate_page",
+                        ctx.session_id
+                    ))
+                })?;
+                Ok::<_, FrankenError>(concurrent_page_state(handle, PageNumber::ONE))
+            })
+            .transpose()?;
+        if let Some(ctx) = &self.concurrent {
+            track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "allocate_page")?;
+        }
+        let allocate_result = self.txn.borrow_mut().allocate_page(cx);
+        if let Err(allocate_error) = &allocate_result {
+            if let (Some(ctx), Some(page_one_state)) = (&self.concurrent, page_one_state.as_ref()) {
+                let mut guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing during allocate rollback",
+                        ctx.session_id
+                    ))
+                })?;
+                if let Err(restore_error) = concurrent_restore_page_state(
+                    handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    page_one_state,
+                ) {
+                    return Err(FrankenError::Internal(format!(
+                        "pager allocate_page failed: {allocate_error}; MVCC state restore failed: {restore_error}"
+                    )));
+                }
+            }
+        }
+        allocate_result
     }
 
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.txn.borrow_mut().free_page(cx, page_no)
+        let prior_page_state = self
+            .concurrent
+            .as_ref()
+            .map(|ctx| {
+                let guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing in registry before free_page",
+                        ctx.session_id
+                    ))
+                })?;
+                Ok::<_, FrankenError>(concurrent_page_state(handle, page_no))
+            })
+            .transpose()?;
+        let page_one_state = self
+            .concurrent
+            .as_ref()
+            .map(|ctx| {
+                let guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing in registry before free_page(page1)",
+                        ctx.session_id
+                    ))
+                })?;
+                Ok::<_, FrankenError>(concurrent_page_state(handle, PageNumber::ONE))
+            })
+            .transpose()?;
+        if let Some(ref ctx) = self.concurrent {
+            track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "free_page")?;
+            let concurrent_free_result = (|| -> Result<()> {
+                let started = Instant::now();
+                let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+                let mut handoff = BusyRetryHandoff::default();
+
+                loop {
+                    observe_execution_cancellation(cx)?;
+                    let (txn_id, snapshot_high, conflicting_commit_seq) = {
+                        let guard = ctx
+                            .registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let handle = guard.get(ctx.session_id).ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "MVCC session {} not found in registry during free",
+                                ctx.session_id
+                            ))
+                        })?;
+                        let snapshot_high = handle.snapshot().high;
+                        let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
+                            .then(|| ctx.commit_index.latest(page_no))
+                            .flatten()
+                            .filter(|seq| *seq > snapshot_high);
+                        (
+                            handle.txn_token().id.get(),
+                            snapshot_high.get(),
+                            conflicting_commit_seq,
+                        )
+                    };
+
+                    if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                        tracing::warn!(
+                            txn_id,
+                            commit_seq = conflicting_commit_seq.get(),
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "free_snapshot_stale",
+                            conflict_reason = "fcw_base_drift",
+                            "mvcc free rejected due to stale snapshot"
+                        );
+                        return Err(FrankenError::BusySnapshot {
+                            conflicting_pages: page_no.get().to_string(),
+                        });
+                    }
+
+                    let (free_result, txn_id, snapshot_high) = {
+                        let mut guard = ctx
+                            .registry
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "MVCC session {} not found in registry during free",
+                                ctx.session_id
+                            ))
+                        })?;
+                        let txn_id = handle.txn_token().id.get();
+                        let snapshot_high = handle.snapshot().high.get();
+                        let free_result =
+                            concurrent_free_page(handle, &ctx.lock_table, ctx.session_id, page_no);
+                        (free_result, txn_id, snapshot_high)
+                    };
+
+                    match free_result {
+                        Ok(()) => {
+                            tracing::debug!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "free_set_recorded",
+                                conflict_reason = "none",
+                                "mvcc free visibility decision"
+                            );
+                            return Ok(());
+                        }
+                        Err(MvccError::Busy) => {
+                            let Some(wait) = handoff.next_wait(started, deadline) else {
+                                tracing::warn!(
+                                    txn_id,
+                                    commit_seq = snapshot_high,
+                                    snapshot_high,
+                                    page_id = page_no.get(),
+                                    visibility_decision = "free_busy_timeout",
+                                    conflict_reason = "page_lock_busy",
+                                    retry_policy = "bounded_handoff",
+                                    "mvcc free conflict exceeded busy timeout"
+                                );
+                                return Err(FrankenError::Busy);
+                            };
+
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "free_retry",
+                                conflict_reason = "page_lock_busy",
+                                retry_policy = "bounded_handoff",
+                                retry_attempt = wait.attempt,
+                                retry_spin_loops = wait.spin_loops,
+                                retry_yielded = wait.yielded,
+                                "mvcc free conflict detected"
+                            );
+                            perform_busy_retry_handoff(wait);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "free_abort",
+                                conflict_reason = %e,
+                                "mvcc free failed"
+                            );
+                            return Err(FrankenError::Internal(format!(
+                                "MVCC free_page failed: {e}"
+                            )));
+                        }
+                    }
+                }
+            })();
+            if let Err(error) = concurrent_free_result {
+                let mut guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing during free rollback",
+                        ctx.session_id
+                    ))
+                })?;
+                if let Some(prior_page_state) = prior_page_state.as_ref()
+                    && let Err(restore_error) = concurrent_restore_page_state(
+                        handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        prior_page_state,
+                    )
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "{error}; MVCC page restore failed: {restore_error}"
+                    )));
+                }
+                if let Some(page_one_state) = page_one_state.as_ref()
+                    && let Err(restore_error) = concurrent_restore_page_state(
+                        handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_one_state,
+                    )
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "{error}; MVCC page1 restore failed: {restore_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+        let free_result = self.txn.borrow_mut().free_page(cx, page_no);
+        if let Err(free_error) = free_result {
+            if let (Some(ctx), Some(prior_page_state)) =
+                (&self.concurrent, prior_page_state.as_ref())
+            {
+                let mut guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} missing during free rollback",
+                        ctx.session_id
+                    ))
+                })?;
+                if let Err(restore_error) = concurrent_restore_page_state(
+                    handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    prior_page_state,
+                ) {
+                    return Err(FrankenError::Internal(format!(
+                        "pager free_page failed: {free_error}; MVCC state restore failed: {restore_error}"
+                    )));
+                }
+                if let Some(page_one_state) = page_one_state.as_ref() {
+                    if let Err(restore_error) = concurrent_restore_page_state(
+                        handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_one_state,
+                    ) {
+                        return Err(FrankenError::Internal(format!(
+                            "pager free_page failed: {free_error}; MVCC page1 restore failed: {restore_error}"
+                        )));
+                    }
+                }
+            }
+            return Err(free_error);
+        }
+        Ok(())
     }
 
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
@@ -2756,19 +3238,25 @@ pub struct VdbeEngine {
     changes: usize,
     /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
     last_insert_rowid: i64,
+    /// Whether this execution recorded a real last-insert rowid.
+    last_insert_rowid_valid: bool,
     /// Cursor ID used by the last Insert opcode (for conflict resolution in
     /// `IdxInsert`: allows the index handler to undo or replace the table row).
     last_insert_cursor_id: Option<i32>,
+    /// Deleted-row state for UPDATE's delete+insert rewrite. When the
+    /// replacement row later conflicts, we must restore the original row.
+    pending_update_restore: Option<PendingUpdateRestore>,
     /// Provisional table insert metadata kept until later `IdxInsert`
-    /// opcodes either succeed or roll the row back under `OE_IGNORE`.
+    /// opcodes either succeed or roll the row back after a secondary-index
+    /// conflict.
     pending_insert_rollback: Option<PendingInsertRollback>,
     /// When true, a UNIQUE conflict with IGNORE was detected during an
     /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
     /// skipped.
     conflict_skip_idx: bool,
     /// Index entries inserted for the current row (cursor_id, key_bytes).
-    /// On IGNORE conflict rollback, these entries must be deleted to avoid
-    /// phantom index entries blocking future inserts.
+    /// On secondary-index conflict rollback, these entries must be deleted to
+    /// avoid phantom index entries blocking future inserts.
     pending_idx_entries: Vec<(i32, Vec<u8>)>,
     /// RowSet data structures for OR-optimized queries (keyed by register).
     rowsets: SwissIndex<i32, RowSet>,
@@ -3009,13 +3497,29 @@ struct AggregateContext {
     distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
 }
 
-/// Metadata for a provisional table insert that may need to be undone if a
-/// later UNIQUE index write resolves to `OE_IGNORE`.
-#[derive(Debug, Clone, Copy)]
+/// Original-row state captured for UPDATE's delete+insert rewrite so the old
+/// row can be restored if the replacement later hits a conflict.
+#[derive(Debug, Clone)]
+enum PendingUpdateRestore {
+    Storage {
+        cursor_id: i32,
+        rowid: i64,
+        payload: Vec<u8>,
+    },
+    Mem {
+        root_page: i32,
+        rowid: i64,
+        values: Vec<SqliteValue>,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct PendingInsertRollback {
     cursor_id: i32,
     rowid: i64,
     previous_last_insert_rowid: i64,
+    previous_last_insert_rowid_valid: bool,
+    update_restore: Option<PendingUpdateRestore>,
 }
 
 /// Per-accumulator window function context (for `AggInverse` / `AggValue`).
@@ -3121,7 +3625,9 @@ impl VdbeEngine {
             last_compare_result: None,
             changes: 0,
             last_insert_rowid: 0,
+            last_insert_rowid_valid: false,
             last_insert_cursor_id: None,
+            pending_update_restore: None,
             pending_insert_rollback: None,
             conflict_skip_idx: false,
             pending_idx_entries: Vec::new(),
@@ -3152,9 +3658,11 @@ impl VdbeEngine {
         self.changes
     }
 
-    /// Returns the rowid of the last INSERT operation.
-    pub fn last_insert_rowid(&self) -> i64 {
-        self.last_insert_rowid
+    /// Returns the rowid of the last INSERT operation, if this execution
+    /// performed a real INSERT that updated `last_insert_rowid()`.
+    pub fn last_insert_rowid(&self) -> Option<i64> {
+        self.last_insert_rowid_valid
+            .then_some(self.last_insert_rowid)
     }
 
     /// Returns the time-travel marker for a cursor, if any.
@@ -3258,6 +3766,99 @@ impl VdbeEngine {
             tsc.cursor.delete(&tsc.cx)?;
         }
 
+        Ok(())
+    }
+
+    fn rollback_pending_insert_after_index_conflict(&mut self) -> Result<()> {
+        let entries = std::mem::take(&mut self.pending_idx_entries);
+        for (idx_cid, idx_key) in entries {
+            if let Some(isc) = self.storage_cursors.get_mut(&idx_cid)
+                && isc.cursor.index_move_to(&isc.cx, &idx_key)?.is_found()
+            {
+                isc.cursor.delete(&isc.cx)?;
+            }
+        }
+
+        let rollback = self.pending_insert_rollback.take().ok_or_else(|| {
+            FrankenError::internal("secondary-index conflict without pending table insert")
+        })?;
+        let tsc = self
+            .storage_cursors
+            .get_mut(&rollback.cursor_id)
+            .ok_or_else(|| {
+                FrankenError::internal("table cursor missing during secondary-index rollback")
+            })?;
+        if !tsc
+            .cursor
+            .table_move_to(&tsc.cx, rollback.rowid)?
+            .is_found()
+        {
+            return Err(FrankenError::internal(
+                "failed to locate provisional table row during secondary-index rollback",
+            ));
+        }
+        tsc.cursor.delete(&tsc.cx)?;
+        self.changes = self.changes.checked_sub(1).ok_or_else(|| {
+            FrankenError::internal("secondary-index rollback underflowed change counter")
+        })?;
+        if let Some(update_restore) = rollback.update_restore {
+            self.restore_pending_update_after_conflict(update_restore)?;
+        }
+        self.last_insert_rowid = rollback.previous_last_insert_rowid;
+        self.last_insert_rowid_valid = rollback.previous_last_insert_rowid_valid;
+        self.last_insert_cursor_id = None;
+        Ok(())
+    }
+
+    fn restore_pending_update_after_conflict(
+        &mut self,
+        restore: PendingUpdateRestore,
+    ) -> Result<()> {
+        match restore {
+            PendingUpdateRestore::Storage {
+                cursor_id,
+                rowid,
+                payload,
+            } => {
+                let tsc = self.storage_cursors.get_mut(&cursor_id).ok_or_else(|| {
+                    FrankenError::internal("table cursor missing during UPDATE conflict restore")
+                })?;
+                tsc.cursor.table_insert(&tsc.cx, rowid, &payload)?;
+
+                if let Some(index_metas) = self.table_index_meta.get(&cursor_id).cloned() {
+                    let old_row = parse_record(&payload).ok_or_else(|| {
+                        FrankenError::internal(
+                            "UPDATE conflict restore could not decode original row payload",
+                        )
+                    })?;
+                    for meta in &index_metas {
+                        let mut key_values =
+                            Vec::with_capacity(meta.column_indices.len().saturating_add(1));
+                        for &col_idx in &meta.column_indices {
+                            key_values
+                                .push(old_row.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                        }
+                        key_values.push(SqliteValue::Integer(rowid));
+                        let key_bytes = encode_record(&key_values);
+                        if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
+                            && sc.writable
+                        {
+                            sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+                        }
+                    }
+                }
+            }
+            PendingUpdateRestore::Mem {
+                root_page,
+                rowid,
+                values,
+            } => {
+                let db = self.db.as_mut().ok_or_else(|| {
+                    FrankenError::internal("MemDatabase missing during UPDATE conflict restore")
+                })?;
+                db.upsert_row(root_page, rowid, values);
+            }
+        }
         Ok(())
     }
 
@@ -3476,7 +4077,9 @@ impl VdbeEngine {
         self.last_compare_result = None;
         self.changes = 0;
         self.last_insert_rowid = 0;
+        self.last_insert_rowid_valid = false;
         self.last_insert_cursor_id = None;
+        self.pending_update_restore = None;
         self.pending_insert_rollback = None;
         self.conflict_skip_idx = false;
         self.pending_idx_entries.clear();
@@ -5389,16 +5992,25 @@ impl VdbeEngine {
                 Opcode::Insert => {
                     // Insert record in register p2 with rowid from register p3
                     // into cursor p1. p5 encodes conflict resolution mode:
-                    // 1=ROLLBACK, 2=ABORT (default), 3=FAIL, 4=IGNORE, 5=REPLACE
+                    // 1=ROLLBACK, 2=ABORT (default), 3=FAIL, 4=IGNORE, 5=REPLACE.
+                    // Higher bits carry OPFLAG_* metadata.
                     //
                     // OE_* constants matching SQLite (4=IGNORE, 5=REPLACE)
                     let cursor_id = op.p1;
                     let record_reg = op.p2;
                     let rowid_reg = op.p3;
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
+                    let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
                     let previous_last_insert_rowid = self.last_insert_rowid;
+                    let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
+                    let pending_update_restore = if is_update {
+                        self.pending_update_restore.take()
+                    } else {
+                        self.pending_update_restore = None;
+                        None
+                    };
                     let pk_conflict = ExecOutcome::Error {
                         code: ErrorCode::Constraint as i32,
                         message: "PRIMARY KEY constraint failed".to_owned(),
@@ -5414,11 +6026,10 @@ impl VdbeEngine {
                             let exists = sc.cursor.table_move_to(&sc.cx, rowid)?.is_found();
 
                             if exists {
-                                // Match on OE_* mode value — p5 is NOT a
-                                // bitfield, so do NOT use bit-flag checks
-                                // like `(op.p5 & 0x04)`.  OE_IGNORE == 4
-                                // would collide with a hypothetical
-                                // OPFLAG_ISUPDATE bit at 0x04.
+                                // Match on the low OE_* bits directly — p5 is
+                                // not a plain bitfield in this engine because
+                                // it also carries the custom OPFLAG_ISUPDATE
+                                // bit above the conflict-mode nibble.
                                 if oe_flag == 5 {
                                     // OE_REPLACE: Delete old, insert new
                                     self.native_replace_row(cursor_id, rowid)?;
@@ -5433,8 +6044,14 @@ impl VdbeEngine {
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
                                     // OE_IGNORE: Skip insert for conflicting row
+                                    if let Some(update_restore) = pending_update_restore.clone() {
+                                        self.restore_pending_update_after_conflict(update_restore)?;
+                                    }
                                 } else {
                                     // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                    if let Some(update_restore) = pending_update_restore.clone() {
+                                        self.restore_pending_update_after_conflict(update_restore)?;
+                                    }
                                     break pk_conflict;
                                 }
                             } else {
@@ -5468,6 +6085,12 @@ impl VdbeEngine {
                                 match oe_flag {
                                     4 => {
                                         // OE_IGNORE: Skip insert for conflicting row
+                                        if let Some(update_restore) = pending_update_restore.clone()
+                                        {
+                                            self.restore_pending_update_after_conflict(
+                                                update_restore,
+                                            )?;
+                                        }
                                     }
                                     5 => {
                                         // OE_REPLACE: Delete conflicting row(s),
@@ -5486,6 +6109,12 @@ impl VdbeEngine {
                                     }
                                     _ => {
                                         // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                        if let Some(update_restore) = pending_update_restore.clone()
+                                        {
+                                            self.restore_pending_update_after_conflict(
+                                                update_restore,
+                                            )?;
+                                        }
                                         break pk_conflict;
                                     }
                                 }
@@ -5501,11 +6130,16 @@ impl VdbeEngine {
                     // C SQLite does not update last_insert_rowid() when IGNORE skips.
                     if actually_inserted {
                         self.changes += 1;
-                        self.last_insert_rowid = rowid;
+                        if !is_update {
+                            self.last_insert_rowid = rowid;
+                            self.last_insert_rowid_valid = true;
+                        }
                         self.pending_insert_rollback = Some(PendingInsertRollback {
                             cursor_id,
                             rowid,
                             previous_last_insert_rowid,
+                            previous_last_insert_rowid_valid,
+                            update_restore: pending_update_restore,
                         });
                     } else {
                         self.pending_insert_rollback = None;
@@ -5533,12 +6167,21 @@ impl VdbeEngine {
                 Opcode::Delete => {
                     // Delete the row at the current cursor position.
                     let cursor_id = op.p1;
+                    let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let mut deleted = false;
+                    let mut update_restore = None;
                     // Phase 5B.3 (bd-1r0d): write-through — route ONLY through
                     // storage cursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
+                            if is_update {
+                                update_restore = Some(PendingUpdateRestore::Storage {
+                                    cursor_id,
+                                    rowid: sc.cursor.rowid(&sc.cx)?,
+                                    payload: sc.cursor.payload(&sc.cx)?,
+                                });
+                            }
                             sc.cursor.delete(&sc.cx)?;
                             deleted = true;
                         }
@@ -5552,12 +6195,25 @@ impl VdbeEngine {
                                 .and_then(|db| db.get_table(root))
                                 .is_some_and(|table| pos < table.rows.len());
                             if can_delete && let Some(db) = self.db.as_mut() {
+                                if is_update
+                                    && let Some(row) = db
+                                        .get_table(root)
+                                        .and_then(|table| table.rows.get(pos))
+                                        .cloned()
+                                {
+                                    update_restore = Some(PendingUpdateRestore::Mem {
+                                        root_page: root,
+                                        rowid: row.rowid,
+                                        values: row.values,
+                                    });
+                                }
                                 db.delete_at(root, pos);
                                 deleted = true;
                             }
                         }
                     }
                     if deleted {
+                        self.pending_update_restore = if is_update { update_restore } else { None };
                         // P5 bit 0 = OPFLAG_NCHANGE: only count standalone
                         // DELETE changes. UPDATE's internal Delete uses P5=0
                         // so only the subsequent Insert counts.
@@ -5565,6 +6221,8 @@ impl VdbeEngine {
                             self.changes += 1;
                         }
                         self.pending_next_after_delete.insert(cursor_id);
+                    } else if is_update {
+                        self.pending_update_restore = None;
                     }
                     pc += 1;
                 }
@@ -5616,65 +6274,8 @@ impl VdbeEngine {
                                             // insert, roll back any already-inserted
                                             // index entries, and skip remaining indexes.
                                             4 => {
-                                                // Roll back index entries inserted
-                                                // earlier for this row.
-                                                let entries =
-                                                    std::mem::take(&mut self.pending_idx_entries);
-                                                for (idx_cid, idx_key) in &entries {
-                                                    if let Some(isc) =
-                                                        self.storage_cursors.get_mut(idx_cid)
-                                                    {
-                                                        if isc
-                                                            .cursor
-                                                            .index_move_to(&isc.cx, idx_key)?
-                                                            .is_found()
-                                                        {
-                                                            isc.cursor.delete(&isc.cx)?;
-                                                        }
-                                                    }
-                                                }
-
-                                                let rollback = self
-                                                    .pending_insert_rollback
-                                                    .take()
-                                                    .ok_or_else(|| {
-                                                        FrankenError::internal(
-                                                            "UNIQUE IGNORE conflict without \
-                                                             pending table insert",
-                                                        )
-                                                    })?;
-                                                let tsc = self
-                                                    .storage_cursors
-                                                    .get_mut(&rollback.cursor_id)
-                                                    .ok_or_else(|| {
-                                                        FrankenError::internal(
-                                                            "table cursor missing during \
-                                                             UNIQUE IGNORE rollback",
-                                                        )
-                                                    })?;
-                                                if !tsc
-                                                    .cursor
-                                                    .table_move_to(&tsc.cx, rollback.rowid)?
-                                                    .is_found()
-                                                {
-                                                    return Err(FrankenError::internal(
-                                                        "failed to locate provisional table row \
-                                                         during UNIQUE IGNORE rollback",
-                                                    ));
-                                                }
-                                                tsc.cursor.delete(&tsc.cx)?;
-                                                self.changes = self
-                                                    .changes
-                                                    .checked_sub(1)
-                                                    .ok_or_else(|| {
-                                                        FrankenError::internal(
-                                                            "UNIQUE IGNORE rollback underflowed \
-                                                             change counter",
-                                                        )
-                                                    })?;
-                                                self.last_insert_rowid =
-                                                    rollback.previous_last_insert_rowid;
-                                                self.last_insert_cursor_id = None;
+                                                self.rollback_pending_insert_after_index_conflict(
+                                                )?;
                                                 self.conflict_skip_idx = true;
                                                 pc += 1;
                                                 continue;
@@ -5716,6 +6317,8 @@ impl VdbeEngine {
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
                                             _ => {
+                                                self.rollback_pending_insert_after_index_conflict(
+                                                )?;
                                                 return Err(FrankenError::UniqueViolation {
                                                     columns: columns_label.to_owned(),
                                                 });
@@ -9061,14 +9664,14 @@ mod tests {
             ExecOutcome::Done
         );
         assert_eq!(engine.changes(), 1);
-        assert_eq!(engine.last_insert_rowid(), 1);
+        assert_eq!(engine.last_insert_rowid(), Some(1));
 
         assert_eq!(
             engine.execute(&noop_program).expect("noop execution"),
             ExecOutcome::Done
         );
         assert_eq!(engine.changes(), 0);
-        assert_eq!(engine.last_insert_rowid(), 0);
+        assert_eq!(engine.last_insert_rowid(), None);
     }
 
     #[test]
@@ -9100,7 +9703,36 @@ mod tests {
         );
         assert!(engine.results().is_empty());
         assert_eq!(engine.changes(), 0);
-        assert_eq!(engine.last_insert_rowid(), 0);
+        assert_eq!(engine.last_insert_rowid(), None);
+    }
+
+    #[test]
+    fn test_execute_insert_with_explicit_rowid_zero_tracks_last_insert_rowid() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut builder = ProgramBuilder::new();
+        let end = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        builder.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        builder.emit_op(Opcode::Integer, 0, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+        builder.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        builder.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        builder.resolve_label(end);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert_eq!(
+            engine.execute(&program).expect("insert execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(engine.changes(), 1);
+        assert_eq!(engine.last_insert_rowid(), Some(0));
     }
 
     #[test]
@@ -15345,10 +15977,9 @@ mod tests {
 
         let mut engine =
             VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
-        let vtab =
-            MockVtab::new(MockVtabCursor::with_filter_interrupt(vec![vec![SqliteValue::Integer(
-                7,
-            )]]));
+        let vtab = MockVtab::new(MockVtabCursor::with_filter_interrupt(vec![vec![
+            SqliteValue::Integer(7),
+        ]]));
         engine.register_vtab_instance(0, Box::new(vtab));
 
         let err = engine

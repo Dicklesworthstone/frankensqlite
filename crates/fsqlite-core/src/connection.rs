@@ -33,7 +33,7 @@ use fsqlite_ast::{
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
-use fsqlite_error::{FrankenError, Result};
+use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_ext_fts5::{Fts5Expr, Fts5Table, build_expr, parse_fts5_query};
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
 use fsqlite_ext_misc::GenerateSeriesTable;
@@ -100,8 +100,9 @@ use fsqlite_mvcc::{
     GcTickResult, GcTodo, InProcessPageLockTable, MvccError, PreparedConcurrentCommit,
     SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
     SsiReadSetSummary, VersionStore, concurrent_abort, concurrent_rollback_to_savepoint,
-    concurrent_savepoint, finalize_prepared_concurrent_commit_with_ssi,
-    prepare_concurrent_commit_with_ssi, ssi_metrics_snapshot,
+    concurrent_savepoint, concurrent_track_write_conflict_page,
+    finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
+    ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
@@ -937,6 +938,8 @@ enum PreparedDmlKind {
 struct PreparedPrecompiledDml {
     kind: PreparedDmlKind,
     table_name: String,
+    rollback_on_constraint_violation: bool,
+    preserve_prior_changes_on_constraint_violation: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1192,9 +1195,9 @@ impl PreparedStatement<'_> {
         // that exact execution path so prepared reads observe the connection's
         // uncommitted writes, concurrent session state, and MVCC snapshot.
         if self.conn.active_txn.borrow().is_some() {
-            let (rows, _, _) = self
-                .conn
-                .execute_table_program(self.program.as_ref(), params)?;
+            let (rows, _, _) =
+                self.conn
+                    .execute_table_program(self.program.as_ref(), params, false)?;
             return Ok(rows);
         }
 
@@ -1238,7 +1241,7 @@ impl PreparedStatement<'_> {
         if let Some(ref mut txn) = txn_back {
             txn.commit(op_cx)?;
         }
-        result.map(|(rows, ..)| rows)
+        result.map(|(rows, ..)| rows).map_err(|error| error.error)
     }
 
     /// Execute as a query and return all result rows.
@@ -1965,6 +1968,9 @@ pub struct Connection {
     last_insert_rowid: RefCell<i64>,
     /// Cumulative number of rows changed on this connection.
     total_changes: RefCell<usize>,
+    /// Error-time VDBE change tracking captured before higher layers decide
+    /// whether a failing statement should preserve partial progress.
+    last_table_program_error_state: RefCell<Option<TableProgramErrorState>>,
     /// Tracks nested internal statement savepoints so one top-level write
     /// statement can protect all nested trigger/FK work without per-substatement
     /// savepoint churn.
@@ -2207,6 +2213,7 @@ impl Connection {
             last_changes: RefCell::new(0),
             last_insert_rowid: RefCell::new(0),
             total_changes: RefCell::new(0),
+            last_table_program_error_state: RefCell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: RefCell::new(false),
             concurrent_txn: RefCell::new(false),
@@ -2460,6 +2467,11 @@ impl Connection {
         }
     }
 
+    fn apply_attached_statement_tracking(&self, changes: usize) {
+        self.reset_statement_change_count();
+        self.record_statement_changes(changes);
+    }
+
     fn maybe_execute_attached_target_statement(
         &self,
         statement: &Statement,
@@ -2476,6 +2488,9 @@ impl Connection {
                 )?;
                 let mut rewritten = create.clone();
                 rewritten.name.schema = None;
+                if let CreateTableBody::AsSelect(select_stmt) = &mut rewritten.body {
+                    strip_attached_schema_from_select(select_stmt, &target_schema);
+                }
                 tracing::debug!(
                     schema = %target_schema,
                     table = %create.name.name,
@@ -2501,41 +2516,79 @@ impl Connection {
                     table = %insert.table.name,
                     "delegating attached-schema INSERT target"
                 );
+                let preserve_prior_changes_on_constraint_violation =
+                    insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
                 match &rewritten.source {
                     fsqlite_ast::InsertSource::Select(select_stmt) => {
-                        let source_rows =
-                            self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
-                        let (affected, last_insert_rowid) =
+                        let source_rows = self.materialize_insert_select_source_rows(
+                            insert,
+                            select_stmt,
+                            params,
+                        )?;
+                        let (result, changes, last_insert_rowid) =
                             self.with_attached_connection(&target_schema, |conn| {
-                                let affected = conn.execute_insert_select_materialized_rows(
+                                let result = conn.execute_materialized_insert_select_statement(
                                     &rewritten,
                                     &source_rows,
-                                )?;
-                                let last_insert_rowid = (affected > 0
+                                );
+                                let changes = *conn.last_changes.borrow();
+                                let last_insert_rowid = (changes > 0
                                     && conn.attached_table_supports_last_insert_rowid(
                                         &rewritten.table.name,
                                     ))
                                 .then(|| conn.current_last_insert_rowid());
-                                Ok((affected, last_insert_rowid))
+                                Ok((result, changes, last_insert_rowid))
                             })?;
-                        self.apply_attached_insert_tracking(affected, last_insert_rowid);
-                        Ok(Some(Vec::new()))
+                        match result {
+                            Ok(affected) => {
+                                self.apply_attached_insert_tracking(affected, last_insert_rowid);
+                                Ok(Some(Vec::new()))
+                            }
+                            Err(error) => {
+                                if preserve_prior_changes_on_constraint_violation
+                                    && error_is_constraint_violation(&error)
+                                {
+                                    self.apply_attached_insert_tracking(changes, last_insert_rowid);
+                                    self.record_table_program_error_state(
+                                        changes,
+                                        last_insert_rowid,
+                                    );
+                                }
+                                Err(error)
+                            }
+                        }
                     }
                     _ => {
-                        let (rows, changes, last_insert_rowid) =
+                        let (result, changes, last_insert_rowid) =
                             self.with_attached_connection(&target_schema, |conn| {
-                                let rows =
-                                    conn.execute_statement(&Statement::Insert(rewritten), params)?;
+                                let result =
+                                    conn.execute_statement(&Statement::Insert(rewritten), params);
                                 let changes = *conn.last_changes.borrow();
                                 let last_insert_rowid = (changes > 0
                                     && conn.attached_table_supports_last_insert_rowid(
                                         &insert.table.name,
                                     ))
                                 .then(|| conn.current_last_insert_rowid());
-                                Ok((rows, changes, last_insert_rowid))
+                                Ok((result, changes, last_insert_rowid))
                             })?;
-                        self.apply_attached_insert_tracking(changes, last_insert_rowid);
-                        Ok(Some(rows))
+                        match result {
+                            Ok(rows) => {
+                                self.apply_attached_insert_tracking(changes, last_insert_rowid);
+                                Ok(Some(rows))
+                            }
+                            Err(error) => {
+                                if preserve_prior_changes_on_constraint_violation
+                                    && error_is_constraint_violation(&error)
+                                {
+                                    self.apply_attached_insert_tracking(changes, last_insert_rowid);
+                                    self.record_table_program_error_state(
+                                        changes,
+                                        last_insert_rowid,
+                                    );
+                                }
+                                Err(error)
+                            }
+                        }
                     }
                 }
             }
@@ -2549,7 +2602,12 @@ impl Connection {
                 };
                 self.reject_attached_target_write_in_explicit_transaction(
                     "UPDATE",
-                    update.table.name.schema.as_deref().unwrap_or(&target_schema),
+                    update
+                        .table
+                        .name
+                        .schema
+                        .as_deref()
+                        .unwrap_or(&target_schema),
                 )?;
                 let mut rewritten = update.clone();
                 strip_attached_schema_from_update(&mut rewritten, &target_schema);
@@ -2558,13 +2616,41 @@ impl Connection {
                     table = %update.table.name.name,
                     "delegating attached-schema UPDATE target"
                 );
-                let (rows, changes) = self.with_attached_connection(&target_schema, |conn| {
-                    let rows = conn.execute_statement(&Statement::Update(rewritten), params)?;
-                    Ok((rows, *conn.last_changes.borrow()))
+                let preserve_prior_changes_on_constraint_violation =
+                    update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+                let (result, changes) = self.with_attached_connection(&target_schema, |conn| {
+                    let previous_last_insert_rowid = conn.current_last_insert_rowid();
+                    let result = conn.execute_statement(&Statement::Update(rewritten), params);
+                    let changes = *conn.last_changes.borrow();
+                    if preserve_prior_changes_on_constraint_violation
+                        && matches!(
+                            result.as_ref(),
+                            Err(error) if error_is_constraint_violation(error)
+                        )
+                    {
+                        // Attached connections are reused across statements, so
+                        // preserve their own last_insert_rowid() state too.
+                        conn.record_last_insert_rowid(previous_last_insert_rowid);
+                    }
+                    Ok((result, changes))
                 })?;
-                self.reset_statement_change_count();
-                self.record_statement_changes(changes);
-                Ok(Some(rows))
+                match result {
+                    Ok(rows) => {
+                        self.apply_attached_statement_tracking(changes);
+                        Ok(Some(rows))
+                    }
+                    Err(error) => {
+                        if preserve_prior_changes_on_constraint_violation
+                            && error_is_constraint_violation(&error)
+                        {
+                            self.apply_attached_statement_tracking(changes);
+                            // UPDATE must preserve the outer connection's
+                            // prior last_insert_rowid().
+                            self.record_table_program_error_state(changes, None);
+                        }
+                        Err(error)
+                    }
+                }
             }
             Statement::Delete(delete) => {
                 let target_schema = {
@@ -2576,7 +2662,12 @@ impl Connection {
                 };
                 self.reject_attached_target_write_in_explicit_transaction(
                     "DELETE",
-                    delete.table.name.schema.as_deref().unwrap_or(&target_schema),
+                    delete
+                        .table
+                        .name
+                        .schema
+                        .as_deref()
+                        .unwrap_or(&target_schema),
                 )?;
                 let mut rewritten = delete.clone();
                 strip_attached_schema_from_delete(&mut rewritten, &target_schema);
@@ -2844,15 +2935,35 @@ impl Connection {
                 &table_name,
             ) {
                 if let Err(error) = instance.savepoint(cx, level) {
+                    let mut cleanup_errors = Vec::new();
                     for applied in &completed {
                         if let Some(applied_instance) = Self::active_live_vtab_instance_mut(
                             &mut live_instances,
                             &mut dropped_instances,
                             applied,
                         ) {
-                            let _ = applied_instance.rollback_to(cx, level);
-                            let _ = applied_instance.release(cx, level);
+                            match applied_instance.rollback_to(cx, level) {
+                                Ok(()) => {
+                                    if let Err(cleanup_error) = applied_instance.release(cx, level)
+                                    {
+                                        cleanup_errors.push(format!(
+                                            "virtual table {applied} release({level}) failed: {cleanup_error}"
+                                        ));
+                                    }
+                                }
+                                Err(cleanup_error) => {
+                                    cleanup_errors.push(format!(
+                                        "virtual table {applied} rollback_to({level}) failed: {cleanup_error}"
+                                    ));
+                                }
+                            }
                         }
+                    }
+                    if !cleanup_errors.is_empty() {
+                        return Err(FrankenError::Internal(format!(
+                            "virtual table {table_name} savepoint({level}) failed: {error}; cleanup failed: {}",
+                            cleanup_errors.join("; ")
+                        )));
                     }
                     return Err(FrankenError::Internal(format!(
                         "virtual table {table_name} savepoint({level}) failed: {error}"
@@ -2862,6 +2973,67 @@ impl Connection {
             }
         }
         Ok(())
+    }
+
+    fn cleanup_failed_savepoint_setup(
+        &self,
+        cx: &Cx,
+        savepoint_name: &str,
+        concurrent_snapshot: Option<&ConcurrentSavepoint>,
+    ) -> Vec<String> {
+        let mut cleanup_errors = Vec::new();
+        if let Some(concurrent_snap) = concurrent_snapshot {
+            if let Some(session_id) = *self.concurrent_session_id.borrow() {
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                if let Some(handle) = registry.get_mut(session_id) {
+                    if let Err(err) = concurrent_rollback_to_savepoint(handle, concurrent_snap) {
+                        cleanup_errors.push(format!(
+                            "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                        ));
+                        return cleanup_errors;
+                    }
+                } else {
+                    cleanup_errors.push(format!(
+                        "concurrent session {session_id} missing during rollback"
+                    ));
+                    return cleanup_errors;
+                }
+            } else {
+                cleanup_errors.push(
+                    "concurrent transaction active but no session ID during rollback".to_owned(),
+                );
+                return cleanup_errors;
+            }
+        }
+
+        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+            match txn.rollback_to_savepoint(cx, savepoint_name) {
+                Ok(()) => {
+                    if let Err(err) = txn.release_savepoint(cx, savepoint_name) {
+                        cleanup_errors.push(format!(
+                            "pager release_savepoint('{savepoint_name}') failed: {err}"
+                        ));
+                    }
+                }
+                Err(err) => {
+                    cleanup_errors.push(format!(
+                        "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                    ));
+                }
+            }
+        }
+
+        cleanup_errors
+    }
+
+    fn rollback_failed_implicit_savepoint_transaction(&self) -> Option<String> {
+        if !*self.in_transaction.borrow() {
+            return None;
+        }
+        let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
+        self.execute_rollback(&rollback_stmt).err().map(|err| {
+            format!("implicit transaction rollback after SAVEPOINT setup failure failed: {err}")
+        })
     }
 
     fn live_vtab_release_all(&self, cx: &Cx, level: i32) -> Result<()> {
@@ -3105,6 +3277,61 @@ impl Connection {
     fn reset_statement_change_count(&self) {
         *self.last_changes.borrow_mut() = 0;
         self.sync_change_tracking_context();
+    }
+
+    fn set_statement_change_count(&self, changes: usize) {
+        *self.last_changes.borrow_mut() = changes;
+        self.sync_change_tracking_context();
+    }
+
+    fn restore_change_tracking_state(
+        &self,
+        last_changes: usize,
+        total_changes: usize,
+        last_insert_rowid: i64,
+    ) {
+        *self.last_changes.borrow_mut() = last_changes;
+        *self.total_changes.borrow_mut() = total_changes;
+        *self.last_insert_rowid.borrow_mut() = last_insert_rowid;
+        self.sync_change_tracking_context();
+    }
+
+    fn clear_table_program_error_state(&self) {
+        self.last_table_program_error_state.borrow_mut().take();
+    }
+
+    fn record_table_program_error_state(&self, changes: usize, last_insert_rowid: Option<i64>) {
+        *self.last_table_program_error_state.borrow_mut() = Some(TableProgramErrorState {
+            changes,
+            last_insert_rowid,
+        });
+    }
+
+    fn take_table_program_error_state(&self) -> Option<TableProgramErrorState> {
+        self.last_table_program_error_state.borrow_mut().take()
+    }
+
+    fn restore_failed_statement_tracking(
+        &self,
+        preserve_prior_changes_on_constraint_violation: bool,
+        error: &FrankenError,
+        previous_total_changes: usize,
+        previous_last_insert_rowid: i64,
+    ) {
+        let error_state = self.take_table_program_error_state();
+        if preserve_prior_changes_on_constraint_violation && error_is_constraint_violation(error) {
+            if let Some(state) = error_state {
+                self.restore_change_tracking_state(
+                    state.changes,
+                    previous_total_changes.saturating_add(state.changes),
+                    state
+                        .last_insert_rowid
+                        .unwrap_or(previous_last_insert_rowid),
+                );
+                return;
+            }
+        }
+        self.restore_change_tracking_state(0, previous_total_changes, previous_last_insert_rowid);
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -4058,9 +4285,13 @@ impl Connection {
                 Some(params)
             };
             return match dispatch.kind {
-                PreparedDmlKind::Insert => {
-                    self.execute_precompiled_prepared_insert(stmt, &dispatch.table_name, p)
-                }
+                PreparedDmlKind::Insert => self.execute_precompiled_prepared_insert(
+                    stmt,
+                    &dispatch.table_name,
+                    dispatch.rollback_on_constraint_violation,
+                    dispatch.preserve_prior_changes_on_constraint_violation,
+                    p,
+                ),
             };
         }
         if let Some(dml) = stmt.deferred_dml_statement() {
@@ -4095,8 +4326,11 @@ impl Connection {
         &self,
         stmt: &PreparedStatement<'_>,
         table_name: &str,
+        rollback_on_constraint_violation: bool,
+        preserve_prior_changes_on_constraint_violation: bool,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
+        self.clear_table_program_error_state();
         self.sync_change_tracking_context();
         let trace_id = next_trace_id();
         let decision_id = next_decision_id();
@@ -4121,10 +4355,13 @@ impl Connection {
         }
         let execution_started = fsqlite_types::sync_primitives::Instant::now();
         let was_auto = self.ensure_autocommit_txn()?;
+        let previous_total_changes = *self.total_changes.borrow();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
         let use_statement_savepoint = !was_auto
             && self.active_txn.borrow().is_some()
-            && self.internal_statement_savepoint_depth.get() == 0;
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !preserve_prior_changes_on_constraint_violation;
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint("insert", || {
                 self.execute_precompiled_prepared_insert_dispatch(
@@ -4140,7 +4377,32 @@ impl Connection {
                 params,
             )
         };
-        let ok = result.is_ok();
+        let result = match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                self.restore_failed_statement_tracking(
+                    preserve_prior_changes_on_constraint_violation,
+                    &error,
+                    previous_total_changes,
+                    previous_last_insert_rowid,
+                );
+                match self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                }
+            }
+        };
+        let commit_autocommit_on_error = was_auto
+            && preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            );
+        let ok = result.is_ok() || commit_autocommit_on_error;
         self.resolve_autocommit_txn(was_auto, ok)?;
         let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let failure_diag = match result.as_ref() {
@@ -4182,7 +4444,7 @@ impl Connection {
         table_name: &str,
         params: Option<&[SqliteValue]>,
     ) -> Result<(Vec<Row>, usize)> {
-        let (rows, affected, _) = self.execute_table_program(program, params)?;
+        let (rows, affected, _) = self.execute_table_program(program, params, true)?;
         if table_name.eq_ignore_ascii_case("sqlite_sequence") {
             self.refresh_sqlite_sequence_cache()?;
         } else {
@@ -4467,6 +4729,25 @@ impl Connection {
         }
     }
 
+    fn maybe_rollback_transaction_for_conflict_action(
+        &self,
+        rollback_on_constraint_violation: bool,
+        was_auto: bool,
+        error: &FrankenError,
+    ) -> Result<()> {
+        if !rollback_on_constraint_violation
+            || was_auto
+            || !error_triggers_conflict_action_rollback(error)
+        {
+            return Ok(());
+        }
+        if !*self.in_transaction.borrow() && self.active_txn.borrow().is_none() {
+            return Ok(());
+        }
+        let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
+        self.execute_rollback(&rollback_stmt)
+    }
+
     fn with_internal_statement_savepoint<T>(
         &self,
         purpose: &str,
@@ -4507,9 +4788,13 @@ impl Connection {
             match concurrent_result {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                        let _ = txn.rollback_to_savepoint(&cx, &savepoint_name);
-                        let _ = txn.release_savepoint(&cx, &savepoint_name);
+                    let cleanup_errors =
+                        self.cleanup_failed_savepoint_setup(&cx, &savepoint_name, None);
+                    if !cleanup_errors.is_empty() {
+                        return Err(FrankenError::Internal(format!(
+                            "statement savepoint setup failed after {purpose}: {error}; cleanup failed: {}",
+                            cleanup_errors.join("; ")
+                        )));
                     }
                     return Err(error);
                 }
@@ -4519,17 +4804,16 @@ impl Connection {
         };
         let live_vtab_level = self.current_live_vtab_savepoint_level()?;
         if let Err(error) = self.live_vtab_savepoint_all(&cx, live_vtab_level) {
-            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                let _ = txn.rollback_to_savepoint(&cx, &savepoint_name);
-                let _ = txn.release_savepoint(&cx, &savepoint_name);
-            }
-            if let Some(concurrent_snap) = concurrent_snapshot.as_ref()
-                && let Some(session_id) = *self.concurrent_session_id.borrow()
-            {
-                let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                if let Some(handle) = registry.get_mut(session_id) {
-                    let _ = concurrent_rollback_to_savepoint(handle, concurrent_snap);
-                }
+            let cleanup_errors = self.cleanup_failed_savepoint_setup(
+                &cx,
+                &savepoint_name,
+                concurrent_snapshot.as_ref(),
+            );
+            if !cleanup_errors.is_empty() {
+                return Err(FrankenError::Internal(format!(
+                    "statement savepoint setup failed after {purpose}: {error}; cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                )));
             }
             return Err(error);
         }
@@ -4552,7 +4836,37 @@ impl Connection {
 
                 let mut cleanup_errors = Vec::new();
                 let mut pager_rollback_succeeded = false;
-                if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                let mut concurrent_rollback_succeeded = true;
+                if let Some(concurrent_snap) = concurrent_snapshot.as_ref() {
+                    if let Some(session_id) = *self.concurrent_session_id.borrow() {
+                        let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                        if let Some(handle) = registry.get_mut(session_id) {
+                            if let Err(err) =
+                                concurrent_rollback_to_savepoint(handle, concurrent_snap)
+                            {
+                                concurrent_rollback_succeeded = false;
+                                cleanup_errors.push(format!(
+                                    "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                                ));
+                            }
+                        } else {
+                            concurrent_rollback_succeeded = false;
+                            cleanup_errors.push(format!(
+                                "concurrent session {session_id} missing during rollback"
+                            ));
+                        }
+                    } else {
+                        concurrent_rollback_succeeded = false;
+                        cleanup_errors.push(
+                            "concurrent transaction active but no session ID during rollback"
+                                .to_owned(),
+                        );
+                    }
+                }
+
+                if concurrent_rollback_succeeded
+                    && let Some(txn) = self.active_txn.borrow_mut().as_mut()
+                {
                     match txn.rollback_to_savepoint(&cx, &savepoint_name) {
                         Ok(()) => {
                             pager_rollback_succeeded = true;
@@ -4568,37 +4882,21 @@ impl Connection {
                     }
                 }
 
-                if let Some(concurrent_snap) = concurrent_snapshot.as_ref() {
-                    if let Some(session_id) = *self.concurrent_session_id.borrow() {
-                        let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                        if let Some(handle) = registry.get_mut(session_id) {
-                            if let Err(err) =
-                                concurrent_rollback_to_savepoint(handle, concurrent_snap)
-                            {
+                if concurrent_rollback_succeeded && pager_rollback_succeeded {
+                    match self.live_vtab_rollback_to_all(&cx, live_vtab_level) {
+                        Ok(()) => {
+                            if let Err(err) = self.live_vtab_release_all(&cx, live_vtab_level) {
                                 cleanup_errors.push(format!(
-                                    "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                                    "virtual-table release({live_vtab_level}) failed: {err}"
                                 ));
                             }
-                        } else {
+                        }
+                        Err(err) => {
                             cleanup_errors.push(format!(
-                                "concurrent session {session_id} missing during rollback"
+                                "virtual-table rollback_to({live_vtab_level}) failed: {err}"
                             ));
                         }
-                    } else {
-                        cleanup_errors.push(
-                            "concurrent transaction active but no session ID during rollback"
-                                .to_owned(),
-                        );
                     }
-                }
-                if let Err(err) = self.live_vtab_rollback_to_all(&cx, live_vtab_level) {
-                    cleanup_errors.push(format!(
-                        "virtual-table rollback_to({live_vtab_level}) failed: {err}"
-                    ));
-                } else if let Err(err) = self.live_vtab_release_all(&cx, live_vtab_level) {
-                    cleanup_errors.push(format!(
-                        "virtual-table release({live_vtab_level}) failed: {err}"
-                    ));
                 }
 
                 if pager_rollback_succeeded {
@@ -4636,6 +4934,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
     ) -> Result<Vec<Row>> {
+        self.clear_table_program_error_state();
         self.sync_change_tracking_context();
         let statement_kind = match &statement {
             Statement::Select(_) => "select",
@@ -4742,6 +5041,8 @@ impl Connection {
         } else {
             self.ensure_autocommit_txn_mode(TransactionMode::ReadOnly)?
         };
+        let previous_total_changes = *self.total_changes.borrow();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
         if !is_txn_control {
             if is_write {
                 self.txn_metrics_note_write();
@@ -4752,6 +5053,7 @@ impl Connection {
         let use_statement_savepoint = !was_auto
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
+            && !statement_preserves_prior_changes_on_constraint(statement.as_ref())
             && matches!(
                 statement.as_ref(),
                 Statement::Insert(_)
@@ -4760,6 +5062,8 @@ impl Connection {
                     | Statement::CreateIndex(_)
                     | Statement::Reindex(_)
             );
+        let rollback_on_constraint_violation =
+            statement_rolls_back_transaction_on_constraint(statement.as_ref());
         let op_cx = self.op_cx()?;
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
@@ -4773,7 +5077,37 @@ impl Connection {
         } else {
             self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
         };
-        let ok = result.is_ok();
+        let result = match result {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                if matches!(
+                    statement.as_ref(),
+                    Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                ) {
+                    self.restore_failed_statement_tracking(
+                        statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                        &error,
+                        previous_total_changes,
+                        previous_last_insert_rowid,
+                    );
+                }
+                match self.maybe_rollback_transaction_for_conflict_action(
+                    rollback_on_constraint_violation,
+                    was_auto,
+                    &error,
+                ) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(rollback_error),
+                }
+            }
+        };
+        let commit_autocommit_on_error = was_auto
+            && statement_preserves_prior_changes_on_constraint(statement.as_ref())
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            );
+        let ok = result.is_ok() || commit_autocommit_on_error;
         self.resolve_autocommit_txn(was_auto, ok)?;
         let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
@@ -4875,6 +5209,7 @@ impl Connection {
                     return self.execute_with_materialized_sqlite_schema(select, params);
                 }
                 let distinct = is_distinct_select(select);
+                let ordered_aggregate = has_ordered_aggregate(select);
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
                 if !select.body.compounds.is_empty() {
                     return self.execute_compound_select(select, params);
@@ -4920,7 +5255,9 @@ impl Connection {
                         dedup_rows(&mut rows);
                     }
                     Ok(rows)
-                } else if (has_group_by(select) || has_implicit_aggregation(select))
+                } else if (has_group_by(select)
+                    || has_implicit_aggregation(select)
+                    || ordered_aggregate)
                     && (has_joins(select) || has_fallback_from_source(select))
                 {
                     // GROUP BY (or implicit aggregation) + JOIN/non-table source:
@@ -4937,7 +5274,7 @@ impl Connection {
                         apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
-                } else if has_group_by(select) {
+                } else if has_group_by(select) || ordered_aggregate {
                     // Fallback path: eagerly rewrite IN subqueries.
                     self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
@@ -5088,7 +5425,7 @@ impl Connection {
                         &arc_prog
                     };
 
-                    let (mut rows, _, _) = self.execute_table_program(program, params)?;
+                    let (mut rows, _, _) = self.execute_table_program(program, params, false)?;
                     if distinct {
                         dedup_rows(&mut rows);
                         if let Some(limit_clause) = limit_clause.as_ref() {
@@ -5121,6 +5458,28 @@ impl Connection {
                             "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
                                 .to_owned(),
                         ));
+                    }
+                }
+                if !is_live_vtab
+                    && let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source
+                {
+                    // Detect simple VALUES clause (no compounds).
+                    // We must use the VDBE path for simple VALUES to avoid infinite recursion
+                    // in the fallback (which implements inserts by generating simple VALUES inserts).
+                    let is_simple_values = matches!(select_stmt.body.select, SelectCore::Values(_))
+                        && select_stmt.body.compounds.is_empty();
+
+                    // Complex INSERT ... SELECT statements are replayed as
+                    // per-row INSERT ... VALUES operations. Those inner
+                    // statements already handle trigger firing and change
+                    // tracking, so route around the outer trigger path here.
+                    if insert.returning.is_empty() && !is_simple_values {
+                        self.log_mem_execution_fallback(
+                            "insert_select",
+                            "insert_select_row_by_row_fallback",
+                        )?;
+                        let _ = self.execute_insert_select_fallback(insert, select_stmt, params)?;
+                        return Ok(Vec::new());
                     }
                 }
                 let has_before_insert = self.has_matching_triggers(
@@ -5208,57 +5567,6 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                if let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source {
-                    // Detect simple VALUES clause (no compounds).
-                    // We must use the VDBE path for simple VALUES to avoid infinite recursion
-                    // in the fallback (which implements inserts by generating simple VALUES inserts).
-                    let is_simple_values = matches!(select_stmt.body.select, SelectCore::Values(_))
-                        && select_stmt.body.compounds.is_empty();
-
-                    // Use VDBE path when RETURNING is present OR it's a simple VALUES clause;
-                    // fallback otherwise (e.g. complex SELECTs, compounds).
-                    if insert.returning.is_empty() && !is_simple_values {
-                        self.log_mem_execution_fallback(
-                            "insert_select",
-                            "insert_select_row_by_row_fallback",
-                        )?;
-                        let affected =
-                            self.execute_insert_select_fallback(insert, select_stmt, params)?;
-                        // Patch trigger NEW rows with actual rowids (same as VDBE path).
-                        if has_after_insert && !trigger_new_rows.is_empty() {
-                            let tbl_key = table_name.to_ascii_lowercase();
-                            if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key)
-                            {
-                                let last_rowid = self.current_last_insert_rowid();
-                                let count = trigger_new_rows.len();
-                                for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
-                                    if ipk_idx < new_row.len()
-                                        && new_row[ipk_idx] == SqliteValue::Null
-                                    {
-                                        #[allow(clippy::cast_possible_wrap)]
-                                        let rowid = last_rowid - (count as i64 - 1) + i as i64;
-                                        new_row[ipk_idx] = SqliteValue::Integer(rowid);
-                                    }
-                                }
-                            }
-                        }
-                        // Phase 5G.3: Fire AFTER INSERT triggers.
-                        if has_after_insert {
-                            for new_values in &trigger_new_rows {
-                                self.fire_after_triggers(
-                                    table_name,
-                                    &insert_event,
-                                    None,
-                                    Some(new_values),
-                                )?;
-                            }
-                        }
-                        // 5D.4: Persistence now handled by pager WAL, not compat_persist.
-                        self.record_statement_changes(affected);
-                        return Ok(Vec::new());
-                    }
-                }
-
                 // Phase 5B.2 (bd-1yi8): INSERT OR REPLACE / INSERT OR IGNORE
                 // now routes through VDBE which has UPSERT semantics in the
                 // Insert opcode (table_move_to + delete + insert). The
@@ -5289,7 +5597,7 @@ impl Connection {
                     })?;
                     &arc_prog
                 };
-                let (rows, affected, _) = self.execute_table_program(program, params)?;
+                let (rows, affected, _) = self.execute_table_program(program, params, true)?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 if self.fk_enforcement_enabled() {
@@ -5449,7 +5757,7 @@ impl Connection {
                     })?;
                     &arc_prog
                 };
-                let (rows, affected, _) = self.execute_table_program(program, params)?;
+                let (rows, affected, _) = self.execute_table_program(program, params, false)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -5558,7 +5866,7 @@ impl Connection {
                     })?;
                     &arc_prog
                 };
-                let (rows, affected, _) = self.execute_table_program(program, params)?;
+                let (rows, affected, _) = self.execute_table_program(program, params, false)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -5773,8 +6081,39 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
-        let source_rows = self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
+        let source_rows =
+            self.materialize_insert_select_source_rows(insert, select_stmt, params)?;
         self.execute_insert_select_materialized_rows(insert, &source_rows)
+    }
+
+    fn execute_materialized_insert_select_statement(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        source_rows: &[Row],
+    ) -> Result<usize> {
+        let was_auto = self.ensure_autocommit_txn()?;
+        let preserve_prior_changes_on_constraint_violation =
+            insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let use_statement_savepoint = !was_auto
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !preserve_prior_changes_on_constraint_violation;
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint("insert_select", || {
+                self.execute_insert_select_materialized_rows(insert, source_rows)
+            })
+        } else {
+            self.execute_insert_select_materialized_rows(insert, source_rows)
+        };
+        let commit_autocommit_on_error = was_auto
+            && preserve_prior_changes_on_constraint_violation
+            && matches!(
+                result.as_ref(),
+                Err(error) if error_is_constraint_violation(error)
+            );
+        let ok = result.is_ok() || commit_autocommit_on_error;
+        self.resolve_autocommit_txn(was_auto, ok)?;
+        result
     }
 
     fn materialize_insert_select_source_rows(
@@ -5805,10 +6144,6 @@ impl Connection {
                 "INSERT ... SELECT fallback does not support UPSERT/RETURNING".to_owned(),
             ));
         }
-        if source_rows.is_empty() {
-            return Ok(0);
-        }
-
         let (table_columns, source_target_indices) =
             self.resolve_insert_select_target_layout(insert)?;
         if table_columns.is_empty() {
@@ -5824,6 +6159,9 @@ impl Connection {
                 default_sqls.len(),
                 table_columns.len()
             )));
+        }
+        if source_rows.is_empty() {
+            return Ok(0);
         }
 
         let source_column_count = source_target_indices.len();
@@ -5852,126 +6190,50 @@ impl Connection {
         let insert_sql =
             format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});");
 
-        let cx = self.op_cx()?;
-        let internal_savepoint = if self.active_txn.borrow().is_some() {
-            let mut suffix = 0u64;
-            let savepoint_name = loop {
-                let candidate = format!(
-                    "__fsqlite_insert_select_stmt_{}_{}",
-                    next_trace_id(),
-                    suffix
-                );
-                let conflicts = self
-                    .savepoints
-                    .borrow()
-                    .iter()
-                    .any(|sp| sp.name.eq_ignore_ascii_case(&candidate));
-                if !conflicts {
-                    break candidate;
+        let preserve_prior_changes_on_constraint_violation =
+            insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let previous_total_changes = *self.total_changes.borrow();
+        let previous_last_insert_rowid = self.current_last_insert_rowid();
+        let execute_rows = || -> Result<usize> {
+            let mut statement_changes = 0usize;
+            for row in source_rows {
+                let mut ordered_values = self.evaluate_default_row_from_sqls(&default_sqls)?;
+                for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
+                    ordered_values[target_idx] = row.values()[source_idx].clone();
                 }
-                suffix = suffix.saturating_add(1);
-            };
-
-            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                txn.savepoint(&cx, &savepoint_name)?;
-            }
-
-            let concurrent_snapshot = if *self.concurrent_txn.borrow() {
-                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
-                    FrankenError::Internal(
-                        "concurrent transaction active but no session ID".to_owned(),
-                    )
-                })?;
-                let registry = lock_unpoisoned(&self.concurrent_registry);
-                let handle = registry.get(session_id).ok_or_else(|| {
-                    FrankenError::Internal("concurrent session handle not found".to_owned())
-                })?;
-                Some(concurrent_savepoint(handle, &savepoint_name).map_err(|e| {
-                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
-                })?)
-            } else {
-                None
-            };
-
-            Some((savepoint_name, concurrent_snapshot))
-        } else {
-            None
-        };
-
-        let mut statement_result: Result<usize> = Ok(0);
-        for row in source_rows {
-            let mut ordered_values = self.evaluate_default_row_from_sqls(&default_sqls)?;
-            for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
-                ordered_values[target_idx] = row.values()[source_idx].clone();
-            }
-            match self.execute_with_params(&insert_sql, &ordered_values) {
-                Ok(affected) => {
-                    statement_result = statement_result.map(|count| count.saturating_add(affected));
-                }
-                Err(error) => {
-                    statement_result = Err(error);
-                    break;
-                }
-            }
-        }
-
-        match statement_result {
-            Ok(affected) => {
-                if let Some((savepoint_name, _)) = internal_savepoint.as_ref() {
-                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                        txn.release_savepoint(&cx, savepoint_name)?;
+                match self.execute_with_params(&insert_sql, &ordered_values) {
+                    Ok(affected) => {
+                        statement_changes = statement_changes.saturating_add(affected);
                     }
-                }
-                Ok(affected)
-            }
-            Err(statement_error) => {
-                if let Some((savepoint_name, concurrent_snapshot)) = internal_savepoint.as_ref() {
-                    let mut cleanup_errors = Vec::new();
-                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                        if let Err(err) = txn.rollback_to_savepoint(&cx, savepoint_name) {
-                            cleanup_errors.push(format!(
-                                "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
-                            ));
-                        } else if let Err(err) = txn.release_savepoint(&cx, savepoint_name) {
-                            cleanup_errors.push(format!(
-                                "pager release_savepoint('{savepoint_name}') failed: {err}"
-                            ));
-                        }
-                    }
-
-                    if let Some(concurrent_snap) = concurrent_snapshot {
-                        if let Some(session_id) = *self.concurrent_session_id.borrow() {
-                            let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                            if let Some(handle) = registry.get_mut(session_id) {
-                                if let Err(err) =
-                                    concurrent_rollback_to_savepoint(handle, concurrent_snap)
-                                {
-                                    cleanup_errors.push(format!(
-                                        "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
-                                    ));
-                                }
-                            } else {
-                                cleanup_errors.push(format!(
-                                    "concurrent session {session_id} missing during rollback"
-                                ));
-                            }
+                    Err(error) => {
+                        if self.internal_statement_savepoint_depth.get() > 0 {
+                            self.restore_change_tracking_state(
+                                0,
+                                previous_total_changes,
+                                previous_last_insert_rowid,
+                            );
                         } else {
-                            cleanup_errors.push(
-                                "concurrent transaction active but no session ID during rollback"
-                                    .to_owned(),
+                            self.set_statement_change_count(statement_changes);
+                            self.record_table_program_error_state(
+                                statement_changes,
+                                (statement_changes > 0).then(|| self.current_last_insert_rowid()),
                             );
                         }
-                    }
-
-                    if !cleanup_errors.is_empty() {
-                        return Err(FrankenError::Internal(format!(
-                            "INSERT ... SELECT fallback failed: {statement_error}; cleanup failed: {}",
-                            cleanup_errors.join("; ")
-                        )));
+                        return Err(error);
                     }
                 }
-                Err(statement_error)
             }
+            self.set_statement_change_count(statement_changes);
+            Ok(statement_changes)
+        };
+
+        if !preserve_prior_changes_on_constraint_violation
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0
+        {
+            self.with_internal_statement_savepoint("insert_select", execute_rows)
+        } else {
+            execute_rows()
         }
     }
 
@@ -6392,6 +6654,11 @@ impl Connection {
                                 PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
                                     kind: PreparedDmlKind::Insert,
                                     table_name: insert.table.name.clone(),
+                                    rollback_on_constraint_violation: insert.or_conflict
+                                        == Some(fsqlite_ast::ConflictAction::Rollback),
+                                    preserve_prior_changes_on_constraint_violation: insert
+                                        .or_conflict
+                                        == Some(fsqlite_ast::ConflictAction::Fail),
                                 })
                             } else {
                                 PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))
@@ -6602,7 +6869,9 @@ impl Connection {
         };
 
         let expression_only = is_expression_only_select(select);
-        let has_grouping = has_group_by(select) || has_implicit_aggregation(select);
+        let has_ordered_aggregate = has_ordered_aggregate(select);
+        let has_grouping =
+            has_group_by(select) || has_implicit_aggregation(select) || has_ordered_aggregate;
         let has_join_like_source = has_joins(select) || has_fallback_from_source(select);
 
         statement_contains_rewritable_subquery(statement)
@@ -6615,6 +6884,7 @@ impl Connection {
             || (expression_only && expression_only_has_subquery(select))
             || (has_grouping && has_join_like_source)
             || has_group_by(select)
+            || has_ordered_aggregate
             || has_window_functions(select)
             || select_contains_match_operator(select)
             || has_join_like_source
@@ -10835,7 +11105,8 @@ impl Connection {
             &columns_label,
             where_expr.as_ref(),
         )?;
-        self.execute_table_program(&program, None).map(|_| ())
+        self.execute_table_program(&program, None, false)
+            .map(|_| ())
     }
 
     fn execute_vacuum(
@@ -12549,6 +12820,46 @@ impl Connection {
         pages
     }
 
+    fn track_pending_commit_pages_with_registry(
+        &self,
+        registry: &mut ConcurrentRegistry,
+        session_id: u64,
+    ) -> Result<()> {
+        let pending_commit_pages = self
+            .active_txn
+            .borrow()
+            .as_ref()
+            .map(|txn| txn.pending_commit_pages())
+            .transpose()?
+            .unwrap_or_default();
+        if pending_commit_pages.is_empty() {
+            return Ok(());
+        }
+
+        let handle = registry
+            .get_mut(session_id)
+            .ok_or_else(|| FrankenError::Internal("MVCC session invalid or inactive".to_owned()))?;
+        for page in pending_commit_pages {
+            if handle.tracks_write_conflict_page(page) {
+                continue;
+            }
+            concurrent_track_write_conflict_page(
+                handle,
+                &self.concurrent_lock_table,
+                session_id,
+                page,
+            )
+            .map_err(|error| match error {
+                MvccError::Busy => FrankenError::Busy,
+                _ => FrankenError::Internal(format!(
+                    "MVCC pending commit page tracking failed: {error}"
+                )),
+            })?;
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn plan_concurrent_commit_with_registry(
         &self,
@@ -12567,6 +12878,8 @@ impl Connection {
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
         let assigned_commit_seq =
             CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
+
+        self.track_pending_commit_pages_with_registry(registry, session_id)?;
 
         let (snapshot, active_conflicts) = match registry.get(session_id) {
             Some(handle) if handle.is_active() => {
@@ -13226,7 +13539,8 @@ impl Connection {
     fn execute_savepoint(&self, name: &str) -> Result<()> {
         let cx = self.op_cx()?;
         // If no explicit transaction, implicitly begin one.
-        if !*self.in_transaction.borrow() {
+        let started_implicit_txn = !*self.in_transaction.borrow();
+        if started_implicit_txn {
             let is_concurrent = *self.concurrent_mode_default.borrow();
             let pager_mode = if is_concurrent {
                 TransactionMode::Concurrent
@@ -13271,40 +13585,92 @@ impl Connection {
             self.txn_metrics_mark_started();
         }
 
-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.savepoint(&cx, name)?;
+        let pager_savepoint_result = {
+            let mut active_txn = self.active_txn.borrow_mut();
+            if let Some(txn) = active_txn.as_mut() {
+                txn.savepoint(&cx, name)
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = pager_savepoint_result {
+            let mut cleanup_errors = Vec::new();
+            if started_implicit_txn
+                && let Some(cleanup_error) = self.rollback_failed_implicit_savepoint_transaction()
+            {
+                cleanup_errors.push(cleanup_error);
+            }
+            if !cleanup_errors.is_empty() {
+                return Err(FrankenError::Internal(format!(
+                    "SAVEPOINT {name} setup failed: {error}; cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                )));
+            }
+            return Err(error);
         }
 
         // MVCC concurrent-writer savepoint (bd-14zc / 5E.1):
         // Capture concurrent write set state if in concurrent mode.
         let concurrent_snapshot = if *self.concurrent_txn.borrow() {
-            let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
-                FrankenError::Internal("concurrent transaction active but no session ID".to_owned())
-            })?;
-            let registry = lock_unpoisoned(&self.concurrent_registry);
-            let handle = registry.get(session_id).ok_or_else(|| {
-                FrankenError::Internal("concurrent session handle not found".to_owned())
-            })?;
-            let snapshot = concurrent_savepoint(handle, name)
-                .map_err(|e| FrankenError::Internal(format!("concurrent savepoint failed: {e}")))?;
-            drop(registry);
-            Some(snapshot)
+            let concurrent_result = (|| -> Result<Option<ConcurrentSavepoint>> {
+                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction active but no session ID".to_owned(),
+                    )
+                })?;
+                let registry = lock_unpoisoned(&self.concurrent_registry);
+                let handle = registry.get(session_id).ok_or_else(|| {
+                    FrankenError::Internal("concurrent session handle not found".to_owned())
+                })?;
+                let snapshot = concurrent_savepoint(handle, name).map_err(|e| {
+                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                })?;
+                drop(registry);
+                Ok(Some(snapshot))
+            })();
+            match concurrent_result {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let mut cleanup_errors = if started_implicit_txn {
+                        Vec::new()
+                    } else {
+                        self.cleanup_failed_savepoint_setup(&cx, name, None)
+                    };
+                    if started_implicit_txn
+                        && let Some(cleanup_error) =
+                            self.rollback_failed_implicit_savepoint_transaction()
+                    {
+                        cleanup_errors.push(cleanup_error);
+                    }
+                    if !cleanup_errors.is_empty() {
+                        return Err(FrankenError::Internal(format!(
+                            "SAVEPOINT {name} setup failed: {error}; cleanup failed: {}",
+                            cleanup_errors.join("; ")
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
         let live_vtab_level = self.next_live_vtab_savepoint_level()?;
         if let Err(error) = self.live_vtab_savepoint_all(&cx, live_vtab_level) {
-            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                let _ = txn.rollback_to_savepoint(&cx, name);
-                let _ = txn.release_savepoint(&cx, name);
-            }
-            if let Some(concurrent_snap) = concurrent_snapshot.as_ref()
-                && let Some(session_id) = *self.concurrent_session_id.borrow()
+            let mut cleanup_errors = if started_implicit_txn {
+                Vec::new()
+            } else {
+                self.cleanup_failed_savepoint_setup(&cx, name, concurrent_snapshot.as_ref())
+            };
+            if started_implicit_txn
+                && let Some(cleanup_error) = self.rollback_failed_implicit_savepoint_transaction()
             {
-                let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                if let Some(handle) = registry.get_mut(session_id) {
-                    let _ = concurrent_rollback_to_savepoint(handle, concurrent_snap);
-                }
+                cleanup_errors.push(cleanup_error);
+            }
+            if !cleanup_errors.is_empty() {
+                return Err(FrankenError::Internal(format!(
+                    "SAVEPOINT {name} setup failed: {error}; cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                )));
             }
             return Err(error);
         }
@@ -17307,7 +17673,7 @@ impl Connection {
         // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
         let raw_select = build_raw_scan_select(select);
         let program = self.compile_table_select(&raw_select)?;
-        let (raw_rows, _, _) = self.execute_table_program(&program, params)?;
+        let (raw_rows, _, _) = self.execute_table_program(&program, params, false)?;
 
         // Build per-GROUP-BY-key collation info for collation-aware grouping.
         let group_collations: Vec<Option<String>> = group_by_exprs
@@ -17959,7 +18325,7 @@ impl Connection {
             self.execute_join_select(&raw_select, params)?
         } else {
             let program = self.compile_table_select(&raw_select)?;
-            let (rows, _, _) = self.execute_table_program(&program, params)?;
+            let (rows, _, _) = self.execute_table_program(&program, params, false)?;
             rows
         };
 
@@ -20043,7 +20409,8 @@ impl Connection {
         &self,
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
-    ) -> Result<(Vec<Row>, usize, i64)> {
+        track_last_insert_rowid: bool,
+    ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         let execution_span = tracing::span!(
             target: "fsqlite.execution",
             tracing::Level::DEBUG,
@@ -20112,12 +20479,36 @@ impl Connection {
         if let Some(txn) = txn_back {
             *self.active_txn.borrow_mut() = Some(txn);
         }
-        if let Ok((_, _, last_insert_rowid)) = result.as_ref()
-            && *last_insert_rowid != 0
-        {
-            self.record_last_insert_rowid(*last_insert_rowid);
+        match result {
+            Ok((rows, changes, last_insert_rowid)) => {
+                self.clear_table_program_error_state();
+                if track_last_insert_rowid {
+                    if let Some(last_insert_rowid) = last_insert_rowid {
+                        self.record_last_insert_rowid(last_insert_rowid);
+                    }
+                }
+                Ok((
+                    rows,
+                    changes,
+                    if track_last_insert_rowid {
+                        last_insert_rowid
+                    } else {
+                        None
+                    },
+                ))
+            }
+            Err(exec_error) => {
+                self.record_table_program_error_state(
+                    exec_error.changes,
+                    if track_last_insert_rowid {
+                        exec_error.last_insert_rowid
+                    } else {
+                        None
+                    },
+                );
+                Err(exec_error.error)
+            }
         }
-        result
     }
 
     // ── Schema cookie and change counter tracking (bd-3mmj) ─────────
@@ -20862,6 +21253,137 @@ fn has_implicit_aggregation(select: &SelectStatement) -> bool {
         })
     } else {
         false
+    }
+}
+
+/// Check whether the query contains an aggregate function with an in-aggregate
+/// ORDER BY clause (SQLite 3.44+), such as `group_concat(x ORDER BY y)`.
+fn has_ordered_aggregate(select: &SelectStatement) -> bool {
+    select_core_has_ordered_aggregate(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_has_ordered_aggregate(core))
+        || select
+            .order_by
+            .iter()
+            .any(|term| expr_has_ordered_aggregate(&term.expr))
+        || select.limit.as_ref().is_some_and(|limit| {
+            expr_has_ordered_aggregate(&limit.limit)
+                || limit
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_has_ordered_aggregate)
+        })
+}
+
+fn select_core_has_ordered_aggregate(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            where_clause,
+            group_by,
+            having,
+            ..
+        } => {
+            columns.iter().any(|column| {
+                matches!(
+                    column,
+                    ResultColumn::Expr { expr, .. } if expr_has_ordered_aggregate(expr)
+                )
+            }) || where_clause
+                .as_deref()
+                .is_some_and(expr_has_ordered_aggregate)
+                || group_by.iter().any(expr_has_ordered_aggregate)
+                || having.as_deref().is_some_and(expr_has_ordered_aggregate)
+        }
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(expr_has_ordered_aggregate),
+    }
+}
+
+fn expr_has_ordered_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_ordered_aggregate(left) || expr_has_ordered_aggregate(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => expr_has_ordered_aggregate(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expr_has_ordered_aggregate(inner)
+                || expr_has_ordered_aggregate(low)
+                || expr_has_ordered_aggregate(high)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            expr_has_ordered_aggregate(inner)
+                || match set {
+                    InSet::List(exprs) => exprs.iter().any(expr_has_ordered_aggregate),
+                    InSet::Subquery(select) => has_ordered_aggregate(select),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_ordered_aggregate(inner)
+                || expr_has_ordered_aggregate(pattern)
+                || escape.as_deref().is_some_and(expr_has_ordered_aggregate)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_has_ordered_aggregate)
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_has_ordered_aggregate(when_expr) || expr_has_ordered_aggregate(then_expr)
+                })
+                || else_expr.as_deref().is_some_and(expr_has_ordered_aggregate)
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            has_ordered_aggregate(subquery)
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            (!order_by.is_empty() && is_agg_fn(name) && over.is_none())
+                || match args {
+                    FunctionArgs::List(exprs) => exprs.iter().any(expr_has_ordered_aggregate),
+                    FunctionArgs::Star => false,
+                }
+                || order_by
+                    .iter()
+                    .any(|term| expr_has_ordered_aggregate(&term.expr))
+                || filter.as_deref().is_some_and(expr_has_ordered_aggregate)
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => expr_has_ordered_aggregate(inner) || expr_has_ordered_aggregate(path),
+        Expr::RowValue(values, _) => values.iter().any(expr_has_ordered_aggregate),
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            false
+        }
     }
 }
 
@@ -26971,7 +27493,21 @@ struct ConcurrentExecContext {
     busy_timeout_ms: u64,
 }
 
-type TableProgramExecResult = Result<(Vec<Row>, usize, i64)>;
+#[derive(Debug, Clone, Copy)]
+struct TableProgramErrorState {
+    changes: usize,
+    last_insert_rowid: Option<i64>,
+}
+
+#[derive(Debug)]
+struct TableProgramExecError {
+    error: FrankenError,
+    changes: usize,
+    last_insert_rowid: Option<i64>,
+}
+
+type TableProgramExecResult =
+    std::result::Result<(Vec<Row>, usize, Option<i64>), TableProgramExecError>;
 type TableProgramExecOutcome = (TableProgramExecResult, Option<Box<dyn TransactionHandle>>);
 
 #[allow(clippy::too_many_arguments)]
@@ -27006,7 +27542,14 @@ fn execute_table_program_with_db(
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
-            return (Err(e), txn);
+            return (
+                Err(TableProgramExecError {
+                    error: e,
+                    changes: 0,
+                    last_insert_rowid: None,
+                }),
+                txn,
+            );
         }
         engine.set_bindings(params.to_vec());
     }
@@ -27070,7 +27613,16 @@ fn execute_table_program_with_db(
     }
     let txn_back = match engine.take_transaction() {
         Ok(txn) => txn,
-        Err(e) => return (Err(e), None),
+        Err(e) => {
+            return (
+                Err(TableProgramExecError {
+                    error: e,
+                    changes: engine.changes(),
+                    last_insert_rowid: engine_rowid,
+                }),
+                None,
+            );
+        }
     };
 
     let changes = engine.changes();
@@ -27086,10 +27638,16 @@ fn execute_table_program_with_db(
             changes,
             engine_rowid,
         )),
-        Ok(ExecOutcome::Error { code, message }) => Err(FrankenError::Internal(format!(
-            "VDBE halted with code {code}: {message}",
-        ))),
-        Err(e) => Err(e),
+        Ok(ExecOutcome::Error { code, message }) => Err(TableProgramExecError {
+            error: FrankenError::Internal(format!("VDBE halted with code {code}: {message}",)),
+            changes,
+            last_insert_rowid: engine_rowid,
+        }),
+        Err(e) => Err(TableProgramExecError {
+            error: e,
+            changes,
+            last_insert_rowid: engine_rowid,
+        }),
     };
     (result, txn_back)
 }
@@ -30226,6 +30784,48 @@ fn direct_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
     }
 }
 
+fn statement_rolls_back_transaction_on_constraint(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Insert(insert)
+            if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Rollback)
+    ) || matches!(
+        statement,
+        Statement::Update(update)
+            if update.or_conflict == Some(fsqlite_ast::ConflictAction::Rollback)
+    )
+}
+
+fn statement_preserves_prior_changes_on_constraint(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Insert(insert)
+            if insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail)
+    ) || matches!(
+        statement,
+        Statement::Update(update)
+            if update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail)
+    )
+}
+
+fn error_is_constraint_violation(error: &FrankenError) -> bool {
+    if error.error_code() == ErrorCode::Constraint {
+        return true;
+    }
+    matches!(
+        error,
+        FrankenError::Internal(message)
+            if message.starts_with(&format!(
+                "VDBE halted with code {}:",
+                ErrorCode::Constraint as i32
+            ))
+    )
+}
+
+fn error_triggers_conflict_action_rollback(error: &FrankenError) -> bool {
+    error_is_constraint_violation(error)
+}
+
 fn reverse_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
     match op {
         BinaryOp::Eq => Some(ConstraintOp::Eq),
@@ -32156,6 +32756,7 @@ mod tests {
         hook_log: Vec<String>,
         fail_sync: bool,
         fail_savepoint_at: Option<i32>,
+        fail_rollback_to_at: Option<i32>,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -32210,6 +32811,7 @@ mod tests {
                 hook_log: Vec::new(),
                 fail_sync: false,
                 fail_savepoint_at: None,
+                fail_rollback_to_at: None,
             })
         }
 
@@ -32306,6 +32908,11 @@ mod tests {
 
         fn rollback_to(&mut self, _cx: &Cx, n: i32) -> Result<()> {
             self.record_hook(format!("rollback_to:{n}"));
+            if self.fail_rollback_to_at == Some(n) {
+                return Err(FrankenError::Internal(format!(
+                    "txn-aware test vtab forced rollback_to failure at level {n}",
+                )));
+            }
             if let Some(snapshot) = self.txn_state.rollback_to(n) {
                 self.restore_state(snapshot);
             }
@@ -32707,7 +33314,7 @@ mod tests {
             .poison("simulated poisoned runtime for table execution");
 
         assert!(matches!(
-            conn.execute_table_program(&stmt.program, None),
+            conn.execute_table_program(&stmt.program, None, false),
             Err(FrankenError::BackgroundWorkerFailed(ref msg))
                 if msg.contains("simulated poisoned runtime for table execution")
         ));
@@ -37803,6 +38410,48 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_select_fallback_triggers_fire_once_and_change_tracking_matches_sqlite() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER dst_ai AFTER INSERT ON dst \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.name); END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst SELECT id, name FROM src ORDER BY id;")
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let log_rows = conn
+            .query("SELECT name FROM trigger_log ORDER BY name;")
+            .unwrap();
+        assert_eq!(
+            log_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Text("alpha".to_owned())],
+                vec![SqliteValue::Text("beta".to_owned())],
+            ],
+            "INSERT ... SELECT fallback must fire AFTER triggers exactly once per inserted row",
+        );
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(2));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(6));
+    }
+
+    #[test]
     fn test_insert_select_without_from_inserts_single_row() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE dst (id INTEGER, name TEXT);")
@@ -38208,6 +38857,443 @@ mod tests {
                 SqliteValue::Integer(1),
                 SqliteValue::Text("existing".to_owned()),
             ]
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_insert_select_autocommit_preserves_statement_atomicity_on_conflict() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO dst SELECT id, name FROM src ORDER BY id DESC;")
+            .expect_err("duplicate primary key should fail INSERT ... SELECT");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        assert!(
+            !conn.in_transaction(),
+            "autocommit INSERT ... SELECT failure should not leave a transaction open"
+        );
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("existing".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_or_rollback_select_rolls_back_explicit_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO dst VALUES (9, 'txn_only');")
+            .unwrap();
+        let err = conn
+            .execute("INSERT OR ROLLBACK INTO dst SELECT id, name FROM src ORDER BY id DESC;")
+            .expect_err("duplicate primary key should fail INSERT OR ROLLBACK ... SELECT");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        assert!(
+            !conn.in_transaction(),
+            "OR ROLLBACK conflict should abort the whole explicit transaction"
+        );
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("existing".to_owned()),
+            ]],
+            "full transaction rollback should discard rows written earlier in the transaction",
+        );
+    }
+
+    #[test]
+    fn test_insert_or_fail_values_preserves_prior_rows_in_autocommit() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO dst VALUES (2, 'beta'), (1, 'dup');")
+            .expect_err("duplicate primary key should fail INSERT OR FAIL");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        assert!(
+            !conn.in_transaction(),
+            "autocommit OR FAIL should finish the implicit transaction"
+        );
+        let tracking = conn
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(tracking[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(tracking[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking[0].values()[2], SqliteValue::Integer(2));
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("existing".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("beta".to_owned()),
+                ],
+            ],
+            "OR FAIL must preserve rows inserted before the conflict",
+        );
+    }
+
+    #[test]
+    fn test_insert_or_fail_select_preserves_prior_rows_in_explicit_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO dst VALUES (9, 'txn_only');")
+            .unwrap();
+        let err = conn
+            .execute("INSERT OR FAIL INTO dst SELECT id, name FROM src ORDER BY id DESC;")
+            .expect_err("duplicate primary key should fail INSERT OR FAIL ... SELECT");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        assert!(
+            conn.in_transaction(),
+            "OR FAIL should not abort the explicit transaction"
+        );
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("existing".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("beta".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(9),
+                    SqliteValue::Text("txn_only".to_owned()),
+                ],
+            ],
+            "OR FAIL must preserve rows written before the conflict and keep the transaction open",
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_insert_select_statement_rollback_restores_live_vtab_trigger_side_effects() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE vt_log USING txn_test(value);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER dst_ai AFTER INSERT ON dst \
+             BEGIN INSERT INTO vt_log(value) VALUES (NEW.name); END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'dup');").unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'dup');").unwrap();
+
+        let err = conn
+            .execute("INSERT INTO dst SELECT id, name FROM src ORDER BY id;")
+            .expect_err("duplicate value should abort INSERT ... SELECT");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let dst_rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert!(
+            dst_rows.is_empty(),
+            "INSERT ... SELECT rollback must remove earlier table rows",
+        );
+        let vt_rows = conn
+            .query("SELECT rowid, value FROM vt_log ORDER BY rowid;")
+            .unwrap();
+        assert!(
+            vt_rows.is_empty(),
+            "INSERT ... SELECT rollback must also restore live-VTAB trigger side effects",
+        );
+    }
+
+    #[test]
+    fn test_insert_select_failed_statement_restores_change_tracking() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'dup');").unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'dup');").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO dst(name) VALUES ('seed');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO dst SELECT id + 10, name FROM src ORDER BY id;")
+            .expect_err("duplicate value should abort INSERT ... SELECT");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(tracking[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking[0].values()[1], SqliteValue::Integer(0));
+        assert_eq!(tracking[0].values()[2], SqliteValue::Integer(3));
+
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("seed".to_owned()),
+            ]],
+        );
+    }
+
+    #[test]
+    fn test_insert_or_fail_select_preserves_prior_rows_and_tracking() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'seed');").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO dst(name) VALUES ('seed');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO dst SELECT id + 10, name FROM src ORDER BY id;")
+            .expect_err("duplicate value should fail after preserving the first inserted row");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(tracking[0].values()[0], SqliteValue::Integer(11));
+        assert_eq!(tracking[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking[0].values()[2], SqliteValue::Integer(4));
+
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("seed".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(11),
+                    SqliteValue::Text("alpha".to_owned()),
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn test_insert_or_fail_select_reports_statement_change_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO src VALUES (3, 'alpha');")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO dst(name) VALUES ('seed');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO dst SELECT id + 10, name FROM src ORDER BY id;")
+            .expect_err("duplicate value should fail after preserving earlier rows");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(tracking[0].values()[0], SqliteValue::Integer(12));
+        assert_eq!(tracking[0].values()[1], SqliteValue::Integer(2));
+        assert_eq!(tracking[0].values()[2], SqliteValue::Integer(6));
+
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("seed".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(11),
+                    SqliteValue::Text("alpha".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(12),
+                    SqliteValue::Text("beta".to_owned()),
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn test_prepared_insert_or_rollback_rolls_back_explicit_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+        let stmt = conn
+            .prepare("INSERT OR ROLLBACK INTO dst VALUES (?1, ?2);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO dst VALUES (9, 'txn_only');")
+            .unwrap();
+        let err = conn
+            .execute_prepared_with_params(
+                &stmt,
+                &[SqliteValue::Integer(1), SqliteValue::Text("dup".to_owned())],
+            )
+            .expect_err("duplicate primary key should fail prepared INSERT OR ROLLBACK");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        assert!(
+            !conn.in_transaction(),
+            "prepared OR ROLLBACK conflict should abort the whole explicit transaction"
+        );
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("existing".to_owned()),
+            ]],
+            "prepared direct-dispatch INSERT must honor OR ROLLBACK semantics",
+        );
+    }
+
+    #[test]
+    fn test_prepared_insert_or_fail_preserves_explicit_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+        let stmt = conn
+            .prepare("INSERT OR FAIL INTO dst VALUES (?1, ?2);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO dst VALUES (9, 'txn_only');")
+            .unwrap();
+        let err = conn
+            .execute_prepared_with_params(
+                &stmt,
+                &[SqliteValue::Integer(1), SqliteValue::Text("dup".to_owned())],
+            )
+            .expect_err("duplicate primary key should fail prepared INSERT OR FAIL");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        assert!(
+            conn.in_transaction(),
+            "prepared OR FAIL conflict should keep the explicit transaction open"
+        );
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(0));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(2));
+
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("existing".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(9),
+                    SqliteValue::Text("txn_only".to_owned()),
+                ],
+            ],
+            "prepared direct-dispatch OR FAIL must preserve earlier transaction writes",
         );
 
         conn.execute("ROLLBACK;").unwrap();
@@ -40698,6 +41784,55 @@ mod tests {
     }
 
     #[test]
+    fn test_live_vtab_drop_savepoint_rollback_restores_instance() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('keep');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp_drop;").unwrap();
+        conn.execute("DROP TABLE vt;").unwrap();
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT"),
+            "DROP TABLE inside savepoint should hide the live VTAB immediately"
+        );
+        assert!(
+            conn.dropped_vtab_instances.borrow().contains_key("VT"),
+            "DROP TABLE inside savepoint should stage the live VTAB for restore/finalize"
+        );
+
+        conn.execute("ROLLBACK TO sp_drop;").unwrap();
+        conn.execute("RELEASE SAVEPOINT sp_drop;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        assert!(
+            conn.vtab_instances.borrow().contains_key("VT"),
+            "ROLLBACK TO SAVEPOINT must restore a dropped live VTAB instance"
+        );
+        assert!(
+            conn.dropped_vtab_instances.borrow().is_empty(),
+            "ROLLBACK TO SAVEPOINT must clear the staged dropped VTAB"
+        );
+        let rows = conn
+            .query("SELECT rowid, value FROM vt ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("keep".to_owned()),
+            ]],
+            "ROLLBACK TO SAVEPOINT must restore the dropped VTAB contents"
+        );
+    }
+
+    #[test]
     fn test_live_vtab_recreate_same_name_after_drop_in_transaction_is_rejected() {
         let conn = Connection::open(":memory:").unwrap();
         conn.register_module(
@@ -40731,6 +41866,40 @@ mod tests {
                 SqliteValue::Text("keep".to_owned()),
             ]],
             "ROLLBACK must restore the original VTAB after a rejected same-name recreate",
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_recreate_rejection_commit_finalizes_drop() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('keep');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DROP TABLE vt;").unwrap();
+        let err = conn
+            .execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .expect_err("same-name recreate should remain rejected until staged-drop replacement is implemented");
+        assert!(matches!(err, FrankenError::NotImplemented(_)));
+
+        conn.execute("COMMIT;").unwrap();
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT"),
+            "COMMIT after rejected same-name recreate must finalize the drop"
+        );
+        assert!(
+            conn.dropped_vtab_instances.borrow().is_empty(),
+            "COMMIT after rejected same-name recreate must drain staged dropped VTAB instances"
+        );
+        assert!(
+            conn.query("SELECT rowid, value FROM vt;").is_err(),
+            "dropped VTAB must stay absent after COMMIT"
         );
     }
 
@@ -40822,8 +41991,10 @@ mod tests {
             .unwrap();
 
         conn.execute("BEGIN;").unwrap();
-        conn.execute("INSERT INTO vt1(value) VALUES ('left');").unwrap();
-        conn.execute("INSERT INTO vt2(value) VALUES ('right');").unwrap();
+        conn.execute("INSERT INTO vt1(value) VALUES ('left');")
+            .unwrap();
+        conn.execute("INSERT INTO vt2(value) VALUES ('right');")
+            .unwrap();
         with_txn_test_vtab(&conn, "vt2", |vtab| vtab.fail_savepoint_at = Some(0));
 
         let err = conn
@@ -40849,6 +42020,142 @@ mod tests {
         );
 
         conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_live_vtab_savepoint_failure_surfaces_cleanup_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt1 USING txn_test(value);")
+            .unwrap();
+        conn.execute("CREATE VIRTUAL TABLE vt2 USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO vt1(value) VALUES ('left');")
+            .unwrap();
+        conn.execute("INSERT INTO vt2(value) VALUES ('right');")
+            .unwrap();
+        with_txn_test_vtab(&conn, "vt1", |vtab| vtab.fail_rollback_to_at = Some(0));
+        with_txn_test_vtab(&conn, "vt2", |vtab| vtab.fail_savepoint_at = Some(0));
+
+        let err = conn
+            .execute("SAVEPOINT sp_fail;")
+            .expect_err("savepoint failure should surface rollback cleanup failure");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("cleanup failed"),
+            "savepoint error should mention cleanup failure details: {err_text}",
+        );
+        assert!(
+            err_text.contains("rollback_to(0)"),
+            "savepoint error should include the failing VTAB rollback_to hook: {err_text}",
+        );
+        let vt1_hook_log = with_txn_test_vtab(&conn, "vt1", |vtab| vtab.hook_log.clone());
+        let failing_attempt_start = vt1_hook_log
+            .iter()
+            .rposition(|entry| entry == "savepoint:0")
+            .expect("failing savepoint attempt should be logged");
+        let failing_attempt_log = &vt1_hook_log[failing_attempt_start..];
+        assert!(
+            failing_attempt_log.contains(&"rollback_to:0".to_owned()),
+            "cleanup must attempt VTAB rollback_to for the failing savepoint: {vt1_hook_log:?}",
+        );
+        assert!(
+            !failing_attempt_log.contains(&"release:0".to_owned()),
+            "cleanup must not release a VTAB savepoint after rollback_to failure: {vt1_hook_log:?}",
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_statement_savepoint_vtab_cleanup_skips_release_after_rollback_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('left');")
+            .unwrap();
+
+        let err = conn
+            .with_internal_statement_savepoint("vtab_cleanup_failure", || -> Result<()> {
+                with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_rollback_to_at = Some(0));
+                Err(FrankenError::Internal(
+                    "synthetic statement failure".to_owned(),
+                ))
+            })
+            .expect_err("statement cleanup should surface VTAB rollback failure");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("virtual-table rollback_to(0) failed"),
+            "unexpected error: {err_text}",
+        );
+        assert!(
+            !err_text.contains("virtual-table release(0) failed"),
+            "statement cleanup must not attempt VTAB release after rollback failure: {err_text}",
+        );
+
+        let hook_log = with_txn_test_vtab(&conn, "vt", |vtab| vtab.hook_log.clone());
+        let failing_attempt_start = hook_log
+            .iter()
+            .rposition(|entry| entry == "savepoint:0")
+            .expect("statement savepoint should be logged");
+        let failing_attempt_log = &hook_log[failing_attempt_start..];
+        assert!(
+            failing_attempt_log.contains(&"rollback_to:0".to_owned()),
+            "statement cleanup must attempt VTAB rollback_to before surfacing the failure: {hook_log:?}",
+        );
+        assert!(
+            !failing_attempt_log.contains(&"release:0".to_owned()),
+            "statement cleanup must not release a VTAB savepoint after rollback_to failure: {hook_log:?}",
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_failed_implicit_savepoint_does_not_leave_transaction_open() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        with_txn_test_vtab(&conn, "vt", |vtab| vtab.fail_savepoint_at = Some(0));
+
+        let err = conn
+            .execute("SAVEPOINT sp_fail;")
+            .expect_err("savepoint failure outside an explicit transaction should abort the implicit transaction");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("savepoint(0) failed"),
+            "expected the VTAB savepoint hook failure to surface: {err_text}",
+        );
+        assert!(
+            !conn.in_transaction(),
+            "failed SAVEPOINT outside a transaction must not leave the implicit transaction open"
+        );
+        assert!(
+            conn.active_txn.borrow().is_none(),
+            "failed implicit SAVEPOINT must tear down the pager transaction"
+        );
+        assert!(
+            conn.concurrent_session_id.borrow().is_none(),
+            "failed implicit SAVEPOINT must tear down the concurrent session"
+        );
+        assert!(
+            conn.savepoints.borrow().is_empty(),
+            "failed implicit SAVEPOINT must not leave a dangling savepoint entry"
+        );
     }
 
     #[test]
@@ -46579,11 +47886,8 @@ mod transaction_lifecycle_tests {
 
     #[test]
     fn test_update_or_ignore_does_not_error() {
-        // Verify UPDATE OR IGNORE does not raise an error when a UNIQUE
-        // constraint would be violated. Full IGNORE semantics (keeping
-        // the original row unchanged) requires pre-update constraint
-        // checking which is not yet implemented — this test just verifies
-        // the statement succeeds without error.
+        // Verify UPDATE OR IGNORE keeps the conflicting row unchanged while
+        // preserving the rest of the table.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
             .unwrap();
@@ -46598,12 +47902,14 @@ mod transaction_lifecycle_tests {
             "UPDATE OR IGNORE should not error on UNIQUE conflict"
         );
 
-        // alice's row (id=1) should be untouched.
-        let rows = conn.query("SELECT name FROM t WHERE id = 1").unwrap();
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Text("alice".to_owned())
-        );
+        let rows = conn.query("SELECT id, name FROM t ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alice".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("bob".to_owned()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("carol".to_owned()));
     }
 
     #[test]
@@ -47981,6 +49287,107 @@ mod schema_cookie_tests {
                 fsqlite_pager::TransactionHandle::has_pending_writes(&**txn)
             }),
             "failed savepoint rollback must not rewind the pager write-set"
+        );
+    }
+
+    #[test]
+    fn test_statement_savepoint_cleanup_missing_concurrent_session_preserves_pager_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("BEGIN CONCURRENT should register a session");
+        let err = conn
+            .with_internal_statement_savepoint("test_missing_session", || -> Result<()> {
+                conn.execute("INSERT INTO t VALUES (1);").unwrap();
+                *conn.concurrent_session_id.borrow_mut() = None;
+                Err(FrankenError::Internal(
+                    "synthetic statement failure".to_owned(),
+                ))
+            })
+            .expect_err("missing concurrent session should abort statement cleanup");
+        assert!(
+            err.to_string()
+                .contains("concurrent transaction active but no session ID during rollback"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            conn.active_txn.borrow().as_ref().is_some_and(|txn| {
+                fsqlite_pager::TransactionHandle::has_pending_writes(&**txn)
+            }),
+            "failed statement cleanup must not rewind the pager write-set"
+        );
+
+        *conn.concurrent_session_id.borrow_mut() = Some(session_id);
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_failed_savepoint_setup_skips_pager_release_after_rollback_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+        let pager = fsqlite_pager::traits::MockMvccPager;
+        let txn =
+            fsqlite_pager::MvccPager::begin(&pager, &cx, fsqlite_pager::TransactionMode::Deferred)
+                .unwrap();
+        *conn.active_txn.borrow_mut() = Some(Box::new(txn));
+
+        let cleanup_errors = conn.cleanup_failed_savepoint_setup(&cx, "missing_sp", None);
+        assert_eq!(
+            cleanup_errors.len(),
+            1,
+            "unexpected cleanup errors: {cleanup_errors:?}"
+        );
+        assert!(
+            cleanup_errors[0].contains("rollback_to_savepoint('missing_sp') failed"),
+            "unexpected cleanup error: {cleanup_errors:?}",
+        );
+        assert!(
+            !cleanup_errors[0].contains("release_savepoint"),
+            "cleanup must not release a pager savepoint after rollback failure: {cleanup_errors:?}",
+        );
+    }
+
+    #[test]
+    fn test_statement_savepoint_cleanup_skips_pager_release_after_rollback_failure() {
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+        let pager = fsqlite_pager::traits::MockMvccPager;
+        let txn =
+            fsqlite_pager::MvccPager::begin(&pager, &cx, fsqlite_pager::TransactionMode::Deferred)
+                .unwrap();
+        *conn.in_transaction.borrow_mut() = true;
+        *conn.active_txn.borrow_mut() = Some(Box::new(txn));
+
+        let err = conn
+            .with_internal_statement_savepoint("test_rollback_failure", || -> Result<()> {
+                let replacement = fsqlite_pager::MvccPager::begin(
+                    &pager,
+                    &cx,
+                    fsqlite_pager::TransactionMode::Deferred,
+                )
+                .unwrap();
+                *conn.active_txn.borrow_mut() = Some(Box::new(replacement));
+                Err(FrankenError::Internal(
+                    "synthetic statement failure".to_owned(),
+                ))
+            })
+            .expect_err("statement cleanup should surface pager rollback failure");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("pager rollback_to_savepoint('"),
+            "unexpected error: {err_text}",
+        );
+        assert!(
+            err_text.contains("synthetic statement failure"),
+            "unexpected error: {err_text}",
+        );
+        assert!(
+            !err_text.contains("pager release_savepoint"),
+            "statement cleanup must not release a pager savepoint after rollback failure: {err_text}",
         );
     }
 
@@ -59572,9 +60979,12 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
 
-        let rows = conn.query("SELECT id, value FROM aux.t ORDER BY id;").unwrap();
+        let rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
@@ -59610,7 +61020,11 @@ mod pager_routing_tests {
         conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
             .unwrap();
 
-        assert_eq!(conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap(), 1);
+        assert_eq!(
+            conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+                .unwrap(),
+            1
+        );
 
         let tracking = conn
             .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
@@ -59618,6 +61032,402 @@ mod pager_routing_tests {
         assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
         assert_eq!(tracking.values()[1], SqliteValue::Integer(1));
         assert_eq!(tracking.values()[2], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_multiple_inserts_into_attached_schema_refresh_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (3, 'gamma');")
+            .unwrap();
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(3));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_insert_with_explicit_rowid_zero_updates_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+
+        assert_eq!(
+            conn.execute("INSERT INTO t VALUES (0, 'zero');").unwrap(),
+            1
+        );
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(0));
+
+        let rows = conn.query("SELECT id, value FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".to_owned()));
+    }
+
+    #[test]
+    fn test_insert_or_fail_with_explicit_rowid_zero_preserves_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO t VALUES (0, 'zero'), (1, 'zero');")
+            .expect_err("duplicate value should fail INSERT OR FAIL");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(0));
+
+        let rows = conn.query("SELECT id, value FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".to_owned()));
+    }
+
+    #[test]
+    fn test_attached_insert_or_fail_preserves_change_tracking_on_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO aux.t VALUES (1, 'alpha'), (2, 'alpha');")
+            .expect_err("duplicate value should fail attached INSERT OR FAIL");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(1));
+
+        let rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+    }
+
+    #[test]
+    fn test_attached_insert_or_fail_with_explicit_rowid_zero_preserves_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO aux.t VALUES (0, 'zero'), (1, 'zero');")
+            .expect_err("duplicate value should fail attached INSERT OR FAIL");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(0));
+
+        let rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".to_owned()));
+    }
+
+    #[test]
+    fn test_attached_insert_select_or_fail_preserves_change_tracking_on_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE aux.dest (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.src (id INTEGER, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.src VALUES (1, 'dup');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.src VALUES (2, 'dup');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT OR FAIL INTO aux.dest SELECT id, value FROM aux.src ORDER BY id;")
+            .expect_err("duplicate row should fail attached INSERT OR FAIL ... SELECT");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(3));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(1));
+
+        let rows = conn
+            .query("SELECT id, value FROM aux.dest ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("dup".to_owned()));
+    }
+
+    #[test]
+    fn test_attached_update_preserves_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (3, 'gamma');")
+            .unwrap();
+
+        conn.execute("UPDATE aux.t SET value = 'omega' WHERE id = 1;")
+            .unwrap();
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(4));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_attached_update_or_fail_preserves_change_tracking_on_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (3, 'gamma');")
+            .unwrap();
+        let before_update = conn.query_row("SELECT last_insert_rowid();").unwrap();
+        assert_eq!(before_update.values()[0], SqliteValue::Integer(3));
+        assert_eq!(conn.current_last_insert_rowid(), 3);
+        let attached_before_update = conn
+            .with_attached_connection("aux", |attached| Ok(attached.current_last_insert_rowid()))
+            .unwrap();
+        assert_eq!(attached_before_update, 3);
+
+        let err = conn
+            .execute(
+                "UPDATE OR FAIL aux.t SET value = CASE id \
+                 WHEN 1 THEN 'omega' \
+                 WHEN 2 THEN 'omega' \
+                 ELSE value END \
+                 WHERE id IN (1, 2);",
+            )
+            .expect_err("duplicate update should fail attached UPDATE OR FAIL");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+        let attached_after_error = conn
+            .with_attached_connection("aux", |attached| {
+                Ok((
+                    attached.current_last_insert_rowid(),
+                    *attached.last_changes.borrow(),
+                    *attached.total_changes.borrow(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(attached_after_error.0, 3);
+        assert_eq!(attached_after_error.1, 1);
+        assert_eq!(attached_after_error.2, 4);
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(4));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(3));
+
+        let rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("omega".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("gamma".to_owned()));
+    }
+
+    #[test]
+    fn test_attached_update_or_fail_preserves_outer_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("CREATE TABLE main_t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (3, 'gamma');")
+            .unwrap();
+        conn.execute("INSERT INTO main_t(value) VALUES ('main-row');")
+            .unwrap();
+
+        let before_update = conn.query_row("SELECT last_insert_rowid();").unwrap();
+        assert_eq!(before_update.values()[0], SqliteValue::Integer(1));
+
+        let err = conn
+            .execute(
+                "UPDATE OR FAIL aux.t SET value = CASE id \
+                 WHEN 1 THEN 'omega' \
+                 WHEN 2 THEN 'omega' \
+                 ELSE value END \
+                 WHERE id IN (1, 2);",
+            )
+            .expect_err("duplicate update should fail attached UPDATE OR FAIL");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(5));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_update_preserves_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'gamma');").unwrap();
+        let before_update = conn.query_row("SELECT last_insert_rowid();").unwrap();
+        assert_eq!(before_update.values()[0], SqliteValue::Integer(3));
+
+        conn.execute("UPDATE t SET value = 'omega' WHERE id = 1;")
+            .unwrap();
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(4));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_update_or_fail_preserves_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'gamma');").unwrap();
+        let before_update = conn.query_row("SELECT last_insert_rowid();").unwrap();
+        assert_eq!(before_update.values()[0], SqliteValue::Integer(3));
+
+        let err = conn
+            .execute(
+                "UPDATE OR FAIL t SET value = CASE id \
+                 WHEN 1 THEN 'omega' \
+                 WHEN 2 THEN 'omega' \
+                 ELSE value END \
+                 WHERE id IN (1, 2);",
+            )
+            .expect_err("duplicate update should fail UPDATE OR FAIL");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(4));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(3));
+
+        let rows = conn.query("SELECT id, value FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("omega".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("gamma".to_owned()));
+    }
+
+    #[test]
+    fn test_upsert_do_update_preserves_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO kv VALUES ('a', 1);").unwrap();
+        conn.execute("INSERT INTO kv VALUES ('b', 2);").unwrap();
+
+        conn.execute(
+            "INSERT INTO kv VALUES ('a', 10) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v;",
+        )
+        .unwrap();
+
+        let tracking = conn
+            .query_row("SELECT changes(), total_changes(), last_insert_rowid();")
+            .unwrap();
+        assert_eq!(tracking.values()[0], SqliteValue::Integer(1));
+        assert_eq!(tracking.values()[1], SqliteValue::Integer(3));
+        assert_eq!(tracking.values()[2], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_insert_into_attached_schema_select_is_statement_atomic_in_autocommit() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.dest (id INTEGER PRIMARY KEY, value TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.src (id INTEGER, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.src VALUES (1, 'dup');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.src VALUES (2, 'dup');")
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO aux.dest SELECT id, value FROM aux.src ORDER BY id;")
+            .expect_err("duplicate row should abort the whole attached INSERT ... SELECT");
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        let rows = conn
+            .query("SELECT id, value FROM aux.dest ORDER BY id;")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "attached INSERT ... SELECT leaked partial rows"
+        );
     }
 
     #[test]
@@ -59639,7 +61449,9 @@ mod pager_routing_tests {
         let err = conn
             .execute("INSERT INTO aux.t VALUES (1, 'alpha');")
             .expect_err("attached INSERT inside BEGIN should stay rejected");
-        assert!(matches!(err, FrankenError::NotImplemented(message) if message.contains("explicit transactions/savepoints")));
+        assert!(
+            matches!(err, FrankenError::NotImplemented(message) if message.contains("explicit transactions/savepoints"))
+        );
 
         conn.execute("ROLLBACK;").unwrap();
 
@@ -59648,6 +61460,49 @@ mod pager_routing_tests {
             .query_row("SELECT COUNT(*) FROM t;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(row_count, 0);
+    }
+
+    #[test]
+    fn test_create_table_as_select_in_attached_schema_reads_attached_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("CREATE TABLE aux.src (id INTEGER, value TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO aux.src VALUES (1, 'alpha');")
+            .unwrap();
+
+        conn.execute("CREATE TABLE aux.copy AS SELECT id, value FROM aux.src;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, value FROM aux.copy ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+    }
+
+    #[test]
+    fn test_zero_row_insert_select_into_missing_attached_table_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO aux.missing SELECT 1 WHERE 0;")
+            .expect_err("missing attached target should not silently succeed on zero rows");
+        assert!(
+            matches!(err, FrankenError::Internal(message) if message.contains("table not found"))
+        );
     }
 
     #[test]
@@ -59710,15 +61565,19 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+            .unwrap();
 
         conn.execute(
             "UPDATE aux.t SET value = 'gamma' WHERE id IN (SELECT id FROM aux.t WHERE value = 'beta');",
         )
         .unwrap();
 
-        let rows = conn.query("SELECT id, value FROM aux.t ORDER BY id;").unwrap();
+        let rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
@@ -59750,15 +61609,17 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY, value TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO aux.t VALUES (2, 'beta');")
+            .unwrap();
 
-        conn.execute(
-            "DELETE FROM aux.t WHERE id IN (SELECT id FROM aux.t WHERE value = 'alpha');",
-        )
-        .unwrap();
+        conn.execute("DELETE FROM aux.t WHERE id IN (SELECT id FROM aux.t WHERE value = 'alpha');")
+            .unwrap();
 
-        let rows = conn.query("SELECT id, value FROM aux.t ORDER BY id;").unwrap();
+        let rows = conn
+            .query("SELECT id, value FROM aux.t ORDER BY id;")
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("beta".to_owned()));
@@ -80323,10 +82184,11 @@ mod pager_routing_tests {
         );
 
         let rows = conn
-            .query("SELECT last_insert_rowid(), total_changes();")
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(0));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(1));
     }
 
     #[test]
