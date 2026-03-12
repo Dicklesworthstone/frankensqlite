@@ -44,6 +44,13 @@ use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnTy
 
 use crate::VdbeProgram;
 
+const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 256;
+
+#[inline]
+fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
+    cx.checkpoint().map_err(|_| FrankenError::Interrupt)
+}
+
 // ── In-Memory Table Store ──────────────────────────────────────────────────
 //
 // Phase 4 in-memory cursor backend. Allows the VDBE engine to execute
@@ -941,6 +948,7 @@ impl PageWriter for SharedTxnPageIo {
             let page_data_base = PageData::from_vec(data.to_vec());
 
             loop {
+                observe_execution_cancellation(cx)?;
                 let page_data = page_data_base.clone();
                 let (txn_id, snapshot_high, conflicting_commit_seq) = {
                     let guard = ctx
@@ -3546,6 +3554,9 @@ impl VdbeEngine {
         let outcome = loop {
             if pc >= ops.len() {
                 break ExecOutcome::Done;
+            }
+            if opcode_count & (VDBE_EXECUTION_CHECKPOINT_INTERVAL - 1) == 0 {
+                observe_execution_cancellation(&self.execution_cx)?;
             }
 
             let op = &ops[pc];
@@ -8737,8 +8748,27 @@ mod tests {
 
     use super::*;
     use crate::ProgramBuilder;
-    use fsqlite_func::{FunctionRegistry, register_builtins};
+    use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+
+    struct CancelExecutionFunc {
+        cx: Cx,
+    }
+
+    impl ScalarFunction for CancelExecutionFunc {
+        fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
+            self.cx.cancel();
+            Ok(SqliteValue::Null)
+        }
+
+        fn num_args(&self) -> i32 {
+            0
+        }
+
+        fn name(&self) -> &str {
+            "cancel_exec"
+        }
+    }
 
     /// Build and execute a program, returning results.
     fn run_program(build: impl FnOnce(&mut ProgramBuilder)) -> Vec<Vec<SqliteValue>> {
@@ -8772,6 +8802,29 @@ mod tests {
             .into_iter()
             .map(|v| v.into_vec())
             .collect()
+    }
+
+    #[test]
+    fn test_execute_honors_cancelled_execution_context() {
+        let mut builder = ProgramBuilder::new();
+        for _ in 0..=VDBE_EXECUTION_CHECKPOINT_INTERVAL {
+            builder.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+        }
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let cx = Cx::new();
+        cx.transition_to_running();
+        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
+        let err = engine.execute(&program).unwrap_err();
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(
+            engine.results().is_empty(),
+            "cancelled execute should not emit rows"
+        );
     }
 
     #[test]
@@ -8888,6 +8941,63 @@ mod tests {
         assert!(engine.results().is_empty());
         assert_eq!(engine.changes(), 0);
         assert_eq!(engine.last_insert_rowid(), 0);
+    }
+
+    #[test]
+    fn test_execute_observes_cancelled_execution_context_before_first_opcode() {
+        let cx = Cx::new();
+        cx.cancel();
+
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Integer, 7, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
+        let err = engine
+            .execute(&program)
+            .expect_err("cancelled execution context should abort before opcode dispatch");
+
+        assert!(matches!(err, FrankenError::Interrupt));
+    }
+
+    #[test]
+    fn test_execute_observes_execution_cx_cancellation_after_function_opcode() {
+        let root_cx = Cx::new();
+
+        let mut builder = ProgramBuilder::new();
+        let result_reg = builder.alloc_reg();
+        builder.emit_op(
+            Opcode::Function,
+            0,
+            0,
+            result_reg,
+            P4::FuncName("cancel_exec".to_owned()),
+            0,
+        );
+        for _ in 0..(VDBE_EXECUTION_CHECKPOINT_INTERVAL * 2) {
+            builder.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+        }
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new_with_execution_cx(
+            program.register_count(),
+            &root_cx,
+            PageSize::DEFAULT,
+        );
+        let mut registry = FunctionRegistry::new();
+        registry.register_scalar(CancelExecutionFunc {
+            cx: root_cx.clone(),
+        });
+        engine.set_function_registry(Arc::new(registry));
+
+        let err = engine
+            .execute(&program)
+            .expect_err("cancellation should be observed during opcode dispatch");
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(engine.results().is_empty());
     }
 
     /// Build and execute a program with the builtin function registry attached.

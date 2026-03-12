@@ -336,9 +336,8 @@ pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut 
 
     tracing::info!(target: "fsqlite.compat", path = %path, "sqlite3_open");
 
-    let open_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Connection::open(&path)
-    }));
+    let open_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Connection::open(&path)));
 
     match open_result {
         Ok(Ok(conn)) => {
@@ -449,9 +448,8 @@ pub unsafe extern "C" fn sqlite3_exec(
 
     // Route through Connection::query() because FrankenSQLite already executes
     // DDL/DML there and returns rows only for result-producing statements.
-    let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle.conn.query(sql_str)
-    }));
+    let exec_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.conn.query(sql_str)));
 
     match exec_result {
         Ok(Ok(rows)) => {
@@ -502,9 +500,7 @@ pub unsafe extern "C" fn sqlite3_exec(
 
                     let rc = cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
                     if rc != SQLITE_OK {
-                        let err = FrankenError::ExecutionAborted {
-                            detail: "sqlite3_exec callback returned non-zero".to_owned(),
-                        };
+                        let err = FrankenError::Abort;
                         handle.set_error(&err);
                         write_error_message(errmsg, &err.to_string());
                         return SQLITE_ABORT;
@@ -718,12 +714,11 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
     if s.rows.is_none() {
         tracing::info!(target: "fsqlite.compat", sql = %s.sql, "sqlite3_step (first call)");
 
-        let execute_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match s.step_mode {
+        let execute_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match s.step_mode {
                 PreparedStepMode::Query => db.conn.query(&s.sql).map(Some),
                 PreparedStepMode::Execute => db.conn.execute(&s.sql).map(|_| None),
-            }
-        }));
+            }));
 
         match execute_result {
             Ok(Ok(Some(rows))) => {

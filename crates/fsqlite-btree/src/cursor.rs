@@ -33,6 +33,11 @@ use fsqlite_types::serial_type::{read_varint, write_varint};
 use fsqlite_types::{PageNumber, WitnessKey};
 use tracing::{Level, debug, trace, warn};
 
+#[inline]
+fn observe_cursor_cancellation(cx: &Cx) -> Result<()> {
+    cx.checkpoint().map_err(|_| FrankenError::Interrupt)
+}
+
 // ---------------------------------------------------------------------------
 // Page reader trait (for testability)
 // ---------------------------------------------------------------------------
@@ -540,6 +545,8 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Load a page into a stack entry.
     fn load_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
+        observe_cursor_cancellation(cx)?;
+
         // Alien Optimization: Hot-path Stack Elision.
         // We can only elide the load if the page hasn't been modified
         // in the current transaction (is not dirty).
@@ -598,6 +605,7 @@ impl<P: PageReader> BtCursor<P> {
     ) -> Result<bool> {
         let mut current_page = page_no;
         loop {
+            observe_cursor_cancellation(cx)?;
             if self.stack.len() >= BTREE_MAX_DEPTH as usize {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
@@ -663,6 +671,7 @@ impl<P: PageReader> BtCursor<P> {
     ) -> Result<bool> {
         let mut current_page = page_no;
         loop {
+            observe_cursor_cancellation(cx)?;
             if self.stack.len() >= BTREE_MAX_DEPTH as usize {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
@@ -754,10 +763,12 @@ impl<P: PageReader> BtCursor<P> {
     /// Internal seek used by INSERT that anchors the cursor on the leaf where
     /// the target belongs, even if it falls off the right edge.
     fn table_seek_for_insert(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
+        observe_cursor_cancellation(cx)?;
         self.stack.clear();
         let mut current_page = self.root_page;
 
         loop {
+            observe_cursor_cancellation(cx)?;
             if self.stack.len() >= BTREE_MAX_DEPTH as usize {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
@@ -782,7 +793,7 @@ impl<P: PageReader> BtCursor<P> {
 
             if entry.header.page_type.is_leaf() {
                 // Binary search on the leaf page by rowid.
-                let result = Self::binary_search_table_leaf(&entry, target_rowid)?;
+                let result = Self::binary_search_table_leaf(cx, &entry, target_rowid)?;
                 match result {
                     BinarySearchResult::Found(idx) => {
                         let mut entry = entry;
@@ -821,7 +832,7 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior table page: binary search to find which child to descend.
-            let child_idx = Self::binary_search_table_interior(&entry, target_rowid)?;
+            let child_idx = Self::binary_search_table_interior(cx, &entry, target_rowid)?;
             let child = self.child_page_at(&entry, child_idx)?;
             let mut entry = entry;
             entry.cell_idx = child_idx;
@@ -832,7 +843,11 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Binary search a leaf table page for a rowid.
-    fn binary_search_table_leaf(entry: &StackEntry, target: i64) -> Result<BinarySearchResult> {
+    fn binary_search_table_leaf(
+        cx: &Cx,
+        entry: &StackEntry,
+        target: i64,
+    ) -> Result<BinarySearchResult> {
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(BinarySearchResult::NotFound(0));
@@ -841,6 +856,7 @@ impl<P: PageReader> BtCursor<P> {
         let mut lo = 0u16;
         let mut hi = count;
         while lo < hi {
+            observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let offset = entry.cell_pointers[mid as usize] as usize;
             let cell_data = &entry.page_data[offset..];
@@ -873,7 +889,7 @@ impl<P: PageReader> BtCursor<P> {
     ///
     /// Returns the child index (0..=cell_count). If the target is greater
     /// than all keys, returns cell_count (meaning follow right_child).
-    fn binary_search_table_interior(entry: &StackEntry, target: i64) -> Result<u16> {
+    fn binary_search_table_interior(cx: &Cx, entry: &StackEntry, target: i64) -> Result<u16> {
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(0); // Follow right_child.
@@ -888,6 +904,7 @@ impl<P: PageReader> BtCursor<P> {
         let mut lo = 0u16;
         let mut hi = count;
         while lo < hi {
+            observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let offset = entry.cell_pointers[mid as usize] as usize;
             let cell_data = &entry.page_data[offset..];
@@ -944,10 +961,12 @@ impl<P: PageReader> BtCursor<P> {
     /// Internal seek used by INSERT that anchors the cursor on the leaf where
     /// the target belongs, even if it falls off the right edge.
     fn index_seek_for_insert(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+        observe_cursor_cancellation(cx)?;
         self.stack.clear();
         let mut current_page = self.root_page;
 
         loop {
+            observe_cursor_cancellation(cx)?;
             if self.stack.len() >= BTREE_MAX_DEPTH as usize {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
@@ -1069,6 +1088,7 @@ impl<P: PageReader> BtCursor<P> {
         let parsed_target = parse_record(target);
 
         while lo < hi {
+            observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
@@ -1106,6 +1126,7 @@ impl<P: PageReader> BtCursor<P> {
         let parsed_target = parse_record(target);
 
         while lo < hi {
+            observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
@@ -1129,6 +1150,8 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Advance to the next entry. Returns false if at EOF.
     fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
+
         if self.at_eof {
             self.at_eof = true;
             return Ok(false);
@@ -1161,6 +1184,7 @@ impl<P: PageReader> BtCursor<P> {
             // interior page with more children to visit.
             self.stack.pop();
             while !self.stack.is_empty() {
+                observe_cursor_cancellation(cx)?;
                 let depth = self.stack.len();
                 let parent = &self.stack[depth - 1];
                 if parent.cell_idx < parent.header.cell_count {
@@ -1213,6 +1237,8 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Move to the previous entry. Returns false if at the beginning.
     fn advance_prev(&mut self, cx: &Cx) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
+
         if self.at_eof {
             // Recover from an after-last state (e.g., next() from last row).
             if self.stack.is_empty() {
@@ -1260,6 +1286,7 @@ impl<P: PageReader> BtCursor<P> {
             // Before the first cell on this leaf. Pop up.
             self.stack.pop();
             while !self.stack.is_empty() {
+                observe_cursor_cancellation(cx)?;
                 let depth = self.stack.len();
                 let parent = &self.stack[depth - 1];
                 if parent.cell_idx > 0 {
@@ -1389,6 +1416,7 @@ impl<P: PageWriter> BtCursor<P> {
         let mut visited = 0usize;
 
         while let Some(pgno) = current {
+            observe_cursor_cancellation(cx)?;
             visited += 1;
             if visited > overflow::MAX_OVERFLOW_CHAIN {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -1622,6 +1650,7 @@ impl<P: PageWriter> BtCursor<P> {
                 new_dividers,
             } = outcome
             {
+                observe_cursor_cancellation(cx)?;
                 self.note_split_event();
                 if parent_level == 0 {
                     return Err(FrankenError::internal(
@@ -1676,6 +1705,7 @@ impl<P: PageWriter> BtCursor<P> {
         let mut level = depth - 2;
 
         loop {
+            observe_cursor_cancellation(cx)?;
             let parent_page_no = self.stack[level].page_no;
             let child_idx = usize::from(self.stack[level].cell_idx);
             let parent_is_root = parent_page_no == self.root_page;
@@ -1700,6 +1730,7 @@ impl<P: PageWriter> BtCursor<P> {
                 new_dividers,
             } = outcome
             {
+                observe_cursor_cancellation(cx)?;
                 self.note_split_event();
                 if split_level == 0 {
                     return Err(FrankenError::internal(
@@ -2037,12 +2068,14 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn first(&mut self, cx: &Cx) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
         self.move_to_leftmost_leaf(cx, self.root_page, true)
     }
 
     fn last(&mut self, cx: &Cx) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
         self.move_to_rightmost_leaf(cx, self.root_page, true)
@@ -2544,6 +2577,55 @@ mod tests {
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
 
+    #[derive(Debug, Clone)]
+    struct CancelAfterReadStore {
+        inner: MemPageStore,
+        cancelled: Rc<RefCell<bool>>,
+    }
+
+    impl CancelAfterReadStore {
+        fn new(inner: MemPageStore) -> Self {
+            Self {
+                inner,
+                cancelled: Rc::new(RefCell::new(false)),
+            }
+        }
+    }
+
+    impl PageReader for CancelAfterReadStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            let page = self.inner.read_page(cx, page_no)?;
+            let mut cancelled = self.cancelled.borrow_mut();
+            if !*cancelled {
+                cx.cancel();
+                *cancelled = true;
+            }
+            Ok(page)
+        }
+
+        fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
+            self.inner.prefetch_page_hint(cx, page_no);
+        }
+    }
+
+    impl PageWriter for CancelAfterReadStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
+        }
+
+        fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
+            self.inner.record_write_witness(cx, key);
+        }
+    }
+
     const USABLE: u32 = 4096;
 
     #[test]
@@ -2903,6 +2985,57 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_first_observes_cancelled_context_before_descent() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"alice"), (5, b"bob")]));
+
+        let cx = Cx::new();
+        cx.cancel();
+
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let err = cursor
+            .first(&cx)
+            .expect_err("cancelled context should abort before leaf descent");
+
+        assert!(matches!(err, FrankenError::Interrupt));
+    }
+
+    #[test]
+    fn test_table_seek_observes_cancellation_during_leaf_binary_search() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_leaf_table(&[(1, b"alpha"), (5, b"bravo"), (9, b"charlie")]),
+        );
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
+        let err = cursor
+            .table_move_to(&cx, 5)
+            .expect_err("binary search should observe cancellation after page load");
+
+        assert!(matches!(err, FrankenError::Interrupt));
+    }
+
+    #[test]
+    fn test_index_seek_observes_cancellation_during_leaf_binary_search() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_leaf_index(&[b"alpha", b"bravo", b"charlie"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, false);
+        let err = cursor
+            .index_move_to(&cx, b"bravo")
+            .expect_err("index binary search should observe cancellation after page load");
+
+        assert!(matches!(err, FrankenError::Interrupt));
+    }
+
+    #[test]
     fn test_cursor_seek_exact() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
@@ -2939,6 +3072,51 @@ mod tests {
         let result = cursor.table_move_to(&cx, 20).unwrap();
         assert!(!result.is_found());
         assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_cursor_seek_observes_cancellation_during_leaf_binary_search() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten"), (15, b"fifteen")]),
+        );
+
+        let cancelled_cx = Cx::new();
+        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
+        let err = cursor
+            .table_move_to(&cancelled_cx, 10)
+            .expect_err("cancellation should interrupt the in-node search loop");
+        assert!(matches!(err, FrankenError::Interrupt));
+
+        let recovery_cx = Cx::new();
+        assert!(cursor.table_move_to(&recovery_cx, 10).unwrap().is_found());
+        assert_eq!(cursor.rowid(&recovery_cx).unwrap(), 10);
+    }
+
+    #[test]
+    fn test_cursor_first_observes_cancellation_during_descent_and_recovers() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"ten"), (15, b"fifteen")]));
+
+        let cancelled_cx = Cx::new();
+        let mut cursor = BtCursor::new(CancelAfterReadStore::new(store), pn(2), USABLE, true);
+        let err = cursor
+            .first(&cancelled_cx)
+            .expect_err("cancellation should interrupt multi-page descent");
+        assert!(matches!(err, FrankenError::Interrupt));
+
+        let recovery_cx = Cx::new();
+        assert!(cursor.first(&recovery_cx).unwrap());
+        assert_eq!(cursor.rowid(&recovery_cx).unwrap(), 1);
     }
 
     #[test]
@@ -4619,5 +4797,49 @@ mod tests {
         assert!(revived, "Real cursor should revive from EOF");
         assert!(!cursor.eof());
         assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_table_move_to_honors_cancelled_context() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
+
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let cx = Cx::new();
+        cx.transition_to_running();
+        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+
+        let err = cursor.table_move_to(&cx, 2).unwrap_err();
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(
+            cursor.stack.is_empty(),
+            "cancelled seek should not mutate stack"
+        );
+    }
+
+    #[test]
+    fn test_next_honors_cancelled_context() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
+
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+
+        cx.transition_to_running();
+        cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+
+        let err = cursor.next(&cx).unwrap_err();
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert_eq!(
+            cursor.rowid(&Cx::new()).unwrap(),
+            1,
+            "cancelled iteration should preserve the prior cursor position"
+        );
     }
 }

@@ -12,6 +12,8 @@
 //! propagation. Lightweight accessors (`eof`, `column`, `rowid`) do not
 //! require `&Cx` since they operate on already-fetched row data.
 
+use std::any::Any;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx;
@@ -324,6 +326,10 @@ pub trait VtabModuleFactory: Send + Sync {
 /// A type-erased virtual table instance.
 #[allow(clippy::missing_errors_doc)]
 pub trait ErasedVtabInstance: Send + Sync {
+    /// Return this instance as `Any` for downcasting to concrete extension types.
+    fn as_any(&self) -> &dyn Any;
+    /// Return this instance as mutable `Any` for downcasting to concrete extension types.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
     /// Open a new scan cursor.
     fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>>;
     /// INSERT/UPDATE/DELETE on the virtual table.
@@ -393,6 +399,14 @@ impl<T: VirtualTable + 'static> ErasedVtabInstance for T
 where
     T::Cursor: 'static,
 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>> {
         let cursor = VirtualTable::open(self)?;
         Ok(Box::new(cursor))

@@ -37,10 +37,12 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_ext_fts5::{Fts5Expr, Fts5Table, build_expr, parse_fts5_query};
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
 use fsqlite_ext_misc::GenerateSeriesTable;
+use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
 use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{
-    ColumnContext, ErasedVtabInstance, VtabModuleFactory, module_factory_from,
+    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo,
+    VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
@@ -2277,6 +2279,120 @@ impl Connection {
         *self.last_insert_rowid.borrow()
     }
 
+    fn has_live_vtab_instance(&self, table_name: &str) -> bool {
+        self.vtab_instances
+            .borrow()
+            .contains_key(&table_name.to_ascii_uppercase())
+    }
+
+    fn has_primary_live_vtab_source(&self, select: &SelectStatement) -> bool {
+        has_primary_live_vtab_source_inner(select, |table_name| self.has_live_vtab_instance(table_name))
+    }
+
+    /// Plan a scan against a live virtual-table instance by consulting
+    /// `best_index` and splitting the WHERE clause into consumed constraints
+    /// (passed as filter args) and a residual predicate (evaluated post-scan).
+    fn plan_live_vtab_scan(
+        &self,
+        table_name: &str,
+        where_clause: Option<&Expr>,
+        col_map: &[(String, String, bool)],
+    ) -> Result<LiveVtabScanPlan> {
+        // Flatten the WHERE clause into individual AND-terms and attempt to
+        // map each to a vtab constraint candidate.
+        let mut candidates: Vec<LiveVtabConstraintCandidate> = Vec::new();
+        let mut residual_terms: Vec<Expr> = Vec::new();
+
+        if let Some(where_expr) = where_clause {
+            let mut terms: Vec<&Expr> = Vec::new();
+            flatten_and_terms(where_expr, &mut terms);
+            for term in terms {
+                if let Some(candidate) = extract_live_vtab_constraint_candidate(term, col_map) {
+                    candidates.push(candidate);
+                } else {
+                    residual_terms.push(term.clone());
+                }
+            }
+        }
+
+        // Build IndexInfo and call best_index on the vtab instance.
+        let constraints: Vec<IndexConstraint> =
+            candidates.iter().map(|c| c.constraint.clone()).collect();
+        let mut info = IndexInfo::new(constraints, Vec::new());
+
+        {
+            let instances = self.vtab_instances.borrow();
+            let key = table_name.to_ascii_uppercase();
+            let instance = instances
+                .get(&key)
+                .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {table_name}")))?;
+            instance.best_index(&mut info)?;
+        }
+
+        // Collect consumed constraint values in argv_index order and move
+        // unconsumed constraints into the residual WHERE.
+        let mut indexed_args: Vec<(i32, SqliteValue)> = Vec::new();
+        for (i, usage) in info.constraint_usage.iter().enumerate() {
+            if usage.argv_index > 0 {
+                indexed_args.push((usage.argv_index, candidates[i].value.clone()));
+            } else {
+                // Not consumed by the vtab — must be checked post-scan.
+                residual_terms.push(candidates[i].expr.clone());
+            }
+        }
+        indexed_args.sort_by_key(|(idx, _)| *idx);
+        let args = indexed_args.into_iter().map(|(_, v)| v).collect();
+
+        let residual_where = rebuild_and_terms(residual_terms);
+
+        Ok(LiveVtabScanPlan {
+            idx_num: info.idx_num,
+            idx_str: info.idx_str,
+            args,
+            residual_where,
+        })
+    }
+
+    /// Execute a scan against a live virtual-table instance using a
+    /// previously computed [`LiveVtabScanPlan`].
+    fn scan_live_vtab_rows(
+        &self,
+        src: &JoinTableSource,
+        plan: &LiveVtabScanPlan,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let cx = self.op_cx()?;
+        let key = src.table_name.to_ascii_uppercase();
+        let num_cols = src.col_names.len();
+
+        let mut cursor = {
+            let instances = self.vtab_instances.borrow();
+            let instance = instances
+                .get(&key)
+                .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {}", src.table_name)))?;
+            instance.open_cursor()?
+        };
+
+        cursor.erased_filter(&cx, plan.idx_num, plan.idx_str.as_deref(), &plan.args)?;
+
+        let mut rows: Vec<Vec<SqliteValue>> = Vec::new();
+        while !cursor.erased_eof() {
+            let mut row = Vec::with_capacity(num_cols + 1);
+            for col_idx in 0..num_cols {
+                let mut col_ctx = ColumnContext::new();
+                cursor.erased_column(&mut col_ctx, i32::try_from(col_idx).unwrap_or(0))?;
+                row.push(col_ctx.take_value().unwrap_or(SqliteValue::Null));
+            }
+            if src.hidden_rowid_projection.is_some() {
+                let rowid = cursor.erased_rowid()?;
+                row.push(SqliteValue::Integer(rowid));
+            }
+            rows.push(row);
+            cursor.erased_next(&cx)?;
+        }
+
+        Ok(rows)
+    }
+
     fn reset_statement_change_count(&self) {
         *self.last_changes.borrow_mut() = 0;
         self.sync_change_tracking_context();
@@ -2985,6 +3101,30 @@ impl Connection {
         self.vtab_modules
             .borrow_mut()
             .insert(name.to_ascii_uppercase(), factory);
+    }
+
+    /// Register a custom geometry callback on a live SQL-created R-tree table.
+    pub fn register_rtree_geometry(
+        &self,
+        table_name: &str,
+        geometry_name: &str,
+        geometry: Box<dyn RtreeGeometry>,
+    ) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        let mut instances = self.vtab_instances.borrow_mut();
+        let instance = instances
+            .get_mut(&key)
+            .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {table_name}")))?;
+        let rtree = instance
+            .as_any_mut()
+            .downcast_mut::<RtreeVirtualTable>()
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "virtual table {table_name} is not an R-tree instance",
+                ))
+            })?;
+        rtree.register_geometry(geometry_name, geometry);
+        Ok(())
     }
 
     /// Return lowercase names of all custom aggregate UDFs in the registry.
@@ -4069,6 +4209,23 @@ impl Connection {
                         apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
+                } else if self.has_primary_live_vtab_source(select) {
+                    // Live virtual-table instances are not yet emitted through
+                    // the table-only VDBE codegen path. Route single-source
+                    // scans through the connection fallback, which can drive
+                    // the registered vtab instance directly.
+                    self.log_mem_execution_fallback("select", "live_vtab_select_fallback")?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows = self.execute_join_select(&bound, None)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
                 } else if select_contains_match_operator(select) {
                     // The VDBE path does not yet support MATCH/REGEXP in this
                     // connection path. Route through fallback evaluation.
@@ -4232,6 +4389,47 @@ impl Connection {
                 if skip_dml {
                     // RAISE(IGNORE) was called - skip the INSERT.
                     self.reset_statement_change_count();
+                    return Ok(Vec::new());
+                }
+
+                if self.has_live_vtab_instance(table_name) {
+                    if !insert.returning.is_empty() {
+                        return Err(FrankenError::NotImplemented(
+                            "RETURNING is not supported for live virtual-table INSERT".to_owned(),
+                        ));
+                    }
+                    if insert.or_conflict.is_some() || !insert.upsert.is_empty() {
+                        return Err(FrankenError::NotImplemented(
+                            "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
+                                .to_owned(),
+                        ));
+                    }
+
+                    let mut inserted_rows = if has_before_insert || has_after_insert {
+                        trigger_new_rows.clone()
+                    } else {
+                        self.collect_insert_trigger_rows(insert, params)?
+                    };
+                    let inserted_rowids =
+                        self.execute_live_vtab_insert_rows(table_name, &inserted_rows)?;
+
+                    if has_after_insert {
+                        for (row, rowid) in inserted_rows.iter_mut().zip(inserted_rowids.iter()) {
+                            if row.first().is_some_and(SqliteValue::is_null) {
+                                row[0] = SqliteValue::Integer(*rowid);
+                            }
+                        }
+                        for new_values in &inserted_rows {
+                            self.fire_after_triggers(
+                                table_name,
+                                &insert_event,
+                                None,
+                                Some(new_values),
+                            )?;
+                        }
+                    }
+
+                    self.record_statement_changes(inserted_rows.len());
                     return Ok(Vec::new());
                 }
 
@@ -5439,30 +5637,111 @@ impl Connection {
                     })
                 }
             }
-            Statement::Update(_) | Statement::Delete(_) => {
-                // UPDATE/DELETE still use full execute_statement dispatch
-                // because their execution requires complex materialization.
-                let placeholder_program =
-                    Arc::new(ProgramBuilder::new().finish().map_err(|e| {
-                        FrankenError::Internal(format!("failed to build placeholder program: {e}"))
-                    })?);
-                Ok(PreparedStatement {
-                    sql: sql.to_owned(),
-                    program: placeholder_program,
-                    func_registry: registry,
-                    expression_postprocess: None,
-                    distinct: false,
-                    db: None,
-                    pager: None,
-                    post_distinct_limit: None,
-                    schema_cookie: self.schema_cookie(),
-                    schema_generation: self.schema_generation(),
-                    dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))),
-                    deferred_query_statement: None,
-                    deferred_query_column_count: None,
-                    column_names: prepared_column_names,
-                    conn: self,
-                })
+            Statement::Update(update) => {
+                if Self::prepared_update_supports_precompiled_program(update) {
+                    let sql_key = Self::sql_hash(sql);
+                    let program = self.compile_with_cache(sql_key, sql, |conn| {
+                        conn.compile_table_update(update)
+                    })?;
+                    Ok(PreparedStatement {
+                        sql: sql.to_owned(),
+                        program,
+                        func_registry: registry,
+                        expression_postprocess: None,
+                        distinct: false,
+                        db: Some(Rc::clone(&self.db)),
+                        pager: Some(self.pager.clone()),
+                        post_distinct_limit: None,
+                        schema_cookie: self.schema_cookie(),
+                        schema_generation: self.schema_generation(),
+                        dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
+                            statement.clone(),
+                        ))),
+                        deferred_query_statement: None,
+                        deferred_query_column_count: None,
+                        column_names: prepared_column_names,
+                        conn: self,
+                    })
+                } else {
+                    let placeholder_program =
+                        Arc::new(ProgramBuilder::new().finish().map_err(|e| {
+                            FrankenError::Internal(format!(
+                                "failed to build placeholder program: {e}"
+                            ))
+                        })?);
+                    Ok(PreparedStatement {
+                        sql: sql.to_owned(),
+                        program: placeholder_program,
+                        func_registry: registry,
+                        expression_postprocess: None,
+                        distinct: false,
+                        db: None,
+                        pager: None,
+                        post_distinct_limit: None,
+                        schema_cookie: self.schema_cookie(),
+                        schema_generation: self.schema_generation(),
+                        dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
+                            statement.clone(),
+                        ))),
+                        deferred_query_statement: None,
+                        deferred_query_column_count: None,
+                        column_names: prepared_column_names,
+                        conn: self,
+                    })
+                }
+            }
+            Statement::Delete(delete) => {
+                if Self::prepared_delete_supports_precompiled_program(delete) {
+                    let sql_key = Self::sql_hash(sql);
+                    let program = self.compile_with_cache(sql_key, sql, |conn| {
+                        conn.compile_table_delete(delete)
+                    })?;
+                    Ok(PreparedStatement {
+                        sql: sql.to_owned(),
+                        program,
+                        func_registry: registry,
+                        expression_postprocess: None,
+                        distinct: false,
+                        db: Some(Rc::clone(&self.db)),
+                        pager: Some(self.pager.clone()),
+                        post_distinct_limit: None,
+                        schema_cookie: self.schema_cookie(),
+                        schema_generation: self.schema_generation(),
+                        dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
+                            statement.clone(),
+                        ))),
+                        deferred_query_statement: None,
+                        deferred_query_column_count: None,
+                        column_names: prepared_column_names,
+                        conn: self,
+                    })
+                } else {
+                    let placeholder_program =
+                        Arc::new(ProgramBuilder::new().finish().map_err(|e| {
+                            FrankenError::Internal(format!(
+                                "failed to build placeholder program: {e}"
+                            ))
+                        })?);
+                    Ok(PreparedStatement {
+                        sql: sql.to_owned(),
+                        program: placeholder_program,
+                        func_registry: registry,
+                        expression_postprocess: None,
+                        distinct: false,
+                        db: None,
+                        pager: None,
+                        post_distinct_limit: None,
+                        schema_cookie: self.schema_cookie(),
+                        schema_generation: self.schema_generation(),
+                        dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
+                            statement.clone(),
+                        ))),
+                        deferred_query_statement: None,
+                        deferred_query_column_count: None,
+                        column_names: prepared_column_names,
+                        conn: self,
+                    })
+                }
             }
             _ => Err(FrankenError::NotImplemented(
                 "prepare() supports SELECT, INSERT, UPDATE, and DELETE statements only".to_owned(),
@@ -5497,6 +5776,30 @@ impl Connection {
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case(table_name))
             .is_some_and(|table| table.foreign_keys.is_empty())
+    }
+
+    fn prepared_update_supports_precompiled_program(update: &fsqlite_ast::UpdateStatement) -> bool {
+        update.with.is_none()
+            && update.order_by.is_empty()
+            && update.limit.is_none()
+            && !update
+                .assignments
+                .iter()
+                .any(|assignment| expr_contains_rewritable_subquery(&assignment.value))
+            && !update
+                .where_clause
+                .as_ref()
+                .is_some_and(expr_contains_rewritable_subquery)
+    }
+
+    fn prepared_delete_supports_precompiled_program(delete: &fsqlite_ast::DeleteStatement) -> bool {
+        delete.with.is_none()
+            && delete.order_by.is_empty()
+            && delete.limit.is_none()
+            && !delete
+                .where_clause
+                .as_ref()
+                .is_some_and(expr_contains_rewritable_subquery)
     }
 
     fn prepared_select_requires_dispatch(&self, statement: &Statement) -> bool {
@@ -6064,6 +6367,36 @@ impl Connection {
             .first()
             .map(|row| row.values().to_vec())
             .unwrap_or_default())
+    }
+
+    fn execute_live_vtab_insert_rows(
+        &self,
+        table_name: &str,
+        rows: &[Vec<SqliteValue>],
+    ) -> Result<Vec<i64>> {
+        let cx = self.op_cx()?;
+        let key = table_name.to_ascii_uppercase();
+        let mut instances = self.vtab_instances.borrow_mut();
+        let instance = instances
+            .get_mut(&key)
+            .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {table_name}")))?;
+
+        let mut inserted_rowids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut args = Vec::with_capacity(row.len() + 2);
+            args.push(SqliteValue::Null);
+            args.push(row.first().cloned().unwrap_or(SqliteValue::Null));
+            args.extend(row.iter().cloned());
+            let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "virtual table {table_name} did not return a rowid for INSERT",
+                ))
+            })?;
+            inserted_rowids.push(rowid);
+            self.record_last_insert_rowid(rowid);
+        }
+
+        Ok(inserted_rowids)
     }
 
     #[allow(clippy::unused_self)]
@@ -17546,7 +17879,26 @@ impl Connection {
         }
 
         let primary_width = table_sources[0].scan_width();
-        let primary_where_pushdown = where_clause.as_deref().and_then(|expr| {
+        let mut live_vtab_primary_scan = None;
+        let live_vtab_where_override =
+            if table_sources.len() == 1 && self.has_live_vtab_instance(&table_sources[0].table_name)
+        {
+            let live_plan =
+                self.plan_live_vtab_scan(&table_sources[0].table_name, where_clause.as_deref(), &col_map)?;
+            live_vtab_primary_scan = Some(live_plan);
+            Some(
+                live_vtab_primary_scan
+                    .as_ref()
+                    .and_then(|plan| plan.residual_where.clone()),
+            )
+        } else {
+            None
+        };
+        let effective_where_clause = live_vtab_where_override
+            .as_ref()
+            .map(|expr| expr.as_ref())
+            .unwrap_or(where_clause.as_deref());
+        let primary_where_pushdown = effective_where_clause.and_then(|expr| {
             expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
         });
 
@@ -17613,6 +17965,18 @@ impl Connection {
                     primary_where_pushdown,
                     &col_map[..primary_width],
                 )?);
+            } else if i == 0 {
+                if let Some(plan) = live_vtab_primary_scan.as_ref() {
+                    let row_data = self.scan_live_vtab_rows(src, plan)?;
+                    scanned_cache.insert(src.table_name.clone(), row_data.clone());
+                    table_rows.push(maybe_filter_primary_join_rows(
+                        row_data,
+                        i,
+                        primary_where_pushdown,
+                        &col_map[..primary_width],
+                    )?);
+                    continue;
+                }
             } else {
                 // Named table: scan through the normal query path so file-backed
                 // parity-cert connections read from pager-backed state instead
@@ -17681,7 +18045,7 @@ impl Connection {
         }
 
         // ── 5. Apply WHERE filter ──
-        if let Some(where_expr) = where_clause {
+        if let Some(where_expr) = effective_where_clause {
             let mut filtered = Vec::with_capacity(combined.len());
             for row in combined {
                 let predicate =
@@ -19581,6 +19945,21 @@ fn has_table_function_source(select: &SelectStatement) -> bool {
         }
     }
     false
+}
+
+fn has_primary_live_vtab_source_inner(
+    select: &SelectStatement,
+    has_instance: impl Fn(&str) -> bool,
+) -> bool {
+    match &select.body.select {
+        SelectCore::Select {
+            from: Some(from), ..
+        } if from.joins.is_empty() => match &from.source {
+            TableOrSubquery::Table { name, .. } => has_instance(&name.name),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn has_fallback_from_source(select: &SelectStatement) -> bool {
@@ -27619,6 +27998,21 @@ fn build_join_scan_sql(source: &JoinTableSource) -> String {
     )
 }
 
+#[derive(Debug, Clone)]
+struct LiveVtabConstraintCandidate {
+    expr: Expr,
+    constraint: IndexConstraint,
+    value: SqliteValue,
+}
+
+#[derive(Debug, Clone)]
+struct LiveVtabScanPlan {
+    idx_num: i32,
+    idx_str: Option<String>,
+    args: Vec<SqliteValue>,
+    residual_where: Option<Expr>,
+}
+
 /// Perform a single join step: combine left-side rows with right-side rows.
 #[allow(clippy::too_many_lines)]
 fn execute_single_join(
@@ -27721,6 +28115,173 @@ fn execute_single_join(
     }
 
     Ok(result)
+}
+
+fn flatten_and_terms<'a>(expr: &'a Expr, terms: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOp::And,
+        right,
+        ..
+    } = expr
+    {
+        flatten_and_terms(left, terms);
+        flatten_and_terms(right, terms);
+    } else {
+        terms.push(expr);
+    }
+}
+
+fn rebuild_and_terms(mut terms: Vec<Expr>) -> Option<Expr> {
+    let first = terms.pop()?;
+    Some(
+        terms
+            .into_iter()
+            .rev()
+            .fold(first, |right, left| Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOp::And,
+                right: Box::new(right),
+                span: Span::ZERO,
+            }),
+    )
+}
+
+fn direct_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
+    match op {
+        BinaryOp::Eq => Some(ConstraintOp::Eq),
+        BinaryOp::Lt => Some(ConstraintOp::Lt),
+        BinaryOp::Le => Some(ConstraintOp::Le),
+        BinaryOp::Gt => Some(ConstraintOp::Gt),
+        BinaryOp::Ge => Some(ConstraintOp::Ge),
+        _ => None,
+    }
+}
+
+fn reverse_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
+    match op {
+        BinaryOp::Eq => Some(ConstraintOp::Eq),
+        BinaryOp::Lt => Some(ConstraintOp::Gt),
+        BinaryOp::Le => Some(ConstraintOp::Ge),
+        BinaryOp::Gt => Some(ConstraintOp::Lt),
+        BinaryOp::Ge => Some(ConstraintOp::Le),
+        _ => None,
+    }
+}
+
+fn eval_live_vtab_constant_expr(expr: &Expr) -> Option<SqliteValue> {
+    match expr {
+        Expr::Literal(lit, _) => Some(literal_to_join_value(lit)),
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: inner,
+            ..
+        } => match eval_live_vtab_constant_expr(inner)? {
+            SqliteValue::Integer(value) => Some(SqliteValue::Integer(value.saturating_neg())),
+            SqliteValue::Float(value) => Some(SqliteValue::Float(-value)),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr: inner,
+            ..
+        }
+        | Expr::Collate { expr: inner, .. } => eval_live_vtab_constant_expr(inner),
+        _ => None,
+    }
+}
+
+fn is_vtab_table_match_operand(expr: &Expr, col_map: &[(String, String, bool)]) -> bool {
+    if let Expr::Column(col_ref, _) = expr
+        && col_ref.table.is_none()
+    {
+        return col_map
+            .iter()
+            .any(|(table, _, _)| table.eq_ignore_ascii_case(&col_ref.column));
+    }
+    false
+}
+
+fn column_ref_to_vtab_constraint_column(
+    col_ref: &ColumnRef,
+    col_map: &[(String, String, bool)],
+) -> Option<i32> {
+    let idx = find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None).ok()?;
+    let (_, _, hidden) = col_map.get(idx)?;
+    if *hidden {
+        Some(-1)
+    } else {
+        i32::try_from(idx).ok()
+    }
+}
+
+fn extract_live_vtab_constraint_candidate(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+) -> Option<LiveVtabConstraintCandidate> {
+    match expr {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            if let Expr::Column(col_ref, _) = left.as_ref()
+                && let Some(value) = eval_live_vtab_constant_expr(right)
+                && let Some(column) = column_ref_to_vtab_constraint_column(col_ref, col_map)
+                && let Some(constraint_op) = direct_vtab_constraint_op(*op)
+            {
+                return Some(LiveVtabConstraintCandidate {
+                    expr: expr.clone(),
+                    constraint: IndexConstraint {
+                        column,
+                        op: constraint_op,
+                        usable: true,
+                    },
+                    value,
+                });
+            }
+            if let Expr::Column(col_ref, _) = right.as_ref()
+                && let Some(value) = eval_live_vtab_constant_expr(left)
+                && let Some(column) = column_ref_to_vtab_constraint_column(col_ref, col_map)
+                && let Some(constraint_op) = reverse_vtab_constraint_op(*op)
+            {
+                return Some(LiveVtabConstraintCandidate {
+                    expr: expr.clone(),
+                    constraint: IndexConstraint {
+                        column,
+                        op: constraint_op,
+                        usable: true,
+                    },
+                    value,
+                });
+            }
+            None
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            op: LikeOp::Match,
+            not: false,
+            ..
+        } => {
+            let value = eval_live_vtab_constant_expr(pattern)?;
+            let column = if is_vtab_table_match_operand(inner, col_map) {
+                0
+            } else if let Expr::Column(col_ref, _) = inner.as_ref() {
+                column_ref_to_vtab_constraint_column(col_ref, col_map)?
+            } else {
+                return None;
+            };
+            Some(LiveVtabConstraintCandidate {
+                expr: expr.clone(),
+                constraint: IndexConstraint {
+                    column,
+                    op: ConstraintOp::Match,
+                    usable: true,
+                },
+                value,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn maybe_filter_primary_join_rows(
@@ -35468,6 +36029,62 @@ mod tests {
         assert!(
             sql.to_ascii_uppercase().contains("USING RTREE"),
             "expected CREATE VIRTUAL TABLE SQL, got {sql}"
+        );
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_bbox_query_uses_live_vtab_runtime() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x, min_y, max_y);")
+            .unwrap();
+        conn.execute("INSERT INTO spatial VALUES (10, 0.0, 1.0, 0.0, 1.0);")
+            .unwrap();
+        conn.execute("INSERT INTO spatial VALUES (20, 4.0, 5.0, 4.0, 5.0);")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT rowid FROM spatial \
+                 WHERE min_x <= 4.5 AND max_x >= 3.5 AND min_y <= 4.5 AND max_y >= 3.5 \
+                 ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(20)]],
+        );
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_geometry_match_uses_registered_callback() {
+        struct UpperRightGeometry;
+
+        impl fsqlite_ext_rtree::RtreeGeometry for UpperRightGeometry {
+            fn query_func(&self, bbox: &[f64]) -> fsqlite_ext_rtree::RtreeQueryResult {
+                if bbox.len() >= 4 && bbox[1] >= 6.0 && bbox[3] >= 6.0 {
+                    fsqlite_ext_rtree::RtreeQueryResult::Include
+                } else {
+                    fsqlite_ext_rtree::RtreeQueryResult::Exclude
+                }
+            }
+        }
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE spatial USING rtree(id, min_x, max_x, min_y, max_y);")
+            .unwrap();
+        conn.register_rtree_geometry("spatial", "upper_right", Box::new(UpperRightGeometry))
+            .unwrap();
+        conn.execute("INSERT INTO spatial VALUES (1, 0.0, 1.0, 0.0, 1.0);")
+            .unwrap();
+        conn.execute("INSERT INTO spatial VALUES (2, 6.0, 7.0, 6.0, 7.0);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid FROM spatial WHERE spatial MATCH 'upper_right' ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(2)]],
         );
     }
 
@@ -50965,6 +51582,14 @@ mod pager_routing_tests {
             stmt.dml_dispatch.as_ref(),
             Some(PreparedDmlDispatch::Deferred(_))
         ));
+        assert!(
+            stmt.db.is_some(),
+            "simple UPDATE should compile to a reusable program"
+        );
+        assert!(
+            stmt.dispatch_precompiled_program().is_some(),
+            "simple UPDATE should reuse the prepared program at execution time"
+        );
 
         let affected = conn
             .execute_prepared_with_params(
@@ -50988,6 +51613,18 @@ mod pager_routing_tests {
 
         let stmt = conn.prepare("DELETE FROM prep_del WHERE id = ?1").unwrap();
         assert!(stmt.is_dml());
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
+        assert!(
+            stmt.db.is_some(),
+            "simple DELETE should compile to a reusable program"
+        );
+        assert!(
+            stmt.dispatch_precompiled_program().is_some(),
+            "simple DELETE should reuse the prepared program at execution time"
+        );
 
         let affected = conn
             .execute_prepared_with_params(&stmt, &[SqliteValue::Integer(2)])
@@ -51297,6 +51934,103 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_simple_update_prepare_reuses_compiled_program() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_upd_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_upd_reuse VALUES (1, 'old1'), (2, 'old2');")
+            .unwrap();
+
+        let sql = "UPDATE prep_upd_reuse SET val = ?1 WHERE id = ?2";
+        let stmt1 = conn.prepare(sql).unwrap();
+        let stmt2 = conn.prepare(sql).unwrap();
+
+        assert!(
+            stmt1.db.is_some(),
+            "simple UPDATE should compile to a reusable program"
+        );
+        assert!(
+            stmt2.db.is_some(),
+            "simple UPDATE should compile to a reusable program"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stmt1.program, &stmt2.program),
+            "repeated prepare() should reuse the cached compiled UPDATE program"
+        );
+
+        assert_eq!(
+            stmt1
+                .execute_with_params(&[
+                    SqliteValue::Text("alpha".to_owned()),
+                    SqliteValue::Integer(1),
+                ])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stmt2
+                .execute_with_params(&[
+                    SqliteValue::Text("beta".to_owned()),
+                    SqliteValue::Integer(2),
+                ])
+                .unwrap(),
+            1
+        );
+
+        let rows = conn
+            .query("SELECT val FROM prep_upd_reuse ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_simple_delete_prepare_reuses_compiled_program() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_del_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_del_reuse VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .unwrap();
+
+        let sql = "DELETE FROM prep_del_reuse WHERE id = ?1";
+        let stmt1 = conn.prepare(sql).unwrap();
+        let stmt2 = conn.prepare(sql).unwrap();
+
+        assert!(
+            stmt1.db.is_some(),
+            "simple DELETE should compile to a reusable program"
+        );
+        assert!(
+            stmt2.db.is_some(),
+            "simple DELETE should compile to a reusable program"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stmt1.program, &stmt2.program),
+            "repeated prepare() should reuse the cached compiled DELETE program"
+        );
+
+        assert_eq!(
+            stmt1
+                .execute_with_params(&[SqliteValue::Integer(1)])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stmt2
+                .execute_with_params(&[SqliteValue::Integer(3)])
+                .unwrap(),
+            1
+        );
+
+        let rows = conn
+            .query("SELECT id FROM prep_del_reuse ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
     fn test_prepared_insert_reuse_semantic_parity_with_execute() {
         // Verify that prepared INSERT produces identical results to
         // Connection::execute for the same data.
@@ -51456,6 +52190,44 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT val FROM dst ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_update_with_limit_uses_fallback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_upd_limit (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("UPDATE prep_upd_limit SET val = 'x' ORDER BY id LIMIT 1")
+            .unwrap();
+        assert!(
+            stmt.db.is_none(),
+            "UPDATE with ORDER BY/LIMIT should stay on the deferred path"
+        );
+        assert!(
+            stmt.dispatch_precompiled_program().is_none(),
+            "UPDATE with ORDER BY/LIMIT must not reuse a mismatched compiled program"
+        );
+    }
+
+    #[test]
+    fn test_prepared_delete_with_limit_uses_fallback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_del_limit (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("DELETE FROM prep_del_limit ORDER BY id LIMIT 1")
+            .unwrap();
+        assert!(
+            stmt.db.is_none(),
+            "DELETE with ORDER BY/LIMIT should stay on the deferred path"
+        );
+        assert!(
+            stmt.dispatch_precompiled_program().is_none(),
+            "DELETE with ORDER BY/LIMIT must not reuse a mismatched compiled program"
+        );
     }
 
     #[test]

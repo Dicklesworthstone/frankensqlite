@@ -261,6 +261,10 @@ pub enum FrankenError {
     #[error("attempt to write a readonly database")]
     ReadOnly,
 
+    /// Interrupted by a cancellation-aware execution context.
+    #[error("interrupted")]
+    Interrupt,
+
     /// Execution error within the VDBE bytecode engine.
     #[error("VDBE execution error: {detail}")]
     VdbeExecutionError { detail: String },
@@ -396,6 +400,7 @@ impl FrankenError {
             Self::OutOfMemory => ErrorCode::NoMem,
             Self::Unsupported => ErrorCode::NoLfs,
             Self::ReadOnly => ErrorCode::ReadOnly,
+            Self::Interrupt => ErrorCode::Interrupt,
             Self::VdbeExecutionError { .. } => ErrorCode::Error,
         }
     }
@@ -571,6 +576,7 @@ mod tests {
             ErrorCode::Error
         );
         assert_eq!(FrankenError::Busy.error_code(), ErrorCode::Busy);
+        assert_eq!(FrankenError::Interrupt.error_code(), ErrorCode::Interrupt);
         assert_eq!(
             FrankenError::DatabaseCorrupt {
                 detail: String::new()

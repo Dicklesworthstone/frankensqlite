@@ -474,8 +474,9 @@ fn parse_coordinate_value(value: &SqliteValue, coord_type: RtreeCoordType) -> Re
     }
 }
 
+/// Runtime virtual-table instance for `CREATE VIRTUAL TABLE ... USING rtree(...)`.
 #[derive(Debug, Clone)]
-struct RtreeVirtualTable {
+pub struct RtreeVirtualTable {
     index: RtreeIndex,
 }
 
@@ -518,8 +519,8 @@ impl RtreeVirtualTable {
         })
     }
 
-    #[cfg(test)]
-    fn register_geometry(&mut self, name: &str, geom: Box<dyn RtreeGeometry>) {
+    /// Register a custom geometry callback on a live virtual table instance.
+    pub fn register_geometry(&mut self, name: &str, geom: Box<dyn RtreeGeometry>) {
         self.index.register_geometry(name, geom);
     }
 }
@@ -711,7 +712,7 @@ impl VirtualTable for RtreeVirtualTable {
 }
 
 #[derive(Debug, Clone)]
-struct RtreeCursor {
+pub struct RtreeCursor {
     index: RtreeIndex,
     rows: Vec<RtreeEntry>,
     pos: usize,
