@@ -26416,7 +26416,6 @@ fn expr_references_only_col_map(expr: &Expr, col_map: &[(String, String, bool)])
             .iter()
             .all(|value| expr_references_only_col_map(value, col_map)),
         Expr::Exists { .. } | Expr::Subquery(..) => false,
-        _ => false,
     }
 }
 
