@@ -10597,8 +10597,10 @@ fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Emit VDBE bytecode that evaluates `where_expr` against the current row of
 /// `cursor` (which scans `table`) and jumps to `skip_label` when the predicate
-/// is **not** satisfied.  Used by `backfill_index` in `fsqlite-core` to skip
-/// rows that don't match a partial index WHERE clause.
+/// is **not** satisfied.
+///
+/// Used by `backfill_index` in `fsqlite-core` to skip rows that don't match a
+/// partial index WHERE clause.
 pub fn emit_scan_filter(
     b: &mut ProgramBuilder,
     where_expr: &Expr,
@@ -14358,10 +14360,7 @@ mod tests {
         let prog = b.finish().unwrap();
 
         // The qualified alias "u.rowid" should resolve to the rowid fast path.
-        assert!(has_opcodes(
-            &prog,
-            &[Opcode::Variable, Opcode::SeekRowid]
-        ));
+        assert!(has_opcodes(&prog, &[Opcode::Variable, Opcode::SeekRowid]));
     }
 
     #[test]
@@ -14844,7 +14843,7 @@ mod tests {
             &prog,
             &[
                 Opcode::Variable,
-                Opcode::SeekRowid,  // direct probe
+                Opcode::SeekRowid, // direct probe
                 Opcode::RowSetAdd,
                 Opcode::RowSetRead, // pass 2: delete collected rows
                 Opcode::SeekRowid,

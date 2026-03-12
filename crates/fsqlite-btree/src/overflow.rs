@@ -93,7 +93,10 @@ where
         chain_length += 1;
         if chain_length > MAX_OVERFLOW_CHAIN {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("overflow chain exceeds maximum length of {}", MAX_OVERFLOW_CHAIN),
+                detail: format!(
+                    "overflow chain exceeds maximum length of {}",
+                    MAX_OVERFLOW_CHAIN
+                ),
             });
         }
 

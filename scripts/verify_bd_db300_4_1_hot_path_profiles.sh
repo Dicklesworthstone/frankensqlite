@@ -52,7 +52,7 @@ HOT_PATH_PROFILE_SCHEMA="fsqlite-e2e.hot_path_profile.v1"
 HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
 HOT_PATH_OPCODE_PROFILE_SCHEMA="fsqlite-e2e.hot_path_opcode_profile.v1"
 HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA="fsqlite-e2e.hot_path_subsystem_profile.v1"
-HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v1"
+HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v2"
 HOT_PATH_INLINE_BUNDLE_SCHEMA="fsqlite-e2e.hot_path_inline_bundle.v1"
 HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
 

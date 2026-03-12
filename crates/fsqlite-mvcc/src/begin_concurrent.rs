@@ -1307,6 +1307,7 @@ mod tests {
 
     use crate::core_types::{CommitIndex, InProcessPageLockTable};
     use crate::lifecycle::MvccError;
+    use crate::ssi_validation::ActiveTxnView;
 
     use super::{
         ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_commit,
@@ -1688,13 +1689,15 @@ mod tests {
             .get_mut(doomed)
             .expect("doomed handle")
             .set_marked_for_abort(true);
-        registry.committed_readers.push(crate::ssi_validation::CommittedReaderInfo {
-            token: registry.get(survivor).expect("survivor handle").txn_token(),
-            begin_seq: CommitSeq::new(20),
-            commit_seq: CommitSeq::new(15),
-            had_in_rw: false,
-            keys: vec![WitnessKey::Page(test_page(7))],
-        });
+        registry
+            .committed_readers
+            .push(crate::ssi_validation::CommittedReaderInfo {
+                token: registry.get(survivor).expect("survivor handle").txn_token(),
+                begin_seq: CommitSeq::new(20),
+                commit_seq: CommitSeq::new(15),
+                had_in_rw: false,
+                keys: vec![WitnessKey::Page(test_page(7))],
+            });
 
         assert_eq!(
             registry.gc_horizon(),

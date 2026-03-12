@@ -4073,7 +4073,7 @@ fn cmd_compare(argv: &[String]) -> i32 {
 mod tests {
     use super::*;
     use fsqlite_e2e::perf_runner::{
-        HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1,
+        HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2,
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
         HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
         HotPathArtifactManifest, HotPathOpcodeProfileEntry, HotPathParserProfile,
@@ -4442,7 +4442,7 @@ mod tests {
         );
         assert_eq!(
             value["actionable_ranking"]["schema_version"],
-            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1
+            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2
         );
         assert_eq!(
             value["manifest"]["schema_version"],

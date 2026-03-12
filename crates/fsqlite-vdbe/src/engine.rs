@@ -7321,6 +7321,9 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
+        // Register writes replace the logical value, so any prior subtype
+        // metadata must be discarded as well.
+        self.register_subtypes.remove(&r);
         self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
@@ -7340,6 +7343,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
+        self.register_subtypes.remove(&r);
         self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
@@ -8779,10 +8783,15 @@ mod tests {
         second_builder.emit_op(Opcode::Integer, 22, 1, 0, P4::None, 0);
         second_builder.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
         second_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-        let second_program = second_builder.finish().expect("second program should build");
+        let second_program = second_builder
+            .finish()
+            .expect("second program should build");
 
-        let mut engine =
-            VdbeEngine::new(first_program.register_count().max(second_program.register_count()));
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+        );
         assert_eq!(
             engine.execute(&first_program).expect("first execution"),
             ExecOutcome::Done
@@ -8815,14 +8824,19 @@ mod tests {
         insert_builder.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
         insert_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         insert_builder.resolve_label(insert_end);
-        let insert_program = insert_builder.finish().expect("insert program should build");
+        let insert_program = insert_builder
+            .finish()
+            .expect("insert program should build");
 
         let mut noop_builder = ProgramBuilder::new();
         noop_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let noop_program = noop_builder.finish().expect("noop program should build");
 
-        let mut engine =
-            VdbeEngine::new(insert_program.register_count().max(noop_program.register_count()));
+        let mut engine = VdbeEngine::new(
+            insert_program
+                .register_count()
+                .max(noop_program.register_count()),
+        );
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
@@ -15374,6 +15388,40 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows[0][0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn test_subtype_is_cleared_when_register_value_is_overwritten() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_st = b.alloc_reg();
+            let r_target = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_target,
+                0,
+                P4::Str(r#"{"a":1}"#.to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::Integer, 74, r_st, 0, P4::None, 0);
+            b.emit_op(Opcode::SetSubtype, r_st, r_target, 0, P4::None, 0);
+
+            // Any subsequent register write replaces the logical value, so the
+            // prior JSON subtype must not survive.
+            b.emit_op(Opcode::Integer, 42, r_target, 0, P4::None, 0);
+            b.emit_op(Opcode::GetSubtype, r_target, r_out, 0, P4::None, 0);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
     }
 
     // ── Bloom filter opcode tests ────────────────────────────────────
