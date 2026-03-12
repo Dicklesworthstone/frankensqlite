@@ -27,6 +27,7 @@ pub use s3_fifo::{
     S3FifoEvent, S3FifoRolloutGate,
 };
 pub use traits::{
-    CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MockCheckpointPageWriter,
-    MockMvccPager, MockTransaction, MvccPager, TransactionHandle, TransactionMode, WalBackend,
+    CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MemoryMockMvccPager,
+    MemoryMockTransaction, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
+    TransactionHandle, TransactionMode, WalBackend,
 };

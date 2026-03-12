@@ -6234,6 +6234,14 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let probe_val = self.get_reg(op.p3).clone();
 
+                    let root_page = self
+                        .cursor_root_pages
+                        .get(&cursor_id)
+                        .copied()
+                        .unwrap_or_default();
+                    let desc_flags = self.index_desc_flags_for_root(root_page);
+                    let collation_registry = Arc::clone(&self.collation_registry);
+
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.cursor.eof() {
@@ -6274,16 +6282,13 @@ impl VdbeEngine {
                         } else {
                             sc.target_vals_buf.len()
                         };
-                        let root_page =
-                            self.cursor_root_pages.get(&cursor_id).copied().unwrap_or_default();
-                        let desc_flags = self.index_desc_flags_for_root(root_page);
                         let cmp = compare_index_prefix_keys(
                             &sc.cur_vals_buf,
                             &sc.target_vals_buf,
                             n_compare,
                             &desc_flags,
                             &[], // TODO: Per-index collations are not yet threaded here.
-                            self.collation_registry.as_ref(),
+                            collation_registry.as_ref(),
                         );
 
                         let condition_met = match op.opcode {
@@ -13121,20 +13126,21 @@ mod tests {
 
     #[test]
     fn test_open_storage_cursor_txn_index_honors_desc_key_metadata() {
-        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
         use fsqlite_types::record::{parse_record, serialize_record};
 
-        let pager = MockMvccPager;
+        let pager = MemoryMockMvccPager;
         let cx = Cx::new();
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let root = 256;
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(MemDatabase::new());
         engine.set_transaction(Box::new(txn));
-        engine.set_index_desc_flags_by_root_page(HashMap::from([(256, vec![true])]));
+        engine.set_index_desc_flags_by_root_page(HashMap::from([(root, vec![true])]));
 
         assert!(
-            engine.open_storage_cursor(0, 256, true),
+            engine.open_storage_cursor(0, root, true),
             "writable txn-backed index cursor should open on a fresh root page"
         );
 

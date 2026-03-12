@@ -456,7 +456,7 @@ fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
                     j = new_jdn?;
                     continue;
                 }
-                Err(_) => {
+                Err(()) => {
                     // Fall through to `apply_modifier` for fractional values
                 }
             }

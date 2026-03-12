@@ -263,6 +263,17 @@ fn normalize_freelist(pages: &[PageNumber], db_size: u32) -> Vec<PageNumber> {
     normalized
 }
 
+fn return_pages_to_freelist(
+    freelist: &mut Vec<PageNumber>,
+    pages: impl IntoIterator<Item = PageNumber>,
+) {
+    for page in pages {
+        if !freelist.contains(&page) {
+            freelist.push(page);
+        }
+    }
+}
+
 fn load_freelist_from_disk<F: VfsFile>(
     cx: &Cx,
     db_file: &mut F,
@@ -2473,9 +2484,7 @@ where
             }
         } else {
             // Restore pages allocated from the freelist.
-            for page in self.allocated_from_freelist.drain(..) {
-                inner.freelist.push(page);
-            }
+            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
                 inner.db_size = self.original_db_size;
@@ -2491,18 +2500,14 @@ where
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                // For concurrent transactions, only return pages to the freelist
-                // if they are within the current committed db_size. Pages beyond
-                // db_size were allocated from EOF and should be "dropped" by
-                // just not being reused, as they were never part of a committed
-                // state and cannot be safely referenced in a trunk page if
-                // db_size is not also extended.
-                let current_db_size = inner.db_size;
-                for page in self.allocated_from_eof.drain(..) {
-                    if page.get() <= current_db_size {
-                        inner.freelist.push(page);
-                    }
-                }
+                // Aborted EOF allocations must return to the in-memory freelist
+                // even if they lie beyond the current db_size. Otherwise
+                // next_page skips over them permanently and a later commit can
+                // grow page_count past those holes, yielding "Page N: never
+                // used" corruption. serialize_freelist_to_write_set() already
+                // knows how to preserve beyond-db_size freelist entries until a
+                // future commit reuses them or grows the file.
+                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
@@ -2585,21 +2590,16 @@ where
                 inner.next_page = entry.next_page_snapshot;
                 inner.freelist.clone_from(&entry.freelist_snapshot);
             } else {
-                let current_db_size = inner.db_size;
-                for page in self
-                    .allocated_from_eof
-                    .drain(entry.allocated_from_eof_snapshot.len()..)
-                {
-                    if page.get() <= current_db_size {
-                        inner.freelist.push(page);
-                    }
-                }
-                for page in self
-                    .allocated_from_freelist
-                    .drain(entry.allocated_from_freelist_snapshot.len()..)
-                {
-                    inner.freelist.push(page);
-                }
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.allocated_from_eof
+                        .drain(entry.allocated_from_eof_snapshot.len()..),
+                );
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.allocated_from_freelist
+                        .drain(entry.allocated_from_freelist_snapshot.len()..),
+                );
             }
         }
         self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
@@ -2622,9 +2622,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
         }
         if let Ok(mut inner) = self.inner.lock() {
             // Restore pages allocated from the freelist.
-            for page in self.allocated_from_freelist.drain(..) {
-                inner.freelist.push(page);
-            }
+            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
                 inner.db_size = self.original_db_size;
@@ -2640,18 +2638,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                // For concurrent transactions, only return pages to the freelist
-                // if they are within the current committed db_size. Pages beyond
-                // db_size were allocated from EOF and should be "dropped" by
-                // just not being reused, as they were never part of a committed
-                // state and cannot be safely referenced in a trunk page if
-                // db_size is not also extended.
-                let current_db_size = inner.db_size;
-                for page in self.allocated_from_eof.drain(..) {
-                    if page.get() <= current_db_size {
-                        inner.freelist.push(page);
-                    }
-                }
+                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let preserve_level =
@@ -2887,8 +2874,11 @@ where
     ///
     /// This implementation refuses to checkpoint while any transaction is active.
     /// It starts from the beginning (backfilled_frames = 0) and passes
-    /// `oldest_reader_frame = None`. For incremental, reader-aware checkpointing,
-    /// use the lower-level WAL backend API.
+    /// `oldest_reader_frame = None`. Because pager does not yet track external
+    /// reader end marks, `RESTART` and `TRUNCATE` are conservatively downgraded
+    /// to `FULL` so we never reset or truncate WAL based on incomplete reader
+    /// visibility. For incremental, reader-aware checkpointing, use the
+    /// lower-level WAL backend API.
     pub fn checkpoint(
         &self,
         cx: &Cx,
@@ -2979,6 +2969,16 @@ where
 
         // Create a checkpoint writer that writes directly to the database file.
         let mut writer = self.checkpoint_writer();
+        let effective_mode = match mode {
+            traits::CheckpointMode::Restart | traits::CheckpointMode::Truncate => {
+                tracing::debug!(
+                    requested_mode = ?mode,
+                    "downgrading checkpoint mode because pager lacks reader-tracking for safe WAL reset"
+                );
+                traits::CheckpointMode::Full
+            }
+            _ => mode,
+        };
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
@@ -2986,7 +2986,7 @@ where
             .wal
             .as_mut()
             .expect("wal was just inserted")
-            .checkpoint(cx, mode, &mut writer, 0, None)
+            .checkpoint(cx, effective_mode, &mut writer, 0, None)
     }
 }
 
@@ -8059,6 +8059,127 @@ mod tests {
             assert_eq!(inner.freelist[0], p);
             drop(inner);
         }
+    }
+
+    #[test]
+    fn test_concurrent_rollback_reclaims_eof_allocations_without_holes() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let p2 = concurrent.allocate_page(&cx).unwrap();
+        let p3 = concurrent.allocate_page(&cx).unwrap();
+        concurrent.write_page(&cx, p2, &vec![0xAA; ps]).unwrap();
+        concurrent.write_page(&cx, p3, &vec![0xBB; ps]).unwrap();
+        concurrent.rollback(&cx).unwrap();
+
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                inner.freelist.contains(&p2) && inner.freelist.contains(&p3),
+                "bead_id={BEAD_ID} case=concurrent_rollback_restores_eof_pages freelist={:?}",
+                inner.freelist
+            );
+        }
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused1 = txn.allocate_page(&cx).unwrap();
+        let reused2 = txn.allocate_page(&cx).unwrap();
+        assert!(
+            reused1 != reused2
+                && [p2, p3].contains(&reused1)
+                && [p2, p3].contains(&reused2),
+            "bead_id={BEAD_ID} case=concurrent_rollback_reuses_eof_pages reused=({}, {}) expected=({}, {})",
+            reused1.get(),
+            reused2.get(),
+            p2.get(),
+            p3.get()
+        );
+        txn.write_page(&cx, reused1, &vec![0xCC; ps]).unwrap();
+        txn.write_page(&cx, reused2, &vec![0xDD; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let inner = pager.inner.lock().unwrap();
+        assert_eq!(
+            inner.db_size, 3,
+            "bead_id={BEAD_ID} case=concurrent_rollback_does_not_skip_page_numbers"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_rollback_to_savepoint_reclaims_eof_allocations() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let base = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, base, &vec![0x11; ps]).unwrap();
+        txn.savepoint(&cx, "sp").unwrap();
+
+        let p3 = txn.allocate_page(&cx).unwrap();
+        let p4 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+        txn.write_page(&cx, p4, &vec![0x33; ps]).unwrap();
+
+        txn.rollback_to_savepoint(&cx, "sp").unwrap();
+
+        let reused1 = txn.allocate_page(&cx).unwrap();
+        let reused2 = txn.allocate_page(&cx).unwrap();
+        assert!(
+            reused1 != reused2
+                && [p3, p4].contains(&reused1)
+                && [p3, p4].contains(&reused2),
+            "bead_id={BEAD_ID} case=concurrent_savepoint_reuses_eof_pages reused=({}, {}) expected=({}, {})",
+            reused1.get(),
+            reused2.get(),
+            p3.get(),
+            p4.get()
+        );
+        txn.write_page(&cx, reused1, &vec![0x44; ps]).unwrap();
+        txn.write_page(&cx, reused2, &vec![0x55; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let inner = pager.inner.lock().unwrap();
+        assert_eq!(
+            inner.db_size, 4,
+            "bead_id={BEAD_ID} case=concurrent_savepoint_rollback_does_not_skip_page_numbers"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_drop_reclaims_eof_allocations_without_holes() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        {
+            let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let p2 = concurrent.allocate_page(&cx).unwrap();
+            let p3 = concurrent.allocate_page(&cx).unwrap();
+            concurrent.write_page(&cx, p2, &vec![0x66; ps]).unwrap();
+            concurrent.write_page(&cx, p3, &vec![0x77; ps]).unwrap();
+        }
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused1 = txn.allocate_page(&cx).unwrap();
+        let reused2 = txn.allocate_page(&cx).unwrap();
+        assert!(
+            reused1.get() <= 3 && reused2.get() <= 3 && reused1 != reused2,
+            "bead_id={BEAD_ID} case=concurrent_drop_reuses_abandoned_eof_pages reused=({}, {})",
+            reused1.get(),
+            reused2.get()
+        );
+        txn.write_page(&cx, reused1, &vec![0x88; ps]).unwrap();
+        txn.write_page(&cx, reused2, &vec![0x99; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let inner = pager.inner.lock().unwrap();
+        assert_eq!(
+            inner.db_size, 3,
+            "bead_id={BEAD_ID} case=concurrent_drop_does_not_skip_page_numbers"
+        );
     }
 
     #[test]

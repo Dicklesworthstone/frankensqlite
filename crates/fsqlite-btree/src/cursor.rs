@@ -593,6 +593,26 @@ impl<P: PageReader> BtCursor<P> {
         })
     }
 
+    /// Reload a page from the pager, bypassing the stack-entry cache.
+    ///
+    /// This is required immediately after in-place writes because some test
+    /// pagers do not surface dirty-state through `is_dirty()`.
+    fn reload_page_fresh(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
+        observe_cursor_cancellation(cx)?;
+        self.note_page_visit(page_no);
+        let page_data = self.pager.read_page(cx, page_no)?;
+        let header_offset = cell::header_offset_for_page(page_no);
+        let header = cell::parse_page_header(&page_data, page_no)?;
+        let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        Ok(StackEntry {
+            page_no,
+            page_data,
+            header,
+            cell_pointers,
+            cell_idx: 0,
+        })
+    }
+
     /// Parse a cell at the given index on the top-of-stack page.
     fn parse_cell_at(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
         let idx_usize = idx as usize;
@@ -1110,7 +1130,7 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes(&key, target, &parsed_target);
+            let ord = self.compare_index_key_bytes(&key, target, parsed_target.as_deref());
 
             match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
@@ -1142,7 +1162,7 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes(&key, target, &parsed_target);
+            let ord = self.compare_index_key_bytes(&key, target, parsed_target.as_deref());
 
             // Note: target vs key comparison direction
             match ord {
@@ -1158,7 +1178,7 @@ impl<P: PageReader> BtCursor<P> {
         &self,
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
-        parsed_rhs: &Option<Vec<fsqlite_types::SqliteValue>>,
+        parsed_rhs: Option<&[fsqlite_types::SqliteValue]>,
     ) -> std::cmp::Ordering {
         match (parse_record(lhs_bytes), parsed_rhs) {
             (Some(lhs_vals), Some(rhs_vals)) => self
@@ -1592,7 +1612,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.pager.write_page(cx, leaf_page_no, &page_data)?;
 
         // Refresh the top stack entry.
-        let mut refreshed = self.load_page(cx, leaf_page_no)?;
+        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
         #[allow(clippy::cast_possible_truncation)]
         {
             refreshed.cell_idx = insert_at as u16;
@@ -1842,9 +1862,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Encode the new cell.
         let mut new_cell = Vec::new();
-        let mut vbuf = [0u8; 9];
-        let n = write_varint(&mut vbuf, u64::from(left_child.get()));
-        new_cell.extend_from_slice(&vbuf[..n]);
+        new_cell.extend_from_slice(&left_child.get().to_be_bytes());
 
         let payload_size = u32::try_from(new_payload.len()).map_err(|_| FrankenError::TooBig)?;
         let mut varint = [0u8; 9];
@@ -1945,6 +1963,12 @@ impl<P: PageWriter> BtCursor<P> {
             cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
 
             self.pager.write_page(cx, page_no, &page_data)?;
+            let mut refreshed = self.reload_page_fresh(cx, page_no)?;
+            refreshed.cell_idx = cell_idx;
+            if let Some(top) = self.stack.last_mut() {
+                *top = refreshed;
+            }
+            self.at_eof = false;
             if let Some(first) = old_overflow {
                 self.free_overflow_chain(cx, first)?;
             }
@@ -2060,7 +2084,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.pager.write_page(cx, leaf_page_no, &page_data)?;
 
         // Refresh the stack entry.
-        let mut refreshed = self.load_page(cx, leaf_page_no)?;
+        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
         let new_count = refreshed.header.cell_count;
         if new_count == 0 {
             refreshed.cell_idx = 0;
@@ -2351,31 +2375,31 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     .last()
                     .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
                     .clone();
-                if !top_after.header.page_type.is_leaf() {
-                    // Index B-trees: stop at the separator cell.
-                    cursor
-                        .stack
-                        .last_mut()
-                        .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-                        .cell_idx = top_after.cell_idx;
-                    cursor.issue_prefetch_hint(cx, top_after.page_no);
-                    let found = cursor.move_to_rightmost_leaf(cx, top_after.page_no, true)?;
-                    if found {
-                        return Ok(());
-                    }
-                    cursor.advance_prev(cx)?;
-                    return Ok(());
+                if top_after.header.page_type.is_leaf() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "interior delete re-seek landed on leaf".to_owned(),
+                    });
                 }
 
                 // Replace the interior key first so failures do not lose both keys.
                 cursor.replace_interior_cell(cx, &successor_key)?;
 
-                // Re-seek successor. A found interior match means the duplicate leaf
-                // successor should be the immediate next entry.
-                let successor_seek = cursor.index_seek(cx, &successor_key)?;
-                if !successor_seek.is_found() {
+                // The duplicate successor still exists as the next logical entry
+                // in the right subtree. Walk there from the interior replacement
+                // site instead of re-seeking, which would land back on the new
+                // interior separator.
+                let successor_found = cursor.advance_next(cx)?;
+                if !successor_found || cursor.at_eof {
                     return Err(FrankenError::DatabaseCorrupt {
-                        detail: "successor key missing after interior replacement".to_owned(),
+                        detail: "duplicate successor missing after interior replacement"
+                            .to_owned(),
+                    });
+                }
+                let duplicate_successor = cursor.payload(cx)?;
+                if duplicate_successor != successor_key {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "interior delete advanced to wrong successor duplicate"
+                            .to_owned(),
                     });
                 }
 
@@ -2665,6 +2689,41 @@ mod tests {
     }
 
     const USABLE: u32 = 4096;
+
+    fn collect_reachable_pages(
+        store: &MemPageStore,
+        page_no: PageNumber,
+        usable_size: u32,
+        out: &mut BTreeSet<u32>,
+    ) {
+        if !out.insert(page_no.get()) {
+            return;
+        }
+
+        let page = store
+            .pages
+            .get(&page_no.get())
+            .expect("reachable page should exist in store");
+        let header_offset = cell::header_offset_for_page(page_no);
+        let header = BtreePageHeader::parse(page, header_offset).expect("page header should parse");
+
+        if !header.page_type.is_interior() {
+            return;
+        }
+
+        let ptrs =
+            cell::read_cell_pointers(page, &header, header_offset).expect("cell pointers parse");
+        for ptr in ptrs {
+            let cell = CellRef::parse(page, usize::from(ptr), header.page_type, usable_size)
+                .expect("interior cell should parse");
+            let child = cell.left_child.expect("interior cell should reference child");
+            collect_reachable_pages(store, child, usable_size, out);
+        }
+        let right_child = header
+            .right_child
+            .expect("interior page should reference right child");
+        collect_reachable_pages(store, right_child, usable_size, out);
+    }
 
     #[test]
     fn test_btree_observability_operation_totals() {
@@ -3575,6 +3634,111 @@ mod tests {
 
         assert!(cursor.index_move_to(&cx, &split_key).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), split_key);
+    }
+
+    #[test]
+    fn test_cursor_index_delete_removes_interior_separator_key() {
+        const INDEX_USABLE: u32 = 512;
+
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
+
+        let mut key_idx = 0usize;
+        let separator_key = loop {
+            let key = format!("key-{key_idx:04}").into_bytes();
+            cursor.index_insert(&cx, &key).unwrap();
+            key_idx += 1;
+
+            let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorIndex {
+                let root_entry = cursor.load_page(&cx, root).unwrap();
+                let divider = cursor.parse_cell_at(&root_entry, 0).unwrap();
+                break cursor.read_cell_payload(&cx, &root_entry, &divider).unwrap();
+            }
+        };
+
+        let mut expected = Vec::new();
+        if cursor.first(&cx).unwrap() {
+            loop {
+                expected.push(cursor.payload(&cx).unwrap());
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        expected.retain(|key| key != &separator_key);
+
+        let seek = cursor.index_move_to(&cx, &separator_key).unwrap();
+        assert!(seek.is_found(), "separator key should be seekable before delete");
+        assert!(
+            !cursor
+                .stack
+                .last()
+                .expect("separator seek should leave a cursor frame")
+                .header
+                .page_type
+                .is_leaf(),
+            "separator key must resolve to an interior frame to exercise interior delete"
+        );
+
+        cursor.delete(&cx).unwrap();
+
+        let seek_after = cursor.index_move_to(&cx, &separator_key).unwrap();
+        assert!(
+            !seek_after.is_found(),
+            "deleted separator key must not remain reachable"
+        );
+
+        let mut scanned = Vec::new();
+        if cursor.first(&cx).unwrap() {
+            loop {
+                scanned.push(cursor.payload(&cx).unwrap());
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            scanned, expected,
+            "interior delete must remove the separator without leaving a stale logical entry"
+        );
+    }
+
+    #[test]
+    fn test_cursor_repeated_root_overflow_does_not_leave_orphan_pages() {
+        const SMALL_USABLE: u32 = 512;
+
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+
+        for rowid in 1_i64..=200_i64 {
+            cursor.table_insert(&cx, rowid, &vec![b'R'; 180]).unwrap();
+        }
+
+        let root_page = cursor.pager.pages.get(&root.get()).unwrap();
+        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+        assert!(
+            root_header.page_type.is_interior(),
+            "test requires an interior root after sustained inserts"
+        );
+
+        let all_pages: BTreeSet<u32> = cursor.pager.pages.keys().copied().collect();
+        assert!(
+            all_pages.len() > 6,
+            "test requires enough pages to exercise repeated root overflow"
+        );
+
+        let mut reachable = BTreeSet::new();
+        collect_reachable_pages(&cursor.pager, root, SMALL_USABLE, &mut reachable);
+        assert_eq!(
+            reachable, all_pages,
+            "repeated root overflow must not leave detached child generations behind"
+        );
     }
 
     #[test]

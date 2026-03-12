@@ -100,11 +100,12 @@ pub fn execute_checkpoint<F: VfsFile>(
     );
 
     if plan.frames_to_backfill == 0 {
+        let wal_was_reset = apply_checkpoint_post_action(cx, wal, plan.post_action)?;
         return Ok(CheckpointExecutionResult {
             plan,
             frames_backfilled: 0,
             db_size_pages: None,
-            wal_was_reset: false,
+            wal_was_reset,
         });
     }
 
@@ -166,24 +167,7 @@ pub fn execute_checkpoint<F: VfsFile>(
     }
 
     // Post-action: reset or truncate WAL.
-    let wal_was_reset = match plan.post_action {
-        CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
-            let new_seq = wal.header().checkpoint_seq.wrapping_add(1);
-            let new_salts = WalSalts {
-                salt1: wal.header().salts.salt1.wrapping_add(1),
-                salt2: wal.header().salts.salt2.wrapping_add(1),
-            };
-            let truncate = matches!(plan.post_action, CheckpointPostAction::TruncateWal);
-            wal.reset(cx, new_seq, new_salts, truncate)?;
-            info!(
-                new_checkpoint_seq = new_seq,
-                action = ?plan.post_action,
-                "WAL reset after checkpoint"
-            );
-            true
-        }
-        CheckpointPostAction::None => false,
-    };
+    let wal_was_reset = apply_checkpoint_post_action(cx, wal, plan.post_action)?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -204,6 +188,31 @@ pub fn execute_checkpoint<F: VfsFile>(
         db_size_pages: last_db_size,
         wal_was_reset,
     })
+}
+
+fn apply_checkpoint_post_action<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut WalFile<F>,
+    post_action: CheckpointPostAction,
+) -> Result<bool> {
+    match post_action {
+        CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
+            let new_seq = wal.header().checkpoint_seq.wrapping_add(1);
+            let new_salts = WalSalts {
+                salt1: wal.header().salts.salt1.wrapping_add(1),
+                salt2: wal.header().salts.salt2.wrapping_add(1),
+            };
+            let truncate = matches!(post_action, CheckpointPostAction::TruncateWal);
+            wal.reset(cx, new_seq, new_salts, truncate)?;
+            info!(
+                new_checkpoint_seq = new_seq,
+                action = ?post_action,
+                "WAL reset after checkpoint"
+            );
+            Ok(true)
+        }
+        CheckpointPostAction::None => Ok(false),
+    }
 }
 
 // ===========================================================================
@@ -473,6 +482,29 @@ mod tests {
         assert_eq!(wal.frame_count(), 4);
     }
 
+    #[test]
+    fn test_restart_resets_wal_when_already_backfilled() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 4);
+
+        let state = CheckpointState {
+            total_frames: 4,
+            backfilled_frames: 4,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Restart, state, &mut target)
+            .expect("checkpoint");
+
+        assert_eq!(result.frames_backfilled, 0);
+        assert!(result.wal_was_reset);
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.header().checkpoint_seq, 1);
+    }
+
     // ── Truncate mode tests ──
 
     #[test]
@@ -519,6 +551,30 @@ mod tests {
 
         assert_eq!(result.frames_backfilled, 6);
         assert!(!result.wal_was_reset);
+    }
+
+    #[test]
+    fn test_truncate_resets_wal_when_already_backfilled() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 6);
+
+        let state = CheckpointState {
+            total_frames: 6,
+            backfilled_frames: 6,
+            oldest_reader_frame: None,
+        };
+        let mut target = RecordingTarget::new();
+        let result =
+            execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate, state, &mut target)
+                .expect("checkpoint");
+
+        assert_eq!(result.frames_backfilled, 0);
+        assert!(result.wal_was_reset);
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.header().checkpoint_seq, 1);
     }
 
     // ── Empty / edge case tests ──

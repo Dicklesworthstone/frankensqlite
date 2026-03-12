@@ -12,6 +12,8 @@
 //! - **Sealed:** [`MvccPager`], [`TransactionHandle`], [`CheckpointPageWriter`]
 //! - **Open (user-implementable):** `Vfs`, `VfsFile` (in `fsqlite-vfs`)
 
+use std::collections::HashMap;
+
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageData, PageNumber};
@@ -625,6 +627,146 @@ impl TransactionHandle for MockTransaction {
     }
 }
 
+/// In-memory pager mock exported for cross-crate tests that need zero-filled
+/// pages and durable writes within a transaction.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemoryMockMvccPager;
+
+impl sealed::Sealed for MemoryMockMvccPager {}
+
+impl MvccPager for MemoryMockMvccPager {
+    type Txn = MemoryMockTransaction;
+
+    fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
+        Ok(MemoryMockTransaction {
+            committed: false,
+            next_page: 2,
+            pages: HashMap::new(),
+            savepoints: Vec::new(),
+        })
+    }
+
+    fn journal_mode(&self) -> JournalMode {
+        JournalMode::Delete
+    }
+
+    fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        Ok(mode)
+    }
+
+    fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemoryMockSavepoint {
+    name: String,
+    next_page: u32,
+    pages: HashMap<PageNumber, PageData>,
+}
+
+/// In-memory transaction mock that returns zero-filled pages until written and
+/// preserves writes for subsequent reads.
+#[derive(Debug, Clone)]
+pub struct MemoryMockTransaction {
+    committed: bool,
+    next_page: u32,
+    pages: HashMap<PageNumber, PageData>,
+    savepoints: Vec<MemoryMockSavepoint>,
+}
+
+impl sealed::Sealed for MemoryMockTransaction {}
+
+impl TransactionHandle for MemoryMockTransaction {
+    fn get_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        Ok(self
+            .pages
+            .get(&page_no)
+            .cloned()
+            .unwrap_or_else(|| PageData::zeroed(fsqlite_types::PageSize::default())))
+    }
+
+    fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        let page_size = fsqlite_types::PageSize::default().as_usize();
+        let mut page = vec![0_u8; page_size];
+        let copy_len = data.len().min(page_size);
+        page[..copy_len].copy_from_slice(&data[..copy_len]);
+        self.pages.insert(page_no, PageData::from_vec(page));
+        Ok(())
+    }
+
+    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
+        let page = PageNumber::new(self.next_page)
+            .expect("mock allocator must always produce non-zero page numbers");
+        self.next_page += 1;
+        self.pages
+            .entry(page)
+            .or_insert_with(|| PageData::zeroed(fsqlite_types::PageSize::default()));
+        Ok(page)
+    }
+
+    fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.pages.remove(&page_no);
+        Ok(())
+    }
+
+    fn commit(&mut self, _cx: &Cx) -> Result<()> {
+        self.committed = true;
+        Ok(())
+    }
+
+    fn is_writer(&self) -> bool {
+        !self.pages.is_empty()
+    }
+
+    fn has_pending_writes(&self) -> bool {
+        !self.pages.is_empty()
+    }
+
+    fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+        self.pages.clear();
+        self.savepoints.clear();
+        Ok(())
+    }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
+
+    fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.savepoints.push(MemoryMockSavepoint {
+            name: name.to_owned(),
+            next_page: self.next_page,
+            pages: self.pages.clone(),
+        });
+        Ok(())
+    }
+
+    fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if let Some(pos) = self.savepoints.iter().rposition(|sp| sp.name == name) {
+            self.savepoints.truncate(pos);
+            Ok(())
+        } else {
+            Err(fsqlite_error::FrankenError::internal(format!(
+                "no savepoint named '{name}'"
+            )))
+        }
+    }
+
+    fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if let Some(pos) = self.savepoints.iter().rposition(|sp| sp.name == name) {
+            let snapshot = self.savepoints[pos].clone();
+            self.next_page = snapshot.next_page;
+            self.pages = snapshot.pages;
+            self.savepoints.truncate(pos + 1);
+            Ok(())
+        } else {
+            Err(fsqlite_error::FrankenError::internal(format!(
+                "no savepoint named '{name}'"
+            )))
+        }
+    }
+}
+
 /// Test/mock checkpoint writer exported for cross-crate tests.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MockCheckpointPageWriter;
@@ -724,5 +866,22 @@ mod tests {
         // in a unit test, we verify that our mock impls compile and work.
         let pager = MockMvccPager;
         let _: &dyn MvccPager<Txn = MockTransaction> = &pager;
+    }
+
+    #[test]
+    fn test_memory_mock_transaction_persists_writes() {
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = PageNumber::new(256).unwrap();
+
+        let mut bytes = vec![0_u8; fsqlite_types::PageSize::default().as_usize()];
+        bytes[0] = 0x0A;
+        txn.write_page(&cx, page_no, &bytes).unwrap();
+
+        let page = txn.get_page(&cx, page_no).unwrap();
+        assert_eq!(page.as_bytes()[0], 0x0A);
+        assert!(txn.has_pending_writes());
+        assert!(txn.is_writer());
     }
 }

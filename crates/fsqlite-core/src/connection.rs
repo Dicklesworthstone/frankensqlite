@@ -800,20 +800,23 @@ where
 {
     if vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
-        let (file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
-        match WalFile::open(cx, file) {
-            Ok(wal) => {
-                pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
-                return Ok(());
+        let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
+        if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+            match WalFile::open(cx, file) {
+                Ok(wal) => {
+                    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
+                    return Ok(());
+                }
+                Err(err @ FrankenError::WalCorrupt { .. }) => return Err(err),
+                Err(err) => return Err(err),
             }
-            Err(FrankenError::WalCorrupt { .. }) => {}
-            Err(err) => return Err(err),
         }
+        let _ = file.close(cx);
     }
 
     let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
-    let wal = WalFile::create(cx, file, PageSize::DEFAULT.get(), 0, WalSalts::default())?;
+    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::default())?;
     pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
 }
 
@@ -13009,6 +13012,59 @@ impl Connection {
         Ok(values)
     }
 
+    fn parse_partial_index_predicate_for_integrity(index: &IndexSchema) -> Result<Option<Expr>> {
+        index
+            .where_clause
+            .as_deref()
+            .map(fsqlite_parser::expr::parse_expr)
+            .transpose()
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "index `{}` has an invalid partial index predicate: {err}",
+                    index.name
+                ),
+            })
+    }
+
+    fn row_matches_partial_index_for_integrity(
+        table: &TableSchema,
+        predicate: Option<&Expr>,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+    ) -> Result<bool> {
+        let Some(predicate) = predicate else {
+            return Ok(true);
+        };
+
+        let mut predicate = predicate.clone();
+        if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx)) {
+            rewrite_rowid_aliases_in_expr(&mut predicate, &ipk_column.name);
+        }
+
+        let mut eval_row = row_values.to_vec();
+        let mut col_map = table
+            .columns
+            .iter()
+            .map(|column| (table.name.clone(), column.name.clone(), false))
+            .collect::<Vec<_>>();
+        let shadowed_names = table
+            .columns
+            .iter()
+            .map(|column| column.name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if ["rowid", "_rowid_", "oid"]
+            .iter()
+            .any(|alias| !shadowed_names.contains(*alias))
+        {
+            eval_row.push(SqliteValue::Integer(rowid));
+            col_map.push((table.name.clone(), "rowid".to_owned(), true));
+        }
+
+        let predicate_value = eval_join_expr(&predicate, &eval_row, &col_map)?;
+        Ok(is_sqlite_truthy(&predicate_value))
+    }
+
     fn build_expected_index_key_for_integrity(
         table_name: &str,
         index_name: &str,
@@ -13522,6 +13578,12 @@ impl Connection {
                     }
                 }
             } else {
+                struct IntegrityIndexSpec<'a> {
+                    index: &'a IndexSchema,
+                    positions: Vec<usize>,
+                    predicate: Option<Expr>,
+                }
+
                 let index_specs = if quick {
                     Vec::new()
                 } else {
@@ -13543,7 +13605,13 @@ impl Connection {
                                     })
                                 })
                                 .collect::<Result<Vec<_>>>()?;
-                            Ok((index, positions))
+                            let predicate =
+                                Self::parse_partial_index_predicate_for_integrity(index)?;
+                            Ok(IntegrityIndexSpec {
+                                index,
+                                positions,
+                                predicate,
+                            })
                         })
                         .collect::<Result<Vec<_>>>()?
                 };
@@ -13551,6 +13619,7 @@ impl Connection {
                     .iter()
                     .map(|_| HashMap::<i64, Vec<u8>>::new())
                     .collect::<Vec<_>>();
+                let mut table_rowids = HashSet::new();
                 let rowid_alias_col_idx = rowid_alias_col_by_root_page
                     .as_ref()
                     .and_then(|map| map.get(&table.root_page))
@@ -13595,15 +13664,25 @@ impl Connection {
                                 rowid_alias_col_idx,
                                 column_defaults,
                             )?;
-                            for ((index, positions), expected_keys) in
+                            table_rowids.insert(rowid);
+                            for (index_spec, expected_keys) in
                                 index_specs.iter().zip(expected_index_keys.iter_mut())
                             {
-                                let key = Self::build_expected_index_key_for_integrity(
-                                    &table.name,
-                                    &index.name,
+                                if !Self::row_matches_partial_index_for_integrity(
+                                    table,
+                                    index_spec.predicate.as_ref(),
                                     rowid,
                                     &row_values,
-                                    positions,
+                                    rowid_alias_col_idx,
+                                )? {
+                                    continue;
+                                }
+                                let key = Self::build_expected_index_key_for_integrity(
+                                    &table.name,
+                                    &index_spec.index.name,
+                                    rowid,
+                                    &row_values,
+                                    &index_spec.positions,
                                 )?;
                                 expected_keys.insert(rowid, key);
                             }
@@ -13613,9 +13692,10 @@ impl Connection {
                         }
                     }
                 }
-                for ((index, _positions), expected_keys) in
+                for (index_spec, expected_keys) in
                     index_specs.iter().zip(expected_index_keys.iter())
                 {
+                    let index = index_spec.index;
                     let index_root =
                         page_number_from_schema_root(index.root_page, &index.name, "index")?;
                     let page = txn.get_page(cx, index_root)?;
@@ -13700,12 +13780,18 @@ impl Connection {
                             }
                             let rowid = cursor.rowid(cx)?;
                             let Some(expected_payload) = expected_keys.get(&rowid) else {
-                                return Err(FrankenError::DatabaseCorrupt {
-                                    detail: format!(
+                                let detail = if table_rowids.contains(&rowid) {
+                                    format!(
+                                        "index `{}` contains rowid {rowid} for a table row that does not satisfy the partial index predicate",
+                                        index.name
+                                    )
+                                } else {
+                                    format!(
                                         "index `{}` contains stale rowid {rowid} with no matching table row",
                                         index.name
-                                    ),
-                                });
+                                    )
+                                };
+                                return Err(FrankenError::DatabaseCorrupt { detail });
                             };
                             if expected_payload.as_slice() != payload.as_slice() {
                                 return Err(FrankenError::DatabaseCorrupt {
@@ -30686,9 +30772,9 @@ mod tests {
     use super::{
         CommitSeq, Connection, ConnectionEnv, InProcessPageLockTable, IoPollStrategy, PagerBackend,
         Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SimplePager, Snapshot,
-        init_global_runtime, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
-        join_table_supports_hidden_rowid, lock_unpoisoned, statement_contains_rewritable_subquery,
-        wal_file_present_with_vfs, wal_path_for_db_path,
+        init_global_runtime, install_wal_backend_with_vfs, is_sqlite_master_entry_missing,
+        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
+        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use fsqlite_ast::Statement;
     use fsqlite_btree::BtreeCursorOps;
@@ -30707,6 +30793,7 @@ mod tests {
     use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::ShmRegion;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
+    use fsqlite_wal::WalFile;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -32928,6 +33015,1331 @@ mod tests {
     }
 
     #[test]
+    fn test_beads_issue_indexes_stay_sqlite_compatible_after_backfill_updates_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("beads_issue_index_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ephemeral INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    is_template INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO issues(
+                    id, content_hash, title, status, priority, created_at, updated_at,
+                    ephemeral, pinned, is_template
+                 )
+                 VALUES
+                    ('a', 'hash-a1', 'alpha', 'open', 1, '2026-03-11T10:00:00Z', '2026-03-11T10:00:00Z', 0, 0, 0),
+                    ('b', 'hash-b1', 'beta', 'open', 2, '2026-03-11T11:00:00Z', '2026-03-11T11:00:00Z', 0, 0, NULL),
+                    ('c', 'hash-c1', 'gamma', 'closed', 3, '2026-03-11T12:00:00Z', '2026-03-11T12:00:00Z', 0, 0, 0);",
+            )
+            .unwrap();
+
+            // Migration-style backfill: create the indexes after rows already exist.
+            conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+                .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_ready
+                 ON issues(status, priority, created_at)
+                 WHERE status = 'open'
+                   AND ephemeral = 0
+                   AND pinned = 0
+                   AND is_template = 0;",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_list_active_order
+                 ON issues(priority, created_at DESC)
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL);",
+            )
+            .unwrap();
+
+            // Beads-like updates always touch content_hash and can move rows in
+            // and out of the partial indexes at the same time.
+            conn.execute(
+                "UPDATE issues
+                 SET priority = 0,
+                     status = 'open',
+                     content_hash = 'hash-c2',
+                     updated_at = '2026-03-11T13:00:00Z',
+                     created_at = '2026-03-11T13:00:00Z',
+                     is_template = 0
+                 WHERE id = 'c';",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE issues
+                 SET status = 'closed',
+                     content_hash = 'hash-a2',
+                     updated_at = '2026-03-11T14:00:00Z'
+                 WHERE id = 'a';",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE issues
+                 SET content_hash = 'hash-b2',
+                     updated_at = '2026-03-11T15:00:00Z',
+                     pinned = 1
+                 WHERE id = 'b';",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "UPDATE issues
+                 SET content_hash = 'hash-b3',
+                     updated_at = '2026-03-11T16:00:00Z',
+                     pinned = 0,
+                     is_template = 0
+                 WHERE id = 'b';",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE issues
+                 SET content_hash = 'hash-c3',
+                     updated_at = '2026-03-11T17:00:00Z',
+                     status = 'tombstone'
+                 WHERE id = 'c';",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "Beads-style issue index backfill and updates should stay SQLite-compatible"
+        );
+
+        let hashes = sqlite
+            .prepare("SELECT id, content_hash FROM issues ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            hashes,
+            vec![
+                ("a".to_owned(), "hash-a2".to_owned()),
+                ("b".to_owned(), "hash-b3".to_owned()),
+                ("c".to_owned(), "hash-c3".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_single_connection_beads_issue_index_churn_stays_sqlite_compatible() {
+        const TXNS: usize = 360;
+        const ISSUE_COUNT: usize = 48;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("beads_issue_index_single_connection.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        conn.execute(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                ephemeral INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                is_template INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_issues_ready
+             ON issues(status, priority, created_at)
+             WHERE status = 'open'
+               AND ephemeral = 0
+               AND pinned = 0
+               AND is_template = 0;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_issues_list_active_order
+             ON issues(priority, created_at DESC)
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND ((is_template = 0) OR is_template IS NULL);",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        for issue_idx in 0..ISSUE_COUNT {
+            let status = if issue_idx % 7 == 0 { "closed" } else { "open" };
+            let is_template_sql = match issue_idx % 5 {
+                0 => "NULL",
+                1 => "1",
+                _ => "0",
+            };
+            conn.execute(&format!(
+                "INSERT INTO issues(
+                    id, content_hash, title, status, priority, created_at, updated_at,
+                    ephemeral, pinned, is_template
+                 ) VALUES (
+                    'bd-{issue_idx:03}',
+                    'seed-{issue_idx:03}',
+                    'issue {issue_idx:03}',
+                    '{status}',
+                    {},
+                    '2026-03-11T{:02}:{:02}:00Z',
+                    '2026-03-11T{:02}:{:02}:00Z',
+                    0,
+                    0,
+                    {is_template_sql}
+                 );",
+                issue_idx % 5,
+                issue_idx % 24,
+                issue_idx % 60,
+                issue_idx % 24,
+                issue_idx % 60,
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        for txn_idx in 0..TXNS {
+            let issue_idx = (txn_idx * 7) % ISSUE_COUNT;
+            let status = match txn_idx % 3 {
+                0 => "open",
+                1 => "closed",
+                _ => "tombstone",
+            };
+            let pinned = if txn_idx % 5 == 0 { 1 } else { 0 };
+            let priority = i64::try_from(txn_idx % 5).unwrap();
+            let is_template_sql = match txn_idx % 4 {
+                0 => "NULL",
+                1 => "1",
+                _ => "0",
+            };
+            let created_at = format!(
+                "2026-03-12T{:02}:{:02}:{:02}Z",
+                txn_idx % 24,
+                (txn_idx * 3) % 60,
+                (txn_idx * 7) % 60,
+            );
+            let updated_at = format!(
+                "2026-03-12T{:02}:{:02}:{:02}Z",
+                txn_idx % 24,
+                (txn_idx * 5) % 60,
+                (txn_idx * 11) % 60,
+            );
+            let content_hash = format!("tx{txn_idx:03}-bd-{issue_idx:03}");
+
+            conn.execute("BEGIN CONCURRENT;").unwrap();
+            let changes = conn
+                .execute(&format!(
+                    "UPDATE issues
+                     SET content_hash = '{content_hash}',
+                         priority = {priority},
+                         created_at = '{created_at}',
+                         updated_at = '{updated_at}',
+                         status = '{status}',
+                         pinned = {pinned},
+                         is_template = {is_template_sql}
+                     WHERE id = 'bd-{issue_idx:03}';"
+                ))
+                .unwrap();
+            assert_eq!(changes, 1, "expected one Beads row update");
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "single-connection Beads-like issue churn must preserve SQLite compatibility"
+        );
+
+        let hash_rows = sqlite
+            .prepare("SELECT id, content_hash FROM issues ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (id, content_hash) in hash_rows {
+            let indexed_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues INDEXED BY idx_issues_content_hash
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let fullscan_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues NOT INDEXED
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                indexed_ids, fullscan_ids,
+                "forced content-hash index lookup must match full scan for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_content_hash_only_index_churn_stays_sqlite_compatible() {
+        const WORKERS: usize = 4;
+        const TXNS_PER_WORKER: usize = 90;
+        const ISSUE_COUNT: usize = 48;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("content_hash_only_index_concurrent.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+                .unwrap();
+
+            conn.execute("BEGIN;").unwrap();
+            for issue_idx in 0..ISSUE_COUNT {
+                conn.execute(&format!(
+                    "INSERT INTO issues(id, content_hash, updated_at)
+                     VALUES (
+                        'bd-{issue_idx:03}',
+                        'seed-{issue_idx:03}',
+                        '2026-03-11T{:02}:{:02}:00Z'
+                     );",
+                    issue_idx % 24,
+                    issue_idx % 60,
+                ))
+                .unwrap();
+            }
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut handles = Vec::with_capacity(WORKERS);
+        for worker_id in 0..WORKERS {
+            let db = db_str.clone();
+            let barrier = std::sync::Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || -> u64 {
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+                barrier.wait();
+
+                let mut retries = 0_u64;
+                for txn_idx in 0..TXNS_PER_WORKER {
+                    let issue_idx = (worker_id * 17 + txn_idx * 7) % ISSUE_COUNT;
+                    let updated_at = format!(
+                        "2026-03-12T{:02}:{:02}:{:02}Z",
+                        (worker_id * 5 + txn_idx) % 24,
+                        (worker_id * 13 + txn_idx * 3) % 60,
+                        (txn_idx * 7 + worker_id) % 60,
+                    );
+                    let content_hash =
+                        format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
+
+                    loop {
+                        conn.execute("BEGIN CONCURRENT;").unwrap();
+                        match conn.execute(&format!(
+                            "UPDATE issues
+                             SET content_hash = '{content_hash}',
+                                 updated_at = '{updated_at}'
+                             WHERE id = 'bd-{issue_idx:03}';"
+                        )) {
+                            Ok(changes) => {
+                                assert_eq!(changes, 1, "expected one row update");
+                            }
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                                continue;
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient concurrent content-hash update failure \
+                                     (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                                );
+                            }
+                        }
+
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => break,
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient concurrent content-hash commit failure \
+                                     (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                retries
+            }));
+        }
+
+        let mut total_retries = 0_u64;
+        for handle in handles {
+            total_retries += handle.join().expect("worker should not panic");
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "concurrent content-hash-only index churn must preserve SQLite compatibility (retries={total_retries})"
+        );
+
+        let hash_rows = sqlite
+            .prepare("SELECT id, content_hash FROM issues ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (id, content_hash) in hash_rows {
+            let indexed_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues INDEXED BY idx_issues_content_hash
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let fullscan_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues NOT INDEXED
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                indexed_ids, fullscan_ids,
+                "forced content-hash index lookup must match full scan for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_concurrent_beads_row_rewrite_with_content_hash_index_only_stays_sqlite_compatible() {
+        const WORKERS: usize = 4;
+        const TXNS_PER_WORKER: usize = 90;
+        const ISSUE_COUNT: usize = 48;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("beads_row_rewrite_content_hash_index_only.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ephemeral INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    is_template INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+                .unwrap();
+
+            conn.execute("BEGIN;").unwrap();
+            for issue_idx in 0..ISSUE_COUNT {
+                let status = if issue_idx % 7 == 0 { "closed" } else { "open" };
+                let is_template_sql = match issue_idx % 5 {
+                    0 => "NULL",
+                    1 => "1",
+                    _ => "0",
+                };
+                conn.execute(&format!(
+                    "INSERT INTO issues(
+                        id, content_hash, title, status, priority, created_at, updated_at,
+                        ephemeral, pinned, is_template
+                     ) VALUES (
+                        'bd-{issue_idx:03}',
+                        'seed-{issue_idx:03}',
+                        'issue {issue_idx:03}',
+                        '{status}',
+                        {},
+                        '2026-03-11T{:02}:{:02}:00Z',
+                        '2026-03-11T{:02}:{:02}:00Z',
+                        0,
+                        0,
+                        {is_template_sql}
+                     );",
+                    issue_idx % 5,
+                    issue_idx % 24,
+                    issue_idx % 60,
+                    issue_idx % 24,
+                    issue_idx % 60,
+                ))
+                .unwrap();
+            }
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut handles = Vec::with_capacity(WORKERS);
+        for worker_id in 0..WORKERS {
+            let db = db_str.clone();
+            let barrier = std::sync::Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || -> u64 {
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+                barrier.wait();
+
+                let mut retries = 0_u64;
+                for txn_idx in 0..TXNS_PER_WORKER {
+                    let issue_idx = (worker_id * 17 + txn_idx * 7) % ISSUE_COUNT;
+                    let status = match (worker_id + txn_idx) % 3 {
+                        0 => "open",
+                        1 => "closed",
+                        _ => "tombstone",
+                    };
+                    let pinned = if (worker_id + txn_idx) % 5 == 0 { 1 } else { 0 };
+                    let priority = i64::try_from((worker_id * 11 + txn_idx) % 5).unwrap();
+                    let is_template_sql = match (worker_id + txn_idx) % 4 {
+                        0 => "NULL",
+                        1 => "1",
+                        _ => "0",
+                    };
+                    let created_at = format!(
+                        "2026-03-12T{:02}:{:02}:{:02}Z",
+                        (worker_id * 5 + txn_idx) % 24,
+                        (worker_id * 13 + txn_idx * 3) % 60,
+                        (txn_idx * 7 + worker_id) % 60,
+                    );
+                    let updated_at = format!(
+                        "2026-03-12T{:02}:{:02}:{:02}Z",
+                        (worker_id * 7 + txn_idx) % 24,
+                        (worker_id * 19 + txn_idx * 5) % 60,
+                        (txn_idx * 11 + worker_id) % 60,
+                    );
+                    let content_hash =
+                        format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
+
+                    loop {
+                        conn.execute("BEGIN CONCURRENT;").unwrap();
+                        match conn.execute(&format!(
+                            "UPDATE issues
+                             SET content_hash = '{content_hash}',
+                                 priority = {priority},
+                                 created_at = '{created_at}',
+                                 updated_at = '{updated_at}',
+                                 status = '{status}',
+                                 pinned = {pinned},
+                                 is_template = {is_template_sql}
+                             WHERE id = 'bd-{issue_idx:03}';"
+                        )) {
+                            Ok(changes) => {
+                                assert_eq!(changes, 1, "expected one row update");
+                            }
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                                continue;
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient concurrent content-hash-only-index update failure \
+                                     (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                                );
+                            }
+                        }
+
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => break,
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient concurrent content-hash-only-index commit failure \
+                                     (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                retries
+            }));
+        }
+
+        let mut total_retries = 0_u64;
+        for handle in handles {
+            total_retries += handle.join().expect("worker should not panic");
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "concurrent Beads-style row rewrites with only content-hash index must preserve SQLite compatibility (retries={total_retries})"
+        );
+
+        let hash_rows = sqlite
+            .prepare("SELECT id, content_hash FROM issues ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (id, content_hash) in hash_rows {
+            let indexed_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues INDEXED BY idx_issues_content_hash
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let fullscan_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues NOT INDEXED
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                indexed_ids, fullscan_ids,
+                "forced content-hash index lookup must match full scan for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_same_row_concurrent_beads_rewrite_reports_transient_not_pk_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("same_row_beads_rewrite_text_pk.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ephemeral INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    is_template INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO issues(
+                    id, content_hash, title, status, priority, created_at, updated_at,
+                    ephemeral, pinned, is_template
+                 ) VALUES (
+                    'bd-040',
+                    'seed-040',
+                    'issue 040',
+                    'open',
+                    0,
+                    '2026-03-11T08:00:00Z',
+                    '2026-03-11T08:00:00Z',
+                    0,
+                    0,
+                    0
+                 );",
+            )
+            .unwrap();
+        }
+
+        let conn1 = Connection::open(&db_str).unwrap();
+        let conn2 = Connection::open(&db_str).unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        assert_eq!(
+            conn1
+                .execute(
+                    "UPDATE issues
+                     SET content_hash = 'winner-hash',
+                         priority = 1,
+                         created_at = '2026-03-12T01:00:00Z',
+                         updated_at = '2026-03-12T01:00:00Z',
+                         status = 'closed',
+                         pinned = 1,
+                         is_template = 0
+                     WHERE id = 'bd-040';"
+                )
+                .unwrap(),
+            1
+        );
+
+        let loser_err = match conn2.execute(
+            "UPDATE issues
+             SET content_hash = 'loser-hash',
+                 priority = 2,
+                 created_at = '2026-03-12T02:00:00Z',
+                 updated_at = '2026-03-12T02:00:00Z',
+                 status = 'tombstone',
+                 pinned = 0,
+                 is_template = NULL
+             WHERE id = 'bd-040';",
+        ) {
+            Ok(changes) => {
+                assert_eq!(
+                    changes, 1,
+                    "second writer should affect one row before stale conflict resolves"
+                );
+                conn1.execute("COMMIT;").unwrap();
+                conn2.execute("COMMIT;").unwrap_err()
+            }
+            Err(err) => {
+                conn1.execute("COMMIT;").unwrap();
+                err
+            }
+        };
+
+        assert!(
+            loser_err.is_transient(),
+            "same-row Beads rewrite should fail transiently, got {loser_err:?}"
+        );
+
+        conn2.execute("ROLLBACK;").unwrap();
+
+        let visible = conn1
+            .query_row(
+                "SELECT content_hash, priority, created_at, status, pinned, is_template
+                 FROM issues
+                 WHERE id = 'bd-040';",
+            )
+            .unwrap();
+        assert_eq!(
+            visible.values(),
+            &[
+                SqliteValue::Text("winner-hash".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("2026-03-12T01:00:00Z".to_owned()),
+                SqliteValue::Text("closed".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(0),
+            ],
+            "winner state must remain visible after loser rollback"
+        );
+    }
+
+    #[test]
+    fn test_retrying_same_row_beads_rewrite_rebinds_latest_content_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retry_same_row_beads_rewrite_text_pk.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ephemeral INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    is_template INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO issues(
+                    id, content_hash, title, status, priority, created_at, updated_at,
+                    ephemeral, pinned, is_template
+                 ) VALUES (
+                    'bd-040',
+                    'seed-040',
+                    'issue 040',
+                    'open',
+                    0,
+                    '2026-03-11T08:00:00Z',
+                    '2026-03-11T08:00:00Z',
+                    0,
+                    0,
+                    0
+                 );",
+            )
+            .unwrap();
+        }
+
+        let conn1 = Connection::open(&db_str).unwrap();
+        let conn2 = Connection::open(&db_str).unwrap();
+        for conn in [&conn1, &conn2] {
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        }
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        assert_eq!(
+            conn1
+                .execute(
+                    "UPDATE issues
+                     SET content_hash = 'winner-hash',
+                         priority = 1,
+                         created_at = '2026-03-12T01:00:00Z',
+                         updated_at = '2026-03-12T01:00:00Z',
+                         status = 'closed',
+                         pinned = 1,
+                         is_template = 0
+                     WHERE id = 'bd-040';"
+                )
+                .unwrap(),
+            1
+        );
+
+        let loser_err = match conn2.execute(
+            "UPDATE issues
+             SET content_hash = 'loser-hash',
+                 priority = 2,
+                 created_at = '2026-03-12T02:00:00Z',
+                 updated_at = '2026-03-12T02:00:00Z',
+                 status = 'tombstone',
+                 pinned = 0,
+                 is_template = NULL
+             WHERE id = 'bd-040';",
+        ) {
+            Ok(changes) => {
+                assert_eq!(changes, 1);
+                conn1.execute("COMMIT;").unwrap();
+                conn2.execute("COMMIT;").unwrap_err()
+            }
+            Err(err) => {
+                conn1.execute("COMMIT;").unwrap();
+                err
+            }
+        };
+        assert!(
+            loser_err.is_transient(),
+            "losing writer should fail transiently, got {loser_err:?}"
+        );
+
+        conn2.execute("ROLLBACK;").unwrap();
+        assert_eq!(
+            conn2
+                .query_row("SELECT content_hash FROM issues WHERE id = 'bd-040';")
+                .unwrap()
+                .get(0),
+            Some(&SqliteValue::Text("winner-hash".to_owned())),
+            "loser must see winner content hash after rollback"
+        );
+
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+        assert_eq!(
+            conn2
+                .execute(
+                    "UPDATE issues
+                     SET content_hash = 'retry-hash',
+                         priority = 3,
+                         created_at = '2026-03-12T03:00:00Z',
+                         updated_at = '2026-03-12T03:00:00Z',
+                         status = 'open',
+                         pinned = 0,
+                         is_template = 0
+                     WHERE id = 'bd-040';"
+                )
+                .unwrap(),
+            1
+        );
+        conn2.execute("COMMIT;").unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "retrying same-row rewrite must keep the content-hash index SQLite-compatible"
+        );
+
+        let retry_ids = sqlite
+            .prepare(
+                "SELECT id
+                 FROM issues INDEXED BY idx_issues_content_hash
+                 WHERE content_hash = 'retry-hash'
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            retry_ids,
+            vec!["bd-040".to_owned()],
+            "retry hash must be the only forced-index result"
+        );
+
+        let winner_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE content_hash = 'winner-hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            winner_count, 0,
+            "winner hash must be fully removed after retry rewrite"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_beads_issue_index_churn_stays_sqlite_compatible() {
+        const WORKERS: usize = 4;
+        const TXNS_PER_WORKER: usize = 90;
+        const ISSUE_COUNT: usize = 48;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("beads_issue_index_concurrent.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    ephemeral INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    is_template INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+                .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_ready
+                 ON issues(status, priority, created_at)
+                 WHERE status = 'open'
+                   AND ephemeral = 0
+                   AND pinned = 0
+                   AND is_template = 0;",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_list_active_order
+                 ON issues(priority, created_at DESC)
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL);",
+            )
+            .unwrap();
+
+            conn.execute("BEGIN;").unwrap();
+            for issue_idx in 0..ISSUE_COUNT {
+                let status = if issue_idx % 7 == 0 { "closed" } else { "open" };
+                let is_template_sql = match issue_idx % 5 {
+                    0 => "NULL",
+                    1 => "1",
+                    _ => "0",
+                };
+                conn.execute(&format!(
+                    "INSERT INTO issues(
+                        id, content_hash, title, status, priority, created_at, updated_at,
+                        ephemeral, pinned, is_template
+                     ) VALUES (
+                        'bd-{issue_idx:03}',
+                        'seed-{issue_idx:03}',
+                        'issue {issue_idx:03}',
+                        '{status}',
+                        {},
+                        '2026-03-11T{:02}:{:02}:00Z',
+                        '2026-03-11T{:02}:{:02}:00Z',
+                        0,
+                        0,
+                        {is_template_sql}
+                     );",
+                    issue_idx % 5,
+                    issue_idx % 24,
+                    issue_idx % 60,
+                    issue_idx % 24,
+                    issue_idx % 60,
+                ))
+                .unwrap();
+            }
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut handles = Vec::with_capacity(WORKERS);
+        for worker_id in 0..WORKERS {
+            let db = db_str.clone();
+            let barrier = std::sync::Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || -> u64 {
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+                barrier.wait();
+
+                let mut retries = 0_u64;
+                for txn_idx in 0..TXNS_PER_WORKER {
+                    let issue_idx = (worker_id * 17 + txn_idx * 7) % ISSUE_COUNT;
+                    let status = match (worker_id + txn_idx) % 3 {
+                        0 => "open",
+                        1 => "closed",
+                        _ => "tombstone",
+                    };
+                    let pinned = if (worker_id + txn_idx) % 5 == 0 { 1 } else { 0 };
+                    let priority = i64::try_from((worker_id * 11 + txn_idx) % 5).unwrap();
+                    let is_template_sql = match (worker_id + txn_idx) % 4 {
+                        0 => "NULL",
+                        1 => "1",
+                        _ => "0",
+                    };
+                    let created_at = format!(
+                        "2026-03-12T{:02}:{:02}:{:02}Z",
+                        (worker_id * 5 + txn_idx) % 24,
+                        (worker_id * 13 + txn_idx * 3) % 60,
+                        (txn_idx * 7 + worker_id) % 60,
+                    );
+                    let updated_at = format!(
+                        "2026-03-12T{:02}:{:02}:{:02}Z",
+                        (worker_id * 7 + txn_idx) % 24,
+                        (worker_id * 19 + txn_idx * 5) % 60,
+                        (txn_idx * 11 + worker_id) % 60,
+                    );
+                    let content_hash =
+                        format!("w{worker_id:02}-tx{txn_idx:03}-bd-{issue_idx:03}");
+
+                    loop {
+                        conn.execute("BEGIN CONCURRENT;").unwrap();
+                        let update_sql = format!(
+                            "UPDATE issues
+                             SET content_hash = '{content_hash}',
+                                 priority = {priority},
+                                 created_at = '{created_at}',
+                                 updated_at = '{updated_at}',
+                                 status = '{status}',
+                                 pinned = {pinned},
+                                 is_template = {is_template_sql}
+                             WHERE id = 'bd-{issue_idx:03}';"
+                        );
+
+                        match conn.execute(&update_sql) {
+                            Ok(changes) => {
+                                assert_eq!(changes, 1, "expected one Beads row update");
+                            }
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                                continue;
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient concurrent Beads update failure \
+                                     (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                                );
+                            }
+                        }
+
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => break,
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient concurrent Beads commit failure \
+                                     (worker={worker_id} txn={txn_idx} issue=bd-{issue_idx:03}): {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                retries
+            }));
+        }
+
+        let mut total_retries = 0_u64;
+        for handle in handles {
+            total_retries += handle.join().expect("worker should not panic");
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        if integrity_check != "ok" {
+            let page_count: i64 = sqlite
+                .query_row("PRAGMA page_count;", [], |row| row.get(0))
+                .unwrap();
+            let freelist_count: i64 = sqlite
+                .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+                .unwrap();
+            eprintln!(
+                "beads churn debug: path={} page_count={} freelist_count={} integrity={integrity_check}",
+                db_path.display(),
+                page_count,
+                freelist_count
+            );
+
+            let master_rows = sqlite
+                .prepare(
+                    "SELECT type, name, tbl_name, rootpage
+                     FROM sqlite_master
+                     ORDER BY rootpage, name",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for (entry_type, name, table_name, rootpage) in master_rows {
+                eprintln!(
+                    "beads churn debug: sqlite_master type={entry_type} name={name} table={table_name} rootpage={rootpage}"
+                );
+            }
+
+            match sqlite.prepare(
+                "SELECT name, path, pageno, pagetype, ncell
+                 FROM dbstat
+                 ORDER BY pageno, name, path",
+            ) {
+                Ok(mut stmt) => {
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                            ))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    for (name, path, pageno, pagetype, ncell) in rows {
+                        eprintln!(
+                            "beads churn debug: dbstat name={name} path={path} pageno={pageno} pagetype={pagetype} ncell={ncell}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!("beads churn debug: dbstat unavailable: {err}");
+                }
+            }
+
+            let fsqlite = Connection::open(&db_str).unwrap();
+            let own_integrity_rows = fsqlite.query("PRAGMA integrity_check;").unwrap();
+            for row in own_integrity_rows {
+                if let Some(SqliteValue::Text(message)) = row.values.first() {
+                    eprintln!("beads churn debug: fsqlite integrity_check={message}");
+                }
+            }
+        }
+        assert_eq!(
+            integrity_check, "ok",
+            "concurrent Beads-like index churn must preserve SQLite compatibility (retries={total_retries})"
+        );
+
+        let indexed_active = sqlite
+            .prepare(
+                "SELECT id
+                 FROM issues INDEXED BY idx_issues_list_active_order
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL)
+                 ORDER BY priority, created_at DESC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let fullscan_active = sqlite
+            .prepare(
+                "SELECT id
+                 FROM issues NOT INDEXED
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL)
+                 ORDER BY priority, created_at DESC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            indexed_active, fullscan_active,
+            "forced descending partial-index scan must match full scan after concurrent churn"
+        );
+
+        let hash_rows = sqlite
+            .prepare("SELECT id, content_hash FROM issues ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (id, content_hash) in hash_rows {
+            let indexed_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues INDEXED BY idx_issues_content_hash
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let fullscan_ids = sqlite
+                .prepare(
+                    "SELECT id
+                     FROM issues NOT INDEXED
+                     WHERE content_hash = ?1
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([content_hash.as_str()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                indexed_ids, fullscan_ids,
+                "forced content-hash index lookup must match full scan for {id}"
+            );
+            assert!(
+                indexed_ids.contains(&id),
+                "content-hash lookup must return its owning row for {id}"
+            );
+        }
+    }
+
+    #[test]
     fn test_comments_ipk_payload_stays_sqlite_compatible() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("comments_ipk_payload.db");
@@ -33010,6 +34422,502 @@ mod tests {
                 ),
             ],
             "external SQLite should decode the same comment rows without column shifting"
+        );
+    }
+
+    #[test]
+    fn test_create_index_backfills_existing_desc_partial_index_rows_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("issues_partial_backfill.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                is_template INTEGER
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO issues(id, priority, created_at, status, is_template)
+             VALUES
+                ('a', 1, '2026-03-11 10:00:00', 'open', 0),
+                ('b', 1, '2026-03-11 11:00:00', 'open', NULL),
+                ('c', 2, '2026-03-11 12:00:00', 'closed', 0),
+                ('d', 3, '2026-03-11 13:00:00', 'open', 1);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE INDEX idx_issues_list_active_order
+             ON issues(priority, created_at DESC)
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND ((is_template = 0) OR is_template IS NULL);",
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "CREATE INDEX backfill for a descending partial index should stay SQLite-compatible"
+        );
+    }
+
+    #[test]
+    fn test_create_index_backfills_large_desc_partial_index_rows_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("issues_partial_backfill_large.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                is_template INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        for i in 0..800 {
+            conn.execute(&format!(
+                "INSERT INTO issues(id, priority, created_at, status, is_template)
+                 VALUES ('bd-{i:04}', {}, '2026-03-11T{:02}:00:00Z', 'open', 0);",
+                i % 5,
+                i % 24
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        conn.execute(
+            "CREATE INDEX idx_issues_list_active_order
+             ON issues(priority, created_at DESC)
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND ((is_template = 0) OR is_template IS NULL);",
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "CREATE INDEX backfill should remain correct when the partial index spans many rows"
+        );
+    }
+
+    #[test]
+    fn test_prepared_update_keeps_secondary_and_partial_indexes_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("issues_prepared_update_indexes.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                is_template INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT,
+                close_reason TEXT DEFAULT ''
+            );",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_issues_list_active_order
+             ON issues(priority, created_at DESC)
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND ((is_template = 0) OR is_template IS NULL);",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO issues(
+                id, content_hash, priority, created_at, status, is_template, updated_at, closed_at, close_reason
+             ) VALUES
+                ('bd-a', 'hash-a0', 1, '2026-03-11 10:00:00', 'open', 0, '2026-03-11 10:00:00', NULL, ''),
+                ('bd-b', 'hash-b0', 2, '2026-03-11 11:00:00', 'open', 0, '2026-03-11 11:00:00', NULL, ''),
+                ('bd-c', 'hash-c0', 3, '2026-03-11 12:00:00', 'closed', 0, '2026-03-11 12:00:00', '2026-03-11 12:00:00', 'done');",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare(
+                "UPDATE issues
+                 SET content_hash = ?1,
+                     priority = ?2,
+                     created_at = ?3,
+                     status = ?4,
+                     updated_at = ?5,
+                     closed_at = ?6,
+                     close_reason = ?7
+                 WHERE id = ?8",
+            )
+            .unwrap();
+
+        conn.execute_prepared_with_params(
+            &stmt,
+            &[
+                SqliteValue::Text("hash-a1".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("2026-03-11 10:00:00".to_owned()),
+                SqliteValue::Text("closed".to_owned()),
+                SqliteValue::Text("2026-03-11 13:00:00".to_owned()),
+                SqliteValue::Text("2026-03-11 13:00:00".to_owned()),
+                SqliteValue::Text("completed".to_owned()),
+                SqliteValue::Text("bd-a".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        conn.execute_prepared_with_params(
+            &stmt,
+            &[
+                SqliteValue::Text("hash-c1".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("2026-03-11 14:00:00".to_owned()),
+                SqliteValue::Text("open".to_owned()),
+                SqliteValue::Text("2026-03-11 14:00:00".to_owned()),
+                SqliteValue::Null,
+                SqliteValue::Text(String::new()),
+                SqliteValue::Text("bd-c".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        conn.execute_prepared_with_params(
+            &stmt,
+            &[
+                SqliteValue::Text("hash-b1".to_owned()),
+                SqliteValue::Integer(2),
+                SqliteValue::Text("2026-03-11 11:30:00".to_owned()),
+                SqliteValue::Text("open".to_owned()),
+                SqliteValue::Text("2026-03-11 11:30:00".to_owned()),
+                SqliteValue::Null,
+                SqliteValue::Text(String::new()),
+                SqliteValue::Text("bd-b".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        drop(stmt);
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "prepared UPDATE should keep ordinary and partial secondary indexes SQLite-compatible"
+        );
+    }
+
+    #[test]
+    fn test_prepared_update_keeps_large_secondary_and_partial_indexes_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("issues_prepared_update_large_indexes.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                is_template INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                closed_at TEXT,
+                close_reason TEXT DEFAULT ''
+            );",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_issues_content_hash ON issues(content_hash);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_issues_list_active_order
+             ON issues(priority, created_at DESC)
+             WHERE status NOT IN ('closed', 'tombstone')
+               AND ((is_template = 0) OR is_template IS NULL);",
+        )
+        .unwrap();
+
+        let insert = conn
+            .prepare(
+                "INSERT INTO issues(
+                    id, content_hash, priority, created_at, status, is_template, updated_at, closed_at, close_reason
+                 ) VALUES (?1, ?2, ?3, ?4, 'open', 0, ?5, NULL, '')",
+            )
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        for i in 0_i64..1200 {
+            let hash = format!("{i:032x}{:032x}", i + 1);
+            let ts = format!("2026-03-11T{:02}:{:02}:00Z", i % 24, i % 60);
+            conn.execute_prepared_with_params(
+                &insert,
+                &[
+                    SqliteValue::Text(format!("bd-{i:04}")),
+                    SqliteValue::Text(hash),
+                    SqliteValue::Integer(i % 5),
+                    SqliteValue::Text(ts.clone()),
+                    SqliteValue::Text(ts),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+        drop(insert);
+
+        let target = 600_i64;
+        let old_hash = format!("{target:032x}{:032x}", target + 1);
+        let new_hash = "4548b222a696de7a7fd04b23869ebef9b3e70e1b183e2936e0f554ee41bead05";
+        let stmt = conn
+            .prepare(
+                "UPDATE issues
+                 SET content_hash = ?1,
+                     priority = ?2,
+                     created_at = ?3,
+                     status = ?4,
+                     updated_at = ?5,
+                     closed_at = ?6,
+                     close_reason = ?7
+                 WHERE id = ?8",
+            )
+            .unwrap();
+        conn.execute_prepared_with_params(
+            &stmt,
+            &[
+                SqliteValue::Text(new_hash.to_owned()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text("2026-03-12T02:43:28Z".to_owned()),
+                SqliteValue::Text("closed".to_owned()),
+                SqliteValue::Text("2026-03-12T02:43:28Z".to_owned()),
+                SqliteValue::Text("2026-03-12T02:43:28Z".to_owned()),
+                SqliteValue::Text("closed during stress regression".to_owned()),
+                SqliteValue::Text(format!("bd-{target:04}")),
+            ],
+        )
+        .unwrap();
+        drop(stmt);
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "prepared UPDATE should remain SQLite-compatible after the content-hash index grows beyond a single small leaf"
+        );
+
+        let stale_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE content_hash = ?1",
+                [old_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_count, 0,
+            "old content hash should not remain query-visible"
+        );
+    }
+
+    #[test]
+    fn test_beads_like_schema_survives_reopen_updates_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("beads_like_schema_compat.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    is_template INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_list_active_order
+                 ON issues(priority, created_at DESC)
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues (id) ON DELETE CASCADE
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_comments_issue ON comments(issue_id);")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_comments_created_at ON comments(created_at);")
+                .unwrap();
+
+            conn.execute(
+                "INSERT INTO issues(id, title, status, priority, created_at, is_template)
+                 VALUES
+                    ('bd-10t6', 'Aggregate functions', 'open', 1, '2026-03-11 10:00:00', 0),
+                    ('bd-cfzef', 'Cancellation checkpoints', 'open', 1, '2026-03-11 11:00:00', 0),
+                    ('bd-zjisk', 'Default backend cutover', 'closed', 2, '2026-03-11 12:00:00', 0),
+                    ('bd-template', 'Template row', 'open', 0, '2026-03-11 09:00:00', 1);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comments(issue_id, author, text, created_at)
+                 VALUES ('bd-10t6', 'Dicklesworthstone', 'seed comment', '2026-03-12T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "UPDATE issues
+                 SET status = 'open', created_at = '2026-03-11 13:00:00'
+                 WHERE id = 'bd-zjisk';",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE issues
+                 SET status = 'closed'
+                 WHERE id = 'bd-10t6';",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comments(issue_id, author, text)
+                 VALUES ('bd-cfzef', 'ScarletFalcon', 'follow-up comment');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comments(issue_id, author, text, created_at)
+                 VALUES ('bd-zjisk', 'BlueOwl', 'reopened and verified', '2026-03-12T00:01:00Z');",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "Beads-style issues/comments workload should remain SQLite-compatible after reopen"
+        );
+
+        let active_issue_rows = sqlite
+            .prepare(
+                "SELECT id, priority, created_at
+                 FROM issues
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL)
+                 ORDER BY priority, created_at DESC",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            active_issue_rows,
+            vec![
+                ("bd-cfzef".to_owned(), 1, "2026-03-11 11:00:00".to_owned()),
+                ("bd-zjisk".to_owned(), 2, "2026-03-11 13:00:00".to_owned()),
+            ],
+            "descending partial index query over active Beads issues should match expected rows"
+        );
+
+        let comment_rows = sqlite
+            .prepare(
+                "SELECT id, issue_id, author, text, created_at, typeof(created_at)
+                 FROM comments
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(comment_rows.len(), 3);
+        assert_eq!(
+            comment_rows[0],
+            (
+                1,
+                "bd-10t6".to_owned(),
+                "Dicklesworthstone".to_owned(),
+                "seed comment".to_owned(),
+                "2026-03-12T00:00:00Z".to_owned(),
+                "text".to_owned(),
+            )
+        );
+        assert_eq!(comment_rows[1].0, 2);
+        assert_eq!(comment_rows[1].1, "bd-cfzef");
+        assert_eq!(comment_rows[1].2, "ScarletFalcon");
+        assert_eq!(comment_rows[1].3, "follow-up comment");
+        assert!(!comment_rows[1].4.is_empty());
+        assert_eq!(comment_rows[1].5, "text");
+        assert_eq!(
+            comment_rows[2],
+            (
+                3,
+                "bd-zjisk".to_owned(),
+                "BlueOwl".to_owned(),
+                "reopened and verified".to_owned(),
+                "2026-03-12T00:01:00Z".to_owned(),
+                "text".to_owned(),
+            )
         );
     }
 
@@ -41547,6 +43455,50 @@ mod tests {
         assert!(
             wal_file_present_with_vfs(&vfs, &cx, &wal_path),
             "WAL presence probe should not require read-write open access"
+        );
+    }
+
+    #[test]
+    fn test_install_wal_backend_creates_wal_with_pager_page_size() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = Path::new("/wal_page_size.db");
+        let requested_page_size = PageSize::new(8192).expect("valid page size");
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, vfs.clone(), db_path, requested_page_size).unwrap(),
+        );
+        let wal_path = wal_path_for_db_path("/wal_page_size.db");
+
+        install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path).expect("install wal backend");
+
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        let wal = WalFile::open(&cx, file).expect("open created wal");
+        assert_eq!(
+            wal.page_size(),
+            usize::try_from(requested_page_size.get()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_install_wal_backend_rejects_corrupt_existing_wal() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = Path::new("/wal_corrupt_existing.db");
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT).unwrap(),
+        );
+        let wal_path = wal_path_for_db_path("/wal_corrupt_existing.db");
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        file.write(&cx, &[0_u8; 32], 0).unwrap();
+        file.close(&cx).unwrap();
+
+        let err = install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+            .expect_err("header-sized corrupt WAL should be surfaced");
+        assert!(
+            matches!(err, FrankenError::WalCorrupt { .. }),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -53408,6 +55360,83 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_insert_reopen_keeps_desc_partial_index_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prepared_partial_index_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    is_template INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_list_active_order
+                 ON issues(priority, created_at DESC)
+                 WHERE status NOT IN ('closed', 'tombstone')
+                   AND ((is_template = 0) OR is_template IS NULL);",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            let stmt = conn
+                .prepare(
+                    "INSERT INTO issues(id, priority, created_at, status, is_template)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .unwrap();
+            assert!(
+                stmt.db.is_some(),
+                "simple prepared INSERT should still compile to a reusable program after reopen"
+            );
+
+            for row in [
+                [
+                    SqliteValue::Text("a".to_owned()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("2026-03-11 10:00:00".to_owned()),
+                    SqliteValue::Text("open".to_owned()),
+                    SqliteValue::Integer(0),
+                ],
+                [
+                    SqliteValue::Text("b".to_owned()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("2026-03-11 11:00:00".to_owned()),
+                    SqliteValue::Text("open".to_owned()),
+                    SqliteValue::Null,
+                ],
+                [
+                    SqliteValue::Text("c".to_owned()),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("2026-03-11 12:00:00".to_owned()),
+                    SqliteValue::Text("closed".to_owned()),
+                    SqliteValue::Integer(0),
+                ],
+            ] {
+                stmt.execute_with_params(&row).unwrap();
+            }
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "prepared INSERT after schema reload must keep partial index membership valid"
+        );
+    }
+
+    #[test]
     fn test_prepared_simple_delete_prepare_reuses_compiled_program() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_del_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -56495,6 +58524,75 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO t VALUES (1, 'alice@example.com', 'alpha');")
             .unwrap();
 
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_accepts_partial_index_excluding_null_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE issues (id INTEGER PRIMARY KEY, title TEXT NOT NULL, assignee TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_issues_assignee ON issues(assignee) WHERE assignee IS NOT NULL;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO issues (id, title, assignee) VALUES
+             (1, 'triage mailbox', NULL),
+             (2, 'repair index', 'alice');",
+        )
+        .unwrap();
+
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_accepts_partial_index_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("partial-index-integrity.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.set_reject_mem_fallback(true);
+            conn.set_strict_mem_fallback_rejection(true);
+            conn.execute(
+                "CREATE TABLE issues (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    assignee TEXT,
+                    status TEXT NOT NULL DEFAULT 'open'
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX idx_issues_assignee ON issues(assignee) WHERE assignee IS NOT NULL;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO issues (id, title, assignee, status) VALUES
+                 (1, 'doctor rebuild', NULL, 'open'),
+                 (2, 'fix engine integrity', 'alice', 'open'),
+                 (3, 'verify reopen path', NULL, 'closed');",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let sqlite_integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sqlite_integrity, "ok");
+
+        let conn = Connection::open(&db).unwrap();
+        conn.set_reject_mem_fallback(true);
+        conn.set_strict_mem_fallback_rejection(true);
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
