@@ -2262,10 +2262,10 @@ where
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
         self.ensure_writer(cx)?;
 
-        // First, try to reuse a page freed by this transaction.
-        if let Some(page) = self.freed_pages.pop() {
-            return Ok(page);
-        }
+        // Pages freed earlier in the same transaction stay quarantined until
+        // commit. Reusing them immediately lets one B-tree operation hand a
+        // page to another tree before the old ownership is durably retired,
+        // which can surface as cross-tree page aliasing on disk.
 
         let mut inner = self
             .inner
@@ -4028,6 +4028,35 @@ mod tests {
             p2.get(),
             p.get()
         );
+    }
+
+    #[test]
+    fn test_freed_pages_are_quarantined_until_commit() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p2, &vec![0xAA; ps]).unwrap();
+        txn.free_page(&cx, p2).unwrap();
+
+        let p3 = txn.allocate_page(&cx).unwrap();
+        assert_eq!(
+            p3.get(),
+            p2.get() + 1,
+            "bead_id={BEAD_ID} case=freed_pages_quarantined_until_commit"
+        );
+        txn.write_page(&cx, p3, &vec![0xBB; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let mut next_txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused = next_txn.allocate_page(&cx).unwrap();
+        assert_eq!(
+            reused, p2,
+            "bead_id={BEAD_ID} case=freed_pages_reenter_committed_freelist_after_commit"
+        );
+        next_txn.rollback(&cx).unwrap();
     }
 
     #[test]
