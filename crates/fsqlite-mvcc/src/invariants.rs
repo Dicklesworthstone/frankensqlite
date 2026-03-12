@@ -563,20 +563,39 @@ impl VersionStore {
         drop(arena);
 
         // Step 2: CAS-based chain head install (lock-free).
-        let _span = tracing::info_span!(
-            "latchfree_install",
-            pgno = pgno.get(),
-            cas_attempts = tracing::field::Empty,
-            succeeded = tracing::field::Empty,
-        )
-        .entered();
+        // INV-3: Establish backward link BEFORE making the new head visible.
+        let shard = &self.chain_heads.shards[ChainHeadTable::shard_index(pgno)];
+        let slot_idx = shard.ensure_slot(pgno);
+        let new_raw = ChainHeadTable::pack_idx(idx);
+        let mut cas_attempts = 0_u32;
 
-        let (previous_head, cas_attempts) = self.chain_heads.install_with_retry(pgno, idx);
+        let previous_head = loop {
+            cas_attempts += 1;
+            let slots = shard.slots.read();
+            let current_raw = slots[slot_idx].load(Ordering::Acquire);
+            let prev = ChainHeadTable::unpack_idx(current_raw);
+
+            // Link the new version to the current head BEFORE trying to swap.
+            {
+                let mut arena = self.arena.write();
+                let v = arena.get_mut(idx).expect("just allocated");
+                v.prev = prev.map(idx_to_version_pointer);
+            }
+
+            match slots[slot_idx].compare_exchange_weak(
+                current_raw,
+                new_raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break prev,
+                Err(_) => {
+                    std::hint::spin_loop();
+                }
+            }
+        };
+
         record_cas_attempt(cas_attempts);
-
-        tracing::Span::current()
-            .record("cas_attempts", cas_attempts)
-            .record("succeeded", true);
 
         // Step 3: Visibility ranges update (brief write lock).
         let mut ranges = self.visibility_ranges.write();

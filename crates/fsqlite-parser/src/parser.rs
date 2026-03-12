@@ -344,6 +344,36 @@ impl Parser {
         }
     }
 
+    fn recover_trigger_body_after_error(&mut self) {
+        let mut case_depth = 0_usize;
+
+        loop {
+            match self.peek() {
+                TokenKind::Eof => return,
+                TokenKind::KwCase => {
+                    case_depth = case_depth.saturating_add(1);
+                    self.advance();
+                }
+                TokenKind::KwEnd if case_depth > 0 => {
+                    case_depth = case_depth.saturating_sub(1);
+                    self.advance();
+                }
+                // Once CASE nesting is balanced, treat END as the trigger-body
+                // terminator even if the malformed statement left parentheses
+                // unbalanced. Recovery should prefer the enclosing trigger
+                // boundary over swallowing subsequent top-level SQL.
+                TokenKind::KwEnd => {
+                    self.advance();
+                    let _ = self.eat(&TokenKind::Semicolon);
+                    return;
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Identifiers and names
     // -----------------------------------------------------------------------
@@ -1692,7 +1722,14 @@ impl Parser {
             if self.check_kw(&TokenKind::KwEnd) {
                 break;
             }
-            body.push(self.parse_statement_inner()?);
+            let stmt = match self.parse_statement_inner() {
+                Ok(stmt) => stmt,
+                Err(err) => {
+                    self.recover_trigger_body_after_error();
+                    return Err(err);
+                }
+            };
+            body.push(stmt);
             let _ = self.eat(&TokenKind::Semicolon);
         }
         self.expect_kw(&TokenKind::KwEnd)?;
@@ -2349,6 +2386,82 @@ mod tests {
         assert!(
             error.message.contains("expected ';' separator"),
             "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_error_recovery_does_not_fabricate_top_level_statements_from_trigger_body() {
+        let mut parser = Parser::from_sql(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN XYZZY; SELECT 1; END; SELECT 2;",
+        );
+        let (stmts, errs) = parser.parse_all();
+
+        assert_eq!(errs.len(), 1, "expected one trigger-body parse error");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "only the trailing top-level SELECT should remain"
+        );
+        assert!(
+            matches!(
+                &stmts[0],
+                Statement::Select(select)
+                    if matches!(
+                        &select.body.select,
+                        SelectCore::Select { columns, .. }
+                            if matches!(
+                                columns.as_slice(),
+                                [ResultColumn::Expr {
+                                    expr: Expr::Literal(Literal::Integer(2), _),
+                                    alias: None,
+                                }]
+                            )
+                    )
+            ),
+            "parser must skip the malformed trigger instead of reinterpreting body tokens as top-level SQL: {stmts:?}"
+        );
+    }
+
+    #[test]
+    fn test_error_recovery_recovers_values_statement_after_garbage() {
+        let mut parser = Parser::from_sql("XYZZY VALUES (1);");
+        let (stmts, errs) = parser.parse_all();
+
+        assert_eq!(errs.len(), 1, "expected one error for leading garbage");
+        assert_eq!(stmts.len(), 1, "VALUES statement should still be recovered");
+        assert!(matches!(stmts[0], Statement::Select(_)));
+    }
+
+    #[test]
+    fn test_error_recovery_does_not_swallow_top_level_sql_after_unbalanced_trigger_paren() {
+        let mut parser = Parser::from_sql(
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT (1; END; SELECT 2;",
+        );
+        let (stmts, errs) = parser.parse_all();
+
+        assert_eq!(errs.len(), 1, "expected one trigger-body parse error");
+        assert_eq!(
+            stmts.len(),
+            1,
+            "malformed trigger recovery must still preserve the trailing top-level SELECT"
+        );
+        assert!(
+            matches!(
+                &stmts[0],
+                Statement::Select(select)
+                    if matches!(
+                        &select.body.select,
+                        SelectCore::Select { columns, .. }
+                            if matches!(
+                                columns.as_slice(),
+                                [ResultColumn::Expr {
+                                    expr: Expr::Literal(Literal::Integer(2), _),
+                                    alias: None,
+                                }]
+                            )
+                    )
+            ),
+            "parser must stop at the trigger END even when parentheses are left unbalanced: {stmts:?}"
         );
     }
 

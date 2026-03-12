@@ -841,84 +841,92 @@ fn core_gate_specs() -> Vec<GateSpec> {
     vec![
         GateSpec {
             gate_id: "phase4.sql_conformance_20",
-            gate_name: "Phase 4 gate: SQL conformance (20 tests)",
+            gate_name: "Phase 4 gate: native SQL conformance suite",
             scope: GateScope::Phase4,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase4_gate_sql_conformance_20",
+                "--test",
+                "bd_3plop_7_native_sql_conformance",
+                "native_sql_conformance_suite",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase4.vdbe_explain",
-            gate_name: "Phase 4 gate: VDBE EXPLAIN output sequence",
+            gate_name: "Phase 4 gate: EXPLAIN bytecode emission",
             scope: GateScope::Phase4,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase4_gate_vdbe_explain",
+                "fsqlite-core",
+                "test_explain_returns_bytecode",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase4.sorter_100k",
-            gate_name: "Phase 4 gate: sorter correctness on 100k rows",
+            gate_name: "Phase 4 gate: sorter spill and external merge correctness",
             scope: GateScope::Phase4,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase4_gate_sorter_100k",
+                "fsqlite-vdbe",
+                "test_sorter_spill_to_disk_under_low_threshold",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase5.format_write_read_c",
-            gate_name: "Phase 5 gate: FrankenSQLite DB readable by C sqlite3",
+            gate_name: "Phase 5 gate: FrankenSQLite file readable by C SQLite",
             scope: GateScope::Phase5,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase5_gate_format_write_read_c",
+                "fsqlite-e2e",
+                "--test",
+                "compat_file_format",
+                "test_fsqlite_writes_csqlite_reads",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase5.format_read_c_write",
-            gate_name: "Phase 5 gate: C sqlite3 DB readable by FrankenSQLite",
+            gate_name: "Phase 5 gate: C SQLite file readable by FrankenSQLite",
             scope: GateScope::Phase5,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase5_gate_format_read_c_write",
+                "fsqlite-e2e",
+                "--test",
+                "compat_file_format",
+                "test_csqlite_writes_fsqlite_reads",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase5.wal_crash_recovery",
-            gate_name: "Phase 5 gate: WAL crash recovery (100 scenarios)",
+            gate_name: "Phase 5 gate: crash recovery parity assessment",
             scope: GateScope::Phase5,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase5_gate_wal_crash_recovery",
+                "--test",
+                "bd_1dp9_4_4_crash_recovery_parity",
+                "assessment_produces_parity_verdict",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -932,20 +940,24 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase5_gate_raptorq_wal",
+                "--test",
+                "bd_bca_1_phase5_compliance",
+                "test_raptorq_wal_repair",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase5.raptorq_harness",
-            gate_name: "Phase 5 gate: RaptorQ harness (loss/corruption/perf)",
+            gate_name: "Phase 5 gate: WAL FEC end-to-end harness",
             scope: GateScope::Phase5,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
+                "fsqlite-wal",
+                "--test",
+                "wal_fec_recovery",
                 "test_e2e_raptorq_harness",
             ],
             env: &[],
@@ -953,14 +965,16 @@ fn core_gate_specs() -> Vec<GateSpec> {
         },
         GateSpec {
             gate_id: "phase6.mvcc_stress",
-            gate_name: "Phase 6 gate: MVCC stress (100 writers x 100 ops)",
+            gate_name: "Phase 6 gate: concurrent-writer deadlock stress",
             scope: GateScope::Phase6,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_mvcc_stress",
+                "--test",
+                "bd_2npr_mvcc_concurrent_writer_stress",
+                "test_e2e_100_concurrent_transactions_no_deadlock",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -974,7 +988,9 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_ssi_write_skew",
+                "--test",
+                "bd_bca_2_phase6_mvcc_ssi_compliance",
+                "test_ssi_write_skew_abort",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -988,7 +1004,9 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_ssi_mazurkiewicz",
+                "--test",
+                "bd_bca_2_phase6_mvcc_ssi_compliance",
+                "test_mazurkiewicz_3txn_6_orderings",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1002,7 +1020,9 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_ssi_witness_epoch",
+                "--test",
+                "bd_2d3i_1_ssi_witness_plane_deterministic_scenarios_compliance",
+                "test_slot_reuse_epoch_guard",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1016,49 +1036,55 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_ssi_witness_decode",
+                "--test",
+                "bd_2d3i_1_ssi_witness_plane_deterministic_scenarios_compliance",
+                "e2e_witness_plane_loss_profiles",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase6.snapshot_mazurkiewicz",
-            gate_name: "Phase 6 gate: snapshot isolation Mazurkiewicz exploration",
+            gate_name: "Phase 6 gate: snapshot read stability under WAL",
             scope: GateScope::Phase6,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase6_gate_snapshot_mazurkiewicz",
+                "fsqlite-e2e",
+                "--test",
+                "correctness_mvcc_isolation",
+                "csqlite_wal_snapshot_read_stability",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase6.eprocess_inv",
-            gate_name: "Phase 6 gate: e-process invariants INV-1..INV-7",
+            gate_name: "Phase 6 gate: e-process monitors cover INV-1..INV-7",
             scope: GateScope::Phase6,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_eprocess_inv",
+                "--lib",
+                "test_eprocess_inv1_through_inv7",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase6.gc_memory",
-            gate_name: "Phase 6 gate: GC memory bound <= 2x theoretical minimum",
+            gate_name: "Phase 6 gate: GC memory stays within bounded overhead",
             scope: GateScope::Phase6,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase6_gate_gc_memory",
+                "fsqlite-mvcc",
+                "--lib",
+                "test_gc_memory_bounded",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1072,7 +1098,9 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_serialized_parity",
+                "--test",
+                "bd_bca_2_phase6_mvcc_ssi_compliance",
+                "test_mvcc_serialized_mode_begin_immediate_blocks_other_writers",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1086,7 +1114,9 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_rebase_merge",
+                "--test",
+                "bd_bca_2_phase6_mvcc_ssi_compliance",
+                "test_rebase_merge_distinct_offsets_succeeds",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1100,21 +1130,25 @@ fn core_gate_specs() -> Vec<GateSpec> {
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_structured_merge",
+                "--test",
+                "bd_2d3i_1_ssi_witness_plane_deterministic_scenarios_compliance",
+                "test_same_page_disjoint_cells_merge",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase6.crash_model",
-            gate_name: "Phase 6 gate: crash model durability scenarios",
+            gate_name: "Phase 6 gate: mid-commit crash recovery stress",
             scope: GateScope::Phase6,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase6_gate_crash_model",
+                "--test",
+                "bd_2npr_mvcc_concurrent_writer_stress",
+                "test_e2e_crash_recovery_mid_commit",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1127,42 +1161,46 @@ fn late_phase_gate_specs() -> Vec<GateSpec> {
     vec![
         GateSpec {
             gate_id: "phase7.index_usage",
-            gate_name: "Phase 7 gate: EXPLAIN QUERY PLAN index usage",
+            gate_name: "Phase 7 gate: EXPLAIN QUERY PLAN shows index usage",
             scope: GateScope::Phase7,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase7_gate_index_usage",
+                "fsqlite-core",
+                "test_explain_query_plan_shows_index",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase7.window_functions",
-            gate_name: "Phase 7 gate: window functions (50 conformance tests)",
+            gate_name: "Phase 7 gate: window function parity sweep",
             scope: GateScope::Phase7,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase7_gate_window_functions",
+                "--test",
+                "bd_2yqp6_5_1_function_parity_matrix",
+                "test_window_function_extended_parity",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase7.recursive_cte_limit",
-            gate_name: "Phase 7 gate: recursive CTE terminates with LIMIT",
+            gate_name: "Phase 7 gate: recursive CTE LIMIT parity",
             scope: GateScope::Phase7,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase7_gate_recursive_cte_limit",
+                "fsqlite-core",
+                "--test",
+                "conformance_oracle_ext",
+                "test_conformance_cte_advanced",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1185,98 +1223,107 @@ fn late_phase_gate_specs() -> Vec<GateSpec> {
         },
         GateSpec {
             gate_id: "phase8.json1",
-            gate_name: "Phase 8 gate: JSON1 conformance (200 tests)",
+            gate_name: "Phase 8 gate: JSON1 parity smoke",
             scope: GateScope::Phase8,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase8_gate_json1",
+                "fsqlite-e2e",
+                "--test",
+                "extension_json_fts_parity",
+                "json1_contract_rows_match_csqlite",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase8.fts5",
-            gate_name: "Phase 8 gate: FTS5 full-text search (100 queries)",
+            gate_name: "Phase 8 gate: FTS5 column-filter parity",
             scope: GateScope::Phase8,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase8_gate_fts5",
+                "fsqlite-e2e",
+                "--test",
+                "extension_json_fts_parity",
+                "fts5_match_column_filters_work_in_frankensqlite",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase8.rtree",
-            gate_name: "Phase 8 gate: R*-Tree spatial queries (50 bbox tests)",
+            gate_name: "Phase 8 gate: R-tree spatial parity scenario",
             scope: GateScope::Phase8,
             command: &[
                 "cargo",
                 "test",
                 "-p",
-                "fsqlite-harness",
-                "test_phase8_gate_rtree",
+                "fsqlite-e2e",
+                "--test",
+                "extension_rtree_session_icu_misc_parity",
+                "rtree_spatial_scenario_rows_match_csqlite",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase9.conformance_golden",
-            gate_name: "Phase 9 gate: 100% parity target (1,000+ golden files)",
+            gate_name: "Phase 9 gate: golden corpus checksum integrity",
             scope: GateScope::Phase9,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase9_gate_conformance_golden",
+                "--test",
+                "bd_1lsfu_2_core_sql_golden_checksums",
+                "test_bd_1lsfu_2_core_sql_golden_checksums",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase9.benchmark_3x",
-            gate_name: "Phase 9 gate: single-writer benchmark within 3x of C SQLite",
+            gate_name: "Phase 9 gate: single-writer 3x benchmark gate is still missing",
             scope: GateScope::Phase9,
             command: &[
-                "cargo",
-                "test",
-                "-p",
-                "fsqlite-harness",
-                "test_phase9_gate_benchmark_3x",
+                "bash",
+                "-lc",
+                "echo 'phase9.benchmark_3x is unimplemented; see PERF-regression-suite gap in crates/fsqlite-harness/src/e2e_traceability.rs' >&2; exit 1",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase9.no_regression",
-            gate_name: "Phase 9 gate: no regression vs Phase 8 (conformal p-value)",
+            gate_name: "Phase 9 gate: performance regression detector coverage",
             scope: GateScope::Phase9,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase9_gate_no_regression",
+                "--test",
+                "bd_mblr_7_3_2_regression_detector",
             ],
             env: &[],
             expected_exit_code: 0,
         },
         GateSpec {
             gate_id: "phase9.replication_loss",
-            gate_name: "Phase 9 gate: replication under 10% packet loss",
+            gate_name: "Phase 9 gate: replication decode under partial loss",
             scope: GateScope::Phase9,
             command: &[
                 "cargo",
                 "test",
                 "-p",
                 "fsqlite-harness",
-                "test_phase9_gate_replication_loss",
+                "--test",
+                "bd_m0l2_raptorq_e2e_integration",
+                "test_e2e_replication_decode_with_partial_loss",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1799,7 +1846,8 @@ mod tests {
         let command = gate.command.join(" ");
 
         assert_eq!(gate.scope, GateScope::Phase4);
-        assert!(command.contains("test_phase4_gate_sql_conformance_20"));
+        assert!(command.contains("bd_3plop_7_native_sql_conformance"));
+        assert!(command.contains("native_sql_conformance_suite"));
     }
 
     #[test]
@@ -1809,7 +1857,8 @@ mod tests {
         let command = gate.command.join(" ");
 
         assert_eq!(gate.scope, GateScope::Phase5);
-        assert!(command.contains("test_phase5_gate_wal_crash_recovery"));
+        assert!(command.contains("bd_1dp9_4_4_crash_recovery_parity"));
+        assert!(command.contains("assessment_produces_parity_verdict"));
     }
 
     #[test]
@@ -1819,6 +1868,8 @@ mod tests {
         let command = gate.command.join(" ");
 
         assert_eq!(gate.scope, GateScope::Phase5);
+        assert!(command.contains("fsqlite-wal"));
+        assert!(command.contains("wal_fec_recovery"));
         assert!(command.contains("test_e2e_raptorq_harness"));
     }
 
@@ -1829,7 +1880,8 @@ mod tests {
         let command = gate.command.join(" ");
 
         assert_eq!(gate.scope, GateScope::Phase6);
-        assert!(command.contains("test_phase6_gate_crash_model"));
+        assert!(command.contains("bd_2npr_mvcc_concurrent_writer_stress"));
+        assert!(command.contains("test_e2e_crash_recovery_mid_commit"));
     }
 
     #[test]
@@ -1920,7 +1972,7 @@ mod tests {
         let command = gate.command.join(" ");
 
         assert_eq!(gate.scope, GateScope::Phase7);
-        assert!(command.contains("test_phase7_gate_index_usage"));
+        assert!(command.contains("test_explain_query_plan_shows_index"));
     }
 
     #[test]
@@ -1941,7 +1993,31 @@ mod tests {
         let command = gate.command.join(" ");
 
         assert_eq!(gate.scope, GateScope::Phase9);
-        assert!(command.contains("test_phase9_gate_replication_loss"));
+        assert!(command.contains("bd_m0l2_raptorq_e2e_integration"));
+        assert!(command.contains("test_e2e_replication_decode_with_partial_loss"));
+    }
+
+    #[test]
+    fn test_behavioral_phase_gate_commands_do_not_target_marker_tests() {
+        let gate_plan = phase_4_to_6_gate_plan()
+            .into_iter()
+            .chain(phase_7_to_9_gate_plan())
+            .collect::<Vec<_>>();
+
+        for gate in gate_plan {
+            let command = gate.command.join(" ");
+            assert!(
+                !command.contains("test_phase4_gate_")
+                    && !command.contains("test_phase5_gate_")
+                    && !command.contains("test_phase6_gate_")
+                    && !command.contains("test_phase7_gate_")
+                    && !command.contains("test_phase8_gate_")
+                    && !command.contains("test_phase9_gate_"),
+                "gate {} still targets a marker/self-check command: {}",
+                gate.gate_id,
+                command
+            );
+        }
     }
 
     #[test]

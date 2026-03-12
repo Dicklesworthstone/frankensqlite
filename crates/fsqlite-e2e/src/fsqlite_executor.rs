@@ -37,8 +37,8 @@ use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
 use crate::report::{
     AllocatorPressureHotPathProfile, BtreeRuntimeHotPathProfile, CorrectnessReport,
     EngineRunReport, FsqliteHotPathProfile, HotPathEvidence, HotPathOpcodeCount,
-    HotPathValueHistogram, ParserHotPathProfile, ResultRowHotPathProfile, VdbeHotPathProfile,
-    VfsHotPathProfile, WalHotPathProfile,
+    HotPathValueHistogram, ParserHotPathProfile, ResultRowHotPathProfile, StorageWiringReport,
+    VdbeHotPathProfile, VfsHotPathProfile, WalHotPathProfile,
 };
 use crate::sqlite_executor;
 use crate::{E2eError, E2eResult};
@@ -54,8 +54,9 @@ pub struct FsqliteExecConfig {
     ///
     /// The executor issues `PRAGMA fsqlite.concurrent_mode=ON|OFF;` before
     /// workload execution so plain `BEGIN` follows this mode unless later
-    /// PRAGMAs override it. The report's `correctness.notes` records which
-    /// mode was requested.
+    /// PRAGMAs override it. The report records the requested mode in
+    /// `correctness.notes` and the effective storage wiring in
+    /// [`EngineRunReport::storage_wiring`].
     ///
     /// Expected transient errors in concurrent mode:
     /// - `SQLITE_BUSY` — page lock contention under hot writes.
@@ -532,6 +533,7 @@ pub fn run_oplog_fsqlite(
     }
 
     let (setup_len, per_worker) = partition_records(oplog, worker_count)?;
+    let mut storage_wiring = None;
 
     let started = Instant::now();
     let run_parallel_workers = worker_count > 1 && db_path != Path::new(":memory:");
@@ -543,10 +545,11 @@ pub fn run_oplog_fsqlite(
             &per_worker,
             config,
             &mut metrics_capture,
+            &mut storage_wiring,
         )?
     } else {
         let conn = open_connection(db_path)?;
-        configure_connection(&conn, config)?;
+        storage_wiring = Some(configure_connection(&conn, db_path, config)?);
         execute_setup(&conn, &oplog.records[..setup_len])?;
         metrics_capture.reset();
         let stats = replay_sequential(&conn, &per_worker, config);
@@ -580,6 +583,7 @@ pub fn run_oplog_fsqlite(
         concurrent_mode: config.concurrent_mode,
         integrity_check_ok,
         parallel_workers: run_parallel_workers,
+        storage_wiring,
         hot_path_profile,
     }))
 }
@@ -596,13 +600,64 @@ fn open_connection(db_path: &Path) -> E2eResult<Connection> {
     Connection::open(&path_str).map_err(|e| E2eError::Fsqlite(format!("open: {e}")))
 }
 
-fn configure_connection(conn: &Connection, config: &FsqliteExecConfig) -> E2eResult<()> {
+const FILE_BACKED_DEFAULT_PARITY_PRAGMAS: [&str; 2] = [
+    "PRAGMA fsqlite.parity_cert=ON;",
+    "PRAGMA fsqlite.parity_cert_strict=ON;",
+];
+
+fn is_memory_db_path(db_path: &Path) -> bool {
+    db_path == Path::new(":memory:")
+}
+
+fn config_has_explicit_parity_override(config: &FsqliteExecConfig) -> bool {
+    config.pragmas.iter().any(|pragma| {
+        let normalized = pragma.to_ascii_lowercase();
+        normalized.contains("fsqlite.parity_cert")
+            || normalized.contains("parity_cert=")
+            || normalized.contains("parity_cert =")
+            || normalized.contains("fsqlite.parity_cert_strict")
+            || normalized.contains("parity_cert_strict=")
+            || normalized.contains("parity_cert_strict =")
+    })
+}
+
+fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
+    let rows = conn
+        .query(pragma)
+        .map_err(|e| E2eError::Fsqlite(format!("query `{pragma}`: {e}")))?;
+    let Some(value) = rows.first().and_then(|row| row.values().first()) else {
+        return Err(E2eError::Fsqlite(format!(
+            "query `{pragma}` returned no rows"
+        )));
+    };
+    match value {
+        SqliteValue::Text(value) => Ok(value.clone()),
+        SqliteValue::Integer(value) => Ok(value.to_string()),
+        other => Err(E2eError::Fsqlite(format!(
+            "query `{pragma}` returned non-text pragma value: {other:?}"
+        ))),
+    }
+}
+
+fn configure_connection(
+    conn: &Connection,
+    db_path: &Path,
+    config: &FsqliteExecConfig,
+) -> E2eResult<StorageWiringReport> {
     // Apply concurrent-mode PRAGMA before user pragmas so the user can
     // override it if needed.
     let concurrent_mode = if config.concurrent_mode { "ON" } else { "OFF" };
     let concurrent_pragma = format!("PRAGMA fsqlite.concurrent_mode={concurrent_mode};");
+    let default_parity_pragmas: &[&str] = if is_memory_db_path(db_path) {
+        &[]
+    } else {
+        &FILE_BACKED_DEFAULT_PARITY_PRAGMAS
+    };
 
-    for pragma in std::iter::once(&concurrent_pragma).chain(config.pragmas.iter()) {
+    for pragma in std::iter::once(concurrent_pragma.as_str())
+        .chain(default_parity_pragmas.iter().copied())
+        .chain(config.pragmas.iter().map(String::as_str))
+    {
         let mut attempt = 0;
         loop {
             match conn.execute(pragma) {
@@ -621,7 +676,27 @@ fn configure_connection(conn: &Connection, config: &FsqliteExecConfig) -> E2eRes
             }
         }
     }
-    Ok(())
+    let backend_kind = query_pragma_text(conn, "PRAGMA fsqlite.backend_kind;")?;
+    let backend_mode = query_pragma_text(conn, "PRAGMA fsqlite.backend_mode;")?;
+    if !is_memory_db_path(db_path) && backend_kind == "memory" {
+        return Err(E2eError::Fsqlite(format!(
+            "file-backed executor path miswired to memory backend: path={} backend_mode={backend_mode}",
+            db_path.display()
+        )));
+    }
+    if !is_memory_db_path(db_path)
+        && !config_has_explicit_parity_override(config)
+        && backend_mode != "parity_cert_strict"
+    {
+        return Err(E2eError::Fsqlite(format!(
+            "file-backed executor path must default to strict parity-cert mode; got backend_mode={backend_mode}"
+        )));
+    }
+    Ok(StorageWiringReport {
+        backend_identity: format!("{backend_kind}:{backend_mode}"),
+        backend_kind,
+        backend_mode,
+    })
 }
 
 /// Partition OpLog records into setup SQL + per-worker slices.
@@ -657,6 +732,7 @@ fn replay_parallel(
     per_worker: &[Vec<&OpRecord>],
     config: &FsqliteExecConfig,
     metrics_capture: &mut HotPathMetricsCapture,
+    storage_wiring: &mut Option<StorageWiringReport>,
 ) -> E2eResult<(u64, u64, u64, u64, Option<String>)> {
     let worker_count = u16::try_from(per_worker.len()).map_err(|_| {
         E2eError::Io(std::io::Error::new(
@@ -670,7 +746,7 @@ fn replay_parallel(
 
     // Setup SQL must run once before worker replay so schema/seed data exists.
     let setup_conn = open_connection(db_path)?;
-    configure_connection(&setup_conn, config)?;
+    *storage_wiring = Some(configure_connection(&setup_conn, db_path, config)?);
     execute_setup(&setup_conn, &oplog.records[..setup_len])?;
     drop(setup_conn);
 
@@ -793,7 +869,7 @@ fn run_worker_parallel(
             };
         }
     };
-    if let Err(e) = configure_connection(&conn, config) {
+    if let Err(e) = configure_connection(&conn, db_path, config) {
         config_barrier.wait();
         start_barrier.wait();
         return WorkerStats {
@@ -820,6 +896,7 @@ struct EngineRunReportArgs {
     concurrent_mode: bool,
     integrity_check_ok: Option<bool>,
     parallel_workers: bool,
+    storage_wiring: Option<StorageWiringReport>,
     hot_path_profile: Option<FsqliteHotPathProfile>,
 }
 
@@ -835,6 +912,7 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
         concurrent_mode,
         integrity_check_ok,
         parallel_workers,
+        storage_wiring,
         hot_path_profile,
     } = args;
     let wall_ms = wall.as_millis() as u64;
@@ -863,7 +941,15 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
     } else {
         "single-threaded sequential execution"
     };
-    let notes = format!("mode={mode_label}; {execution_model}");
+    let notes = storage_wiring.as_ref().map_or_else(
+        || format!("mode={mode_label}; {execution_model}"),
+        |storage_wiring| {
+            format!(
+                "mode={mode_label}; {execution_model}; backend_identity={}",
+                storage_wiring.backend_identity
+            )
+        },
+    );
 
     EngineRunReport {
         wall_time_ms: wall_ms,
@@ -882,7 +968,9 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
             notes: Some(notes),
         },
         latency_ms: None,
+        first_failure_diagnostic: error.clone(),
         error,
+        storage_wiring,
         hot_path_profile,
     }
 }
@@ -1650,6 +1738,63 @@ mod tests {
             report.correctness.integrity_check_ok.is_some(),
             "expected Some for file-based db"
         );
+    }
+
+    #[test]
+    fn file_backed_runs_default_to_strict_parity_storage_wiring() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("strict-default.db");
+        let oplog = preset_commutative_inserts_disjoint_keys("strict-default", 17, 1, 4);
+
+        let report = run_oplog_fsqlite(&db_path, &oplog, &FsqliteExecConfig::default()).unwrap();
+        let storage_wiring = report
+            .storage_wiring
+            .as_ref()
+            .expect("file-backed run must capture storage wiring");
+
+        assert_ne!(
+            storage_wiring.backend_kind, "memory",
+            "file-backed runtime must not report memory backend"
+        );
+        assert_eq!(
+            storage_wiring.backend_mode, "parity_cert_strict",
+            "file-backed runtime must default to strict parity-cert wiring"
+        );
+        assert_eq!(
+            storage_wiring.backend_identity,
+            format!(
+                "{}:{}",
+                storage_wiring.backend_kind, storage_wiring.backend_mode
+            )
+        );
+        assert!(
+            report
+                .correctness
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("backend_identity=")),
+            "storage wiring should also be surfaced in report notes"
+        );
+    }
+
+    #[test]
+    fn file_backed_runs_allow_explicit_parity_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("strict-override.db");
+        let oplog = preset_commutative_inserts_disjoint_keys("strict-override", 23, 1, 4);
+        let config = FsqliteExecConfig {
+            pragmas: vec!["PRAGMA fsqlite.parity_cert=OFF;".to_owned()],
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(&db_path, &oplog, &config).unwrap();
+        let storage_wiring = report
+            .storage_wiring
+            .as_ref()
+            .expect("file-backed run must capture storage wiring");
+
+        assert_ne!(storage_wiring.backend_kind, "memory");
+        assert_eq!(storage_wiring.backend_mode, "fallback_allowed");
     }
 
     #[test]

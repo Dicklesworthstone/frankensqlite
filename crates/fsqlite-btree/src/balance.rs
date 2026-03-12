@@ -113,15 +113,24 @@ pub fn balance_deeper<W: PageWriter>(
     let child_offset = header_offset_for_page(child_pgno);
 
     // Build the child page using the extracted cells.
-    let child_data = build_page(
+    let child_data = match build_page(
         &root_cells,
         root_header.page_type,
         child_offset,
         usable_size,
         root_header.right_child,
-    )?;
+    ) {
+        Ok(page) => page,
+        Err(err) => {
+            let _ = writer.free_page(cx, child_pgno);
+            return Err(err);
+        }
+    };
 
-    writer.write_page(cx, child_pgno, &child_data)?;
+    if let Err(err) = writer.write_page(cx, child_pgno, &child_data) {
+        let _ = writer.free_page(cx, child_pgno);
+        return Err(err);
+    }
 
     // Clear the root page and make it an interior page pointing to the child.
     let mut new_root = vec![0u8; usable_size as usize];
@@ -146,7 +155,10 @@ pub fn balance_deeper<W: PageWriter>(
         new_root[..root_offset].copy_from_slice(&root_data[..root_offset]);
     }
 
-    writer.write_page(cx, root_page_no, &new_root)?;
+    if let Err(err) = writer.write_page(cx, root_page_no, &new_root) {
+        let _ = writer.free_page(cx, child_pgno);
+        return Err(err);
+    }
 
     Ok(child_pgno)
 }
@@ -372,9 +384,11 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     let mut all_cells: Vec<GatheredCell> = Vec::new();
     let mut sibling_types: Vec<BtreePageType> = Vec::new();
     let mut old_right_children: Vec<Option<PageNumber>> = Vec::new();
+    let mut original_sibling_pages: Vec<(PageNumber, Vec<u8>)> = Vec::with_capacity(sibling_count);
 
     for (sib_idx, &pgno) in sibling_pgnos.iter().enumerate() {
         let page_data = writer.read_page(cx, pgno)?;
+        original_sibling_pages.push((pgno, page_data.clone()));
         let page_offset = header_offset_for_page(pgno);
         let page_header = parse_page_header(&page_data, pgno)?;
         let ptrs = read_cell_pointers(&page_data, &page_header, page_offset)?;
@@ -483,19 +497,37 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     // Allocate/reuse pages.
     let new_page_count = distribution.len();
     let mut new_pgnos: Vec<PageNumber> = Vec::with_capacity(new_page_count);
+    let mut newly_allocated_pgnos: Vec<PageNumber> =
+        Vec::with_capacity(new_page_count.saturating_sub(sibling_pgnos.len()));
     for i in 0..new_page_count {
         if i < sibling_pgnos.len() {
             new_pgnos.push(sibling_pgnos[i]);
         } else {
-            new_pgnos.push(writer.allocate_page(cx)?);
+            match writer.allocate_page(cx) {
+                Ok(pgno) => {
+                    newly_allocated_pgnos.push(pgno);
+                    new_pgnos.push(pgno);
+                }
+                Err(err) => {
+                    free_pages_best_effort(cx, writer, &newly_allocated_pgnos);
+                    return Err(err);
+                }
+            }
         }
     }
+    let pages_to_free_after_success: Vec<PageNumber> =
+        sibling_pgnos.iter().skip(new_page_count).copied().collect();
+    let original_parent_page = writer.read_page(cx, parent_page_no)?;
 
-    // Free any excess old sibling pages.
-    if new_page_count < sibling_pgnos.len() {
-        for &pgno in &sibling_pgnos[new_page_count..] {
-            writer.free_page(cx, pgno)?;
-        }
+    // Inline rollback helper — avoids closure capturing `writer` which would
+    // conflict with the mutable borrows needed inside the loop.
+    macro_rules! do_rollback {
+        ($err:expr) => {{
+            let _ = writer.write_page(cx, parent_page_no, &original_parent_page);
+            restore_pages_best_effort(cx, writer, &original_sibling_pages);
+            free_pages_best_effort(cx, writer, &newly_allocated_pgnos);
+            $err
+        }};
     }
 
     // Populate new pages and collect divider info for parent.
@@ -532,15 +564,20 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             None
         };
 
-        let page_data = build_page(
+        let page_data = match build_page(
             cells_for_page,
             page_type,
             page_offset,
             usable_size,
             right_child,
-        )?;
+        ) {
+            Ok(page) => page,
+            Err(err) => return Err(do_rollback!(err)),
+        };
 
-        writer.write_page(cx, pgno, &page_data)?;
+        if let Err(err) = writer.write_page(cx, pgno, &page_data) {
+            return Err(do_rollback!(err));
+        }
 
         // Extract divider for parent (between this page and the next).
         if page_idx < new_page_count - 1 {
@@ -548,7 +585,10 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
                 // Table leaf: divider is [4-byte child ptr][rowid varint].
                 // The divider key is the rightmost rowid on this page.
                 let last_cell = &cells_for_page[cell_count - 1];
-                let last_ref = CellRef::parse(&last_cell.data, 0, page_type, usable_size)?;
+                let last_ref = match CellRef::parse(&last_cell.data, 0, page_type, usable_size) {
+                    Ok(cell) => cell,
+                    Err(err) => return Err(do_rollback!(err)),
+                };
                 let rowid = last_ref.rowid.ok_or_else(|| {
                     FrankenError::internal("table cell missing rowid for divider")
                 })?;
@@ -590,7 +630,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     }
 
     // Update parent: remove old dividers, insert new ones, update child pointers.
-    apply_child_replacement(
+    let outcome = match apply_child_replacement(
         cx,
         writer,
         parent_page_no,
@@ -600,7 +640,16 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         &new_pgnos,
         &new_dividers,
         parent_is_root,
-    )
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return Err(do_rollback!(err)),
+    };
+
+    for pgno in pages_to_free_after_success {
+        writer.free_page(cx, pgno)?;
+    }
+
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +727,22 @@ fn cell_on_page_size_from_ref(cell: &CellRef, cell_start: usize) -> usize {
         size += 4;
     }
     size
+}
+
+fn restore_pages_best_effort<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    pages: &[(PageNumber, Vec<u8>)],
+) {
+    for (pgno, data) in pages {
+        let _ = writer.write_page(cx, *pgno, data);
+    }
+}
+
+fn free_pages_best_effort<W: PageWriter>(cx: &Cx, writer: &mut W, pages: &[PageNumber]) {
+    for &pgno in pages {
+        let _ = writer.free_page(cx, pgno);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,7 +1311,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
                 usable_size,
                 offset,
                 header.page_type,
-                &page_data[..offset],
+                &page_data,
                 &final_cells,
                 right_child,
             )?;
@@ -1531,13 +1596,20 @@ fn split_overflowing_root<W: PageWriter>(
     let child_count = ranges.len();
     let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
     for _ in 0..child_count {
-        child_pgnos.push(writer.allocate_page(cx)?);
+        match writer.allocate_page(cx) {
+            Ok(pgno) => child_pgnos.push(pgno),
+            Err(err) => {
+                free_pages_best_effort(cx, writer, &child_pgnos);
+                return Err(err);
+            }
+        }
     }
 
     for (i, (start, end)) in ranges.iter().copied().enumerate() {
         let child_offset = header_offset_for_page(child_pgnos[i]);
         let child_cells = &final_cells[start..end];
         if !page_fits(child_cells, page_type, child_offset, usable_size) {
+            free_pages_best_effort(cx, writer, &child_pgnos);
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "overflowing root {} split child {} does not fit",
@@ -1558,6 +1630,7 @@ fn split_overflowing_root<W: PageWriter>(
         })
         .collect();
     if !page_fits(&root_cells, page_type, root_offset, usable_size) {
+        free_pages_best_effort(cx, writer, &child_pgnos);
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
                 "overflowing root {} cannot fit {} promoted dividers",
@@ -1570,14 +1643,23 @@ fn split_overflowing_root<W: PageWriter>(
     for (i, (start, end)) in ranges.iter().copied().enumerate() {
         let child_cells = &final_cells[start..end];
         let child_offset = header_offset_for_page(child_pgnos[i]);
-        let page = build_page(
+        let page = match build_page(
             child_cells,
             page_type,
             child_offset,
             usable_size,
             Some(right_children[i]),
-        )?;
-        writer.write_page(cx, child_pgnos[i], &page)?;
+        ) {
+            Ok(page) => page,
+            Err(err) => {
+                free_pages_best_effort(cx, writer, &child_pgnos);
+                return Err(err);
+            }
+        };
+        if let Err(err) = writer.write_page(cx, child_pgnos[i], &page) {
+            free_pages_best_effort(cx, writer, &child_pgnos);
+            return Err(err);
+        }
     }
 
     let root_right = child_pgnos
@@ -1599,7 +1681,13 @@ fn split_overflowing_root<W: PageWriter>(
     if root_offset > 0 {
         new_root[..root_offset].copy_from_slice(root_prefix);
     }
-    writer.write_page(cx, root_page_no, &new_root)
+    match writer.write_page(cx, root_page_no, &new_root) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            free_pages_best_effort(cx, writer, &child_pgnos);
+            Err(err)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1610,7 +1698,7 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     usable_size: u32,
     page_offset: usize,
     page_type: BtreePageType,
-    page_prefix: &[u8],
+    original_page: &[u8],
     final_cells: &[GatheredCell],
     right_child: Option<PageNumber>,
 ) -> Result<SplitPagesAndDividers> {
@@ -1748,7 +1836,21 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
     child_pgnos.push(page_no);
     for _ in 1..child_count {
-        child_pgnos.push(writer.allocate_page(cx)?);
+        match writer.allocate_page(cx) {
+            Ok(pgno) => child_pgnos.push(pgno),
+            Err(err) => {
+                free_pages_best_effort(cx, writer, &child_pgnos[1..]);
+                return Err(err);
+            }
+        }
+    }
+
+    macro_rules! do_rollback2 {
+        ($err:expr) => {{
+            let _ = writer.write_page(cx, page_no, original_page);
+            free_pages_best_effort(cx, writer, &child_pgnos[1..]);
+            $err
+        }};
     }
 
     // Patch promoted divider cells to point to their left child pages.
@@ -1765,18 +1867,23 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     for (i, (start, end)) in ranges.iter().copied().enumerate() {
         let child_pgno = child_pgnos[i];
         let child_off = header_offset_for_page(child_pgno);
-        let page = build_page(
+        let page = match build_page(
             &final_cells[start..end],
             page_type,
             child_off,
             usable_size,
             Some(right_children[i]),
-        )?;
+        ) {
+            Ok(page) => page,
+            Err(err) => return Err(do_rollback2!(err)),
+        };
         let mut final_page = page;
         if i == 0 && child_off > 0 {
-            final_page[..child_off].copy_from_slice(page_prefix);
+            final_page[..child_off].copy_from_slice(&original_page[..child_off]);
         }
-        writer.write_page(cx, child_pgno, &final_page)?;
+        if let Err(err) = writer.write_page(cx, child_pgno, &final_page) {
+            return Err(do_rollback2!(err));
+        }
     }
 
     Ok((child_pgnos, promoted))
@@ -1831,8 +1938,55 @@ mod tests {
             self.next_page += 1;
             PageNumber::new(pgno).ok_or(FrankenError::DatabaseFull)
         }
-        fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
+        fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.pages.remove(&page_no.get());
             Ok(())
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailingMemPageStore {
+        inner: MemPageStore,
+        fail_on_write: usize,
+        write_calls: usize,
+    }
+
+    impl FailingMemPageStore {
+        fn new(inner: MemPageStore, fail_on_write: usize) -> Self {
+            Self {
+                inner,
+                fail_on_write,
+                write_calls: 0,
+            }
+        }
+    }
+
+    impl crate::cursor::PageReader for FailingMemPageStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.inner.read_page(cx, page_no)
+        }
+    }
+
+    impl PageWriter for FailingMemPageStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.write_calls = self.write_calls.saturating_add(1);
+            if self.write_calls == self.fail_on_write {
+                return Err(FrankenError::internal(format!(
+                    "injected write failure on page {}",
+                    page_no.get()
+                )));
+            }
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
         }
 
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
@@ -1912,6 +2066,14 @@ mod tests {
         write_cell_pointers(&mut page, 0, &header, &cell_offsets);
 
         page
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn build_interior_table_cell(left_child: PageNumber, rowid: i64) -> Vec<u8> {
+        let mut cell_buf = [0u8; 64];
+        cell_buf[0..4].copy_from_slice(&left_child.get().to_be_bytes());
+        let vlen = write_varint(&mut cell_buf[4..], rowid as u64);
+        cell_buf[..4 + vlen].to_vec()
     }
 
     // -- balance_deeper tests --
@@ -2381,5 +2543,93 @@ mod tests {
         let page_data = store.pages.get(&2).unwrap();
         let header = BtreePageHeader::parse(page_data, 0).unwrap();
         assert_eq!(header.cell_count, 2);
+    }
+
+    #[test]
+    fn test_balance_nonroot_restores_siblings_when_rewrite_fails() {
+        let cx = Cx::new();
+        let mut base = MemPageStore::new(20);
+
+        let parent = build_interior_table(&[(pn(3), 50)], pn(4));
+        base.pages.insert(2, parent);
+        base.pages
+            .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
+        base.pages
+            .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
+
+        let original_left = base.pages.get(&3).cloned().unwrap();
+        let original_right = base.pages.get(&4).cloned().unwrap();
+
+        let mut store = FailingMemPageStore::new(base, 1);
+        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true);
+        assert!(result.is_err(), "injected write failure should surface");
+        assert_eq!(store.inner.pages.get(&3), Some(&original_left));
+        assert_eq!(store.inner.pages.get(&4), Some(&original_right));
+    }
+
+    #[test]
+    fn test_balance_nonroot_restores_parent_when_root_collapse_fails() {
+        let cx = Cx::new();
+        let mut base = MemPageStore::new(20);
+
+        let parent = build_interior_table(&[(pn(3), 50)], pn(4));
+        base.pages.insert(2, parent.clone());
+        base.pages
+            .insert(3, build_leaf_table(&[(10, b"ten"), (50, b"fifty")]));
+        base.pages
+            .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
+
+        let original_left = base.pages.get(&3).cloned().unwrap();
+        let original_right = base.pages.get(&4).cloned().unwrap();
+
+        let mut store = FailingMemPageStore::new(base, 3);
+        let result = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true);
+        assert!(
+            result.is_err(),
+            "injected root-collapse failure should surface"
+        );
+        assert_eq!(store.inner.pages.get(&2), Some(&parent));
+        assert_eq!(store.inner.pages.get(&3), Some(&original_left));
+        assert_eq!(store.inner.pages.get(&4), Some(&original_right));
+    }
+
+    #[test]
+    fn test_split_overflowing_nonroot_interior_restores_original_page_on_failure() {
+        let cx = Cx::new();
+        let mut base = MemPageStore::new(20);
+        let original_page = build_interior_table(&[(pn(10), 50), (pn(20), 100)], pn(30));
+        base.pages.insert(2, original_page.clone());
+
+        let final_cells: Vec<GatheredCell> = (0_u32..1_500)
+            .map(|i| {
+                let left_child = pn(1_000 + i);
+                let rowid = i64::from(i + 1);
+                let data = build_interior_table_cell(left_child, rowid);
+                GatheredCell {
+                    size: u16::try_from(data.len()).unwrap_or(u16::MAX),
+                    data,
+                }
+            })
+            .collect();
+
+        let mut store = FailingMemPageStore::new(base, 3);
+        let result = split_overflowing_nonroot_interior_page(
+            &cx,
+            &mut store,
+            pn(2),
+            USABLE,
+            0,
+            BtreePageType::InteriorTable,
+            &original_page,
+            &final_cells,
+            Some(pn(9_999)),
+        );
+        assert!(result.is_err(), "injected write failure should surface");
+        assert_eq!(
+            store.inner.pages.len(),
+            1,
+            "new siblings should be cleaned up"
+        );
+        assert_eq!(store.inner.pages.get(&2), Some(&original_page));
     }
 }

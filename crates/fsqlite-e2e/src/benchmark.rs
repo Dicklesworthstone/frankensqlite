@@ -393,6 +393,8 @@ mod tests {
             },
             latency_ms: None,
             error: None,
+            first_failure_diagnostic: None,
+            storage_wiring: None,
             hot_path_profile: None,
         }
     }

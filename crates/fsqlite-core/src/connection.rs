@@ -573,6 +573,20 @@ impl PagerBackend {
         }
     }
 
+    /// The database page size in bytes.
+    #[must_use]
+    pub fn page_size(&self) -> PageSize {
+        match self {
+            Self::Memory(p) => p.page_size(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.page_size(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.page_size(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.page_size(),
+        }
+    }
+
     /// Open a pager for the given path.
     ///
     /// Uses [`MemoryVfs`] for `:memory:`.
@@ -910,6 +924,28 @@ impl Row {
 }
 
 /// A prepared SQL statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedDmlKind {
+    Insert,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedPrecompiledDml {
+    kind: PreparedDmlKind,
+    table_name: String,
+}
+
+#[derive(Debug, Clone)]
+enum PreparedDmlDispatch {
+    /// Fall back to the full statement pipeline. This can still reuse a cached
+    /// compiled program when `db` is populated, but it keeps the AST around for
+    /// trigger/FK/materialization paths that still need statement structure.
+    Deferred(Arc<Statement>),
+    /// Execute through a dedicated prepared-DML helper that reuses the cached
+    /// program without keeping the full AST alive.
+    Precompiled(PreparedPrecompiledDml),
+}
+
 pub struct PreparedStatement<'conn> {
     sql: String,
     program: Arc<VdbeProgram>,
@@ -935,11 +971,10 @@ pub struct PreparedStatement<'conn> {
     /// Local schema-generation marker captured at prepare time so prepared
     /// statements invalidate on same-connection DDL before any memdb reload.
     schema_generation: u64,
-    /// For DML statements (INSERT/UPDATE/DELETE), the parsed AST is stored
-    /// here so that `Connection::execute_prepared` can re-dispatch without
-    /// re-parsing.  `None` for SELECT statements (which use the compiled
-    /// VdbeProgram directly).
-    dml_statement: Option<Arc<Statement>>,
+    /// DML execution path metadata for prepared statements. Some statements
+    /// still need the parsed AST at execution time, while others can run from
+    /// the cached bytecode plus a small amount of dispatch metadata.
+    dml_dispatch: Option<PreparedDmlDispatch>,
     /// For SELECT statements that cannot be safely precompiled because they
     /// depend on connection-level fallback routing or parameter-sensitive
     /// subquery rewriting, store the AST and re-dispatch at execution time.
@@ -1074,14 +1109,28 @@ impl std::fmt::Debug for PreparedStatement<'_> {
 
 impl PreparedStatement<'_> {
     fn requires_schema_validation(&self) -> bool {
-        self.db.is_some() || self.dml_statement.is_some() || self.deferred_query_statement.is_some()
+        self.db.is_some() || self.dml_dispatch.is_some() || self.deferred_query_statement.is_some()
     }
 
     fn dispatch_precompiled_program(&self) -> Option<&VdbeProgram> {
-        if self.dml_statement.is_some() && self.db.is_some() {
+        if self.deferred_dml_statement().is_some() && self.db.is_some() {
             Some(self.program.as_ref())
         } else {
             None
+        }
+    }
+
+    fn deferred_dml_statement(&self) -> Option<&Statement> {
+        match self.dml_dispatch.as_ref() {
+            Some(PreparedDmlDispatch::Deferred(statement)) => Some(statement.as_ref()),
+            Some(PreparedDmlDispatch::Precompiled(_)) | None => None,
+        }
+    }
+
+    fn precompiled_dml(&self) -> Option<&PreparedPrecompiledDml> {
+        match self.dml_dispatch.as_ref() {
+            Some(PreparedDmlDispatch::Precompiled(dispatch)) => Some(dispatch),
+            Some(PreparedDmlDispatch::Deferred(_)) | None => None,
         }
     }
 
@@ -1120,7 +1169,7 @@ impl PreparedStatement<'_> {
     /// Returns `true` if this prepared statement is a DML statement
     /// (INSERT/UPDATE/DELETE).
     pub fn is_dml(&self) -> bool {
-        self.dml_statement.is_some()
+        self.dml_dispatch.is_some()
     }
 
     fn execute_table_query(&self, op_cx: &Cx, params: Option<&[SqliteValue]>) -> Result<Vec<Row>> {
@@ -1178,6 +1227,7 @@ impl PreparedStatement<'_> {
             col_defaults_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.conn.version_store)),
+            PageSize::new(self.conn.pragma_state.borrow().page_size).unwrap(),
         );
         if let Some(ref mut txn) = txn_back {
             txn.commit(op_cx)?;
@@ -1187,7 +1237,7 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        if self.dml_statement.is_some() {
+        if self.dml_dispatch.is_some() {
             return Err(FrankenError::Internal(
                 "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
@@ -1211,6 +1261,7 @@ impl PreparedStatement<'_> {
                 Some(&self.conn.collation_registry),
                 &op_cx,
                 self.expression_postprocess.as_ref(),
+                PageSize::new(self.conn.pragma_state.borrow().page_size).unwrap(),
             )?
         };
         if self.distinct {
@@ -1224,7 +1275,7 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        if self.dml_statement.is_some() {
+        if self.dml_dispatch.is_some() {
             return Err(FrankenError::Internal(
                 "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
@@ -1250,6 +1301,7 @@ impl PreparedStatement<'_> {
                 Some(&self.conn.collation_registry),
                 &op_cx,
                 self.expression_postprocess.as_ref(),
+                PageSize::new(self.conn.pragma_state.borrow().page_size).unwrap(),
             )?
         };
         if self.distinct {
@@ -1298,7 +1350,7 @@ impl PreparedStatement<'_> {
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
     pub fn execute(&self) -> Result<usize> {
-        if self.dml_statement.is_some() {
+        if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared(self);
         }
         Ok(self.query()?.len())
@@ -1311,7 +1363,7 @@ impl PreparedStatement<'_> {
     /// constraints, and autocommit.  For SELECT statements, this returns
     /// the number of result rows.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
-        if self.dml_statement.is_some() {
+        if self.dml_dispatch.is_some() {
             return self.conn.execute_prepared_with_params(self, params);
         }
         Ok(self.query_with_params(params)?.len())
@@ -2098,6 +2150,7 @@ impl Connection {
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
         let pager = PagerBackend::open(&path, &bootstrap_cx)?;
+        let pager_page_size = pager.page_size();
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
@@ -2164,7 +2217,7 @@ impl Connection {
             root_cx,
             eprocess_oracle,
             // MVCC garbage collection (bd-3bql / 5E.5)
-            version_store: Arc::new(VersionStore::new(PageSize::DEFAULT)),
+            version_store: Arc::new(VersionStore::new(pager_page_size)),
             gc_scheduler: RefCell::new(GcScheduler::new()),
             gc_todo: RefCell::new(GcTodo::new()),
             gc_clock_millis: RefCell::new(0),
@@ -2191,6 +2244,7 @@ impl Connection {
             time_travel_active: Cell::new(false),
         };
         conn.bootstrap_journal_mode_from_storage()?;
+        conn.bootstrap_pragma_state_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // The pager already opened the database file; we load schema + data from it.
@@ -2745,6 +2799,12 @@ impl Connection {
         Ok(())
     }
 
+    /// Bootstrap connection-local pragma state from storage parameters.
+    fn bootstrap_pragma_state_from_storage(&self) {
+        let mut pragma = self.pragma_state.borrow_mut();
+        pragma.page_size = self.pager.page_size().get();
+    }
+
     /// Register or clear sqlite3_trace_v2-compatible callbacks.
     ///
     /// Passing `Some(callback)` enables callback delivery for the requested
@@ -3129,7 +3189,7 @@ impl Connection {
                 "prepared statement belongs to a different connection",
             ));
         }
-        if let Some(dml) = &stmt.dml_statement {
+        if let Some(dispatch) = stmt.precompiled_dml() {
             let op_cx = self.op_cx()?;
             stmt.ensure_schema_unchanged(&op_cx)?;
             let p = if params.is_empty() {
@@ -3137,10 +3197,23 @@ impl Connection {
             } else {
                 Some(params)
             };
-            let rows =
-                self.execute_statement_impl(dml.as_ref(), p, stmt.dispatch_precompiled_program())?;
+            return match dispatch.kind {
+                PreparedDmlKind::Insert => {
+                    self.execute_precompiled_prepared_insert(stmt, &dispatch.table_name, p)
+                }
+            };
+        }
+        if let Some(dml) = stmt.deferred_dml_statement() {
+            let op_cx = self.op_cx()?;
+            stmt.ensure_schema_unchanged(&op_cx)?;
+            let p = if params.is_empty() {
+                None
+            } else {
+                Some(params)
+            };
+            let rows = self.execute_statement_impl(dml, p, stmt.dispatch_precompiled_program())?;
             let is_dml = matches!(
-                dml.as_ref(),
+                dml,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
             Ok(if is_dml {
@@ -3156,6 +3229,107 @@ impl Connection {
                 stmt.query_with_params(params)?.len()
             })
         }
+    }
+
+    fn execute_precompiled_prepared_insert(
+        &self,
+        stmt: &PreparedStatement<'_>,
+        table_name: &str,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        self.sync_change_tracking_context();
+        let trace_id = next_trace_id();
+        let decision_id = next_decision_id();
+        let trace_registration = self.trace_registration.borrow().clone();
+        let statement_span = tracing::span!(
+            target: "fsqlite.statement",
+            tracing::Level::DEBUG,
+            "statement",
+            trace_id,
+            decision_id,
+            statement_kind = "insert"
+        );
+        record_trace_span_created();
+        let _statement_guard = statement_span.enter();
+        if trace_registration.is_some() {
+            emit_compat_trace_event(
+                trace_registration.as_ref(),
+                TraceEvent::Statement {
+                    sql: stmt.sql.clone(),
+                },
+            );
+        }
+        let execution_started = fsqlite_types::sync_primitives::Instant::now();
+        let was_auto = self.ensure_autocommit_txn()?;
+        self.txn_metrics_note_write();
+        let use_statement_savepoint = !was_auto
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0;
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint("insert", || {
+                self.execute_precompiled_prepared_insert_dispatch(
+                    stmt.program.as_ref(),
+                    table_name,
+                    params,
+                )
+            })
+        } else {
+            self.execute_precompiled_prepared_insert_dispatch(
+                stmt.program.as_ref(),
+                table_name,
+                params,
+            )
+        };
+        let ok = result.is_ok();
+        self.resolve_autocommit_txn(was_auto, ok)?;
+        let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let failure_diag = match result.as_ref() {
+            Ok(_) => Cow::Borrowed("none"),
+            Err(error) => Cow::Owned(error.to_string()),
+        };
+        self.log_statement_reuse_event(
+            "execution",
+            &stmt.sql,
+            true,
+            if ok { "none" } else { "execution_error" },
+            0,
+            elapsed_ns,
+            failure_diag.as_ref(),
+        );
+        emit_compat_trace_event(
+            trace_registration.as_ref(),
+            TraceEvent::Profile {
+                sql: stmt.sql.clone(),
+                elapsed_ns,
+            },
+        );
+        if let Ok((rows, _)) = result.as_ref() {
+            for row in rows {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Row {
+                        values: row.values().to_vec(),
+                    },
+                );
+            }
+        }
+        result.map(|(_, affected)| affected)
+    }
+
+    fn execute_precompiled_prepared_insert_dispatch(
+        &self,
+        program: &VdbeProgram,
+        table_name: &str,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<(Vec<Row>, usize)> {
+        let (rows, affected, _) = self.execute_table_program(program, params)?;
+        if table_name.eq_ignore_ascii_case("sqlite_sequence") {
+            self.refresh_sqlite_sequence_cache()?;
+        } else {
+            self.refresh_autoincrement_sequence_after_insert(table_name)?;
+        }
+        self.record_statement_changes(affected);
+        Ok((rows, affected))
     }
 
     // ── Parse cache helpers (br-legjy.7.3) ─────────────────────────────
@@ -3843,6 +4017,7 @@ impl Connection {
                         Some(&self.collation_registry),
                         &op_cx,
                         Some(&build_expression_postprocess(&rewritten)),
+                        PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
                     )?;
                     if distinct {
                         dedup_rows(&mut rows);
@@ -5125,7 +5300,7 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    dml_statement: None,
+                    dml_dispatch: None,
                     deferred_query_statement: Some(Arc::new(statement.clone())),
                     deferred_query_column_count: Some(
                         self.prepared_statement_column_count(statement),
@@ -5148,7 +5323,7 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    dml_statement: None,
+                    dml_dispatch: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
                     column_names: prepared_column_names,
@@ -5181,7 +5356,7 @@ impl Connection {
                     post_distinct_limit: if distinct { limit_clause } else { None },
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    dml_statement: None,
+                    dml_dispatch: None,
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
                     column_names: prepared_column_names,
@@ -5220,7 +5395,16 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        dml_statement: Some(Arc::new(statement.clone())),
+                        dml_dispatch: Some(
+                            if self.prepared_insert_supports_direct_dispatch(insert) {
+                                PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
+                                    kind: PreparedDmlKind::Insert,
+                                    table_name: insert.table.name.clone(),
+                                })
+                            } else {
+                                PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))
+                            },
+                        ),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names.clone(),
@@ -5245,7 +5429,9 @@ impl Connection {
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
                         schema_generation: self.schema_generation(),
-                        dml_statement: Some(Arc::new(statement.clone())),
+                        dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(
+                            statement.clone(),
+                        ))),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         column_names: prepared_column_names.clone(),
@@ -5271,7 +5457,7 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     schema_generation: self.schema_generation(),
-                    dml_statement: Some(Arc::new(statement.clone())),
+                    dml_dispatch: Some(PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))),
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
                     column_names: prepared_column_names,
@@ -5282,6 +5468,35 @@ impl Connection {
                 "prepare() supports SELECT, INSERT, UPDATE, and DELETE statements only".to_owned(),
             )),
         }
+    }
+
+    fn prepared_insert_supports_direct_dispatch(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> bool {
+        if is_fts5_optimize_noop_insert(insert) {
+            return false;
+        }
+
+        let table_name = insert.table.name.as_str();
+        let insert_event = fsqlite_ast::TriggerEvent::Insert;
+        if self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::Before,
+            &insert_event,
+        ) || self.has_matching_triggers(
+            table_name,
+            fsqlite_ast::TriggerTiming::After,
+            &insert_event,
+        ) {
+            return false;
+        }
+
+        self.schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .is_some_and(|table| table.foreign_keys.is_empty())
     }
 
     fn prepared_select_requires_dispatch(&self, statement: &Statement) -> bool {
@@ -7108,11 +7323,18 @@ impl Connection {
                             drop(_commit_guard);
                             self.abort_current_concurrent_session();
                             self.txn_metrics_note_rollback();
-                            let _ = txn.rollback(&cx);
+                            let rollback_result = txn.rollback(&cx);
+                            let rollback_succeeded = rollback_result.is_ok();
                             *self.concurrent_txn.borrow_mut() = false;
                             *self.concurrent_session_id.borrow_mut() = None;
                             self.txn_metrics_mark_finished();
-                            return Err(e);
+                            if txn_has_pending_writes && rollback_succeeded {
+                                self.reload_memdb_from_pager(&cx)?;
+                            }
+                            return Err(match rollback_result {
+                                Ok(()) => e,
+                                Err(rollback_error) => rollback_error,
+                            });
                         }
                     }
                 } else {
@@ -11372,6 +11594,25 @@ impl Connection {
                 )
             };
 
+            let concurrent_session_id = if concurrent_snap.is_some() {
+                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent savepoint present but no active session".to_owned(),
+                    )
+                })?;
+                {
+                    let registry = lock_unpoisoned(&self.concurrent_registry);
+                    if registry.get(session_id).is_none() {
+                        return Err(FrankenError::Internal(
+                            "concurrent session handle not found".to_owned(),
+                        ));
+                    }
+                }
+                Some(session_id)
+            } else {
+                None
+            };
+
             // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
             // but keep the savepoint (don't pop it).
             if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
@@ -11381,11 +11622,7 @@ impl Connection {
             // MVCC concurrent-writer rollback (bd-14zc / 5E.1):
             // Restore concurrent write set state if in concurrent mode.
             if let Some(concurrent_snap) = concurrent_snap {
-                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
-                    FrankenError::Internal(
-                        "concurrent savepoint present but no active session".to_owned(),
-                    )
-                })?;
+                let session_id = concurrent_session_id.expect("validated above");
                 let mut registry = lock_unpoisoned(&self.concurrent_registry);
                 let handle = registry.get_mut(session_id).ok_or_else(|| {
                     FrankenError::Internal("concurrent session handle not found".to_owned())
@@ -17162,6 +17399,7 @@ impl Connection {
 
         {
             let schema = self.schema.borrow();
+            let original_ddl_sql = self.original_ddl_sql.borrow();
 
             // Helper closure: resolve a TableOrSubquery into a JoinTableSource
             // and optional preloaded rows (for subqueries/table functions).
@@ -17188,6 +17426,10 @@ impl Connection {
                                     alias: alias.clone(),
                                     hidden_rowid_projection: join_hidden_rowid_projection(
                                         &col_names,
+                                        join_table_supports_hidden_rowid(
+                                            &name.name,
+                                            &original_ddl_sql,
+                                        ),
                                     ),
                                     col_names,
                                 },
@@ -18234,6 +18476,7 @@ impl Connection {
             col_defaults_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.version_store)),
+            PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
         );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
@@ -18351,7 +18594,7 @@ impl Connection {
         // Open a read transaction to see the committed state.
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
 
-        let page_size = PageSize::DEFAULT;
+        let page_size = self.pager.page_size();
         let usable_size = u32::try_from(page_size.as_usize())
             .map_err(|_| FrankenError::internal("page size exceeds u32"))?;
 
@@ -24227,12 +24470,10 @@ fn execute_program(
     func_registry: Option<&Arc<FunctionRegistry>>,
     collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
+    page_size: PageSize,
 ) -> Result<Vec<Row>> {
-    let mut engine = VdbeEngine::new_with_execution_cx(
-        program.register_count(),
-        execution_cx,
-        fsqlite_types::PageSize::new(4096).unwrap(),
-    );
+    let mut engine =
+        VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
     if let Some(params) = params {
         validate_bound_parameters(program, params)?;
         engine.set_bindings(params.to_vec());
@@ -24265,6 +24506,7 @@ fn execute_program_with_postprocess(
     collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
     expression_postprocess: Option<&ExpressionPostprocess>,
+    page_size: PageSize,
 ) -> Result<Vec<Row>> {
     let mut rows = execute_program(
         program,
@@ -24272,6 +24514,7 @@ fn execute_program_with_postprocess(
         func_registry,
         collation_registry,
         execution_cx,
+        page_size,
     )?;
     if let Some(postprocess) = expression_postprocess {
         apply_expression_postprocess(&mut rows, postprocess)?;
@@ -24309,6 +24552,7 @@ fn execute_table_program_with_db(
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
+    page_size: PageSize,
 ) -> TableProgramExecOutcome {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
@@ -24318,11 +24562,8 @@ fn execute_table_program_with_db(
     );
     record_trace_span_created();
     let _execution_guard = execution_span.enter();
-    let mut engine = VdbeEngine::new_with_execution_cx(
-        program.register_count(),
-        execution_cx,
-        fsqlite_types::PageSize::new(4096).unwrap(),
-    );
+    let mut engine =
+        VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
             return (Err(e), txn);
@@ -27339,7 +27580,19 @@ impl JoinTableSource {
     }
 }
 
-fn join_hidden_rowid_projection(columns: &[String]) -> Option<String> {
+fn join_table_supports_hidden_rowid(
+    table_name: &str,
+    original_ddl_sql: &HashMap<String, String>,
+) -> bool {
+    original_ddl_sql
+        .get(&table_name.to_ascii_lowercase())
+        .is_none_or(|sql| !is_without_rowid_table_sql(sql))
+}
+
+fn join_hidden_rowid_projection(columns: &[String], supports_hidden_rowid: bool) -> Option<String> {
+    if !supports_hidden_rowid {
+        return None;
+    }
     let shadowed: HashSet<String> = columns
         .iter()
         .map(|column| column.to_ascii_lowercase())
@@ -29229,8 +29482,9 @@ mod tests {
     use super::{
         CommitSeq, Connection, ConnectionEnv, InProcessPageLockTable, IoPollStrategy, PagerBackend,
         Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SimplePager, Snapshot,
-        init_global_runtime, is_sqlite_master_entry_missing, lock_unpoisoned,
-        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
+        init_global_runtime, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        join_table_supports_hidden_rowid, lock_unpoisoned, statement_contains_rewritable_subquery,
+        wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use fsqlite_ast::Statement;
     use fsqlite_btree::BtreeCursorOps;
@@ -29245,7 +29499,7 @@ mod tests {
     use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::ShmRegion;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -35058,6 +35312,25 @@ mod tests {
                 SqliteValue::Integer(1),
                 SqliteValue::Text("x".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_join_hidden_rowid_projection_skips_without_rowid_tables() {
+        let columns = vec!["id".to_owned(), "payload".to_owned()];
+        let mut original_ddl_sql = HashMap::new();
+        original_ddl_sql.insert(
+            "wr".to_owned(),
+            "CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID".to_owned(),
+        );
+
+        assert!(!join_table_supports_hidden_rowid("wr", &original_ddl_sql));
+        assert_eq!(
+            join_hidden_rowid_projection(
+                &columns,
+                join_table_supports_hidden_rowid("wr", &original_ddl_sql),
+            ),
+            None
         );
     }
 
@@ -41779,6 +42052,45 @@ mod autocommit_txn_tests {
     }
 
     #[test]
+    fn test_autocommit_plan_failure_reloads_dirty_memdb_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+
+        assert!(conn.ensure_autocommit_txn().unwrap());
+        let dirty_root = conn.db.borrow_mut().create_table(1);
+        {
+            let mut txn_guard = conn.active_txn.borrow_mut();
+            let txn = txn_guard.as_mut().expect("autocommit txn should be active");
+            let page_no = txn.allocate_page(&cx).unwrap();
+            let page_bytes = vec![0xAB; fsqlite_types::PageSize::DEFAULT.as_usize()];
+            txn.write_page(&cx, page_no, &page_bytes).unwrap();
+        }
+
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("concurrent session should exist");
+        lock_unpoisoned(&conn.concurrent_registry).remove(session_id);
+
+        let error = conn
+            .resolve_autocommit_txn(true, true)
+            .expect_err("missing concurrent session should fail commit planning");
+        assert!(
+            error.to_string().contains("MVCC session invalid")
+                || error
+                    .to_string()
+                    .contains("concurrent transaction missing session"),
+            "unexpected error: {error}"
+        );
+        assert!(conn.active_txn.borrow().is_none());
+        assert!(!conn.is_concurrent_transaction());
+        assert!(
+            conn.db.borrow().get_table(dirty_root).is_none(),
+            "autocommit rollback must reload and discard dirty connection-local tables"
+        );
+    }
+
+    #[test]
     fn test_explicit_txn_bypasses_autocommit() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
@@ -41962,6 +42274,39 @@ mod schema_cookie_tests {
 
         conn.execute("RELEASE ddl_step;").unwrap();
         conn.execute("COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_missing_concurrent_session_preserves_pager_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT s1;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        assert!(
+            conn.active_txn.borrow().as_ref().is_some_and(|txn| {
+                fsqlite_pager::TransactionHandle::has_pending_writes(&**txn)
+            }),
+            "insert after savepoint should leave pending pager writes"
+        );
+        *conn.concurrent_session_id.borrow_mut() = None;
+
+        let error = conn
+            .execute("ROLLBACK TO s1;")
+            .expect_err("missing concurrent session should abort savepoint rollback");
+        assert!(
+            error
+                .to_string()
+                .contains("concurrent savepoint present but no active session"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            conn.active_txn.borrow().as_ref().is_some_and(|txn| {
+                fsqlite_pager::TransactionHandle::has_pending_writes(&**txn)
+            }),
+            "failed savepoint rollback must not rewind the pager write-set"
+        );
     }
 
     #[test]
@@ -50573,6 +50918,13 @@ mod pager_routing_tests {
             .prepare("INSERT INTO prep_dml (id, name) VALUES (?1, ?2)")
             .unwrap();
         assert!(stmt.is_dml());
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
+                kind: PreparedDmlKind::Insert,
+                ..
+            }))
+        ));
 
         conn.execute_prepared_with_params(
             &stmt,
@@ -50609,6 +50961,10 @@ mod pager_routing_tests {
             .prepare("UPDATE prep_upd SET val = ?1 WHERE id = ?2")
             .unwrap();
         assert!(stmt.is_dml());
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
 
         let affected = conn
             .execute_prepared_with_params(
@@ -50642,6 +50998,26 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_prepare_insert_with_foreign_keys_uses_deferred_dispatch() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO child (id, parent_id) VALUES (?1, ?2)")
+            .unwrap();
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Deferred(_))
+        ));
     }
 
     #[test]
@@ -50803,6 +51179,13 @@ mod pager_routing_tests {
             stmt.db.is_some(),
             "simple VALUES INSERT should be pre-compiled with db set"
         );
+        assert!(matches!(
+            stmt.dml_dispatch.as_ref(),
+            Some(PreparedDmlDispatch::Precompiled(PreparedPrecompiledDml {
+                kind: PreparedDmlKind::Insert,
+                ..
+            }))
+        ));
 
         for i in 1..=5 {
             let affected = stmt

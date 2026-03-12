@@ -1342,7 +1342,15 @@ impl<P: PageWriter> BtCursor<P> {
 
         let mut pages = Vec::with_capacity(num_pages);
         for _ in 0..num_pages {
-            pages.push(self.pager.allocate_page(cx)?);
+            match self.pager.allocate_page(cx) {
+                Ok(pgno) => pages.push(pgno),
+                Err(err) => {
+                    for leaked in pages {
+                        let _ = self.pager.free_page(cx, leaked);
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         let mut page_buf = vec![0u8; page_size];

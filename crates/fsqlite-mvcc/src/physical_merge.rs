@@ -370,9 +370,11 @@ fn parse_leaf_index_cell(
 
     let cell_bytes = data[..cell_end].to_vec();
 
-    // For index pages, use the payload as canonical key bytes
+    // For index pages, use the payload + overflow pointer as canonical key bytes
+    // to ensure uniqueness even when common prefixes overflow (§5.10.3).
     let payload_start = n1;
-    let payload_end = (n1 + local_payload as usize).min(data.len());
+    let payload_end =
+        (n1 + local_payload as usize + if has_overflow { 4 } else { 0 }).min(data.len());
     let key_bytes = &data[payload_start..payload_end];
 
     let digest = SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, btree_ref, key_bytes);
@@ -419,9 +421,8 @@ fn parse_interior_index_cell(
 
     let cell_bytes = data[..cell_end].to_vec();
 
-    let payload_start = 4 + n1;
-    let payload_end = (payload_start + local_payload as usize).min(data.len());
-    let key_bytes = &data[payload_start..payload_end];
+    // Use [left_child][payload][overflow] as canonical key bytes for interior index pages.
+    let key_bytes = &data[..cell_end];
 
     let digest = SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, btree_ref, key_bytes);
 

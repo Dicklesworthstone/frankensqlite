@@ -418,6 +418,7 @@ impl TokenKind {
         matches!(
             self,
             Self::KwSelect
+                | Self::KwValues
                 | Self::KwInsert
                 | Self::KwUpdate
                 | Self::KwDelete

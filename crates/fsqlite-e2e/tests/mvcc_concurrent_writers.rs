@@ -233,7 +233,9 @@ fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
             notes: Some("mode=sequential (fsqlite baseline)".to_owned()),
         },
         latency_ms: None,
+        first_failure_diagnostic: error.clone(),
         error,
+        storage_wiring: None,
         hot_path_profile: None,
     }
 }

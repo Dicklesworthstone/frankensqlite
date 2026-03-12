@@ -936,31 +936,43 @@ where
             inner.db_file.lock(cx, LockLevel::Shared)?;
         }
 
+        let mut journal_visibility_invalidation = false;
         let wal_snapshot_initialized = if active_transactions_before_begin == 0 {
-            if inner.rollback_journal_recovery_pending {
-                let journal_path = Self::journal_path(&self.db_path);
+            let journal_path = Self::journal_path(&self.db_path);
+            let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
+                Ok(exists) => exists,
+                Err(err) => {
+                    let _ = inner.db_file.unlock(cx, LockLevel::None);
+                    return Err(err);
+                }
+            };
+            journal_visibility_invalidation = had_recovery_pending || journal_exists;
+            if inner.rollback_journal_recovery_pending || journal_exists {
                 let page_size = inner.page_size;
-                match Self::recover_rollback_journal_if_present(
+                match Self::recover_rollback_journal_if_present_locked(
                     cx,
                     &*self.vfs,
                     &mut inner.db_file,
                     &journal_path,
                     page_size,
+                    LockLevel::Shared,
                 ) {
-                    Ok(false) => {
+                    Ok(false) if inner.rollback_journal_recovery_pending => {
                         inner.db_file.unlock(cx, LockLevel::None)?;
                         return Err(FrankenError::internal(
                             "rollback journal missing while local recovery was pending",
                         ));
                     }
-                    Ok(true) => {}
+                    Ok(_) => {}
                     Err(err) => {
                         let _ = inner.db_file.unlock(cx, LockLevel::None);
                         return Err(err);
                     }
                 }
-                // Failed rollback-journal commits can leave uncommitted bytes in
-                // the cache even after the on-disk pre-images are restored.
+                // Any leftover rollback journal means the durable image may
+                // have changed behind this pager, even when the journal had
+                // already been invalidated to zero bytes. Drop cached state and
+                // rebuild from disk before serving reads.
                 inner.cache.clear();
                 inner.rollback_journal_recovery_pending = false;
             }
@@ -977,7 +989,7 @@ where
 
         if active_transactions_before_begin == 0 {
             let clear_published_pages =
-                had_recovery_pending || inner.commit_seq != commit_seq_before_refresh;
+                journal_visibility_invalidation || inner.commit_seq != commit_seq_before_refresh;
             self.published.publish(
                 cx,
                 PublishedPagerUpdate {
@@ -1297,24 +1309,33 @@ where
 
         let had_recovery_pending = inner.rollback_journal_recovery_pending;
         let commit_seq_before_refresh = inner.commit_seq;
+        let journal_path = Self::journal_path(&self.db_path);
 
-        if inner.rollback_journal_recovery_pending {
-            let journal_path = Self::journal_path(&self.db_path);
+        let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
+            Ok(exists) => exists,
+            Err(err) => {
+                let _ = inner.db_file.unlock(cx, LockLevel::None);
+                return Err(err);
+            }
+        };
+
+        if inner.rollback_journal_recovery_pending || journal_exists {
             let page_size = inner.page_size;
-            match Self::recover_rollback_journal_if_present(
+            match Self::recover_rollback_journal_if_present_locked(
                 cx,
                 &*self.vfs,
                 &mut inner.db_file,
                 &journal_path,
                 page_size,
+                LockLevel::Shared,
             ) {
-                Ok(false) => {
+                Ok(false) if inner.rollback_journal_recovery_pending => {
                     inner.db_file.unlock(cx, LockLevel::None)?;
                     return Err(FrankenError::internal(
                         "rollback journal missing while local recovery was pending",
                     ));
                 }
-                Ok(true) => {
+                Ok(_) => {
                     inner.cache.clear();
                     inner.rollback_journal_recovery_pending = false;
                 }
@@ -1331,7 +1352,7 @@ where
         }
 
         let clear_published_pages =
-            had_recovery_pending || inner.commit_seq != commit_seq_before_refresh;
+            had_recovery_pending || journal_exists || inner.commit_seq != commit_seq_before_refresh;
         self.published.publish(
             cx,
             PublishedPagerUpdate {
@@ -1356,6 +1377,16 @@ where
     #[must_use]
     pub fn published_read_retry_count(&self) -> u64 {
         self.published.read_retry_count()
+    }
+
+    /// Returns the database page size.
+    #[must_use]
+    pub fn page_size(&self) -> PageSize {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.page_size
     }
 
     /// Number of page reads satisfied directly from the publication plane.
@@ -1398,28 +1429,87 @@ where
         Ok(true)
     }
 
+    fn recover_rollback_journal_if_present_locked(
+        cx: &Cx,
+        vfs: &V,
+        db_file: &mut V::File,
+        journal_path: &Path,
+        page_size: PageSize,
+        restore_lock_level: LockLevel,
+    ) -> Result<bool> {
+        if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
+            return Ok(false);
+        }
+
+        db_file.lock(cx, LockLevel::Exclusive)?;
+        let recovery_result =
+            Self::recover_rollback_journal_if_present(cx, vfs, db_file, journal_path, page_size);
+        let restore_result = db_file.unlock(cx, restore_lock_level);
+        match (recovery_result, restore_result) {
+            (Ok(recovered), Ok(())) => Ok(recovered),
+            (Err(recovery_err), Ok(())) => Err(recovery_err),
+            (Ok(_), Err(restore_err)) => Err(restore_err),
+            (Err(recovery_err), Err(restore_err)) => Err(FrankenError::internal(format!(
+                "hot journal recovery failed and could not restore lock level {restore_lock_level:?}: recovery={recovery_err}; restore={restore_err}"
+            ))),
+        }
+    }
+
     /// Open (or create) a database and return a pager using a caller-owned
     /// capability context.
+    ///
+    /// Existing databases adopt the page size encoded in their on-disk header;
+    /// `requested_page_size` is used when creating a new database or when the
+    /// header is unavailable/corrupt and recovery must fall back to a caller
+    /// default.
     ///
     /// If a hot journal is detected (leftover from a crash), it is replayed
     /// to restore the database to a consistent state before returning.
     #[allow(clippy::too_many_lines)]
-    pub fn open_with_cx(cx: &Cx, vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
+    pub fn open_with_cx(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+    ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
 
+        // Probe for existing page size BEFORE hot journal recovery.
+        // Recovery requires the correct page size to correctly parse records.
+        let mut file_size = db_file.file_size(cx)?;
+        let page_size = if file_size >= DATABASE_HEADER_SIZE as u64 {
+            let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
+            let header_read = db_file.read(cx, &mut header_bytes, 0)?;
+            if header_read >= DATABASE_HEADER_SIZE {
+                if let Ok(header) = DatabaseHeader::from_bytes(&header_bytes) {
+                    header.page_size
+                } else {
+                    requested_page_size
+                }
+            } else {
+                requested_page_size
+            }
+        } else {
+            requested_page_size
+        };
+
         let journal_path = Self::journal_path(path);
-        // Hot journal recovery: if a journal file exists, replay it.
-        let _ = Self::recover_rollback_journal_if_present(
+        // Hot journal recovery writes the database image back to its durable
+        // pre-commit state, so acquire EXCLUSIVE before replay even during
+        // initial open.
+        let _ = Self::recover_rollback_journal_if_present_locked(
             cx,
             &*vfs,
             &mut db_file,
             &journal_path,
             page_size,
+            LockLevel::None,
         )?;
 
-        let mut file_size = db_file.file_size(cx)?;
+        // Refresh file size after potential recovery.
+        file_size = db_file.file_size(cx)?;
         let header = if file_size == 0 {
             // SQLite databases are never truly empty: page 1 contains the
             // 100-byte database header followed by the sqlite_master root page.
@@ -3603,18 +3693,16 @@ mod tests {
     }
 
     #[test]
-    fn test_open_existing_database_rejects_page_size_mismatch() {
+    fn test_open_existing_database_uses_header_page_size() {
         let vfs = MemoryVfs::new();
-        let path = PathBuf::from("/page_size_mismatch.db");
+        let path = PathBuf::from("/page_size_autodetect.db");
 
-        let _pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
-        let wrong_page_size = PageSize::new(8192).unwrap();
-        let Err(err) = SimplePager::open(vfs, &path, wrong_page_size) else {
-            panic!("expected page size mismatch error");
-        };
+        let expected_page_size = PageSize::new(8192).unwrap();
+        let _pager = SimplePager::open(vfs.clone(), &path, expected_page_size).unwrap();
+        let reopened = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         assert!(
-            matches!(err, FrankenError::DatabaseCorrupt { .. }),
-            "bead_id={BEAD_ID} case=reject_page_size_mismatch"
+            reopened.page_size() == expected_page_size,
+            "bead_id={BEAD_ID} case=autodetect_existing_page_size"
         );
     }
 
@@ -4451,6 +4539,161 @@ mod tests {
         assert!(
             !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
             "bead_id={BEAD_ID} case=journal_deleted_after_recovery"
+        );
+    }
+
+    #[test]
+    fn test_long_lived_pager_recovers_external_hot_journal_on_begin() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/long_lived_hot_journal.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let page_two = PageNumber::new(2).unwrap();
+
+        // Keep one pager instance alive while another actor mutates the file.
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+        {
+            let seed = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let mut txn = seed.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            assert_eq!(page_two.get(), 2);
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let warm_reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            warm_reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x11; ps],
+            "bead_id={BEAD_ID} case=existing_pager_populates_publication_before_hot_journal"
+        );
+        drop(warm_reader);
+        assert!(
+            pager.published_snapshot().page_set_size > 0,
+            "bead_id={BEAD_ID} case=existing_pager_has_published_pages_before_hot_journal"
+        );
+
+        {
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+
+            let header = JournalHeader {
+                page_count: 1,
+                nonce: 0x4652_414E,
+                initial_db_size: 2,
+                sector_size: 512,
+                page_size: PageSize::DEFAULT.get(),
+            };
+            let hdr_bytes = header.encode_padded();
+            let jrnl_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut jrnl_file, _) = vfs.open(&cx, Some(&journal_path), jrnl_flags).unwrap();
+            jrnl_file.write(&cx, &hdr_bytes, 0).unwrap();
+            let record = JournalPageRecord::new(2, vec![0x11; ps], header.nonce);
+            jrnl_file
+                .write(&cx, &record.encode(), hdr_bytes.len() as u64)
+                .unwrap();
+            jrnl_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+
+            let page_offset = PageSize::DEFAULT.as_usize() as u64;
+            db_file.write(&cx, &vec![0x99; ps], page_offset).unwrap();
+            db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        }
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            pager.published_snapshot().page_set_size,
+            0,
+            "bead_id={BEAD_ID} case=existing_pager_clears_published_pages_after_hot_journal"
+        );
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x11; ps],
+            "bead_id={BEAD_ID} case=existing_pager_recovers_hot_journal"
+        );
+        assert!(
+            !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=existing_pager_removes_hot_journal"
+        );
+    }
+
+    #[test]
+    fn test_refresh_published_snapshot_recovers_external_hot_journal() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/published_refresh_hot_journal.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            assert_eq!(page_two.get(), 2);
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let page_two = PageNumber::new(2).unwrap();
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(reader.get_page(&cx, page_two).unwrap().as_ref()[0], 0x11);
+        drop(reader);
+        assert!(
+            pager.published_snapshot().page_set_size > 0,
+            "bead_id={BEAD_ID} case=publication_plane_populated_before_hot_journal_refresh"
+        );
+
+        {
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+
+            let header = JournalHeader {
+                page_count: 1,
+                nonce: 0x5245_4652,
+                initial_db_size: 2,
+                sector_size: 512,
+                page_size: PageSize::DEFAULT.get(),
+            };
+            let hdr_bytes = header.encode_padded();
+            let jrnl_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut jrnl_file, _) = vfs.open(&cx, Some(&journal_path), jrnl_flags).unwrap();
+            jrnl_file.write(&cx, &hdr_bytes, 0).unwrap();
+            let record = JournalPageRecord::new(2, vec![0x11; ps], header.nonce);
+            jrnl_file
+                .write(&cx, &record.encode(), hdr_bytes.len() as u64)
+                .unwrap();
+            jrnl_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+
+            let page_offset = PageSize::DEFAULT.as_usize() as u64;
+            db_file.write(&cx, &vec![0x99; ps], page_offset).unwrap();
+            db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        }
+
+        let refreshed = pager.refresh_published_snapshot(&cx).unwrap();
+        assert_eq!(
+            refreshed.page_set_size, 0,
+            "bead_id={BEAD_ID} case=published_refresh_clears_published_pages_after_hot_journal"
+        );
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let mut restored = vec![0u8; ps];
+        let bytes_read = db_file
+            .read(&cx, &mut restored, PageSize::DEFAULT.as_usize() as u64)
+            .unwrap();
+        assert_eq!(bytes_read, ps);
+        assert_eq!(
+            restored,
+            vec![0x11; ps],
+            "bead_id={BEAD_ID} case=published_refresh_recovers_hot_journal_bytes"
+        );
+        assert!(
+            !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=published_refresh_removes_hot_journal"
         );
     }
 

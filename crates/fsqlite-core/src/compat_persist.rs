@@ -222,7 +222,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
     let mut txn = pager.begin(cx, TransactionMode::ReadOnly)?;
 
-    let ps = DEFAULT_PAGE_SIZE.as_usize();
+    let ps = pager.page_size().as_usize();
     let usable_size =
         u32::try_from(ps).map_err(|_| FrankenError::internal("page size exceeds u32"))?;
 
@@ -626,7 +626,11 @@ fn is_virtual_table_sql(sql: &str) -> bool {
 
 fn parse_virtual_table_columns_from_sql(sql: &str) -> Option<Vec<ColumnInfo>> {
     let mut parser = Parser::from_sql(sql);
-    match parser.parse_statement().ok()? {
+    let (statements, errors) = parser.parse_all();
+    if !errors.is_empty() || statements.len() != 1 {
+        return None;
+    }
+    match statements.into_iter().next()? {
         Statement::CreateVirtualTable(create) => {
             Some(parse_virtual_table_column_infos(&create.args))
         }
@@ -1209,6 +1213,15 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (42, "hello".to_owned()));
         assert_eq!(rows[1], (99, "world".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_virtual_table_columns_from_sql_rejects_trailing_junk() {
+        assert!(
+            parse_virtual_table_columns_from_sql("CREATE VIRTUAL TABLE docs USING fts5(a) garbage")
+                .is_none(),
+            "trailing tokens must invalidate virtual-table SQL during compat import"
+        );
     }
 
     #[test]

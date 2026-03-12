@@ -472,6 +472,13 @@ pub struct CaseReport {
     pub comparison: Option<ComparisonReport>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageWiringReport {
+    pub backend_kind: String,
+    pub backend_mode: String,
+    pub backend_identity: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRunReport {
     pub wall_time_ms: u64,
@@ -482,6 +489,10 @@ pub struct EngineRunReport {
     pub correctness: CorrectnessReport,
     pub latency_ms: Option<LatencySummary>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failure_diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_wiring: Option<StorageWiringReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hot_path_profile: Option<FsqliteHotPathProfile>,
 }
@@ -693,6 +704,12 @@ mod tests {
             correctness: cr(Some(true), None, None, None),
             latency_ms: None,
             error: None,
+            first_failure_diagnostic: None,
+            storage_wiring: Some(StorageWiringReport {
+                backend_kind: "unix".to_owned(),
+                backend_mode: "parity_cert_strict".to_owned(),
+                backend_identity: "unix:parity_cert_strict".to_owned(),
+            }),
             hot_path_profile: None,
         };
 
@@ -729,6 +746,14 @@ mod tests {
         assert_eq!(parsed.concurrency, 4);
         assert_eq!(parsed.ops_count, 10);
         assert_eq!(parsed.report.wall_time_ms, 123);
+        assert_eq!(
+            parsed
+                .report
+                .storage_wiring
+                .as_ref()
+                .map(|wiring| wiring.backend_identity.as_str()),
+            Some("unix:parity_cert_strict")
+        );
     }
 
     #[test]
@@ -742,6 +767,8 @@ mod tests {
             correctness: cr(None, None, None, None),
             latency_ms: None,
             error: None,
+            first_failure_diagnostic: None,
+            storage_wiring: None,
             hot_path_profile: None,
         };
 
@@ -787,6 +814,8 @@ mod tests {
             correctness: cr(Some(true), None, None, None),
             latency_ms: None,
             error: None,
+            first_failure_diagnostic: None,
+            storage_wiring: None,
             hot_path_profile: None,
         };
         let profile = FsqliteHotPathProfile {

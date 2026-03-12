@@ -994,24 +994,19 @@ impl ArcCacheInner {
         // Phase 2: insert the page.
         match lookup {
             CacheLookup::GhostHitB1 | CacheLookup::GhostHitB2 => {
-                // Ghost hit in B1 or B2 → move to B1.
-                let ghost_idx = self.b1.push_back(key);
-                self.directory.insert(key, Location::B1(ghost_idx));
-                self.b1_len()
-            }
-            CacheLookup::Hit => {
-                // Hit in T1 or T2 → admit to T1.
-                let t1_idx = self.t1.push_back(page.clone());
-                self.directory.insert(key, Location::T1(t1_idx));
-                self.t1_len()
+                // Ghost hit in B1 or B2 → admit to T2 (frequent).
+                let t2_idx = self.t2.push_back(page.clone());
+                self.directory.insert(key, Location::T2(t2_idx));
             }
             CacheLookup::Miss => {
-                // Miss → admit to T1.
+                // Miss → admit to T1 (recency).
                 let t1_idx = self.t1.push_back(page.clone());
                 self.directory.insert(key, Location::T1(t1_idx));
-                self.t1_len()
             }
-        };
+            CacheLookup::Hit => {
+                unreachable!("admit called after a cache hit");
+            }
+        }
 
         self.total_bytes += byte_size;
         self.page_versions
