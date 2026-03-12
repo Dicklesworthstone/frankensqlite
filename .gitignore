@@ -214,3 +214,14 @@ gemini.mcp.json
 .beads/*.bak-corrupt
 tmp_golden/
 tmp_rch_probe/
+
+# Beads recovery/backup snapshots
+.beads/.br_recovery/
+.beads/*.backup.*
+
+# Remote compilation helper local cache
+.rch/
+
+# Session extension binary test artifacts
+__CHANGESET__
+__PATCHSET__
