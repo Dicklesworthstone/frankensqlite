@@ -215,9 +215,15 @@ gemini.mcp.json
 tmp_golden/
 tmp_rch_probe/
 
-# Beads recovery/backup snapshots
+# Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
 .beads/.br_recovery/
 .beads/*.backup.*
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.rebuild_*
+.beads/*.reindex_test_*
+.beads/*.vacuum_test_*
+.beads/recovery*/
 
 # Remote compilation helper local cache
 .rch/
