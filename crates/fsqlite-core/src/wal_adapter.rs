@@ -118,6 +118,12 @@ impl WalPublishedSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingPublicationFrame {
+    page_number: u32,
+    frame_index: usize,
+}
+
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
     /// Guard so commit-time append refresh runs only once per commit batch.
@@ -128,6 +134,8 @@ pub struct WalBackendAdapter<F: VfsFile> {
     next_publication_seq: u64,
     /// Transaction-bounded read snapshot pinned at `begin_transaction()`.
     read_snapshot: Option<WalPublishedSnapshot>,
+    /// Frames appended after the last published commit horizon.
+    pending_publication_frames: Vec<PendingPublicationFrame>,
     /// Optional FEC commit hook for encoding repair symbols on commit.
     #[cfg(not(target_arch = "wasm32"))]
     fec_hook: Option<FecCommitHook>,
@@ -151,6 +159,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
+            pending_publication_frames: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             fec_hook: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -170,6 +179,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
+            pending_publication_frames: Vec::new(),
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
@@ -199,6 +209,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Discard published and pinned snapshots after external WAL mutation.
     fn invalidate_publication(&mut self) {
         self.read_snapshot = None;
+        self.pending_publication_frames.clear();
         self.published_snapshot = WalPublishedSnapshot::empty(
             self.published_snapshot.publication_seq,
             self.published_snapshot.generation,
@@ -434,6 +445,122 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let last_commit_frame = self.wal.last_commit_frame(cx)?;
         self.publish_visible_snapshot(cx, last_commit_frame, scenario_id)
     }
+
+    fn synchronize_publication_before_append(
+        &mut self,
+        cx: &Cx,
+        scenario_id: &'static str,
+    ) -> Result<()> {
+        self.wal.refresh(cx)?;
+        self.pending_publication_frames.clear();
+        self.publish_latest_committed_snapshot(cx, scenario_id)
+    }
+
+    fn record_appended_frames<I>(&mut self, start_frame_index: usize, frames: I) -> Option<usize>
+    where
+        I: IntoIterator<Item = (u32, u32)>,
+    {
+        let mut last_commit_frame = None;
+        for (offset, (page_number, db_size_if_commit)) in frames.into_iter().enumerate() {
+            let frame_index = start_frame_index.saturating_add(offset);
+            self.pending_publication_frames
+                .push(PendingPublicationFrame {
+                    page_number,
+                    frame_index,
+                });
+            if db_size_if_commit != 0 {
+                last_commit_frame = Some(frame_index);
+            }
+        }
+        last_commit_frame
+    }
+
+    fn publish_pending_commit_snapshot(
+        &mut self,
+        cx: &Cx,
+        last_commit_frame: usize,
+        scenario_id: &'static str,
+    ) -> Result<()> {
+        let generation = self.wal.generation_identity();
+        let previous = self.published_snapshot.clone();
+        let can_extend_previous = previous.generation == generation
+            && previous
+                .last_commit_frame
+                .is_none_or(|previous_last_commit| previous_last_commit < last_commit_frame);
+        let mut page_index = if can_extend_previous {
+            previous.page_index.as_ref().clone()
+        } else {
+            HashMap::new()
+        };
+        let mut index_is_partial = if can_extend_previous {
+            previous.index_is_partial
+        } else {
+            false
+        };
+        let previous_last_commit = if can_extend_previous {
+            previous.last_commit_frame
+        } else {
+            None
+        };
+
+        let mut frame_delta_count = 0_usize;
+        for frame in &self.pending_publication_frames {
+            if previous_last_commit
+                .is_some_and(|previous_last_commit| frame.frame_index <= previous_last_commit)
+                || frame.frame_index > last_commit_frame
+            {
+                continue;
+            }
+
+            frame_delta_count = frame_delta_count.saturating_add(1);
+            if page_index.len() < self.page_index_cap || page_index.contains_key(&frame.page_number)
+            {
+                page_index.insert(frame.page_number, frame.frame_index);
+            } else {
+                index_is_partial = true;
+            }
+        }
+
+        if frame_delta_count == 0 {
+            self.pending_publication_frames.clear();
+            return self.publish_visible_snapshot(cx, Some(last_commit_frame), scenario_id);
+        }
+
+        let publication_seq = self.next_publication_seq;
+        self.next_publication_seq = self.next_publication_seq.saturating_add(1);
+        let latest_frame_entries = page_index.len();
+        self.published_snapshot = WalPublishedSnapshot {
+            publication_seq,
+            generation,
+            last_commit_frame: Some(last_commit_frame),
+            page_index: Arc::new(page_index),
+            index_is_partial,
+        };
+        self.pending_publication_frames.clear();
+
+        tracing::trace!(
+            target: "fsqlite.wal_publication",
+            trace_id = cx.trace_id(),
+            run_id = "wal-publication",
+            scenario_id,
+            wal_generation = generation.checkpoint_seq,
+            wal_salt1 = generation.salts.salt1,
+            wal_salt2 = generation.salts.salt2,
+            publication_seq,
+            frame_delta_count,
+            latest_frame_entries,
+            snapshot_age = 0_u64,
+            lookup_mode = "published_visibility_map",
+            fallback_reason = if index_is_partial {
+                "partial_index_cap"
+            } else {
+                "none"
+            },
+            "published WAL visibility snapshot from commit path"
+        );
+
+        Ok(())
+    }
 }
 
 /// Convert pager checkpoint mode to WAL checkpoint mode.
@@ -465,13 +592,17 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         db_size_if_commit: u32,
     ) -> Result<()> {
         if self.refresh_before_append {
-            // Keep this handle synchronized with external WAL growth/reset
-            // before choosing append offset and checksum seed.
-            self.wal.refresh(cx)?;
+            // Refresh and synchronize the published base snapshot once before
+            // the commit batch starts, then publish local frame deltas directly
+            // from the append path.
+            self.synchronize_publication_before_append(cx, "append_frame_pre_refresh")?;
         }
+        let start_frame_index = self.wal.frame_count();
         self.wal
             .append_frame(cx, page_number, page_data, db_size_if_commit)?;
         self.refresh_before_append = false;
+        let last_commit_frame =
+            self.record_appended_frames(start_frame_index, [(page_number, db_size_if_commit)]);
 
         // Feed the frame to the FEC hook.  On commit, it encodes repair
         // symbols and stores them for later sidecar persistence.
@@ -495,8 +626,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
         }
 
-        if db_size_if_commit != 0 {
-            self.publish_latest_committed_snapshot(cx, "append_frame_commit")?;
+        if let Some(last_commit_frame) = last_commit_frame {
+            self.publish_pending_commit_snapshot(cx, last_commit_frame, "append_frame_commit")?;
         }
 
         Ok(())
@@ -508,11 +639,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         }
 
         if self.refresh_before_append {
-            // Keep this handle synchronized with external WAL growth/reset
-            // before choosing append offset and checksum seed.
-            self.wal.refresh(cx)?;
+            self.synchronize_publication_before_append(cx, "append_frames_pre_refresh")?;
         }
 
+        let start_frame_index = self.wal.frame_count();
         let mut wal_frames = Vec::with_capacity(frames.len());
         for frame in frames {
             wal_frames.push(WalAppendFrameRef {
@@ -523,6 +653,12 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         }
         self.wal.append_frames(cx, &wal_frames)?;
         self.refresh_before_append = false;
+        let last_commit_frame = self.record_appended_frames(
+            start_frame_index,
+            frames
+                .iter()
+                .map(|frame| (frame.page_number, frame.db_size_if_commit)),
+        );
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(hook) = &mut self.fec_hook {
@@ -553,8 +689,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
         }
 
-        if frames.iter().any(|frame| frame.db_size_if_commit != 0) {
-            self.publish_latest_committed_snapshot(cx, "append_frames_commit")?;
+        if let Some(last_commit_frame) = last_commit_frame {
+            self.publish_pending_commit_snapshot(cx, last_commit_frame, "append_frames_commit")?;
         }
 
         Ok(())
@@ -624,11 +760,10 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         }
 
         if self.refresh_before_append {
-            // Keep this handle synchronized with external WAL growth/reset
-            // before choosing append offset and checksum seed.
-            self.wal.refresh(cx)?;
+            self.synchronize_publication_before_append(cx, "append_prepared_pre_refresh")?;
         }
 
+        let start_frame_index = self.wal.frame_count();
         let checksum_transforms = prepared
             .checksum_transforms
             .iter()
@@ -647,6 +782,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             &checksum_transforms,
         )?;
         self.refresh_before_append = false;
+        let last_commit_frame = self.record_appended_frames(
+            start_frame_index,
+            prepared
+                .frame_metas
+                .iter()
+                .map(|frame| (frame.page_number, frame.db_size_if_commit)),
+        );
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(hook) = &mut self.fec_hook {
@@ -677,12 +819,12 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
         }
 
-        if prepared
-            .frame_metas
-            .iter()
-            .any(|frame| frame.db_size_if_commit != 0)
-        {
-            self.publish_latest_committed_snapshot(cx, "append_prepared_frames_commit")?;
+        if let Some(last_commit_frame) = last_commit_frame {
+            self.publish_pending_commit_snapshot(
+                cx,
+                last_commit_frame,
+                "append_prepared_frames_commit",
+            )?;
         }
 
         Ok(())
@@ -1605,6 +1747,62 @@ mod tests {
             Some(&1),
             "prepared commit append must map each page to its latest committed frame"
         );
+    }
+
+    #[test]
+    fn test_commit_publication_refreshes_external_prefix_before_local_commit() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+
+        let file_writer = open_wal_file(&vfs, &cx);
+        let wal_writer =
+            WalFile::create(&cx, file_writer, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut writer = WalBackendAdapter::new(wal_writer);
+
+        let file_follower = open_wal_file(&vfs, &cx);
+        let wal_follower = WalFile::open(&cx, file_follower).expect("open WAL");
+        let mut follower = WalBackendAdapter::new(wal_follower);
+
+        let p1 = sample_page(0x61);
+        writer
+            .append_frame(&cx, 1, &p1, 1)
+            .expect("writer commit 1");
+        writer.sync(&cx).expect("sync writer commit 1");
+
+        let p2 = sample_page(0x62);
+        writer
+            .append_frame(&cx, 2, &p2, 2)
+            .expect("writer commit 2");
+        writer.sync(&cx).expect("sync writer commit 2");
+
+        let p3 = sample_page(0x63);
+        follower
+            .append_frame(&cx, 3, &p3, 3)
+            .expect("follower local commit");
+
+        assert_eq!(
+            follower.published_snapshot.last_commit_frame,
+            Some(2),
+            "local commit should publish on top of refreshed external WAL state"
+        );
+        assert_eq!(
+            follower.published_snapshot.page_index.get(&1),
+            Some(&0),
+            "refresh-before-append should preserve earlier committed pages"
+        );
+        assert_eq!(
+            follower.published_snapshot.page_index.get(&2),
+            Some(&1),
+            "refresh-before-append should publish externally committed pages"
+        );
+        assert_eq!(
+            follower.published_snapshot.page_index.get(&3),
+            Some(&2),
+            "local commit should extend the published WAL visibility map"
+        );
+        assert_eq!(follower.read_page(&cx, 1).expect("read p1"), Some(p1));
+        assert_eq!(follower.read_page(&cx, 2).expect("read p2"), Some(p2));
+        assert_eq!(follower.read_page(&cx, 3).expect("read p3"), Some(p3));
     }
 
     // -- Partial index fallback tests --

@@ -361,7 +361,16 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
         SqliteValue::Text(text) => {
             Ok(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()))
         }
-        SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
+        SqliteValue::Blob(b) => {
+            use std::fmt::Write;
+            let mut hex = String::with_capacity(b.len() * 2 + 2);
+            hex.push('"');
+            for byte in b {
+                let _ = write!(&mut hex, "{byte:02X}");
+            }
+            hex.push('"');
+            Ok(hex)
+        }
     }
 }
 
@@ -1439,24 +1448,14 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
 fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
     match value {
         SqliteValue::Null => Ok(Value::Null),
-        SqliteValue::Integer(i) => {
-            if let Ok(f) = f64::try_from(*i) {
-                Number::from_f64(f).ok_or_else(|| {
-                    FrankenError::function_error(
-                        "failed to convert integer value to JSON floating-point",
-                    )
-                })
-            } else {
-                Number::from(*i)
-            }
-        }
+        SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
         SqliteValue::Float(f) => {
             if !f.is_finite() {
                 return Err(FrankenError::function_error(
                     "non-finite float is not representable in JSON",
                 ));
             }
-            Number::from_f64(*f).ok_or_else(|| {
+            Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
                 FrankenError::function_error("failed to convert floating-point value to JSON")
             })
         }

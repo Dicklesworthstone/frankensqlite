@@ -104,12 +104,18 @@ fn tokenize_query(query: &str) -> Result<Vec<QueryToken>, QueryValidationError> 
             let mut phrase = String::new();
             let mut closed = false;
 
-            for phrase_ch in chars.by_ref() {
+            while let Some(phrase_ch) = chars.next() {
                 if phrase_ch == '"' {
-                    closed = true;
-                    break;
+                    if chars.peek() == Some(&'"') {
+                        let _ = chars.next();
+                        phrase.push('"');
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    phrase.push(phrase_ch);
                 }
-                phrase.push(phrase_ch);
             }
 
             if !closed {

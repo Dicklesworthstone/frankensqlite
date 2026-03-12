@@ -184,8 +184,12 @@ impl AggregateFunction for GroupConcatFunc {
         if args[0].is_null() {
             return Ok(());
         }
-        let sep = if args.len() > 1 && !args[1].is_null() {
-            args[1].to_text()
+        let sep = if args.len() > 1 {
+            if args[1].is_null() {
+                String::new()
+            } else {
+                args[1].to_text()
+            }
         } else {
             ",".to_owned()
         };

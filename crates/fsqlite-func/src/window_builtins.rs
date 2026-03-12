@@ -1085,8 +1085,12 @@ fn window_group_concat_step(state: &mut WindowGroupConcatState, args: &[SqliteVa
     if args.is_empty() || args[0].is_null() {
         return;
     }
-    let sep = if args.len() > 1 && !args[1].is_null() {
-        args[1].to_text()
+    let sep = if args.len() > 1 {
+        if args[1].is_null() {
+            String::new()
+        } else {
+            args[1].to_text()
+        }
     } else {
         ",".to_owned()
     };

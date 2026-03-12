@@ -625,12 +625,19 @@ fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, 
             let mut phrase = String::new();
             let mut closed = false;
 
-            for phrase_ch in chars.by_ref() {
+            while let Some(phrase_ch) = chars.next() {
                 if phrase_ch == '"' {
-                    closed = true;
-                    break;
+                    if chars.peek() == Some(&'"') {
+                        // Escaped double-quote.
+                        let _ = chars.next();
+                        phrase.push('"');
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    phrase.push(phrase_ch);
                 }
-                phrase.push(phrase_ch);
             }
 
             if !closed {
@@ -705,6 +712,7 @@ fn push_query_word_tokens(word: &str, tokens: &mut Vec<Fts5QueryToken>) {
 
     let upper = word.to_ascii_uppercase();
     let kind = match upper.as_str() {
+        "AND" => Fts5QueryTokenKind::And,
         "OR" => Fts5QueryTokenKind::Or,
         "NOT" => Fts5QueryTokenKind::Not,
         "NEAR" => Fts5QueryTokenKind::Near,
@@ -1360,11 +1368,11 @@ fn evaluate_phrase(
         }
         'positions: for &start_pos in &first_p.positions {
             for (offset, word) in words.iter().enumerate().skip(1) {
-                let target_pos = start_pos + u32::try_from(offset).unwrap_or(u32::MAX);
-                let found = index.get_postings(word).iter().any(|p| {
+                #[allow(clippy::cast_possible_truncation)]
+                let target_pos = start_pos + offset as u32; // implied start_pos = 0
+                let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
                     p.docid == first_p.docid
                         && p.column == first_p.column
-                        && posting_matches_allowed_columns(p.column, allowed_columns)
                         && p.positions.contains(&target_pos)
                 });
                 if !found {
@@ -1582,6 +1590,34 @@ impl Fts5Table {
         Ok(results)
     }
 
+    pub fn search_rows(
+        &self,
+        query: &str,
+    ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
+        self.search(query).map(|results| {
+            results
+                .into_iter()
+                .map(|(rowid, score)| {
+                    let columns = self
+                        .get_document(rowid)
+                        .map_or_else(Vec::new, ToOwned::to_owned);
+                    (rowid, score, columns)
+                })
+                .collect()
+        })
+    }
+
+    #[must_use]
+    pub fn all_rows(&self) -> Vec<(i64, Vec<String>)> {
+        let mut rows: Vec<(i64, Vec<String>)> = self
+            .documents
+            .iter()
+            .map(|(rowid, columns)| (*rowid, columns.clone()))
+            .collect();
+        rows.sort_by_key(|(rowid, _)| *rowid);
+        rows
+    }
+
     /// Get document content for a rowid.
     #[must_use]
     pub fn get_document(&self, rowid: i64) -> Option<&[String]> {
@@ -1793,7 +1829,7 @@ impl VirtualTable for Fts5Table {
         let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
 
         self.insert_document(new_rowid, &col_values);
-        Ok(Some(new_rowid))
+        Ok(None)
     }
 }
 
@@ -2556,8 +2592,8 @@ mod tests {
         let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
 
         table.insert_document(1, &["hello world".to_owned()]);
-        table.insert_document(2, &["goodbye rust".to_owned()]);
-        table.insert_document(3, &["test data".to_owned()]);
+        table.insert_document(2, &["rust lang".to_owned()]);
+        table.insert_document(3, &["goodbye world".to_owned()]);
 
         let results = table.search("hello OR rust").unwrap();
         assert_eq!(results.len(), 2);

@@ -385,14 +385,24 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
         let _ = Box::into_raw(handle);
         return SQLITE_BUSY;
     }
-    match handle.conn.close_in_place() {
-        Ok(()) => SQLITE_OK,
-        Err(e) => {
+
+    let close_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle.conn.close_in_place()
+    }));
+
+    match close_result {
+        Ok(Ok(())) => SQLITE_OK,
+        Ok(Err(e)) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_close failed");
             handle.set_error(&e);
             let code = error_to_code(&e);
             let _ = Box::into_raw(handle);
             code
+        }
+        Err(_) => {
+            tracing::error!(target: "fsqlite.compat", "sqlite3_close panicked");
+            let _ = Box::into_raw(handle); // leak it to prevent further panics
+            SQLITE_ERROR
         }
     }
 }

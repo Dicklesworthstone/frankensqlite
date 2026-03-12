@@ -41,8 +41,8 @@ use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
 use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{
-    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo,
-    VtabModuleFactory, module_factory_from,
+    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo, VtabModuleFactory,
+    module_factory_from,
 };
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
@@ -2286,7 +2286,9 @@ impl Connection {
     }
 
     fn has_primary_live_vtab_source(&self, select: &SelectStatement) -> bool {
-        has_primary_live_vtab_source_inner(select, |table_name| self.has_live_vtab_instance(table_name))
+        has_primary_live_vtab_source_inner(select, |table_name| {
+            self.has_live_vtab_instance(table_name)
+        })
     }
 
     /// Plan a scan against a live virtual-table instance by consulting
@@ -2323,9 +2325,9 @@ impl Connection {
         {
             let instances = self.vtab_instances.borrow();
             let key = table_name.to_ascii_uppercase();
-            let instance = instances
-                .get(&key)
-                .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {table_name}")))?;
+            let instance = instances.get(&key).ok_or_else(|| {
+                FrankenError::Internal(format!("virtual table not found: {table_name}"))
+            })?;
             instance.best_index(&mut info)?;
         }
 
@@ -2360,18 +2362,21 @@ impl Connection {
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
     ) -> Result<Vec<Vec<SqliteValue>>> {
-        let cx = self.op_cx()?;
         let key = src.table_name.to_ascii_uppercase();
         let num_cols = src.col_names.len();
 
         let mut cursor = {
             let instances = self.vtab_instances.borrow();
-            let instance = instances
-                .get(&key)
-                .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {}", src.table_name)))?;
+            let instance = instances.get(&key).ok_or_else(|| {
+                FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
+            })?;
+            if let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() {
+                return self.scan_live_fts5_rows(fts5, src, plan);
+            }
             instance.open_cursor()?
         };
 
+        let cx = self.op_cx()?;
         cursor.erased_filter(&cx, plan.idx_num, plan.idx_str.as_deref(), &plan.args)?;
 
         let mut rows: Vec<Vec<SqliteValue>> = Vec::new();
@@ -2391,6 +2396,56 @@ impl Connection {
         }
 
         Ok(rows)
+    }
+
+    fn scan_live_fts5_rows(
+        &self,
+        fts5: &Fts5Table,
+        src: &JoinTableSource,
+        plan: &LiveVtabScanPlan,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let rows = match plan.idx_num {
+            0 => fts5
+                .all_rows()
+                .into_iter()
+                .map(|(rowid, columns)| (rowid, columns))
+                .collect::<Vec<_>>(),
+            1 => {
+                let query = plan.args.first().ok_or_else(|| {
+                    FrankenError::Internal("fts5 MATCH scan missing query argument".to_owned())
+                })?;
+                fts5.search_rows(&query.to_text())
+                    .map_err(|error| {
+                        FrankenError::function_error(format!("fts5 query failed: {error}"))
+                    })?
+                    .into_iter()
+                    .map(|(rowid, _score, columns)| (rowid, columns))
+                    .collect::<Vec<_>>()
+            }
+            idx_num => {
+                return Err(FrankenError::Internal(format!(
+                    "unsupported FTS5 live scan strategy: {idx_num}",
+                )));
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(rowid, columns)| {
+                let mut row = columns
+                    .into_iter()
+                    .take(src.col_names.len())
+                    .map(SqliteValue::Text)
+                    .collect::<Vec<_>>();
+                while row.len() < src.col_names.len() {
+                    row.push(SqliteValue::Null);
+                }
+                if src.hidden_rowid_projection.is_some() {
+                    row.push(SqliteValue::Integer(rowid));
+                }
+                row
+            })
+            .collect())
     }
 
     fn reset_statement_change_count(&self) {
@@ -2520,6 +2575,7 @@ impl Connection {
         "group_by_join_fallback",
         "group_by_fallback",
         "window_function_fallback",
+        "live_vtab_select_fallback",
         "match_operator_fallback",
         "join_or_subquery_fallback",
         "insert_select_row_by_row_fallback",
@@ -3112,9 +3168,9 @@ impl Connection {
     ) -> Result<()> {
         let key = table_name.to_ascii_uppercase();
         let mut instances = self.vtab_instances.borrow_mut();
-        let instance = instances
-            .get_mut(&key)
-            .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {table_name}")))?;
+        let instance = instances.get_mut(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("virtual table not found: {table_name}"))
+        })?;
         let rtree = instance
             .as_any_mut()
             .downcast_mut::<RtreeVirtualTable>()
@@ -4352,6 +4408,20 @@ impl Connection {
 
                 let table_name = &insert.table.name;
                 let insert_event = fsqlite_ast::TriggerEvent::Insert;
+                let is_live_vtab = self.has_live_vtab_instance(table_name);
+                if is_live_vtab {
+                    if !insert.returning.is_empty() {
+                        return Err(FrankenError::NotImplemented(
+                            "RETURNING is not supported for live virtual-table INSERT".to_owned(),
+                        ));
+                    }
+                    if insert.or_conflict.is_some() || !insert.upsert.is_empty() {
+                        return Err(FrankenError::NotImplemented(
+                            "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
+                                .to_owned(),
+                        ));
+                    }
+                }
                 let has_before_insert = self.has_matching_triggers(
                     table_name,
                     fsqlite_ast::TriggerTiming::Before,
@@ -4392,19 +4462,7 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                if self.has_live_vtab_instance(table_name) {
-                    if !insert.returning.is_empty() {
-                        return Err(FrankenError::NotImplemented(
-                            "RETURNING is not supported for live virtual-table INSERT".to_owned(),
-                        ));
-                    }
-                    if insert.or_conflict.is_some() || !insert.upsert.is_empty() {
-                        return Err(FrankenError::NotImplemented(
-                            "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
-                                .to_owned(),
-                        ));
-                    }
-
+                if is_live_vtab {
                     let mut inserted_rows = if has_before_insert || has_after_insert {
                         trigger_new_rows.clone()
                     } else {
@@ -4415,7 +4473,7 @@ impl Connection {
 
                     if has_after_insert {
                         for (row, rowid) in inserted_rows.iter_mut().zip(inserted_rowids.iter()) {
-                            if row.first().is_some_and(SqliteValue::is_null) {
+                            if row.first().is_some_and(|value| value.is_null()) {
                                 row[0] = SqliteValue::Integer(*rowid);
                             }
                         }
@@ -6377,15 +6435,20 @@ impl Connection {
         let cx = self.op_cx()?;
         let key = table_name.to_ascii_uppercase();
         let mut instances = self.vtab_instances.borrow_mut();
-        let instance = instances
-            .get_mut(&key)
-            .ok_or_else(|| FrankenError::Internal(format!("virtual table not found: {table_name}")))?;
+        let instance = instances.get_mut(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("virtual table not found: {table_name}"))
+        })?;
 
         let mut inserted_rowids = Vec::with_capacity(rows.len());
         for row in rows {
             let mut args = Vec::with_capacity(row.len() + 2);
             args.push(SqliteValue::Null);
-            args.push(row.first().cloned().unwrap_or(SqliteValue::Null));
+            let new_rowid = if instance.as_any().is::<RtreeVirtualTable>() {
+                row.first().cloned().unwrap_or(SqliteValue::Null)
+            } else {
+                SqliteValue::Null
+            };
+            args.push(new_rowid);
             args.extend(row.iter().cloned());
             let rowid = instance.update(&cx, &args)?.ok_or_else(|| {
                 FrankenError::Internal(format!(
@@ -17880,11 +17943,14 @@ impl Connection {
 
         let primary_width = table_sources[0].scan_width();
         let mut live_vtab_primary_scan = None;
-        let live_vtab_where_override =
-            if table_sources.len() == 1 && self.has_live_vtab_instance(&table_sources[0].table_name)
+        let live_vtab_where_override = if table_sources.len() == 1
+            && self.has_live_vtab_instance(&table_sources[0].table_name)
         {
-            let live_plan =
-                self.plan_live_vtab_scan(&table_sources[0].table_name, where_clause.as_deref(), &col_map)?;
+            let live_plan = self.plan_live_vtab_scan(
+                &table_sources[0].table_name,
+                where_clause.as_deref(),
+                &col_map,
+            )?;
             live_vtab_primary_scan = Some(live_plan);
             Some(
                 live_vtab_primary_scan
@@ -17965,19 +18031,20 @@ impl Connection {
                     primary_where_pushdown,
                     &col_map[..primary_width],
                 )?);
-            } else if i == 0 {
-                if let Some(plan) = live_vtab_primary_scan.as_ref() {
-                    let row_data = self.scan_live_vtab_rows(src, plan)?;
-                    scanned_cache.insert(src.table_name.clone(), row_data.clone());
-                    table_rows.push(maybe_filter_primary_join_rows(
-                        row_data,
-                        i,
-                        primary_where_pushdown,
-                        &col_map[..primary_width],
-                    )?);
-                    continue;
-                }
             } else {
+                if i == 0 {
+                    if let Some(plan) = live_vtab_primary_scan.as_ref() {
+                        let row_data = self.scan_live_vtab_rows(src, plan)?;
+                        scanned_cache.insert(src.table_name.clone(), row_data.clone());
+                        table_rows.push(maybe_filter_primary_join_rows(
+                            row_data,
+                            i,
+                            primary_where_pushdown,
+                            &col_map[..primary_width],
+                        )?);
+                        continue;
+                    }
+                }
                 // Named table: scan through the normal query path so file-backed
                 // parity-cert connections read from pager-backed state instead
                 // of the schema-only MemDatabase mirror.  When the join layer
@@ -30390,6 +30457,26 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_join_select_scans_primary_named_table_without_live_vtab() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+        let statement = conn
+            .cached_parse_single("SELECT a.x FROM t AS a JOIN t AS b ON a.x = b.x ORDER BY a.x;")
+            .unwrap();
+        let Statement::Select(select) = statement.as_ref() else {
+            panic!("expected SELECT statement");
+        };
+
+        let rows = conn.execute_join_select(select, None).unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)],],
+        );
+    }
+
+    #[test]
     fn test_execute_table_program_restores_active_txn_when_op_cx_fails() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
@@ -36085,6 +36172,61 @@ mod tests {
         assert_eq!(
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(2)]],
+        );
+    }
+
+    #[test]
+    fn test_fts5_live_vtab_full_scan_uses_live_runtime() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, subject, body FROM docs ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("Hello".to_owned()),
+                    SqliteValue::Text("Rust world".to_owned()),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("Other".to_owned()),
+                    SqliteValue::Text("Nothing".to_owned()),
+                ],
+            ],
+        );
+    }
+
+    #[test]
+    fn test_fts5_live_vtab_insert_without_explicit_rowid_tracks_last_insert_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            .unwrap();
+
+        conn.execute("INSERT INTO docs(subject, body) VALUES ('Hello', 'Rust world')")
+            .unwrap();
+
+        let rows = conn.query("SELECT last_insert_rowid();").unwrap();
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+
+        let docs = conn
+            .query("SELECT rowid, subject, body FROM docs ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            docs.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("Hello".to_owned()),
+                SqliteValue::Text("Rust world".to_owned()),
+            ]],
         );
     }
 

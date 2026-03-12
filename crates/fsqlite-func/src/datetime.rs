@@ -474,7 +474,7 @@ fn is_month_year_modifier(m: &str) -> bool {
 /// Returns Ok(Some(jdn)) for exact application.
 /// Returns Ok(None) for overflow.
 /// Returns Err(()) if the modifier is not an integer, so it should fall back.
-fn apply_month_year_exact(jdn: f64, m: &str) -> Result<Option<f64>, ()> {
+fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<f64>, ()> {
     let (sign, rest) = if let Some(r) = m.strip_prefix('+') {
         (1_i64, r.trim())
     } else if let Some(r) = m.strip_prefix('-') {
@@ -486,7 +486,7 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> Result<Option<f64>, ()> {
     let mut parts = rest.splitn(2, ' ');
     let num_str = parts.next().ok_or(())?;
     let unit = parts.next().ok_or(())?.trim();
-    
+
     // SQLite uses exact math only if the value is an integer.
     let num = if let Ok(n) = num_str.parse::<i64>() {
         n
@@ -504,14 +504,34 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> Result<Option<f64>, ()> {
     let (h, mi, s, frac) = jdn_to_hms(jdn);
 
     let total_months = match unit.trim_end_matches('s') {
-        "month" => if let Some(val) = num.checked_mul(sign) { val } else { return Ok(None) },
-        "year" => if let Some(val) = num.checked_mul(sign).and_then(|v| v.checked_mul(12)) { val } else { return Ok(None) },
+        "month" => {
+            if let Some(val) = num.checked_mul(sign) {
+                val
+            } else {
+                return Ok(None);
+            }
+        }
+        "year" => {
+            if let Some(val) = num.checked_mul(sign).and_then(|v| v.checked_mul(12)) {
+                val
+            } else {
+                return Ok(None);
+            }
+        }
         _ => return Err(()),
     };
 
     // (y * 12 + (mo - 1)) + total_months
-    let current_months = if let Some(val) = y.checked_mul(12).and_then(|v| v.checked_add(mo - 1)) { val } else { return Ok(None) };
-    let new_total = if let Some(val) = current_months.checked_add(total_months) { val } else { return Ok(None) };
+    let current_months = if let Some(val) = y.checked_mul(12).and_then(|v| v.checked_add(mo - 1)) {
+        val
+    } else {
+        return Ok(None);
+    };
+    let new_total = if let Some(val) = current_months.checked_add(total_months) {
+        val
+    } else {
+        return Ok(None);
+    };
 
     let new_y = new_total.div_euclid(12);
     let new_mo = new_total.rem_euclid(12) + 1;

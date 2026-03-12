@@ -314,6 +314,19 @@ impl RtreeIndex {
         self.entries.len() < before
     }
 
+    #[must_use]
+    pub fn contains_id(&self, id: i64) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
+
+    #[must_use]
+    pub fn bbox_for_id(&self, id: i64) -> Option<MBoundingBox> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.bbox.clone())
+    }
+
     /// Update an entry's bounding box.
     ///
     /// Returns `true` if the entry was found and updated.
@@ -564,17 +577,9 @@ impl VirtualTable for RtreeVirtualTable {
                 continue;
             }
 
-            if coord_index % 2 == 0
-                && matches!(
-                    constraint.op,
-                    ConstraintOp::Le | ConstraintOp::Lt | ConstraintOp::Eq
-                )
-            {
+            if coord_index % 2 == 0 && constraint.op == ConstraintOp::Le {
                 upper_bounds[dimension] = Some(index);
-            } else if matches!(
-                constraint.op,
-                ConstraintOp::Ge | ConstraintOp::Gt | ConstraintOp::Eq
-            ) {
+            } else if constraint.op == ConstraintOp::Ge {
                 lower_bounds[dimension] = Some(index);
             }
         }
@@ -659,9 +664,7 @@ impl VirtualTable for RtreeVirtualTable {
             count if count == self.index.dimensions() * 2 + 1 => {
                 if let Some(id_value) = args[2].as_integer() {
                     if id_value != new_rowid {
-                        return Err(FrankenError::function_error(
-                            "rtree rowid must match the id column",
-                        ));
+                        return Err(FrankenError::PrimaryKeyViolation);
                     }
                 }
                 &args[3..]
@@ -679,33 +682,47 @@ impl VirtualTable for RtreeVirtualTable {
 
         if let Some(old_rowid) = old_rowid {
             if old_rowid != new_rowid {
-                self.index.delete(old_rowid);
+                if self.index.contains_id(new_rowid) {
+                    return Err(FrankenError::PrimaryKeyViolation);
+                }
+                let previous_bbox = self.index.bbox_for_id(old_rowid).ok_or_else(|| {
+                    FrankenError::Internal("rtree update referenced a missing rowid".to_owned())
+                })?;
+                let deleted = self.index.delete(old_rowid);
+                if !deleted {
+                    return Err(FrankenError::Internal(
+                        "rtree update referenced a missing rowid".to_owned(),
+                    ));
+                }
                 if !self.index.insert(RtreeEntry {
                     id: new_rowid,
                     bbox,
                 }) {
-                    return Err(FrankenError::function_error(
-                        "rtree update could not replace rowid",
+                    let restored = self.index.insert(RtreeEntry {
+                        id: old_rowid,
+                        bbox: previous_bbox,
+                    });
+                    debug_assert!(restored, "rtree rollback after failed rowid change");
+                    return Err(FrankenError::Internal(
+                        "rtree update could not replace rowid".to_owned(),
                     ));
                 }
-                return Ok(Some(new_rowid));
+                return Ok(None);
             }
 
-            if !self.index.update(old_rowid, bbox.clone()) {
-                return Err(FrankenError::function_error(
-                    "rtree update referenced a missing rowid",
+            if !self.index.update(old_rowid, bbox) {
+                return Err(FrankenError::Internal(
+                    "rtree update referenced a missing rowid".to_owned(),
                 ));
             }
-            return Ok(Some(new_rowid));
+            return Ok(None);
         }
 
         if !self.index.insert(RtreeEntry {
             id: new_rowid,
             bbox,
         }) {
-            return Err(FrankenError::function_error(
-                "rtree insert failed because the rowid already exists",
-            ));
+            return Err(FrankenError::PrimaryKeyViolation);
         }
         Ok(Some(new_rowid))
     }
@@ -2418,6 +2435,193 @@ mod tests {
         let rows = collect_rtree_rows(&mut cursor, &cx, 5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SqliteValue::Integer(20));
+    }
+
+    #[test]
+    fn test_rtree_best_index_does_not_omit_noninclusive_bbox_constraints() {
+        let table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+        let cases = [
+            vec![
+                IndexConstraint {
+                    column: 1,
+                    op: ConstraintOp::Lt,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 2,
+                    op: ConstraintOp::Gt,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 3,
+                    op: ConstraintOp::Lt,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 4,
+                    op: ConstraintOp::Gt,
+                    usable: true,
+                },
+            ],
+            vec![
+                IndexConstraint {
+                    column: 1,
+                    op: ConstraintOp::Eq,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 2,
+                    op: ConstraintOp::Eq,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 3,
+                    op: ConstraintOp::Eq,
+                    usable: true,
+                },
+                IndexConstraint {
+                    column: 4,
+                    op: ConstraintOp::Eq,
+                    usable: true,
+                },
+            ],
+        ];
+
+        for constraints in cases {
+            let mut info = IndexInfo::new(constraints, Vec::new());
+            VirtualTable::best_index(&table, &mut info).unwrap();
+            assert_eq!(info.idx_num, RTREE_SCAN_FULL);
+            assert!(
+                info.constraint_usage
+                    .iter()
+                    .all(|usage| usage.argv_index == 0 && !usage.omit)
+            );
+        }
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_update_returns_none() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+                SqliteValue::Float(0.0),
+                SqliteValue::Float(1.0),
+            ],
+        )
+        .unwrap();
+
+        let result = VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(5.0),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(5.0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, None);
+
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(5.0),
+                SqliteValue::Float(4.0),
+                SqliteValue::Float(5.0),
+            ]]
+        );
+    }
+
+    #[test]
+    fn test_rtree_virtual_table_rowid_conflict_preserves_original_entry() {
+        let cx = Cx::new();
+        let mut table = RtreeVirtualTable::from_args(
+            &["id", "min_x", "max_x", "min_y", "max_y"],
+            RtreeCoordType::Float32,
+        )
+        .unwrap();
+
+        for (rowid, coords) in [(1_i64, [0.0, 1.0, 0.0, 1.0]), (2_i64, [2.0, 3.0, 2.0, 3.0])] {
+            VirtualTable::update(
+                &mut table,
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Float(coords[0]),
+                    SqliteValue::Float(coords[1]),
+                    SqliteValue::Float(coords[2]),
+                    SqliteValue::Float(coords[3]),
+                ],
+            )
+            .unwrap();
+        }
+
+        let err = VirtualTable::update(
+            &mut table,
+            &cx,
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+                SqliteValue::Float(8.0),
+                SqliteValue::Float(9.0),
+                SqliteValue::Float(8.0),
+                SqliteValue::Float(9.0),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+
+        let mut cursor = table.open().unwrap();
+        cursor.filter(&cx, RTREE_SCAN_FULL, None, &[]).unwrap();
+        let rows = collect_rtree_rows(&mut cursor, &cx, 5);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Float(0.0),
+                    SqliteValue::Float(1.0),
+                    SqliteValue::Float(0.0),
+                    SqliteValue::Float(1.0),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Float(2.0),
+                    SqliteValue::Float(3.0),
+                    SqliteValue::Float(2.0),
+                    SqliteValue::Float(3.0),
+                ],
+            ]
+        );
     }
 
     #[test]

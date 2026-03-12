@@ -88,6 +88,8 @@ pub struct WalFile<F: VfsFile> {
     running_checksum: SqliteWalChecksum,
     /// Number of valid frames currently in the WAL.
     frame_count: usize,
+    /// Index of the latest visible commit frame for the active generation.
+    last_commit_frame: Option<usize>,
     /// Reusable contiguous scratch for direct append paths.
     ///
     /// Ownership is per-`WalFile` handle. Append methods already require
@@ -260,6 +262,7 @@ impl<F: VfsFile> WalFile<F> {
 
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
+        self.last_commit_frame = last_commit_count.checked_sub(1);
 
         Ok(())
     }
@@ -363,6 +366,7 @@ impl<F: VfsFile> WalFile<F> {
 
         self.frame_count = last_commit_count;
         self.running_checksum = last_commit_checksum;
+        self.last_commit_frame = last_commit_count.checked_sub(1);
 
         Ok(())
     }
@@ -482,6 +486,7 @@ impl<F: VfsFile> WalFile<F> {
             header,
             running_checksum,
             frame_count: 0,
+            last_commit_frame: None,
             frame_scratch: Vec::new(),
         })
     }
@@ -627,6 +632,7 @@ impl<F: VfsFile> WalFile<F> {
             header,
             running_checksum: last_commit_checksum,
             frame_count: last_commit_frames,
+            last_commit_frame: last_commit_frames.checked_sub(1),
             frame_scratch: Vec::new(),
         })
     }
@@ -719,6 +725,9 @@ impl<F: VfsFile> WalFile<F> {
 
         self.running_checksum = new_checksum;
         self.frame_count += 1;
+        if db_size_if_commit != 0 {
+            self.last_commit_frame = Some(self.frame_count - 1);
+        }
         crate::metrics::GLOBAL_WAL_METRICS
             .set_wal_frames_current(u64::try_from(self.frame_count).unwrap_or(u64::MAX));
 
@@ -837,9 +846,25 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         let start_frame_index = self.frame_count;
+        let last_commit_offset = prepared_frame_bytes
+            .chunks_exact(frame_size)
+            .enumerate()
+            .rev()
+            .find_map(|(offset, frame_slice)| {
+                let db_size_if_commit = u32::from_be_bytes([
+                    frame_slice[4],
+                    frame_slice[5],
+                    frame_slice[6],
+                    frame_slice[7],
+                ]);
+                (db_size_if_commit != 0).then_some(offset)
+            });
         let offset = self.frame_offset(start_frame_index);
         self.file.write(cx, prepared_frame_bytes, offset)?;
         self.advance_state_after_write(frame_count, running_checksum)?;
+        if let Some(last_commit_offset) = last_commit_offset {
+            self.last_commit_frame = Some(start_frame_index + last_commit_offset);
+        }
 
         let bytes_per_frame = u64::try_from(frame_size).unwrap_or(u64::MAX);
         let bytes_written = u64::try_from(expected_bytes).unwrap_or(u64::MAX);
@@ -996,13 +1021,8 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Find the last commit frame index, or `None` if there are no commits.
     pub fn last_commit_frame(&mut self, cx: &Cx) -> Result<Option<usize>> {
-        for i in (0..self.frame_count).rev() {
-            let header = self.read_frame_header(cx, i)?;
-            if header.is_commit() {
-                return Ok(Some(i));
-            }
-        }
-        Ok(None)
+        let _ = cx;
+        Ok(self.last_commit_frame)
     }
 
     /// Sync the WAL file to stable storage.
@@ -1047,6 +1067,7 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
         self.frame_count = 0;
+        self.last_commit_frame = None;
         self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
@@ -1559,6 +1580,7 @@ mod tests {
         };
         wal.reset(&cx, 1, new_salts, true).expect("reset");
         assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.last_commit_frame(&cx).expect("query"), None);
         assert_eq!(wal.header().checkpoint_seq, 1);
         assert_eq!(wal.header().salts, new_salts);
 
@@ -1566,6 +1588,7 @@ mod tests {
         wal.append_frame(&cx, 10, &sample_page(0xAA), 1)
             .expect("append after reset");
         assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.last_commit_frame(&cx).expect("query"), Some(0));
 
         wal.close(&cx).expect("close WAL");
 
@@ -2276,6 +2299,7 @@ mod tests {
         let file_reader = open_wal_file(&vfs, &cx);
         let mut reader = WalFile::open(&cx, file_reader).expect("open reader");
         assert_eq!(reader.frame_count(), 3);
+        assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(2));
 
         // "Second writer" appends 2 more frames (frames 4,5 with commit at 5).
         let file_w2 = open_wal_file(&vfs, &cx);
@@ -2295,6 +2319,7 @@ mod tests {
             5,
             "after refresh, reader must see the 2 new committed frames"
         );
+        assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(4));
 
         reader.close(&cx).expect("close reader");
     }
@@ -2317,6 +2342,7 @@ mod tests {
         let file_r = open_wal_file(&vfs, &cx);
         let mut reader = WalFile::open(&cx, file_r).expect("open reader");
         assert_eq!(reader.frame_count(), 1);
+        assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(0));
 
         // "Checkpointer" opens, resets with new salts.
         let file_cp = open_wal_file(&vfs, &cx);
@@ -2333,6 +2359,7 @@ mod tests {
         // Reader refresh: should rebuild and see the new generation.
         reader.refresh(&cx).expect("refresh");
         assert_eq!(reader.frame_count(), 1);
+        assert_eq!(reader.last_commit_frame(&cx).expect("query"), Some(0));
         assert_eq!(
             reader.header().salts,
             new_salts,
