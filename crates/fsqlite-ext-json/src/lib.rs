@@ -1152,7 +1152,22 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
             b'[' => {
                 idx += 1;
                 let start = idx;
-                while idx < bytes.len() && bytes[idx] != b']' {
+                let mut escaped = false;
+                while idx < bytes.len() {
+                    let byte = bytes[idx];
+                    if escaped {
+                        escaped = false;
+                        idx += 1;
+                        continue;
+                    }
+                    if byte == b'\\' {
+                        escaped = true;
+                        idx += 1;
+                        continue;
+                    }
+                    if byte == b']' {
+                        break;
+                    }
                     idx += 1;
                 }
                 if idx >= bytes.len() {
@@ -1424,17 +1439,26 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
 fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
     match value {
         SqliteValue::Null => Ok(Value::Null),
-        SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
+        SqliteValue::Integer(i) => {
+            if let Ok(f) = f64::try_from(*i) {
+                Number::from_f64(f).ok_or_else(|| {
+                    FrankenError::function_error(
+                        "failed to convert integer value to JSON floating-point",
+                    )
+                })
+            } else {
+                Number::from(*i)
+            }
+        }
         SqliteValue::Float(f) => {
             if !f.is_finite() {
                 return Err(FrankenError::function_error(
                     "non-finite float is not representable in JSON",
                 ));
             }
-            let number = Number::from_f64(*f).ok_or_else(|| {
+            Number::from_f64(*f).ok_or_else(|| {
                 FrankenError::function_error("failed to convert floating-point value to JSON")
-            })?;
-            Ok(Value::Number(number))
+            })
         }
         SqliteValue::Text(text) => Ok(Value::String(text.clone())),
         SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
@@ -1787,8 +1811,12 @@ fn merge_patch(target: Value, patch: Value) -> Value {
                     target_map.remove(&key);
                     continue;
                 }
-                let prior = target_map.remove(&key).unwrap_or(Value::Null);
-                target_map.insert(key, merge_patch(prior, patch_value));
+                if let Some(prior) = target_map.get_mut(&key) {
+                    let old_val = std::mem::replace(prior, Value::Null);
+                    *prior = merge_patch(old_val, patch_value);
+                } else {
+                    target_map.insert(key, merge_patch(Value::Null, patch_value));
+                }
             }
 
             Value::Object(target_map)
@@ -2893,13 +2921,13 @@ mod tests {
             .invoke(&[
                 SqliteValue::Blob(input),
                 SqliteValue::Text("$.b".to_owned()),
-                SqliteValue::Integer(2),
+                SqliteValue::Integer(9),
             ])
             .expect("jsonb_set should accept JSONB blob input");
         let SqliteValue::Blob(blob) = out else {
             panic!("jsonb_set should return BLOB");
         };
-        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":2}"#);
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":9}"#);
     }
 
     #[test]

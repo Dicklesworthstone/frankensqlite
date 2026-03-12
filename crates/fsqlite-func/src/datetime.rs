@@ -451,8 +451,15 @@ fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
         // through to the approximate path which would produce overflow
         // panics in jdn_to_ymd.
         if is_month_year_modifier(&m_lower) {
-            j = apply_month_year_exact(j, &m_lower)?;
-            continue;
+            match apply_month_year_exact(j, &m_lower) {
+                Ok(new_jdn) => {
+                    j = new_jdn?;
+                    continue;
+                }
+                Err(_) => {
+                    // Fall through to `apply_modifier` for fractional values
+                }
+            }
         }
         j = apply_modifier(j, m)?;
     }
@@ -464,38 +471,53 @@ fn is_month_year_modifier(m: &str) -> bool {
 }
 
 /// Exact month/year arithmetic by decomposing to YMD.
-fn apply_month_year_exact(jdn: f64, m: &str) -> Option<f64> {
+/// Returns Ok(Some(jdn)) for exact application.
+/// Returns Ok(None) for overflow.
+/// Returns Err(()) if the modifier is not an integer, so it should fall back.
+fn apply_month_year_exact(jdn: f64, m: &str) -> Result<Option<f64>, ()> {
     let (sign, rest) = if let Some(r) = m.strip_prefix('+') {
         (1_i64, r.trim())
     } else if let Some(r) = m.strip_prefix('-') {
         (-1_i64, r.trim())
     } else {
-        return None;
+        return Err(());
     };
 
     let mut parts = rest.splitn(2, ' ');
-    let num_str = parts.next()?;
-    let unit = parts.next()?.trim();
-    let num = num_str.parse::<i64>().ok()?;
+    let num_str = parts.next().ok_or(())?;
+    let unit = parts.next().ok_or(())?.trim();
+    
+    // SQLite uses exact math only if the value is an integer.
+    let num = if let Ok(n) = num_str.parse::<i64>() {
+        n
+    } else if let Ok(f) = num_str.parse::<f64>() {
+        if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            f as i64
+        } else {
+            return Err(());
+        }
+    } else {
+        return Err(());
+    };
 
     let (y, mo, d) = jdn_to_ymd(jdn);
     let (h, mi, s, frac) = jdn_to_hms(jdn);
 
     let total_months = match unit.trim_end_matches('s') {
-        "month" => num.checked_mul(sign)?,
-        "year" => num.checked_mul(sign)?.checked_mul(12)?,
-        _ => return None,
+        "month" => if let Some(val) = num.checked_mul(sign) { val } else { return Ok(None) },
+        "year" => if let Some(val) = num.checked_mul(sign).and_then(|v| v.checked_mul(12)) { val } else { return Ok(None) },
+        _ => return Err(()),
     };
 
     // (y * 12 + (mo - 1)) + total_months
-    let current_months = y.checked_mul(12)?.checked_add(mo - 1)?;
-    let new_total = current_months.checked_add(total_months)?;
+    let current_months = if let Some(val) = y.checked_mul(12).and_then(|v| v.checked_add(mo - 1)) { val } else { return Ok(None) };
+    let new_total = if let Some(val) = current_months.checked_add(total_months) { val } else { return Ok(None) };
 
     let new_y = new_total.div_euclid(12);
     let new_mo = new_total.rem_euclid(12) + 1;
     // Do NOT clamp `d` to the target month's day count.  C SQLite lets
     // out-of-range days overflow via JDN arithmetic (e.g. Feb 31 → Mar 3).
-    Some(ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac))
+    Ok(Some(ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac)))
 }
 
 // ── Output Formatters ─────────────────────────────────────────────────────
