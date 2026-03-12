@@ -336,16 +336,25 @@ pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut 
 
     tracing::info!(target: "fsqlite.compat", path = %path, "sqlite3_open");
 
-    match Connection::open(&path) {
-        Ok(conn) => {
+    let open_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Connection::open(&path)
+    }));
+
+    match open_result {
+        Ok(Ok(conn)) => {
             let handle = Box::new(Sqlite3::new(conn));
             *pp_db = Box::into_raw(handle);
             SQLITE_OK
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_open failed");
             *pp_db = std::ptr::null_mut();
             error_to_code(&e)
+        }
+        Err(_) => {
+            tracing::error!(target: "fsqlite.compat", path = %path, "sqlite3_open panicked");
+            *pp_db = std::ptr::null_mut();
+            SQLITE_ERROR
         }
     }
 }
@@ -634,8 +643,13 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     };
 
     let source_len = source.len();
-    match validate_and_classify_prepared_sql(&handle.conn, source) {
-        Ok(Some(info)) => {
+
+    let compile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_and_classify_prepared_sql(&handle.conn, source)
+    }));
+
+    match compile_result {
+        Ok(Ok(Some(info))) => {
             tracing::info!(
                 target: "fsqlite.compat",
                 sql = %info.consumed_sql,
@@ -658,15 +672,21 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
             }
             SQLITE_OK
         }
-        Ok(None) => {
+        Ok(Ok(None)) => {
             handle.clear_error();
             if !pz_tail.is_null() {
                 *pz_tail = sql.add(source_len);
             }
             SQLITE_OK
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_prepare_v2 failed");
+            handle.set_error(&e);
+            error_to_code(&e)
+        }
+        Err(_) => {
+            let e = FrankenError::Internal("Rust panic during sqlite3_prepare_v2".to_owned());
+            tracing::error!(target: "fsqlite.compat", error = %e, "sqlite3_prepare_v2 panicked");
             handle.set_error(&e);
             error_to_code(&e)
         }
