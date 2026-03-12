@@ -6515,6 +6515,7 @@ impl VdbeEngine {
                     if should_step {
                         ctx.func.step(&mut ctx.state, args)?;
                     }
+                    observe_execution_cancellation(&self.execution_cx)?;
                     pc += 1;
                 }
 
@@ -6557,6 +6558,7 @@ impl VdbeEngine {
                         None => func.finalize(func.initial_state())?,
                     };
 
+                    observe_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(accum_reg, result);
                     pc += 1;
                 }
@@ -6604,6 +6606,7 @@ impl VdbeEngine {
                     });
 
                     ctx.func.inverse(&mut ctx.state, args)?;
+                    observe_execution_cancellation(&self.execution_cx)?;
                     pc += 1;
                 }
 
@@ -6641,6 +6644,7 @@ impl VdbeEngine {
                         Some(ctx) => ctx.func.value(&ctx.state)?,
                         None => func.value(&func.initial_state())?,
                     };
+                    observe_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(op.p3, result);
                     pc += 1;
                 }
@@ -6680,6 +6684,7 @@ impl VdbeEngine {
 
                     let args = self.collect_reg_range(first_arg_reg, arg_count);
                     let result = func.invoke(&args)?;
+                    observe_execution_cancellation(&self.execution_cx)?;
 
                     if self.trace_opcodes {
                         let result_type = match &result {
@@ -7038,6 +7043,7 @@ impl VdbeEngine {
                                 message: format!("VFilter error: {e}"),
                             };
                         }
+                        observe_execution_cancellation(&self.execution_cx)?;
                         if state.cursor.eof() {
                             #[allow(clippy::cast_sign_loss)]
                             {
@@ -7066,6 +7072,7 @@ impl VdbeEngine {
                                 message: format!("VColumn error: {e}"),
                             };
                         }
+                        observe_execution_cancellation(&self.execution_cx)?;
                         #[allow(clippy::cast_sign_loss)]
                         {
                             if let Some(reg) = self.registers.get_mut(dest as usize) {
@@ -7091,6 +7098,7 @@ impl VdbeEngine {
                                 message: format!("VNext error: {e}"),
                             };
                         }
+                        observe_execution_cancellation(&self.execution_cx)?;
                         if !state.cursor.eof() {
                             #[allow(clippy::cast_sign_loss)]
                             {
@@ -7119,32 +7127,25 @@ impl VdbeEngine {
                                 .unwrap_or(SqliteValue::Null)
                         })
                         .collect();
-                    if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
-                        match vtab.vtab_update(&cx, &args) {
-                            Ok(Some(rowid)) => {
-                                #[allow(clippy::cast_sign_loss)]
-                                if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
-                                    *reg = SqliteValue::Integer(rowid);
+                    let vtab_update_result =
+                        if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
+                            match vtab.vtab_update(&cx, &args) {
+                                Ok(Some(rowid)) => SqliteValue::Integer(rowid),
+                                Ok(None) => SqliteValue::Null,
+                                Err(e) => {
+                                    break ExecOutcome::Error {
+                                        code: 1,
+                                        message: format!("VUpdate error: {e}"),
+                                    };
                                 }
                             }
-                            Ok(None) => {
-                                #[allow(clippy::cast_sign_loss)]
-                                if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
-                                    *reg = SqliteValue::Null;
-                                }
-                            }
-                            Err(e) => {
-                                break ExecOutcome::Error {
-                                    code: 1,
-                                    message: format!("VUpdate error: {e}"),
-                                };
-                            }
-                        }
-                    } else {
-                        #[allow(clippy::cast_sign_loss)]
-                        if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
-                            *reg = SqliteValue::Null;
-                        }
+                        } else {
+                            SqliteValue::Null
+                        };
+                    observe_execution_cancellation(&self.execution_cx)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                        *reg = vtab_update_result;
                     }
                     pc += 1;
                 }
@@ -7162,6 +7163,7 @@ impl VdbeEngine {
                             };
                         }
                     }
+                    observe_execution_cancellation(&self.execution_cx)?;
                     pc += 1;
                 }
 
@@ -7225,6 +7227,7 @@ impl VdbeEngine {
                             };
                         }
                     }
+                    observe_execution_cancellation(&self.execution_cx)?;
                     pc += 1;
                 }
 
@@ -9051,7 +9054,7 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_observes_execution_cx_cancellation_after_function_opcode() {
+    fn test_execute_observes_execution_cx_cancellation_immediately_after_function_opcode() {
         let root_cx = Cx::new();
 
         let mut builder = ProgramBuilder::new();
@@ -9064,9 +9067,6 @@ mod tests {
             P4::FuncName("cancel_exec".to_owned()),
             0,
         );
-        for _ in 0..(VDBE_EXECUTION_CHECKPOINT_INTERVAL * 2) {
-            builder.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
-        }
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let program = builder.finish().expect("program should build");
 
@@ -9083,7 +9083,7 @@ mod tests {
 
         let err = engine
             .execute(&program)
-            .expect_err("cancellation should be observed during opcode dispatch");
+            .expect_err("cancellation should be observed before dispatch continues");
         assert!(matches!(err, FrankenError::Interrupt));
         assert!(engine.results().is_empty());
     }
@@ -14857,6 +14857,7 @@ mod tests {
         rows: Vec<Vec<SqliteValue>>,
         pos: usize,
         filtered: bool,
+        cancel_on_column: Option<Cx>,
     }
 
     impl MockVtabCursor {
@@ -14865,6 +14866,16 @@ mod tests {
                 rows,
                 pos: 0,
                 filtered: false,
+                cancel_on_column: None,
+            }
+        }
+
+        fn with_column_cancel(rows: Vec<Vec<SqliteValue>>, cancel_cx: Cx) -> Self {
+            Self {
+                rows,
+                pos: 0,
+                filtered: false,
+                cancel_on_column: Some(cancel_cx),
             }
         }
     }
@@ -14889,6 +14900,9 @@ mod tests {
             self.pos >= self.rows.len()
         }
         fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+            if let Some(cancel_cx) = &self.cancel_on_column {
+                cancel_cx.cancel();
+            }
             #[allow(clippy::cast_sign_loss)]
             let val = self
                 .rows
@@ -15153,6 +15167,35 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows, vec![vec![SqliteValue::Integer(55)]]);
+    }
+
+    #[test]
+    fn test_execute_observes_execution_cx_cancellation_immediately_after_vcolumn_opcode() {
+        let root_cx = Cx::new();
+        let cursor = MockVtabCursor::with_column_cancel(
+            vec![vec![SqliteValue::Integer(7)]],
+            root_cx.clone(),
+        );
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_out = b.alloc_reg();
+        b.emit_op(Opcode::VColumn, 0, 0, r_out, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
+        engine.register_vtab_cursor(0, Box::new(cursor));
+
+        let err = engine
+            .execute(&prog)
+            .expect_err("cancellation should be observed before VColumn publishes a value");
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(engine.take_results().is_empty());
     }
 
     // ── Time-travel (SetSnapshot) tests ──────────────────────────────────

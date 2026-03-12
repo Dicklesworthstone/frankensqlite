@@ -16,12 +16,12 @@ EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
 SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
 HASHES_TXT="${ARTIFACT_DIR}/artifact_hashes.txt"
-CORE_TARGET_DIR="/tmp/${RUN_ID_SAFE}_core_wal_publication"
-WAL_TARGET_DIR="/tmp/${RUN_ID_SAFE}_wal_publication"
+CORE_TARGET_DIR="${CORE_TARGET_DIR:-/tmp/bd_1dp9_6_7_8_4_core_wal_publication}"
+WAL_TARGET_DIR="${WAL_TARGET_DIR:-/tmp/bd_1dp9_6_7_8_4_wal_publication}"
 
 mkdir -p "${ARTIFACT_DIR}"
 
-export RUST_LOG="${RUST_LOG:-fsqlite_core::wal_adapter=trace,fsqlite_wal=debug}"
+export RUST_LOG="${RUST_LOG:-fsqlite.wal_publication=trace,fsqlite_core::wal_adapter=debug,fsqlite_wal=debug}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 export NO_COLOR="${NO_COLOR:-1}"
 
@@ -70,14 +70,62 @@ run_phase() {
 
 trace_contract_status() {
   local logfile="$1"
-  if grep -Eq 'publication_seq' "${logfile}" \
-    && grep -Eq 'snapshot_age' "${logfile}" \
-    && grep -Eq 'lookup_mode' "${logfile}" \
-    && grep -Eq 'fallback_reason' "${logfile}" \
-    && grep -Eq 'wal_checkpoint_seq' "${logfile}"; then
-    printf 'present'
-  else
-    printf 'missing'
+  shift
+
+  local pattern
+  for pattern in "$@"; do
+    if ! grep -Eq "${pattern}" "${logfile}"; then
+      printf 'missing'
+      return 0
+    fi
+  done
+
+  printf 'present'
+}
+
+require_publication_trace_contract() {
+  local phase="$1"
+  local logfile="$2"
+  local description="$3"
+  require_trace_contract \
+    "${phase}" \
+    "${logfile}" \
+    "${description}" \
+    'wal_generation' \
+    'publication_seq' \
+    'frame_delta_count' \
+    'latest_frame_entries' \
+    'snapshot_age' \
+    'lookup_mode' \
+    'fallback_reason'
+}
+
+require_reader_trace_contract() {
+  local phase="$1"
+  local logfile="$2"
+  local description="$3"
+  require_trace_contract \
+    "${phase}" \
+    "${logfile}" \
+    "${description}" \
+    'wal_checkpoint_seq' \
+    'publication_seq' \
+    'snapshot_age' \
+    'lookup_mode' \
+    'fallback_reason'
+}
+
+require_trace_contract() {
+  local phase="$1"
+  local logfile="$2"
+  local description="$3"
+  shift 3
+  local status
+  status="$(trace_contract_status "${logfile}" "$@")"
+  emit_event "${phase}" "trace_contract" "${status}" 0 "${description} trace contract ${status}"
+  if [[ "${status}" != "present" ]]; then
+    emit_event "${phase}" "fail" "fail" 0 "${description} trace contract missing"
+    return 1
   fi
 }
 
@@ -101,52 +149,62 @@ emit_event "bootstrap" "start" "running" 0 "verification started"
 run_phase \
   "commit_publication" \
   "${ARTIFACT_DIR}/commit_publication.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_commit_append_publishes_visibility_snapshot -- --nocapture
-TRACE_COMMIT_PUBLICATION="$(trace_contract_status "${ARTIFACT_DIR}/commit_publication.log")"
-emit_event "commit_publication" "trace_contract" "${TRACE_COMMIT_PUBLICATION}" 0 \
-  "publication trace contract ${TRACE_COMMIT_PUBLICATION}"
+require_publication_trace_contract \
+  "commit_publication" \
+  "${ARTIFACT_DIR}/commit_publication.log" \
+  "publication"
+TRACE_COMMIT_PUBLICATION="present"
 
 run_phase \
   "prepared_commit_publication" \
   "${ARTIFACT_DIR}/prepared_commit_publication.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_prepared_append_publishes_visibility_snapshot -- --nocapture
-TRACE_PREPARED_COMMIT_PUBLICATION="$(trace_contract_status "${ARTIFACT_DIR}/prepared_commit_publication.log")"
-emit_event "prepared_commit_publication" "trace_contract" "${TRACE_PREPARED_COMMIT_PUBLICATION}" 0 \
-  "prepared publication trace contract ${TRACE_PREPARED_COMMIT_PUBLICATION}"
+require_publication_trace_contract \
+  "prepared_commit_publication" \
+  "${ARTIFACT_DIR}/prepared_commit_publication.log" \
+  "prepared publication"
+TRACE_PREPARED_COMMIT_PUBLICATION="present"
 
 run_phase \
   "reader_snapshot_binding" \
   "${ARTIFACT_DIR}/reader_snapshot_binding.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_adapter_pins_read_snapshot_until_next_begin -- --nocapture
-TRACE_READER_BINDING="$(trace_contract_status "${ARTIFACT_DIR}/reader_snapshot_binding.log")"
-emit_event "reader_snapshot_binding" "trace_contract" "${TRACE_READER_BINDING}" 0 \
-  "reader binding trace contract ${TRACE_READER_BINDING}"
+require_reader_trace_contract \
+  "reader_snapshot_binding" \
+  "${ARTIFACT_DIR}/reader_snapshot_binding.log" \
+  "reader binding"
+TRACE_READER_BINDING="present"
 
 run_phase \
   "partial_index_lookup_contract" \
   "${ARTIFACT_DIR}/partial_index_lookup_contract.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_lookup_contract_distinguishes_authoritative_and_fallback_paths -- --nocapture
-TRACE_LOOKUP_CONTRACT="$(trace_contract_status "${ARTIFACT_DIR}/partial_index_lookup_contract.log")"
-emit_event "partial_index_lookup_contract" "trace_contract" "${TRACE_LOOKUP_CONTRACT}" 0 \
-  "lookup contract trace contract ${TRACE_LOOKUP_CONTRACT}"
+require_publication_trace_contract \
+  "partial_index_lookup_contract" \
+  "${ARTIFACT_DIR}/partial_index_lookup_contract.log" \
+  "lookup contract"
+TRACE_LOOKUP_CONTRACT="present"
 
 run_phase \
   "same_salt_generation_rollover" \
   "${ARTIFACT_DIR}/same_salt_generation_rollover.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_page_index_invalidated_on_same_salt_generation_change -- --nocapture
-TRACE_SAME_SALT_ROLLOVER="$(trace_contract_status "${ARTIFACT_DIR}/same_salt_generation_rollover.log")"
-emit_event "same_salt_generation_rollover" "trace_contract" "${TRACE_SAME_SALT_ROLLOVER}" 0 \
-  "generation rollover trace contract ${TRACE_SAME_SALT_ROLLOVER}"
+require_publication_trace_contract \
+  "same_salt_generation_rollover" \
+  "${ARTIFACT_DIR}/same_salt_generation_rollover.log" \
+  "generation rollover"
+TRACE_SAME_SALT_ROLLOVER="present"
 
 run_phase \
   "wal_refresh_generation_identity" \
   "${ARTIFACT_DIR}/wal_refresh_generation_identity.log" \
-  rch exec -- env CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
     cargo test -p fsqlite-wal test_refresh_after_reset_with_same_salts_detects_new_generation -- --nocapture
 emit_event "wal_refresh_generation_identity" "trace_contract" "not_applicable" 0 \
   "wal.rs generation-identity unit test does not emit wal_adapter publication logs"

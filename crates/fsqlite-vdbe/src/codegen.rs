@@ -6009,8 +6009,6 @@ pub fn codegen_update(
     register_table_index_meta(b, table, table_cursor);
 
     let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table));
-    let skip_label = b.emit_label();
-    let mut loop_start = 0;
 
     let set_placeholder_count: u32 = stmt
         .assignments
@@ -6023,23 +6021,42 @@ pub fn codegen_update(
         .as_ref()
         .map_or(0, count_anon_placeholders);
 
+    let rowset_reg = b.alloc_reg();
+    let matched_rowid_reg = b.alloc_reg();
+    let collect_done_label = b.emit_label();
+
     if let Some(target_expr) = rowid_target {
-        let rowid_reg = b.alloc_reg();
         b.set_next_anon_placeholder(set_placeholder_count + 1);
-        emit_expr(b, target_expr, rowid_reg, None);
+        emit_expr(b, target_expr, matched_rowid_reg, None);
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
-            rowid_reg,
-            done_label,
+            matched_rowid_reg,
+            collect_done_label,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::RowSetAdd,
+            rowset_reg,
+            matched_rowid_reg,
+            0,
             P4::None,
             0,
         );
     } else {
-        // Full table scan: Rewind → loop body → Next.
-        loop_start = b.current_addr();
-        b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, done_label, P4::None, 0);
+        // Pass 1: collect matching rowids before mutating the table cursor.
+        let collect_start = b.current_addr();
+        b.emit_jump_to_label(
+            Opcode::Rewind,
+            table_cursor,
+            0,
+            collect_done_label,
+            P4::None,
+            0,
+        );
 
+        let collect_skip_label = b.emit_label();
         if let Some(where_expr) = &stmt.where_clause {
             b.set_next_anon_placeholder(set_placeholder_count + 1);
             emit_where_filter(
@@ -6049,10 +6066,53 @@ pub fn codegen_update(
                 table,
                 stmt.table.alias.as_deref(),
                 schema,
-                skip_label,
+                collect_skip_label,
             );
         }
+
+        b.emit_op(
+            Opcode::Rowid,
+            table_cursor,
+            matched_rowid_reg,
+            0,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::RowSetAdd,
+            rowset_reg,
+            matched_rowid_reg,
+            0,
+            P4::None,
+            0,
+        );
+        b.resolve_label(collect_skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let collect_body = (collect_start + 1) as i32;
+        b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
     }
+    b.resolve_label(collect_done_label);
+
+    // Pass 2: revisit each matched rowid and perform the delete+insert rewrite.
+    let apply_done_label = b.emit_label();
+    let apply_loop = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::RowSetRead,
+        rowset_reg,
+        matched_rowid_reg,
+        apply_done_label,
+        P4::None,
+        0,
+    );
+    let apply_seek_miss_label = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        table_cursor,
+        matched_rowid_reg,
+        apply_seek_miss_label,
+        P4::None,
+        0,
+    );
 
     // Read ALL existing columns into registers.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -6107,16 +6167,12 @@ pub fn codegen_update(
         );
     }
 
-    // Get the current rowid before deleting the old row.
-    let old_rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::Rowid, table_cursor, old_rowid_reg, 0, P4::None, 0);
-
     // UPDATE is delete+insert: remove the current row first, then insert the
     // rewritten record (possibly at a new rowid).
     b.emit_op(Opcode::Delete, table_cursor, 0, 0, P4::None, 0);
 
     // Determine destination rowid for re-insertion.
-    let mut rowid_reg = old_rowid_reg;
+    let mut rowid_reg = matched_rowid_reg;
     let rowid_alias_col_idx = ctx
         .rowid_alias_col_idx
         .or_else(|| table.columns.iter().position(|col| col.is_ipk));
@@ -6203,17 +6259,13 @@ pub fn codegen_update(
         emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
     }
 
-    // Skip label for WHERE-filtered rows.
-    b.resolve_label(skip_label);
-
-    // Next: jump back to loop body, unless we did a point-lookup seek.
-    if loop_start != 0 {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let loop_body = (loop_start + 1) as i32;
-        b.emit_op(Opcode::Next, table_cursor, loop_body, 0, P4::None, 0);
-    }
+    b.resolve_label(apply_seek_miss_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let apply_loop_addr = apply_loop as i32;
+    b.emit_op(Opcode::Goto, 0, apply_loop_addr, 0, P4::None, 0);
 
     // Done: Close index cursors, then table cursor.
+    b.resolve_label(apply_done_label);
     b.resolve_label(done_label);
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     for idx_offset in 0..table.indexes.len() {
@@ -12239,6 +12291,67 @@ mod tests {
         assert!(
             idx_delete.p3 > 0,
             "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_non_rowid_predicate_uses_two_pass_rowset() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("a".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Rewind,
+                Opcode::RowSetAdd,
+                Opcode::Next,
+                Opcode::RowSetRead,
+                Opcode::SeekRowid,
+                Opcode::Delete,
+                Opcode::Insert,
+            ]
+        ));
+
+        let rowset_add_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::RowSetAdd)
+            .expect("RowSetAdd should be emitted before mutation");
+        let delete_pos = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::Delete)
+            .expect("Delete opcode should exist");
+        assert!(
+            rowset_add_pos < delete_pos,
+            "UPDATE must collect rowids before deleting rows from a scan cursor"
         );
     }
 

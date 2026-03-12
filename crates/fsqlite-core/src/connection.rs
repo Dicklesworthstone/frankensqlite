@@ -807,7 +807,6 @@ where
                     pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
                     return Ok(());
                 }
-                Err(err @ FrankenError::WalCorrupt { .. }) => return Err(err),
                 Err(err) => return Err(err),
             }
         }
@@ -1680,6 +1679,7 @@ struct DbSnapshot {
     next_master_rowid: i64,
     schema_cookie: u32,
     schema_generation: u64,
+    live_vtab_registry_undo_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1716,6 +1716,11 @@ struct SavepointEntry {
     snapshot: DbSnapshot,
     /// Concurrent savepoint state (MVCC mode only).
     concurrent_snapshot: Option<ConcurrentSavepoint>,
+}
+
+enum LiveVtabRegistryUndo {
+    Created { table_name: String },
+    Dropped { table_name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -2092,9 +2097,16 @@ pub struct Connection {
     /// Each entry is created by `execute_create_virtual_table` and registered
     /// with the VDBE engine before program execution.
     vtab_instances: RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
+    /// Instances dropped by DDL inside the current transaction/savepoint stack.
+    /// They stay hidden from planning/execution but still participate in
+    /// transaction hook dispatch until COMMIT or rollback restoration.
+    dropped_vtab_instances: RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
     /// Live virtual tables that currently participate in this connection's
     /// transaction/savepoint stack.
     live_vtab_transactions: RefCell<HashSet<String>>,
+    /// Undo log for connection-local VTAB registry topology changes so
+    /// savepoint/statement rollback can restore CREATE/DROP VIRTUAL TABLE.
+    live_vtab_registry_undo: RefCell<Vec<LiveVtabRegistryUndo>>,
     // ── Parse cache (br-legjy.7.3) ──────────────────────────────────────────
     /// LRU-bounded cache of parsed SQL ASTs keyed by SQL text hash.
     /// Avoids re-parsing the same SQL string on repeated query/execute calls.
@@ -2112,6 +2124,10 @@ pub struct Connection {
     /// Registry of attached databases. Tracks schema names registered via
     /// ATTACH DATABASE so that schema-qualified references resolve correctly.
     attached_schemas: RefCell<SchemaRegistry>,
+    /// Live secondary connections for attached schemas. These back the current
+    /// attached-schema read delegation path until the VDBE can route across
+    /// multiple pager backends directly.
+    attached_connections: RefCell<HashMap<String, Box<Self>>>,
     // ── Time-travel MemDatabase snapshots (#23) ──────────────────────────────
     /// Ring buffer of MemDatabase snapshots captured at each COMMIT.
     /// Used for `FOR SYSTEM_TIME AS OF` queries on :memory: databases.
@@ -2242,7 +2258,9 @@ impl Connection {
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(default_vtab_module_registry()),
             vtab_instances: RefCell::new(HashMap::new()),
+            dropped_vtab_instances: RefCell::new(HashMap::new()),
             live_vtab_transactions: RefCell::new(HashSet::new()),
+            live_vtab_registry_undo: RefCell::new(Vec::new()),
             // Parse cache (br-legjy.7.3)
             parse_cache: RefCell::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
             parse_cache_cookie: RefCell::new(0),
@@ -2250,6 +2268,7 @@ impl Connection {
             compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
+            attached_connections: RefCell::new(HashMap::new()),
             // Time-travel MemDatabase snapshots (#23)
             time_travel_snapshots: RefCell::new(Vec::new()),
             time_travel_active: Cell::new(false),
@@ -2288,6 +2307,108 @@ impl Connection {
         *self.last_insert_rowid.borrow()
     }
 
+    fn with_attached_connection<T>(
+        &self,
+        schema: &str,
+        f: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        let key = attached_schema_key(schema);
+        let attached_connections = self.attached_connections.borrow();
+        let conn = attached_connections.get(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("attached connection missing for schema: {schema}"))
+        })?;
+        f(conn.as_ref())
+    }
+
+    fn validate_attached_target_schema(
+        &self,
+        name: &QualifiedName,
+        action: &'static str,
+    ) -> Result<()> {
+        let Some(schema) = name.schema.as_deref() else {
+            return Ok(());
+        };
+        if is_builtin_schema(schema) {
+            return Ok(());
+        }
+
+        let registry = self.attached_schemas.borrow();
+        if registry.find(schema).is_some() {
+            return Err(FrankenError::NotImplemented(format!(
+                "{action} against attached schema {schema} is not yet supported"
+            )));
+        }
+
+        Err(FrankenError::Internal(format!(
+            "no such database: {schema}"
+        )))
+    }
+
+    fn reject_unsupported_attached_target_schema(&self, statement: &Statement) -> Result<()> {
+        match statement {
+            Statement::CreateTable(create) => {
+                self.validate_attached_target_schema(&create.name, "CREATE TABLE")
+            }
+            Statement::CreateVirtualTable(create_virtual) => {
+                self.validate_attached_target_schema(&create_virtual.name, "CREATE VIRTUAL TABLE")
+            }
+            Statement::CreateIndex(create_index) => {
+                self.validate_attached_target_schema(&create_index.name, "CREATE INDEX")
+            }
+            Statement::CreateView(create_view) => {
+                self.validate_attached_target_schema(&create_view.name, "CREATE VIEW")
+            }
+            Statement::CreateTrigger(create_trigger) => {
+                self.validate_attached_target_schema(&create_trigger.name, "CREATE TRIGGER")
+            }
+            Statement::Drop(drop_stmt) => {
+                self.validate_attached_target_schema(&drop_stmt.name, "DROP")
+            }
+            Statement::AlterTable(alter) => {
+                self.validate_attached_target_schema(&alter.table, "ALTER TABLE")
+            }
+            Statement::Insert(insert) => {
+                self.validate_attached_target_schema(&insert.table, "INSERT")
+            }
+            Statement::Update(update) => {
+                self.validate_attached_target_schema(&update.table.name, "UPDATE")
+            }
+            Statement::Delete(delete) => {
+                self.validate_attached_target_schema(&delete.table.name, "DELETE")
+            }
+            Statement::Pragma(pragma) => {
+                self.validate_attached_target_schema(&pragma.name, "PRAGMA")
+            }
+            Statement::Explain { stmt, .. } => self.reject_unsupported_attached_target_schema(stmt),
+            _ => Ok(()),
+        }
+    }
+
+    fn maybe_execute_attached_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Vec<Row>>> {
+        let attached_schema = {
+            let registry = self.attached_schemas.borrow();
+            determine_attached_select_schema(select, &registry)?
+        };
+        let Some(attached_schema) = attached_schema else {
+            return Ok(None);
+        };
+
+        let mut rewritten = select.clone();
+        strip_attached_schema_from_select(&mut rewritten, &attached_schema);
+        tracing::debug!(
+            schema = %attached_schema,
+            "delegating attached-schema SELECT to attached connection"
+        );
+        self.with_attached_connection(&attached_schema, |conn| {
+            conn.execute_statement(&Statement::Select(rewritten), params)
+        })
+        .map(Some)
+    }
+
     fn has_live_vtab_instance(&self, table_name: &str) -> bool {
         self.vtab_instances
             .borrow()
@@ -2298,6 +2419,135 @@ impl Connection {
         has_primary_live_vtab_source_inner(select, |table_name| {
             self.has_live_vtab_instance(table_name)
         })
+    }
+
+    fn transactional_live_vtab_registry_active(&self) -> bool {
+        *self.in_transaction.borrow()
+            || self.active_txn.borrow().is_some()
+            || !self.savepoints.borrow().is_empty()
+            || self.internal_statement_savepoint_depth.get() > 0
+    }
+
+    fn active_live_vtab_instance_mut<'a>(
+        live_instances: &'a mut HashMap<String, Box<dyn ErasedVtabInstance>>,
+        dropped_instances: &'a mut HashMap<String, Box<dyn ErasedVtabInstance>>,
+        table_name: &str,
+    ) -> Option<&'a mut Box<dyn ErasedVtabInstance>> {
+        if let Some(instance) = live_instances.get_mut(table_name) {
+            Some(instance)
+        } else {
+            dropped_instances.get_mut(table_name)
+        }
+    }
+
+    fn note_live_vtab_created(&self, table_name: &str) {
+        if !self.transactional_live_vtab_registry_active() {
+            return;
+        }
+        self.live_vtab_registry_undo
+            .borrow_mut()
+            .push(LiveVtabRegistryUndo::Created {
+                table_name: table_name.to_ascii_uppercase(),
+            });
+    }
+
+    fn stage_dropped_live_vtab(
+        &self,
+        table_name: &str,
+        mut instance: Box<dyn ErasedVtabInstance>,
+        cx: &Cx,
+    ) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        if !self.transactional_live_vtab_registry_active() {
+            self.live_vtab_transactions.borrow_mut().remove(&key);
+            return instance.destroy(cx);
+        }
+
+        let replaced = self
+            .dropped_vtab_instances
+            .borrow_mut()
+            .insert(key.clone(), instance);
+        if replaced.is_some() {
+            return Err(FrankenError::Internal(format!(
+                "dropped virtual table registry already contains {table_name}"
+            )));
+        }
+        self.live_vtab_registry_undo
+            .borrow_mut()
+            .push(LiveVtabRegistryUndo::Dropped { table_name: key });
+        Ok(())
+    }
+
+    fn restore_live_vtab_registry_to(&self, cx: &Cx, target_len: usize) -> Result<()> {
+        let mut first_error = None;
+        while self.live_vtab_registry_undo.borrow().len() > target_len {
+            let undo = self
+                .live_vtab_registry_undo
+                .borrow_mut()
+                .pop()
+                .expect("undo length checked above");
+            match undo {
+                LiveVtabRegistryUndo::Created { table_name } => {
+                    self.live_vtab_transactions.borrow_mut().remove(&table_name);
+                    let removed = {
+                        let mut live_instances = self.vtab_instances.borrow_mut();
+                        live_instances.remove(&table_name)
+                    }
+                    .or_else(|| {
+                        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+                        dropped_instances.remove(&table_name)
+                    });
+                    if let Some(mut instance) = removed
+                        && let Err(error) = instance.destroy(cx)
+                        && first_error.is_none()
+                    {
+                        first_error = Some(FrankenError::Internal(format!(
+                            "virtual table {table_name} destroy failed during rollback: {error}"
+                        )));
+                    }
+                }
+                LiveVtabRegistryUndo::Dropped { table_name } => {
+                    let instance = {
+                        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+                        dropped_instances.remove(&table_name)
+                    }
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "dropped virtual table {table_name} missing during rollback restore"
+                        ))
+                    })?;
+                    let mut live_instances = self.vtab_instances.borrow_mut();
+                    if live_instances.contains_key(&table_name) {
+                        self.dropped_vtab_instances
+                            .borrow_mut()
+                            .insert(table_name.clone(), instance);
+                        return Err(FrankenError::Internal(format!(
+                            "virtual table {table_name} already exists during rollback restore"
+                        )));
+                    }
+                    live_instances.insert(table_name, instance);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn finalize_live_vtab_registry_commit(&self, cx: &Cx) {
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+        for (table_name, mut instance) in dropped_instances.drain() {
+            if let Err(error) = instance.destroy(cx) {
+                tracing::error!(
+                    table = %table_name,
+                    error = %error,
+                    "virtual-table destroy finalizer failed after durable commit"
+                );
+            }
+        }
+        drop(dropped_instances);
+        self.live_vtab_registry_undo.borrow_mut().clear();
     }
 
     fn active_live_vtab_names(&self) -> Vec<String> {
@@ -2371,9 +2621,14 @@ impl Connection {
 
     fn live_vtab_sync_all(&self, cx: &Cx) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut instances = self.vtab_instances.borrow_mut();
+        let mut live_instances = self.vtab_instances.borrow_mut();
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         for table_name in names {
-            if let Some(instance) = instances.get_mut(&table_name) {
+            if let Some(instance) = Self::active_live_vtab_instance_mut(
+                &mut live_instances,
+                &mut dropped_instances,
+                &table_name,
+            ) {
                 instance.sync_txn(cx).map_err(|error| {
                     FrankenError::Internal(format!(
                         "virtual table {table_name} sync failed: {error}"
@@ -2386,13 +2641,22 @@ impl Connection {
 
     fn live_vtab_savepoint_all(&self, cx: &Cx, level: i32) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut instances = self.vtab_instances.borrow_mut();
-        let mut completed = Vec::new();
+        let mut live_instances = self.vtab_instances.borrow_mut();
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
+        let mut completed: Vec<String> = Vec::new();
         for table_name in names {
-            if let Some(instance) = instances.get_mut(&table_name) {
+            if let Some(instance) = Self::active_live_vtab_instance_mut(
+                &mut live_instances,
+                &mut dropped_instances,
+                &table_name,
+            ) {
                 if let Err(error) = instance.savepoint(cx, level) {
                     for applied in &completed {
-                        if let Some(applied_instance) = instances.get_mut(applied) {
+                        if let Some(applied_instance) = Self::active_live_vtab_instance_mut(
+                            &mut live_instances,
+                            &mut dropped_instances,
+                            applied,
+                        ) {
                             let _ = applied_instance.release(cx, level);
                         }
                     }
@@ -2408,9 +2672,14 @@ impl Connection {
 
     fn live_vtab_release_all(&self, cx: &Cx, level: i32) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut instances = self.vtab_instances.borrow_mut();
+        let mut live_instances = self.vtab_instances.borrow_mut();
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         for table_name in names {
-            if let Some(instance) = instances.get_mut(&table_name) {
+            if let Some(instance) = Self::active_live_vtab_instance_mut(
+                &mut live_instances,
+                &mut dropped_instances,
+                &table_name,
+            ) {
                 instance.release(cx, level).map_err(|error| {
                     FrankenError::Internal(format!(
                         "virtual table {table_name} release({level}) failed: {error}"
@@ -2423,9 +2692,14 @@ impl Connection {
 
     fn live_vtab_rollback_to_all(&self, cx: &Cx, level: i32) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut instances = self.vtab_instances.borrow_mut();
+        let mut live_instances = self.vtab_instances.borrow_mut();
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         for table_name in names {
-            if let Some(instance) = instances.get_mut(&table_name) {
+            if let Some(instance) = Self::active_live_vtab_instance_mut(
+                &mut live_instances,
+                &mut dropped_instances,
+                &table_name,
+            ) {
                 instance.rollback_to(cx, level).map_err(|error| {
                     FrankenError::Internal(format!(
                         "virtual table {table_name} rollback_to({level}) failed: {error}"
@@ -2438,10 +2712,14 @@ impl Connection {
 
     fn live_vtab_commit_all_best_effort(&self, cx: &Cx) {
         let names = self.active_live_vtab_names();
-        let mut instances = self.vtab_instances.borrow_mut();
+        let mut live_instances = self.vtab_instances.borrow_mut();
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         for table_name in &names {
-            if let Some(instance) = instances.get_mut(table_name)
-                && let Err(error) = instance.commit(cx)
+            if let Some(instance) = Self::active_live_vtab_instance_mut(
+                &mut live_instances,
+                &mut dropped_instances,
+                table_name,
+            ) && let Err(error) = instance.commit(cx)
             {
                 tracing::error!(
                     table = %table_name,
@@ -2455,11 +2733,15 @@ impl Connection {
 
     fn live_vtab_rollback_all(&self, cx: &Cx) -> Result<()> {
         let names = self.active_live_vtab_names();
-        let mut instances = self.vtab_instances.borrow_mut();
+        let mut live_instances = self.vtab_instances.borrow_mut();
+        let mut dropped_instances = self.dropped_vtab_instances.borrow_mut();
         let mut first_error = None;
         for table_name in &names {
-            if let Some(instance) = instances.get_mut(table_name)
-                && let Err(error) = instance.rollback(cx)
+            if let Some(instance) = Self::active_live_vtab_instance_mut(
+                &mut live_instances,
+                &mut dropped_instances,
+                table_name,
+            ) && let Err(error) = instance.rollback(cx)
                 && first_error.is_none()
             {
                 first_error = Some(FrankenError::Internal(format!(
@@ -2554,7 +2836,7 @@ impl Connection {
                 FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
             })?;
             if let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() {
-                return self.scan_live_fts5_rows(fts5, src, plan);
+                return Self::scan_live_fts5_rows(fts5, src, plan);
             }
             instance.open_cursor()?
         };
@@ -2582,17 +2864,12 @@ impl Connection {
     }
 
     fn scan_live_fts5_rows(
-        &self,
         fts5: &Fts5Table,
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let rows = match plan.idx_num {
-            0 => fts5
-                .all_rows()
-                .into_iter()
-                .map(|(rowid, columns)| (rowid, columns))
-                .collect::<Vec<_>>(),
+            0 => fts5.all_rows().into_iter().collect::<Vec<_>>(),
             1 => {
                 let query = plan.args.first().ok_or_else(|| {
                     FrankenError::Internal("fts5 MATCH scan missing query argument".to_owned())
@@ -3210,8 +3487,10 @@ impl Connection {
 
             if best_effort {
                 let _ = self.live_vtab_rollback_all(&cx);
+                let _ = self.restore_live_vtab_registry_to(&cx, 0);
             } else {
                 self.live_vtab_rollback_all(&cx)?;
+                self.restore_live_vtab_registry_to(&cx, 0)?;
             }
 
             // Only tear down the concurrent session once rollback has
@@ -4130,7 +4409,7 @@ impl Connection {
 
                 if pager_rollback_succeeded {
                     self.txn_metrics_note_rollback();
-                    self.restore_snapshot(&snapshot);
+                    self.restore_snapshot(&cx, &snapshot)?;
                 }
 
                 if !cleanup_errors.is_empty() {
@@ -4281,7 +4560,11 @@ impl Connection {
             && self.internal_statement_savepoint_depth.get() == 0
             && matches!(
                 statement.as_ref(),
-                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
+                    | Statement::CreateIndex(_)
+                    | Statement::Reindex(_)
             );
         let op_cx = self.op_cx()?;
         let result = if use_statement_savepoint {
@@ -4355,6 +4638,7 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
     ) -> Result<Vec<Row>> {
+        self.reject_unsupported_attached_target_schema(statement)?;
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(create)?;
@@ -4381,6 +4665,9 @@ impl Connection {
                 if self.has_view_references(select) {
                     self.log_mem_execution_fallback("select", "view_materialization")?;
                     return self.execute_with_materialized_views(select, params);
+                }
+                if let Some(rows) = self.maybe_execute_attached_select(select, params)? {
+                    return Ok(rows);
                 }
                 // 5G.4 (bd-3ly4): sqlite_master/sqlite_schema virtual table support.
                 if self.has_sqlite_schema_references(select) {
@@ -5188,13 +5475,20 @@ impl Connection {
                         other => format!("{other}"),
                     })
                     .unwrap_or_default();
+                let attached_connection = Box::new(Self::open(path.clone())?);
                 self.attached_schemas
                     .borrow_mut()
                     .attach(attach.schema.clone(), path)?;
+                self.attached_connections
+                    .borrow_mut()
+                    .insert(attached_schema_key(&attach.schema), attached_connection);
                 Ok(Vec::new())
             }
             Statement::Detach(schema_name) => {
                 self.attached_schemas.borrow_mut().detach(schema_name)?;
+                self.attached_connections
+                    .borrow_mut()
+                    .remove(&attached_schema_key(schema_name));
                 Ok(Vec::new())
             }
             #[allow(unreachable_patterns)]
@@ -6106,6 +6400,7 @@ impl Connection {
             || select.with.is_some()
             || self.has_view_references(select)
             || self.has_sqlite_schema_references(select)
+            || select_references_non_main_schema(select)
             || !select.body.compounds.is_empty()
             || (expression_only && has_implicit_aggregation(select))
             || (expression_only && expression_only_has_subquery(select))
@@ -8044,6 +8339,11 @@ impl Connection {
             let mut guard = self.active_txn.borrow_mut();
             let Some(txn) = guard.take() else {
                 self.live_vtab_transactions.borrow_mut().clear();
+                if ok {
+                    self.finalize_live_vtab_registry_commit(&cx);
+                } else {
+                    self.restore_live_vtab_registry_to(&cx, 0)?;
+                }
                 *self.concurrent_txn.borrow_mut() = false;
                 *self.concurrent_session_id.borrow_mut() = None;
                 self.txn_metrics_mark_finished();
@@ -8057,120 +8357,136 @@ impl Connection {
         // next_commit_seq between plan (which reads it) and finalize (which
         // bumps it).  Without this, assigned_commit_seq != committed_seq,
         // corrupting the MVCC commit index.
-        let (txn_result, committed_write, rolled_back_dirty_state) =
-            if ok {
-                let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-                let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
-                let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
-                    match self.plan_concurrent_commit() {
-                        Ok(plan) => plan,
-                        Err(e) => {
-                            // Plan failed (SSI conflict, etc.) — abort under the
-                            // mutex so we still hold sequencing invariants.
-                            drop(_commit_guard);
-                            self.abort_current_concurrent_session();
-                            self.txn_metrics_note_rollback();
-                            let rollback_result = txn.rollback(&cx);
-                            let rollback_succeeded = rollback_result.is_ok();
-                            *self.concurrent_txn.borrow_mut() = false;
-                            *self.concurrent_session_id.borrow_mut() = None;
-                            self.txn_metrics_mark_finished();
-                            if txn_has_pending_writes && rollback_succeeded {
-                                self.reload_memdb_from_pager(&cx)?;
-                            }
-                            return Err(match rollback_result {
-                                Ok(()) => e,
-                                Err(rollback_error) => rollback_error,
-                            });
-                        }
-                    }
-                } else {
-                    None
-                };
-                if !self.live_vtab_transactions.borrow().is_empty() {
-                    match self.live_vtab_sync_all(&cx) {
-                        Ok(()) => {}
-                        Err(sync_error) => {
-                            drop(_commit_guard);
-                            if *self.concurrent_txn.borrow() {
-                                self.abort_current_concurrent_session();
-                            }
-                            self.txn_metrics_note_rollback();
-                            let rollback_result = txn.rollback(&cx);
-                            let rollback_succeeded = rollback_result.is_ok();
-                            let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                            *self.concurrent_txn.borrow_mut() = false;
-                            *self.concurrent_session_id.borrow_mut() = None;
-                            self.txn_metrics_mark_finished();
-                            if txn_has_pending_writes && rollback_succeeded {
-                                self.reload_memdb_from_pager(&cx)?;
-                            }
-                            vtab_rollback_result?;
-                            return Err(match rollback_result {
-                                Ok(()) => sync_error,
-                                Err(rollback_error) => rollback_error,
-                            });
-                        }
-                    }
-                }
-                match txn.commit(&cx) {
-                    Ok(()) => {
-                        if txn_has_pending_writes {
-                            let committed_seq = self.advance_commit_clock();
-                            if let Some(plan) = concurrent_plan {
-                                self.finalize_concurrent_commit(plan, committed_seq);
-                            }
-                        } else if *self.concurrent_txn.borrow() {
-                            let _ = self.concurrent_session_id.borrow_mut().take().and_then(
-                                |session_id| {
-                                    lock_unpoisoned(&self.concurrent_registry).remove(session_id)
-                                },
-                            );
-                        }
-                        self.live_vtab_commit_all_best_effort(&cx);
-                        (Ok(()), txn_has_pending_writes, false)
-                    }
+        let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
+            let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
+            let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+            let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
+                match self.plan_concurrent_commit() {
+                    Ok(plan) => plan,
                     Err(e) => {
-                        // Commit failed (e.g. I/O error or BUSY in standard mode).
-                        // We must rollback to ensure cleanup and propagate the error.
+                        // Plan failed (SSI conflict, etc.) — abort under the
+                        // mutex so we still hold sequencing invariants.
+                        drop(_commit_guard);
+                        self.abort_current_concurrent_session();
                         self.txn_metrics_note_rollback();
                         let rollback_result = txn.rollback(&cx);
                         let rollback_succeeded = rollback_result.is_ok();
                         let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                        if *self.concurrent_txn.borrow() {
-                            self.abort_current_concurrent_session();
+                        let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                        *self.concurrent_txn.borrow_mut() = false;
+                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.txn_metrics_mark_finished();
+                        if txn_has_pending_writes && rollback_succeeded {
+                            self.reload_memdb_from_pager(&cx)?;
                         }
-                        (
-                            match rollback_result {
-                                Ok(()) => match vtab_rollback_result {
-                                    Ok(()) => Err(e),
-                                    Err(vtab_error) => Err(vtab_error),
-                                },
-                                Err(rollback_error) => Err(rollback_error),
-                            },
-                            false,
-                            txn_has_pending_writes && rollback_succeeded,
-                        )
+                        vtab_rollback_result?;
+                        registry_rollback_result?;
+                        return Err(match rollback_result {
+                            Ok(()) => e,
+                            Err(rollback_error) => rollback_error,
+                        });
                     }
                 }
             } else {
-                let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
-                if *self.concurrent_txn.borrow() {
-                    self.abort_current_concurrent_session();
-                }
-                self.txn_metrics_note_rollback();
-                let rollback_result = txn.rollback(&cx);
-                let rollback_succeeded = rollback_result.is_ok();
-                let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                (
-                    match rollback_result {
-                        Ok(()) => vtab_rollback_result,
-                        Err(rollback_error) => Err(rollback_error),
-                    },
-                    false,
-                    txn_has_pending_writes && rollback_succeeded,
-                )
+                None
             };
+            if !self.live_vtab_transactions.borrow().is_empty() {
+                match self.live_vtab_sync_all(&cx) {
+                    Ok(()) => {}
+                    Err(sync_error) => {
+                        drop(_commit_guard);
+                        if *self.concurrent_txn.borrow() {
+                            self.abort_current_concurrent_session();
+                        }
+                        self.txn_metrics_note_rollback();
+                        let rollback_result = txn.rollback(&cx);
+                        let rollback_succeeded = rollback_result.is_ok();
+                        let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+                        let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                        *self.concurrent_txn.borrow_mut() = false;
+                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.txn_metrics_mark_finished();
+                        if txn_has_pending_writes && rollback_succeeded {
+                            self.reload_memdb_from_pager(&cx)?;
+                        }
+                        vtab_rollback_result?;
+                        registry_rollback_result?;
+                        return Err(match rollback_result {
+                            Ok(()) => sync_error,
+                            Err(rollback_error) => rollback_error,
+                        });
+                    }
+                }
+            }
+            match txn.commit(&cx) {
+                Ok(()) => {
+                    if txn_has_pending_writes {
+                        let committed_seq = self.advance_commit_clock();
+                        if let Some(plan) = concurrent_plan {
+                            self.finalize_concurrent_commit(plan, committed_seq);
+                        }
+                    } else if *self.concurrent_txn.borrow() {
+                        let _ =
+                            self.concurrent_session_id
+                                .borrow_mut()
+                                .take()
+                                .and_then(|session_id| {
+                                    lock_unpoisoned(&self.concurrent_registry).remove(session_id)
+                                });
+                    }
+                    self.live_vtab_commit_all_best_effort(&cx);
+                    self.finalize_live_vtab_registry_commit(&cx);
+                    (Ok(()), txn_has_pending_writes, false)
+                }
+                Err(e) => {
+                    // Commit failed (e.g. I/O error or BUSY in standard mode).
+                    // We must rollback to ensure cleanup and propagate the error.
+                    self.txn_metrics_note_rollback();
+                    let rollback_result = txn.rollback(&cx);
+                    let rollback_succeeded = rollback_result.is_ok();
+                    let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+                    let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                    if *self.concurrent_txn.borrow() {
+                        self.abort_current_concurrent_session();
+                    }
+                    (
+                        match rollback_result {
+                            Ok(()) => match vtab_rollback_result {
+                                Ok(()) => match registry_rollback_result {
+                                    Ok(()) => Err(e),
+                                    Err(registry_error) => Err(registry_error),
+                                },
+                                Err(vtab_error) => Err(vtab_error),
+                            },
+                            Err(rollback_error) => Err(rollback_error),
+                        },
+                        false,
+                        txn_has_pending_writes && rollback_succeeded,
+                    )
+                }
+            }
+        } else {
+            let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+            if *self.concurrent_txn.borrow() {
+                self.abort_current_concurrent_session();
+            }
+            self.txn_metrics_note_rollback();
+            let rollback_result = txn.rollback(&cx);
+            let rollback_succeeded = rollback_result.is_ok();
+            let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+            let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+            (
+                match rollback_result {
+                    Ok(()) => match vtab_rollback_result {
+                        Ok(()) => registry_rollback_result,
+                        Err(vtab_error) => Err(vtab_error),
+                    },
+                    Err(rollback_error) => Err(rollback_error),
+                },
+                false,
+                txn_has_pending_writes && rollback_succeeded,
+            )
+        };
 
         // Ensure connection-level transaction state is cleared regardless of outcome.
         *self.concurrent_txn.borrow_mut() = false;
@@ -9644,9 +9960,16 @@ impl Connection {
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             });
-            self.vtab_instances
+            let replaced = self
+                .vtab_instances
                 .borrow_mut()
                 .insert(table_name.to_ascii_uppercase(), instance);
+            if replaced.is_some() {
+                return Err(FrankenError::Internal(format!(
+                    "live virtual table registry already contains {table_name}"
+                )));
+            }
+            self.note_live_vtab_created(&table_name);
 
             self.insert_sqlite_master_row(
                 "table",
@@ -9697,6 +10020,7 @@ impl Connection {
     /// Execute a DROP statement (TABLE, INDEX, VIEW, TRIGGER).
     #[allow(clippy::too_many_lines)]
     fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
+        let cx = self.op_cx()?;
         let swallow_missing_master = |err: FrankenError| -> Result<()> {
             if drop_stmt.if_exists && is_sqlite_master_entry_missing(&err) {
                 Ok(())
@@ -9752,6 +10076,13 @@ impl Connection {
                         if let Err(err) = self.delete_sqlite_master_row(&trigger_name) {
                             swallow_missing_master(err)?;
                         }
+                    }
+                    if let Some(instance) = self
+                        .vtab_instances
+                        .borrow_mut()
+                        .remove(&obj_name.to_ascii_uppercase())
+                    {
+                        self.stage_dropped_live_vtab(obj_name, instance, &cx)?;
                     }
 
                     if let Err(err) = self.delete_sqlite_master_row(obj_name) {
@@ -9883,6 +10214,11 @@ impl Connection {
     /// Execute an ALTER TABLE statement.
     fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         let table_name = &alter.table.name;
+        if matches!(alter.action, AlterTableAction::RenameTo(_))
+            && self.has_live_vtab_instance(table_name)
+        {
+            return Err(FrankenError::Unsupported);
+        }
         let old_name = table_name.clone();
         let new_schema = match &alter.action {
             AlterTableAction::RenameTo(new_name) => {
@@ -11772,11 +12108,12 @@ impl Connection {
             next_master_rowid: *self.next_master_rowid.borrow(),
             schema_cookie: *self.schema_cookie.borrow(),
             schema_generation: self.schema_generation.get(),
+            live_vtab_registry_undo_len: self.live_vtab_registry_undo.borrow().len(),
         }
     }
 
     /// Restore a snapshot, replacing the current database + schema state.
-    fn restore_snapshot(&self, snap: &DbSnapshot) {
+    fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
         self.db.borrow_mut().rollback_to(snap.db_version);
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
         (*self.views.borrow_mut()).clone_from(&snap.views);
@@ -11788,6 +12125,7 @@ impl Connection {
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
         self.schema_generation.set(snap.schema_generation);
+        self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -12270,6 +12608,7 @@ impl Connection {
                 };
                 let rollback_succeeded = rollback_result.is_ok();
                 let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
+                let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
                 let reload_result = if txn_has_pending_writes && rollback_succeeded {
                     self.reload_memdb_from_pager(&cx)
                 } else {
@@ -12289,6 +12628,7 @@ impl Connection {
                 rollback_result?;
                 reload_result?;
                 vtab_rollback_result?;
+                registry_rollback_result?;
                 return Err(sync_error);
             }
         }
@@ -12337,6 +12677,7 @@ impl Connection {
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
         self.live_vtab_commit_all_best_effort(&cx);
+        self.finalize_live_vtab_registry_commit(&cx);
         self.txn_metrics_mark_finished();
 
         // Discard rollback snapshot and savepoints — changes are committed.
@@ -12494,7 +12835,7 @@ impl Connection {
                 self.txn_metrics_set_savepoint_depth(savepoints.len());
             }
             self.txn_metrics_note_rollback();
-            self.restore_snapshot(&snap);
+            self.restore_snapshot(&cx, &snap)?;
 
             // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
             self.maybe_gc_tick();
@@ -12531,6 +12872,7 @@ impl Connection {
                 Ok(())
             };
             let live_vtab_result = self.live_vtab_rollback_all(&cx);
+            let live_vtab_registry_result = self.restore_live_vtab_registry_to(&cx, 0);
 
             // Reload MemDatabase from pager's committed state.
             // This replaces the snapshot-restore approach with reading the
@@ -12555,6 +12897,7 @@ impl Connection {
             rollback_result?;
             reload_result?;
             live_vtab_result?;
+            live_vtab_registry_result?;
         }
         Ok(())
     }
@@ -20674,6 +21017,586 @@ fn has_primary_live_vtab_source_inner(
 
 fn has_fallback_from_source(select: &SelectStatement) -> bool {
     has_subquery_source(select) || has_table_function_source(select)
+}
+
+#[derive(Debug, Default)]
+struct AttachedSelectUsage {
+    attached_schemas: HashSet<String>,
+    mixed_with_main_or_unqualified: bool,
+}
+
+fn attached_schema_key(schema: &str) -> String {
+    schema.to_ascii_lowercase()
+}
+
+fn is_builtin_schema(schema: &str) -> bool {
+    schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp")
+}
+
+fn determine_attached_select_schema(
+    select: &SelectStatement,
+    registry: &SchemaRegistry,
+) -> Result<Option<String>> {
+    let mut usage = AttachedSelectUsage::default();
+    visit_select_qualified_names(select, &mut |name| {
+        match name.schema.as_deref() {
+            None => usage.mixed_with_main_or_unqualified = true,
+            Some(schema) if is_builtin_schema(schema) => {
+                usage.mixed_with_main_or_unqualified = true;
+            }
+            Some(schema) if registry.find(schema).is_some() => {
+                usage.attached_schemas.insert(attached_schema_key(schema));
+            }
+            Some(schema) => {
+                return Err(FrankenError::Internal(format!(
+                    "no such database: {schema}"
+                )));
+            }
+        }
+        Ok(())
+    })?;
+
+    if usage.attached_schemas.is_empty() {
+        return Ok(None);
+    }
+    if usage.attached_schemas.len() > 1 {
+        return Err(FrankenError::NotImplemented(
+            "queries spanning multiple attached schemas are not yet supported".to_owned(),
+        ));
+    }
+    if usage.mixed_with_main_or_unqualified {
+        return Err(FrankenError::NotImplemented(
+            "queries mixing attached schemas with main/temp or unqualified tables are not yet supported"
+                .to_owned(),
+        ));
+    }
+    Ok(usage.attached_schemas.into_iter().next())
+}
+
+fn select_references_non_main_schema(select: &SelectStatement) -> bool {
+    let mut found = false;
+    let _ = visit_select_qualified_names(select, &mut |name| {
+        if name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| !is_builtin_schema(schema))
+        {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+fn strip_attached_schema_from_select(select: &mut SelectStatement, target_schema: &str) {
+    visit_select_qualified_names_mut(select, &mut |name| {
+        if name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case(target_schema))
+        {
+            name.schema = None;
+        }
+    });
+}
+
+fn visit_select_qualified_names(
+    select: &SelectStatement,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            visit_select_qualified_names(&cte.query, f)?;
+        }
+    }
+    visit_select_core_qualified_names(&select.body.select, f)?;
+    for (_, core) in &select.body.compounds {
+        visit_select_core_qualified_names(core, f)?;
+    }
+    for term in &select.order_by {
+        visit_expr_qualified_names(&term.expr, f)?;
+    }
+    if let Some(limit) = &select.limit {
+        visit_expr_qualified_names(&limit.limit, f)?;
+        if let Some(offset) = &limit.offset {
+            visit_expr_qualified_names(offset, f)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_select_core_qualified_names(
+    core: &SelectCore,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    visit_expr_qualified_names(expr, f)?;
+                }
+            }
+            if let Some(from_clause) = from {
+                visit_table_or_subquery_qualified_names(&from_clause.source, f)?;
+                for join in &from_clause.joins {
+                    visit_table_or_subquery_qualified_names(&join.table, f)?;
+                    if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                        visit_expr_qualified_names(expr, f)?;
+                    }
+                }
+            }
+            if let Some(expr) = where_clause {
+                visit_expr_qualified_names(expr, f)?;
+            }
+            for expr in group_by {
+                visit_expr_qualified_names(expr, f)?;
+            }
+            if let Some(expr) = having {
+                visit_expr_qualified_names(expr, f)?;
+            }
+            for window in windows {
+                visit_window_qualified_names(window, f)?;
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    visit_expr_qualified_names(expr, f)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn visit_table_or_subquery_qualified_names(
+    source: &TableOrSubquery,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    match source {
+        TableOrSubquery::Table { name, .. } => f(name),
+        TableOrSubquery::Subquery { query, .. } => visit_select_qualified_names(query, f),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for expr in args {
+                visit_expr_qualified_names(expr, f)?;
+            }
+            Ok(())
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            visit_table_or_subquery_qualified_names(&from.source, f)?;
+            for join in &from.joins {
+                visit_table_or_subquery_qualified_names(&join.table, f)?;
+                if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                    visit_expr_qualified_names(expr, f)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn visit_expr_qualified_names(
+    expr: &Expr,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    match expr {
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+            Ok(())
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            visit_expr_qualified_names(left, f)?;
+            visit_expr_qualified_names(right, f)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => visit_expr_qualified_names(expr, f),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            visit_expr_qualified_names(expr, f)?;
+            visit_expr_qualified_names(low, f)?;
+            visit_expr_qualified_names(high, f)
+        }
+        Expr::In { expr, set, .. } => {
+            visit_expr_qualified_names(expr, f)?;
+            match set {
+                InSet::List(exprs) => {
+                    for expr in exprs {
+                        visit_expr_qualified_names(expr, f)?;
+                    }
+                    Ok(())
+                }
+                InSet::Subquery(subquery) => visit_select_qualified_names(subquery, f),
+                InSet::Table(name) => f(name),
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            visit_expr_qualified_names(expr, f)?;
+            visit_expr_qualified_names(pattern, f)?;
+            if let Some(escape) = escape {
+                visit_expr_qualified_names(escape, f)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                visit_expr_qualified_names(operand, f)?;
+            }
+            for (when_expr, then_expr) in whens {
+                visit_expr_qualified_names(when_expr, f)?;
+                visit_expr_qualified_names(then_expr, f)?;
+            }
+            if let Some(else_expr) = else_expr {
+                visit_expr_qualified_names(else_expr, f)?;
+            }
+            Ok(())
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            visit_select_qualified_names(subquery, f)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(args) = args {
+                for expr in args {
+                    visit_expr_qualified_names(expr, f)?;
+                }
+            }
+            for term in order_by {
+                visit_expr_qualified_names(&term.expr, f)?;
+            }
+            if let Some(filter) = filter {
+                visit_expr_qualified_names(filter, f)?;
+            }
+            if let Some(window) = over {
+                visit_window_spec_qualified_names(window, f)?;
+            }
+            Ok(())
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            visit_expr_qualified_names(expr, f)?;
+            visit_expr_qualified_names(path, f)
+        }
+        Expr::RowValue(exprs, _) => {
+            for expr in exprs {
+                visit_expr_qualified_names(expr, f)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn visit_window_qualified_names(
+    window: &fsqlite_ast::WindowDef,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    visit_window_spec_qualified_names(&window.spec, f)
+}
+
+fn visit_window_spec_qualified_names(
+    window: &WindowSpec,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    for expr in &window.partition_by {
+        visit_expr_qualified_names(expr, f)?;
+    }
+    for term in &window.order_by {
+        visit_expr_qualified_names(&term.expr, f)?;
+    }
+    if let Some(frame) = &window.frame {
+        visit_frame_spec_qualified_names(frame, f)?;
+    }
+    Ok(())
+}
+
+fn visit_frame_spec_qualified_names(
+    frame: &FrameSpec,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    visit_frame_bound_qualified_names(&frame.start, f)?;
+    if let Some(end) = &frame.end {
+        visit_frame_bound_qualified_names(end, f)?;
+    }
+    Ok(())
+}
+
+fn visit_frame_bound_qualified_names(
+    bound: &FrameBound,
+    f: &mut impl FnMut(&QualifiedName) -> Result<()>,
+) -> Result<()> {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            visit_expr_qualified_names(expr, f)
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => Ok(()),
+    }
+}
+
+fn visit_select_qualified_names_mut(
+    select: &mut SelectStatement,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            visit_select_qualified_names_mut(&mut cte.query, f);
+        }
+    }
+    visit_select_core_qualified_names_mut(&mut select.body.select, f);
+    for (_, core) in &mut select.body.compounds {
+        visit_select_core_qualified_names_mut(core, f);
+    }
+    for term in &mut select.order_by {
+        visit_expr_qualified_names_mut(&mut term.expr, f);
+    }
+    if let Some(limit) = &mut select.limit {
+        visit_expr_qualified_names_mut(&mut limit.limit, f);
+        if let Some(offset) = &mut limit.offset {
+            visit_expr_qualified_names_mut(offset, f);
+        }
+    }
+}
+
+fn visit_select_core_qualified_names_mut(
+    core: &mut SelectCore,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    visit_expr_qualified_names_mut(expr, f);
+                }
+            }
+            if let Some(from_clause) = from {
+                visit_table_or_subquery_qualified_names_mut(&mut from_clause.source, f);
+                for join in &mut from_clause.joins {
+                    visit_table_or_subquery_qualified_names_mut(&mut join.table, f);
+                    if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                        visit_expr_qualified_names_mut(expr, f);
+                    }
+                }
+            }
+            if let Some(expr) = where_clause {
+                visit_expr_qualified_names_mut(expr, f);
+            }
+            for expr in group_by {
+                visit_expr_qualified_names_mut(expr, f);
+            }
+            if let Some(expr) = having {
+                visit_expr_qualified_names_mut(expr, f);
+            }
+            for window in windows {
+                visit_window_qualified_names_mut(window, f);
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    visit_expr_qualified_names_mut(expr, f);
+                }
+            }
+        }
+    }
+}
+
+fn visit_table_or_subquery_qualified_names_mut(
+    source: &mut TableOrSubquery,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    match source {
+        TableOrSubquery::Table { name, .. } => f(name),
+        TableOrSubquery::Subquery { query, .. } => visit_select_qualified_names_mut(query, f),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for expr in args {
+                visit_expr_qualified_names_mut(expr, f);
+            }
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            visit_table_or_subquery_qualified_names_mut(&mut from.source, f);
+            for join in &mut from.joins {
+                visit_table_or_subquery_qualified_names_mut(&mut join.table, f);
+                if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+                    visit_expr_qualified_names_mut(expr, f);
+                }
+            }
+        }
+    }
+}
+
+fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut QualifiedName)) {
+    match expr {
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            visit_expr_qualified_names_mut(left, f);
+            visit_expr_qualified_names_mut(right, f);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => visit_expr_qualified_names_mut(expr, f),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            visit_expr_qualified_names_mut(expr, f);
+            visit_expr_qualified_names_mut(low, f);
+            visit_expr_qualified_names_mut(high, f);
+        }
+        Expr::In { expr, set, .. } => {
+            visit_expr_qualified_names_mut(expr, f);
+            match set {
+                InSet::List(exprs) => {
+                    for expr in exprs {
+                        visit_expr_qualified_names_mut(expr, f);
+                    }
+                }
+                InSet::Subquery(subquery) => visit_select_qualified_names_mut(subquery, f),
+                InSet::Table(name) => f(name),
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            visit_expr_qualified_names_mut(expr, f);
+            visit_expr_qualified_names_mut(pattern, f);
+            if let Some(escape) = escape {
+                visit_expr_qualified_names_mut(escape, f);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                visit_expr_qualified_names_mut(operand, f);
+            }
+            for (when_expr, then_expr) in whens {
+                visit_expr_qualified_names_mut(when_expr, f);
+                visit_expr_qualified_names_mut(then_expr, f);
+            }
+            if let Some(else_expr) = else_expr {
+                visit_expr_qualified_names_mut(else_expr, f);
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            visit_select_qualified_names_mut(subquery, f);
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(args) = args {
+                for expr in args {
+                    visit_expr_qualified_names_mut(expr, f);
+                }
+            }
+            for term in order_by {
+                visit_expr_qualified_names_mut(&mut term.expr, f);
+            }
+            if let Some(filter) = filter {
+                visit_expr_qualified_names_mut(filter, f);
+            }
+            if let Some(window) = over {
+                visit_window_spec_qualified_names_mut(window, f);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            visit_expr_qualified_names_mut(expr, f);
+            visit_expr_qualified_names_mut(path, f);
+        }
+        Expr::RowValue(exprs, _) => {
+            for expr in exprs {
+                visit_expr_qualified_names_mut(expr, f);
+            }
+        }
+    }
+}
+
+fn visit_window_qualified_names_mut(
+    window: &mut fsqlite_ast::WindowDef,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    visit_window_spec_qualified_names_mut(&mut window.spec, f);
+}
+
+fn visit_window_spec_qualified_names_mut(
+    window: &mut WindowSpec,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    for expr in &mut window.partition_by {
+        visit_expr_qualified_names_mut(expr, f);
+    }
+    for term in &mut window.order_by {
+        visit_expr_qualified_names_mut(&mut term.expr, f);
+    }
+    if let Some(frame) = &mut window.frame {
+        visit_frame_spec_qualified_names_mut(frame, f);
+    }
+}
+
+fn visit_frame_spec_qualified_names_mut(
+    frame: &mut FrameSpec,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    visit_frame_bound_qualified_names_mut(&mut frame.start, f);
+    if let Some(end) = &mut frame.end {
+        visit_frame_bound_qualified_names_mut(end, f);
+    }
+}
+
+fn visit_frame_bound_qualified_names_mut(
+    bound: &mut FrameBound,
+    f: &mut impl FnMut(&mut QualifiedName),
+) {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            visit_expr_qualified_names_mut(expr, f);
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => {}
+    }
 }
 
 fn select_is_real_backend_join_candidate(select: &SelectStatement) -> bool {
@@ -30772,9 +31695,9 @@ mod tests {
     use super::{
         CommitSeq, Connection, ConnectionEnv, InProcessPageLockTable, IoPollStrategy, PagerBackend,
         Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SimplePager, Snapshot,
-        init_global_runtime, install_wal_backend_with_vfs, is_sqlite_master_entry_missing,
-        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
-        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
+        init_global_runtime, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        join_table_supports_hidden_rowid, lock_unpoisoned, statement_contains_rewritable_subquery,
+        wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use fsqlite_ast::Statement;
     use fsqlite_btree::BtreeCursorOps;
@@ -30963,6 +31886,11 @@ mod tests {
             if let Some(snapshot) = self.txn_state.rollback_to(n) {
                 self.restore_state(snapshot);
             }
+            Ok(())
+        }
+
+        fn destroy(&mut self, _cx: &Cx) -> Result<()> {
+            self.record_hook("destroy");
             Ok(())
         }
     }
@@ -34842,7 +35770,7 @@ mod tests {
         let active_issue_rows = sqlite
             .prepare(
                 "SELECT id, priority, created_at
-                 FROM issues
+                 FROM issues INDEXED BY idx_issues_list_active_order
                  WHERE status NOT IN ('closed', 'tombstone')
                    AND ((is_template = 0) OR is_template IS NULL)
                  ORDER BY priority, created_at DESC",
@@ -34918,6 +35846,130 @@ mod tests {
                 "text".to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn test_beads_like_events_ipk_payload_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("beads_like_events_compat.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL DEFAULT '',
+                    old_value TEXT,
+                    new_value TEXT,
+                    comment TEXT,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues (id) ON DELETE CASCADE
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_events_issue_id ON events(issue_id);")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_events_created_at ON events(created_at);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO issues(id, title) VALUES ('bd-10t6', 'Aggregate functions');",
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO events(issue_id, event_type, actor, comment, created_at)
+                 VALUES (
+                    'bd-10t6',
+                    'created',
+                    'ubuntu',
+                    'Created issue: Aggregate functions',
+                    '2026-03-12T01:38:03.704848018+00:00'
+                 );",
+            )
+            .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "INSERT INTO events(issue_id, event_type, actor, comment)
+                 VALUES (
+                    'bd-10t6',
+                    'commented',
+                    'CloudyPine',
+                    'Follow-up comment event'
+                 );",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "Beads-style events payloads should remain SQLite-compatible after reopen"
+        );
+
+        let event_rows = sqlite
+            .prepare(
+                "SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at, typeof(created_at)
+                 FROM events
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(event_rows.len(), 2);
+        assert_eq!(
+            event_rows[0],
+            (
+                1,
+                "bd-10t6".to_owned(),
+                "created".to_owned(),
+                "ubuntu".to_owned(),
+                None,
+                None,
+                Some("Created issue: Aggregate functions".to_owned()),
+                "2026-03-12T01:38:03.704848018+00:00".to_owned(),
+                "text".to_owned(),
+            )
+        );
+        assert_eq!(event_rows[1].0, 2);
+        assert_eq!(event_rows[1].1, "bd-10t6");
+        assert_eq!(event_rows[1].2, "commented");
+        assert_eq!(event_rows[1].3, "CloudyPine");
+        assert_eq!(event_rows[1].4, None);
+        assert_eq!(event_rows[1].5, None);
+        assert_eq!(event_rows[1].6, Some("Follow-up comment event".to_owned()));
+        assert!(!event_rows[1].7.is_empty());
+        assert_eq!(event_rows[1].8, "text");
     }
 
     #[test]
@@ -38949,6 +40001,71 @@ mod tests {
     }
 
     #[test]
+    fn test_live_vtab_create_rollback_unregisters_instance() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('transient');")
+            .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT"),
+            "rolled-back CREATE VIRTUAL TABLE must remove the live instance"
+        );
+        assert!(
+            !conn.dropped_vtab_instances.borrow().contains_key("VT"),
+            "rolled-back CREATE VIRTUAL TABLE must not leave a staged drop"
+        );
+        assert!(
+            !conn.live_vtab_transactions.borrow().contains("VT"),
+            "rolled-back CREATE VIRTUAL TABLE must clear enlisted VTAB state"
+        );
+        assert!(
+            conn.query("SELECT rowid, value FROM vt;").is_err(),
+            "rolled-back CREATE VIRTUAL TABLE must remove the table from the connection"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_create_savepoint_rollback_unregisters_instance() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('transient');")
+            .unwrap();
+        conn.execute("ROLLBACK TO sp1;").unwrap();
+        conn.execute("RELEASE SAVEPOINT sp1;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT"),
+            "ROLLBACK TO SAVEPOINT must remove VTABs created after that savepoint"
+        );
+        assert!(
+            !conn.dropped_vtab_instances.borrow().contains_key("VT"),
+            "ROLLBACK TO SAVEPOINT must leave no staged VTAB instance behind"
+        );
+        assert!(
+            conn.query("SELECT rowid, value FROM vt;").is_err(),
+            "ROLLBACK TO SAVEPOINT must remove the created VTAB from the connection"
+        );
+    }
+
+    #[test]
     fn test_live_vtab_savepoint_rollback_restores_state() {
         let conn = Connection::open(":memory:").unwrap();
         conn.register_module(
@@ -39105,6 +40222,126 @@ mod tests {
         assert!(
             !hook_log.contains(&"commit".to_owned()),
             "failed COMMIT must not finalize the live VTAB: {hook_log:?}"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_drop_rollback_restores_instance() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+        conn.execute("INSERT INTO vt(value) VALUES ('keep');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DROP TABLE vt;").unwrap();
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT"),
+            "DROP TABLE should hide the live VTAB immediately"
+        );
+        assert!(
+            conn.dropped_vtab_instances.borrow().contains_key("VT"),
+            "DROP TABLE inside a transaction should stage the live VTAB for commit/rollback"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+
+        assert!(
+            conn.vtab_instances.borrow().contains_key("VT"),
+            "ROLLBACK must restore the dropped live VTAB instance"
+        );
+        assert!(
+            conn.dropped_vtab_instances.borrow().is_empty(),
+            "ROLLBACK must clear staged dropped VTAB instances"
+        );
+        let rows = conn
+            .query("SELECT rowid, value FROM vt ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("keep".to_owned()),
+            ]],
+            "ROLLBACK must restore the dropped VTAB contents"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_drop_autocommit_unregisters_instance() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        conn.execute("DROP TABLE vt;").unwrap();
+
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT"),
+            "committed DROP TABLE must unregister the live VTAB instance"
+        );
+        assert!(
+            conn.dropped_vtab_instances.borrow().is_empty(),
+            "committed DROP TABLE must destroy staged VTAB instances"
+        );
+        assert!(
+            !conn.live_vtab_transactions.borrow().contains("VT"),
+            "committed DROP TABLE must clear VTAB transaction enlistment"
+        );
+        assert!(
+            conn.query("SELECT rowid, value FROM vt;").is_err(),
+            "committed DROP TABLE must remove the table from the connection"
+        );
+    }
+
+    #[test]
+    fn test_live_vtab_rename_is_rejected_until_hook_is_supported() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.register_module(
+            "txn_test",
+            Box::new(module_factory_from::<TxnAwareTestVtab>()),
+        );
+        conn.execute("CREATE VIRTUAL TABLE vt USING txn_test(value);")
+            .unwrap();
+
+        let err = conn
+            .execute("ALTER TABLE vt RENAME TO vt2;")
+            .expect_err("live VTAB rename should be rejected");
+        assert!(
+            matches!(err, FrankenError::Unsupported),
+            "unexpected live VTAB rename error: {err}"
+        );
+        assert!(
+            conn.vtab_instances.borrow().contains_key("VT"),
+            "rejected live VTAB rename must preserve the original registry entry"
+        );
+        assert!(
+            !conn.vtab_instances.borrow().contains_key("VT2"),
+            "rejected live VTAB rename must not create a new registry entry"
+        );
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'vt';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let SqliteValue::Text(sql) = &rows[0].values()[0] else {
+            panic!("sqlite_master.sql should be TEXT");
+        };
+        assert!(
+            sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE"),
+            "rejected live VTAB rename must preserve virtual-table DDL text"
+        );
+        assert!(
+            conn.query("SELECT sql FROM sqlite_master WHERE name = 'vt2';")
+                .unwrap()
+                .is_empty(),
+            "rejected live VTAB rename must not rewrite sqlite_master"
         );
     }
 
@@ -45896,7 +47133,9 @@ mod autocommit_txn_tests {
 
         let reopened = Connection::open(db_str).unwrap();
         let rows = reopened
-            .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_name';")
+            .query(
+                "SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name='idx_name';",
+            )
             .unwrap();
         assert_eq!(
             rows.len(),
@@ -45905,9 +47144,79 @@ mod autocommit_txn_tests {
         );
         assert_eq!(
             rows[0].values().to_vec(),
-            vec![SqliteValue::Text(
-                "CREATE INDEX idx_name ON t(name)".to_owned()
-            )]
+            vec![
+                SqliteValue::Text("idx_name".to_owned()),
+                SqliteValue::Text("t".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_explicit_tx_failed_create_unique_index_restores_statement_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("explicit_tx_failed_unique_index.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db_str).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'dup');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'dup');").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+
+        let err = conn
+            .execute("CREATE UNIQUE INDEX idx_name ON t(name);")
+            .unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("UNIQUE") || err_text.contains("unique"),
+            "expected unique-index backfill failure, got: {err_text}"
+        );
+
+        let table = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .cloned()
+            .expect("table should remain present");
+        assert!(
+            !table
+                .indexes
+                .iter()
+                .any(|index| index.name.eq_ignore_ascii_case("idx_name")),
+            "failed CREATE INDEX inside BEGIN must not leak index metadata into connection schema"
+        );
+
+        let sqlite_master_rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_name';")
+            .unwrap();
+        assert!(
+            sqlite_master_rows.is_empty(),
+            "failed CREATE INDEX inside BEGIN must roll back sqlite_master changes"
+        );
+
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let reopened = Connection::open(db_str).unwrap();
+        let rows = reopened
+            .query(
+                "SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name='idx_name';",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "successful CREATE INDEX after rollback should persist exactly one index"
+        );
+        assert_eq!(
+            rows[0].values().to_vec(),
+            vec![
+                SqliteValue::Text("idx_name".to_owned()),
+                SqliteValue::Text("t".to_owned()),
+            ]
         );
     }
 
@@ -57667,6 +58976,96 @@ mod pager_routing_tests {
         }
         let result = conn.execute("ATTACH DATABASE ':memory:' AS overflow;");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_from_attached_schema_reads_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+        let aux_path_str = aux_path.to_string_lossy().into_owned();
+
+        let aux = Connection::open(&aux_path_str).unwrap();
+        aux.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+        aux.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+        aux.execute("INSERT INTO t VALUES (2, 'beta');").unwrap();
+        drop(aux);
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+
+        let rows = conn.query("SELECT value FROM aux.t ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Text("alpha".to_owned()),
+                SqliteValue::Text("beta".to_owned()),
+            ]
+        );
+
+        let stmt = conn
+            .prepare("SELECT value FROM aux.t ORDER BY id;")
+            .unwrap();
+        let prepared_rows = stmt.query().unwrap();
+        assert_eq!(
+            prepared_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Text("alpha".to_owned()),
+                SqliteValue::Text("beta".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_from_attached_schema_uses_attached_source_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let aux_path = dir.path().join("aux.db");
+        let aux_path_sql = aux_path.to_string_lossy().replace('\'', "''");
+        let aux_path_str = aux_path.to_string_lossy().into_owned();
+
+        let aux = Connection::open(&aux_path_str).unwrap();
+        aux.execute("CREATE TABLE src (id INTEGER, value TEXT);")
+            .unwrap();
+        aux.execute("INSERT INTO src VALUES (1, 'left');").unwrap();
+        aux.execute("INSERT INTO src VALUES (2, 'right');").unwrap();
+        drop(aux);
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sink (id INTEGER, value TEXT);")
+            .unwrap();
+        conn.execute(&format!("ATTACH DATABASE '{aux_path_sql}' AS aux;"))
+            .unwrap();
+        conn.execute("INSERT INTO sink SELECT id, value FROM aux.src;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, value FROM sink ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("left".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("right".to_owned()));
+    }
+
+    #[test]
+    fn test_attached_schema_write_target_is_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+
+        let err = conn
+            .execute("CREATE TABLE aux.t (id INTEGER PRIMARY KEY);")
+            .expect_err(
+                "attached CREATE TABLE should be rejected until multi-pager routing exists",
+            );
+        assert!(matches!(err, FrankenError::NotImplemented(_)));
     }
 
     // ── PRAGMA introspection tests ───────────────────────────────────────

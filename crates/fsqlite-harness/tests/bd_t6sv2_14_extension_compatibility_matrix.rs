@@ -469,6 +469,12 @@ fn connection_runtime_state_tags_document_extension_reachability() {
     assert!(
         wired
             .iter()
+            .any(|entry| entry.name == "rtree virtual table"),
+        "rtree virtual table should be tagged as connection-runtime-wired"
+    );
+    assert!(
+        wired
+            .iter()
             .any(|entry| entry.name == "icu_load_collation()"),
         "icu_load_collation() should be tagged as connection-runtime-wired"
     );
@@ -487,12 +493,6 @@ fn connection_runtime_state_tags_document_extension_reachability() {
             .iter()
             .any(|entry| entry.name == "FTS3 virtual table"),
         "FTS3 virtual table should be tagged as connection-runtime-unwired"
-    );
-    assert!(
-        unwired
-            .iter()
-            .any(|entry| entry.name == "rtree virtual table"),
-        "rtree virtual table should be tagged as connection-runtime-unwired"
     );
     assert!(
         unwired.iter().any(|entry| entry.name == "decimal_sum()"),
@@ -556,6 +556,22 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         &[SqliteValue::Text("hello".to_owned())]
     );
 
+    conn.execute("CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)")
+        .expect("R-tree virtual table should be creatable via default registry wiring");
+    conn.execute("INSERT INTO boxes VALUES (1, 0.0, 1.0, 0.0, 1.0)")
+        .expect("R-tree insert should succeed");
+    conn.execute("INSERT INTO boxes VALUES (2, 4.0, 5.0, 4.0, 5.0)")
+        .expect("R-tree insert should succeed");
+    let rtree_rows = conn
+        .query(
+            "SELECT rowid FROM boxes \
+             WHERE min_x <= 4.5 AND max_x >= 3.5 AND min_y <= 4.5 AND max_y >= 3.5 \
+             ORDER BY rowid;",
+        )
+        .expect("R-tree range query should dispatch through the connection path");
+    assert_eq!(rtree_rows.len(), 1);
+    assert_eq!(rtree_rows[0].values(), &[SqliteValue::Integer(2)]);
+
     let icu_rows = conn
         .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
         .expect("ICU and misc scalar functions should be reachable");
@@ -603,15 +619,6 @@ fn connection_runtime_unwired_extension_surfaces_fail_closed() {
     assert!(
         fts3_err.to_string().contains("no module registered"),
         "expected missing-module error for FTS3, got {fts3_err}"
-    );
-
-    let rtree_err = conn
-        .execute("CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)")
-        .expect_err("R-tree should fail closed until runtime wiring is implemented");
-    assert!(matches!(rtree_err, FrankenError::NotImplemented(_)));
-    assert!(
-        rtree_err.to_string().contains("no module registered"),
-        "expected missing-module error for R-tree, got {rtree_err}"
     );
 
     let geopoly_err = conn

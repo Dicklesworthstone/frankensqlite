@@ -42,16 +42,19 @@ use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 /// The pager calls `dyn WalBackend` during WAL-mode commits and page reads.
 /// This adapter delegates those calls to the concrete `WalFile<F>` from
 /// `fsqlite-wal`.
-/// Maximum number of entries in the page index before we stop growing it.
-/// This caps memory usage at roughly 64K * (4 + 8) = ~768 KB.
-const PAGE_INDEX_MAX_ENTRIES: usize = 65_536;
+/// Default steady-state page-index cap.
+///
+/// Normal runtime operation keeps the published WAL page index authoritative
+/// for the full visible generation. Tests can still lower this cap explicitly
+/// to exercise the bounded fallback path.
+const PAGE_INDEX_MAX_ENTRIES: usize = usize::MAX;
 
 /// How a visible page lookup was resolved for the current WAL generation.
 ///
 /// The steady-state contract is that `Authoritative*` outcomes come from a
 /// complete per-generation index. `PartialIndexFallback*` outcomes are an
-/// explicit slow-path exception used only when the capped in-memory index is
-/// known to be incomplete.
+/// explicit slow-path exception used only when a lowered cap makes the
+/// in-memory index incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalPageLookupResolution {
     AuthoritativeHit { frame_index: usize },
@@ -142,9 +145,9 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// Accumulated FEC commit results (for later sidecar persistence).
     #[cfg(not(target_arch = "wasm32"))]
     fec_pending: Vec<FecCommitResult>,
-    /// Maximum number of unique pages the index will track.  Defaults to
-    /// [`PAGE_INDEX_MAX_ENTRIES`].  Overridable in tests to exercise the
-    /// partial-index fallback path without writing 64K+ frames.
+    /// Maximum number of unique pages the index will track. Defaults to a
+    /// full authoritative index in steady state. Tests can lower the cap to
+    /// exercise the partial-index fallback path explicitly.
     page_index_cap: usize,
 }
 
@@ -904,15 +907,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             return Ok(0);
         };
 
-        let mut last_page_frame = None;
-        for frame_index in 0..=last_commit_frame {
-            let header = self.wal.read_frame_header(cx, frame_index)?;
-            if header.page_number == page_number {
-                last_page_frame = Some(frame_index);
-            }
-        }
-
-        let Some(last_page_frame) = last_page_frame else {
+        let resolution = self.resolve_visible_frame(cx, &snapshot, page_number)?;
+        let Some(last_page_frame) = resolution.frame_index() else {
             let mut total_commits = 0_u64;
             for frame_index in 0..=last_commit_frame {
                 if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
@@ -922,18 +918,21 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             return Ok(total_commits);
         };
 
-        let mut page_commit_seen = false;
+        let mut page_commit_frame = None;
+        for frame_index in last_page_frame..=last_commit_frame {
+            if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                page_commit_frame = Some(frame_index);
+                break;
+            }
+        }
+
+        let Some(page_commit_frame) = page_commit_frame else {
+            return Ok(0);
+        };
+
         let mut committed_txns_after_page = 0_u64;
-        for frame_index in 0..=last_commit_frame {
-            let header = self.wal.read_frame_header(cx, frame_index)?;
-            if !header.is_commit() {
-                continue;
-            }
-            if !page_commit_seen && frame_index >= last_page_frame {
-                page_commit_seen = true;
-                continue;
-            }
-            if page_commit_seen {
+        for frame_index in page_commit_frame.saturating_add(1)..=last_commit_frame {
+            if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
                 committed_txns_after_page = committed_txns_after_page.saturating_add(1);
             }
         }
@@ -1042,6 +1041,8 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use fsqlite_pager::MockCheckpointPageWriter;
     use fsqlite_pager::traits::WalFrameRef;
     use fsqlite_types::flags::VfsOpenFlags;
@@ -1052,6 +1053,21 @@ mod tests {
     use super::*;
 
     const PAGE_SIZE: u32 = 4096;
+
+    fn init_wal_publication_test_tracing() {
+        static TRACING_INIT: OnceLock<()> = OnceLock::new();
+        TRACING_INIT.get_or_init(|| {
+            if tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .try_init()
+                .is_err()
+            {
+                // Another test already installed a global subscriber.
+            }
+        });
+    }
 
     fn test_cx() -> Cx {
         Cx::default()
@@ -1363,6 +1379,7 @@ mod tests {
 
     #[test]
     fn test_adapter_pins_read_snapshot_until_next_begin() {
+        init_wal_publication_test_tracing();
         let cx = test_cx();
         let vfs = MemoryVfs::new();
 
@@ -1605,6 +1622,7 @@ mod tests {
 
     #[test]
     fn test_page_index_invalidated_on_same_salt_generation_change() {
+        init_wal_publication_test_tracing();
         // Generation identity must include checkpoint_seq. Reusing salts across
         // reset must still invalidate the cached page index and avoid ABA bugs.
         let cx = test_cx();
@@ -1678,6 +1696,7 @@ mod tests {
 
     #[test]
     fn test_commit_append_publishes_visibility_snapshot() {
+        init_wal_publication_test_tracing();
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let mut adapter = make_adapter(&vfs, &cx);
@@ -1706,6 +1725,7 @@ mod tests {
 
     #[test]
     fn test_prepared_append_publishes_visibility_snapshot() {
+        init_wal_publication_test_tracing();
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let mut adapter = make_adapter(&vfs, &cx);
@@ -1809,6 +1829,7 @@ mod tests {
 
     #[test]
     fn test_partial_index_falls_back_to_linear_scan() {
+        init_wal_publication_test_tracing();
         // Verify that when the page index cap is hit, pages that weren't
         // indexed are still found via the backwards linear scan fallback.
         let cx = test_cx();
@@ -1918,6 +1939,7 @@ mod tests {
 
     #[test]
     fn test_lookup_contract_distinguishes_authoritative_and_fallback_paths() {
+        init_wal_publication_test_tracing();
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let mut adapter = make_adapter(&vfs, &cx);
@@ -1957,6 +1979,88 @@ mod tests {
                 .resolve_visible_frame(&cx, &snapshot, 99)
                 .expect("resolve missing page"),
             WalPageLookupResolution::PartialIndexFallbackMiss
+        );
+    }
+
+    #[test]
+    fn test_lookup_contract_is_authoritative_by_default() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let p1 = sample_page(0x11);
+        let p2 = sample_page(0x22);
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter
+            .append_frame(&cx, 2, &p2, 2)
+            .expect("append p2 commit");
+
+        let last_commit = adapter
+            .inner_mut()
+            .last_commit_frame(&cx)
+            .expect("last commit")
+            .expect("commit exists");
+        adapter
+            .publish_visible_snapshot(&cx, Some(last_commit), "lookup_contract_default")
+            .expect("build published snapshot");
+        let snapshot = adapter.published_snapshot.clone();
+
+        assert!(
+            !snapshot.index_is_partial,
+            "default index should be authoritative"
+        );
+        assert_eq!(
+            adapter
+                .resolve_visible_frame(&cx, &snapshot, 1)
+                .expect("resolve page 1"),
+            WalPageLookupResolution::AuthoritativeHit { frame_index: 0 }
+        );
+        assert_eq!(
+            adapter
+                .resolve_visible_frame(&cx, &snapshot, 2)
+                .expect("resolve page 2"),
+            WalPageLookupResolution::AuthoritativeHit { frame_index: 1 }
+        );
+        assert_eq!(
+            adapter
+                .resolve_visible_frame(&cx, &snapshot, 99)
+                .expect("resolve missing page"),
+            WalPageLookupResolution::AuthoritativeMiss
+        );
+    }
+
+    #[test]
+    fn test_committed_txns_since_page_uses_visible_frame_horizon() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let p1 = sample_page(0x31);
+        let p2 = sample_page(0x32);
+        let p3 = sample_page(0x33);
+
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 2).expect("commit tx1");
+        adapter.append_frame(&cx, 3, &p3, 0).expect("append p3");
+        adapter.append_frame(&cx, 2, &p2, 3).expect("commit tx2");
+
+        assert_eq!(
+            adapter
+                .committed_txns_since_page(&cx, 1)
+                .expect("count txns since page 1"),
+            1
+        );
+        assert_eq!(
+            adapter
+                .committed_txns_since_page(&cx, 2)
+                .expect("count txns since page 2"),
+            0
+        );
+        assert_eq!(
+            adapter
+                .committed_txns_since_page(&cx, 99)
+                .expect("count txns since missing page"),
+            2
         );
     }
 

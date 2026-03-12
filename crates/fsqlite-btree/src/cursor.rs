@@ -1474,7 +1474,8 @@ impl<P: PageWriter> BtCursor<P> {
         let mut visited = 0usize;
 
         while let Some(pgno) = current {
-            observe_cursor_cancellation(cx)?;
+            // Once overflow cleanup starts, finish the chain so the statement
+            // cannot strand partially-freed pages behind an interrupt.
             visited += 1;
             if visited > overflow::MAX_OVERFLOW_CHAIN {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -1708,7 +1709,8 @@ impl<P: PageWriter> BtCursor<P> {
                 new_dividers,
             } = outcome
             {
-                observe_cursor_cancellation(cx)?;
+                // Once we start rewriting parent links, finish propagating the
+                // split so we do not return with a half-rebalanced tree.
                 self.note_split_event();
                 if parent_level == 0 {
                     return Err(FrankenError::internal(
@@ -1763,7 +1765,9 @@ impl<P: PageWriter> BtCursor<P> {
         let mut level = depth - 2;
 
         loop {
-            observe_cursor_cancellation(cx)?;
+            // Deletion has already mutated the tree by the time rebalance
+            // begins, so we intentionally finish this fixup even if the
+            // caller's context becomes cancelled mid-flight.
             let parent_page_no = self.stack[level].page_no;
             let child_idx = usize::from(self.stack[level].cell_idx);
             let parent_is_root = parent_page_no == self.root_page;
@@ -1788,7 +1792,8 @@ impl<P: PageWriter> BtCursor<P> {
                 new_dividers,
             } = outcome
             {
-                observe_cursor_cancellation(cx)?;
+                // Keep split propagation atomic with respect to interrupts for
+                // the same reason as balance_for_insert above.
                 self.note_split_event();
                 if split_level == 0 {
                     return Err(FrankenError::internal(
@@ -2391,15 +2396,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 let successor_found = cursor.advance_next(cx)?;
                 if !successor_found || cursor.at_eof {
                     return Err(FrankenError::DatabaseCorrupt {
-                        detail: "duplicate successor missing after interior replacement"
-                            .to_owned(),
+                        detail: "duplicate successor missing after interior replacement".to_owned(),
                     });
                 }
                 let duplicate_successor = cursor.payload(cx)?;
                 if duplicate_successor != successor_key {
                     return Err(FrankenError::DatabaseCorrupt {
-                        detail: "interior delete advanced to wrong successor duplicate"
-                            .to_owned(),
+                        detail: "interior delete advanced to wrong successor duplicate".to_owned(),
                     });
                 }
 
@@ -2716,7 +2719,9 @@ mod tests {
         for ptr in ptrs {
             let cell = CellRef::parse(page, usize::from(ptr), header.page_type, usable_size)
                 .expect("interior cell should parse");
-            let child = cell.left_child.expect("interior cell should reference child");
+            let child = cell
+                .left_child
+                .expect("interior cell should reference child");
             collect_reachable_pages(store, child, usable_size, out);
         }
         let right_child = header
@@ -3656,7 +3661,9 @@ mod tests {
             if root_header.page_type == cell::BtreePageType::InteriorIndex {
                 let root_entry = cursor.load_page(&cx, root).unwrap();
                 let divider = cursor.parse_cell_at(&root_entry, 0).unwrap();
-                break cursor.read_cell_payload(&cx, &root_entry, &divider).unwrap();
+                break cursor
+                    .read_cell_payload(&cx, &root_entry, &divider)
+                    .unwrap();
             }
         };
 
@@ -3672,7 +3679,10 @@ mod tests {
         expected.retain(|key| key != &separator_key);
 
         let seek = cursor.index_move_to(&cx, &separator_key).unwrap();
-        assert!(seek.is_found(), "separator key should be seekable before delete");
+        assert!(
+            seek.is_found(),
+            "separator key should be seekable before delete"
+        );
         assert!(
             !cursor
                 .stack

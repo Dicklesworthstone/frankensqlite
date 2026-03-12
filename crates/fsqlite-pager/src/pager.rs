@@ -8087,9 +8087,7 @@ mod tests {
         let reused1 = txn.allocate_page(&cx).unwrap();
         let reused2 = txn.allocate_page(&cx).unwrap();
         assert!(
-            reused1 != reused2
-                && [p2, p3].contains(&reused1)
-                && [p2, p3].contains(&reused2),
+            reused1 != reused2 && [p2, p3].contains(&reused1) && [p2, p3].contains(&reused2),
             "bead_id={BEAD_ID} case=concurrent_rollback_reuses_eof_pages reused=({}, {}) expected=({}, {})",
             reused1.get(),
             reused2.get(),
@@ -8128,9 +8126,7 @@ mod tests {
         let reused1 = txn.allocate_page(&cx).unwrap();
         let reused2 = txn.allocate_page(&cx).unwrap();
         assert!(
-            reused1 != reused2
-                && [p3, p4].contains(&reused1)
-                && [p3, p4].contains(&reused2),
+            reused1 != reused2 && [p3, p4].contains(&reused1) && [p3, p4].contains(&reused2),
             "bead_id={BEAD_ID} case=concurrent_savepoint_reuses_eof_pages reused=({}, {}) expected=({}, {})",
             reused1.get(),
             reused2.get(),

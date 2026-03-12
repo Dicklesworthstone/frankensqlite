@@ -688,6 +688,7 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 
     fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.committed = false;
         let page_size = fsqlite_types::PageSize::default().as_usize();
         let mut page = vec![0_u8; page_size];
         let copy_len = data.len().min(page_size);
@@ -697,6 +698,7 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 
     fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
+        self.committed = false;
         let page = PageNumber::new(self.next_page)
             .expect("mock allocator must always produce non-zero page numbers");
         self.next_page += 1;
@@ -707,6 +709,7 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 
     fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.committed = false;
         self.pages.remove(&page_no);
         Ok(())
     }
@@ -721,10 +724,12 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 
     fn has_pending_writes(&self) -> bool {
-        !self.pages.is_empty()
+        !self.committed && !self.pages.is_empty()
     }
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+        self.committed = false;
+        self.next_page = 2;
         self.pages.clear();
         self.savepoints.clear();
         Ok(())
@@ -883,5 +888,40 @@ mod tests {
         assert_eq!(page.as_bytes()[0], 0x0A);
         assert!(txn.has_pending_writes());
         assert!(txn.is_writer());
+    }
+
+    #[test]
+    fn test_memory_mock_transaction_commit_clears_pending_writes() {
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = PageNumber::new(2).unwrap();
+
+        txn.write_page(&cx, page_no, &[1_u8; 4096]).unwrap();
+        assert!(txn.has_pending_writes());
+
+        txn.commit(&cx).unwrap();
+        assert!(
+            !txn.has_pending_writes(),
+            "committed mock transactions must not report pending writes"
+        );
+    }
+
+    #[test]
+    fn test_memory_mock_transaction_rollback_resets_allocator() {
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        assert_eq!(txn.allocate_page(&cx).unwrap().get(), 2);
+        assert_eq!(txn.allocate_page(&cx).unwrap().get(), 3);
+
+        txn.rollback(&cx).unwrap();
+
+        assert_eq!(
+            txn.allocate_page(&cx).unwrap().get(),
+            2,
+            "rollback should restore the mock allocator to its initial state"
+        );
     }
 }

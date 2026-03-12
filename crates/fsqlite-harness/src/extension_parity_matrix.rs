@@ -1508,6 +1508,9 @@ impl ExtensionParityMatrix {
                 "->> operator",
                 "FTS5 virtual table",
                 "FTS5 MATCH operator",
+                "rtree virtual table",
+                "R-tree range query",
+                "R-tree containment query",
                 "fts5_source_id()",
                 "ICU collation registration",
                 "icu_load_collation()",
@@ -1540,12 +1543,7 @@ impl ExtensionParityMatrix {
         );
         tag_named_entries(
             &mut entries,
-            &[
-                "rtree virtual table",
-                "R-tree range query",
-                "R-tree containment query",
-                "Geopoly virtual table",
-            ],
+            &["Geopoly virtual table"],
             "connection-runtime-unwired",
         );
         tag_module(&mut entries, ExtensionModule::Session, "library-api-only");

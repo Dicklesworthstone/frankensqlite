@@ -99,70 +99,62 @@ pub fn execute_checkpoint<F: VfsFile>(
         "checkpoint plan computed"
     );
 
-    if plan.frames_to_backfill == 0 {
-        let wal_was_reset = apply_checkpoint_post_action(cx, wal, plan.post_action)?;
-        return Ok(CheckpointExecutionResult {
-            plan,
-            frames_backfilled: 0,
-            db_size_pages: None,
-            wal_was_reset,
-        });
-    }
-
-    // Backfill frames [backfilled_frames .. backfilled_frames + frames_to_backfill).
-    let start = usize::try_from(normalized.backfilled_frames).unwrap_or(usize::MAX);
-    let count = usize::try_from(plan.frames_to_backfill).unwrap_or(usize::MAX);
-    let end = start.saturating_add(count).min(wal.frame_count());
-
     let mut frames_backfilled: u32 = 0;
     let mut last_db_size: Option<u32> = None;
-    let mut latest_frames: std::collections::HashMap<PageNumber, usize> =
-        std::collections::HashMap::new();
+    if plan.frames_to_backfill > 0 {
+        // Backfill frames [backfilled_frames .. backfilled_frames + frames_to_backfill).
+        let start = usize::try_from(normalized.backfilled_frames).unwrap_or(usize::MAX);
+        let count = usize::try_from(plan.frames_to_backfill).unwrap_or(usize::MAX);
+        let end = start.saturating_add(count).min(wal.frame_count());
 
-    // Pass 1: Find the latest frame index for each page in the checkpoint range.
-    for frame_idx in start..end {
-        let header = wal.read_frame_header(cx, frame_idx)?;
+        let mut latest_frames: std::collections::HashMap<PageNumber, usize> =
+            std::collections::HashMap::new();
 
-        let page_no =
-            PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
-                what: "checkpoint frame page number".to_owned(),
-                value: header.page_number.to_string(),
-            })?;
+        // Pass 1: Find the latest frame index for each page in the checkpoint range.
+        for frame_idx in start..end {
+            let header = wal.read_frame_header(cx, frame_idx)?;
 
-        latest_frames.insert(page_no, frame_idx);
-        frames_backfilled += 1;
+            let page_no =
+                PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
+                    what: "checkpoint frame page number".to_owned(),
+                    value: header.page_number.to_string(),
+                })?;
 
-        if header.is_commit() && header.db_size > 0 {
-            last_db_size = Some(header.db_size);
+            latest_frames.insert(page_no, frame_idx);
+            frames_backfilled += 1;
+
+            if header.is_commit() && header.db_size > 0 {
+                last_db_size = Some(header.db_size);
+            }
         }
-    }
 
-    // Pass 2: Write deduplicated pages in sorted order to minimize disk seeks.
-    let mut sorted_pages: Vec<(PageNumber, usize)> = latest_frames.into_iter().collect();
-    sorted_pages.sort_unstable_by_key(|(p, _)| p.get());
+        // Pass 2: Write deduplicated pages in sorted order to minimize disk seeks.
+        let mut sorted_pages: Vec<(PageNumber, usize)> = latest_frames.into_iter().collect();
+        sorted_pages.sort_unstable_by_key(|(p, _)| p.get());
 
-    let mut frame_buf = vec![0u8; wal.frame_size()];
-    for (page_no, frame_idx) in sorted_pages {
-        wal.read_frame_into(cx, frame_idx, &mut frame_buf)?;
-        let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
-        target.write_page(cx, page_no, page_data)?;
+        let mut frame_buf = vec![0u8; wal.frame_size()];
+        for (page_no, frame_idx) in sorted_pages {
+            wal.read_frame_into(cx, frame_idx, &mut frame_buf)?;
+            let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
+            target.write_page(cx, page_no, page_data)?;
 
-        debug!(
-            frame_idx,
-            page_number = page_no.get(),
-            "checkpoint: page backfilled"
-        );
-    }
+            debug!(
+                frame_idx,
+                page_number = page_no.get(),
+                "checkpoint: page backfilled"
+            );
+        }
 
-    // Sync database after all frame writes.
-    target.sync_db(cx)?;
+        // Sync database after all frame writes.
+        target.sync_db(cx)?;
 
-    // If the checkpoint completed fully, truncate the database to the last
-    // committed size.
-    if matches!(plan.progress, CheckpointProgress::Complete) {
-        if let Some(db_size) = last_db_size {
-            target.truncate_db(cx, db_size)?;
-            target.sync_db(cx)?;
+        // If the checkpoint completed fully, truncate the database to the last
+        // committed size.
+        if matches!(plan.progress, CheckpointProgress::Complete) {
+            if let Some(db_size) = last_db_size {
+                target.truncate_db(cx, db_size)?;
+                target.sync_db(cx)?;
+            }
         }
     }
 

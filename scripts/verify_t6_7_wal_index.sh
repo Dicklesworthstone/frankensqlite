@@ -16,8 +16,8 @@ EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
 SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
 HASHES_TXT="${ARTIFACT_DIR}/artifact_hashes.txt"
-CORE_TARGET_DIR="/tmp/${RUN_ID_SAFE}_core_wal_index"
-WAL_TARGET_DIR="/tmp/${RUN_ID_SAFE}_wal_index"
+CORE_TARGET_DIR="${CORE_TARGET_DIR:-/tmp/bd_1dp9_6_7_8_3_core_wal_index}"
+WAL_TARGET_DIR="${WAL_TARGET_DIR:-/tmp/bd_1dp9_6_7_8_3_wal_index}"
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -83,14 +83,18 @@ trace_contract_status() {
   fi
 }
 
-record_trace_contract() {
+require_trace_contract() {
   local phase="$1"
   local logfile="$2"
   local mode_pattern="$3"
+  local description="$4"
   local status
   status="$(trace_contract_status "${logfile}" "${mode_pattern}")"
-  emit_event "${phase}" "trace_contract" "${status}" 0 "trace contract ${status}"
-  printf '%s' "${status}"
+  emit_event "${phase}" "trace_contract" "${status}" 0 "${description} trace contract ${status}"
+  if [[ "${status}" != "present" ]]; then
+    emit_event "${phase}" "fail" "fail" 0 "${description} trace contract missing"
+    return 1
+  fi
 }
 
 hash_artifacts() {
@@ -113,47 +117,55 @@ emit_event "bootstrap" "start" "running" 0 "verification started"
 run_phase \
   "wal_reset_new_generation" \
   "${ARTIFACT_DIR}/wal_reset_new_generation.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_page_index_invalidated_on_wal_reset -- --nocapture
-TRACE_WAL_RESET_NEW_GENERATION="$(record_trace_contract \
+require_trace_contract \
   "wal_reset_new_generation" \
   "${ARTIFACT_DIR}/wal_reset_new_generation.log" \
-  'authoritative_index')"
+  'authoritative_index' \
+  "wal reset new generation"
+TRACE_WAL_RESET_NEW_GENERATION="present"
 
 run_phase \
   "wal_reset_same_salts_generation_change" \
   "${ARTIFACT_DIR}/wal_reset_same_salts_generation_change.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_page_index_invalidated_on_same_salt_generation_change -- --nocapture
-TRACE_WAL_RESET_SAME_SALTS="$(record_trace_contract \
+require_trace_contract \
   "wal_reset_same_salts_generation_change" \
   "${ARTIFACT_DIR}/wal_reset_same_salts_generation_change.log" \
-  'authoritative_index')"
+  'authoritative_index' \
+  "wal reset same-salts generation change"
+TRACE_WAL_RESET_SAME_SALTS="present"
 
 run_phase \
   "wal_lookup_contract" \
   "${ARTIFACT_DIR}/wal_lookup_contract.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_lookup_contract_distinguishes_authoritative_and_fallback_paths -- --nocapture
-TRACE_WAL_LOOKUP_CONTRACT="$(record_trace_contract \
+require_trace_contract \
   "wal_lookup_contract" \
   "${ARTIFACT_DIR}/wal_lookup_contract.log" \
-  'partial_index_fallback|authoritative_index')"
+  'partial_index_fallback|authoritative_index' \
+  "wal lookup contract"
+TRACE_WAL_LOOKUP_CONTRACT="present"
 
 run_phase \
   "wal_partial_index_fallback" \
   "${ARTIFACT_DIR}/wal_partial_index_fallback.log" \
-  rch exec -- env CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
     cargo test -p fsqlite-core test_partial_index_falls_back_to_linear_scan -- --nocapture
-TRACE_WAL_PARTIAL_INDEX="$(record_trace_contract \
+require_trace_contract \
   "wal_partial_index_fallback" \
   "${ARTIFACT_DIR}/wal_partial_index_fallback.log" \
-  'partial_index_fallback')"
+  'partial_index_fallback' \
+  "wal partial-index fallback"
+TRACE_WAL_PARTIAL_INDEX="present"
 
 run_phase \
   "wal_truncate_recovery_matrix" \
   "${ARTIFACT_DIR}/wal_truncate_recovery_matrix.log" \
-  rch exec -- env CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
     cargo test -p fsqlite-wal test_crash_matrix_truncate_at_every_frame_boundary -- --nocapture
 emit_event "wal_truncate_recovery_matrix" "trace_contract" "not_applicable" 0 \
   "runtime trace contract not asserted for wal.rs crash-matrix unit test"
@@ -161,7 +173,7 @@ emit_event "wal_truncate_recovery_matrix" "trace_contract" "not_applicable" 0 \
 run_phase \
   "wal_corruption_recovery_matrix" \
   "${ARTIFACT_DIR}/wal_corruption_recovery_matrix.log" \
-  rch exec -- env CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
     cargo test -p fsqlite-wal test_crash_matrix_bit_flip_at_every_frame -- --nocapture
 emit_event "wal_corruption_recovery_matrix" "trace_contract" "not_applicable" 0 \
   "runtime trace contract not asserted for wal.rs crash-matrix unit test"
@@ -169,7 +181,7 @@ emit_event "wal_corruption_recovery_matrix" "trace_contract" "not_applicable" 0 
 run_phase \
   "wal_reset_then_crash_matrix" \
   "${ARTIFACT_DIR}/wal_reset_then_crash_matrix.log" \
-  rch exec -- env CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \
     cargo test -p fsqlite-wal test_crash_matrix_reset_then_crash -- --nocapture
 emit_event "wal_reset_then_crash_matrix" "trace_contract" "not_applicable" 0 \
   "runtime trace contract not asserted for wal.rs crash-matrix unit test"

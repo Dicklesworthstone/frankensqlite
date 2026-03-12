@@ -508,6 +508,8 @@ pub unsafe extern "C" fn sqlite3_exec(
                         owned_vals.push(cval);
                     }
 
+                    debug_assert_eq!(owned_vals.len(), c_values.len());
+                    debug_assert_eq!(owned_names.len(), c_names.len());
                     let rc = cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
                     if rc != SQLITE_OK {
                         let err = FrankenError::Abort;
