@@ -1459,7 +1459,6 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection as SqliteConnection;
 
     #[test]
     fn test_engine_display() {
@@ -1599,7 +1598,8 @@ mod tests {
     fn hot_path_profile_smoke_writes_artifacts() {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("profile.db");
-        SqliteConnection::open(&db_path).unwrap();
+        let db = db_path.to_string_lossy().to_string();
+        fsqlite::Connection::open(&db).unwrap();
 
         let config = FsqliteHotPathProfileConfig {
             seed: 7,

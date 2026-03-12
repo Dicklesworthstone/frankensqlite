@@ -15094,6 +15094,14 @@ mod tests {
             }
         }
 
+        fn with_begin_child_cancel(cursor_template: MockVtabCursor) -> Self {
+            Self {
+                cursor_template,
+                cancel_on_begin: true,
+                interrupt_on_begin: false,
+            }
+        }
+
         fn with_begin_interrupt(cursor_template: MockVtabCursor) -> Self {
             Self {
                 cursor_template,
@@ -15414,6 +15422,60 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_vbegin_observes_child_cx_cancellation_immediately() {
+        let root_cx = Cx::new();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_out = b.alloc_reg();
+        b.emit_op(Opcode::VBegin, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
+        let vtab = MockVtab::with_begin_child_cancel(MockVtabCursor::new(Vec::new()));
+        engine.register_vtab_instance(0, Box::new(vtab));
+
+        let err = engine
+            .execute(&prog)
+            .expect_err("VBegin child cancellation should abort execution immediately");
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(engine.take_results().is_empty());
+    }
+
+    #[test]
+    fn test_vbegin_propagates_interrupt_from_vtab() {
+        let root_cx = Cx::new();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_out = b.alloc_reg();
+        b.emit_op(Opcode::VBegin, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(prog.register_count(), &root_cx, PageSize::DEFAULT);
+        let vtab = MockVtab::with_begin_interrupt(MockVtabCursor::new(Vec::new()));
+        engine.register_vtab_instance(0, Box::new(vtab));
+
+        let err = engine
+            .execute(&prog)
+            .expect_err("VBegin interrupt should propagate without being wrapped");
+        assert!(matches!(err, FrankenError::Interrupt));
+        assert!(engine.take_results().is_empty());
     }
 
     #[test]

@@ -2377,7 +2377,16 @@ impl Connection {
                 self.validate_attached_target_schema(&delete.table.name, "DELETE")
             }
             Statement::Pragma(pragma) => {
-                self.validate_attached_target_schema(&pragma.name, "PRAGMA")
+                if pragma
+                    .name
+                    .schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("fsqlite"))
+                {
+                    Ok(())
+                } else {
+                    self.validate_attached_target_schema(&pragma.name, "PRAGMA")
+                }
             }
             Statement::Explain { stmt, .. } => self.reject_unsupported_attached_target_schema(stmt),
             _ => Ok(()),
