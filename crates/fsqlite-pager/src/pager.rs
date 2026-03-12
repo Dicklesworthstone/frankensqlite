@@ -1911,11 +1911,14 @@ impl<V: Vfs> SimpleTransaction<V> {
             let upper_bound = inner.next_page.saturating_sub(1).max(inner.db_size);
             let mut freelist = inner.freelist.clone();
             return_pages_to_freelist(&mut freelist, self.freed_pages.iter().copied());
-            let freelist = normalize_freelist(&freelist, upper_bound);
-            if !freelist.is_empty() {
+            let durable_freelist: Vec<PageNumber> = normalize_freelist(&freelist, upper_bound)
+                .into_iter()
+                .filter(|page| page.get() <= inner.db_size)
+                .collect();
+            if !durable_freelist.is_empty() {
                 let max_leaf_entries = (inner.page_size.as_usize() / 4).saturating_sub(2).max(1);
-                let trunk_count = freelist.len().div_ceil(max_leaf_entries + 1);
-                pages.extend(freelist.into_iter().take(trunk_count));
+                let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
+                pages.extend(durable_freelist.into_iter().take(trunk_count));
             }
         }
 
@@ -8320,6 +8323,48 @@ mod tests {
             !inner.freelist.contains(&p4),
             "bead_id={BEAD_ID} case=durable_freelist_drops_beyond_db_size_page"
         );
+    }
+
+    #[test]
+    fn test_pending_commit_pages_ignore_beyond_db_size_freelist_entries() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/pending_commit_pages_ignore_beyond_db_size.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::MIN).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::MIN.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = seed.allocate_page(&cx).unwrap();
+        let p3 = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+        seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+        seed.commit(&cx).unwrap();
+
+        let overflow_freelist_pages = (ps / 4).saturating_sub(2) + 2;
+        let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut abandoned_pages = Vec::with_capacity(overflow_freelist_pages);
+        for _ in 0..overflow_freelist_pages {
+            abandoned_pages.push(abandoned.allocate_page(&cx).unwrap());
+        }
+        abandoned.rollback(&cx).unwrap();
+
+        let first_beyond_db_size_page = abandoned_pages[0];
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        txn.free_page(&cx, p2).unwrap();
+        let predicted = txn.pending_commit_pages().unwrap();
+        assert!(
+            predicted.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=pending_commit_pages_still_include_page_one_rewrite"
+        );
+        assert!(
+            predicted.contains(&p2),
+            "bead_id={BEAD_ID} case=pending_commit_pages_include_real_durable_trunk"
+        );
+        assert!(
+            !predicted.contains(&first_beyond_db_size_page),
+            "bead_id={BEAD_ID} case=pending_commit_pages_ignore_eof_only_freelist_pages"
+        );
+        txn.rollback(&cx).unwrap();
     }
 
     #[test]
