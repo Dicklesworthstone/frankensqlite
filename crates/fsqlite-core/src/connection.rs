@@ -30793,7 +30793,6 @@ mod tests {
     use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::ShmRegion;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
-    use fsqlite_wal::WalFile;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -43469,11 +43468,12 @@ mod tests {
         );
         let wal_path = wal_path_for_db_path("/wal_page_size.db");
 
-        install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path).expect("install wal backend");
+        super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+            .expect("install wal backend");
 
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
         let (file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
-        let wal = WalFile::open(&cx, file).expect("open created wal");
+        let wal = fsqlite_wal::WalFile::open(&cx, file).expect("open created wal");
         assert_eq!(
             wal.page_size(),
             usize::try_from(requested_page_size.get()).unwrap()
@@ -43494,7 +43494,7 @@ mod tests {
         file.write(&cx, &[0_u8; 32], 0).unwrap();
         file.close(&cx).unwrap();
 
-        let err = install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+        let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
             .expect_err("header-sized corrupt WAL should be surfaced");
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
