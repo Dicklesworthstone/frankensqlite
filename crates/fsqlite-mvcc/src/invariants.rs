@@ -328,6 +328,14 @@ impl ChainHeadTable {
         let chunk = u64::from(idx.chunk());
         let offset = u64::from(idx.offset());
         let generation = u64::from(idx.generation());
+
+        // Ensure bit ranges do not overlap (§5E.2).
+        // offset: 12 bits (0..4095)
+        // chunk: 20 bits (0..1048575)
+        // generation: 32 bits
+        assert!(chunk <= 0xF_FFFF, "VersionIdx chunk overflow (max 20 bits)");
+        assert!(offset <= 0xFFF, "VersionIdx offset overflow (max 12 bits)");
+
         (generation << 32) | (chunk << 12) | offset
     }
 

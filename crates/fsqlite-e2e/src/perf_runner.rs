@@ -1727,7 +1727,10 @@ mod tests {
 
         let first_scope = HotPathProfileScope::enable().unwrap();
 
-        let error = HotPathProfileScope::enable().unwrap_err();
+        let error = match HotPathProfileScope::enable() {
+            Ok(_) => panic!("reentrant profiling scope should fail"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("already active in this process"));
 
