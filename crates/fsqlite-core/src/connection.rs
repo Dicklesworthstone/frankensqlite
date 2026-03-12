@@ -7095,69 +7095,87 @@ impl Connection {
         // next_commit_seq between plan (which reads it) and finalize (which
         // bumps it).  Without this, assigned_commit_seq != committed_seq,
         // corrupting the MVCC commit index.
-        let (txn_result, committed_write) = if ok {
-            let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
-            let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
-                match self.plan_concurrent_commit() {
-                    Ok(plan) => plan,
+        let (txn_result, committed_write, rolled_back_dirty_state) =
+            if ok {
+                let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
+                let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+                let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
+                    match self.plan_concurrent_commit() {
+                        Ok(plan) => plan,
+                        Err(e) => {
+                            // Plan failed (SSI conflict, etc.) — abort under the
+                            // mutex so we still hold sequencing invariants.
+                            drop(_commit_guard);
+                            self.abort_current_concurrent_session();
+                            self.txn_metrics_note_rollback();
+                            let _ = txn.rollback(&cx);
+                            *self.concurrent_txn.borrow_mut() = false;
+                            *self.concurrent_session_id.borrow_mut() = None;
+                            self.txn_metrics_mark_finished();
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    None
+                };
+                match txn.commit(&cx) {
+                    Ok(()) => {
+                        if txn_has_pending_writes {
+                            let committed_seq = self.advance_commit_clock();
+                            if let Some(plan) = concurrent_plan {
+                                self.finalize_concurrent_commit(plan, committed_seq);
+                            }
+                        } else if *self.concurrent_txn.borrow() {
+                            let _ = self.concurrent_session_id.borrow_mut().take().and_then(
+                                |session_id| {
+                                    lock_unpoisoned(&self.concurrent_registry).remove(session_id)
+                                },
+                            );
+                        }
+                        (Ok(()), txn_has_pending_writes, false)
+                    }
                     Err(e) => {
-                        // Plan failed (SSI conflict, etc.) — abort under the
-                        // mutex so we still hold sequencing invariants.
-                        drop(_commit_guard);
-                        self.abort_current_concurrent_session();
+                        // Commit failed (e.g. I/O error or BUSY in standard mode).
+                        // We must rollback to ensure cleanup and propagate the error.
                         self.txn_metrics_note_rollback();
-                        let _ = txn.rollback(&cx);
-                        *self.concurrent_txn.borrow_mut() = false;
-                        *self.concurrent_session_id.borrow_mut() = None;
-                        self.txn_metrics_mark_finished();
-                        return Err(e);
+                        let rollback_result = txn.rollback(&cx);
+                        let rollback_succeeded = rollback_result.is_ok();
+                        if *self.concurrent_txn.borrow() {
+                            self.abort_current_concurrent_session();
+                        }
+                        (
+                            match rollback_result {
+                                Ok(()) => Err(e),
+                                Err(rollback_error) => Err(rollback_error),
+                            },
+                            false,
+                            txn_has_pending_writes && rollback_succeeded,
+                        )
                     }
                 }
             } else {
-                None
+                let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+                if *self.concurrent_txn.borrow() {
+                    self.abort_current_concurrent_session();
+                }
+                self.txn_metrics_note_rollback();
+                let rollback_result = txn.rollback(&cx);
+                let rollback_succeeded = rollback_result.is_ok();
+                (
+                    rollback_result,
+                    false,
+                    txn_has_pending_writes && rollback_succeeded,
+                )
             };
-            match txn.commit(&cx) {
-                Ok(()) => {
-                    if txn_has_pending_writes {
-                        let committed_seq = self.advance_commit_clock();
-                        if let Some(plan) = concurrent_plan {
-                            self.finalize_concurrent_commit(plan, committed_seq);
-                        }
-                    } else if *self.concurrent_txn.borrow() {
-                        let _ =
-                            self.concurrent_session_id
-                                .borrow_mut()
-                                .take()
-                                .and_then(|session_id| {
-                                    lock_unpoisoned(&self.concurrent_registry).remove(session_id)
-                                });
-                    }
-                    (Ok(()), txn_has_pending_writes)
-                }
-                Err(e) => {
-                    // Commit failed (e.g. I/O error or BUSY in standard mode).
-                    // We must rollback to ensure cleanup and propagate the error.
-                    self.txn_metrics_note_rollback();
-                    let _ = txn.rollback(&cx);
-                    if *self.concurrent_txn.borrow() {
-                        self.abort_current_concurrent_session();
-                    }
-                    (Err(e), false)
-                }
-            }
-        } else {
-            if *self.concurrent_txn.borrow() {
-                self.abort_current_concurrent_session();
-            }
-            self.txn_metrics_note_rollback();
-            (txn.rollback(&cx), false)
-        };
 
         // Ensure connection-level transaction state is cleared regardless of outcome.
         *self.concurrent_txn.borrow_mut() = false;
         *self.concurrent_session_id.borrow_mut() = None;
         self.txn_metrics_mark_finished();
+
+        if rolled_back_dirty_state {
+            self.reload_memdb_from_pager(&cx)?;
+        }
 
         txn_result?;
 
@@ -17238,8 +17256,10 @@ impl Connection {
             if pre.is_some() {
                 match all_sources[i] {
                     TableOrSubquery::Subquery { query, .. } => {
-                        let rows = self
-                            .execute_statement(&Statement::Select(query.as_ref().clone()), params)?;
+                        let rows = self.execute_statement(
+                            &Statement::Select(query.as_ref().clone()),
+                            params,
+                        )?;
                         let row_data: Vec<Vec<SqliteValue>> =
                             rows.iter().map(|r| r.values().to_vec()).collect();
                         // If col_names contains "*" (unresolved star), resolve it
@@ -41704,6 +41724,61 @@ mod autocommit_txn_tests {
     }
 
     #[test]
+    fn test_autocommit_failed_create_unique_index_restores_schema_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("autocommit_failed_unique_index.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db_str).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'dup');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'dup');").unwrap();
+
+        let err = conn
+            .execute("CREATE UNIQUE INDEX idx_name ON t(name);")
+            .unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("UNIQUE") || err_text.contains("unique"),
+            "expected unique-index backfill failure, got: {err_text}"
+        );
+
+        let table = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .cloned()
+            .expect("table should remain present");
+        assert!(
+            !table
+                .indexes
+                .iter()
+                .any(|index| index.name.eq_ignore_ascii_case("idx_name")),
+            "failed autocommit DDL must not leak index metadata into connection-local schema"
+        );
+
+        conn.execute("CREATE INDEX idx_name ON t(name);").unwrap();
+
+        let reopened = Connection::open(db_str).unwrap();
+        let rows = reopened
+            .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_name';")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "reopened connection should see exactly one index"
+        );
+        assert_eq!(
+            rows[0].values().to_vec(),
+            vec![SqliteValue::Text(
+                "CREATE INDEX idx_name ON t(name)".to_owned()
+            )]
+        );
+    }
+
+    #[test]
     fn test_explicit_txn_bypasses_autocommit() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
@@ -51310,8 +51385,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO sr_update_limit VALUES (1, 10), (2, 20), (3, 30);")
             .unwrap();
 
-        let sql =
-            "UPDATE sr_update_limit SET score = score + 100 ORDER BY score ASC LIMIT 1;";
+        let sql = "UPDATE sr_update_limit SET score = score + 100 ORDER BY score ASC LIMIT 1;";
         assert_eq!(conn.execute(sql).unwrap(), 1);
         assert_eq!(conn.execute(sql).unwrap(), 1);
 

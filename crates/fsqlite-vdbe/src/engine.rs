@@ -3369,11 +3369,6 @@ impl VdbeEngine {
         clippy::cast_possible_wrap
     )]
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
-        let ops = program.ops();
-        if ops.is_empty() {
-            return Ok(ExecOutcome::Done);
-        }
-
         self.aggregates.clear();
         self.results.clear();
         self.table_index_meta.clear();
@@ -3389,6 +3384,14 @@ impl VdbeEngine {
         self.sequence_counters.clear();
         self.cursor_root_pages.clear();
         self.vtab_cursors.clear();
+        self.window_contexts.clear();
+        self.register_subtypes.clear();
+        self.bloom_filters.clear();
+
+        let ops = program.ops();
+        if ops.is_empty() {
+            return Ok(ExecOutcome::Done);
+        }
 
         // Load table-to-index cursor metadata for REPLACE conflict resolution.
         for (table_cursor, indexes) in program.table_index_meta() {
@@ -8851,6 +8854,38 @@ mod tests {
             engine.execute(&noop_program).expect("noop execution"),
             ExecOutcome::Done
         );
+        assert_eq!(engine.changes(), 0);
+        assert_eq!(engine.last_insert_rowid(), 0);
+    }
+
+    #[test]
+    fn test_execute_reuse_empty_program_clears_prior_statement_state() {
+        let mut first_builder = ProgramBuilder::new();
+        first_builder.emit_op(Opcode::Integer, 11, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let first_program = first_builder.finish().expect("first program should build");
+
+        let empty_program = ProgramBuilder::new()
+            .finish()
+            .expect("empty program should build");
+
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(empty_program.register_count()),
+        );
+        assert_eq!(
+            engine.execute(&first_program).expect("first execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(engine.results().len(), 1);
+
+        assert_eq!(
+            engine.execute(&empty_program).expect("empty execution"),
+            ExecOutcome::Done
+        );
+        assert!(engine.results().is_empty());
         assert_eq!(engine.changes(), 0);
         assert_eq!(engine.last_insert_rowid(), 0);
     }
@@ -15424,6 +15459,54 @@ mod tests {
         assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
     }
 
+    #[test]
+    fn test_execute_reuse_clears_subtype_metadata() {
+        let mut first_builder = ProgramBuilder::new();
+        first_builder.emit_op(
+            Opcode::String8,
+            0,
+            1,
+            0,
+            P4::Str(r#"{"a":1}"#.to_owned()),
+            0,
+        );
+        first_builder.emit_op(Opcode::Integer, 74, 2, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::SetSubtype, 2, 1, 0, P4::None, 0);
+        first_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let first_program = first_builder.finish().expect("first program should build");
+
+        let mut second_builder = ProgramBuilder::new();
+        second_builder.emit_op(Opcode::GetSubtype, 1, 3, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let second_program = second_builder
+            .finish()
+            .expect("second program should build");
+
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+        );
+        assert_eq!(
+            engine.execute(&first_program).expect("first execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            engine.execute(&second_program).expect("second execution"),
+            ExecOutcome::Done
+        );
+
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(0)]]
+        );
+    }
+
     // ── Bloom filter opcode tests ────────────────────────────────────
 
     #[test]
@@ -15530,5 +15613,64 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows[0][0], SqliteValue::Integer(1)); // fell through
+    }
+
+    #[test]
+    fn test_execute_reuse_clears_bloom_filters() {
+        let added_value = SqliteValue::Text("hello".to_owned());
+        let missing_value = SqliteValue::Text("world".to_owned());
+        let bloom_bits = (BLOOM_FILTER_WORDS * 64) as u64;
+        assert_ne!(
+            bloom_hash(&added_value) % bloom_bits,
+            bloom_hash(&missing_value) % bloom_bits,
+            "test fixture must exercise a genuinely missing bloom-filter bit"
+        );
+
+        let mut first_builder = ProgramBuilder::new();
+        first_builder.emit_op(Opcode::String8, 0, 2, 0, P4::Str("hello".to_owned()), 0);
+        first_builder.emit_op(Opcode::FilterAdd, 1, 0, 2, P4::None, 0);
+        first_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let first_program = first_builder.finish().expect("first program should build");
+
+        let mut second_builder = ProgramBuilder::new();
+        let not_present = second_builder.emit_label();
+        let end = second_builder.emit_label();
+        second_builder.emit_op(Opcode::String8, 0, 2, 0, P4::Str("world".to_owned()), 0);
+        second_builder.emit_jump_to_label(Opcode::Filter, 1, 0, not_present, P4::None, 2);
+        second_builder.emit_op(Opcode::Integer, 1, 3, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+        second_builder.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+        second_builder.resolve_label(not_present);
+        second_builder.emit_op(Opcode::Integer, 0, 3, 0, P4::None, 0);
+        second_builder.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+        second_builder.resolve_label(end);
+        second_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let second_program = second_builder
+            .finish()
+            .expect("second program should build");
+
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+        );
+        assert_eq!(
+            engine.execute(&first_program).expect("first execution"),
+            ExecOutcome::Done
+        );
+        assert_eq!(
+            engine.execute(&second_program).expect("second execution"),
+            ExecOutcome::Done
+        );
+
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)]],
+            "second execution should observe no inherited bloom filter"
+        );
     }
 }

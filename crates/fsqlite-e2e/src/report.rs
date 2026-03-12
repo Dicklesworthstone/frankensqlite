@@ -12,7 +12,7 @@ pub const REPORT_SCHEMA_V1: &str = "fsqlite-e2e.report.v1";
 /// Each JSONL line should contain exactly one [`RunRecordV1`] object.
 pub const RUN_RECORD_SCHEMA_V1: &str = "fsqlite-e2e.run_record.v1";
 /// JSON schema version for opt-in FrankenSQLite hot-path profile records.
-pub const HOT_PATH_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile.v1";
+pub const HOT_PATH_PROFILE_RECORD_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile_record.v1";
 
 /// Human-readable explanation of the RealDB E2E equality policy tiers.
 ///
@@ -214,7 +214,7 @@ impl HotPathProfileRecordV1 {
     #[must_use]
     pub fn new(args: HotPathProfileRecordV1Args) -> Self {
         Self {
-            schema_version: HOT_PATH_PROFILE_SCHEMA_V1.to_owned(),
+            schema_version: HOT_PATH_PROFILE_RECORD_SCHEMA_V1.to_owned(),
             recorded_unix_ms: args.recorded_unix_ms,
             fixture_id: args.fixture_id,
             golden_path: args.golden_path,
@@ -916,11 +916,19 @@ mod tests {
 
         let line = record.to_jsonl_line().unwrap();
         let parsed: HotPathProfileRecordV1 = serde_json::from_str(&line).unwrap();
-        assert_eq!(parsed.schema_version, HOT_PATH_PROFILE_SCHEMA_V1);
+        assert_eq!(parsed.schema_version, HOT_PATH_PROFILE_RECORD_SCHEMA_V1);
         assert_eq!(parsed.fixture_id, "fixture-a");
         assert!(parsed.concurrent_mode);
         assert_eq!(parsed.profile.vdbe.estimated_total_opcodes, 72);
         assert_eq!(parsed.profile.statement_hotspots.len(), 1);
+    }
+
+    #[test]
+    fn hot_path_profile_record_schema_is_distinct_from_raw_profile_schema() {
+        assert_ne!(
+            HOT_PATH_PROFILE_RECORD_SCHEMA_V1,
+            crate::perf_runner::HOT_PATH_PROFILE_SCHEMA_V1
+        );
     }
 
     #[test]

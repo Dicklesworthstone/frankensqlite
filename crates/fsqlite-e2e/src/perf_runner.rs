@@ -16,6 +16,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -386,16 +387,33 @@ pub struct HotPathArtifactManifest {
     pub files: Vec<HotPathArtifactFile>,
 }
 
+static HOT_PATH_PROFILE_SCOPE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 struct HotPathProfileScope {
     was_enabled: bool,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl HotPathProfileScope {
-    fn enable() -> Self {
+    fn enable() -> crate::E2eResult<Self> {
+        let guard = HOT_PATH_PROFILE_SCOPE_LOCK.try_lock().map_err(|_| {
+            crate::E2eError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "hot-path profiling is already active in this process",
+            ))
+        })?;
         let was_enabled = hot_path_profile_enabled();
+        if was_enabled {
+            return Err(crate::E2eError::Io(std::io::Error::other(
+                "hot-path profiling was already enabled before scope entry",
+            )));
+        }
         set_hot_path_profile_enabled(true);
         reset_hot_path_profile();
-        Self { was_enabled }
+        Ok(Self {
+            was_enabled,
+            _guard: guard,
+        })
     }
 }
 
@@ -669,7 +687,7 @@ pub fn profile_fsqlite_mixed_read_write_hot_path(
         ))
     })?;
 
-    let _scope = HotPathProfileScope::enable();
+    let _scope = HotPathProfileScope::enable()?;
     let engine_report = run_oplog_fsqlite(db_path, &oplog, &config.exec_config)?;
     let snapshot = hot_path_profile_snapshot();
     Ok(build_hot_path_profile_report(
@@ -1700,5 +1718,21 @@ mod tests {
         assert!(component_names.contains(&"parser_ast_churn"));
         assert!(component_names.contains(&"record_decode"));
         assert!(component_names.contains(&"row_materialization"));
+    }
+
+    #[test]
+    fn hot_path_profile_scope_rejects_reentrant_entry() {
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(false);
+
+        let first_scope = HotPathProfileScope::enable().unwrap();
+
+        let error = HotPathProfileScope::enable().unwrap_err();
+
+        assert!(error.to_string().contains("already active in this process"));
+
+        drop(first_scope);
+        set_hot_path_profile_enabled(false);
+        reset_hot_path_profile();
     }
 }
