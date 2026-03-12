@@ -45300,6 +45300,84 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_reopened_autoincrement_table_current_timestamp_insert_stays_sqlite_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("comments_current_timestamp_reopen.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_comments_issue ON comments (issue_id);")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_comments_created_at ON comments (created_at);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('bd-1', 'Ada', 'first', CURRENT_TIMESTAMP);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO comments (issue_id, author, text, created_at)
+                 VALUES ('bd-2', 'Bea', 'second', CURRENT_TIMESTAMP);",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity_check, "ok");
+
+        let mut stmt = sqlite
+            .prepare(
+                "SELECT id, issue_id, author, text, created_at, typeof(created_at)
+                 FROM comments
+                 ORDER BY id",
+            )
+            .unwrap();
+        let rows: Vec<(i64, String, String, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "bd-1");
+        assert_eq!(rows[0].2, "Ada");
+        assert_eq!(rows[0].3, "first");
+        assert!(!rows[0].4.is_empty(), "created_at should not be NULL/empty");
+        assert_eq!(rows[0].5, "text");
+
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1, "bd-2");
+        assert_eq!(rows[1].2, "Bea");
+        assert_eq!(rows[1].3, "second");
+        assert!(!rows[1].4.is_empty(), "created_at should not be NULL/empty");
+        assert_eq!(rows[1].5, "text");
+    }
+
+    #[test]
     fn test_update_preserves_rowid_alias_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ipk_update_reopen.db");

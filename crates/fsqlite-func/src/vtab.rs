@@ -214,9 +214,7 @@ impl<S: Clone> TransactionalVtabState<S> {
     /// Falling back to the transaction-begin snapshot lets `ROLLBACK TO` an
     /// older savepoint restore the correct pre-transaction state.
     pub fn rollback_to(&mut self, level: i32) -> Option<S> {
-        if self.base_snapshot.is_none() {
-            return None;
-        }
+        self.base_snapshot.as_ref()?;
         let snapshot = self
             .savepoints
             .iter()
