@@ -617,6 +617,18 @@ pub fn concurrent_write_page(
     page: PageNumber,
     data: PageData,
 ) -> Result<(), MvccError> {
+    concurrent_write_page_with(handle, lock_table, session_id, page, || data)
+}
+
+/// Write a page within a concurrent transaction, materializing payload bytes
+/// only after the page lock has been acquired.
+pub fn concurrent_write_page_with(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    page: PageNumber,
+    build_data: impl FnOnce() -> PageData,
+) -> Result<(), MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
@@ -629,7 +641,7 @@ pub fn concurrent_write_page(
     handle.freed_pages.remove(&page);
     handle.conflict_only_pages.remove(&page);
     handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
-    handle.write_set.insert(page, data);
+    handle.write_set.insert(page, build_data());
     Ok(())
 }
 
@@ -1489,8 +1501,8 @@ mod tests {
         concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
         concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
         concurrent_savepoint, concurrent_track_write_conflict_page, concurrent_write_page,
-        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
-        validate_first_committer_wins,
+        concurrent_write_page_with, finalize_prepared_concurrent_commit_with_ssi,
+        prepare_concurrent_commit_with_ssi, validate_first_committer_wins,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -1636,6 +1648,42 @@ mod tests {
         let seq3 = concurrent_commit(h3, &commit_index, &lock_table, s3, CommitSeq::new(13))
             .expect("s3 commits");
         assert_eq!(seq3, CommitSeq::new(13));
+    }
+
+    #[test]
+    fn test_concurrent_write_page_with_skips_payload_build_on_busy() {
+        use std::cell::Cell;
+
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 1");
+        let s2 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 2");
+
+        let h1 = registry.get_mut(s1).expect("h1");
+        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+
+        let builds = Cell::new(0_u32);
+        let h2 = registry.get_mut(s2).expect("h2");
+        let result = concurrent_write_page_with(h2, &lock_table, s2, test_page(5), || {
+            builds.set(builds.get() + 1);
+            test_data()
+        });
+
+        assert_eq!(result, Err(MvccError::Busy));
+        assert_eq!(builds.get(), 0, "busy path must not materialize page payloads");
+        assert!(
+            h2.write_set().is_empty(),
+            "busy path must not leak staged page bytes into the write set"
+        );
+        assert!(
+            !h2.held_locks().contains(&test_page(5)),
+            "busy path must not retain the contested page lock"
+        );
     }
 
     // -----------------------------------------------------------------------

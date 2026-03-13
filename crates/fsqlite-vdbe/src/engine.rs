@@ -34,8 +34,8 @@ use fsqlite_mvcc::{
     CommitIndex, CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError,
     TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_free_page,
     concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
-    concurrent_restore_page_state, concurrent_track_write_conflict_page, concurrent_write_page,
-    create_time_travel_snapshot,
+    concurrent_restore_page_state, concurrent_track_write_conflict_page,
+    concurrent_write_page_with, create_time_travel_snapshot,
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
@@ -1128,11 +1128,8 @@ impl PageWriter for SharedTxnPageIo {
             let deadline = Duration::from_millis(ctx.busy_timeout_ms);
             let mut handoff = BusyRetryHandoff::default();
 
-            let page_data_base = PageData::from_vec(data.to_vec());
-
             loop {
                 observe_execution_cancellation(cx)?;
-                let page_data = page_data_base.clone();
                 let (txn_id, snapshot_high, conflicting_commit_seq) = {
                     let guard = ctx
                         .registry
@@ -1184,12 +1181,12 @@ impl PageWriter for SharedTxnPageIo {
                     })?;
                     let txn_id = handle.txn_token().id.get();
                     let snapshot_high = handle.snapshot().high.get();
-                    let write_result = concurrent_write_page(
+                    let write_result = concurrent_write_page_with(
                         handle,
                         &ctx.lock_table,
                         ctx.session_id,
                         page_no,
-                        page_data,
+                        || PageData::from_vec(data.to_vec()),
                     );
                     (write_result, txn_id, snapshot_high)
                 };
@@ -16574,7 +16571,7 @@ mod tests {
             let holder = guard
                 .get_mut(holder_session)
                 .expect("holder session must be present");
-            concurrent_write_page(
+            fsqlite_mvcc::concurrent_write_page(
                 holder,
                 &lock_table,
                 holder_session,
