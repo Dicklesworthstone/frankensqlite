@@ -8,7 +8,7 @@
 //! - [`Savepoint`]: B-tree-level page state snapshots within a transaction.
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, btree_map::Entry as BTreeEntry};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -368,6 +368,9 @@ pub struct TransactionManager {
     chain_length_warning: usize,
     /// Active snapshot highs keyed by txn id (used to derive GC horizon).
     active_snapshot_highs: Mutex<HashMap<TxnId, CommitSeq>>,
+    /// Refcounted index of active snapshot highs so the minimum horizon can be
+    /// maintained without rescanning every active transaction on begin/abort.
+    active_snapshot_high_counts: Mutex<BTreeMap<CommitSeq, usize>>,
     /// Cached minimum active snapshot high (`NO_GC_HORIZON` when empty).
     cached_gc_horizon: AtomicU64,
 }
@@ -399,6 +402,7 @@ impl TransactionManager {
             max_chain_length: DEFAULT_MAX_CHAIN_LENGTH,
             chain_length_warning: DEFAULT_CHAIN_LENGTH_WARNING,
             active_snapshot_highs: Mutex::new(HashMap::new()),
+            active_snapshot_high_counts: Mutex::new(BTreeMap::new()),
             cached_gc_horizon: AtomicU64::new(NO_GC_HORIZON),
         }
     }
@@ -713,24 +717,31 @@ impl TransactionManager {
 
     fn register_active_snapshot(&self, txn_id: TxnId, snapshot_high: CommitSeq) {
         let mut active = self.active_snapshot_highs.lock();
-        active.insert(txn_id, snapshot_high);
-        let cached = active
-            .values()
-            .map(|cs| cs.get())
-            .min()
-            .unwrap_or(NO_GC_HORIZON);
-        self.cached_gc_horizon.store(cached, Ordering::Release);
+        let mut snapshot_counts = self.active_snapshot_high_counts.lock();
+
+        if let Some(previous_high) = active.insert(txn_id, snapshot_high) {
+            decrement_active_snapshot_refcount(&mut snapshot_counts, previous_high);
+        }
+        increment_active_snapshot_refcount(&mut snapshot_counts, snapshot_high);
+
+        self.cached_gc_horizon.store(
+            active_snapshot_horizon_raw(&snapshot_counts),
+            Ordering::Release,
+        );
     }
 
     fn unregister_active_snapshot(&self, txn_id: TxnId) {
         let mut active = self.active_snapshot_highs.lock();
-        active.remove(&txn_id);
-        let cached = active
-            .values()
-            .map(|cs| cs.get())
-            .min()
-            .unwrap_or(NO_GC_HORIZON);
-        self.cached_gc_horizon.store(cached, Ordering::Release);
+        let mut snapshot_counts = self.active_snapshot_high_counts.lock();
+
+        if let Some(snapshot_high) = active.remove(&txn_id) {
+            decrement_active_snapshot_refcount(&mut snapshot_counts, snapshot_high);
+        }
+
+        self.cached_gc_horizon.store(
+            active_snapshot_horizon_raw(&snapshot_counts),
+            Ordering::Release,
+        );
     }
 
     fn eager_gc_horizon(&self) -> CommitSeq {
@@ -1507,6 +1518,36 @@ impl TransactionManager {
             );
         }
     }
+}
+
+fn increment_active_snapshot_refcount(
+    snapshot_counts: &mut BTreeMap<CommitSeq, usize>,
+    snapshot_high: CommitSeq,
+) {
+    *snapshot_counts.entry(snapshot_high).or_insert(0) += 1;
+}
+
+fn decrement_active_snapshot_refcount(
+    snapshot_counts: &mut BTreeMap<CommitSeq, usize>,
+    snapshot_high: CommitSeq,
+) {
+    match snapshot_counts.entry(snapshot_high) {
+        BTreeEntry::Occupied(mut entry) => {
+            let count = entry.get_mut();
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                entry.remove();
+            }
+        }
+        BTreeEntry::Vacant(_) => {}
+    }
+}
+
+fn active_snapshot_horizon_raw(snapshot_counts: &BTreeMap<CommitSeq, usize>) -> u64 {
+    snapshot_counts
+        .first_key_value()
+        .map_or(NO_GC_HORIZON, |(snapshot_high, _)| snapshot_high.get())
 }
 
 impl std::fmt::Debug for TransactionManager {
@@ -5675,6 +5716,81 @@ mod tests {
         assert!(
             mgr.cached_gc_horizon().is_none(),
             "releasing last active snapshot should clear cached horizon"
+        );
+    }
+
+    #[test]
+    fn test_cached_gc_horizon_retains_duplicate_snapshot_highs_until_last_release() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_781).unwrap();
+
+        let mut txn_a = mgr.begin(BeginKind::Deferred).unwrap();
+        let mut txn_b = mgr.begin(BeginKind::Deferred).unwrap();
+
+        let _ = mgr.read_page(&mut txn_a, pgno);
+        let first_horizon = mgr
+            .cached_gc_horizon()
+            .expect("first active snapshot should populate cached horizon");
+        let _ = mgr.read_page(&mut txn_b, pgno);
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(first_horizon),
+            "same snapshot high should keep the cached minimum unchanged"
+        );
+
+        mgr.abort(&mut txn_a);
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(first_horizon),
+            "remaining txn with identical snapshot high must keep horizon pinned"
+        );
+
+        mgr.abort(&mut txn_b);
+        assert!(
+            mgr.cached_gc_horizon().is_none(),
+            "cached horizon should clear only after the last duplicate snapshot releases"
+        );
+    }
+
+    #[test]
+    fn test_cached_gc_horizon_advances_to_next_snapshot_without_full_clear() {
+        let mgr = mgr();
+        let read_pgno = PageNumber::new(6_782).unwrap();
+        let write_pgno = PageNumber::new(6_783).unwrap();
+
+        let mut oldest = mgr.begin(BeginKind::Deferred).unwrap();
+        let _ = mgr.read_page(&mut oldest, read_pgno);
+        let oldest_horizon = oldest.snapshot.high;
+
+        let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer, write_pgno, PageData::zeroed(PageSize::DEFAULT))
+            .expect("writer should stage page");
+        mgr.commit(&mut writer).expect("writer should commit");
+
+        let mut newer = mgr.begin(BeginKind::Deferred).unwrap();
+        let _ = mgr.read_page(&mut newer, read_pgno);
+        let newer_horizon = newer.snapshot.high;
+        assert!(
+            newer_horizon > oldest_horizon,
+            "later txn should observe an advanced snapshot high after intervening commit"
+        );
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(oldest_horizon),
+            "oldest active snapshot should pin the minimum horizon"
+        );
+
+        mgr.abort(&mut oldest);
+        assert_eq!(
+            mgr.cached_gc_horizon(),
+            Some(newer_horizon),
+            "releasing the oldest snapshot should advance horizon to the next active snapshot"
+        );
+
+        mgr.abort(&mut newer);
+        assert!(
+            mgr.cached_gc_horizon().is_none(),
+            "cached horizon should clear after all active snapshots release"
         );
     }
 
