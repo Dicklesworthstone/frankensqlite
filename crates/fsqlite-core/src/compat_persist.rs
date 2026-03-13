@@ -15,30 +15,30 @@ use std::path::Path;
 
 use fsqlite_ast::{SortDirection, Statement};
 #[cfg(not(target_arch = "wasm32"))]
-use fsqlite_btree::cursor::TransactionPageIo;
-#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::BtreeCursorOps;
+#[cfg(not(target_arch = "wasm32"))]
+use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_parser::Parser;
+use fsqlite_types::StrictColumnType;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::cx::Cx;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::record::{parse_record, serialize_record};
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::StrictColumnType;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
-#[cfg(not(target_arch = "wasm32"))]
-use fsqlite_vfs::host_fs;
 #[cfg(all(not(target_arch = "wasm32"), unix))]
 use fsqlite_vfs::UnixVfs as PlatformVfs;
 #[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs as PlatformVfs;
+#[cfg(not(target_arch = "wasm32"))]
+use fsqlite_vfs::host_fs;
 
 /// SQLite file header magic bytes (first 16 bytes).
 #[cfg(not(target_arch = "wasm32"))]
@@ -392,7 +392,7 @@ fn init_leaf_table_page(
 ) -> Result<()> {
     let mut page = vec![0u8; page_size];
     page[0] = 0x0D; // Leaf table
-                    // cell_count = 0 (bytes 3..5)
+    // cell_count = 0 (bytes 3..5)
     page[3..5].copy_from_slice(&0u16.to_be_bytes());
     // cell content area starts at end of page
     #[allow(clippy::cast_possible_truncation)]

@@ -2296,7 +2296,10 @@ mod tests {
 
         let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
         store.inner.pages.insert(2, original_parent.clone());
-        store.inner.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
+        store
+            .inner
+            .pages
+            .insert(3, build_leaf_table(&[(10, b"ten")]));
 
         let mut overflow_cell = [0u8; 64];
         let mut pos = 0;
@@ -2330,7 +2333,10 @@ mod tests {
 
         let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
         store.inner.pages.insert(2, original_parent.clone());
-        store.inner.pages.insert(3, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+        store
+            .inner
+            .pages
+            .insert(3, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
 
         let mut overflow_cell = [0u8; 64];
         let mut pos = 0;

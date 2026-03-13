@@ -1938,18 +1938,14 @@ impl VirtualTableCursor for Fts5Cursor {
 
                 // Parse the query into tokens, build an expression tree,
                 // evaluate against the inverted index, and score with BM25.
-                let tokens = parse_fts5_query(&query).map_err(|e| {
-                    FrankenError::function_error(format!("fts5 query error: {e}"))
-                })?;
-                let expr = build_expr(&tokens).map_err(|e| {
-                    FrankenError::function_error(format!("fts5 query error: {e}"))
-                })?;
-                validate_column_filters(&expr, &self.columns).map_err(|e| {
-                    FrankenError::function_error(format!("fts5 query error: {e}"))
-                })?;
+                let tokens = parse_fts5_query(&query)
+                    .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
+                let expr = build_expr(&tokens)
+                    .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
+                validate_column_filters(&expr, &self.columns)
+                    .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
 
-                let matching_docs =
-                    evaluate_expr_for_columns(&self.index, &expr, &self.columns);
+                let matching_docs = evaluate_expr_for_columns(&self.index, &expr, &self.columns);
 
                 // Extract query terms for BM25 scoring.
                 let query_terms = extract_query_terms(&expr);
@@ -1958,21 +1954,15 @@ impl VirtualTableCursor for Fts5Cursor {
                 self.results = matching_docs
                     .into_iter()
                     .map(|docid| {
-                        let score =
-                            bm25_score(&self.index, docid, &query_terms, &weights);
-                        let columns = self
-                            .documents
-                            .get(&docid)
-                            .cloned()
-                            .unwrap_or_default();
+                        let score = bm25_score(&self.index, docid, &query_terms, &weights);
+                        let columns = self.documents.get(&docid).cloned().unwrap_or_default();
                         (docid, score, columns)
                     })
                     .collect();
 
                 // Sort by score (lower = better in FTS5 convention).
-                self.results.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                self.results
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             }
         } else {
             // Full table scan (idx_num == 0): return all documents.

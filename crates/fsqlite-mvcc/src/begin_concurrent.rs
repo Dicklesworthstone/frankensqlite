@@ -926,7 +926,9 @@ impl ActiveTxnView for HandleView<'_> {
             WitnessKey::Page(p)
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.handle.tracks_write_conflict_page(*p),
+            | WitnessKey::KeyRange { btree_root: p, .. } => {
+                self.handle.tracks_write_conflict_page(*p)
+            }
             WitnessKey::Custom { .. } => {
                 !self.handle.write_set.is_empty()
                     || !self.handle.freed_pages.is_empty()
@@ -1457,7 +1459,9 @@ pub fn concurrent_rollback_to_savepoint(
         return Err(MvccError::InvalidState);
     }
     handle.write_set.clone_from(&savepoint.write_set_snapshot);
-    handle.freed_pages.clone_from(&savepoint.freed_pages_snapshot);
+    handle
+        .freed_pages
+        .clone_from(&savepoint.freed_pages_snapshot);
     handle
         .conflict_only_pages
         .clone_from(&savepoint.conflict_only_pages_snapshot);
@@ -1822,7 +1826,10 @@ mod tests {
         concurrent_commit(handle, &commit_index, &lock_table, s1, CommitSeq::new(11))
             .expect("commit should succeed");
 
-        assert_eq!(commit_index.latest(PageNumber::ONE), Some(CommitSeq::new(11)));
+        assert_eq!(
+            commit_index.latest(PageNumber::ONE),
+            Some(CommitSeq::new(11))
+        );
     }
 
     // -----------------------------------------------------------------------

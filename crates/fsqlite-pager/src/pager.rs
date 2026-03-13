@@ -443,8 +443,9 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     inner: &mut PagerInner<F>,
     write_set: &mut HashMap<PageNumber, StagedPage>,
     write_pages_sorted: &mut Vec<PageNumber>,
+    committed_db_size: u32,
 ) -> Result<()> {
-    if inner.db_size == 0 {
+    if committed_db_size == 0 {
         inner.freelist.clear();
         return Ok(());
     }
@@ -453,13 +454,13 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     // pages returned by aborted concurrent transactions. Those pages were
     // never part of the durable file image, so they must not be serialized
     // into page-1 freelist metadata until db_size grows to include them.
-    let upper_bound = inner.next_page.saturating_sub(1).max(inner.db_size);
+    let upper_bound = inner.next_page.saturating_sub(1).max(committed_db_size);
     inner.freelist = normalize_freelist(&inner.freelist, upper_bound);
     let durable_freelist: Vec<PageNumber> = inner
         .freelist
         .iter()
         .copied()
-        .filter(|page| page.get() <= inner.db_size)
+        .filter(|page| page.get() <= committed_db_size)
         .collect();
 
     let ps = inner.page_size.as_usize();
@@ -1889,6 +1890,13 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     #[must_use]
+    fn committed_db_size_with_inner(&self, inner: &PagerInner<V::File>) -> u32 {
+        self.write_pages_sorted
+            .last()
+            .map_or(inner.db_size, |page| inner.db_size.max(page.get()))
+    }
+
+    #[must_use]
     fn classify_wal_page_one_write(
         &self,
         current_db_size: u32,
@@ -1906,14 +1914,15 @@ impl<V: Vfs> SimpleTransaction<V> {
     fn predicted_commit_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
         let mut pages = self.write_pages_sorted.clone();
         let freelist_dirty = self.freelist_metadata_dirty();
+        let committed_db_size = self.committed_db_size_with_inner(inner);
 
-        if freelist_dirty && inner.db_size != 0 {
-            let upper_bound = inner.next_page.saturating_sub(1).max(inner.db_size);
+        if freelist_dirty && committed_db_size != 0 {
+            let upper_bound = inner.next_page.saturating_sub(1).max(committed_db_size);
             let mut freelist = inner.freelist.clone();
             return_pages_to_freelist(&mut freelist, self.freed_pages.iter().copied());
             let durable_freelist: Vec<PageNumber> = normalize_freelist(&freelist, upper_bound)
                 .into_iter()
-                .filter(|page| page.get() <= inner.db_size)
+                .filter(|page| page.get() <= committed_db_size)
                 .collect();
             if !durable_freelist.is_empty() {
                 let max_leaf_entries = (inner.page_size.as_usize() / 4).saturating_sub(2).max(1);
@@ -2388,6 +2397,7 @@ where
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
         let freelist_dirty = self.freelist_metadata_dirty();
+        let committed_db_size = self.committed_db_size_with_inner(&inner);
         for page_no in self.freed_pages.drain(..) {
             inner.freelist.push(page_no);
         }
@@ -2397,6 +2407,7 @@ where
                 &mut inner,
                 &mut self.write_set,
                 &mut self.write_pages_sorted,
+                committed_db_size,
             )?;
         }
 
@@ -2422,10 +2433,7 @@ where
                 if self.journal_mode != JournalMode::Wal
                     || wal_page1_plan.requires_page_count_advance()
                 {
-                    let new_db_size = inner
-                        .db_size
-                        .max(wal_page1_plan.max_written)
-                        .max(existing_page_count);
+                    let new_db_size = committed_db_size.max(existing_page_count);
                     // Offset 28..32: page count (big-endian u32)
                     page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
                 }
@@ -2454,6 +2462,7 @@ where
         };
 
         if commit_result.is_ok() {
+            inner.db_size = committed_db_size;
             inner.commit_seq = inner.commit_seq.next();
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
@@ -8365,6 +8374,106 @@ mod tests {
             "bead_id={BEAD_ID} case=pending_commit_pages_ignore_eof_only_freelist_pages"
         );
         txn.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_commit_keeps_newly_freed_pages_below_future_db_size_on_durable_freelist() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/commit_keeps_newly_freed_pages.db");
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = seed.allocate_page(&cx).unwrap();
+        let p3 = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+        seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+        seed.commit(&cx).unwrap();
+
+        let (p4, p5, p6, p7) = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p4 = txn.allocate_page(&cx).unwrap();
+            let p5 = txn.allocate_page(&cx).unwrap();
+            let p6 = txn.allocate_page(&cx).unwrap();
+            let p7 = txn.allocate_page(&cx).unwrap();
+            txn.free_page(&cx, p4).unwrap();
+            txn.free_page(&cx, p5).unwrap();
+            txn.free_page(&cx, p6).unwrap();
+            txn.write_page(&cx, p7, &vec![0x77; ps]).unwrap();
+
+            let predicted = txn.pending_commit_pages().unwrap();
+            assert!(
+                predicted.contains(&PageNumber::ONE),
+                "bead_id={BEAD_ID} case=future_db_size_commit_still_rewrites_page_one"
+            );
+            assert!(
+                predicted.contains(&p4),
+                "bead_id={BEAD_ID} case=future_db_size_commit_includes_new_trunk_page"
+            );
+            assert!(
+                predicted.contains(&p7),
+                "bead_id={BEAD_ID} case=future_db_size_commit_includes_live_high_page"
+            );
+
+            txn.commit(&cx).unwrap();
+            (p4, p5, p6, p7)
+        };
+
+        let mut txn_ro = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw = txn_ro.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+        let hdr_bytes: [u8; DATABASE_HEADER_SIZE] = raw[..DATABASE_HEADER_SIZE].try_into().unwrap();
+        let hdr = DatabaseHeader::from_bytes(&hdr_bytes).unwrap();
+        assert_eq!(
+            hdr.page_count,
+            p7.get(),
+            "bead_id={BEAD_ID} case=future_db_size_commit_advances_page_count_to_live_high_page"
+        );
+        assert_eq!(
+            hdr.freelist_count, 3,
+            "bead_id={BEAD_ID} case=future_db_size_commit_persists_newly_freed_pages"
+        );
+        assert_eq!(
+            hdr.freelist_trunk,
+            p4.get(),
+            "bead_id={BEAD_ID} case=future_db_size_commit_uses_first_newly_freed_page_as_trunk"
+        );
+        txn_ro.commit(&cx).unwrap();
+
+        let reopened = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        {
+            let inner = reopened.inner.lock().unwrap();
+            assert_eq!(
+                inner.db_size,
+                p7.get(),
+                "bead_id={BEAD_ID} case=future_db_size_commit_reopen_keeps_page_count"
+            );
+            assert_eq!(
+                inner.freelist.len(),
+                3,
+                "bead_id={BEAD_ID} case=future_db_size_commit_reopen_restores_freelist_len"
+            );
+            assert!(
+                inner.freelist.contains(&p4)
+                    && inner.freelist.contains(&p5)
+                    && inner.freelist.contains(&p6),
+                "bead_id={BEAD_ID} case=future_db_size_commit_reopen_restores_newly_freed_pages"
+            );
+        }
+
+        let mut reuse = reopened.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut reused = vec![
+            reuse.allocate_page(&cx).unwrap(),
+            reuse.allocate_page(&cx).unwrap(),
+            reuse.allocate_page(&cx).unwrap(),
+        ];
+        reused.sort_unstable();
+        assert_eq!(
+            reused,
+            vec![p4, p5, p6],
+            "bead_id={BEAD_ID} case=future_db_size_commit_reuses_newly_freed_pages_after_reopen"
+        );
+        reuse.rollback(&cx).unwrap();
     }
 
     #[test]

@@ -22,17 +22,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_core::connection::{
-    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
+    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
+    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 
-use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use crate::HarnessSettings;
+use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
-use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
+use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use crate::sqlite_executor::run_oplog_sqlite;
-use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -1622,12 +1622,16 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Sqlite3
+                && c.fixture_id == "fix1"
+                && c.concurrency == 1)
+        );
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Fsqlite
+                && c.fixture_id == "fix2"
+                && c.concurrency == 4)
+        );
     }
 
     #[test]
@@ -1822,16 +1826,20 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## Quantified Cost Components"));
-        assert!(actionable_ranking
-            .named_hotspots
-            .iter()
-            .flat_map(|entry| entry.mapped_beads.iter())
-            .any(|bead| bead == "bd-db300.4.2"
-                || bead == "bd-db300.4.3"
-                || bead == "bd-db300.4.4"));
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Quantified Cost Components")
+        );
+        assert!(
+            actionable_ranking
+                .named_hotspots
+                .iter()
+                .flat_map(|entry| entry.mapped_beads.iter())
+                .any(|bead| bead == "bd-db300.4.2"
+                    || bead == "bd-db300.4.3"
+                    || bead == "bd-db300.4.4")
+        );
         assert_eq!(actionable_ranking.cost_components.len(), 3);
         let component_names = actionable_ranking
             .cost_components
@@ -1841,10 +1849,12 @@ mod tests {
         assert!(component_names.contains(&"parser_ast_churn"));
         assert!(component_names.contains(&"record_decode"));
         assert!(component_names.contains(&"row_materialization"));
-        assert!(actionable_ranking
-            .allocator_pressure
-            .iter()
-            .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty()));
+        assert!(
+            actionable_ranking
+                .allocator_pressure
+                .iter()
+                .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty())
+        );
 
         let parser_component = actionable_ranking
             .cost_components

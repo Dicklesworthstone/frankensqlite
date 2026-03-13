@@ -9,7 +9,7 @@ use fsqlite_ast::{
     InsertSource, InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn,
     SelectCore, SelectStatement, UnaryOp as AstUnaryOp, UpdateStatement,
 };
-use fsqlite_types::opcode::{Label, Opcode, ProgramBuilder, P4};
+use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
 // ---------------------------------------------------------------------------
 // INSERT conflict-mode p5 flags (must match fsqlite-vdbe/src/codegen.rs)

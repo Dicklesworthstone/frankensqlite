@@ -288,6 +288,134 @@ fn format_hot_path_heaptrack_command(
     )
 }
 
+fn format_hot_path_bash_command(output_dir: &Path, relpath: &str, script: String) -> String {
+    mkdir_prefixed_capture_command(
+        output_dir,
+        relpath,
+        format!(
+            "bash -lc {}",
+            shell_escape(&format!("set -euo pipefail; {script}"))
+        ),
+    )
+}
+
+fn hot_path_sidecar_relpath(relpath: &str, suffix: &str) -> String {
+    relpath.strip_suffix(".summary.txt").map_or_else(
+        || format!("{relpath}{suffix}"),
+        |prefix| format!("{prefix}{suffix}"),
+    )
+}
+
+fn format_hot_path_perf_topdown_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    format_hot_path_bash_command(
+        output_dir,
+        relpath,
+        format!(
+            "out={}; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; \
+             if perf stat -M TopdownL1 -o \"$tmp\" -- true >/dev/null 2>&1; then \
+                 printf '%s\\n' 'capture=topdown' 'selected=TopdownL1' 'fallback=false' > \"$out\"; \
+                 perf stat -x, -M TopdownL1 -o \"$tmp\" -- {replay_command}; \
+             else \
+                 printf '%s\\n' 'capture=topdown' 'selected=core_event_fallback' 'fallback=true' 'reason=TopdownL1 unsupported on this host' > \"$out\"; \
+                 perf stat -x, -e cycles,instructions,branches,branch-misses,cache-references,cache-misses -o \"$tmp\" -- {replay_command}; \
+             fi; \
+             cat \"$tmp\" >> \"$out\"",
+            shell_escape(&output_path),
+        ),
+    )
+}
+
+fn format_hot_path_perf_c2c_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    let raw_path = hot_path_output_path(output_dir, &hot_path_sidecar_relpath(relpath, ".data"));
+    format_hot_path_bash_command(
+        output_dir,
+        relpath,
+        format!(
+            "out={}; raw={}; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; \
+             rm -f \"$raw\"; \
+             if perf c2c record -o \"$raw\" -- {replay_command} >/dev/null 2>&1 && \
+                 perf c2c report --stats -i \"$raw\" > \"$tmp\" 2>&1; then \
+                 printf '%s\\n' 'capture=cache_to_cache' 'selected=perf_c2c' 'fallback=false' > \"$out\"; \
+                 cat \"$tmp\" >> \"$out\"; \
+             elif perf mem record -o \"$raw\" -- {replay_command} >/dev/null 2>&1 && \
+                 perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then \
+                 printf '%s\\n' 'capture=cache_to_cache' 'selected=perf_mem_fallback' 'fallback=true' 'reason=perf c2c unavailable or failed on this host' > \"$out\"; \
+                 cat \"$tmp\" >> \"$out\"; \
+             else \
+                 rm -f \"$raw\"; \
+                 printf '%s\\n' 'capture=cache_to_cache' 'selected=cache_event_fallback' 'fallback=true' 'reason=perf c2c and perf mem unavailable or failed on this host' > \"$out\"; \
+                 perf stat -x, -e cache-references,cache-misses -o \"$tmp\" -- {replay_command}; \
+                 cat \"$tmp\" >> \"$out\"; \
+             fi",
+            shell_escape(&output_path),
+            shell_escape(&raw_path),
+        ),
+    )
+}
+
+fn format_hot_path_perf_migration_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    format_hot_path_bash_command(
+        output_dir,
+        relpath,
+        format!(
+            "out={}; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; \
+             if perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true >/dev/null 2>&1; then \
+                 printf '%s\\n' 'capture=migration' 'selected=cpu_migrations' 'fallback=false' > \"$out\"; \
+                 perf stat -x, -e cpu-migrations,context-switches -o \"$tmp\" -- {replay_command}; \
+             else \
+                 printf '%s\\n' 'capture=migration' 'selected=context_switch_fallback' 'fallback=true' 'reason=cpu-migrations unsupported on this host' > \"$out\"; \
+                 perf stat -x, -e context-switches,task-clock -o \"$tmp\" -- {replay_command}; \
+             fi; \
+             cat \"$tmp\" >> \"$out\"",
+            shell_escape(&output_path),
+        ),
+    )
+}
+
+fn format_hot_path_perf_mem_remote_access_command(
+    output_dir: &Path,
+    relpath: &str,
+    replay_command: &str,
+) -> String {
+    let output_path = hot_path_output_path(output_dir, relpath);
+    let raw_path = hot_path_output_path(output_dir, &hot_path_sidecar_relpath(relpath, ".data"));
+    format_hot_path_bash_command(
+        output_dir,
+        relpath,
+        format!(
+            "out={}; raw={}; tmp=$(mktemp); trap 'rm -f \"$tmp\"' EXIT; \
+             rm -f \"$raw\"; \
+             if perf mem record -o \"$raw\" -- {replay_command} >/dev/null 2>&1 && \
+                 perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then \
+                 printf '%s\\n' 'capture=remote_access' 'selected=perf_mem' 'fallback=false' > \"$out\"; \
+                 cat \"$tmp\" >> \"$out\"; \
+             else \
+                 rm -f \"$raw\"; \
+                 printf '%s\\n' 'capture=remote_access' 'selected=cache_event_fallback' 'fallback=true' 'reason=perf mem unavailable or failed on this host' > \"$out\"; \
+                 perf stat -x, -e cache-references,cache-misses,page-faults -o \"$tmp\" -- {replay_command}; \
+                 cat \"$tmp\" >> \"$out\"; \
+             fi",
+            shell_escape(&output_path),
+            shell_escape(&raw_path),
+        ),
+    )
+}
+
 fn build_hot_path_command_pack(
     report: &HotPathProfileReport,
     replay_command: &HotProfileReplayCommand<'_>,
@@ -302,7 +430,7 @@ fn build_hot_path_command_pack(
             run_integrity_check: true,
             ..*replay_command
         });
-    let mut commands = Vec::with_capacity(10);
+    let mut commands = Vec::with_capacity(18);
     for (mode, replay) in [
         ("profiler_safe", profiler_safe_replay_command.as_str()),
         ("full_validation", full_validation_replay_command.as_str()),
@@ -360,6 +488,56 @@ fn build_hot_path_command_pack(
                 format_hot_path_heaptrack_command(
                     replay_command.output_dir,
                     &format!("profiles/heaptrack.{mode}.gz"),
+                    replay,
+                ),
+            ),
+            (
+                "topdown",
+                "perf-stat",
+                format!("profiles/perf-stat-topdown.{mode}.summary.txt"),
+                format!("topdown counter pack with comparable fallback metrics for {mode} capture"),
+                format_hot_path_perf_topdown_command(
+                    replay_command.output_dir,
+                    &format!("profiles/perf-stat-topdown.{mode}.summary.txt"),
+                    replay,
+                ),
+            ),
+            (
+                "cache_to_cache",
+                "perf-c2c",
+                format!("profiles/perf-c2c.{mode}.summary.txt"),
+                format!(
+                    "cache-to-cache or HITM evidence with perf mem/cache-stat fallbacks for {mode} capture"
+                ),
+                format_hot_path_perf_c2c_command(
+                    replay_command.output_dir,
+                    &format!("profiles/perf-c2c.{mode}.summary.txt"),
+                    replay,
+                ),
+            ),
+            (
+                "migration",
+                "perf-stat",
+                format!("profiles/perf-stat-migration.{mode}.summary.txt"),
+                format!(
+                    "migration and scheduling counter pack with fallback metrics for {mode} capture"
+                ),
+                format_hot_path_perf_migration_command(
+                    replay_command.output_dir,
+                    &format!("profiles/perf-stat-migration.{mode}.summary.txt"),
+                    replay,
+                ),
+            ),
+            (
+                "remote_access",
+                "perf-mem",
+                format!("profiles/perf-mem-remote-access.{mode}.summary.txt"),
+                format!(
+                    "remote-access memory evidence with cache-stat fallback metrics for {mode} capture"
+                ),
+                format_hot_path_perf_mem_remote_access_command(
+                    replay_command.output_dir,
+                    &format!("profiles/perf-mem-remote-access.{mode}.summary.txt"),
                     replay,
                 ),
             ),
@@ -4502,7 +4680,7 @@ mod tests {
             pack.full_validation_replay_command
                 .contains("--integrity-check")
         );
-        assert_eq!(pack.commands.len(), 10);
+        assert_eq!(pack.commands.len(), 18);
         assert!(pack.commands.iter().any(|command| {
             command.capture == "wall_clock"
                 && command.mode == "profiler_safe"
@@ -4517,6 +4695,37 @@ mod tests {
             command.capture == "allocation"
                 && command.mode == "full_validation"
                 && command.output_relpath == "profiles/heaptrack.full_validation.gz"
+        }));
+        assert!(pack.commands.iter().any(|command| {
+            command.capture == "topdown"
+                && command.mode == "profiler_safe"
+                && command.command_line.contains("TopdownL1")
+                && command.command_line.contains("cycles,instructions")
+        }));
+        assert!(pack.commands.iter().any(|command| {
+            command.capture == "cache_to_cache"
+                && command.mode == "full_validation"
+                && command.command_line.contains("perf c2c record")
+                && command.command_line.contains("perf mem record")
+                && command.output_relpath == "profiles/perf-c2c.full_validation.summary.txt"
+        }));
+        assert!(pack.commands.iter().any(|command| {
+            command.capture == "migration"
+                && command.mode == "profiler_safe"
+                && command
+                    .command_line
+                    .contains("cpu-migrations,context-switches")
+                && command.command_line.contains("context-switches,task-clock")
+        }));
+        assert!(pack.commands.iter().any(|command| {
+            command.capture == "remote_access"
+                && command.mode == "full_validation"
+                && command.command_line.contains("perf mem report")
+                && command
+                    .command_line
+                    .contains("cache-references,cache-misses,page-faults")
+                && command.output_relpath
+                    == "profiles/perf-mem-remote-access.full_validation.summary.txt"
         }));
     }
 

@@ -4711,8 +4711,8 @@ mod tests {
         let cost_if_only_last = 1.0_f64 // small full scan cost
             + 10.0 * 10.0 // medium scanned 10 times
             + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)
-                             // The plan's total cost should be larger than this naive estimate
-                             // because large is actually scanned 10*100=1000 times.
+        // The plan's total cost should be larger than this naive estimate
+        // because large is actually scanned 10*100=1000 times.
         assert!(
             plan_sml.total_cost > cost_if_only_last,
             "3-way join cost should scale by cumulative rows, not just last table: plan_cost={} bug_cost={}",
@@ -6963,7 +6963,7 @@ mod tests {
         assert_eq!(order.len(), 3);
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
-                            // Small table should be chosen first (lower cost).
+        // Small table should be chosen first (lower cost).
         assert_eq!(order[0], 0); // "x" has fewest pages.
     }
 
