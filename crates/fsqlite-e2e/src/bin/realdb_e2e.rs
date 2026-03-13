@@ -8,10 +8,11 @@
 //! - `corpus verify` — Verify golden copies against `sample_sqlite_db_files/checksums.sha256`.
 //! - `run` — Execute an OpLog workload against a chosen engine.
 //! - `bench` — Run a Criterion-style benchmark matrix.
-//! - `hot-profile` — Capture a structured mixed-read-write hot-path profile.
+//! - `hot-profile` — Capture a structured hot-path profile for a benchmark preset.
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
 //! - `compare` — Tiered comparison of two database files (bd-2als.3.2).
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -32,6 +33,9 @@ use fsqlite_e2e::fixture_metadata::{
     ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
     FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
 };
+use fsqlite_e2e::fixture_select::{
+    BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, load_beads_benchmark_campaign,
+};
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
@@ -39,8 +43,8 @@ use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
     FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
     HotPathProfileReport, build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
-    build_hot_path_subsystem_profile, profile_fsqlite_mixed_read_write_hot_path,
-    render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
+    build_hot_path_subsystem_profile, profile_fsqlite_hot_path, render_hot_path_profile_markdown,
+    write_hot_path_profile_artifacts,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
@@ -51,6 +55,15 @@ const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bund
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
 const HOT_PATH_COMMAND_PACK_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_command_pack.v1";
 const HOT_PATH_COMMAND_PACK_NAME: &str = "command_pack.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchCampaignDefaults {
+    golden_dir: PathBuf,
+    fixture_ids: Vec<String>,
+    fixture_paths: HashMap<String, PathBuf>,
+    presets: Vec<String>,
+    concurrency: Vec<u16>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunModeOptions {
@@ -92,6 +105,103 @@ impl RunModeOptions {
     }
 }
 
+fn default_bench_presets() -> Vec<String> {
+    vec![
+        "commutative_inserts_disjoint_keys".to_owned(),
+        "hot_page_contention".to_owned(),
+        "mixed_read_write".to_owned(),
+    ]
+}
+
+fn find_bench_workspace_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE).is_file())
+        .map(Path::to_path_buf)
+}
+
+fn canonical_bench_defaults(workspace_root: &Path) -> Result<BenchCampaignDefaults, String> {
+    let campaign = load_beads_benchmark_campaign(workspace_root)?;
+    canonical_bench_defaults_from_campaign(workspace_root, &campaign)
+}
+
+fn canonical_bench_defaults_from_campaign(
+    workspace_root: &Path,
+    campaign: &BeadsBenchmarkCampaign,
+) -> Result<BenchCampaignDefaults, String> {
+    let Some(first_fixture) = campaign.fixtures.first() else {
+        return Err("canonical Beads benchmark campaign has no fixtures".to_owned());
+    };
+    let first_path = workspace_root.join(&first_fixture.working_copy_relpath);
+    let Some(golden_dir) = first_path.parent().map(Path::to_path_buf) else {
+        return Err(format!(
+            "canonical fixture `{}` has no parent directory: {}",
+            first_fixture.fixture_id,
+            first_path.display()
+        ));
+    };
+
+    for fixture in &campaign.fixtures[1..] {
+        let fixture_path = workspace_root.join(&fixture.working_copy_relpath);
+        let Some(parent) = fixture_path.parent() else {
+            return Err(format!(
+                "canonical fixture `{}` has no parent directory: {}",
+                fixture.fixture_id,
+                fixture_path.display()
+            ));
+        };
+        if parent != golden_dir {
+            return Err(format!(
+                "canonical Beads benchmark fixtures must share one golden directory: {} vs {}",
+                golden_dir.display(),
+                parent.display()
+            ));
+        }
+    }
+
+    let fixture_ids = campaign
+        .fixtures
+        .iter()
+        .map(|fixture| fixture.fixture_id.clone())
+        .collect::<Vec<_>>();
+    let fixture_paths = campaign
+        .fixtures
+        .iter()
+        .map(|fixture| {
+            (
+                fixture.fixture_id.clone(),
+                workspace_root.join(&fixture.working_copy_relpath),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut presets = Vec::new();
+    let mut concurrency = Vec::new();
+    for row in &campaign.matrix_rows {
+        if !presets.iter().any(|preset| preset == &row.workload) {
+            presets.push(row.workload.clone());
+        }
+        if !concurrency.contains(&row.concurrency) {
+            concurrency.push(row.concurrency);
+        }
+    }
+
+    if presets.is_empty() {
+        return Err("canonical Beads benchmark campaign has no workloads".to_owned());
+    }
+    if concurrency.is_empty() {
+        return Err("canonical Beads benchmark campaign has no concurrency rows".to_owned());
+    }
+
+    Ok(BenchCampaignDefaults {
+        golden_dir,
+        fixture_ids,
+        fixture_paths,
+        presets,
+        concurrency,
+    })
+}
+
 fn shell_escape(raw: &str) -> String {
     if raw
         .bytes()
@@ -106,6 +216,7 @@ fn shell_escape(raw: &str) -> String {
 #[derive(Debug, Clone, Copy)]
 struct HotProfileReplayCommand<'a> {
     db: &'a str,
+    workload: &'a str,
     golden_dir: &'a Path,
     working_base: &'a Path,
     concurrency: u16,
@@ -150,6 +261,7 @@ fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> S
         String::from("rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile");
     for (flag, value) in [
         ("--db", command.db.to_owned()),
+        ("--workload", command.workload.to_owned()),
         (
             "--golden-dir",
             command
@@ -704,7 +816,7 @@ SUBCOMMANDS:
     corpus verify           Verify golden copies against checksums.sha256
     run                     Execute an OpLog workload against an engine
     bench                   Run the benchmark matrix (Criterion)
-    hot-profile             Capture mixed_read_write hot-path evidence
+    hot-profile             Capture hot-path evidence for a benchmark preset
     corrupt                 Inject corruption into a working copy
     compare                 Tiered comparison of two database files
 
@@ -719,7 +831,7 @@ EXAMPLES:
     realdb-e2e run --engine sqlite3 --db beads-proj-a --workload commutative_inserts --concurrency 4
     realdb-e2e run --engine fsqlite --db beads-proj-a --workload hot_page_contention --concurrency 8
     realdb-e2e bench --db beads-proj-a --preset all
-    realdb-e2e hot-profile --db beads-proj-a --concurrency 4
+    realdb-e2e hot-profile --db beads-proj-a --workload mixed_read_write --concurrency 4
     realdb-e2e corrupt --db beads-proj-a --strategy page --page 1 --seed 42
 ";
     let _ = io::stdout().write_all(text.as_bytes());
@@ -2560,6 +2672,9 @@ fn cmd_bench(argv: &[String]) -> i32 {
     let mut output_jsonl: Option<PathBuf> = None;
     let mut output_md: Option<PathBuf> = None;
     let mut pretty = false;
+    let mut golden_dir_overridden = false;
+    let mut db_overridden = false;
+    let mut concurrency_overridden = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -2571,6 +2686,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
                     return 2;
                 }
                 golden_dir = PathBuf::from(&argv[i]);
+                golden_dir_overridden = true;
             }
             "--db" => {
                 i += 1;
@@ -2578,6 +2694,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
                     eprintln!("error: --db requires a fixture id or comma-separated list");
                     return 2;
                 }
+                db_overridden = true;
                 for part in argv[i].split(',') {
                     let part = part.trim();
                     if !part.is_empty() {
@@ -2605,7 +2722,10 @@ fn cmd_bench(argv: &[String]) -> i32 {
                     return 2;
                 }
                 match parse_u16_list(&argv[i]) {
-                    Ok(v) => concurrency = v,
+                    Ok(v) => {
+                        concurrency = v;
+                        concurrency_overridden = true;
+                    }
                     Err(e) => {
                         eprintln!("error: {e}");
                         return 2;
@@ -2708,20 +2828,61 @@ fn cmd_bench(argv: &[String]) -> i32 {
         i += 1;
     }
 
+    let needs_canonical_defaults = !golden_dir_overridden
+        || !db_overridden
+        || !concurrency_overridden
+        || presets.is_empty()
+        || presets.iter().any(|preset| preset == "all");
+
+    let canonical_defaults = if needs_canonical_defaults {
+        match std::env::current_dir() {
+            Ok(cwd) => match find_bench_workspace_root(&cwd) {
+                Some(workspace_root) => match canonical_bench_defaults(&workspace_root) {
+                    Ok(defaults) => Some(defaults),
+                    Err(e) => {
+                        eprintln!("error: failed to load canonical Beads benchmark defaults: {e}");
+                        return 1;
+                    }
+                },
+                None => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    if !golden_dir_overridden {
+        if let Some(defaults) = &canonical_defaults {
+            golden_dir.clone_from(&defaults.golden_dir);
+        }
+    }
+
+    if !concurrency_overridden {
+        if let Some(defaults) = &canonical_defaults {
+            concurrency.clone_from(&defaults.concurrency);
+        }
+    }
+
     if presets.is_empty() || presets.iter().any(|p| p == "all") {
-        presets = vec![
-            "commutative_inserts_disjoint_keys".to_owned(),
-            "hot_page_contention".to_owned(),
-            "mixed_read_write".to_owned(),
-        ];
+        presets = canonical_defaults
+            .as_ref()
+            .map_or_else(default_bench_presets, |defaults| defaults.presets.clone());
     }
 
     if fixture_ids.is_empty() {
-        match discover_golden_fixture_ids(&golden_dir) {
-            Ok(ids) => fixture_ids = ids,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
+        if !golden_dir_overridden {
+            if let Some(defaults) = &canonical_defaults {
+                fixture_ids.clone_from(&defaults.fixture_ids);
+            }
+        }
+        if fixture_ids.is_empty() {
+            match discover_golden_fixture_ids(&golden_dir) {
+                Ok(ids) => fixture_ids = ids,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
             }
         }
     }
@@ -2759,12 +2920,21 @@ fn cmd_bench(argv: &[String]) -> i32 {
         }
     }
 
+    let canonical_fixture_paths = canonical_defaults
+        .as_ref()
+        .filter(|defaults| golden_dir == defaults.golden_dir)
+        .map_or_else(HashMap::new, |defaults| defaults.fixture_paths.clone());
+
     for fixture_id in &fixture_ids {
-        let golden_path = match resolve_golden_db_in(&golden_dir, fixture_id) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return 1;
+        let golden_path = if let Some(path) = canonical_fixture_paths.get(fixture_id) {
+            path.clone()
+        } else {
+            match resolve_golden_db_in(&golden_dir, fixture_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
             }
         };
 
@@ -2783,10 +2953,10 @@ fn cmd_bench(argv: &[String]) -> i32 {
                 };
 
                 for (engine_name, fsqlite_mvcc) in engines {
-                    let engine_label = if engine_name == "fsqlite" && fsqlite_mvcc {
-                        "fsqlite_mvcc"
-                    } else {
-                        engine_name
+                    let engine_label = match (engine_name, fsqlite_mvcc) {
+                        ("fsqlite", true) => "fsqlite_mvcc",
+                        ("fsqlite", false) => "fsqlite_single_writer",
+                        _ => engine_name,
                     };
 
                     let meta = BenchmarkMeta {
@@ -2902,13 +3072,18 @@ USAGE:
     realdb-e2e bench [OPTIONS]
 
 OPTIONS:
-    --golden-dir <DIR>      Golden directory (default: sample_sqlite_db_files/golden)
-    --db <DB_ID>            Database fixture id, or comma-separated list (default: all)
-    --preset <NAME>         Workload preset, or comma-separated list (default: all)
-    --concurrency <N|LIST>  Concurrency levels (default: 1,2,4,8)
-    --engine <NAME>         sqlite3 | fsqlite | both (default: both)
+    --golden-dir <DIR>      Golden directory (default: canonical Beads campaign working golden/,
+                            else sample_sqlite_db_files/golden)
+    --db <DB_ID>            Database fixture id, or comma-separated list
+                            (default: canonical campaign fixtures, else all DBs in golden dir)
+    --preset <NAME>         Workload preset, or comma-separated list
+                            (default: canonical campaign workloads, else all wired presets)
+    --concurrency <N|LIST>  Concurrency levels (default: canonical campaign matrix 1,4,8,
+                            else 1,2,4,8)
+    --engine <NAME>         sqlite3 | fsqlite | both
+                            (default: both = sqlite3 + current fsqlite mode)
     --mvcc                  For fsqlite: force MVCC concurrent_mode on (default)
-    --no-mvcc               For fsqlite: disable MVCC concurrent_mode
+    --no-mvcc               For fsqlite: disable MVCC concurrent_mode (reports fsqlite_single_writer)
     --warmup <N>            Warmup iterations discarded (default: methodology default)
     --repeat <N>            Exact measurement iterations (sets --min-iters=N and --time-secs=0)
     --min-iters <N>         Minimum measurement iterations (default: methodology default)
@@ -2931,6 +3106,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
     let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
     let mut working_base = PathBuf::from(DEFAULT_WORKING_DIR);
     let mut db: Option<String> = None;
+    let mut workload = "mixed_read_write".to_owned();
     let mut concurrency: u16 = 4;
     let mut seed: u64 = 42;
     let mut scale: u32 = 50;
@@ -2966,6 +3142,14 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
                     return 2;
                 }
                 db = Some(argv[i].clone());
+            }
+            "--workload" | "--preset" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --workload requires a preset name");
+                    return 2;
+                }
+                workload = argv[i].clone();
             }
             "--concurrency" => {
                 i += 1;
@@ -3037,7 +3221,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         golden_dir: golden_dir.clone(),
         working_base: working_base.clone(),
     };
-    let label = format!("hot_profile_{db}_c{concurrency}_s{seed}");
+    let label = format!("hot_profile_{workload}_{db}_c{concurrency}_s{seed}");
     let workspace = match create_workspace_with_label(&workspace_config, &[db.as_str()], &label) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -3053,10 +3237,12 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
     let output_dir = output_dir.unwrap_or_else(|| {
         PathBuf::from("artifacts")
             .join("bd-db300.4.1")
+            .join(&workload)
             .join(format!("{db}_c{concurrency}_s{seed}"))
     });
     let replay_command = HotProfileReplayCommand {
         db: &db,
+        workload: &workload,
         golden_dir: &golden_dir,
         working_base: &working_base,
         concurrency,
@@ -3067,6 +3253,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         run_integrity_check,
     };
     let config = FsqliteHotPathProfileConfig {
+        workload: workload.clone(),
         seed,
         scale,
         concurrency,
@@ -3080,8 +3267,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         working_base: Some(working_base.display().to_string()),
     };
 
-    let report = match profile_fsqlite_mixed_read_write_hot_path(&profile_db.db_path, &db, &config)
-    {
+    let report = match profile_fsqlite_hot_path(&profile_db.db_path, &db, &config) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("error: {error}");
@@ -3155,7 +3341,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
 
 fn print_hot_profile_help() {
     let text = "\
-realdb-e2e hot-profile — Capture mixed_read_write hot-path evidence
+realdb-e2e hot-profile — Capture hot-path evidence for a benchmark preset
 
 USAGE:
     realdb-e2e hot-profile [OPTIONS]
@@ -3164,9 +3350,11 @@ OPTIONS:
     --golden-dir <DIR>      Golden directory (default: sample_sqlite_db_files/golden)
     --working-base <DIR>    Working-copy directory (default: sample_sqlite_db_files/working)
     --db <DB_ID>            Database fixture id (required)
-    --concurrency <N>       Worker count for mixed_read_write (default: 4)
+    --workload <NAME>       Workload preset to profile (default: mixed_read_write)
+    --preset <NAME>         Alias for --workload
+    --concurrency <N>       Worker count for the selected preset (default: 4)
     --seed <N>              Deterministic workload seed (default: 42)
-    --scale <N>             Workload scale passed to preset_mixed_read_write (default: 50)
+    --scale <N>             Workload scale passed to the preset generator (default: 50)
     --output-dir <DIR>      Artifact output directory
     --mvcc                  Force concurrent mode on (default)
     --no-mvcc               Disable concurrent mode for forced serialized comparison
@@ -4322,7 +4510,7 @@ mod tests {
             golden_dir: Some("/tmp/golden".to_owned()),
             working_base: Some("/tmp/working".to_owned()),
             replay_command:
-                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
                     .to_owned(),
             engine_report: sample_engine_report(),
             parser: HotPathParserProfile {
@@ -4405,7 +4593,7 @@ mod tests {
             golden_dir: Some("/tmp/golden".to_owned()),
             working_base: Some("/tmp/working".to_owned()),
             replay_command:
-                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
                     .to_owned(),
             files: vec![
                 HotPathArtifactFile {
@@ -4462,10 +4650,10 @@ mod tests {
             concurrent_mode: true,
             artifact_root: "/tmp/out".to_owned(),
             profiler_safe_replay_command:
-                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
                     .to_owned(),
             full_validation_replay_command:
-                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc --integrity-check"
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc --integrity-check"
                     .to_owned(),
             commands: vec![HotPathEvidenceCommand {
                 capture: "wall_clock".to_owned(),
@@ -4473,7 +4661,7 @@ mod tests {
                 tool: "hyperfine".to_owned(),
                 output_relpath: "profiles/hyperfine.profiler_safe.json".to_owned(),
                 command_line:
-                    "mkdir -p /tmp/out/profiles && hyperfine --warmup 1 --runs 5 --export-json /tmp/out/profiles/hyperfine.profiler_safe.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc'"
+                    "mkdir -p /tmp/out/profiles && hyperfine --warmup 1 --runs 5 --export-json /tmp/out/profiles/hyperfine.profiler_safe.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc'"
                         .to_owned(),
                 description: "wall-clock benchmark replay for profiler_safe capture".to_owned(),
             }],
@@ -4511,6 +4699,7 @@ mod tests {
     fn format_hot_profile_replay_command_renders_expected_flags() {
         let rendered = format_hot_profile_replay_command(&HotProfileReplayCommand {
             db: "fixture-a",
+            workload: "hot_page_contention",
             golden_dir: Path::new("/tmp/golden dir"),
             working_base: Path::new("/tmp/working"),
             concurrency: 4,
@@ -4523,7 +4712,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir '/tmp/golden dir' --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir '/tmp/output dir' --no-mvcc --integrity-check"
+            "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload hot_page_contention --golden-dir '/tmp/golden dir' --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir '/tmp/output dir' --no-mvcc --integrity-check"
         );
     }
 
@@ -4660,6 +4849,7 @@ mod tests {
         let report = sample_hot_path_report();
         let replay_command = HotProfileReplayCommand {
             db: "fixture-a",
+            workload: "mixed_read_write",
             golden_dir: Path::new("/tmp/golden"),
             working_base: Path::new("/tmp/working"),
             concurrency: 4,
@@ -4808,6 +4998,68 @@ mod tests {
     #[test]
     fn test_bench_help() {
         assert_eq!(run_with(&["realdb-e2e", "bench", "--help"]), 0);
+    }
+
+    #[test]
+    fn canonical_bench_defaults_match_checked_in_campaign_manifest() {
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root should exist")
+            .to_path_buf();
+
+        let defaults =
+            canonical_bench_defaults(&workspace_root).expect("canonical defaults should load");
+
+        assert_eq!(
+            defaults.golden_dir,
+            workspace_root.join("sample_sqlite_db_files/working/beads_bench_20260310/golden")
+        );
+        assert_eq!(
+            defaults.fixture_ids,
+            vec![
+                "frankensqlite".to_owned(),
+                "frankentui".to_owned(),
+                "frankensearch".to_owned(),
+            ]
+        );
+        assert_eq!(
+            defaults.fixture_paths.get("frankensqlite"),
+            Some(&workspace_root.join(
+                "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensqlite_beads.db"
+            ))
+        );
+        assert_eq!(
+            defaults.fixture_paths.get("frankentui"),
+            Some(&workspace_root.join(
+                "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankentui_beads.db"
+            ))
+        );
+        assert_eq!(
+            defaults.fixture_paths.get("frankensearch"),
+            Some(&workspace_root.join(
+                "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensearch_beads.db"
+            ))
+        );
+        assert_eq!(defaults.presets, default_bench_presets());
+        assert_eq!(defaults.concurrency, vec![1, 4, 8]);
+    }
+
+    #[test]
+    fn find_bench_workspace_root_walks_up_to_campaign_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let nested = dir.path().join("a/b/c");
+        fs::create_dir_all(&nested).expect("nested dirs should be created");
+        let manifest_dir = dir.path().join("sample_sqlite_db_files/manifests");
+        fs::create_dir_all(&manifest_dir).expect("manifest dir should be created");
+        fs::write(manifest_dir.join("beads_benchmark_campaign.v1.json"), "{}")
+            .expect("sentinel manifest should be written");
+
+        assert_eq!(
+            find_bench_workspace_root(&nested),
+            Some(dir.path().to_path_buf())
+        );
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub struct PerfResult {
 
 /// Schema version for the perf result JSONL format.
 pub const PERF_RESULT_SCHEMA_V1: &str = "fsqlite-e2e.perf_result.v1";
-/// Schema version for mixed-read-write hot-path profile reports.
+/// Schema version for hot-path profile reports.
 pub const HOT_PATH_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile.v1";
 /// Schema version for hot-path artifact manifests.
 pub const HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile_manifest.v1";
@@ -157,12 +157,13 @@ pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2: &str =
     "fsqlite-e2e.hot_path_actionable_ranking.v2";
 /// Bead identifier for the hot-path profiling work.
 pub const HOT_PATH_PROFILE_BEAD_ID: &str = "bd-db300.4.1";
-/// Canonical scenario identifier for the mixed read/write hot path.
-pub const HOT_PATH_PROFILE_SCENARIO_ID: &str = "bd-db300.4.1.mixed_read_write";
+/// Canonical scenario identifier prefix for preset-specific hot-path profiles.
+pub const HOT_PATH_PROFILE_SCENARIO_PREFIX: &str = HOT_PATH_PROFILE_BEAD_ID;
 
-/// Configuration for a focused FrankenSQLite mixed-read-write hot-path profile.
+/// Configuration for a focused FrankenSQLite hot-path profile.
 #[derive(Debug, Clone)]
 pub struct FsqliteHotPathProfileConfig {
+    pub workload: String,
     pub seed: u64,
     pub scale: u32,
     pub concurrency: u16,
@@ -612,11 +613,11 @@ fn build_hot_path_profile_report(
     HotPathProfileReport {
         schema_version: HOT_PATH_PROFILE_SCHEMA_V1.to_owned(),
         bead_id: HOT_PATH_PROFILE_BEAD_ID.to_owned(),
-        scenario_id: HOT_PATH_PROFILE_SCENARIO_ID.to_owned(),
+        scenario_id: hot_path_profile_scenario_id(&config.workload),
         run_id,
         trace_id,
         fixture_id: fixture_id.to_owned(),
-        workload: "mixed_read_write".to_owned(),
+        workload: config.workload.clone(),
         seed: config.seed,
         scale: config.scale,
         concurrency: config.concurrency,
@@ -652,7 +653,11 @@ fn unix_timestamp_millis() -> u64 {
         .unwrap_or(0)
 }
 
-pub fn profile_fsqlite_mixed_read_write_hot_path(
+fn hot_path_profile_scenario_id(workload: &str) -> String {
+    format!("{HOT_PATH_PROFILE_SCENARIO_PREFIX}.{workload}")
+}
+
+pub fn profile_fsqlite_hot_path(
     db_path: &Path,
     fixture_id: &str,
     config: &FsqliteHotPathProfileConfig,
@@ -666,15 +671,13 @@ pub fn profile_fsqlite_mixed_read_write_hot_path(
 
     let now_ms = unix_timestamp_millis();
     let run_id = format!(
-        "{HOT_PATH_PROFILE_BEAD_ID}-{fixture_id}-c{}-s{}-{now_ms}",
-        config.concurrency, config.seed
+        "{HOT_PATH_PROFILE_BEAD_ID}-{}-{fixture_id}-c{}-s{}-{now_ms}",
+        config.workload, config.concurrency, config.seed
     );
-    let trace_id = format!(
-        "{HOT_PATH_PROFILE_SCENARIO_ID}:{fixture_id}:c{}",
-        config.concurrency
-    );
+    let scenario_id = hot_path_profile_scenario_id(&config.workload);
+    let trace_id = format!("{scenario_id}:{fixture_id}:c{}", config.concurrency);
     let oplog = generate_oplog(
-        "mixed_read_write",
+        &config.workload,
         fixture_id,
         config.seed,
         config.concurrency,
@@ -683,7 +686,7 @@ pub fn profile_fsqlite_mixed_read_write_hot_path(
     .ok_or_else(|| {
         crate::E2eError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "mixed_read_write preset unavailable",
+            format!("hot-path profile preset unavailable: {}", config.workload),
         ))
     })?;
 
@@ -704,7 +707,7 @@ pub fn profile_fsqlite_mixed_read_write_hot_path(
 pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String {
     let actionable_ranking = build_hot_path_actionable_ranking(report);
     let mut out = String::with_capacity(4096);
-    let _ = writeln!(out, "# Mixed Read/Write Hot-Path Profile\n");
+    let _ = writeln!(out, "# Hot-Path Profile\n");
     let _ = writeln!(out, "- Bead: `{}`", report.bead_id);
     let _ = writeln!(out, "- Run ID: `{}`", report.run_id);
     let _ = writeln!(out, "- Trace ID: `{}`", report.trace_id);
@@ -821,7 +824,7 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     let _ = writeln!(out, "- `profile.json` — raw scenario profile");
     let _ = writeln!(
         out,
-        "- `opcode_profile.json` — raw opcode totals for this canonical hot-cell run"
+        "- `opcode_profile.json` — raw opcode totals for this profiled run"
     );
     let _ = writeln!(
         out,
@@ -1188,7 +1191,7 @@ pub fn write_hot_path_profile_artifacts(
             HotPathArtifactFile {
                 path: "opcode_profile.json".to_owned(),
                 bytes: u64::try_from(opcode_profile_json.len()).unwrap_or(u64::MAX),
-                description: "raw opcode totals for the canonical hot-cell run".to_owned(),
+                description: "raw opcode totals for the profiled run".to_owned(),
             },
             HotPathArtifactFile {
                 path: "subsystem_profile.json".to_owned(),
@@ -1588,7 +1591,10 @@ mod tests {
             "smoke",
             config,
             "bd-db300.4.1-smoke".to_owned(),
-            "bd-db300.4.1.mixed_read_write:smoke:c1".to_owned(),
+            format!(
+                "{}:smoke:c1",
+                hot_path_profile_scenario_id(&config.workload)
+            ),
             engine_report,
             snapshot,
         )
@@ -1732,6 +1738,7 @@ mod tests {
     fn hot_path_profile_smoke_writes_artifacts() {
         let tempdir = tempfile::tempdir().unwrap();
         let config = FsqliteHotPathProfileConfig {
+            workload: "hot_page_contention".to_owned(),
             seed: 7,
             scale: 6,
             concurrency: 1,
@@ -1740,8 +1747,9 @@ mod tests {
                 run_integrity_check: false,
                 ..crate::fsqlite_executor::FsqliteExecConfig::default()
             },
-            replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db smoke"
-                .to_owned(),
+            replay_command:
+                "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db smoke --workload hot_page_contention"
+                    .to_owned(),
             golden_dir: Some("sample_sqlite_db_files/golden".to_owned()),
             working_base: Some("sample_sqlite_db_files/working".to_owned()),
         };
@@ -1750,7 +1758,8 @@ mod tests {
 
         assert_eq!(report.schema_version, HOT_PATH_PROFILE_SCHEMA_V1);
         assert_eq!(report.fixture_id, "smoke");
-        assert_eq!(report.workload, "mixed_read_write");
+        assert_eq!(report.workload, "hot_page_contention");
+        assert_eq!(report.scenario_id, "bd-db300.4.1.hot_page_contention");
         assert!(report.concurrent_mode);
         assert!(!report.run_integrity_check);
         assert_eq!(
