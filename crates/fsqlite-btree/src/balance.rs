@@ -343,7 +343,7 @@ pub fn balance_quick<W: PageWriter>(
         // Right-child is at header_offset + 8.
         parent_data[parent_offset + 8..parent_offset + 12]
             .copy_from_slice(&new_pgno.get().to_be_bytes());
-        writer.write_page(cx, parent_page_no, &parent_data)
+        writer.write_page_data(cx, parent_page_no, PageData::from_vec(parent_data))
     })();
     if let Err(err) = parent_update_result {
         let _ = writer.write_page(cx, parent_page_no, &original_parent_data);
@@ -1238,7 +1238,7 @@ fn insert_cell_into_page<W: PageWriter>(
     header.write(&mut page_data, offset);
     write_cell_pointers(&mut page_data, offset, &header, &ptrs);
 
-    writer.write_page(cx, page_no, &page_data)
+    writer.write_page_data(cx, page_no, PageData::from_vec(page_data))
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,7 +1391,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
         final_page[..offset].copy_from_slice(&page_data[..offset]);
     }
 
-    writer.write_page(cx, parent_page_no, &final_page)?;
+    writer.write_page_data(cx, parent_page_no, PageData::from_vec(final_page))?;
 
     // Balance-shallower: when the root page has zero cells after merging
     // children, copy the single right-child's content into the root and
@@ -1922,7 +1922,7 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
         if i == 0 && child_off > 0 {
             final_page[..child_off].copy_from_slice(&original_page[..child_off]);
         }
-        if let Err(err) = writer.write_page(cx, child_pgno, &final_page) {
+        if let Err(err) = writer.write_page_data(cx, child_pgno, PageData::from_vec(final_page)) {
             return Err(do_rollback2!(err));
         }
     }
