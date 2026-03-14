@@ -130,12 +130,12 @@ fn bench_point_lookup(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite();
+        let stmt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
         let mut id = 1_i64;
         b.iter(|| {
-            let rows = conn
-                .query(&format!("SELECT * FROM bench WHERE id = {id}"))
+            let _row = stmt
+                .query_row_with_params(&[SqliteValue::Integer(id)])
                 .unwrap();
-            assert_eq!(rows.len(), 1);
             id = (id % SEED_ROWS) + 1;
         });
     });
@@ -170,9 +170,12 @@ fn bench_range_scan(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite();
+        let stmt = conn
+            .prepare("SELECT * FROM bench WHERE id >= ?1 AND id < ?2")
+            .unwrap();
         b.iter(|| {
-            let rows = conn
-                .query("SELECT * FROM bench WHERE id >= 200 AND id < 250")
+            let rows = stmt
+                .query_with_params(&[SqliteValue::Integer(200), SqliteValue::Integer(250)])
                 .unwrap();
             assert_eq!(rows.len(), 50);
         });
@@ -200,9 +203,10 @@ fn bench_full_count(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite();
+        let stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
         b.iter(|| {
-            let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-            assert_eq!(rows[0].values()[0], SqliteValue::Integer(SEED_ROWS));
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(SEED_ROWS));
         });
     });
 
@@ -240,10 +244,11 @@ fn bench_group_by(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite();
+        let stmt = conn
+            .prepare("SELECT category, COUNT(*), SUM(score) FROM bench GROUP BY category")
+            .unwrap();
         b.iter(|| {
-            let rows = conn
-                .query("SELECT category, COUNT(*), SUM(score) FROM bench GROUP BY category")
-                .unwrap();
+            let rows = stmt.query().unwrap();
             assert_eq!(rows.len(), 10);
         });
     });
@@ -276,10 +281,11 @@ fn bench_order_limit(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite();
+        let stmt = conn
+            .prepare("SELECT * FROM bench ORDER BY score DESC LIMIT 10")
+            .unwrap();
         b.iter(|| {
-            let rows = conn
-                .query("SELECT * FROM bench ORDER BY score DESC LIMIT 10")
-                .unwrap();
+            let rows = stmt.query().unwrap();
             assert_eq!(rows.len(), 10);
         });
     });

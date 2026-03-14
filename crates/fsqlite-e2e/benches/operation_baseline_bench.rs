@@ -176,8 +176,9 @@ fn bench_sequential_scan(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_seeded();
+        let stmt = conn.prepare("SELECT * FROM bench").unwrap();
         b.iter(|| {
-            let rows = conn.query("SELECT * FROM bench").unwrap();
+            let rows = stmt.query().unwrap();
             assert_eq!(
                 i64::try_from(rows.len()).expect("row count must fit i64"),
                 SEED_ROWS
@@ -213,12 +214,12 @@ fn bench_point_lookup(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_seeded();
+        let stmt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
         let mut id = 1_i64;
         b.iter(|| {
-            let rows = conn
-                .query(&format!("SELECT * FROM bench WHERE id = {id}"))
+            let _row = stmt
+                .query_row_with_params(&[SqliteValue::Integer(id)])
                 .unwrap();
-            assert_eq!(rows.len(), 1);
             id = (id % SEED_ROWS) + 1;
         });
     });
@@ -253,9 +254,12 @@ fn bench_range_scan(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_seeded();
+        let stmt = conn
+            .prepare("SELECT * FROM bench WHERE id >= ?1 AND id < ?2")
+            .unwrap();
         b.iter(|| {
-            let rows = conn
-                .query("SELECT * FROM bench WHERE id >= 100 AND id < 200")
+            let rows = stmt
+                .query_with_params(&[SqliteValue::Integer(100), SqliteValue::Integer(200)])
                 .unwrap();
             assert_eq!(rows.len(), 100);
         });
@@ -311,8 +315,9 @@ fn bench_single_row_insert(c: &mut Criterion) {
             |conn| {
                 conn.execute("INSERT INTO bench VALUES (1, 'test_name', 42)")
                     .unwrap();
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+                let stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+                let row = stmt.query_row().unwrap();
+                assert_eq!(row.values()[0], SqliteValue::Integer(1));
             },
             BatchSize::SmallInput,
         );
@@ -373,16 +378,17 @@ fn bench_batch_insert(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN").unwrap();
-                for i in 1..=1000_i64 {
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'name_{i}', {})",
-                        i * 7,
-                    ))
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
                     .unwrap();
+                for i in 1..=1000_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(1000));
+                let count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+                let row = count_stmt.query_row().unwrap();
+                assert_eq!(row.values()[0], SqliteValue::Integer(1000));
             },
             BatchSize::LargeInput,
         );
@@ -413,13 +419,13 @@ fn bench_single_row_update(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_seeded();
+        let stmt = conn
+            .prepare("UPDATE bench SET score = ?1 WHERE id = ?2")
+            .unwrap();
         let mut id = 1_i64;
         b.iter(|| {
-            conn.execute(&format!(
-                "UPDATE bench SET score = {} WHERE id = {id}",
-                id * 13,
-            ))
-            .unwrap();
+            stmt.execute_with_params(&[SqliteValue::Integer(id * 13), SqliteValue::Integer(id)])
+                .unwrap();
             id = (id % SEED_ROWS) + 1;
         });
     });
@@ -458,8 +464,9 @@ fn bench_single_row_delete(c: &mut Criterion) {
             setup_fsqlite_seeded,
             |conn| {
                 conn.execute("DELETE FROM bench WHERE id = 500").unwrap();
-                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
-                assert_eq!(rows[0].values()[0], SqliteValue::Integer(SEED_ROWS - 1));
+                let stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+                let row = stmt.query_row().unwrap();
+                assert_eq!(row.values()[0], SqliteValue::Integer(SEED_ROWS - 1));
             },
             BatchSize::LargeInput,
         );
@@ -496,13 +503,14 @@ fn bench_two_way_join(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_with_join_table();
+        let stmt = conn
+            .prepare(
+                "SELECT bench.id, bench.name, bench2.label \
+                 FROM bench INNER JOIN bench2 ON bench.id = bench2.bench_id",
+            )
+            .unwrap();
         b.iter(|| {
-            let rows = conn
-                .query(
-                    "SELECT bench.id, bench.name, bench2.label \
-                     FROM bench INNER JOIN bench2 ON bench.id = bench2.bench_id",
-                )
-                .unwrap();
+            let rows = stmt.query().unwrap();
             assert!(!rows.is_empty());
         });
     });
@@ -537,12 +545,12 @@ fn bench_aggregation(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         let conn = setup_fsqlite_seeded();
+        let stmt = conn
+            .prepare("SELECT COUNT(*), SUM(score), AVG(score) FROM bench")
+            .unwrap();
         b.iter(|| {
-            let rows = conn
-                .query("SELECT COUNT(*), SUM(score), AVG(score) FROM bench")
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            let vals = rows[0].values();
+            let row = stmt.query_row().unwrap();
+            let vals = row.values();
             // COUNT should equal SEED_ROWS.
             assert_eq!(vals[0], SqliteValue::Integer(SEED_ROWS));
         });

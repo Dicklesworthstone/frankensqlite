@@ -247,11 +247,179 @@ pub enum TokenKind {
 }
 
 impl TokenKind {
+    /// Fast-path lookup for common SQL keywords directly on ASCII bytes.
+    ///
+    /// This avoids allocating an owned identifier string and an uppercased
+    /// temporary for the keywords that dominate hot query parsing paths.
+    #[must_use]
+    pub(crate) fn lookup_common_keyword_bytes(s: &[u8]) -> Option<Self> {
+        match s.len() {
+            2 => {
+                if s.eq_ignore_ascii_case(b"AS") {
+                    Some(Self::KwAs)
+                } else if s.eq_ignore_ascii_case(b"BY") {
+                    Some(Self::KwBy)
+                } else if s.eq_ignore_ascii_case(b"DO") {
+                    Some(Self::KwDo)
+                } else if s.eq_ignore_ascii_case(b"IF") {
+                    Some(Self::KwIf)
+                } else if s.eq_ignore_ascii_case(b"IN") {
+                    Some(Self::KwIn)
+                } else if s.eq_ignore_ascii_case(b"IS") {
+                    Some(Self::KwIs)
+                } else if s.eq_ignore_ascii_case(b"NO") {
+                    Some(Self::KwNo)
+                } else if s.eq_ignore_ascii_case(b"OF") {
+                    Some(Self::KwOf)
+                } else if s.eq_ignore_ascii_case(b"ON") {
+                    Some(Self::KwOn)
+                } else if s.eq_ignore_ascii_case(b"OR") {
+                    Some(Self::KwOr)
+                } else if s.eq_ignore_ascii_case(b"TO") {
+                    Some(Self::KwTo)
+                } else {
+                    None
+                }
+            }
+            3 => {
+                if s.eq_ignore_ascii_case(b"AND") {
+                    Some(Self::KwAnd)
+                } else if s.eq_ignore_ascii_case(b"ASC") {
+                    Some(Self::KwAsc)
+                } else if s.eq_ignore_ascii_case(b"END") {
+                    Some(Self::KwEnd)
+                } else if s.eq_ignore_ascii_case(b"FOR") {
+                    Some(Self::KwFor)
+                } else if s.eq_ignore_ascii_case(b"KEY") {
+                    Some(Self::KwKey)
+                } else if s.eq_ignore_ascii_case(b"NOT") {
+                    Some(Self::KwNot)
+                } else if s.eq_ignore_ascii_case(b"SET") {
+                    Some(Self::KwSet)
+                } else {
+                    None
+                }
+            }
+            4 => {
+                if s.eq_ignore_ascii_case(b"FROM") {
+                    Some(Self::KwFrom)
+                } else if s.eq_ignore_ascii_case(b"INTO") {
+                    Some(Self::KwInto)
+                } else if s.eq_ignore_ascii_case(b"JOIN") {
+                    Some(Self::KwJoin)
+                } else if s.eq_ignore_ascii_case(b"LEFT") {
+                    Some(Self::KwLeft)
+                } else if s.eq_ignore_ascii_case(b"LIKE") {
+                    Some(Self::KwLike)
+                } else if s.eq_ignore_ascii_case(b"NULL") {
+                    Some(Self::KwNull)
+                } else if s.eq_ignore_ascii_case(b"THEN") {
+                    Some(Self::KwThen)
+                } else if s.eq_ignore_ascii_case(b"WHEN") {
+                    Some(Self::KwWhen)
+                } else {
+                    None
+                }
+            }
+            5 => {
+                if s.eq_ignore_ascii_case(b"BEGIN") {
+                    Some(Self::KwBegin)
+                } else if s.eq_ignore_ascii_case(b"CROSS") {
+                    Some(Self::KwCross)
+                } else if s.eq_ignore_ascii_case(b"GROUP") {
+                    Some(Self::KwGroup)
+                } else if s.eq_ignore_ascii_case(b"INNER") {
+                    Some(Self::KwInner)
+                } else if s.eq_ignore_ascii_case(b"LIMIT") {
+                    Some(Self::KwLimit)
+                } else if s.eq_ignore_ascii_case(b"ORDER") {
+                    Some(Self::KwOrder)
+                } else if s.eq_ignore_ascii_case(b"TABLE") {
+                    Some(Self::KwTable)
+                } else if s.eq_ignore_ascii_case(b"WHERE") {
+                    Some(Self::KwWhere)
+                } else {
+                    None
+                }
+            }
+            6 => {
+                if s.eq_ignore_ascii_case(b"COMMIT") {
+                    Some(Self::KwCommit)
+                } else if s.eq_ignore_ascii_case(b"CREATE") {
+                    Some(Self::KwCreate)
+                } else if s.eq_ignore_ascii_case(b"DELETE") {
+                    Some(Self::KwDelete)
+                } else if s.eq_ignore_ascii_case(b"EXISTS") {
+                    Some(Self::KwExists)
+                } else if s.eq_ignore_ascii_case(b"INSERT") {
+                    Some(Self::KwInsert)
+                } else if s.eq_ignore_ascii_case(b"OFFSET") {
+                    Some(Self::KwOffset)
+                } else if s.eq_ignore_ascii_case(b"SELECT") {
+                    Some(Self::KwSelect)
+                } else if s.eq_ignore_ascii_case(b"UPDATE") {
+                    Some(Self::KwUpdate)
+                } else if s.eq_ignore_ascii_case(b"VALUES") {
+                    Some(Self::KwValues)
+                } else {
+                    None
+                }
+            }
+            7 => {
+                if s.eq_ignore_ascii_case(b"BETWEEN") {
+                    Some(Self::KwBetween)
+                } else if s.eq_ignore_ascii_case(b"DEFAULT") {
+                    Some(Self::KwDefault)
+                } else if s.eq_ignore_ascii_case(b"HAVING") {
+                    Some(Self::KwHaving)
+                } else if s.eq_ignore_ascii_case(b"INDEXED") {
+                    Some(Self::KwIndexed)
+                } else if s.eq_ignore_ascii_case(b"PRIMARY") {
+                    Some(Self::KwPrimary)
+                } else {
+                    None
+                }
+            }
+            8 => {
+                if s.eq_ignore_ascii_case(b"DISTINCT") {
+                    Some(Self::KwDistinct)
+                } else {
+                    None
+                }
+            }
+            9 => {
+                if s.eq_ignore_ascii_case(b"RETURNING") {
+                    Some(Self::KwReturning)
+                } else {
+                    None
+                }
+            }
+            10 => {
+                if s.eq_ignore_ascii_case(b"CONCURRENT") {
+                    Some(Self::KwConcurrent)
+                } else {
+                    None
+                }
+            }
+            11 => {
+                if s.eq_ignore_ascii_case(b"TRANSACTION") {
+                    Some(Self::KwTransaction)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Look up an identifier string to see if it's a keyword.
     /// Returns the keyword variant if so, else `None`.
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn lookup_keyword(s: &str) -> Option<Self> {
+        if let Some(keyword) = Self::lookup_common_keyword_bytes(s.as_bytes()) {
+            return Some(keyword);
+        }
         // Case-insensitive keyword matching.
         // We uppercase for comparison since SQL keywords are case-insensitive.
         match s.to_ascii_uppercase().as_str() {

@@ -322,6 +322,21 @@ impl<P> BtCursor<P> {
         self.root_page
     }
 
+    /// Lightweight identity for the cursor's current logical position.
+    ///
+    /// Used by the VDBE to cache decoded row state while the cursor remains
+    /// on the same leaf cell.
+    #[must_use]
+    pub fn position_stamp(&self) -> Option<(u32, u16)> {
+        if self.at_eof {
+            return None;
+        }
+
+        self.stack
+            .last()
+            .map(|entry| (entry.page_no.get(), entry.cell_idx))
+    }
+
     /// The usable page size for this cursor's B-tree.
     #[must_use]
     pub fn usable_size(&self) -> u32 {

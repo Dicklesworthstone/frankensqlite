@@ -1895,6 +1895,20 @@ struct CompiledCacheEntry {
     program: Arc<VdbeProgram>,
 }
 
+/// Schema-scoped execution metadata reused by table-backed VDBE runs.
+///
+/// This caches only structural data derived from the schema graph. Values that
+/// are intentionally dynamic at execution time, such as evaluated column
+/// defaults or sqlite_sequence high-water marks, stay uncached.
+#[derive(Clone)]
+struct TableExecutionMetadataCacheEntry {
+    schema_generation: u64,
+    autoincrement_table_names_by_root_page: Vec<(i32, String)>,
+    rowid_alias_col_by_root_page: HashMap<i32, usize>,
+    table_column_count_by_root_page: HashMap<i32, usize>,
+    index_desc_flags_by_root_page: HashMap<i32, Vec<bool>>,
+}
+
 // ── Time-travel MemDatabase snapshots ──────────────────────────────────────
 // For :memory: databases (and as a fallback when the MVCC VersionStore is not
 // populated), time-travel queries are satisfied by cloning the MemDatabase at
@@ -2126,6 +2140,10 @@ pub struct Connection {
     /// repeated `execute()`/`execute_with_params()` calls skip compilation.
     /// Invalidated alongside parse_cache when schema_cookie changes.
     compiled_cache: RefCell<LruCache<u64, Arc<CompiledCacheEntry>>>,
+    /// Schema-generation-scoped execution metadata cache for table-backed
+    /// statements. Avoids rebuilding structural root-page maps on every VDBE
+    /// run while leaving dynamic defaults and sqlite_sequence values live.
+    table_execution_metadata_cache: RefCell<Option<Arc<TableExecutionMetadataCacheEntry>>>,
     // ── ATTACH/DETACH schema registry (§12.11, bd-7pxb) ─────────────────────
     /// Registry of attached databases. Tracks schema names registered via
     /// ATTACH DATABASE so that schema-qualified references resolve correctly.
@@ -2273,6 +2291,7 @@ impl Connection {
             parse_cache_cookie: RefCell::new(0),
             // Compiled bytecode cache (bd-1dp9.6.7.2.2)
             compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
+            table_execution_metadata_cache: RefCell::new(None),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attached_connections: RefCell::new(HashMap::new()),
@@ -4578,6 +4597,7 @@ impl Connection {
         if cached_cookie != current_cookie {
             self.parse_cache.borrow_mut().clear();
             self.compiled_cache.borrow_mut().clear();
+            self.table_execution_metadata_cache.borrow_mut().take();
             *self.parse_cache_cookie.borrow_mut() = current_cookie;
             self.log_statement_reuse_event(
                 "schema_invalidation",
@@ -4960,14 +4980,13 @@ impl Connection {
         let trace_id = next_trace_id();
         let decision_id = next_decision_id();
         let trace_registration = self.trace_registration.borrow().clone();
-        let statement_sql = if trace_registration.is_some() || precompiled.is_none() {
-            statement.to_string()
-        } else {
-            String::new()
-        };
+        let statement_sql = trace_registration.is_some().then(|| statement.to_string());
         let statement_reuse_sql =
-            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO)
-                .then(|| statement.to_string());
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO).then(|| {
+                statement_sql
+                    .clone()
+                    .unwrap_or_else(|| statement.to_string())
+            });
         let statement_span = tracing::span!(
             target: "fsqlite.statement",
             tracing::Level::DEBUG,
@@ -4982,7 +5001,7 @@ impl Connection {
             emit_compat_trace_event(
                 trace_registration.as_ref(),
                 TraceEvent::Statement {
-                    sql: statement_sql.clone(),
+                    sql: statement_sql.clone().unwrap_or_default(),
                 },
             );
         }
@@ -5128,7 +5147,7 @@ impl Connection {
         emit_compat_trace_event(
             trace_registration.as_ref(),
             TraceEvent::Profile {
-                sql: statement_sql,
+                sql: statement_sql.unwrap_or_default(),
                 elapsed_ns,
             },
         );
@@ -5239,7 +5258,7 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    let program = compile_expression_select(&rewritten)?;
+                    let program = compile_expression_select(rewritten.as_ref())?;
                     let registry = self.func_registry.borrow().clone();
                     let op_cx = self.op_cx()?;
                     let mut rows = execute_program_with_postprocess(
@@ -5248,7 +5267,7 @@ impl Connection {
                         Some(&registry),
                         Some(&self.collation_registry),
                         &op_cx,
-                        Some(&build_expression_postprocess(&rewritten)),
+                        Some(&build_expression_postprocess(rewritten.as_ref())),
                         PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
                     )?;
                     if distinct {
@@ -5264,7 +5283,8 @@ impl Connection {
                     // materialize the join as a temp table, then GROUP BY on that.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_join_select(cx, &bound, None)?;
                     if distinct {
@@ -5278,7 +5298,8 @@ impl Connection {
                     // Fallback path: eagerly rewrite IN subqueries.
                     self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_select(&bound, None)?;
                     if distinct {
@@ -5293,7 +5314,8 @@ impl Connection {
                     // window spec, compute window functions at connection level.
                     self.log_mem_execution_fallback("select", "window_function_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_window_select(&bound, None)?;
                     if distinct {
@@ -5310,7 +5332,8 @@ impl Connection {
                     // the registered vtab instance directly.
                     self.log_mem_execution_fallback("select", "live_vtab_select_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
@@ -5325,7 +5348,8 @@ impl Connection {
                     // connection path. Route through fallback evaluation.
                     self.log_mem_execution_fallback("select", "match_operator_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
@@ -5340,11 +5364,12 @@ impl Connection {
                     // Also handles derived tables even without explicit JOINs.
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let native_join_dispatch =
-                        self.can_execute_join_select_on_real_backend(&rewritten);
+                        self.can_execute_join_select_on_real_backend(rewritten.as_ref());
                     if !native_join_dispatch {
                         self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
                     }
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let started = std::time::Instant::now();
                     let mut rows = self.execute_join_select(&bound, None)?;
@@ -5363,7 +5388,8 @@ impl Connection {
                 } else if has_table_function_source(select) {
                     self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
@@ -5380,7 +5406,8 @@ impl Connection {
                     // connection-level fallback which can inline-evaluate them.
                     self.log_mem_execution_fallback("select", "correlated_join_subquery_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
@@ -5400,11 +5427,11 @@ impl Connection {
                         // cannot handle (e.g. those with GROUP BY / HAVING).
                         let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                         let compiled_select = if distinct && limit_clause.is_some() {
-                            let mut unbounded = rewritten.clone();
+                            let mut unbounded = rewritten.as_ref().clone();
                             unbounded.limit = None;
-                            unbounded
+                            Cow::Owned(unbounded)
                         } else {
-                            rewritten.clone()
+                            rewritten
                         };
                         let plan_span = tracing::span!(
                             target: "fsqlite.plan",
@@ -5417,10 +5444,11 @@ impl Connection {
                         // Cache the actual compiled SELECT shape, not the original
                         // SQL text, because eager subquery rewriting can inline
                         // parameter-sensitive literal lists before codegen.
-                        let sql_text = Statement::Select(compiled_select.clone()).to_string();
+                        let sql_text =
+                            Statement::Select(compiled_select.as_ref().clone()).to_string();
                         let sql_key = Self::sql_hash(&sql_text);
                         arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                            conn.compile_table_select(&compiled_select)
+                            conn.compile_table_select(compiled_select.as_ref())
                         })?;
                         &arc_prog
                     };
@@ -9898,55 +9926,88 @@ impl Connection {
     }
 
     fn autoincrement_sequence_by_root_page(&self) -> HashMap<i32, i64> {
-        let schema = self.schema.borrow();
+        let metadata = self.table_execution_metadata();
         let autoincrement_tables = self.autoincrement_tables.borrow();
         let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
-        let mut out = HashMap::new();
-        for table in schema.iter() {
-            let key = table.name.to_ascii_lowercase();
-            if autoincrement_tables.contains(&key) {
-                let seq = sqlite_sequence_cache.get(&key).copied().unwrap_or(0);
-                out.insert(table.root_page, seq);
-            }
-        }
-        out
-    }
-
-    fn rowid_alias_column_by_root_page(&self) -> HashMap<i32, usize> {
-        let schema = self.schema.borrow();
-        let rowid_alias_columns = self.rowid_alias_columns.borrow();
-        let mut out = HashMap::new();
-        for table in schema.iter() {
-            let key = table.name.to_ascii_lowercase();
-            if let Some(&alias_idx) = rowid_alias_columns.get(&key) {
-                out.insert(table.root_page, alias_idx);
-            }
-        }
-        out
-    }
-
-    fn table_column_count_by_root_page(&self) -> HashMap<i32, usize> {
-        let schema = self.schema.borrow();
-        schema
+        metadata
+            .autoincrement_table_names_by_root_page
             .iter()
-            .map(|table| (table.root_page, table.columns.len()))
+            .filter(|(_, table_name)| autoincrement_tables.contains(table_name))
+            .map(|(root_page, table_name)| {
+                let seq = sqlite_sequence_cache.get(table_name).copied().unwrap_or(0);
+                (*root_page, seq)
+            })
             .collect()
     }
 
+    fn rowid_alias_column_by_root_page(&self) -> HashMap<i32, usize> {
+        self.table_execution_metadata()
+            .rowid_alias_col_by_root_page
+            .clone()
+    }
+
+    fn table_column_count_by_root_page(&self) -> HashMap<i32, usize> {
+        self.table_execution_metadata()
+            .table_column_count_by_root_page
+            .clone()
+    }
+
     fn index_desc_flags_by_root_page(&self) -> HashMap<i32, Vec<bool>> {
+        self.table_execution_metadata()
+            .index_desc_flags_by_root_page
+            .clone()
+    }
+
+    fn table_execution_metadata(&self) -> Arc<TableExecutionMetadataCacheEntry> {
+        let schema_generation = self.schema_generation();
+        if let Some(cached) = self
+            .table_execution_metadata_cache
+            .borrow()
+            .as_ref()
+            .filter(|entry| entry.schema_generation == schema_generation)
+            .cloned()
+        {
+            return cached;
+        }
+
         let schema = self.schema.borrow();
-        schema
-            .iter()
-            .flat_map(|table| table.indexes.iter())
-            .map(|index| {
-                (
+        let rowid_alias_columns = self.rowid_alias_columns.borrow();
+        let autoincrement_tables = self.autoincrement_tables.borrow();
+        let mut autoincrement_table_names_by_root_page = Vec::new();
+        let mut rowid_alias_col_by_root_page = HashMap::new();
+        let mut table_column_count_by_root_page = HashMap::with_capacity(schema.len());
+        let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
+        let mut index_desc_flags_by_root_page = HashMap::with_capacity(index_count);
+
+        for table in schema.iter() {
+            let table_name_key = table.name.to_ascii_lowercase();
+            if autoincrement_tables.contains(&table_name_key) {
+                autoincrement_table_names_by_root_page
+                    .push((table.root_page, table_name_key.clone()));
+            }
+            if let Some(&alias_idx) = rowid_alias_columns.get(&table_name_key) {
+                rowid_alias_col_by_root_page.insert(table.root_page, alias_idx);
+            }
+            table_column_count_by_root_page.insert(table.root_page, table.columns.len());
+            for index in &table.indexes {
+                index_desc_flags_by_root_page.insert(
                     index.root_page,
                     (0..index.key_term_count())
                         .map(|key_pos| index.key_term_descending(key_pos))
                         .collect(),
-                )
-            })
-            .collect()
+                );
+            }
+        }
+
+        let entry = Arc::new(TableExecutionMetadataCacheEntry {
+            schema_generation,
+            autoincrement_table_names_by_root_page,
+            rowid_alias_col_by_root_page,
+            table_column_count_by_root_page,
+            index_desc_flags_by_root_page,
+        });
+        *self.table_execution_metadata_cache.borrow_mut() = Some(Arc::clone(&entry));
+        entry
     }
 
     /// Build evaluated column default values keyed by root page.
@@ -9965,7 +10026,6 @@ impl Connection {
                         .and_then(|sql| self.evaluate_column_default_value(Some(sql)).ok())
                 })
                 .collect();
-            // Only include tables that have at least one non-None default.
             if defaults.iter().any(Option::is_some) {
                 out.insert(table.root_page, defaults);
             }
@@ -19406,17 +19466,20 @@ impl Connection {
     /// Eagerly rewrite `IN (SELECT ...)` subqueries into literal lists
     /// for fallback execution paths that cannot handle them natively
     /// (expression-only SELECT, GROUP BY, JOINs).
-    fn rewrite_in_subqueries_select(
+    fn rewrite_in_subqueries_select<'a>(
         &self,
-        select: &SelectStatement,
+        select: &'a SelectStatement,
         params: Option<&[SqliteValue]>,
-    ) -> Result<SelectStatement> {
+    ) -> Result<Cow<'a, SelectStatement>> {
+        if !select_contains_rewritable_subquery(select) {
+            return Ok(Cow::Borrowed(select));
+        }
         let mut result = select.clone();
         rewrite_in_select_core(&mut result.body.select, self, true, params)?;
         for (_op, core) in &mut result.body.compounds {
             rewrite_in_select_core(core, self, true, params)?;
         }
-        Ok(result)
+        Ok(Cow::Owned(result))
     }
 
     /// Execute a SELECT with JOINs using in-memory nested-loop evaluation.
@@ -20656,6 +20719,7 @@ impl Connection {
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
         self.compiled_cache.borrow_mut().clear();
+        self.table_execution_metadata_cache.borrow_mut().take();
     }
 
     /// Increment the file change counter.  Must be called for every
@@ -41450,6 +41514,31 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_in_subqueries_select_borrows_plain_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        let statement = super::parse_single_statement("SELECT 1 + 2;").unwrap();
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+
+        let rewritten = conn.rewrite_in_subqueries_select(&select, None).unwrap();
+        assert!(matches!(rewritten, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_rewrite_in_subqueries_select_owns_grouped_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        let statement =
+            super::parse_single_statement("SELECT 1 WHERE 1 IN (SELECT 1 GROUP BY 1);").unwrap();
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+
+        let rewritten = conn.rewrite_in_subqueries_select(&select, None).unwrap();
+        assert!(matches!(rewritten, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
     fn test_statement_subquery_rewrite_probe_update_scalar_subquery_is_true() {
         let conn = Connection::open(":memory:").unwrap();
         let stmt = conn
@@ -58815,6 +58904,76 @@ mod pager_routing_tests {
         // After DDL, re-parsed query must still work.
         let rows = conn.query("SELECT x FROM pc2 WHERE id = 1").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("before".to_owned()));
+    }
+
+    #[test]
+    fn test_table_execution_metadata_cache_invalidated_by_ddl() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cache_meta (id INTEGER PRIMARY KEY, value TEXT);")
+            .unwrap();
+
+        let first = conn.table_execution_metadata();
+        let second = conn.table_execution_metadata();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            first
+                .rowid_alias_col_by_root_page
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        conn.execute("CREATE INDEX idx_cache_meta_value ON cache_meta (value DESC);")
+            .unwrap();
+
+        let third = conn.table_execution_metadata();
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
+        assert_eq!(third.index_desc_flags_by_root_page.len(), 1);
+        assert_eq!(
+            third
+                .index_desc_flags_by_root_page
+                .values()
+                .next()
+                .expect("index metadata missing"),
+            &vec![true]
+        );
+    }
+
+    #[test]
+    fn test_table_execution_metadata_cache_keeps_autoincrement_values_live() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE cache_auto (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                value TEXT
+            );",
+        )
+        .unwrap();
+
+        let cached = conn.table_execution_metadata();
+        let cached_again = conn.table_execution_metadata();
+        assert!(std::sync::Arc::ptr_eq(&cached, &cached_again));
+        assert_eq!(
+            conn.autoincrement_sequence_by_root_page()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+
+        conn.execute("INSERT INTO cache_auto (value) VALUES ('first');")
+            .unwrap();
+
+        let cached_after_dml = conn.table_execution_metadata();
+        assert!(std::sync::Arc::ptr_eq(&cached, &cached_after_dml));
+        assert_eq!(
+            conn.autoincrement_sequence_by_root_page()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     #[test]
@@ -81939,7 +82098,8 @@ mod pager_routing_tests {
         };
 
         let rewritten = conn.rewrite_in_subqueries_select(&select, None).unwrap();
-        let bound = super::bind_placeholders_in_select_for_fallback(&rewritten, None).unwrap();
+        let bound =
+            super::bind_placeholders_in_select_for_fallback(rewritten.as_ref(), None).unwrap();
         let fsqlite_ast::SelectCore::Select { columns, .. } = &bound.body.select else {
             panic!("expected SELECT core");
         };

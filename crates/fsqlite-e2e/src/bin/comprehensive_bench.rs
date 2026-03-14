@@ -1545,8 +1545,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn.prepare("SELECT * FROM bench").unwrap();
         let fs = measure(&format!("fs_scan_{count}"), count, || {
-            let _rows = fs_conn.query("SELECT * FROM bench").unwrap();
+            let _rows = fs_stmt.query().unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -1572,9 +1573,12 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT * FROM bench WHERE id = ?1")
+            .unwrap();
         let fs = measure(&format!("fs_pk_{count}"), 1, || {
-            let _rows = fs_conn
-                .query(&format!("SELECT * FROM bench WHERE id = {target_id}"))
+            let _row = fs_stmt
+                .query_row_with_params(&[fsqlite::SqliteValue::Integer(target_id)])
                 .unwrap();
         });
         eprintln!(
@@ -1608,11 +1612,15 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT * FROM bench WHERE id >= ?1 AND id < ?2")
+            .unwrap();
         let fs = measure(&format!("fs_range_{count}"), range_size, || {
-            let _rows = fs_conn
-                .query(&format!(
-                    "SELECT * FROM bench WHERE id >= {range_start} AND id < {range_end}"
-                ))
+            let _rows = fs_stmt
+                .query_with_params(&[
+                    fsqlite::SqliteValue::Integer(range_start),
+                    fsqlite::SqliteValue::Integer(range_end),
+                ])
                 .unwrap();
         });
         eprintln!(
@@ -1634,8 +1642,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
+        let fs_stmt = fs_conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
         let fs = measure(&format!("fs_count_{count}"), 1, || {
-            let _rows = fs_conn.query("SELECT COUNT(*) FROM bench").unwrap();
+            let _row = fs_stmt.query_row().unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -1668,8 +1677,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             let sql = format!(
                 "SELECT (id / {group_divisor}), SUM(value) FROM bench GROUP BY (id / {group_divisor})"
             );
+            let stmt = fs_conn.prepare(&sql).unwrap();
             measure(&format!("fs_groupby_{count}"), count, || {
-                let _rows = fs_conn.query(&sql).unwrap();
+                let _rows = stmt.query().unwrap();
             })
         };
         eprintln!(
@@ -1700,10 +1710,12 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT * FROM bench WHERE name = ?1")
+            .unwrap();
+        let target_name_param = [fsqlite::SqliteValue::Text(target_name)];
         let fs = measure(&format!("fs_idx_{count}"), 1, || {
-            let _rows = fs_conn
-                .query(&format!("SELECT * FROM bench WHERE name = '{target_name}'"))
-                .unwrap();
+            let _rows = fs_stmt.query_with_params(&target_name_param).unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -1730,10 +1742,11 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT * FROM bench ORDER BY value DESC LIMIT 20")
+            .unwrap();
         let fs = measure(&format!("fs_order_{count}"), 20, || {
-            let _rows = fs_conn
-                .query("SELECT * FROM bench ORDER BY value DESC LIMIT 20")
-                .unwrap();
+            let _rows = fs_stmt.query().unwrap();
         });
         eprintln!(
             "C={} F={}",
@@ -1813,10 +1826,17 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 conn.execute("COMMIT").unwrap();
 
                 conn.execute("BEGIN").unwrap();
+                let update = conn
+                    .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+                    .unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..update_count as i64 {
                     let id = i * 10;
-                    conn.execute(&format!("UPDATE bench SET value = 999.99 WHERE id = {id}"))
+                    update
+                        .execute_with_params(&[
+                            fsqlite::SqliteValue::Integer(id),
+                            fsqlite::SqliteValue::Float(999.99),
+                        ])
                         .unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
@@ -1879,10 +1899,12 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 conn.execute("COMMIT").unwrap();
 
                 conn.execute("BEGIN").unwrap();
+                let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..delete_count as i64 {
                     let id = i * 20;
-                    conn.execute(&format!("DELETE FROM bench WHERE id = {id}"))
+                    delete
+                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
                         .unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
@@ -2030,36 +2052,47 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
         let mut rng = Rng64::new(42);
         #[allow(clippy::cast_possible_wrap)]
         let mut next_id = seed_rows as i64 + 1;
+        let select_pt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
+        let select_range = conn
+            .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+            .unwrap();
+        let select_agg = conn
+            .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+            .unwrap();
+        let insert = conn
+            .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
+            .unwrap();
+        let update = conn
+            .prepare("UPDATE bench SET score = ?2 WHERE id = ?1")
+            .unwrap();
+        let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
 
         #[allow(clippy::cast_possible_wrap)]
         for _ in 0..ops {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = conn.query(&format!("SELECT * FROM bench WHERE id = {id}"));
+                let _ = select_pt.query_row_with_params(&[fsqlite::SqliteValue::Integer(id)]);
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
-                let _ = conn.query(&format!(
-                    "SELECT COUNT(*) FROM bench WHERE id >= {start} AND id < {}",
-                    start + 50,
-                ));
+                let _ = select_range.query_row_with_params(&[
+                    fsqlite::SqliteValue::Integer(start),
+                    fsqlite::SqliteValue::Integer(start + 50),
+                ]);
             } else if roll < 80 {
-                let _ = conn.query("SELECT COUNT(*), SUM(score) FROM bench");
+                let _ = select_agg.query_row();
             } else if roll < 95 {
-                let _ = conn.execute(&format!(
-                    "INSERT INTO bench VALUES ({next_id}, 'name_{next_id}', {})",
-                    next_id * 7,
-                ));
+                let _ = insert.execute_with_params(&[fsqlite::SqliteValue::Integer(next_id)]);
                 next_id += 1;
             } else if roll < 98 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = conn.execute(&format!(
-                    "UPDATE bench SET score = {} WHERE id = {id}",
-                    id * 99,
-                ));
+                let _ = update.execute_with_params(&[
+                    fsqlite::SqliteValue::Integer(id),
+                    fsqlite::SqliteValue::Integer(id * 99),
+                ]);
             } else {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = conn.execute(&format!("DELETE FROM bench WHERE id = {id}"));
+                let _ = delete.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]);
             }
         }
     });
@@ -2170,8 +2203,11 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id")
+            .unwrap();
         let fs = measure(&format!("fs_inner_join_{count}"), count, || {
-            let _ = fs_conn.query("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id");
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",
@@ -2192,8 +2228,11 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id")
+            .unwrap();
         let fs = measure(&format!("fs_left_join_{count}"), count, || {
-            let _ = fs_conn.query("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id");
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",
@@ -2214,8 +2253,11 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name")
+            .unwrap();
         let fs = measure(&format!("fs_join_agg_{count}"), customer_count, || {
-            let _ = fs_conn.query("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name");
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",
@@ -2248,8 +2290,9 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             let sql = format!(
                 "SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}"
             );
+            let stmt = fs_conn.prepare(&sql).unwrap();
             measure(&format!("fs_join_having_{count}"), customer_count, || {
-                let _ = fs_conn.query(&sql);
+                let _ = stmt.query();
             })
         };
         eprintln!(
@@ -2355,8 +2398,13 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare(
+                "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100",
+            )
+            .unwrap();
         let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
-            let _ = fs_conn.query("SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100");
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",
@@ -2385,8 +2433,9 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
             let sql = format!(
                 "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
             );
+            let stmt = fs_conn.prepare(&sql).unwrap();
             measure(&format!("fs_exists_{count}"), 1, || {
-                let _ = fs_conn.query(&sql);
+                let _ = stmt.query_row();
             })
         };
         eprintln!(
@@ -2409,8 +2458,11 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)")
+            .unwrap();
         let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
-            let _ = fs_conn.query("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)");
+            let _ = fs_stmt.query_row();
         });
         eprintln!(
             "C={} F={}",
@@ -2434,11 +2486,14 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
-        let fs = measure(&format!("fs_cte_{count}"), count, || {
-            let _ = fs_conn.query(
+        let fs_stmt = fs_conn
+            .prepare(
                 "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
-                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id"
-            );
+                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id",
+            )
+            .unwrap();
+        let fs = measure(&format!("fs_cte_{count}"), count, || {
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",
@@ -2461,10 +2516,13 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
     };
     let fs = {
         let fs_conn = fsqlite::Connection::open(":memory:").unwrap();
+        let stmt = fs_conn
+            .prepare(
+                "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt",
+            )
+            .unwrap();
         measure("fs_recursive_cte", 1000, || {
-            let _ = fs_conn.query(
-                "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt"
-            );
+            let _ = stmt.query_row();
         })
     };
     eprintln!(
@@ -2553,8 +2611,11 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'")
+            .unwrap();
         let fs = measure(&format!("fs_like_prefix_{count}"), 1, || {
-            let _ = fs_conn.query("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'");
+            let _ = fs_stmt.query_row();
         });
         eprintln!(
             "C={} F={}",
@@ -2577,8 +2638,11 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'")
+            .unwrap();
         let fs = measure(&format!("fs_like_wild_{count}"), 1, || {
-            let _ = fs_conn.query("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'");
+            let _ = fs_stmt.query_row();
         });
         eprintln!(
             "C={} F={}",
@@ -2605,9 +2669,11 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs")
+            .unwrap();
         let fs = measure(&format!("fs_str_funcs_{count}"), count, || {
-            let _ =
-                fs_conn.query("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs");
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",
@@ -2634,8 +2700,11 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
+        let fs_stmt = fs_conn
+            .prepare("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag")
+            .unwrap();
         let fs = measure(&format!("fs_group_concat_{count}"), count, || {
-            let _ = fs_conn.query("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag");
+            let _ = fs_stmt.query();
         });
         eprintln!(
             "C={} F={}",

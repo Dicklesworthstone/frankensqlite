@@ -17,6 +17,8 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4147,6 +4149,7 @@ fn copy_sidecars(src_db: &Path, dest_db: &Path) -> Result<Vec<PathBuf>, String> 
                 dest.display()
             )
         })?;
+        make_path_writable(&dest)?;
         copied.push(dest);
     }
 
@@ -4161,8 +4164,21 @@ fn copy_db_with_sidecars(src_db: &Path, dest_db: &Path) -> Result<(), String> {
             dest_db.display()
         )
     })?;
+    make_path_writable(dest_db)?;
     let _ = copy_sidecars(src_db, dest_db)?;
     Ok(())
+}
+
+fn make_path_writable(path: &Path) -> Result<(), String> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|e| format!("failed to read permissions for {}: {e}", path.display()))?
+        .permissions();
+    #[cfg(unix)]
+    permissions.set_mode(permissions.mode() | 0o200);
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)
+        .map_err(|e| format!("failed to mark {} writable: {e}", path.display()))
 }
 
 fn upsert_checksum(

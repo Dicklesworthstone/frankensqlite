@@ -34,8 +34,8 @@ use fsqlite_mvcc::{
     CommitIndex, CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError,
     TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_free_page,
     concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
-    concurrent_restore_page_state, concurrent_track_write_conflict_page,
-    concurrent_write_page_with, create_time_travel_snapshot,
+    concurrent_restore_page_state, concurrent_track_write_conflict_page, concurrent_write_page,
+    create_time_travel_snapshot,
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
@@ -1128,8 +1128,11 @@ impl PageWriter for SharedTxnPageIo {
             let deadline = Duration::from_millis(ctx.busy_timeout_ms);
             let mut handoff = BusyRetryHandoff::default();
 
+            let page_data_base = PageData::from_vec(data.to_vec());
+
             loop {
                 observe_execution_cancellation(cx)?;
+                let page_data = page_data_base.clone();
                 let (txn_id, snapshot_high, conflicting_commit_seq) = {
                     let guard = ctx
                         .registry
@@ -1181,12 +1184,12 @@ impl PageWriter for SharedTxnPageIo {
                     })?;
                     let txn_id = handle.txn_token().id.get();
                     let snapshot_high = handle.snapshot().high.get();
-                    let write_result = concurrent_write_page_with(
+                    let write_result = concurrent_write_page(
                         handle,
                         &ctx.lock_table,
                         ctx.session_id,
                         page_no,
-                        || PageData::from_vec(data.to_vec()),
+                        page_data,
                     );
                     (write_result, txn_id, snapshot_high)
                 };
@@ -1923,6 +1926,15 @@ impl CursorBackend {
             Self::TimeTravel(c) => c.invalidate(),
         }
     }
+
+    #[must_use]
+    fn position_stamp(&self) -> Option<(u32, u16)> {
+        match self {
+            Self::Mem(c) => c.position_stamp(),
+            Self::Txn(c) => c.position_stamp(),
+            Self::TimeTravel(c) => c.position_stamp(),
+        }
+    }
 }
 
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
@@ -1946,8 +1958,9 @@ struct StorageCursor {
     target_vals_buf: Vec<SqliteValue>,
     /// Scratch buffer for parsing current index keys.
     cur_vals_buf: Vec<SqliteValue>,
+    /// Cached decoded table row for repeated `Column` reads at one position.
+    row_vals_buf: Vec<SqliteValue>,
     /// Cache the cursor's physical position to avoid redundant payload reads.
-    #[allow(dead_code)]
     last_position_stamp: Option<(u32, u16)>,
 }
 
@@ -3752,6 +3765,7 @@ impl VdbeEngine {
                 if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id) {
                     if sc.writable && sc.cursor.index_move_to(&sc.cx, &key_bytes)?.is_found() {
                         sc.cursor.delete(&sc.cx)?;
+                        invalidate_storage_cursor_row_cache(sc);
                     }
                 }
             }
@@ -3761,6 +3775,7 @@ impl VdbeEngine {
         if let Some(tsc) = self.storage_cursors.get_mut(&tbl_cursor_id) {
             tsc.cursor.table_move_to(&tsc.cx, conflict_rowid)?;
             tsc.cursor.delete(&tsc.cx)?;
+            invalidate_storage_cursor_row_cache(tsc);
         }
 
         Ok(())
@@ -3773,6 +3788,7 @@ impl VdbeEngine {
                 && isc.cursor.index_move_to(&isc.cx, &idx_key)?.is_found()
             {
                 isc.cursor.delete(&isc.cx)?;
+                invalidate_storage_cursor_row_cache(isc);
             }
         }
 
@@ -3795,6 +3811,7 @@ impl VdbeEngine {
             ));
         }
         tsc.cursor.delete(&tsc.cx)?;
+        invalidate_storage_cursor_row_cache(tsc);
         self.changes = self.changes.checked_sub(1).ok_or_else(|| {
             FrankenError::internal("secondary-index rollback underflowed change counter")
         })?;
@@ -3821,6 +3838,7 @@ impl VdbeEngine {
                     FrankenError::internal("table cursor missing during UPDATE conflict restore")
                 })?;
                 tsc.cursor.table_insert(&tsc.cx, rowid, &payload)?;
+                invalidate_storage_cursor_row_cache(tsc);
 
                 if let Some(index_metas) = self.table_index_meta.get(&cursor_id).cloned() {
                     let old_row = parse_record(&payload).ok_or_else(|| {
@@ -3841,6 +3859,7 @@ impl VdbeEngine {
                             && sc.writable
                         {
                             sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+                            invalidate_storage_cursor_row_cache(sc);
                         }
                     }
                 }
@@ -4430,6 +4449,7 @@ impl VdbeEngine {
                             payload_buf: Vec::new(),
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
+                            row_vals_buf: Vec::new(),
                             last_position_stamp: None,
                         },
                     );
@@ -5070,6 +5090,7 @@ impl VdbeEngine {
                                 payload_buf: Vec::new(),
                                 target_vals_buf: Vec::new(),
                                 cur_vals_buf: Vec::new(),
+                                row_vals_buf: Vec::new(),
                                 last_position_stamp: None,
                             },
                         );
@@ -6038,6 +6059,7 @@ impl VdbeEngine {
                                         },
                                     )?;
                                     sc2.cursor.table_insert(&sc2.cx, rowid, blob)?;
+                                    invalidate_storage_cursor_row_cache(sc2);
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
                                     // OE_IGNORE: Skip insert for conflicting row
@@ -6054,6 +6076,7 @@ impl VdbeEngine {
                             } else {
                                 // No conflict — insert normally
                                 sc.cursor.table_insert(&sc.cx, rowid, blob)?;
+                                invalidate_storage_cursor_row_cache(sc);
                                 actually_inserted = true;
                             }
                         }
@@ -6180,6 +6203,7 @@ impl VdbeEngine {
                                 });
                             }
                             sc.cursor.delete(&sc.cx)?;
+                            invalidate_storage_cursor_row_cache(sc);
                             deleted = true;
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -6262,6 +6286,7 @@ impl VdbeEngine {
                                     columns_label,
                                 ) {
                                     Ok(()) => {
+                                        invalidate_storage_cursor_row_cache(sc);
                                         self.pending_idx_entries
                                             .push((cursor_id, key_bytes.to_vec()));
                                     }
@@ -6310,6 +6335,7 @@ impl VdbeEngine {
                                                         FrankenError::internal("cursor must exist")
                                                     })?;
                                                 sc2.cursor.index_insert(&sc2.cx, key_bytes)?;
+                                                invalidate_storage_cursor_row_cache(sc2);
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -6326,6 +6352,7 @@ impl VdbeEngine {
                                 }
                             } else {
                                 sc.cursor.index_insert(&sc.cx, key_bytes)?;
+                                invalidate_storage_cursor_row_cache(sc);
                                 self.pending_idx_entries
                                     .push((cursor_id, key_bytes.to_vec()));
                             }
@@ -6372,10 +6399,12 @@ impl VdbeEngine {
                                 // Seek to the key first, then delete.
                                 if sc.cursor.index_move_to(&sc.cx, key)?.is_found() {
                                     sc.cursor.delete(&sc.cx)?;
+                                    invalidate_storage_cursor_row_cache(sc);
                                 }
                             } else if !sc.cursor.eof() {
                                 // Delete at current position.
                                 sc.cursor.delete(&sc.cx)?;
+                                invalidate_storage_cursor_row_cache(sc);
                             }
                         }
                     }
@@ -8077,9 +8106,21 @@ impl VdbeEngine {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
-            cursor
-                .cursor
-                .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
+            let position_stamp = cursor.cursor.position_stamp();
+            if cursor.last_position_stamp != position_stamp {
+                cursor
+                    .cursor
+                    .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
+                cursor.row_vals_buf.clear();
+                fsqlite_types::record::parse_record_into(
+                    &cursor.payload_buf,
+                    &mut cursor.row_vals_buf,
+                )
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "malformed record header in cursor payload".to_owned(),
+                })?;
+                cursor.last_position_stamp = position_stamp;
+            }
 
             let root_page = self.cursor_root_pages.get(&cursor_id).copied();
             let rowid = cursor.cursor.rowid(&cursor.cx)?;
@@ -8091,7 +8132,7 @@ impl VdbeEngine {
                     .zip(ipk_col_idx)
                     .is_some_and(|(root_page, ipk_col_idx)| {
                         payload_includes_rowid_alias(
-                            &cursor.payload_buf,
+                            &cursor.row_vals_buf,
                             rowid,
                             ipk_col_idx,
                             self.table_column_count_by_root_page
@@ -8112,20 +8153,7 @@ impl VdbeEngine {
                 col_idx
             };
 
-            let num_cols = fsqlite_types::record::record_column_count(&cursor.payload_buf)
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "malformed record header in cursor payload".to_owned(),
-                })?;
-
-            if payload_idx < num_cols {
-                let val =
-                    fsqlite_types::record::parse_record_column(&cursor.payload_buf, payload_idx)
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "failed to parse record column {} even though count is {}",
-                                payload_idx, num_cols
-                            ),
-                        })?;
+            if let Some(val) = cursor.row_vals_buf.get(payload_idx).cloned() {
                 if collect_vdbe_metrics {
                     FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                     record_decoded_value_metrics(&val);
@@ -8368,6 +8396,7 @@ impl VdbeEngine {
                         payload_buf: Vec::new(),
                         target_vals_buf: Vec::new(),
                         cur_vals_buf: Vec::new(),
+                        row_vals_buf: Vec::new(),
                         last_position_stamp: None,
                     },
                 );
@@ -8447,6 +8476,7 @@ impl VdbeEngine {
                         payload_buf: Vec::new(),
                         target_vals_buf: Vec::new(),
                         cur_vals_buf: Vec::new(),
+                        row_vals_buf: Vec::new(),
                         last_position_stamp: None,
                     },
                 );
@@ -8562,6 +8592,7 @@ impl VdbeEngine {
                 payload_buf: Vec::new(),
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
+                row_vals_buf: Vec::new(),
                 last_position_stamp: None,
             },
         );
@@ -8844,6 +8875,7 @@ fn find_conflicting_rowid_in_index(
 
             // Delete the conflicting index entry.
             sc.cursor.delete(&sc.cx)?;
+            invalidate_storage_cursor_row_cache(sc);
 
             return Ok(Some(old_rowid));
         }
@@ -8861,26 +8893,31 @@ fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
 }
 
 fn payload_includes_rowid_alias(
-    payload: &[u8],
+    payload_values: &[SqliteValue],
     rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
 ) -> bool {
-    let payload_column_count = fsqlite_types::record::record_column_count(payload);
-    if let (Some(payload_cols), Some(table_cols)) = (payload_column_count, table_column_count)
+    let payload_cols = payload_values.len();
+    if let Some(table_cols) = table_column_count
         && payload_cols >= table_cols
     {
         return true;
     }
-    if payload_column_count.is_some_and(|payload_cols| payload_cols <= ipk_col_idx) {
+    if payload_cols <= ipk_col_idx {
         return false;
     }
 
-    match fsqlite_types::record::parse_record_column(payload, ipk_col_idx) {
+    match payload_values.get(ipk_col_idx) {
         Some(SqliteValue::Null) => true,
-        Some(SqliteValue::Integer(encoded_rowid)) => encoded_rowid == rowid,
+        Some(SqliteValue::Integer(encoded_rowid)) => *encoded_rowid == rowid,
         _ => false,
     }
+}
+
+fn invalidate_storage_cursor_row_cache(cursor: &mut StorageCursor) {
+    cursor.row_vals_buf.clear();
+    cursor.last_position_stamp = None;
 }
 
 #[allow(dead_code)]
@@ -13287,6 +13324,37 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_invalidates_cached_storage_row_before_successor_column() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            // Prime the per-row column cache on rowid=1/value=10.
+            b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+
+            // Delete the current row. The cursor now lands on the successor.
+            b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+
+            // Without cache invalidation this would incorrectly return 10 again.
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(20)]]);
+    }
+
+    #[test]
     fn test_delete_then_prev_then_next_advances_correctly() {
         // Regression: after Delete marks pending_next_after_delete, a
         // subsequent Prev must clear that pending state. Otherwise the next
@@ -16571,7 +16639,7 @@ mod tests {
             let holder = guard
                 .get_mut(holder_session)
                 .expect("holder session must be present");
-            fsqlite_mvcc::concurrent_write_page(
+            concurrent_write_page(
                 holder,
                 &lock_table,
                 holder_session,

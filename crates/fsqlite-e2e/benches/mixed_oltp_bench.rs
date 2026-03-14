@@ -13,12 +13,10 @@
 //! The benchmark measures throughput (ops/sec) over a fixed number of
 //! operations on both backends.
 //!
-//! Note: FrankenSQLite's `prepare()` currently supports SELECT only, so DML
-//! uses `conn.execute()` with formatted SQL strings.
-
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use fsqlite::SqliteValue;
 
 const SEED_ROWS: usize = 500;
 const OPS_PER_ITERATION: u64 = 2000;
@@ -195,35 +193,46 @@ fn bench_mixed_oltp_fsqlite(c: &mut Criterion) {
             |conn| {
                 let mut rng = Rng64::new(42);
                 let mut next_id = SEED_ROWS as i64 + 1;
+                let select_pt = conn.prepare("SELECT * FROM bench WHERE id = ?1").unwrap();
+                let select_range = conn
+                    .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+                    .unwrap();
+                let select_agg = conn
+                    .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+                    .unwrap();
+                let insert = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
+                    .unwrap();
+                let update = conn
+                    .prepare("UPDATE bench SET score = ?2 WHERE id = ?1")
+                    .unwrap();
+                let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
 
                 for _ in 0..OPS_PER_ITERATION {
                     let roll = rng.next_usize(100);
                     if roll < 40 {
                         let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
-                        let _ = conn.query(&format!("SELECT * FROM bench WHERE id = {id}"));
+                        let _ = select_pt.query_row_with_params(&[SqliteValue::Integer(id)]);
                     } else if roll < 60 {
                         let start = (rng.next_usize(SEED_ROWS - 50) + 1) as i64;
-                        let _ = conn.query(&format!(
-                            "SELECT COUNT(*) FROM bench WHERE id >= {start} AND id < {}",
-                            start + 50,
-                        ));
+                        let _ = select_range.query_row_with_params(&[
+                            SqliteValue::Integer(start),
+                            SqliteValue::Integer(start + 50),
+                        ]);
                     } else if roll < 80 {
-                        let _ = conn.query("SELECT COUNT(*), SUM(score) FROM bench");
+                        let _ = select_agg.query_row();
                     } else if roll < 95 {
-                        let _ = conn.execute(&format!(
-                            "INSERT INTO bench VALUES ({next_id}, 'name_{next_id}', {})",
-                            next_id * 7,
-                        ));
+                        let _ = insert.execute_with_params(&[SqliteValue::Integer(next_id)]);
                         next_id += 1;
                     } else if roll < 98 {
                         let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
-                        let _ = conn.execute(&format!(
-                            "UPDATE bench SET score = {} WHERE id = {id}",
-                            id * 99,
-                        ));
+                        let _ = update.execute_with_params(&[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Integer(id * 99),
+                        ]);
                     } else {
                         let id = (rng.next_usize(SEED_ROWS) + 1) as i64;
-                        let _ = conn.execute(&format!("DELETE FROM bench WHERE id = {id}"));
+                        let _ = delete.execute_with_params(&[SqliteValue::Integer(id)]);
                     }
                 }
             },
