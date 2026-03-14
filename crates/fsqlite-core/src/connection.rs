@@ -13144,7 +13144,8 @@ impl Connection {
             }
             Err((err, fcw_result)) => {
                 if let Some(handle) = registry.remove(session_id) {
-                    concurrent_abort(handle.lock(), &self.concurrent_lock_table, session_id);
+                    let mut handle = handle.lock();
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
                 }
                 *self.concurrent_session_id.borrow_mut() = None;
                 Err(Self::map_mvcc_commit_error(err, fcw_result))

@@ -555,7 +555,7 @@ impl ConcurrentRegistry {
                     "prune_committed_conflict_history: marking long-running transaction for abort due to SSI history limit"
                 );
                 if let Some(handle) = self.active.get_mut(&id) {
-                    let mut handle = handle.lock();
+                    let handle = handle.lock();
                     handle.set_marked_for_abort(true);
                 }
 
@@ -1708,17 +1708,17 @@ mod tests {
             .expect("session");
 
         // Write page 1 (INSERT A).
-        let handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
 
         // Create savepoint.
         let handle = registry.get(s1).expect("handle");
-        let sp = concurrent_savepoint(handle, "sp1").unwrap();
+        let sp = concurrent_savepoint(&handle, "sp1").unwrap();
         assert_eq!(sp.captured_len(), 1);
 
         // Write page 2 (INSERT B).
-        let handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(handle, &lock_table, s1, test_page(2), test_data()).unwrap();
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, test_page(2), test_data()).unwrap();
         assert_eq!(handle.write_set_len(), 2);
 
         // Rollback to savepoint: page 2 should be removed from write set,
@@ -1973,8 +1973,8 @@ mod tests {
         let s2 = registry
             .begin_concurrent(test_snapshot(10))
             .expect("session 2");
-        let handle2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(handle2, &lock_table, s2, test_page(5), test_data())
+        let mut handle2 = registry.get_mut(s2).expect("handle 2");
+        concurrent_write_page(&mut handle2, &lock_table, s2, test_page(5), test_data())
             .expect("lock should be available after abort");
     }
 
@@ -2005,12 +2005,12 @@ mod tests {
         let s1 = registry
             .begin_concurrent(test_snapshot(10))
             .expect("session");
-        let handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         let handle = registry.get(s1).expect("handle");
         assert_eq!(
-            validate_first_committer_wins(handle, &commit_index),
+            validate_first_committer_wins(&handle, &commit_index),
             FcwResult::Clean
         );
     }
@@ -2031,8 +2031,8 @@ mod tests {
         let s1 = registry
             .begin_concurrent(test_snapshot(10))
             .expect("session");
-        let handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(handle, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         let handle = registry.get(s1).expect("handle");
         let result = validate_first_committer_wins(handle, &commit_index);
