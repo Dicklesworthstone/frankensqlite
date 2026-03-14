@@ -424,6 +424,14 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// validation at commit time.
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
 
+    /// Write owned page data within this transaction.
+    ///
+    /// The default implementation borrows the page bytes, but implementations
+    /// can override this to adopt owned buffers without another copy.
+    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        self.write_page(cx, page_no, data.as_bytes())
+    }
+
     /// Allocate a new page and return its page number.
     ///
     /// Searches the freelist first, then extends the database file.
@@ -705,6 +713,12 @@ impl TransactionHandle for MemoryMockTransaction {
         let copy_len = data.len().min(page_size);
         page[..copy_len].copy_from_slice(&data[..copy_len]);
         self.pages.insert(page_no, PageData::from_vec(page));
+        Ok(())
+    }
+
+    fn write_page_data(&mut self, _cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        self.committed = false;
+        self.pages.insert(page_no, data);
         Ok(())
     }
 

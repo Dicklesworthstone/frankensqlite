@@ -30,7 +30,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::parse_record;
 use fsqlite_types::serial_type::{read_varint, write_varint};
-use fsqlite_types::{PageNumber, WitnessKey};
+use fsqlite_types::{PageData, PageNumber, WitnessKey};
 use tracing::{Level, debug, trace, warn};
 
 #[inline]
@@ -69,6 +69,15 @@ pub trait PageReader {
 pub trait PageWriter: PageReader {
     /// Write raw data to a page.
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+
+    /// Write owned page data to a page.
+    ///
+    /// Implementations can override this to adopt owned page buffers without
+    /// routing through a borrowed slice first.
+    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        self.write_page(cx, page_no, data.as_bytes())
+    }
+
     /// Allocate a new page.
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
     /// Free a page.
@@ -118,6 +127,10 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
 impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.txn.write_page(cx, page_no, data)
+    }
+
+    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        self.txn.write_page_data(cx, page_no, data)
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
@@ -219,6 +232,11 @@ impl PageReader for MemPageStore {
 impl PageWriter for MemPageStore {
     fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.pages.insert(page_no.get(), data.to_vec());
+        Ok(())
+    }
+
+    fn write_page_data(&mut self, _cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        self.pages.insert(page_no.get(), data.into_vec());
         Ok(())
     }
 
@@ -1625,7 +1643,8 @@ impl<P: PageWriter> BtCursor<P> {
         }
         header.write(&mut page_data, header_offset);
         cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
-        self.pager.write_page(cx, leaf_page_no, &page_data)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, PageData::from_vec(page_data))?;
 
         // Refresh the top stack entry.
         let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
@@ -1986,7 +2005,8 @@ impl<P: PageWriter> BtCursor<P> {
             header.write(&mut page_data, header_offset);
             cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
 
-            self.pager.write_page(cx, page_no, &page_data)?;
+            self.pager
+                .write_page_data(cx, page_no, PageData::from_vec(page_data))?;
             let mut refreshed = self.reload_page_fresh(cx, page_no)?;
             refreshed.cell_idx = cell_idx;
             if let Some(top) = self.stack.last_mut() {
@@ -2105,7 +2125,8 @@ impl<P: PageWriter> BtCursor<P> {
 
         header.write(&mut page_data, header_offset);
         cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
-        self.pager.write_page(cx, leaf_page_no, &page_data)?;
+        self.pager
+            .write_page_data(cx, leaf_page_no, PageData::from_vec(page_data))?;
 
         // Refresh the stack entry.
         let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
@@ -2559,7 +2580,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 mod tests {
     use super::*;
     use crate::instrumentation::btree_metrics_snapshot;
-    use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+    use fsqlite_pager::{MemoryMockMvccPager, MockMvccPager, MvccPager as _, TransactionMode};
     use fsqlite_types::SqliteValue;
     use fsqlite_types::record::serialize_record;
     use fsqlite_types::serial_type::write_varint;
@@ -2887,6 +2908,26 @@ mod tests {
             Some(&page_no.get().to_le_bytes()[..]),
             "TransactionHandle::get_page stamps page number in first 4 bytes"
         );
+    }
+
+    #[test]
+    fn test_transaction_page_io_writes_owned_page_data_via_transaction_handle() {
+        let cx = Cx::new();
+        let pager = MemoryMockMvccPager;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .expect("mock transaction begin should succeed");
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let expected = vec![0xAB; 32];
+
+        let mut io = TransactionPageIo::new(&mut txn);
+        io.write_page_data(&cx, page_no, PageData::from_vec(expected.clone()))
+            .expect("write_page_data should forward");
+
+        let bytes = io
+            .read_page(&cx, page_no)
+            .expect("read_page should return the owned bytes");
+        assert_eq!(&bytes[..expected.len()], expected.as_slice());
     }
 
     #[test]

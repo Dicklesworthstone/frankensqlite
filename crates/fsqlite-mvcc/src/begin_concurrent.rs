@@ -20,10 +20,12 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use fsqlite_types::{
     CommitSeq, PageData, PageNumber, Snapshot, TxnEpoch, TxnId, TxnToken, WitnessKey,
 };
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
@@ -37,6 +39,9 @@ use crate::ssi_validation::{
 /// This is a soft limit enforced at `begin_concurrent` time to prevent
 /// unbounded resource consumption.
 pub const MAX_CONCURRENT_WRITERS: usize = 128;
+
+/// Stable shared handle for one active concurrent transaction.
+pub type SharedConcurrentHandle = Arc<Mutex<ConcurrentHandle>>;
 
 /// Result of first-committer-wins validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,7 +437,7 @@ impl ConcurrentSavepoint {
 #[derive(Debug)]
 pub struct ConcurrentRegistry {
     /// Active concurrent handles, keyed by an opaque session id.
-    active: HashMap<u64, ConcurrentHandle>,
+    active: HashMap<u64, SharedConcurrentHandle>,
     /// Committed-reader history (RCRI-like) for SSI edge discovery.
     committed_readers: Vec<CommittedReaderInfo>,
     /// Committed-writer history (commit-log-like) for SSI edge discovery.
@@ -479,29 +484,37 @@ impl ConcurrentRegistry {
         let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
         let txn_token = TxnToken::new(txn_id, TxnEpoch::new(self.epoch_counter));
 
-        let handle = ConcurrentHandle::new(snapshot, txn_token);
+        let handle = Arc::new(Mutex::new(ConcurrentHandle::new(snapshot, txn_token)));
         self.active.insert(session_id, handle);
         Ok(session_id)
     }
 
     /// Returns an iterator over all active handles (for SSI validation).
-    pub fn iter_active(&self) -> impl Iterator<Item = (u64, &ConcurrentHandle)> {
-        self.active.iter().map(|(&id, h)| (id, h))
+    pub fn iter_active(&self) -> impl Iterator<Item = (u64, SharedConcurrentHandle)> + '_ {
+        self.active
+            .iter()
+            .map(|(&id, handle)| (id, Arc::clone(handle)))
     }
 
-    /// Look up a concurrent handle by session id.
+    /// Look up a shared concurrent handle by session id.
     #[must_use]
-    pub fn get(&self, session_id: u64) -> Option<&ConcurrentHandle> {
-        self.active.get(&session_id)
+    pub fn handle(&self, session_id: u64) -> Option<SharedConcurrentHandle> {
+        self.active.get(&session_id).map(Arc::clone)
     }
 
-    /// Look up a mutable concurrent handle by session id.
-    pub fn get_mut(&mut self, session_id: u64) -> Option<&mut ConcurrentHandle> {
-        self.active.get_mut(&session_id)
+    /// Lock a concurrent handle by session id.
+    #[must_use]
+    pub fn get(&self, session_id: u64) -> Option<MutexGuard<'_, ConcurrentHandle>> {
+        self.active.get(&session_id).map(|handle| handle.lock())
+    }
+
+    /// Lock a concurrent handle by session id for mutation.
+    pub fn get_mut(&self, session_id: u64) -> Option<MutexGuard<'_, ConcurrentHandle>> {
+        self.active.get(&session_id).map(|handle| handle.lock())
     }
 
     /// Remove a session (after commit or abort).
-    pub fn remove(&mut self, session_id: u64) -> Option<ConcurrentHandle> {
+    pub fn remove(&mut self, session_id: u64) -> Option<SharedConcurrentHandle> {
         self.active.remove(&session_id)
     }
 
@@ -525,6 +538,7 @@ impl ConcurrentRegistry {
             let mut oldest_id = None;
             let mut oldest_seq = CommitSeq::new(u64::MAX);
             for (&id, handle) in &self.active {
+                let handle = handle.lock();
                 if handle.is_active()
                     && !handle.is_marked_for_abort()
                     && handle.snapshot.high < oldest_seq
@@ -541,6 +555,7 @@ impl ConcurrentRegistry {
                     "prune_committed_conflict_history: marking long-running transaction for abort due to SSI history limit"
                 );
                 if let Some(handle) = self.active.get_mut(&id) {
+                    let mut handle = handle.lock();
                     handle.set_marked_for_abort(true);
                 }
 
@@ -577,8 +592,10 @@ impl ConcurrentRegistry {
     pub fn gc_horizon(&self) -> Option<CommitSeq> {
         self.active
             .values()
-            .filter(|h| h.is_active())
-            .map(|h| h.snapshot.high)
+            .filter_map(|handle| {
+                let handle = handle.lock();
+                handle.is_active().then_some(handle.snapshot.high)
+            })
             .min()
     }
 
@@ -593,8 +610,11 @@ impl ConcurrentRegistry {
     fn history_retention_horizon(&self) -> Option<CommitSeq> {
         self.active
             .values()
-            .filter(|h| h.is_active() && !h.is_marked_for_abort())
-            .map(|h| h.snapshot.high)
+            .filter_map(|handle| {
+                let handle = handle.lock();
+                (handle.is_active() && !handle.is_marked_for_abort())
+                    .then_some(handle.snapshot.high)
+            })
             .min()
     }
 }
@@ -621,6 +641,16 @@ pub fn concurrent_write_page(
         return Err(MvccError::InvalidState);
     }
     let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    if handle.write_set.contains_key(&page)
+        && handle.page_locks.contains(&page)
+        && !handle.freed_pages.contains(&page)
+        && !handle.conflict_only_pages.contains(&page)
+    {
+        handle.write_set.insert(page, data);
+        return Ok(());
+    }
+
+    let already_tracked = handle.tracks_write_conflict_page(page);
     // Acquire page lock if not already held.
     if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
         handle.page_locks.remove(&page);
@@ -628,7 +658,9 @@ pub fn concurrent_write_page(
     }
     handle.freed_pages.remove(&page);
     handle.conflict_only_pages.remove(&page);
-    handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    if !already_tracked {
+        handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    }
     handle.write_set.insert(page, data);
     Ok(())
 }
@@ -696,6 +728,7 @@ pub fn concurrent_track_write_conflict_page(
         return Err(MvccError::InvalidState);
     }
     let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let already_tracked = handle.tracks_write_conflict_page(page);
     if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
         handle.page_locks.remove(&page);
         return Err(MvccError::Busy);
@@ -703,7 +736,9 @@ pub fn concurrent_track_write_conflict_page(
     if !handle.write_set.contains_key(&page) && !handle.freed_pages.contains(&page) {
         handle.conflict_only_pages.insert(page);
     }
-    handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    if !already_tracked {
+        handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    }
     Ok(())
 }
 
@@ -721,6 +756,7 @@ pub fn concurrent_free_page(
         return Err(MvccError::InvalidState);
     }
     let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let already_tracked = handle.tracks_write_conflict_page(page);
     if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
         handle.page_locks.remove(&page);
         return Err(MvccError::Busy);
@@ -728,7 +764,9 @@ pub fn concurrent_free_page(
     handle.write_set.remove(&page);
     handle.conflict_only_pages.remove(&page);
     handle.freed_pages.insert(page);
-    handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    if !already_tracked {
+        handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    }
     Ok(())
 }
 
@@ -873,34 +911,46 @@ impl PreparedConcurrentCommit {
     }
 }
 
-/// Borrowed active-transaction view with materialized witness keys.
-struct HandleView<'a> {
-    handle: &'a ConcurrentHandle,
+/// Snapshot of one active transaction used during SSI edge discovery.
+struct HandleView {
+    token: TxnToken,
+    begin_seq: CommitSeq,
+    is_active: bool,
+    read_pages: HashSet<PageNumber>,
+    tracked_write_pages: HashSet<PageNumber>,
     read_keys: Vec<WitnessKey>,
     write_keys: Vec<WitnessKey>,
+    has_in_rw: Cell<bool>,
+    has_out_rw: Cell<bool>,
 }
 
-impl<'a> HandleView<'a> {
-    fn new(handle: &'a ConcurrentHandle) -> Self {
+impl HandleView {
+    fn new(handle: &ConcurrentHandle) -> Self {
         Self {
-            handle,
+            token: handle.token(),
+            begin_seq: handle.begin_seq(),
+            is_active: handle.is_active(),
+            read_pages: handle.read_set().clone(),
+            tracked_write_pages: handle.write_set_pages().into_iter().collect(),
             read_keys: handle.read_witness_keys(),
             write_keys: handle.write_witness_keys(),
+            has_in_rw: Cell::new(handle.has_in_rw()),
+            has_out_rw: Cell::new(handle.has_out_rw()),
         }
     }
 }
 
-impl ActiveTxnView for HandleView<'_> {
+impl ActiveTxnView for HandleView {
     fn token(&self) -> TxnToken {
-        self.handle.token()
+        self.token
     }
 
     fn begin_seq(&self) -> CommitSeq {
-        self.handle.begin_seq()
+        self.begin_seq
     }
 
     fn is_active(&self) -> bool {
-        self.handle.is_active()
+        self.is_active
     }
 
     fn read_keys(&self) -> &[WitnessKey] {
@@ -916,8 +966,8 @@ impl ActiveTxnView for HandleView<'_> {
             WitnessKey::Page(p)
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.handle.read_set.contains(p),
-            WitnessKey::Custom { .. } => !self.handle.read_set.is_empty(), // Conservative fallback
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.read_pages.contains(p),
+            WitnessKey::Custom { .. } => !self.read_pages.is_empty(), // Conservative fallback
         }
     }
 
@@ -926,36 +976,28 @@ impl ActiveTxnView for HandleView<'_> {
             WitnessKey::Page(p)
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => {
-                self.handle.tracks_write_conflict_page(*p)
-            }
-            WitnessKey::Custom { .. } => {
-                !self.handle.write_set.is_empty()
-                    || !self.handle.freed_pages.is_empty()
-                    || !self.handle.conflict_only_pages.is_empty()
-            } // Conservative fallback
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.tracked_write_pages.contains(p),
+            WitnessKey::Custom { .. } => !self.tracked_write_pages.is_empty(), // Conservative fallback
         }
     }
 
     fn has_in_rw(&self) -> bool {
-        self.handle.has_in_rw()
+        self.has_in_rw.get()
     }
 
     fn has_out_rw(&self) -> bool {
-        self.handle.has_out_rw()
+        self.has_out_rw.get()
     }
 
     fn set_has_out_rw(&self, val: bool) {
-        self.handle.has_out_rw.set(val);
+        self.has_out_rw.set(val);
     }
 
     fn set_has_in_rw(&self, val: bool) {
-        self.handle.has_in_rw.set(val);
+        self.has_in_rw.set(val);
     }
 
-    fn set_marked_for_abort(&self, val: bool) {
-        self.handle.marked_for_abort.set(val);
-    }
+    fn set_marked_for_abort(&self, _val: bool) {}
 }
 
 fn evaluate_prepare_t3_dro(
@@ -1003,7 +1045,7 @@ pub fn concurrent_commit(
     let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
     // Step 1: First-committer-wins validation.
-    let fcw_result = validate_first_committer_wins(handle, commit_index);
+    let fcw_result = validate_first_committer_wins(&handle, commit_index);
     match &fcw_result {
         FcwResult::Clean => {
             // FCW passed. Now run SSI validation.
@@ -1077,10 +1119,10 @@ pub fn prepare_concurrent_commit_with_ssi(
         }
 
         // Step 1: First-committer-wins validation.
-        let fcw_result = validate_first_committer_wins(handle, commit_index);
+        let fcw_result = validate_first_committer_wins(&handle, commit_index);
         if !matches!(fcw_result, FcwResult::Clean) {
             lock_table.release_all(txn_id);
-            if let Some(handle) = registry.get_mut(session_id) {
+            if let Some(mut handle) = registry.get_mut(session_id) {
                 handle.mark_aborted();
             }
             return Err((MvccError::BusySnapshot, fcw_result));
@@ -1113,7 +1155,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             "prepare_concurrent_commit_with_ssi: marked_for_abort"
         );
         lock_table.release_all(txn_id);
-        if let Some(handle) = registry.get_mut(session_id) {
+        if let Some(mut handle) = registry.get_mut(session_id) {
             handle.mark_aborted();
         }
         return Err((MvccError::BusySnapshot, FcwResult::Clean));
@@ -1126,11 +1168,13 @@ pub fn prepare_concurrent_commit_with_ssi(
     sorted_write_keys.sort_unstable();
 
     // Step 2: Discover SSI edges without publishing side effects yet.
-    let views: Vec<HandleView<'_>> = registry
+    let views = registry
         .iter_active()
-        .filter(|(_, other)| other.is_active())
-        .map(|(_, other)| HandleView::new(other))
-        .collect();
+        .filter_map(|(_, handle)| {
+            let guard = handle.lock();
+            guard.is_active().then_some(HandleView::new(&guard))
+        })
+        .collect::<Vec<_>>();
     let active_views: Vec<&dyn ActiveTxnView> = views
         .iter()
         .map(|view| view as &dyn ActiveTxnView)
@@ -1216,7 +1260,14 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     // Re-scan against current active state to capture overlap edges that may
     // appear after prepare but before finalize. This keeps committed pivot
     // decisions deterministic.
-    let active_views: Vec<HandleView> = registry.active.values().map(HandleView::new).collect();
+    let active_views: Vec<HandleView> = registry
+        .active
+        .values()
+        .map(|handle| {
+            let guard = handle.lock();
+            HandleView::new(&guard)
+        })
+        .collect();
     let active_refs: Vec<&dyn ActiveTxnView> = active_views
         .iter()
         .map(|view| view as &dyn ActiveTxnView)
@@ -1270,11 +1321,11 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         if !edge.source_is_active {
             continue;
         }
-        if let Some(reader) = registry
-            .active
-            .values_mut()
-            .find(|reader| reader.is_active() && reader.token() == edge.from)
-        {
+        for reader in registry.active.values() {
+            let reader = reader.lock();
+            if !reader.is_active() || reader.token() != edge.from {
+                continue;
+            }
             reader.set_has_out_rw(true);
             if reader.has_in_rw() {
                 if should_abort_active_pivot {
@@ -1294,6 +1345,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                     );
                 }
             }
+            break;
         }
     }
 
@@ -1302,11 +1354,11 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         if !edge.source_is_active {
             continue;
         }
-        if let Some(writer) = registry
-            .active
-            .values_mut()
-            .find(|writer| writer.is_active() && writer.token() == edge.to)
-        {
+        for writer in registry.active.values() {
+            let writer = writer.lock();
+            if !writer.is_active() || writer.token() != edge.to {
+                continue;
+            }
             writer.set_has_in_rw(true);
             if writer.has_out_rw() {
                 if should_abort_active_pivot {
@@ -1326,6 +1378,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                     );
                 }
             }
+            break;
         }
     }
 
@@ -1353,7 +1406,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     }
     lock_table.release_all(txn_id);
     if mark_committed {
-        if let Some(handle) = registry.get_mut(prepared.session_id) {
+        if let Some(mut handle) = registry.get_mut(prepared.session_id) {
             if handle.is_active() {
                 handle.mark_committed();
             }
@@ -1397,8 +1450,9 @@ pub fn concurrent_commit_with_ssi(
     ) {
         Ok(p) => p,
         Err(e) => {
-            if let Some(mut handle) = registry.remove(session_id) {
-                concurrent_abort(&mut handle, lock_table, session_id);
+            if let Some(handle) = registry.remove(session_id) {
+                let mut handle = handle.lock();
+                concurrent_abort(&mut *handle, lock_table, session_id);
             }
             return Err(e);
         }
@@ -1476,6 +1530,8 @@ pub const fn is_concurrent_mode(mode: TransactionMode) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot, WitnessKey,
     };
@@ -1683,8 +1739,14 @@ mod tests {
         assert_eq!(pages, vec![test_page(1), test_page(3)]);
 
         let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_commit(&mut handle, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("commit succeeds");
+        concurrent_commit(
+            &mut handle,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("commit succeeds");
     }
 
     #[test]
@@ -1807,8 +1869,14 @@ mod tests {
         let mut handle = registry.get_mut(s1).expect("handle");
         concurrent_free_page(&mut handle, &lock_table, s1, test_page(11)).unwrap();
 
-        concurrent_commit(&mut handle, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("commit should succeed");
+        concurrent_commit(
+            &mut handle,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("commit should succeed");
 
         assert_eq!(commit_index.latest(test_page(11)), Some(CommitSeq::new(11)));
     }
@@ -1824,13 +1892,59 @@ mod tests {
         concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
             .unwrap();
 
-        concurrent_commit(&mut handle, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("commit should succeed");
+        concurrent_commit(
+            &mut handle,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("commit should succeed");
 
         assert_eq!(
             commit_index.latest(PageNumber::ONE),
             Some(CommitSeq::new(11))
         );
+    }
+
+    #[test]
+    fn test_concurrent_write_page_fast_path_reuses_owned_page_without_duplicate_witnesses() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let page = test_page(5);
+        let updated = PageData::from_vec(vec![0x7A; PageSize::DEFAULT.as_usize()]);
+
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, page, test_data()).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, s1, page, updated.clone()).unwrap();
+
+        assert_eq!(concurrent_read_page(&handle, page), Some(&updated));
+        assert_eq!(handle.held_locks().len(), 1);
+        assert_eq!(
+            handle
+                .write_witness_keys()
+                .iter()
+                .filter(
+                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
+                )
+                .count(),
+            1,
+            "rewriting an already-owned page should not duplicate page witnesses"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_registry_remove_keeps_shared_handle_alive_for_existing_clones() {
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let shared = registry.handle(s1).expect("shared handle");
+        let removed = registry.remove(s1).expect("removed handle");
+
+        assert!(Arc::ptr_eq(&shared, &removed));
+        assert_eq!(registry.active_count(), 0);
+        assert!(removed.lock().is_active());
     }
 
     // -----------------------------------------------------------------------

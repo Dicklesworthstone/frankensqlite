@@ -18,10 +18,10 @@ use crate::cell::{
 };
 use crate::cursor::PageWriter;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::{BTREE_LEAF_HEADER_SIZE, CELL_POINTER_SIZE};
 use fsqlite_types::serial_type::write_varint;
+use fsqlite_types::{PageData, PageNumber};
 
 /// Maximum number of sibling pages involved in a single balance_nonroot.
 /// SQLite uses NN=1 (1 neighbor each side) → NB = 2*NN+1 = 3.
@@ -127,7 +127,7 @@ pub fn balance_deeper<W: PageWriter>(
         }
     };
 
-    if let Err(err) = writer.write_page(cx, child_pgno, &child_data) {
+    if let Err(err) = writer.write_page_data(cx, child_pgno, PageData::from_vec(child_data)) {
         let _ = writer.free_page(cx, child_pgno);
         return Err(err);
     }
@@ -155,7 +155,7 @@ pub fn balance_deeper<W: PageWriter>(
         new_root[..root_offset].copy_from_slice(&root_data[..root_offset]);
     }
 
-    if let Err(err) = writer.write_page(cx, root_page_no, &new_root) {
+    if let Err(err) = writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root)) {
         let _ = writer.free_page(cx, child_pgno);
         return Err(err);
     }
@@ -262,7 +262,7 @@ pub fn balance_quick<W: PageWriter>(
     // Write cell content.
     new_page[content_start..content_start + cell_size].copy_from_slice(overflow_cell);
 
-    if let Err(err) = writer.write_page(cx, new_pgno, &new_page) {
+    if let Err(err) = writer.write_page_data(cx, new_pgno, PageData::from_vec(new_page)) {
         let _ = writer.free_page(cx, new_pgno);
         return Err(err);
     }
@@ -616,7 +616,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             Err(err) => return Err(do_rollback!(err)),
         };
 
-        if let Err(err) = writer.write_page(cx, pgno, &page_data) {
+        if let Err(err) = writer.write_page_data(cx, pgno, PageData::from_vec(page_data)) {
             return Err(do_rollback!(err));
         }
 
@@ -1480,7 +1480,7 @@ fn balance_shallower<W: PageWriter>(
         new_root[..root_offset].copy_from_slice(&original_root[..root_offset]);
     }
 
-    writer.write_page(cx, root_page_no, &new_root)?;
+    writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root))?;
     writer.free_page(cx, child_pgno)?;
 
     Ok(())
@@ -1697,7 +1697,7 @@ fn split_overflowing_root<W: PageWriter>(
                 return Err(err);
             }
         };
-        if let Err(err) = writer.write_page(cx, child_pgnos[i], &page) {
+        if let Err(err) = writer.write_page_data(cx, child_pgnos[i], PageData::from_vec(page)) {
             free_pages_best_effort(cx, writer, &child_pgnos);
             return Err(err);
         }
@@ -1722,7 +1722,7 @@ fn split_overflowing_root<W: PageWriter>(
     if root_offset > 0 {
         new_root[..root_offset].copy_from_slice(root_prefix);
     }
-    match writer.write_page(cx, root_page_no, &new_root) {
+    match writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root)) {
         Ok(()) => Ok(()),
         Err(err) => {
             free_pages_best_effort(cx, writer, &child_pgnos);

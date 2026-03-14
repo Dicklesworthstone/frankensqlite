@@ -32,8 +32,8 @@ use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::{
     CommitIndex, CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError,
-    TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_free_page,
-    concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
+    SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
+    concurrent_free_page, concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
     concurrent_restore_page_state, concurrent_track_write_conflict_page, concurrent_write_page,
     create_time_travel_snapshot,
 };
@@ -750,8 +750,8 @@ impl RunIterator {
 struct ConcurrentContext {
     /// Session ID for this concurrent transaction.
     session_id: u64,
-    /// Shared reference to the concurrent writer registry.
-    registry: Arc<Mutex<ConcurrentRegistry>>,
+    /// Stable shared handle for this concurrent transaction.
+    handle: SharedConcurrentHandle,
     /// Shared reference to the page-level lock table.
     lock_table: Arc<InProcessPageLockTable>,
     /// Shared reference to the FCW commit index.
@@ -794,7 +794,7 @@ impl SharedTxnPageIo {
     fn with_concurrent(
         txn: Box<dyn TransactionHandle>,
         session_id: u64,
-        registry: Arc<Mutex<ConcurrentRegistry>>,
+        handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
         commit_index: Arc<CommitIndex>,
         busy_timeout_ms: u64,
@@ -803,7 +803,7 @@ impl SharedTxnPageIo {
             txn: Rc::new(RefCell::new(txn)),
             concurrent: Some(ConcurrentContext {
                 session_id,
-                registry,
+                handle,
                 lock_table,
                 commit_index,
                 busy_timeout_ms,
@@ -895,16 +895,7 @@ fn track_concurrent_conflict_only_page(
     loop {
         observe_execution_cancellation(cx)?;
         let (txn_id, snapshot_high, conflicting_commit_seq) = {
-            let guard = ctx
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "MVCC session {} not found in registry during {operation}",
-                    ctx.session_id
-                ))
-            })?;
+            let handle = ctx.handle.lock();
             let snapshot_high = handle.snapshot().high;
             let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
                 .then(|| ctx.commit_index.latest(page_no))
@@ -934,20 +925,11 @@ fn track_concurrent_conflict_only_page(
         }
 
         let (track_result, txn_id, snapshot_high) = {
-            let mut guard = ctx
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "MVCC session {} not found in registry during {operation}",
-                    ctx.session_id
-                ))
-            })?;
+            let mut handle = ctx.handle.lock();
             let txn_id = handle.txn_token().id.get();
             let snapshot_high = handle.snapshot().high.get();
             let track_result = concurrent_track_write_conflict_page(
-                handle,
+                &mut handle,
                 &ctx.lock_table,
                 ctx.session_id,
                 page_no,
@@ -1025,19 +1007,10 @@ impl PageReader for SharedTxnPageIo {
         if let Some(ctx) = &self.concurrent {
             // Read-own-writes visibility: if this txn already wrote the page,
             // return that version first and still record the read for SSI.
-            let mut guard = ctx
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "MVCC session {} not found in registry during read",
-                    ctx.session_id
-                ))
-            })?;
+            let mut handle = ctx.handle.lock();
             let txn_id = handle.txn_token().id.get();
             let snapshot_high = handle.snapshot().high.get();
-            if concurrent_page_is_freed(handle, page_no) {
+            if concurrent_page_is_freed(&handle, page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "page {} was freed earlier in concurrent transaction {}",
@@ -1046,7 +1019,7 @@ impl PageReader for SharedTxnPageIo {
                     ),
                 });
             }
-            let write_set_page = concurrent_read_page(handle, page_no).cloned();
+            let write_set_page = concurrent_read_page(&handle, page_no).cloned();
             handle.record_read(page_no);
 
             if let Some(page) = write_set_page {
@@ -1079,25 +1052,13 @@ impl PageReader for SharedTxnPageIo {
 
     fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
         if let Some(ctx) = &self.concurrent {
-            let mut guard = ctx
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(handle) = guard.get_mut(ctx.session_id) {
-                handle.record_read_witness(key);
-            }
+            ctx.handle.lock().record_read_witness(key);
         }
     }
 
     fn is_dirty(&self, page_no: PageNumber) -> bool {
         if let Some(ctx) = &self.concurrent {
-            let guard = ctx
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(handle) = guard.get(ctx.session_id) {
-                return handle.tracks_write_conflict_page(page_no);
-            }
+            return ctx.handle.lock().tracks_write_conflict_page(page_no);
         }
         false
     }
@@ -1110,17 +1071,8 @@ impl PageWriter for SharedTxnPageIo {
             .concurrent
             .as_ref()
             .map(|ctx| {
-                let guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing in registry before write_page",
-                        ctx.session_id
-                    ))
-                })?;
-                Ok::<_, FrankenError>(concurrent_page_state(handle, page_no))
+                let handle = ctx.handle.lock();
+                Ok::<_, FrankenError>(concurrent_page_state(&handle, page_no))
             })
             .transpose()?;
         if let Some(ref ctx) = self.concurrent {
@@ -1133,24 +1085,26 @@ impl PageWriter for SharedTxnPageIo {
             loop {
                 observe_execution_cancellation(cx)?;
                 let page_data = page_data_base.clone();
-                let (txn_id, snapshot_high, conflicting_commit_seq) = {
-                    let guard = ctx
-                        .registry
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "MVCC session {} not found in registry during write",
-                            ctx.session_id
-                        ))
-                    })?;
+                let (write_result, txn_id, snapshot_high, conflicting_commit_seq) = {
+                    let mut handle = ctx.handle.lock();
+                    let txn_id = handle.txn_token().id.get();
                     let snapshot_high = handle.snapshot().high;
                     let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
                         .then(|| ctx.commit_index.latest(page_no))
                         .flatten()
                         .filter(|seq| *seq > snapshot_high);
+                    let write_result = conflicting_commit_seq.is_none().then(|| {
+                        concurrent_write_page(
+                            &mut handle,
+                            &ctx.lock_table,
+                            ctx.session_id,
+                            page_no,
+                            page_data,
+                        )
+                    });
                     (
-                        handle.txn_token().id.get(),
+                        write_result,
+                        txn_id,
                         snapshot_high.get(),
                         conflicting_commit_seq,
                     )
@@ -1171,30 +1125,7 @@ impl PageWriter for SharedTxnPageIo {
                     });
                 }
 
-                let (write_result, txn_id, snapshot_high) = {
-                    let mut guard = ctx
-                        .registry
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "MVCC session {} not found in registry during write",
-                            ctx.session_id
-                        ))
-                    })?;
-                    let txn_id = handle.txn_token().id.get();
-                    let snapshot_high = handle.snapshot().high.get();
-                    let write_result = concurrent_write_page(
-                        handle,
-                        &ctx.lock_table,
-                        ctx.session_id,
-                        page_no,
-                        page_data,
-                    );
-                    (write_result, txn_id, snapshot_high)
-                };
-
-                match write_result {
+                match write_result.expect("write result must exist when snapshot is valid") {
                     Ok(()) => {
                         tracing::debug!(
                             txn_id,
@@ -1260,18 +1191,9 @@ impl PageWriter for SharedTxnPageIo {
             if let (Some(ctx), Some(prior_page_state)) =
                 (&self.concurrent, prior_page_state.as_ref())
             {
-                let mut guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing during write rollback",
-                        ctx.session_id
-                    ))
-                })?;
+                let mut handle = ctx.handle.lock();
                 if let Err(restore_error) = concurrent_restore_page_state(
-                    handle,
+                    &mut handle,
                     &ctx.lock_table,
                     ctx.session_id,
                     prior_page_state,
@@ -1291,17 +1213,8 @@ impl PageWriter for SharedTxnPageIo {
             .concurrent
             .as_ref()
             .map(|ctx| {
-                let guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing in registry before allocate_page",
-                        ctx.session_id
-                    ))
-                })?;
-                Ok::<_, FrankenError>(concurrent_page_state(handle, PageNumber::ONE))
+                let handle = ctx.handle.lock();
+                Ok::<_, FrankenError>(concurrent_page_state(&handle, PageNumber::ONE))
             })
             .transpose()?;
         if let Some(ctx) = &self.concurrent {
@@ -1310,18 +1223,9 @@ impl PageWriter for SharedTxnPageIo {
         let allocate_result = self.txn.borrow_mut().allocate_page(cx);
         if let Err(allocate_error) = &allocate_result {
             if let (Some(ctx), Some(page_one_state)) = (&self.concurrent, page_one_state.as_ref()) {
-                let mut guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing during allocate rollback",
-                        ctx.session_id
-                    ))
-                })?;
+                let mut handle = ctx.handle.lock();
                 if let Err(restore_error) = concurrent_restore_page_state(
-                    handle,
+                    &mut handle,
                     &ctx.lock_table,
                     ctx.session_id,
                     page_one_state,
@@ -1340,34 +1244,16 @@ impl PageWriter for SharedTxnPageIo {
             .concurrent
             .as_ref()
             .map(|ctx| {
-                let guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing in registry before free_page",
-                        ctx.session_id
-                    ))
-                })?;
-                Ok::<_, FrankenError>(concurrent_page_state(handle, page_no))
+                let handle = ctx.handle.lock();
+                Ok::<_, FrankenError>(concurrent_page_state(&handle, page_no))
             })
             .transpose()?;
         let page_one_state = self
             .concurrent
             .as_ref()
             .map(|ctx| {
-                let guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing in registry before free_page(page1)",
-                        ctx.session_id
-                    ))
-                })?;
-                Ok::<_, FrankenError>(concurrent_page_state(handle, PageNumber::ONE))
+                let handle = ctx.handle.lock();
+                Ok::<_, FrankenError>(concurrent_page_state(&handle, PageNumber::ONE))
             })
             .transpose()?;
         if let Some(ref ctx) = self.concurrent {
@@ -1379,24 +1265,25 @@ impl PageWriter for SharedTxnPageIo {
 
                 loop {
                     observe_execution_cancellation(cx)?;
-                    let (txn_id, snapshot_high, conflicting_commit_seq) = {
-                        let guard = ctx
-                            .registry
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let handle = guard.get(ctx.session_id).ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "MVCC session {} not found in registry during free",
-                                ctx.session_id
-                            ))
-                        })?;
+                    let (free_result, txn_id, snapshot_high, conflicting_commit_seq) = {
+                        let mut handle = ctx.handle.lock();
+                        let txn_id = handle.txn_token().id.get();
                         let snapshot_high = handle.snapshot().high;
                         let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
                             .then(|| ctx.commit_index.latest(page_no))
                             .flatten()
                             .filter(|seq| *seq > snapshot_high);
+                        let free_result = conflicting_commit_seq.is_none().then(|| {
+                            concurrent_free_page(
+                                &mut handle,
+                                &ctx.lock_table,
+                                ctx.session_id,
+                                page_no,
+                            )
+                        });
                         (
-                            handle.txn_token().id.get(),
+                            free_result,
+                            txn_id,
                             snapshot_high.get(),
                             conflicting_commit_seq,
                         )
@@ -1417,25 +1304,7 @@ impl PageWriter for SharedTxnPageIo {
                         });
                     }
 
-                    let (free_result, txn_id, snapshot_high) = {
-                        let mut guard = ctx
-                            .registry
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "MVCC session {} not found in registry during free",
-                                ctx.session_id
-                            ))
-                        })?;
-                        let txn_id = handle.txn_token().id.get();
-                        let snapshot_high = handle.snapshot().high.get();
-                        let free_result =
-                            concurrent_free_page(handle, &ctx.lock_table, ctx.session_id, page_no);
-                        (free_result, txn_id, snapshot_high)
-                    };
-
-                    match free_result {
+                    match free_result.expect("free result must exist when snapshot is valid") {
                         Ok(()) => {
                             tracing::debug!(
                                 txn_id,
@@ -1496,19 +1365,10 @@ impl PageWriter for SharedTxnPageIo {
                 }
             })();
             if let Err(error) = concurrent_free_result {
-                let mut guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing during free rollback",
-                        ctx.session_id
-                    ))
-                })?;
+                let mut handle = ctx.handle.lock();
                 if let Some(prior_page_state) = prior_page_state.as_ref()
                     && let Err(restore_error) = concurrent_restore_page_state(
-                        handle,
+                        &mut handle,
                         &ctx.lock_table,
                         ctx.session_id,
                         prior_page_state,
@@ -1520,7 +1380,7 @@ impl PageWriter for SharedTxnPageIo {
                 }
                 if let Some(page_one_state) = page_one_state.as_ref()
                     && let Err(restore_error) = concurrent_restore_page_state(
-                        handle,
+                        &mut handle,
                         &ctx.lock_table,
                         ctx.session_id,
                         page_one_state,
@@ -1538,18 +1398,9 @@ impl PageWriter for SharedTxnPageIo {
             if let (Some(ctx), Some(prior_page_state)) =
                 (&self.concurrent, prior_page_state.as_ref())
             {
-                let mut guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} missing during free rollback",
-                        ctx.session_id
-                    ))
-                })?;
+                let mut handle = ctx.handle.lock();
                 if let Err(restore_error) = concurrent_restore_page_state(
-                    handle,
+                    &mut handle,
                     &ctx.lock_table,
                     ctx.session_id,
                     prior_page_state,
@@ -1560,7 +1411,7 @@ impl PageWriter for SharedTxnPageIo {
                 }
                 if let Some(page_one_state) = page_one_state.as_ref() {
                     if let Err(restore_error) = concurrent_restore_page_state(
-                        handle,
+                        &mut handle,
                         &ctx.lock_table,
                         ctx.session_id,
                         page_one_state,
@@ -1578,14 +1429,8 @@ impl PageWriter for SharedTxnPageIo {
 
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
         if let Some(ref ctx) = self.concurrent {
-            let mut guard = ctx
-                .registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(handle) = guard.get_mut(ctx.session_id) {
-                handle.record_write_witness(key);
-                return;
-            }
+            ctx.handle.lock().record_write_witness(key);
+            return;
         }
         self.txn.borrow_mut().record_write_witness(cx, key);
     }
@@ -3987,7 +3832,7 @@ impl VdbeEngine {
         &mut self,
         txn: Box<dyn TransactionHandle>,
         session_id: u64,
-        registry: Arc<Mutex<ConcurrentRegistry>>,
+        handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
         commit_index: Arc<CommitIndex>,
         busy_timeout_ms: u64,
@@ -3995,7 +3840,7 @@ impl VdbeEngine {
         self.txn_page_io = Some(SharedTxnPageIo::with_concurrent(
             txn,
             session_id,
-            registry,
+            handle,
             lock_table,
             commit_index,
             busy_timeout_ms,
@@ -13975,15 +13820,27 @@ mod tests {
         // returns a zero type byte, forcing the writable root-page init path.
         let root = 256;
 
-        // Deliberately install concurrent context without a registered session.
+        // Deliberately install concurrent context with an inactive handle.
         // SharedTxnPageIo::write_page will fail before touching pager state.
         let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
         let lock_table = Arc::new(InProcessPageLockTable::new());
         let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard.handle(session_id).expect("handle should exist");
+            (session_id, handle)
+        };
+        handle.lock().mark_aborted();
         engine.set_transaction_concurrent(
             Box::new(txn),
-            999,
-            registry,
+            session_id,
+            handle,
             lock_table,
             commit_index,
             5000,
@@ -16625,7 +16482,7 @@ mod tests {
         let contested_page = PageNumber::ONE;
         let page_bytes = vec![0xAB; PageSize::DEFAULT.as_usize()];
 
-        let (holder_session, writer_session) = {
+        let (holder_session, writer_session, writer_handle) = {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -16636,24 +16493,27 @@ mod tests {
                 .begin_concurrent(snapshot)
                 .expect("writer session should register");
 
-            let holder = guard
+            let mut holder = guard
                 .get_mut(holder_session)
                 .expect("holder session must be present");
             concurrent_write_page(
-                holder,
+                &mut holder,
                 &lock_table,
                 holder_session,
                 contested_page,
                 PageData::from_vec(page_bytes.clone()),
             )
             .expect("holder should acquire the contested page lock");
-            (holder_session, writer_session)
+            let writer_handle = guard
+                .handle(writer_session)
+                .expect("writer session handle must be present");
+            (holder_session, writer_session, writer_handle)
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             Box::new(txn),
             writer_session,
-            Arc::clone(&registry),
+            writer_handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
             1,

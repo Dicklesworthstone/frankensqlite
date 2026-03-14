@@ -98,9 +98,9 @@ use fsqlite_wal::{WalFile, WalSalts};
 use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, GcScheduler,
     GcTickResult, GcTodo, InProcessPageLockTable, MvccError, PreparedConcurrentCommit,
-    SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
-    SsiReadSetSummary, VersionStore, concurrent_abort, concurrent_rollback_to_savepoint,
-    concurrent_savepoint, concurrent_track_write_conflict_page,
+    SharedConcurrentHandle, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
+    SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore, concurrent_abort,
+    concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_track_write_conflict_page,
     finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
     ssi_metrics_snapshot,
 };
@@ -8286,12 +8286,7 @@ impl Connection {
     }
 
     fn active_concurrent_txn_count(&self) -> u64 {
-        u64::try_from(
-            lock_unpoisoned(&self.concurrent_registry)
-                .iter_active()
-                .count(),
-        )
-        .unwrap_or(u64::MAX)
+        u64::try_from(lock_unpoisoned(&self.concurrent_registry).active_count()).unwrap_or(u64::MAX)
     }
 
     fn wal_checkpoint_blocked_by_active_concurrent_txns(&self) -> bool {
@@ -12866,6 +12861,7 @@ impl Connection {
         let mut conflict_pages = HashSet::new();
 
         for (other_session_id, other_handle) in registry.iter_active() {
+            let other_handle = other_handle.lock();
             if other_session_id == session_id || !other_handle.is_active() {
                 continue;
             }
@@ -13147,8 +13143,8 @@ impl Connection {
                 Ok(Some(plan))
             }
             Err((err, fcw_result)) => {
-                if let Some(mut handle) = registry.remove(session_id) {
-                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                if let Some(handle) = registry.remove(session_id) {
+                    concurrent_abort(handle.lock(), &self.concurrent_lock_table, session_id);
                 }
                 *self.concurrent_session_id.borrow_mut() = None;
                 Err(Self::map_mvcc_commit_error(err, fcw_result))
@@ -13192,6 +13188,7 @@ impl Connection {
             committed_seq,
         );
         let commit_card = registry.remove(session_id).map(|handle| {
+            let handle = handle.lock();
             let snapshot = Self::capture_ssi_snapshot(&handle);
             let active_conflicts =
                 Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
@@ -20600,16 +20597,26 @@ impl Connection {
 
         // bd-kivg / 5E.2: Build concurrent context if in concurrent mode.
         let concurrent_ctx = if *self.concurrent_txn.borrow() {
-            self.concurrent_session_id
-                .borrow()
-                .map(|session_id| ConcurrentExecContext {
-                    session_id,
-                    registry: Arc::clone(&self.concurrent_registry),
-                    lock_table: Arc::clone(&self.concurrent_lock_table),
-                    commit_index: Arc::clone(&self.concurrent_commit_index),
-                    #[allow(clippy::cast_sign_loss)]
-                    busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
-                })
+            let session_id = (*self.concurrent_session_id.borrow()).ok_or_else(|| {
+                FrankenError::Internal(
+                    "concurrent transaction missing session during VDBE setup".to_owned(),
+                )
+            })?;
+            let handle = lock_unpoisoned(&self.concurrent_registry)
+                .handle(session_id)
+                .ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction missing handle during VDBE setup".to_owned(),
+                    )
+                })?;
+            Some(ConcurrentExecContext {
+                session_id,
+                handle,
+                lock_table: Arc::clone(&self.concurrent_lock_table),
+                commit_index: Arc::clone(&self.concurrent_commit_index),
+                #[allow(clippy::cast_sign_loss)]
+                busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
+            })
         } else {
             None
         };
@@ -27647,7 +27654,7 @@ fn execute_program_with_postprocess(
 /// Passed to `execute_table_program_with_db` when in concurrent mode.
 struct ConcurrentExecContext {
     session_id: u64,
-    registry: Arc<Mutex<ConcurrentRegistry>>,
+    handle: SharedConcurrentHandle,
     lock_table: Arc<InProcessPageLockTable>,
     commit_index: Arc<CommitIndex>,
     busy_timeout_ms: u64,
@@ -27742,7 +27749,7 @@ fn execute_table_program_with_db(
             engine.set_transaction_concurrent(
                 txn,
                 ctx.session_id,
-                ctx.registry,
+                ctx.handle,
                 ctx.lock_table,
                 ctx.commit_index,
                 ctx.busy_timeout_ms,
