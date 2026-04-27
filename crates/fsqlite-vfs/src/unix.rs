@@ -254,6 +254,12 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
         l_start: start as libc::off_t,
         l_len: len as libc::off_t,
         l_pid: 0,
+        // FreeBSD's struct flock has an additional l_sysid field for
+        // clustered/network file systems. l_sysid: 0 means "no specific
+        // system" — the documented default for non-clustered local locks.
+        // Linux/macOS flock structs do not have this field.
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
     };
 
     loop {
@@ -345,6 +351,10 @@ fn posix_getlk(
         l_start: start as libc::off_t,
         l_len: len as libc::off_t,
         l_pid: 0,
+        // FreeBSD's struct flock has an additional l_sysid field. See the
+        // matching comment at the F_SETLK callsite above.
+        #[cfg(target_os = "freebsd")]
+        l_sysid: 0,
     };
 
     nix::fcntl::fcntl(
