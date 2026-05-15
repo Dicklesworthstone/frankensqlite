@@ -2109,18 +2109,47 @@ pub struct Fts5Table {
     documents: HashMap<i64, Vec<String>>,
     /// Next auto-generated rowid.
     next_rowid: i64,
-    /// Snapshot-backed transaction/savepoint state for live VTAB writes.
-    txn_state: TransactionalVtabState<Fts5TableSnapshot>,
+    /// Savepoint markers for live VTAB writes. Stored snapshots are O(1)
+    /// markers into the pending-delta log; rollback walks the log backwards.
+    txn_state: TransactionalVtabState<Fts5TableSavepoint>,
+    /// Whether a virtual-table transaction is currently open. Mutations record
+    /// reverse-deltas while this is true; outside a transaction (e.g. during
+    /// initial table construction or `rebuild_documents`) they do not.
+    in_transaction: bool,
+    /// Reverse-delta log accumulated since the current transaction's `xBegin`.
+    /// Each entry describes how to undo a single mutation; rollback pops and
+    /// replays entries in reverse order back to the requested savepoint.
+    pending_deltas: Vec<RowDelta>,
+    /// Suppress delta recording while restore_state is replaying inverse
+    /// deltas. Without this, every reverse mutation would re-record itself
+    /// into the same log we are walking and we would never converge.
+    silent_mutations: bool,
 }
 
+/// Reverse-delta capturing a single mutation that can be undone to roll back
+/// to a savepoint without holding a full copy of the inverted index.
 #[derive(Debug, Clone)]
-struct Fts5TableSnapshot {
+enum RowDelta {
+    /// `rowid` did not exist before this mutation. Reverse by deleting it.
+    Inserted { rowid: i64 },
+    /// `rowid` existed before this mutation with `columns`, then was deleted.
+    /// Reverse by re-inserting with `columns`.
+    Deleted { rowid: i64, columns: Vec<String> },
+    /// `rowid` existed before this mutation with `old_columns`, then was
+    /// updated. Reverse by deleting and re-inserting with `old_columns`.
+    Updated { rowid: i64, old_columns: Vec<String> },
+}
+
+/// Lightweight savepoint marker. Records the schema scalars (cheap to clone)
+/// plus the position in the pending-delta log at which this savepoint opened.
+/// Rolling back to this savepoint pops deltas down to that position.
+#[derive(Debug, Clone)]
+struct Fts5TableSavepoint {
     config: Fts5Config,
     tokenizer_name: String,
     prefix_lengths: Vec<usize>,
-    index: InvertedIndex,
-    documents: HashMap<i64, Vec<String>>,
     next_rowid: i64,
+    deltas_at_savepoint: usize,
 }
 
 impl Fts5Table {
@@ -2136,27 +2165,68 @@ impl Fts5Table {
             documents: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
+            in_transaction: false,
+            pending_deltas: Vec::new(),
+            silent_mutations: false,
         }
     }
 
-    fn snapshot_state(&self) -> Fts5TableSnapshot {
-        Fts5TableSnapshot {
+    /// Capture the current savepoint marker. O(1): records schema scalars and
+    /// the current depth of the pending-delta log, NOT a copy of the inverted
+    /// index or documents map.
+    fn snapshot_state(&self) -> Fts5TableSavepoint {
+        Fts5TableSavepoint {
             config: self.config,
             tokenizer_name: self.tokenizer_name.clone(),
             prefix_lengths: self.prefix_lengths.clone(),
-            index: self.index.clone(),
-            documents: self.documents.clone(),
             next_rowid: self.next_rowid,
+            deltas_at_savepoint: self.pending_deltas.len(),
         }
     }
 
-    fn restore_state(&mut self, snapshot: Fts5TableSnapshot) {
+    /// Restore state back to a previous savepoint by replaying inverse deltas.
+    /// Walks the pending-delta log backwards from its current tail down to the
+    /// position recorded at `snapshot`, undoing each mutation. Schema scalars
+    /// are restored by direct assignment.
+    fn restore_state(&mut self, snapshot: Fts5TableSavepoint) {
         self.config = snapshot.config;
         self.tokenizer_name = snapshot.tokenizer_name;
         self.prefix_lengths = snapshot.prefix_lengths;
-        self.index = snapshot.index;
-        self.documents = snapshot.documents;
         self.next_rowid = snapshot.next_rowid;
+
+        let tokenizer = self.create_tokenizer_instance();
+        self.silent_mutations = true;
+        while self.pending_deltas.len() > snapshot.deltas_at_savepoint {
+            let delta = self
+                .pending_deltas
+                .pop()
+                .expect("len > target implies pop succeeds");
+            self.reverse_delta(delta, tokenizer.as_ref());
+        }
+        self.silent_mutations = false;
+    }
+
+    /// Apply the inverse of a previously-recorded mutation. Called with
+    /// `silent_mutations = true` so the reverse mutation does not append a new
+    /// delta to the log.
+    fn reverse_delta(&mut self, delta: RowDelta, tokenizer: &dyn Fts5Tokenizer) {
+        match delta {
+            RowDelta::Inserted { rowid } => {
+                self.index.remove_document(rowid);
+                self.documents.remove(&rowid);
+            }
+            RowDelta::Deleted { rowid, columns } => {
+                self.index_document_with_tokenizer(rowid, &columns, tokenizer);
+                self.documents.insert(rowid, columns);
+            }
+            RowDelta::Updated { rowid, old_columns } => {
+                if self.documents.contains_key(&rowid) {
+                    self.index.remove_document(rowid);
+                }
+                self.index_document_with_tokenizer(rowid, &old_columns, tokenizer);
+                self.documents.insert(rowid, old_columns);
+            }
+        }
     }
 
     fn index_document_with_tokenizer(
@@ -2177,12 +2247,29 @@ impl Fts5Table {
         column_values: Vec<String>,
         tokenizer: &dyn Fts5Tokenizer,
     ) {
-        if self.documents.contains_key(&rowid) {
+        let recording = self.in_transaction && !self.silent_mutations;
+        let old_columns = if recording {
+            self.documents.get(&rowid).cloned()
+        } else {
+            None
+        };
+
+        let existed = self.documents.contains_key(&rowid);
+        if existed {
             self.index.remove_document(rowid);
         }
         self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
         self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
         self.documents.insert(rowid, column_values);
+
+        if recording {
+            if let Some(old_columns) = old_columns {
+                self.pending_deltas
+                    .push(RowDelta::Updated { rowid, old_columns });
+            } else {
+                self.pending_deltas.push(RowDelta::Inserted { rowid });
+            }
+        }
         debug!(rowid, "fts5: indexed document");
     }
 
@@ -2223,8 +2310,22 @@ impl Fts5Table {
 
     /// Delete a document from the FTS5 table.
     pub fn delete_document(&mut self, rowid: i64) {
+        let recording = self.in_transaction && !self.silent_mutations;
+        let captured = if recording {
+            self.documents.get(&rowid).cloned()
+        } else {
+            None
+        };
+
         self.index.remove_document(rowid);
-        self.documents.remove(&rowid);
+        let removed = self.documents.remove(&rowid);
+
+        if recording {
+            if let Some(columns) = captured.or(removed) {
+                self.pending_deltas
+                    .push(RowDelta::Deleted { rowid, columns });
+            }
+        }
         debug!(rowid, "fts5: removed document");
     }
 
@@ -2527,7 +2628,13 @@ impl VirtualTable for Fts5Table {
     }
 
     fn begin(&mut self, _cx: &Cx) -> Result<()> {
-        self.txn_state.begin(self.snapshot_state());
+        // Capture the savepoint marker BEFORE flipping in_transaction so the
+        // snapshot reflects the pre-transaction state. The marker is O(1):
+        // schema scalars + pending-delta log position (which is currently 0
+        // for the outermost begin).
+        let snapshot = self.snapshot_state();
+        self.txn_state.begin(snapshot);
+        self.in_transaction = true;
         Ok(())
     }
 
@@ -2603,7 +2710,10 @@ impl VirtualTable for Fts5Table {
     }
 
     fn commit(&mut self, _cx: &Cx) -> Result<()> {
+        // All mutations committed; the reverse-delta log is no longer needed.
         self.txn_state.commit();
+        self.pending_deltas.clear();
+        self.in_transaction = false;
         Ok(())
     }
 
@@ -2611,6 +2721,10 @@ impl VirtualTable for Fts5Table {
         if let Some(snapshot) = self.txn_state.rollback() {
             self.restore_state(snapshot);
         }
+        // restore_state walked the delta log back to the begin marker (pos 0);
+        // any residual entries (impossible if state was consistent) are dropped.
+        self.pending_deltas.clear();
+        self.in_transaction = false;
         Ok(())
     }
 
@@ -5219,5 +5333,237 @@ mod tests {
         assert_eq!(cursor.rowid().unwrap(), 1);
         cursor.next(&cx).unwrap();
         assert!(cursor.eof());
+    }
+
+    // -- Savepoint / rollback / delta-journal tests --
+    //
+    // These tests exercise the reverse-delta path that replaces the previous
+    // eager-clone snapshot. They are the regression coverage for the spec-014
+    // memset stall fix: with the eager-clone version, every INSERT into the
+    // FTS5 vtab cloned the entire in-memory inverted index inside the SQLite
+    // statement-level savepoint. With the delta journal, snapshot_state is
+    // O(1) and rollback walks an O(deltas-since-savepoint) reverse log.
+
+    #[test]
+    fn test_snapshot_state_does_not_clone_index_or_documents() {
+        // Snapshot must capture only the schema scalars + delta-log position,
+        // not a copy of the index or documents. We can't directly assert "no
+        // memmove happened", but we can assert the structural property:
+        // taking a snapshot does not change anything observable about the
+        // table state, AND the snapshot type does not own its own copy of the
+        // index / documents (the type only has small scalars + a usize).
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.insert_document(1, &["alpha bravo charlie".to_owned()]);
+
+        let initial_doc_count = table.documents.len();
+        let initial_index_total = table.index.total_docs();
+
+        // snapshot_state must not mutate the table.
+        let snap = table.snapshot_state();
+        assert_eq!(table.documents.len(), initial_doc_count);
+        assert_eq!(table.index.total_docs(), initial_index_total);
+        assert_eq!(snap.deltas_at_savepoint, 0);
+
+        // The snapshot retains the schema scalars but does NOT carry an
+        // InvertedIndex / HashMap field. This is enforced by the type
+        // definition; we re-verify by exercising the move below.
+        let _moved = snap.clone();
+        let _moved2 = _moved.clone();
+        // Clones of the marker must be O(1). If snapshot_state grew an index
+        // field again, this test would still pass at runtime — the type-level
+        // protection is the absence of that field. The runtime check we can
+        // make: cloning the marker many times is fast and harmless.
+        for _ in 0..10_000 {
+            let _ = table.snapshot_state();
+        }
+        // Table still observably unchanged after 10K snapshots.
+        assert_eq!(table.documents.len(), initial_doc_count);
+        assert_eq!(table.index.total_docs(), initial_index_total);
+    }
+
+    #[test]
+    fn test_begin_commit_inserts_persist_and_clear_delta_log() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+
+        table.begin(&cx).unwrap();
+        assert!(table.in_transaction);
+        table.insert_document(1, &["alpha bravo".to_owned()]);
+        table.insert_document(2, &["charlie delta".to_owned()]);
+        assert_eq!(table.pending_deltas.len(), 2);
+        table.commit(&cx).unwrap();
+
+        // After commit, deltas are gone and the rows persist.
+        assert!(!table.in_transaction);
+        assert_eq!(table.pending_deltas.len(), 0);
+        assert_eq!(table.documents.len(), 2);
+        assert!(table.documents.contains_key(&1));
+        assert!(table.documents.contains_key(&2));
+        // Index still has the inserted content.
+        let results = table.search("alpha").unwrap();
+        assert!(results.iter().any(|(rowid, _)| *rowid == 1));
+    }
+
+    #[test]
+    fn test_full_rollback_undoes_all_inserts() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+
+        table.begin(&cx).unwrap();
+        table.insert_document(1, &["alpha bravo".to_owned()]);
+        table.insert_document(2, &["charlie delta".to_owned()]);
+        assert_eq!(table.documents.len(), 2);
+        assert_eq!(table.pending_deltas.len(), 2);
+
+        table.rollback(&cx).unwrap();
+
+        // After rollback, the table is back to pre-begin state.
+        assert!(!table.in_transaction);
+        assert_eq!(table.pending_deltas.len(), 0);
+        assert_eq!(table.documents.len(), 0);
+        assert_eq!(table.index.total_docs(), 0);
+        let results = table.search("alpha").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_savepoint_release_keeps_inserts() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+
+        table.begin(&cx).unwrap();
+        table.savepoint(&cx, 1).unwrap();
+        table.insert_document(1, &["alpha bravo".to_owned()]);
+        table.savepoint(&cx, 2).unwrap();
+        table.insert_document(2, &["charlie delta".to_owned()]);
+        table.release(&cx, 2).unwrap();
+        table.release(&cx, 1).unwrap();
+
+        // Both rows present; deltas still pending until commit.
+        assert_eq!(table.documents.len(), 2);
+        assert_eq!(table.pending_deltas.len(), 2);
+
+        table.commit(&cx).unwrap();
+        assert_eq!(table.documents.len(), 2);
+        assert_eq!(table.pending_deltas.len(), 0);
+    }
+
+    #[test]
+    fn test_rollback_to_inner_savepoint_keeps_outer_inserts() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+
+        table.begin(&cx).unwrap();
+        table.savepoint(&cx, 1).unwrap();
+        table.insert_document(1, &["alpha".to_owned()]); // kept
+        table.savepoint(&cx, 2).unwrap();
+        table.insert_document(2, &["bravo".to_owned()]); // rolled back
+        table.insert_document(3, &["charlie".to_owned()]); // rolled back
+
+        assert_eq!(table.documents.len(), 3);
+        assert_eq!(table.pending_deltas.len(), 3);
+
+        table.rollback_to(&cx, 2).unwrap();
+
+        // Inserts after savepoint 2 are undone; insert before it is kept.
+        assert_eq!(table.documents.len(), 1);
+        assert!(table.documents.contains_key(&1));
+        assert_eq!(table.pending_deltas.len(), 1);
+
+        // Search confirms index is consistent with documents.
+        assert_eq!(table.search("alpha").unwrap().len(), 1);
+        assert_eq!(table.search("bravo").unwrap().len(), 0);
+        assert_eq!(table.search("charlie").unwrap().len(), 0);
+
+        // We're still inside savepoint 1; commit completes the txn cleanly.
+        table.release(&cx, 1).unwrap();
+        table.commit(&cx).unwrap();
+        assert_eq!(table.documents.len(), 1);
+    }
+
+    #[test]
+    fn test_rollback_undoes_delete_of_pre_existing_row() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        // Pre-existing row, inserted OUTSIDE any transaction.
+        table.insert_document(1, &["alpha bravo".to_owned()]);
+        assert_eq!(table.documents.len(), 1);
+        assert_eq!(table.pending_deltas.len(), 0); // no transaction, no delta
+
+        // Now open a txn and delete the row.
+        table.begin(&cx).unwrap();
+        table.delete_document(1);
+        assert_eq!(table.documents.len(), 0);
+        assert_eq!(table.pending_deltas.len(), 1);
+
+        // Rollback should re-create the row with its original columns.
+        table.rollback(&cx).unwrap();
+        assert_eq!(table.documents.len(), 1);
+        assert_eq!(table.pending_deltas.len(), 0);
+        let results = table.search("alpha").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_rollback_undoes_update_of_pre_existing_row() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.insert_document(1, &["original content".to_owned()]);
+        assert_eq!(table.search("original").unwrap().len(), 1);
+
+        table.begin(&cx).unwrap();
+        // Update row 1's content via the public store path.
+        table.insert_document(1, &["replaced content".to_owned()]);
+        assert_eq!(table.pending_deltas.len(), 1);
+        // Old term gone, new term present.
+        assert_eq!(table.search("original").unwrap().len(), 0);
+        assert_eq!(table.search("replaced").unwrap().len(), 1);
+
+        table.rollback(&cx).unwrap();
+        // Old content restored, new content gone.
+        assert_eq!(table.search("original").unwrap().len(), 1);
+        assert_eq!(table.search("replaced").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_mutations_outside_transaction_do_not_record_deltas() {
+        // Mutations before xBegin (e.g. during table construction, or via
+        // `rebuild_documents`) must not accumulate spurious deltas. If they
+        // did, the first xBegin's snapshot would be at offset > 0 and a
+        // subsequent rollback could not roll them back (and shouldn't).
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        for i in 1..=50 {
+            table.insert_document(i, &[format!("row {}", i)]);
+        }
+        assert_eq!(table.pending_deltas.len(), 0);
+        assert_eq!(table.documents.len(), 50);
+    }
+
+    #[test]
+    fn test_many_inserts_inside_transaction_grow_log_linearly() {
+        // Sanity that pending_deltas.len() == number of mutations recorded.
+        // This is the structural property that lets us argue snapshot cost
+        // is O(deltas-since-savepoint), not O(state).
+        let cx = Cx::new();
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.begin(&cx).unwrap();
+        for i in 1..=200 {
+            table.insert_document(i, &[format!("row {}", i)]);
+        }
+        assert_eq!(table.pending_deltas.len(), 200);
+        // Taking a savepoint at this point is O(1):
+        let marker = table.snapshot_state();
+        assert_eq!(marker.deltas_at_savepoint, 200);
+
+        // Insert 50 more, rollback to the marker, all 50 are undone but the
+        // first 200 stay.
+        for i in 201..=250 {
+            table.insert_document(i, &[format!("row {}", i)]);
+        }
+        assert_eq!(table.pending_deltas.len(), 250);
+        table.restore_state(marker);
+        assert_eq!(table.pending_deltas.len(), 200);
+        assert_eq!(table.documents.len(), 200);
     }
 }
