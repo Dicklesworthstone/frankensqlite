@@ -70,6 +70,17 @@ fn sqlite_pending_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+// Best-effort cleanup of the three Windows VFS advisory-lock sidecar files
+// alongside `path`. Without this, every backup/temporary DB file leaks three
+// zero-byte sidecars; if cass then re-opens one of those sidecar paths as a
+// "backup root" the next round of sidecars layers on top, producing chained
+// `*-lock-pending-lock-pending-...` names.
+fn remove_windows_lock_sidecars(path: &Path) {
+    drop(fs::remove_file(sqlite_shared_lock_path(path)));
+    drop(fs::remove_file(sqlite_reserved_lock_path(path)));
+    drop(fs::remove_file(sqlite_pending_lock_path(path)));
+}
+
 fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
     let file = OpenOptions::new()
         .read(true)
@@ -488,6 +499,7 @@ impl Vfs for WindowsVfs {
         if shm_path.exists() {
             fs::remove_file(shm_path)?;
         }
+        remove_windows_lock_sidecars(&resolved);
         Ok(())
     }
 
