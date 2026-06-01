@@ -7082,6 +7082,21 @@ impl VirtualTable for Fts5Table {
                                 config.content_mode = ContentMode::Stored;
                             }
                         }
+                        "content_rowid" => {
+                            // Names the rowid column of the external content
+                            // table (SQLite FTS5 external_content_tables). The
+                            // declared rowid IS the implicit rowid for fsqlite's
+                            // engine, and external-content synchronization is
+                            // handled at the trigger layer rather than inside
+                            // the vtab, so this option is informational here.
+                            // Match upstream SQLite/rusqlite by accepting any
+                            // non-empty identifier and rejecting an empty value.
+                            if value_unquoted_raw.is_empty() {
+                                return Err(FrankenError::function_error(
+                                    "fts5: content_rowid must name a column",
+                                ));
+                            }
+                        }
                         "contentless_delete" => {
                             config.contentless_delete = parse_columnsize_option(
                                 value_unquoted.as_str(),
