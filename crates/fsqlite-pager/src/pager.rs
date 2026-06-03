@@ -4395,6 +4395,7 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
     path: &Path,
     header_bytes: &[u8; DATABASE_HEADER_SIZE],
     error: &DatabaseHeaderError,
+    allow_readonly_wal_probe: bool,
 ) -> Result<bool> {
     if !stale_main_header_is_wal_recoverable_error(error) {
         return Ok(false);
@@ -4414,12 +4415,23 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
     // Probe WAL content with a write-capable handle first. On the Unix VFS,
     // a READONLY-opened WAL can become the canonical inode-table fd, poisoning
     // later writer paths with EBADF if they clone that descriptor.
-    let Ok((wal_file, _)) = vfs.open(
+    let (wal_file, _) = match vfs.open(
         cx,
         Some(&wal_path),
         VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
-    ) else {
-        return Ok(false);
+    ) {
+        Ok(opened) => opened,
+        Err(_) if allow_readonly_wal_probe => {
+            match vfs.open(
+                cx,
+                Some(&wal_path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+            ) {
+                Ok(opened) => opened,
+                Err(_) => return Ok(false),
+            }
+        }
+        Err(_) => return Ok(false),
     };
     let Ok(mut wal) = WalFile::open(cx, wal_file) else {
         return Ok(false);
@@ -4897,6 +4909,20 @@ where
         if inner.journal_mode == mode {
             if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
                 return Err(FrankenError::Unsupported);
+            }
+            if mode == JournalMode::Wal {
+                self.cache.evict(PageNumber::ONE);
+                self.published.publish_remove_page(
+                    cx,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq,
+                        db_size: inner.db_size,
+                        journal_mode: inner.journal_mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: inner.checkpoint_active,
+                    },
+                    PageNumber::ONE,
+                );
             }
             return Ok(mode);
         }
@@ -5547,6 +5573,7 @@ where
                             path,
                             &header_bytes,
                             &error,
+                            false,
                         )? =>
                     {
                         page_size_from_header_bytes(&header_bytes).unwrap_or(requested_page_size)
@@ -5643,6 +5670,7 @@ where
                             path,
                             &header_bytes,
                             &error,
+                            false,
                         )? =>
                     {
                         // A live SQLite WAL can carry the authoritative page-1
@@ -5852,6 +5880,7 @@ where
                     path,
                     &header_bytes,
                     &error,
+                    true,
                 )? =>
             {
                 let page_size = page_size_from_header_bytes(&header_bytes).ok_or_else(|| {
@@ -24829,6 +24858,7 @@ mod tests {
             &db_path,
             &stale_header_bytes,
             &stale_error,
+            false,
         )
         .expect("probe stale-header recovery");
         assert!(
@@ -24865,6 +24895,7 @@ mod tests {
             &db_path,
             &stale_header_bytes,
             &stale_error,
+            false,
         )
         .expect("probe stale-header recovery");
         assert!(
@@ -24874,6 +24905,61 @@ mod tests {
         assert!(
             !vfs.readonly_wal_open_attempted(),
             "bead_id={BEAD_ID} case=stale_header_recovery_must_not_probe_wal_readonly"
+        );
+    }
+
+    #[test]
+    fn test_readonly_stale_main_header_recovery_allows_readonly_wal_probe() {
+        let cx = Cx::new();
+        let vfs = WalReadonlyFallbackProbeVfs::new();
+        let db_path = PathBuf::from("/readonly-stale-main-header-fallback.db");
+        let wal_path = PathBuf::from("/readonly-stale-main-header-fallback.db-wal");
+        let page_size = PageSize::DEFAULT;
+
+        let valid_header = DatabaseHeader {
+            page_size,
+            page_count: 1,
+            ..DatabaseHeader::default()
+        };
+        let mut committed_page1 = vec![0_u8; page_size.as_usize()];
+        committed_page1[..DATABASE_HEADER_SIZE]
+            .copy_from_slice(&valid_header.to_bytes().expect("valid page-1 header"));
+
+        let mut stale_header_bytes = valid_header.to_bytes().expect("base header bytes");
+        stale_header_bytes[44..48].fill(0);
+        let stale_error = DatabaseHeader::from_bytes(&stale_header_bytes)
+            .expect_err("schema format 0 must be treated as a stale main-file header");
+
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.inner.open(&cx, Some(&wal_path), open_flags).unwrap();
+        let mut wal = fsqlite_wal::WalFile::create(
+            &cx,
+            file,
+            page_size.get(),
+            0,
+            fsqlite_wal::WalSalts::default(),
+        )
+        .unwrap();
+        wal.append_frame(&cx, PageNumber::ONE.get(), &committed_page1, 1)
+            .expect("append committed page-1 frame");
+        wal.close(&cx).unwrap();
+
+        let recoverable = stale_main_header_can_be_recovered_from_live_wal(
+            &cx,
+            &vfs,
+            &db_path,
+            &stale_header_bytes,
+            &stale_error,
+            true,
+        )
+        .expect("probe stale-header recovery");
+        assert!(
+            recoverable,
+            "read-only startup may validate a live WAL through a READONLY sidecar handle"
+        );
+        assert!(
+            vfs.readonly_wal_open_attempted(),
+            "read-only recovery should fall back to a READONLY WAL probe"
         );
     }
 
