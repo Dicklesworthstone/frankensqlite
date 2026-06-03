@@ -76,7 +76,8 @@ use fsqlite_btree::{set_btree_copy_profile_enabled, set_btree_metrics_enabled};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
-    Fts5Expr, Fts5Table, InvertedIndex, bm25_score, build_expr, highlight as fts5_highlight,
+    Fts5DocsizeRow, Fts5Expr, Fts5IdxRow, Fts5OnDiskReader, Fts5ShadowRows, Fts5Table,
+    InvertedIndex, bm25_score, build_expr, decode_docsize_blob, highlight as fts5_highlight,
     parse_fts5_query, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
@@ -2565,29 +2566,48 @@ impl PagerBackend {
         }
     }
 
-    fn install_existing_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+    fn install_existing_wal_backend_with_mode(
+        &self,
+        cx: &Cx,
+        db_path: &str,
+        allow_readonly: bool,
+    ) -> Result<bool> {
         let wal_path = wal_path_for_db_path(db_path);
         match self {
             Self::Memory(p) => {
                 let vfs = p.vfs_handle();
-                install_existing_wal_backend_with_vfs(p, vfs.as_ref(), cx, &wal_path)
+                install_existing_wal_backend_with_vfs(
+                    p,
+                    vfs.as_ref(),
+                    cx,
+                    &wal_path,
+                    allow_readonly,
+                )
             }
             #[cfg(target_os = "linux")]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
             }
             #[cfg(unix)]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
             }
             #[cfg(target_os = "windows")]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
             }
         }
+    }
+
+    fn install_existing_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+        self.install_existing_wal_backend_with_mode(cx, db_path, false)
+    }
+
+    fn install_existing_wal_backend_allow_readonly(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+        self.install_existing_wal_backend_with_mode(cx, db_path, true)
     }
 
     fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
@@ -2816,6 +2836,7 @@ fn install_existing_wal_backend_with_vfs<V>(
     vfs: &V,
     cx: &Cx,
     wal_path: &Path,
+    allow_readonly: bool,
 ) -> Result<bool>
 where
     V: Vfs + Send + Sync + 'static,
@@ -2830,11 +2851,21 @@ where
     // table (unix.rs). All subsequent connections that clone this fd via the
     // fast path inherit the read-only fd and fail with EBADF on WAL writes
     // (pwrite on a read-only fd returns EBADF on Linux).
-    let (mut file, _) = vfs.open(
+    let (mut file, _) = match vfs.open(
         cx,
         Some(wal_path),
         VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
-    )?;
+    ) {
+        Ok(opened) => opened,
+        Err(err) if allow_readonly => vfs
+            .open(
+                cx,
+                Some(wal_path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+            )
+            .map_err(|_| err)?,
+        Err(err) => return Err(err),
+    };
     if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
         let _ = file.close(cx);
         return Ok(false);
@@ -6509,6 +6540,37 @@ fn select_table_value_source(
         table
             .column_index(&col_ref.column)
             .map(PreparedMemValueSource::Column)
+    }
+}
+
+fn prepared_order_by_limit_has_storage_ordered_path(
+    table: &TableSchema,
+    order_source: PreparedMemValueSource,
+    descending: bool,
+    nulls_order: NullsOrder,
+) -> bool {
+    let default_direction = if descending {
+        Some(SortDirection::Desc)
+    } else {
+        Some(SortDirection::Asc)
+    };
+    if nulls_order != default_nulls_order(default_direction) {
+        return false;
+    }
+    match order_source {
+        PreparedMemValueSource::Rowid => !table.without_rowid,
+        PreparedMemValueSource::Column(column_index) => {
+            let Some(column) = table.columns.get(column_index) else {
+                return false;
+            };
+            table.indexes.iter().any(|index| {
+                index.where_clause.is_none()
+                    && index
+                        .columns
+                        .first()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+            })
+        }
     }
 }
 
@@ -10673,7 +10735,7 @@ impl Connection {
             #[cfg(feature = "ext-fts5")]
             {
                 if let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() {
-                    LiveVtabCountStrategy::Known(fts5.all_rows().len())
+                    LiveVtabCountStrategy::Known(fts5.row_count())
                 } else {
                     LiveVtabCountStrategy::Cursor(instance.open_cursor()?)
                 }
@@ -18534,7 +18596,7 @@ impl Connection {
                 FrankenError::internal("prepared direct insert missing active transaction")
             })?;
             let cursor_setup_start = profile_enabled.then(Instant::now);
-            let mut cursor = Self::new_header_btree_cursor(
+            let mut cursor = Connection::new_header_btree_cursor(
                 txn,
                 root,
                 direct.cursor_page_size,
@@ -18656,7 +18718,7 @@ impl Connection {
             let txn = active_txn.as_mut().ok_or_else(|| {
                 FrankenError::internal("prepared direct update missing active transaction")
             })?;
-            let mut cursor = Self::new_header_btree_cursor(
+            let mut cursor = Connection::new_header_btree_cursor(
                 txn,
                 root,
                 direct.cursor_page_size,
@@ -19045,7 +19107,7 @@ impl Connection {
             let txn = active_txn.as_mut().ok_or_else(|| {
                 FrankenError::internal("prepared direct delete missing active transaction")
             })?;
-            let mut cursor = Self::new_header_btree_cursor(
+            let mut cursor = Connection::new_header_btree_cursor(
                 txn,
                 root,
                 direct.cursor_page_size,
@@ -22802,6 +22864,11 @@ impl Connection {
                 if self.execute_fts5_maintenance_insert(insert) {
                     return Ok(Vec::new());
                 }
+                #[cfg(feature = "ext-fts5")]
+                if let Some(affected) = self.execute_fts5_magic_delete_insert(insert, params)? {
+                    self.record_statement_changes(affected);
+                    return Ok(Vec::new());
+                }
                 if insert.with.is_some() {
                     self.log_mem_execution_fallback("insert", "with_clause_materialization")?;
                     return self.execute_insert_with_ctes(insert, params);
@@ -25692,6 +25759,10 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> bool {
+        #[cfg(feature = "ext-fts5")]
+        if self.insert_targets_live_fts5_command_column(insert) {
+            return false;
+        }
         if fts5_maintenance_insert_command(insert).is_some() {
             return false;
         }
@@ -26406,6 +26477,10 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<bool> {
+        #[cfg(feature = "ext-fts5")]
+        if self.insert_targets_live_fts5_command_column(insert) {
+            return Ok(true);
+        }
         Ok(fts5_maintenance_insert_command(insert).is_some()
             || self.attached_target_schema(&insert.table)?.is_some())
     }
@@ -27871,15 +27946,25 @@ impl Connection {
         let rowid_alias_name = select_table_rowid_alias_name(table, rowid_alias_column_index);
         let order_source =
             select_table_value_source(table, table_label, &order_term.expr, rowid_alias_name)?;
+        let descending = order_term.direction == Some(SortDirection::Desc);
+        let nulls_order = order_term
+            .nulls
+            .unwrap_or_else(|| default_nulls_order(order_term.direction));
+        if prepared_order_by_limit_has_storage_ordered_path(
+            table,
+            order_source,
+            descending,
+            nulls_order,
+        ) {
+            return None;
+        }
 
         Some(PreparedQueryFastPath::SimpleOrderByLimit {
             root_page: table.root_page,
             order_source,
             rowid_alias_column_index,
-            descending: order_term.direction == Some(SortDirection::Desc),
-            nulls_order: order_term
-                .nulls
-                .unwrap_or_else(|| default_nulls_order(order_term.direction)),
+            descending,
+            nulls_order,
             limit,
         })
     }
@@ -30495,16 +30580,24 @@ impl Connection {
             return Ok(0);
         }
 
+        self.execute_live_vtab_delete_rowids(&table_name, &rowids)
+    }
+
+    fn execute_live_vtab_delete_rowids(&self, table_name: &str, rowids: &[i64]) -> Result<usize> {
+        if rowids.is_empty() {
+            return Ok(0);
+        }
+
         let key = table_name.to_ascii_uppercase();
         let root_page = {
             let schema = self.schema.borrow();
             schema
                 .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&table_name))
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
                 .map(|table| table.root_page)
                 .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
         };
-        let root = page_number_from_schema_root(root_page, &table_name, "table")?;
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
 
         // First route each rowid through the module's delete branch so the
         // in-memory index/content/docsize state is updated and any module-level
@@ -30516,9 +30609,9 @@ impl Connection {
             let instance = instances.get_mut(&key).ok_or_else(|| {
                 FrankenError::Internal(format!("virtual table not found: {table_name}"))
             })?;
-            self.begin_live_vtab_transaction_if_needed(&table_name, instance.as_mut(), cx)?;
+            self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), cx)?;
             let mut count = 0usize;
-            for rowid in &rowids {
+            for rowid in rowids {
                 // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
                 instance.update(cx, &[SqliteValue::Integer(*rowid)])?;
                 if cursor.table_move_to(cx, *rowid)?.is_found() {
@@ -30533,10 +30626,68 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
+    fn execute_fts5_magic_delete_insert(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<usize>> {
+        if !self.insert_targets_live_fts5_command_column(insert) {
+            return Ok(None);
+        }
+        let fsqlite_ast::InsertSource::Values(rows) = &insert.source else {
+            return Ok(None);
+        };
+        let [row_exprs] = rows.as_slice() else {
+            return Ok(None);
+        };
+        let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
+        let Some(SqliteValue::Text(command)) = source_values.first() else {
+            return Ok(None);
+        };
+        if !command.eq_ignore_ascii_case("delete") {
+            return Ok(None);
+        }
+        let rowid = source_values
+            .get(1)
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "FTS5 delete command for `{}` is missing rowid argument",
+                    insert.table.name
+                ))
+            })
+            .and_then(Self::coerce_insert_rowid_value)?
+            .ok_or_else(|| FrankenError::TypeMismatch {
+                expected: "non-NULL FTS5 delete rowid".to_owned(),
+                actual: "null".to_owned(),
+            })?;
+        let affected = self.execute_live_vtab_delete_rowids(&insert.table.name, &[rowid])?;
+        Ok(Some(affected))
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn insert_targets_live_fts5_command_column(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> bool {
+        if !fts5_insert_uses_command_column(insert) {
+            return false;
+        }
+        let key = insert.table.name.to_ascii_uppercase();
+        let instances = self.vtab_instances.borrow();
+        instances
+            .get(&key)
+            .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            .is_some()
+    }
+
+    #[cfg(feature = "ext-fts5")]
     fn execute_fts5_maintenance_insert(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
         let Some(command) = fts5_maintenance_insert_command(insert) else {
             return false;
         };
+        if !self.insert_targets_live_fts5_command_column(insert) {
+            return false;
+        }
 
         match command {
             Fts5MaintenanceCommand::Optimize => {}
@@ -33074,7 +33225,7 @@ impl Connection {
         } else {
             let mut active_txn = self.active_txn.borrow_mut();
             if let Some(txn) = active_txn.as_mut() {
-                let mut cursor = Self::new_header_btree_cursor(
+                let mut cursor = Connection::new_header_btree_cursor(
                     txn,
                     root,
                     run.cursor_page_size,
@@ -33298,7 +33449,7 @@ impl Connection {
                         "table",
                     ) {
                         Ok(root) => {
-                            let mut cursor = Self::new_header_btree_cursor(
+                            let mut cursor = Connection::new_header_btree_cursor(
                                 txn,
                                 root,
                                 cursor_page_size,
@@ -33334,7 +33485,7 @@ impl Connection {
                                 break;
                             }
                         };
-                        let mut cursor = Self::new_header_btree_cursor(
+                        let mut cursor = Connection::new_header_btree_cursor(
                             txn,
                             root,
                             run.cursor_page_size,
@@ -33963,7 +34114,7 @@ impl Connection {
         } else {
             let mut active_txn = self.active_txn.borrow_mut();
             if let Some(txn) = active_txn.as_mut() {
-                let mut cursor = Self::new_header_btree_cursor(
+                let mut cursor = Connection::new_header_btree_cursor(
                     txn,
                     root,
                     run.cursor_page_size,
@@ -42821,7 +42972,7 @@ impl Connection {
             let max_payload_columns = table.columns.len();
 
             if uses_index_btree {
-                let mut cursor = Self::new_header_btree_cursor(
+                let mut cursor = Connection::new_header_btree_cursor(
                     txn,
                     root_page,
                     page_size,
@@ -42905,7 +43056,7 @@ impl Connection {
                     .as_ref()
                     .and_then(|map| map.get(&table.root_page))
                     .map(Vec::as_slice);
-                let mut cursor = Self::new_header_btree_cursor(
+                let mut cursor = Connection::new_header_btree_cursor(
                     txn,
                     root_page,
                     page_size,
@@ -43011,7 +43162,7 @@ impl Connection {
                         })?;
 
                     let mut actual_rowids = HashSet::new();
-                    let mut cursor = Self::new_header_btree_index_cursor(
+                    let mut cursor = Connection::new_header_btree_index_cursor(
                         txn,
                         index_root,
                         page_size,
@@ -43152,7 +43303,7 @@ impl Connection {
                         ),
                     })?;
 
-                let mut cursor = Self::new_header_btree_index_cursor(
+                let mut cursor = Connection::new_header_btree_index_cursor(
                     txn,
                     index_root,
                     page_size,
@@ -45066,10 +45217,15 @@ impl Connection {
             return Ok(());
         }
 
+        let installed_existing_wal = self
+            .pager
+            .install_existing_wal_backend_allow_readonly(&cx, &self.path)?;
         match self.pager.set_journal_mode(&cx, JournalMode::Wal) {
             Ok(_) => Ok(()),
             Err(FrankenError::Unsupported) => {
-                if self.pager.install_existing_wal_backend(&cx, &self.path)? {
+                if !installed_existing_wal
+                    && self.pager.install_existing_wal_backend(&cx, &self.path)?
+                {
                     self.pager.set_journal_mode(&cx, JournalMode::Wal)?;
                 }
                 Ok(())
@@ -51158,7 +51314,17 @@ impl Connection {
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     return self.execute_join_select(&bound, None);
                 }
-                self.execute_statement(&Statement::Select(stripped), params)
+                let suppress_hash_join_dispatch = select_has_single_left_join(&stripped)
+                    && select_join_is_vdbe_eligible(&stripped);
+                let prev_strict_reject = *self.reject_mem_fallback_strict.borrow();
+                if suppress_hash_join_dispatch {
+                    self.set_strict_mem_fallback_rejection(true);
+                }
+                let result = self.execute_statement(&Statement::Select(stripped), params);
+                if suppress_hash_join_dispatch {
+                    *self.reject_mem_fallback_strict.borrow_mut() = prev_strict_reject;
+                }
+                result
             })
         })();
         self.cleanup_cte_tables(&temp_tables);
@@ -55400,18 +55566,45 @@ impl Connection {
             }
             let root_page = PageNumber::new(u32::try_from(table.root_page).unwrap_or(1))
                 .unwrap_or(PageNumber::ONE);
-            let mut cursor =
-                Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, true);
+            let mut cursor = Self::new_header_btree_cursor(
+                txn,
+                root_page,
+                page_size,
+                reserved_per_page,
+                !table.without_rowid,
+            );
             let ipk_col_idx = rowid_alias_columns
                 .get(&table.name.to_ascii_lowercase())
                 .copied();
 
             if cursor.first(cx)? {
                 if table.without_rowid {
-                    return Err(FrankenError::NotImplemented(format!(
-                        "reloading populated WITHOUT ROWID table `{}` into MemDatabase is not yet supported",
-                        table.name
-                    )));
+                    let mut synthetic_rowid = 1_i64;
+                    loop {
+                        let payload = cursor.payload(cx)?;
+                        let values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "WITHOUT ROWID table `{}` payload is not a valid SQLite record",
+                                    table.name
+                                ),
+                            }
+                        })?;
+                        let values = self.inflate_table_row_values_for_storage_reload(
+                            table,
+                            synthetic_rowid,
+                            &values,
+                            None,
+                        )?;
+                        if let Some(mem_table) = new_db.get_table_mut(table.root_page) {
+                            mem_table.insert_row(synthetic_rowid, values);
+                        }
+                        synthetic_rowid = synthetic_rowid.saturating_add(1);
+                        if !cursor.next(cx)? {
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 loop {
                     let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
@@ -55475,8 +55668,13 @@ impl Connection {
         }
 
         let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
-        let mut cursor =
-            Self::new_header_btree_cursor(txn, root_page, page_size, reserved_per_page, true);
+        let mut cursor = Self::new_header_btree_cursor(
+            txn,
+            root_page,
+            page_size,
+            reserved_per_page,
+            !table.without_rowid,
+        );
         let ipk_col_idx = rowid_alias_columns
             .get(&table.name.to_ascii_lowercase())
             .copied();
@@ -55484,10 +55682,29 @@ impl Connection {
 
         if cursor.first(cx)? {
             if table.without_rowid {
-                return Err(FrankenError::NotImplemented(format!(
-                    "reloading populated WITHOUT ROWID table `{}` into a live virtual table is not yet supported",
-                    table.name
-                )));
+                let mut synthetic_rowid = 1_i64;
+                loop {
+                    let payload = cursor.payload(cx)?;
+                    let values =
+                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "WITHOUT ROWID table `{}` payload is not a valid SQLite record",
+                                table.name
+                            ),
+                        })?;
+                    let values = self.inflate_table_row_values_for_storage_reload(
+                        table,
+                        synthetic_rowid,
+                        &values,
+                        None,
+                    )?;
+                    rows.push((synthetic_rowid, values));
+                    synthetic_rowid = synthetic_rowid.saturating_add(1);
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+                return Ok(rows);
             }
             loop {
                 let rowid = cursor.rowid(cx)?;
@@ -55633,6 +55850,57 @@ impl Connection {
             .collect()
     }
 
+    /// Read the persisted FTS5 shadow tables (`<tbl>_data`, `<tbl>_docsize`,
+    /// `<tbl>_content`) for a reopened on-disk index so the table can be bound
+    /// to its existing posting-list index instead of re-tokenizing `_content`.
+    /// `_idx`/`_config` are `WITHOUT ROWID` (not walkable by the rowid table
+    /// reader) and are reconstructed inside `Fts5ShadowRows::from_storage_rows`.
+    // Reads the rowid-backed shadow tables (`_data`/`_docsize`/`_content`) into
+    // typed `Fts5ShadowRows`. NOT yet wired into reload — the shadow-bind query
+    // path it was written for is unsafe on writes and O(N^2) on large corpora
+    // (see the reverted call site). Retained for the corrected rebuild-from-
+    // postings fix (bd-fts5-lazy-shadow-reads). Decoder validated against cass.
+    #[cfg(feature = "ext-fts5")]
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn read_fts5_shadow_rows_for_reload(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        rowid_alias_columns: &HashMap<String, usize>,
+        table_name: &str,
+        args: &[String],
+    ) -> Result<Fts5ShadowRows> {
+        let column_count = parse_virtual_table_column_infos(args).len();
+        let mut shadow: [Vec<(i64, Vec<SqliteValue>)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (slot, suffix) in shadow.iter_mut().zip(["_data", "_docsize", "_content"]) {
+            let name = format!("{table_name}{suffix}");
+            if let Some(table) = schema
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
+            {
+                *slot = self.read_storage_table_rows_for_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    table,
+                    rowid_alias_columns,
+                )?;
+            }
+        }
+        let [data, docsize, content] = shadow;
+        Ok(Fts5ShadowRows::from_storage_rows(
+            &data,
+            &docsize,
+            &content,
+            column_count,
+        ))
+    }
+
     #[cfg(feature = "ext-fts5")]
     fn rebuild_rootpage_zero_live_vtab_instances_from_reload(
         &self,
@@ -55683,6 +55951,13 @@ impl Connection {
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
+                // NOTE (2026-06-01): the shadow-bind fast path was reverted
+                // here — binding `Fts5ShadowRows` for query is unsafe on the
+                // write path (the first insert clears shadow_rows, dropping the
+                // persisted index) and O(N^2) on large corpora (no `_idx`;
+                // linear `data_row`/`doc_length` scans). The correct fix
+                // rebuilds the in-memory `InvertedIndex` from persisted `_data`
+                // postings (no tokenization). See bd-fts5-lazy-shadow-reads.
                 let rows = self.read_fts5_rootpage_zero_content_rows_for_reload(
                     cx,
                     txn,
@@ -56453,19 +56728,48 @@ impl Connection {
                 let file_root = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
                     .unwrap_or(PageNumber::ONE);
 
-                let mut cursor = Self::new_header_btree_cursor(
+                let mut cursor = Connection::new_header_btree_cursor(
                     txn,
                     file_root,
                     page_size,
                     reserved_per_page,
-                    true,
+                    !without_rowid,
                 );
 
                 if cursor.first(cx)? {
                     if without_rowid {
-                        return Err(FrankenError::NotImplemented(format!(
-                            "reloading populated WITHOUT ROWID table `{name}` into MemDatabase is not yet supported"
-                        )));
+                        let mut synthetic_rowid = 1_i64;
+                        loop {
+                            let payload = cursor.payload(cx)?;
+                            let values = parse_record(&payload).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "WITHOUT ROWID table `{name}` payload is not a valid SQLite record"
+                                    ),
+                                }
+                            })?;
+                            if hydrate_rows {
+                                let tbl_schema = new_schema.last().ok_or_else(|| {
+                                    FrankenError::Internal(format!(
+                                        "schema reload lost table metadata for `{name}`"
+                                    ))
+                                })?;
+                                let values = self.inflate_table_row_values_for_storage_reload(
+                                    tbl_schema,
+                                    synthetic_rowid,
+                                    &values,
+                                    None,
+                                )?;
+                                if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
+                                    mem_table.insert_row(synthetic_rowid, values);
+                                }
+                            }
+                            synthetic_rowid = synthetic_rowid.saturating_add(1);
+                            if !cursor.next(cx)? {
+                                break;
+                            }
+                        }
+                        continue;
                     }
                     loop {
                         let (rowid, payload) = cursor.rowid_and_payload_cow(cx)?;
@@ -58163,6 +58467,14 @@ fn has_joins(select: &SelectStatement) -> bool {
     )
 }
 
+fn select_has_single_left_join(select: &SelectStatement) -> bool {
+    matches!(
+        &select.body.select,
+        SelectCore::Select { from: Some(from), .. }
+            if from.joins.len() == 1 && matches!(from.joins[0].join_type.kind, JoinKind::Left)
+    )
+}
+
 /// Returns true if a JOIN query is eligible for the currently validated VDBE
 /// path: one simple INNER or LEFT JOIN over named tables with a plain ON
 /// predicate and no grouping/window/subquery/fallback-only features.
@@ -59800,11 +60112,18 @@ enum Fts5MaintenanceCommand {
     Rebuild,
 }
 
+fn fts5_insert_uses_command_column(insert: &fsqlite_ast::InsertStatement) -> bool {
+    insert
+        .columns
+        .first()
+        .is_some_and(|column| column.eq_ignore_ascii_case(&insert.table.name))
+}
+
 /// Detect INSERT INTO t(t) VALUES('<command>') maintenance commands.
 fn fts5_maintenance_insert_command(
     insert: &fsqlite_ast::InsertStatement,
 ) -> Option<Fts5MaintenanceCommand> {
-    if insert.columns.len() != 1 || !insert.columns[0].eq_ignore_ascii_case(&insert.table.name) {
+    if insert.columns.len() != 1 || !fts5_insert_uses_command_column(insert) {
         return None;
     }
     match &insert.source {
@@ -76501,6 +76820,233 @@ fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<
     Ok(false)
 }
 
+/// Live, transaction-backed [`Fts5OnDiskReader`]: point/range reads of a
+/// persisted FTS5 table's shadow b-trees for the lazy query path. Built per
+/// query from the query's own transaction so every read shares its snapshot.
+/// Cursors are constructed per call and dropped immediately, so the held
+/// `&mut` transaction borrow is only live for the duration of one read.
+#[cfg(feature = "ext-fts5")]
+#[allow(dead_code)] // wired into scan_live_fts5_rows in child bead .4
+struct Fts5LiveShadowReader<'a> {
+    cx: &'a Cx,
+    txn: &'a mut dyn TransactionHandle,
+    page_size: PageSize,
+    reserved_per_page: u8,
+    data_root: PageNumber,
+    idx_root: Option<PageNumber>,
+    docsize_root: Option<PageNumber>,
+    content_root: Option<PageNumber>,
+    collation_registry: Arc<Mutex<CollationRegistry>>,
+}
+
+#[cfg(feature = "ext-fts5")]
+#[allow(dead_code)] // wired into scan_live_fts5_rows in child bead .4
+impl<'a> Fts5LiveShadowReader<'a> {
+    /// Resolve the shadow-table rootpages for `table_name` from `schema` and
+    /// build a reader bound to `txn`. `_data` is required; `_idx`/`_docsize`/
+    /// `_content` are optional (absent => the corresponding lookups return
+    /// `None`, e.g. contentless tables have no `_content`).
+    fn new(
+        cx: &'a Cx,
+        txn: &'a mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        table_name: &str,
+        collation_registry: Arc<Mutex<CollationRegistry>>,
+    ) -> Result<Self> {
+        let resolve = |suffix: &str| -> Result<Option<PageNumber>> {
+            let name = format!("{table_name}{suffix}");
+            match schema
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
+            {
+                Some(table) if table.root_page > 0 => Ok(Some(page_number_from_schema_root(
+                    table.root_page,
+                    &name,
+                    "fts5 shadow",
+                )?)),
+                _ => Ok(None),
+            }
+        };
+        let data_root = resolve("_data")?.ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("FTS5 table `{table_name}` missing `_data` shadow table"),
+        })?;
+        Ok(Self::with_roots(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            data_root,
+            resolve("_idx")?,
+            resolve("_docsize")?,
+            resolve("_content")?,
+            collation_registry,
+        ))
+    }
+
+    /// Construct directly from already-resolved shadow rootpages (used by tests
+    /// and any caller that has the rootpages in hand).
+    #[allow(clippy::too_many_arguments)]
+    fn with_roots(
+        cx: &'a Cx,
+        txn: &'a mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        data_root: PageNumber,
+        idx_root: Option<PageNumber>,
+        docsize_root: Option<PageNumber>,
+        content_root: Option<PageNumber>,
+        collation_registry: Arc<Mutex<CollationRegistry>>,
+    ) -> Self {
+        Self {
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            data_root,
+            idx_root,
+            docsize_root,
+            content_root,
+            collation_registry,
+        }
+    }
+
+    /// Seek a rowid table and return the matched row's parsed record values.
+    fn read_table_record(
+        &mut self,
+        root: PageNumber,
+        rowid: i64,
+    ) -> Result<Option<Vec<SqliteValue>>> {
+        let mut cursor = Connection::new_header_btree_cursor(
+            self.txn,
+            root,
+            self.page_size,
+            self.reserved_per_page,
+            true,
+        );
+        if !cursor.table_move_to(self.cx, rowid)?.is_found() {
+            return Ok(None);
+        }
+        let payload = cursor.payload(self.cx)?;
+        let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("fts5 shadow row {rowid} payload is not a valid SQLite record"),
+        })?;
+        Ok(Some(values))
+    }
+}
+
+#[cfg(feature = "ext-fts5")]
+impl Fts5OnDiskReader for Fts5LiveShadowReader<'_> {
+    fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
+        // `_data(id INTEGER PRIMARY KEY, block BLOB)`: the block is the lone
+        // stored BLOB (the rowid-alias `id` is not in the record payload).
+        let Some(values) = self.read_table_record(self.data_root, id)? else {
+            return Ok(None);
+        };
+        Ok(values
+            .iter()
+            .rev()
+            .find_map(|value| value.as_blob_bytes().map(<[u8]>::to_vec)))
+    }
+
+    fn read_docsize(&mut self, rowid: i64, column_count: usize) -> Result<Option<Fts5DocsizeRow>> {
+        let Some(root) = self.docsize_root else {
+            return Ok(None);
+        };
+        let Some(values) = self.read_table_record(root, rowid)? else {
+            return Ok(None);
+        };
+        let blob = values
+            .iter()
+            .rev()
+            .find_map(SqliteValue::as_blob_bytes)
+            .unwrap_or(&[]);
+        Ok(Some(Fts5DocsizeRow::new(
+            rowid,
+            decode_docsize_blob(blob, column_count),
+        )))
+    }
+
+    fn read_content(&mut self, rowid: i64, column_count: usize) -> Result<Option<Vec<String>>> {
+        let Some(root) = self.content_root else {
+            return Ok(None);
+        };
+        let Some(values) = self.read_table_record(root, rowid)? else {
+            return Ok(None);
+        };
+        // `_content(id INTEGER PRIMARY KEY, c0, c1, ...)`: the trailing
+        // `column_count` values are the column texts (skip any rowid-alias
+        // placeholder the record decoder may surface as a leading element).
+        let start = values.len().saturating_sub(column_count);
+        Ok(Some(
+            values[start..].iter().map(SqliteValue::to_text).collect(),
+        ))
+    }
+
+    fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
+        let Some(root) = self.idx_root else {
+            return Ok(None);
+        };
+        // `_idx(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID`.
+        // Seek to (segid, term); we want the largest stored key <= it within
+        // this segid (the leaf page where `term`'s postings begin).
+        let probe = serialize_record(&[
+            SqliteValue::Integer(i64::from(segid)),
+            SqliteValue::Blob(Arc::from(term)),
+        ]);
+        let mut cursor = Connection::new_header_btree_index_cursor(
+            self.txn,
+            root,
+            self.page_size,
+            self.reserved_per_page,
+            vec![false, false],
+            vec![None, None],
+            Arc::clone(&self.collation_registry),
+        );
+        cursor.index_move_to(self.cx, &probe)?;
+        // index_move_to lands at the smallest stored key >= probe (or EOF).
+        // Decide whether the current row is already <= (segid, term); if not,
+        // step back once to the largest key strictly below the probe.
+        let mut positioned = !cursor.eof();
+        if positioned {
+            let payload = cursor.payload(self.cx)?;
+            let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "fts5 _idx payload is not a valid SQLite record".to_owned(),
+            })?;
+            let cur_segid = values.first().map_or(0, SqliteValue::to_integer);
+            let cur_term = values
+                .get(1)
+                .and_then(SqliteValue::as_blob_bytes)
+                .unwrap_or(&[]);
+            let cur_le = (cur_segid, cur_term) <= (i64::from(segid), term);
+            if !cur_le {
+                positioned = cursor.prev(self.cx)?;
+            }
+        } else {
+            positioned = cursor.prev(self.cx)?;
+        }
+        if !positioned {
+            return Ok(None);
+        }
+        let payload = cursor.payload(self.cx)?;
+        let values = parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "fts5 _idx payload is not a valid SQLite record".to_owned(),
+        })?;
+        if values.first().map_or(0, SqliteValue::to_integer) != i64::from(segid) {
+            return Ok(None); // largest <= key belongs to an earlier segment
+        }
+        let encoded_pgno = values.get(2).map_or(0, SqliteValue::to_integer);
+        let row_term = values
+            .get(1)
+            .and_then(SqliteValue::as_blob_bytes)
+            .map_or_else(Vec::new, <[u8]>::to_vec);
+        Ok(Fts5IdxRow::from_encoded_pgno(segid, row_term, encoded_pgno)
+            .ok()
+            .map(|row| row.btree_page))
+    }
+}
+
 fn page_number_from_schema_root(
     root_page: i32,
     object_name: &str,
@@ -85256,6 +85802,51 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_magic_delete_insert_routes_through_live_vtab_delete() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body)")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO docs(docs, rowid, subject, body)
+             VALUES('delete', 1, 'Hello', 'Rust world')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'hello'")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "magic delete must update the live FTS5 index"
+        );
+        let count_rows = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+        assert_eq!(count_rows[0].get(0), Some(&SqliteValue::Integer(1)));
+
+        let stmt = conn
+            .prepare(
+                "INSERT INTO docs(docs, rowid, subject, body)
+                 VALUES('delete', ?1, ?2, ?3)",
+            )
+            .unwrap();
+        let affected = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("Other".into()),
+                SqliteValue::Text("Nothing".into()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 1);
+        let count_rows = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+        assert_eq!(count_rows[0].get(0), Some(&SqliteValue::Integer(0)));
+    }
+
+    #[test]
     fn test_reopen_materialized_fts5_optimize_command_succeeds() {
         let _serial = super::fsqlite_core_test_serializer();
         let dir = tempfile::tempdir().unwrap();
@@ -88195,6 +88786,18 @@ mod tests {
         assert!(
             filtered.prepared_query_fast_path.is_none(),
             "filtered ORDER BY LIMIT should stay on the generic prepared query path"
+        );
+
+        conn.execute(
+            "CREATE INDEX idx_prep_order_by_limit_score ON prep_order_by_limit_fast_path(score);",
+        )
+        .unwrap();
+        let indexed = conn
+            .prepare("SELECT * FROM prep_order_by_limit_fast_path ORDER BY score DESC LIMIT 2;")
+            .unwrap();
+        assert!(
+            indexed.prepared_query_fast_path.is_none(),
+            "indexed ORDER BY LIMIT should stay on the storage-backed query path"
         );
     }
 
@@ -116320,6 +116923,10 @@ mod without_rowid_runtime_tests {
     use fsqlite_pager::traits::TransactionMode;
     use fsqlite_types::PageNumber;
 
+    fn row_values(row: &Row) -> Vec<SqliteValue> {
+        row.values().to_vec()
+    }
+
     #[test]
     fn test_create_without_rowid_table_uses_index_root_and_skips_rowid_alias_registration() {
         let _serial = super::fsqlite_core_test_serializer();
@@ -116522,7 +117129,7 @@ mod without_rowid_runtime_tests {
     }
 
     #[test]
-    fn test_parity_cert_off_rejects_populated_without_rowid_reload() {
+    fn test_parity_cert_off_reloads_populated_without_rowid_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("without_rowid_populated_reload.db");
 
@@ -116531,24 +117138,24 @@ mod without_rowid_runtime_tests {
             rconn
                 .execute_batch(
                     "CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;
-                 INSERT INTO wr VALUES (1, 'x');",
+                 INSERT INTO wr VALUES (2, 'y'), (1, 'x');",
                 )
                 .unwrap();
         }
 
         let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
-        let err = conn
-            .execute("PRAGMA fsqlite.parity_cert = OFF;")
-            .unwrap_err();
-        match err {
-            FrankenError::NotImplemented(message) => {
-                assert!(
-                    message.contains("reloading populated WITHOUT ROWID table `wr`"),
-                    "unexpected diagnostic: {message}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        conn.execute("PRAGMA fsqlite.parity_cert = OFF;")
+            .expect("populated WITHOUT ROWID reload should hydrate rows");
+        let rows = conn
+            .query("SELECT id, payload FROM wr ORDER BY id;")
+            .expect("WITHOUT ROWID rows should be readable after reload");
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Text("x".into())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("y".into())],
+            ]
+        );
     }
 }
 
@@ -119531,6 +120138,189 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(rows[1].values()[2], SqliteValue::Text("Nothing".into()));
     }
 
+    /// bd-fts5-lazy-shadow-reads-itcc4.1: the lazy `Fts5OnDiskReader` must
+    /// point-read a persisted FTS5 table's shadow b-trees correctly. The
+    /// fixture is built by *stock* SQLite (rusqlite), so this doubles as a
+    /// format-interop check: frankensqlite reads a standard FTS5 index.
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_live_shadow_reader_reads_persisted_index() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_live_reader_fixture.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        // Build a standard on-disk FTS5 index with stock SQLite. `optimize`
+        // flushes pending postings into on-disk segments so `_data`/`_idx`/
+        // `_docsize`/`_content` are all populated.
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE docs USING fts5(body);\n\
+                     INSERT INTO docs(rowid, body) VALUES (1, 'alpha rust beta');\n\
+                     INSERT INTO docs(rowid, body) VALUES (2, 'gamma rust delta');\n\
+                     INSERT INTO docs(docs) VALUES('optimize');",
+                )
+                .unwrap();
+            sqlite.close().unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
+            let rows = conn
+                .query(&format!(
+                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
+                ))
+                .ok()?;
+            let raw = rows.first()?.values().first()?.to_integer();
+            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
+        };
+        let data_root = root("docs_data").expect("docs_data rootpage");
+        let idx_root = root("docs_idx");
+        let docsize_root = root("docs_docsize");
+        let content_root = root("docs_content");
+
+        conn.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
+            let header = super::parse_database_header_checked(page1.as_ref())?;
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(
+                fsqlite_func::collation::CollationRegistry::new(),
+            ));
+            let mut reader = super::Fts5LiveShadowReader::with_roots(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                data_root,
+                idx_root,
+                docsize_root,
+                content_root,
+                registry,
+            );
+
+            // Special `_data` rows: id=1 averages, id=10 structure.
+            assert!(reader.read_data_block(1)?.is_some(), "averages row (id=1)");
+            assert!(
+                reader.read_data_block(10)?.is_some(),
+                "structure row (id=10)"
+            );
+            assert!(
+                reader.read_data_block(123_456_789)?.is_none(),
+                "absent _data id -> None"
+            );
+
+            // Content point reads for known rowids + absent -> None.
+            assert_eq!(
+                reader.read_content(1, 1)?.expect("content for rowid 1"),
+                vec!["alpha rust beta".to_owned()],
+            );
+            assert_eq!(
+                reader.read_content(2, 1)?.expect("content for rowid 2"),
+                vec!["gamma rust delta".to_owned()],
+            );
+            assert!(
+                reader.read_content(9999, 1)?.is_none(),
+                "absent content rowid -> None"
+            );
+
+            // Docsize token counts (alpha rust beta = 3 tokens).
+            assert_eq!(
+                reader
+                    .read_docsize(1, 1)?
+                    .expect("docsize for rowid 1")
+                    .total_tokens(),
+                3,
+            );
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// bd-fts5-lazy-shadow-reads-itcc4.2(a): the lazy on-disk segment scan
+    /// (`lazy_exact_doclist_entries`) must return exactly the documents a term
+    /// occurs in, reading only the leaf pages it needs — driven by the `.1`
+    /// reader over a stock-SQLite-built index.
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_lazy_exact_doclist_entries_match_known_terms() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_lazy_doclist_fixture.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE docs USING fts5(body);\n\
+                     INSERT INTO docs(rowid, body) VALUES (1, 'alpha rust beta');\n\
+                     INSERT INTO docs(rowid, body) VALUES (2, 'gamma rust delta');\n\
+                     INSERT INTO docs(rowid, body) VALUES (3, 'epsilon zeta');\n\
+                     INSERT INTO docs(docs) VALUES('optimize');",
+                )
+                .unwrap();
+            sqlite.close().unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
+            let rows = conn
+                .query(&format!(
+                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
+                ))
+                .ok()?;
+            let raw = rows.first()?.values().first()?.to_integer();
+            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
+        };
+        let data_root = root("docs_data").expect("docs_data rootpage");
+        let idx_root = root("docs_idx");
+        let docsize_root = root("docs_docsize");
+        let content_root = root("docs_content");
+
+        conn.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
+            let header = super::parse_database_header_checked(page1.as_ref())?;
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(
+                fsqlite_func::collation::CollationRegistry::new(),
+            ));
+            let mut reader = super::Fts5LiveShadowReader::with_roots(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                data_root,
+                idx_root,
+                docsize_root,
+                content_root,
+                registry,
+            );
+
+            let structure_block = reader.read_data_block(10)?.expect("structure row (id=10)");
+            let structure = fsqlite_ext_fts5::Fts5StructureRecord::decode(&structure_block)?;
+
+            let mut rowids = |term: &[u8]| -> Result<Vec<u64>> {
+                let mut ids: Vec<u64> =
+                    fsqlite_ext_fts5::lazy_exact_doclist_entries(&mut reader, &structure, term)?
+                        .into_iter()
+                        .map(|entry| entry.rowid)
+                        .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                Ok(ids)
+            };
+
+            assert_eq!(rowids(b"rust")?, vec![1, 2], "'rust' is in docs 1 and 2");
+            assert_eq!(rowids(b"alpha")?, vec![1], "'alpha' only in doc 1");
+            assert_eq!(rowids(b"zeta")?, vec![3], "'zeta' only in doc 3");
+            assert!(rowids(b"nonexistent")?.is_empty(), "absent term -> no docs");
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn test_reopen_rebinds_materialized_fts5_for_match_queries_and_new_inserts() {
         let dir = tempfile::tempdir().unwrap();
@@ -119812,7 +120602,12 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .unwrap();
         }
 
-        let err = Connection::open(&db_str).expect_err("invalid table text should fail");
+        let conn = Connection::open(&db_str).expect("lazy open should defer table row decoding");
+        conn.set_reject_mem_fallback(false);
+        let reload_cx = conn.op_cx().unwrap();
+        let err = conn
+            .reload_memdb_from_pager(&reload_cx)
+            .expect_err("invalid table text should fail once rows are hydrated");
         let message = err.to_string();
         assert!(
             message.contains("table `docs`")
@@ -149664,6 +150459,59 @@ mod pager_routing_tests {
         assert!(
             !prepared_ops.iter().any(|opcode| opcode == "Rewind"),
             "placeholder-backed ordered scan should stay on the bounded prefix seek path: {prepared_ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_order_by_primary_key_limit_uses_storage_index_path() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE messages (
+                conversation_id TEXT PRIMARY KEY,
+                body TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages(conversation_id, body) VALUES
+                ('b', 'second'),
+                ('a', 'first'),
+                ('c', 'third');",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT * FROM messages ORDER BY conversation_id ASC LIMIT 1;")
+            .unwrap();
+        assert!(
+            !matches!(
+                stmt.prepared_query_fast_path.as_ref(),
+                Some(super::PreparedQueryFastPath::SimpleOrderByLimit { .. })
+            ),
+            "indexed ORDER BY LIMIT should not use the MemDatabase top-K scan"
+        );
+        let rows = stmt.query().unwrap();
+        assert_eq!(
+            rows[0].values(),
+            &[
+                SqliteValue::Text("a".into()),
+                SqliteValue::Text("first".into()),
+            ]
+        );
+
+        let forced_ops = explain_opcodes(
+            &conn,
+            "SELECT conversation_id
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             ORDER BY conversation_id ASC LIMIT 1;",
+        );
+        assert!(
+            forced_ops.iter().any(|opcode| opcode == "Rewind"),
+            "forced primary-key ORDER BY LIMIT should start at the ordered index edge: {forced_ops:?}"
+        );
+        assert!(
+            !forced_ops.iter().any(|opcode| opcode == "SorterOpen"),
+            "forced primary-key ORDER BY LIMIT should not build a temp sorter: {forced_ops:?}"
         );
     }
 

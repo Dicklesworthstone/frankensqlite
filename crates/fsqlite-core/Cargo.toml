@@ -82,6 +82,7 @@ foldhash = "0.2.0"
 asupersync = { workspace = true }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
 rusqlite = { workspace = true }
 tracing = { workspace = true }

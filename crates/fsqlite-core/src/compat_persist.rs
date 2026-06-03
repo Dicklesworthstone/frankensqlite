@@ -674,7 +674,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             TransactionPageIo::new(&mut txn),
             file_root,
             usable_size,
-            true,
+            !without_rowid,
         );
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
@@ -721,9 +721,32 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             }
             if cursor.first(cx)? {
                 if without_rowid {
-                    return Err(FrankenError::NotImplemented(format!(
-                        "loading populated WITHOUT ROWID table `{table_name_for_err}` is not yet supported"
-                    )));
+                    let mut synthetic_rowid = 1_i64;
+                    let mut payload_buf: Vec<u8> = Vec::new();
+                    loop {
+                        payload_buf.clear();
+                        cursor.payload_into(cx, &mut payload_buf)?;
+                        let mut values = parse_record(&payload_buf).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "WITHOUT ROWID table `{table_name_for_err}` payload is not a valid SQLite record"
+                                ),
+                            }
+                        })?;
+                        inflate_loaded_table_row_values(
+                            &mut values,
+                            synthetic_rowid,
+                            &current_table_schema.columns,
+                            None,
+                            &table_name_for_err,
+                        )?;
+                        mem_table.insert_row(synthetic_rowid, values);
+                        synthetic_rowid = synthetic_rowid.saturating_add(1);
+                        if !cursor.next(cx)? {
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 let mut payload_buf: Vec<u8> = Vec::new();
                 loop {
