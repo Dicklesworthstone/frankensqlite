@@ -3304,9 +3304,10 @@ impl<P: PageReader> BtCursor<P> {
                             // re-descend its leftmost path via the outer loop.
                             let next_child_idx = parent_cell_idx + 1;
                             let child = {
-                                let parent = self.stack.last().ok_or_else(|| {
-                                    FrankenError::internal("cursor stack empty")
-                                })?;
+                                let parent = self
+                                    .stack
+                                    .last()
+                                    .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
                                 Self::child_page_at(parent, next_child_idx)?
                             };
                             if let Some(parent) = self.stack.last_mut() {
@@ -3454,9 +3455,10 @@ impl<P: PageReader> BtCursor<P> {
                             // re-descend its rightmost path via the outer loop.
                             let prev_child_idx = parent_cell_idx - 1;
                             let child = {
-                                let parent = self.stack.last().ok_or_else(|| {
-                                    FrankenError::internal("cursor stack empty")
-                                })?;
+                                let parent = self
+                                    .stack
+                                    .last()
+                                    .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
                                 Self::child_page_at(parent, prev_child_idx)?
                             };
                             if let Some(parent) = self.stack.last_mut() {

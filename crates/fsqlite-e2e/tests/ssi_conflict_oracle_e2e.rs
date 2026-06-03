@@ -203,13 +203,7 @@ fn concurrent_transfers_preserve_total() {
                             format!("UPDATE acct SET bal = bal - {amount} WHERE id = {from};");
                         let credit =
                             format!("UPDATE acct SET bal = bal + {amount} WHERE id = {to};");
-                        let mut ok = true;
-                        if conn.execute(&debit).is_err() {
-                            ok = false;
-                        }
-                        if ok && conn.execute(&credit).is_err() {
-                            ok = false;
-                        }
+                        let ok = conn.execute(&debit).is_ok() && conn.execute(&credit).is_ok();
                         if !ok {
                             let _ = conn.execute("ROLLBACK");
                             attempts += 1;

@@ -1710,7 +1710,6 @@ mod tests {
             initial_reserve_bytes: Some(64 * 1024),
             growth_chunk_bytes: Some(16 * 1024),
             max_bytes: Some(128 * 1024),
-            ..WasmDatabaseOptions::default()
         };
         let conn = open_core_connection_with_options(":memory:", &options)
             .expect("in-memory connection with explicit memory policy should open");

@@ -658,6 +658,12 @@ mod tests {
         }
     }
 
+    fn group_commit_metrics_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
+            .lock()
+            .expect("global group commit metrics test lock poisoned")
+    }
+
     // ── bd-15jh test 1: test_compat_mode_wal_format ──
 
     #[test]
@@ -791,6 +797,7 @@ mod tests {
 
     #[test]
     fn test_native_group_commit() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         // Multiple commits share a single fsync.
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
 
@@ -842,6 +849,7 @@ mod tests {
 
     #[test]
     fn test_native_crash_recovery() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         // Verify recovery at each step of the protocol.
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
 
@@ -888,6 +896,7 @@ mod tests {
 
     #[test]
     fn test_native_concurrent_writers() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         // N writers commit in parallel without serialization on payload.
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 32);
 
@@ -935,6 +944,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_shutdown_rejects_submissions() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
 
         coord.initiate_shutdown();
@@ -946,6 +956,7 @@ mod tests {
 
     #[test]
     fn test_commit_seq_gap_free() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::new(100), 16);
 
         for i in 0..5u8 {
@@ -957,6 +968,7 @@ mod tests {
 
     #[test]
     fn test_commit_time_monotonic() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
 
         // Submit with decreasing wall-clock times
@@ -1103,6 +1115,7 @@ mod tests {
     /// Reduction ratio: 2N / 2 = N (for N >= 6, ratio > 5x).
     #[test]
     fn test_fsync_reduction_proof_deterministic() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 
         // Reset global metrics for this test.
@@ -1159,6 +1172,7 @@ mod tests {
     /// Verify metrics are emitted during submit_and_commit convenience path.
     #[test]
     fn test_submit_and_commit_records_metrics() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 
         GLOBAL_GROUP_COMMIT_METRICS.reset();
@@ -1179,6 +1193,7 @@ mod tests {
     /// Verify FCW conflict increments the metric counter.
     #[test]
     fn test_fcw_conflict_metric() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 
         GLOBAL_GROUP_COMMIT_METRICS.reset();
@@ -1201,6 +1216,7 @@ mod tests {
     /// Verify shutdown rejection increments the metric counter.
     #[test]
     fn test_shutdown_rejection_metric() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 
         GLOBAL_GROUP_COMMIT_METRICS.reset();
@@ -1221,6 +1237,7 @@ mod tests {
     /// Verify flush_batch increments epoch and records metrics.
     #[test]
     fn test_flush_batch_epoch_tracking() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 
         GLOBAL_GROUP_COMMIT_METRICS.reset();
@@ -1258,6 +1275,7 @@ mod tests {
     /// flush_batch on empty batch is a no-op.
     #[test]
     fn test_flush_batch_empty_noop() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
         let results = coord.flush_batch();
         assert!(results.is_empty());
@@ -1267,6 +1285,7 @@ mod tests {
     /// Verify submit_and_commit delegates through flush_batch path.
     #[test]
     fn test_submit_and_commit_uses_flush_batch_epoch() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
         let sub = make_submission(&[1], 0, 1);
         let result = coord.submit_and_commit(sub, 1_000_000);
@@ -1361,6 +1380,7 @@ mod tests {
 
     #[test]
     fn group_commit_batch_is_full_at_max() {
+        let _metrics_guard = group_commit_metrics_test_guard();
         let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 3);
         let base = 1_000_000_u64;
         for i in 0..3u8 {

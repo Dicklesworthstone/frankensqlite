@@ -4467,9 +4467,9 @@ mod tests {
     #[test]
     fn wal_fec_repair_source_all_variants_debug_copy_eq() {
         let variants = [
-            WalFecRepairSource::WalFrame,
-            WalFecRepairSource::RaptorQSymbol,
-            WalFecRepairSource::DbFileReadback,
+            WalFecRepairSource::WalRepairSymbols,
+            WalFecRepairSource::SnapshotRepairSymbols,
+            WalFecRepairSource::WalAndSnapshotRepairSymbols,
         ];
         for (i, v) in variants.iter().enumerate() {
             let copied = *v;
@@ -4478,8 +4478,8 @@ mod tests {
                 assert_eq!(i == j, v == w);
             }
         }
-        let dbg = format!("{:?}", WalFecRepairSource::RaptorQSymbol);
-        assert!(dbg.contains("RaptorQSymbol"));
+        let dbg = format!("{:?}", WalFecRepairSource::SnapshotRepairSymbols);
+        assert!(dbg.contains("SnapshotRepairSymbols"));
     }
 
     #[test]
@@ -4522,7 +4522,11 @@ mod tests {
     #[test]
     fn wal_fec_decode_proof_clone_eq_debug() {
         let proof = WalFecDecodeProof {
-            group_id: WalFecGroupId::new(1, 4),
+            group_id: WalFecGroupId {
+                wal_salt1: 1,
+                wal_salt2: 2,
+                end_frame_no: 4,
+            },
             required_symbols: 4,
             available_symbols: 6,
             validated_source_symbols: 4,

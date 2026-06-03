@@ -1524,6 +1524,18 @@ mod tests {
         page
     }
 
+    fn frame_ref(
+        page_number: u32,
+        page_data: &[u8],
+        db_size_if_commit: u32,
+    ) -> WalAppendFrameRef<'_> {
+        WalAppendFrameRef {
+            page_number,
+            page_data,
+            db_size_if_commit,
+        }
+    }
+
     fn open_wal_file(vfs: &MemoryVfs, cx: &Cx) -> <MemoryVfs as Vfs>::File {
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
         let (file, _) = vfs
@@ -4253,8 +4265,7 @@ mod tests {
             page_size: PAGE_SIZE,
             checkpoint_seq: 7,
             salts: test_salts(),
-            checksum: SqliteWalChecksum(0, 0),
-            db_size: 0,
+            checksum: SqliteWalChecksum { s1: 0, s2: 0 },
         };
         let identity = WalGenerationIdentity::from_header(&header);
         assert_eq!(identity.checkpoint_seq, 7);
@@ -4282,7 +4293,7 @@ mod tests {
         assert_eq!(copied.page_number, 3);
         assert_eq!(copied.db_size_if_commit, 10);
         assert_eq!(copied.page_data[0], 0xAB);
-        let cloned = frame.clone();
+        let cloned = frame;
         assert_eq!(cloned.page_number, frame.page_number);
         let dbg = format!("{frame:?}");
         assert!(dbg.contains("WalAppendFrameRef"));
@@ -4308,11 +4319,11 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
         assert_eq!(wal.page_size(), PAGE_SIZE as usize);
         assert_eq!(wal.frame_count(), 0);
-        assert!(wal.last_commit_frame().is_none());
+        assert!(wal.last_commit_frame(&cx).expect("query").is_none());
         wal.append_frame(&cx, 1, &sample_page(1), 5)
             .expect("append");
         assert_eq!(wal.frame_count(), 1);
-        assert_eq!(wal.last_commit_frame(), Some(0));
+        assert_eq!(wal.last_commit_frame(&cx).expect("query"), Some(0));
         wal.close(&cx).expect("close");
     }
 
@@ -4345,7 +4356,7 @@ mod tests {
         let file = open_wal_file(&vfs, &cx);
         let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
         let hdr = wal.header();
-        assert_eq!(hdr.page_size_raw, PAGE_SIZE);
+        assert_eq!(hdr.page_size, PAGE_SIZE);
         assert_eq!(hdr.salts, test_salts());
         wal.close(&cx).expect("close");
     }
@@ -4370,7 +4381,8 @@ mod tests {
         assert_eq!(wal.last_fsynced_frame_count(), 0);
 
         let page = vec![0xABu8; PAGE_SIZE as usize];
-        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        let frames = [frame_ref(1, &page, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
         assert_eq!(wal.frame_count(), 1);
         assert_eq!(wal.last_fsynced_frame_count(), 0);
 
@@ -4388,7 +4400,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let page = vec![0xCDu8; PAGE_SIZE as usize];
-        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        let frames = [frame_ref(1, &page, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
         wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
             .expect("durable_sync");
         wal.assert_publish_safe(1)
@@ -4414,7 +4427,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let page = vec![0xEFu8; PAGE_SIZE as usize];
-        wal.append_frames(&cx, &[(2, &page, 1)]).expect("append");
+        let frames = [frame_ref(2, &page, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
         wal.durable_sync(&cx, fsqlite_vfs::SyncKind::DataOnly)
             .expect("data-only sync");
         assert_eq!(wal.last_fsynced_frame_count(), 1);
@@ -4429,7 +4443,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let page = vec![0x11u8; PAGE_SIZE as usize];
-        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        let frames = [frame_ref(1, &page, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
         wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
             .expect("durable_sync");
         assert_eq!(wal.last_fsynced_frame_count(), 1);
@@ -4451,7 +4466,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let page = vec![0x22u8; PAGE_SIZE as usize];
-        wal.append_frames(&cx, &[(1, &page, 1)]).expect("append");
+        let frames = [frame_ref(1, &page, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
         wal.durable_sync(&cx, fsqlite_vfs::SyncKind::FullDurable)
             .expect("durable_sync");
         wal.close(&cx).expect("close");
@@ -4476,8 +4492,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let p1 = sample_page(0xAA);
-        wal.append_frames(&cx, &[(1, &p1, 1)])
-            .expect("first append");
+        let first_frames = [frame_ref(1, &p1, 1)];
+        wal.append_frames(&cx, &first_frames).expect("first append");
         wal.durable_sync(&cx, SyncKind::FullDurable)
             .expect("sync first frame");
         assert_eq!(wal.frame_count(), 1);
@@ -4492,8 +4508,9 @@ mod tests {
         );
 
         let p2 = sample_page(0xBB);
+        let second_frames = [frame_ref(2, &p2, 2)];
         let err = wal
-            .append_frames(&cx, &[(2, &p2, 2)])
+            .append_frames(&cx, &second_frames)
             .expect_err("should fail at crash boundary");
         assert!(
             err.to_string().contains("fault_inject"),
@@ -4523,7 +4540,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let p1 = sample_page(0xCC);
-        wal.append_frames(&cx, &[(1, &p1, 1)]).expect("append");
+        let frames = [frame_ref(1, &p1, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
 
         crate::fault_hooks::arm_crash_boundary(
             crate::fault_hooks::CrashBoundary::AfterFsyncBeforePublish,
@@ -4565,7 +4583,8 @@ mod tests {
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let p1 = sample_page(0xDD);
-        wal.append_frames(&cx, &[(1, &p1, 1)]).expect("append");
+        let frames = [frame_ref(1, &p1, 1)];
+        wal.append_frames(&cx, &frames).expect("append");
         wal.durable_sync(&cx, SyncKind::FullDurable).expect("sync");
         assert_eq!(wal.frame_count(), 1);
 
@@ -4629,8 +4648,9 @@ mod tests {
         );
 
         let p1 = sample_page(0xEE);
+        let frames = [frame_ref(1, &p1, 1)];
         let err = wal
-            .append_frames(&cx, &[(1, &p1, 1)])
+            .append_frames(&cx, &frames)
             .expect_err("should fail after append but before fsync");
         assert!(
             err.to_string().contains("fault_inject"),

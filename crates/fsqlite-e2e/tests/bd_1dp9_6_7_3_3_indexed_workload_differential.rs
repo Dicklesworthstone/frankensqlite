@@ -181,7 +181,7 @@ fn seed_data(exec: &dyn Fn(&str)) {
     let categories = ["electronics", "books", "clothing", "food", "toys"];
     for i in 0..200 {
         let cat = categories[i % categories.len()];
-        let price = (i as f64) * 1.5 + 0.99;
+        let price = (i as f64).mul_add(1.5, 0.99);
         let stock = (i * 7 + 3) % 100;
         exec(&format!(
             "INSERT INTO products (id, category, name, price, stock) VALUES ({i}, '{cat}', 'product-{i:04}', {price}, {stock})"

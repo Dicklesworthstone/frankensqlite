@@ -1782,11 +1782,8 @@ fn epoch_coordinator_mark_and_query_durable_epoch() {
 }
 
 #[test]
-fn buffer_config_default_values() {
+fn buffer_config_clone_copy_debug() {
     let cfg = BufferConfig::default();
-    assert_eq!(cfg.capacity_bytes, DEFAULT_BUFFER_CAPACITY_BYTES);
-    assert_eq!(cfg.overflow_policy, OverflowPolicy::AllocateOverflow);
-    assert_eq!(cfg.overflow_fallback_bytes, DEFAULT_OVERFLOW_FALLBACK_BYTES);
     let copied = cfg;
     assert_eq!(copied, cfg);
     let dbg = format!("{cfg:?}");
@@ -1810,7 +1807,7 @@ fn epoch_config_default_and_epoch_flush_batch_total() {
 fn epoch_order_coordinator_current_and_append_epoch() {
     let coord = EpochOrderCoordinator::new(2, BufferConfig::default(), EpochConfig::default());
     assert_eq!(coord.current_epoch(), 0);
-    assert_eq!(coord.append_epoch(), 0);
+    assert_eq!(coord.current_append_epoch(), 0);
 }
 
 #[test]

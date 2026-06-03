@@ -78,18 +78,15 @@ fn dcg_rebuild_fts_does_not_violate_pk() {
     setup(&conn);
 
     for i in 0..4 {
-        conn.execute(&format!(
-            "INSERT INTO commands(command) VALUES ('cmd {i}')"
-        ))
-        .expect("seed insert");
+        conn.execute(&format!("INSERT INTO commands(command) VALUES ('cmd {i}')"))
+            .expect("seed insert");
     }
 
     // Mirror dcg::rebuild_fts: drop trigger, clear external-content index,
     // repopulate row-by-row, recreate trigger.
     conn.execute("DROP TRIGGER IF EXISTS commands_fts_insert")
         .expect("drop trigger");
-    conn.execute("DELETE FROM commands_fts")
-        .expect("clear fts");
+    conn.execute("DELETE FROM commands_fts").expect("clear fts");
 
     let rows = conn
         .query("SELECT id, command FROM commands")

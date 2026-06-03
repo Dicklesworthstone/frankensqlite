@@ -76,13 +76,13 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
         match (frank_rows(f, q), sqlite_rows(r, q)) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(a), Ok(b)) => {
-                mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"))
+                mismatches.push(format!("MISMATCH: {q}\n  frank: {a:?}\n  csql:  {b:?}"));
             }
             (Err(e), Ok(b)) => mismatches.push(format!(
                 "FRANK_ERR: {q}\n  frank: ERROR({e})\n  csql:  {b:?}"
             )),
             (Ok(a), Err(e)) => {
-                mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"))
+                mismatches.push(format!("CSQL_ERR: {q}\n  frank: {a:?}\n  csql: ERROR({e})"));
             }
             (Err(_), Err(_)) => {}
         }

@@ -13,7 +13,7 @@ fn stmts_agreement(stmts: &[&str], label: &str) -> Option<String> {
     for s in &stmts[..stmts.len() - 1] {
         let fe = f.execute(s);
         let re = r.execute_batch(s);
-        if let (Err(_), Ok(_)) | (Ok(_), Err(_)) = (&fe, &re) {
+        if let (Err(_), Ok(())) | (Ok(_), Err(_)) = (&fe, &re) {
             return Some(format!("{label} setup: disagreement on `{s}`"));
         }
     }

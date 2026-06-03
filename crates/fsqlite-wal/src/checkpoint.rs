@@ -578,7 +578,7 @@ mod tests {
             oldest_reader_frame: Some(75),
         };
         let copied = state;
-        let cloned = state.clone();
+        let cloned = state;
         assert_eq!(copied, cloned);
         let dbg = format!("{state:?}");
         assert!(dbg.contains("CheckpointState"));

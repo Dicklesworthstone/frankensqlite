@@ -1007,7 +1007,8 @@ mod tests {
         buf[WAL_INDEX_HDR_BYTES..].fill(0xBB);
         assert!(!wal_index_hdr_copies_match(&buf));
 
-        buf[WAL_INDEX_HDR_BYTES..].copy_from_slice(&buf[..WAL_INDEX_HDR_BYTES].to_vec());
+        let (first, second) = buf.split_at_mut(WAL_INDEX_HDR_BYTES);
+        second.copy_from_slice(first);
         assert!(wal_index_hdr_copies_match(&buf));
 
         assert!(!wal_index_hdr_copies_match(&[0u8; WAL_INDEX_HDR_BYTES - 1]));

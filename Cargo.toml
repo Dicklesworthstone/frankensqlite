@@ -69,6 +69,7 @@ assertions_on_constants = { level = "allow", priority = 1 }
 bool_to_int_with_if = { level = "allow", priority = 1 }
 case_sensitive_file_extension_comparisons = { level = "allow", priority = 1 }
 collection_is_never_read = { level = "allow", priority = 1 }
+doc_lazy_continuation = { level = "allow", priority = 1 }
 explicit_iter_loop = { level = "allow", priority = 1 }
 float_cmp = { level = "allow", priority = 1 }
 format_push_string = { level = "allow", priority = 1 }
@@ -83,6 +84,7 @@ redundant_clone = { level = "allow", priority = 1 }
 redundant_closure_for_method_calls = { level = "allow", priority = 1 }
 return_self_not_must_use = { level = "allow", priority = 1 }
 single_char_pattern = { level = "allow", priority = 1 }
+semicolon_if_nothing_returned = { level = "allow", priority = 1 }
 single_match = { level = "allow", priority = 1 }
 stable_sort_primitive = { level = "allow", priority = 1 }
 used_underscore_binding = { level = "allow", priority = 1 }

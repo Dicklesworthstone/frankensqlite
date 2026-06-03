@@ -477,8 +477,6 @@ mod tests {
         let a = c(5, 0.8, 3);
         let b = a;
         assert_eq!(a, b, "Copy must produce equal value");
-        let cloned = a.clone();
-        assert_eq!(a, cloned, "Clone must produce equal value");
         let dbg = format!("{a:?}");
         assert!(dbg.contains("Candidate"));
         assert!(dbg.contains("hit_prob"));
@@ -498,7 +496,7 @@ mod tests {
     fn objective_same_group_penalty_exact() {
         let sel = [c(1, 0.8, 0), c(2, 0.6, 0)];
         let val = objective(&sel, 0.25);
-        let expected = (0.8 + 0.6) - 0.25 * (0.8 * 0.6);
+        let expected = 0.25_f64.mul_add(-(0.8 * 0.6), 0.8 + 0.6);
         assert!(
             (val - expected).abs() < 1e-12,
             "expected {expected}, got {val}"

@@ -370,12 +370,10 @@ fn t5_concurrent_trigger_savepoint_storm() {
                             if let Ok(rows) = conn
                                 .query(&format!("SELECT balance FROM accounts WHERE id = {from}"))
                             {
-                                if !rows.is_empty() {
-                                    conn.execute("RELEASE sp").ok();
-                                } else {
+                                if rows.is_empty() {
                                     conn.execute("ROLLBACK TO sp").ok();
-                                    conn.execute("RELEASE sp").ok();
                                 }
+                                conn.execute("RELEASE sp").ok();
                             }
                         }
                         if conn.execute("COMMIT").is_ok() {

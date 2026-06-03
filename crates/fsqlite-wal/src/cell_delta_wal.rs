@@ -897,8 +897,10 @@ mod tests {
 
     #[test]
     fn test_extract_page_number_legacy_marker_with_embedded_zero() {
-        let marker = LEGACY_CELL_DELTA_FRAME_MARKER | 0;
-        assert_eq!(extract_page_number_from_marker(marker), None);
+        assert_eq!(
+            extract_page_number_from_marker(LEGACY_CELL_DELTA_FRAME_MARKER),
+            None
+        );
     }
 
     #[test]
@@ -1158,10 +1160,12 @@ mod tests {
 
     #[test]
     fn wal_recovery_summary_debug_and_clone() {
-        let mut s = WalRecoverySummary::default();
-        s.full_page_frames = 10;
-        s.cell_delta_frames = 5;
-        s.checksum_errors = 1;
+        let s = WalRecoverySummary {
+            full_page_frames: 10,
+            cell_delta_frames: 5,
+            checksum_errors: 1,
+            ..WalRecoverySummary::default()
+        };
         let dbg = format!("{s:?}");
         assert!(dbg.contains("WalRecoverySummary"));
         let cloned = s.clone();
@@ -1181,9 +1185,11 @@ mod tests {
 
     #[test]
     fn wal_recovery_summary_log_does_not_panic() {
-        let mut s = WalRecoverySummary::default();
-        s.full_page_frames = 100;
-        s.cell_data_bytes = 4096;
+        let s = WalRecoverySummary {
+            full_page_frames: 100,
+            cell_data_bytes: 4096,
+            ..WalRecoverySummary::default()
+        };
         s.log_summary();
     }
 }

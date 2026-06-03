@@ -18596,7 +18596,7 @@ impl Connection {
                 FrankenError::internal("prepared direct insert missing active transaction")
             })?;
             let cursor_setup_start = profile_enabled.then(Instant::now);
-            let mut cursor = Connection::new_header_btree_cursor(
+            let mut cursor = Self::new_header_btree_cursor(
                 txn,
                 root,
                 direct.cursor_page_size,
@@ -18718,7 +18718,7 @@ impl Connection {
             let txn = active_txn.as_mut().ok_or_else(|| {
                 FrankenError::internal("prepared direct update missing active transaction")
             })?;
-            let mut cursor = Connection::new_header_btree_cursor(
+            let mut cursor = Self::new_header_btree_cursor(
                 txn,
                 root,
                 direct.cursor_page_size,
@@ -19107,7 +19107,7 @@ impl Connection {
             let txn = active_txn.as_mut().ok_or_else(|| {
                 FrankenError::internal("prepared direct delete missing active transaction")
             })?;
-            let mut cursor = Connection::new_header_btree_cursor(
+            let mut cursor = Self::new_header_btree_cursor(
                 txn,
                 root,
                 direct.cursor_page_size,
@@ -33225,7 +33225,7 @@ impl Connection {
         } else {
             let mut active_txn = self.active_txn.borrow_mut();
             if let Some(txn) = active_txn.as_mut() {
-                let mut cursor = Connection::new_header_btree_cursor(
+                let mut cursor = Self::new_header_btree_cursor(
                     txn,
                     root,
                     run.cursor_page_size,
@@ -33449,7 +33449,7 @@ impl Connection {
                         "table",
                     ) {
                         Ok(root) => {
-                            let mut cursor = Connection::new_header_btree_cursor(
+                            let mut cursor = Self::new_header_btree_cursor(
                                 txn,
                                 root,
                                 cursor_page_size,
@@ -33485,7 +33485,7 @@ impl Connection {
                                 break;
                             }
                         };
-                        let mut cursor = Connection::new_header_btree_cursor(
+                        let mut cursor = Self::new_header_btree_cursor(
                             txn,
                             root,
                             run.cursor_page_size,
@@ -34114,7 +34114,7 @@ impl Connection {
         } else {
             let mut active_txn = self.active_txn.borrow_mut();
             if let Some(txn) = active_txn.as_mut() {
-                let mut cursor = Connection::new_header_btree_cursor(
+                let mut cursor = Self::new_header_btree_cursor(
                     txn,
                     root,
                     run.cursor_page_size,
@@ -42972,7 +42972,7 @@ impl Connection {
             let max_payload_columns = table.columns.len();
 
             if uses_index_btree {
-                let mut cursor = Connection::new_header_btree_cursor(
+                let mut cursor = Self::new_header_btree_cursor(
                     txn,
                     root_page,
                     page_size,
@@ -43056,7 +43056,7 @@ impl Connection {
                     .as_ref()
                     .and_then(|map| map.get(&table.root_page))
                     .map(Vec::as_slice);
-                let mut cursor = Connection::new_header_btree_cursor(
+                let mut cursor = Self::new_header_btree_cursor(
                     txn,
                     root_page,
                     page_size,
@@ -43162,7 +43162,7 @@ impl Connection {
                         })?;
 
                     let mut actual_rowids = HashSet::new();
-                    let mut cursor = Connection::new_header_btree_index_cursor(
+                    let mut cursor = Self::new_header_btree_index_cursor(
                         txn,
                         index_root,
                         page_size,
@@ -43303,7 +43303,7 @@ impl Connection {
                         ),
                     })?;
 
-                let mut cursor = Connection::new_header_btree_index_cursor(
+                let mut cursor = Self::new_header_btree_index_cursor(
                     txn,
                     index_root,
                     page_size,
@@ -56728,7 +56728,7 @@ impl Connection {
                 let file_root = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
                     .unwrap_or(PageNumber::ONE);
 
-                let mut cursor = Connection::new_header_btree_cursor(
+                let mut cursor = Self::new_header_btree_cursor(
                     txn,
                     file_root,
                     page_size,

@@ -233,17 +233,18 @@ fn p2_all_five_signatures_distinct() {
         let dir = fresh_output_dir(&format!("p2_sig_{i}"));
         let mut full_args: Vec<&str> = vec!["--mode", "fsqlite_mvcc"];
         full_args.extend_from_slice(args);
-        if *expected == "fail.shadow_divergence" {
+        let counterexample_bundle = if *expected == "fail.shadow_divergence" {
             let cx_path_str = dir.join("cx.json");
-            let cx_str = cx_path_str.to_str().unwrap().to_owned();
-            full_args.push("--counterexample-bundle");
-            full_args.push(&cx_str);
-            let out = run_verify_suite(&full_args, &dir);
-            assert!(out.status.success(), "combo {i} failed: {}", out.status);
+            Some(cx_path_str.to_str().unwrap().to_owned())
         } else {
-            let out = run_verify_suite(&full_args, &dir);
-            assert!(out.status.success(), "combo {i} failed: {}", out.status);
+            None
+        };
+        if let Some(cx_str) = counterexample_bundle.as_deref() {
+            full_args.push("--counterexample-bundle");
+            full_args.push(cx_str);
         }
+        let out = run_verify_suite(&full_args, &dir);
+        assert!(out.status.success(), "combo {i} failed: {}", out.status);
         let pkg = load_package_json(&dir);
         let sig = pkg["pass_fail_signature"].as_str().unwrap().to_owned();
         assert_eq!(&sig, *expected, "combo {i}: expected {expected}, got {sig}");

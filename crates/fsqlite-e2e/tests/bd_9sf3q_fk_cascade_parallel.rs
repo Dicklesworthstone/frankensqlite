@@ -296,14 +296,12 @@ fn f3_cascade_same_parent_contention() {
                     }
 
                     // Occasionally delete the parent (cascade) then re-add
-                    if local_ops % 50 == 0 {
-                        if conn.execute("BEGIN").is_ok() {
-                            conn.execute("DELETE FROM parents WHERE id = 1").ok();
-                            conn.execute("INSERT OR IGNORE INTO parents VALUES (1, 'hot_parent')")
-                                .ok();
-                            if conn.execute("COMMIT").is_err() {
-                                conn.execute("ROLLBACK").ok();
-                            }
+                    if local_ops % 50 == 0 && conn.execute("BEGIN").is_ok() {
+                        conn.execute("DELETE FROM parents WHERE id = 1").ok();
+                        conn.execute("INSERT OR IGNORE INTO parents VALUES (1, 'hot_parent')")
+                            .ok();
+                        if conn.execute("COMMIT").is_err() {
+                            conn.execute("ROLLBACK").ok();
                         }
                     }
                     local_ops += 1;
@@ -469,13 +467,11 @@ fn f5_rapid_parent_delete_reinsert() {
             }
 
             // Every 10th op, delete a parent (cascade children)
-            if ops % 10 == 0 {
-                if conn.execute("BEGIN").is_ok() {
-                    conn.execute(&format!("DELETE FROM parents WHERE id = {pid}"))
-                        .ok();
-                    if conn.execute("COMMIT").is_err() {
-                        conn.execute("ROLLBACK").ok();
-                    }
+            if ops % 10 == 0 && conn.execute("BEGIN").is_ok() {
+                conn.execute(&format!("DELETE FROM parents WHERE id = {pid}"))
+                    .ok();
+                if conn.execute("COMMIT").is_err() {
+                    conn.execute("ROLLBACK").ok();
                 }
             }
             ops += 1;

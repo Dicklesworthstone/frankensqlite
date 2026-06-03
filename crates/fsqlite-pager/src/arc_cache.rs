@@ -4021,8 +4021,7 @@ mod tests {
         assert!(dbg.contains("CacheMetricsSnapshot"));
         let copied = snap;
         assert_eq!(copied, snap);
-        let cloned = snap.clone();
-        assert_eq!(cloned.hits, 1);
+        assert_eq!(snap.hits, 1);
     }
 
     #[test]

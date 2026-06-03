@@ -361,12 +361,10 @@ fn s5_savepoint_register_unregister_churn() {
                             .ok();
 
                             // Alternate between release and rollback
-                            if local_ops % 2 == 0 {
-                                conn.execute("RELEASE sp1").ok();
-                            } else {
+                            if local_ops % 2 != 0 {
                                 conn.execute("ROLLBACK TO sp1").ok();
-                                conn.execute("RELEASE sp1").ok();
                             }
+                            conn.execute("RELEASE sp1").ok();
                         }
 
                         if local_ops % 3 == 0 {

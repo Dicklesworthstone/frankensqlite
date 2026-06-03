@@ -87,7 +87,8 @@ fn database_list_main_only() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
     // Creating a table doesn't add a database row.
-    for s in ["CREATE TABLE t (a INTEGER)"] {
+    {
+        let s = "CREATE TABLE t (a INTEGER)";
         f.execute(s).unwrap();
         r.execute_batch(s).unwrap();
     }
@@ -106,7 +107,8 @@ fn database_list_main_only() {
 fn database_list_after_attach() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in ["ATTACH ':memory:' AS aux"] {
+    {
+        let s = "ATTACH ':memory:' AS aux";
         f.execute(s).unwrap();
         r.execute_batch(s).unwrap();
     }

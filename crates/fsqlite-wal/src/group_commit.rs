@@ -2535,15 +2535,19 @@ mod tests {
 
     #[test]
     fn transaction_conflict_snapshot_debug_clone_copy_eq() {
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 0,
+            salts: WalSalts { salt1: 0, salt2: 0 },
+        };
         let a = TransactionConflictSnapshot {
-            generation: WalGenerationIdentity::default(),
+            generation,
             last_commit_frame: Some(42),
             commit_count: 7,
         };
         let copied = a;
         assert_eq!(copied, a);
         let b = TransactionConflictSnapshot {
-            generation: WalGenerationIdentity::default(),
+            generation,
             last_commit_frame: None,
             commit_count: 7,
         };

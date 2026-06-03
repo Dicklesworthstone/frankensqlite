@@ -78,12 +78,10 @@ fn d1_concurrent_txns_no_deadlock_during_gc() {
                                 "UPDATE items SET val = 'v{local_ops}' WHERE id = {row}"
                             ))
                             .ok();
-                            if local_ops % 3 == 0 {
+                            let should_rollback =
+                                local_ops % 3 == 0 || conn.execute("COMMIT").is_err();
+                            if should_rollback {
                                 conn.execute("ROLLBACK").ok();
-                            } else {
-                                if conn.execute("COMMIT").is_err() {
-                                    conn.execute("ROLLBACK").ok();
-                                }
                             }
                             local_ops += 1;
                         }

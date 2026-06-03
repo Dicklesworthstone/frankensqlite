@@ -26,6 +26,16 @@ const BEAD_ID: &str = "bd-nsvud";
 const REPLAY_CMD: &str =
     "cargo test -p fsqlite-e2e --test bd_nsvud_value_slab_e2e -- --nocapture --test-threads=1";
 
+type MixedOracleRow = (
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<f64>,
+    String,
+    Option<Vec<u8>>,
+    Option<String>,
+);
+
 fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     eprintln!(
         "VALUE_SLAB_E2E:{}",
@@ -49,10 +59,7 @@ fn integer_value(
     }
 }
 
-fn text_value<'a>(
-    value: &'a fsqlite_types::value::SqliteValue,
-    context: String,
-) -> Result<&'a str, String> {
+fn text_value(value: &fsqlite_types::value::SqliteValue, context: String) -> Result<&str, String> {
     match value {
         fsqlite_types::value::SqliteValue::Text(s) => Ok(s.as_str()),
         other => Err(format!("{context}: expected text, got {other:?}")),
@@ -244,15 +251,7 @@ fn e2_mixed_types() -> Result<(), String> {
             "SELECT id, int_col, text_col, real_col, typeof(real_col), blob_col, null_col FROM mixed ORDER BY id",
         )
         .expect("fsqlite select");
-    let c_rows: Vec<(
-        i64,
-        Option<i64>,
-        Option<String>,
-        Option<f64>,
-        String,
-        Option<Vec<u8>>,
-        Option<String>,
-    )> = {
+    let c_rows: Vec<MixedOracleRow> = {
         let mut stmt = cconn
             .prepare(
                 "SELECT id, int_col, text_col, real_col, typeof(real_col), blob_col, null_col FROM mixed ORDER BY id",

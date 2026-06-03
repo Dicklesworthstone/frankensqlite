@@ -298,7 +298,11 @@ fn q4_remove_and_reclaim() {
         (page_count - removed) as usize,
         "[Q4] cache len after removal"
     );
-    assert_eq!(odd_ok, (page_count + 1) / 2, "[Q4] odd pages should remain");
+    assert_eq!(
+        odd_ok,
+        page_count.div_ceil(2),
+        "[Q4] odd pages should remain"
+    );
     assert_eq!(even_gone, page_count / 2, "[Q4] even pages should be gone");
 }
 

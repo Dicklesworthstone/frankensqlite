@@ -548,8 +548,7 @@ fn concurrent_writers_with_index_parity() {
     {
         let r = rusqlite::Connection::open(&r_path).unwrap();
         r.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        for tid in 0..n_threads {
-            let cat = categories[tid];
+        for (tid, cat) in categories.iter().copied().enumerate().take(n_threads) {
             for i in 0..rows_per_thread {
                 let pk = tid * rows_per_thread + i;
                 r.execute_batch(&format!(

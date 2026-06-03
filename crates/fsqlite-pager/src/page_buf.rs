@@ -798,8 +798,7 @@ mod tests {
         assert!(dbg.contains("PageBufPoolMetricsSnapshot"));
         let copied = snap;
         assert_eq!(copied, snap);
-        let cloned = snap.clone();
-        assert_eq!(cloned.page_buffer_pool_hits, 10);
+        assert_eq!(snap.page_buffer_pool_hits, 10);
     }
 
     #[test]

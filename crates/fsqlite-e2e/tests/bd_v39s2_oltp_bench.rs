@@ -24,7 +24,7 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if lo == hi {
         sorted[lo]
     } else {
-        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+        sorted[hi].mul_add(frac, sorted[lo] * (1.0 - frac))
     }
 }
 
@@ -38,7 +38,9 @@ fn jain_fairness(values: &[f64]) -> f64 {
     if sum_sq <= 0.0 {
         return 1.0;
     }
-    (sum * sum) / (n * sum_sq)
+    let numerator = sum * sum;
+    let denominator = n * sum_sq;
+    numerator / denominator
 }
 
 fn compute_latency_stats(mut latencies_ns: Vec<u64>) -> (u64, f64, f64, f64, f64) {

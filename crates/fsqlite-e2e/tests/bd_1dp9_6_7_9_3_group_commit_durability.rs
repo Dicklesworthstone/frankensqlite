@@ -98,7 +98,9 @@ fn jains_fairness_index(values: &[f64]) -> f64 {
     if sum_sq == 0.0 {
         return 1.0;
     }
-    (sum * sum) / (n * sum_sq)
+    let numerator = sum * sum;
+    let denominator = n * sum_sq;
+    numerator / denominator
 }
 
 #[derive(Debug, Clone)]

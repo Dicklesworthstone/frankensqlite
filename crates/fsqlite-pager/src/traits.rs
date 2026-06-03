@@ -1791,9 +1791,7 @@ mod tests {
     fn test_journal_mode_debug_clone_copy_eq() {
         let a = JournalMode::Wal;
         let b = a;
-        let c = a.clone();
         assert_eq!(a, b);
-        assert_eq!(a, c);
         assert_ne!(JournalMode::Delete, JournalMode::Wal);
         let dbg = format!("{a:?}");
         assert!(dbg.contains("Wal"));
@@ -1828,8 +1826,7 @@ mod tests {
             index_is_partial: false,
         };
         let copied = snap;
-        let cloned = snap.clone();
-        assert_eq!(copied, cloned);
+        assert_eq!(copied, snap);
         let dbg = format!("{snap:?}");
         assert!(dbg.contains("WalPublicationSnapshot"));
         assert!(dbg.contains("publication_seq"));
@@ -1940,8 +1937,8 @@ mod tests {
             seed: PreparedWalChecksumSeed { s1: 10, s2: 20 },
         };
         assert_ne!(def, other);
-        let cloned = other.clone();
-        assert_eq!(cloned, other);
+        let copied = other;
+        assert_eq!(copied, other);
         let dbg = format!("{other:?}");
         assert!(dbg.contains("PreparedWalFinalizationState"));
     }

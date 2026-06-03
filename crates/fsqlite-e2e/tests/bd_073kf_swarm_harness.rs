@@ -166,7 +166,7 @@ fn p5_jsonl_lines_contain_required_fields() {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
         .collect();
 
     // Find the first run directory (there should be exactly one)

@@ -519,7 +519,7 @@ fn l9_commit_profile_evidence_pack() {
     for i in 0..1000 {
         let cat = ["alpha", "beta", "gamma"][i % 3];
         let payload = format!("evidence_row_{i:06}");
-        let score = (i as f64) * 0.7 + 3.14;
+        let score = (i as f64).mul_add(0.7, 3.14);
         conn.execute(&format!(
             "INSERT INTO evidence VALUES ({i}, '{cat}', '{payload}', {score})"
         ))

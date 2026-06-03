@@ -70,34 +70,6 @@ fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     );
 }
 
-macro_rules! oracle_assert_rows_eq {
-    ($test:expr, $label:expr, $f_rows:expr, $c_rows:expr) => {{
-        assert_eq!(
-            $f_rows.len(),
-            $c_rows.len(),
-            "[{}] {} row count mismatch: fsqlite={} csqlite={}",
-            $test,
-            $label,
-            $f_rows.len(),
-            $c_rows.len()
-        );
-        for (i, (f, c)) in $f_rows.iter().zip($c_rows.iter()).enumerate() {
-            let f_vals = f.values();
-            let c_vals: Vec<fsqlite_types::value::SqliteValue> = (0..c.as_ref().column_count())
-                .map(|col| csqlite_val_to_fsqlite(c.as_ref(), col))
-                .collect();
-            assert_eq!(
-                f_vals.as_ref(),
-                c_vals.as_slice(),
-                "[{}] {} row {} mismatch",
-                $test,
-                $label,
-                i
-            );
-        }
-    }};
-}
-
 fn csqlite_val_to_fsqlite(
     row: &rusqlite::Row<'_>,
     col: usize,
@@ -115,32 +87,6 @@ fn csqlite_val_to_fsqlite(
 
 struct OracleRow {
     vals: Vec<fsqlite_types::value::SqliteValue>,
-}
-
-impl OracleRow {
-    fn column_count(&self) -> usize {
-        self.vals.len()
-    }
-}
-
-impl AsRef<OracleRow> for OracleRow {
-    fn as_ref(&self) -> &Self {
-        self
-    }
-}
-
-impl OracleRow {
-    fn get_ref(&self, col: usize) -> Result<rusqlite::types::ValueRef<'_>, rusqlite::Error> {
-        Ok(match &self.vals[col] {
-            fsqlite_types::value::SqliteValue::Null => rusqlite::types::ValueRef::Null,
-            fsqlite_types::value::SqliteValue::Integer(n) => rusqlite::types::ValueRef::Integer(*n),
-            fsqlite_types::value::SqliteValue::Float(f) => rusqlite::types::ValueRef::Real(*f),
-            fsqlite_types::value::SqliteValue::Text(s) => {
-                rusqlite::types::ValueRef::Text(s.as_str().as_bytes())
-            }
-            fsqlite_types::value::SqliteValue::Blob(b) => rusqlite::types::ValueRef::Blob(b),
-        })
-    }
 }
 
 fn csqlite_query(conn: &rusqlite::Connection, sql: &str) -> Vec<OracleRow> {
@@ -173,7 +119,7 @@ fn assert_fsqlite_csqlite_eq(
     for (i, (f, c)) in f_rows.iter().zip(c_rows.iter()).enumerate() {
         let f_vals = f.values();
         assert_eq!(
-            f_vals.as_ref(),
+            f_vals,
             c.vals.as_slice(),
             "[{test_name}] {label} row {i} mismatch"
         );

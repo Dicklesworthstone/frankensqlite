@@ -1083,7 +1083,7 @@ mod tests {
         };
         let copied = entry;
         assert_eq!(entry, copied);
-        let cloned = entry.clone();
+        let cloned = entry;
         assert_eq!(entry, cloned);
         let dbg = format!("{entry:?}");
         assert!(dbg.contains("PidOwnedLockEntry"));
@@ -1148,13 +1148,19 @@ mod tests {
     fn expected_page_checksum_debug_clone_copy_eq() {
         let a = ExpectedPageChecksum {
             page: PageNumber::new(5).unwrap(),
-            checksum: crate::checksum::Xxh3Checksum128(0xAA, 0xBB),
+            checksum: crate::checksum::Xxh3Checksum128 {
+                low: 0xAA,
+                high: 0xBB,
+            },
         };
         let copied = a;
         assert_eq!(copied, a);
         let b = ExpectedPageChecksum {
             page: PageNumber::new(6).unwrap(),
-            checksum: crate::checksum::Xxh3Checksum128(0xAA, 0xBB),
+            checksum: crate::checksum::Xxh3Checksum128 {
+                low: 0xAA,
+                high: 0xBB,
+            },
         };
         assert_ne!(a, b);
         let dbg = format!("{a:?}");

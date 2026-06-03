@@ -129,21 +129,21 @@ fn delete_all_then_reinsert_contentless() {
     let hits = conn
         .query("SELECT rowid FROM t WHERE t MATCH 'redoc'")
         .expect("match redoc");
-    assert_eq!(hits.len(), 3, "[contentless] new content must be searchable");
+    assert_eq!(
+        hits.len(),
+        3,
+        "[contentless] new content must be searchable"
+    );
 }
 
 /// External-content FTS5: `fts5(c, content='base', content_rowid='id')`.
 #[test]
 fn delete_all_then_reinsert_external() {
     let conn = Connection::open(":memory:").expect("open");
-    conn.execute(
-        "CREATE TABLE base (id INTEGER PRIMARY KEY AUTOINCREMENT, command TEXT NOT NULL)",
-    )
-    .expect("create base");
-    conn.execute(
-        "CREATE VIRTUAL TABLE t USING fts5(command, content='base', content_rowid='id')",
-    )
-    .expect("create external fts5");
+    conn.execute("CREATE TABLE base (id INTEGER PRIMARY KEY AUTOINCREMENT, command TEXT NOT NULL)")
+        .expect("create base");
+    conn.execute("CREATE VIRTUAL TABLE t USING fts5(command, content='base', content_rowid='id')")
+        .expect("create external fts5");
 
     for i in 1..=3 {
         conn.execute_with_params(

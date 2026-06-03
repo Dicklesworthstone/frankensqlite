@@ -415,7 +415,6 @@ fn w3_window_lag_lead() {
     for (i, (f_row, c_row)) in f_rows.iter().zip(c_rows.iter()).enumerate() {
         let f_lag = match f_row.get(2) {
             Some(SqliteValue::Integer(v)) => Some(*v),
-            Some(SqliteValue::Null) | None => None,
             _ => None,
         };
         assert_eq!(

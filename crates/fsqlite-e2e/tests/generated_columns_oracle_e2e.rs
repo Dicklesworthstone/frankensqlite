@@ -199,7 +199,8 @@ fn generated_explicit_value_rejected() {
     // Supplying a value for a generated column must error on both engines.
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in ["CREATE TABLE t (a INTEGER, c INTEGER AS (a + 1) VIRTUAL)"] {
+    {
+        let s = "CREATE TABLE t (a INTEGER, c INTEGER AS (a + 1) VIRTUAL)";
         let fe = f.execute(s);
         let re = r.execute_batch(s);
         assert!(

@@ -2173,9 +2173,10 @@ impl Fts5ShadowRows {
 
 /// Lazy on-disk access to a persisted FTS5 table's shadow b-trees, so a
 /// reopened index can be answered by reading ONLY what a query needs instead
-/// of rebuilding the whole in-memory index. Implemented by the host
-/// (fsqlite-core) over a live read transaction and consumed by the lazy query
-/// path. Keys are the shadow tables' own keys:
+/// of rebuilding the whole in-memory index.
+///
+/// Implemented by the host (fsqlite-core) over a live read transaction and
+/// consumed by the lazy query path. Keys are the shadow tables' own keys:
 /// - `_data`: id 1 = averages, 10 = structure, else `fts5_data_rowid(...)`.
 /// - `_docsize` / `_content`: the document rowid.
 ///
@@ -2234,10 +2235,11 @@ fn lazy_segment_exact_postings(
 
 /// Lazily collect doclist entries (FTS5 delete markers filtered out) for an
 /// exact `term` across every on-disk segment of `structure`, reading leaf pages
-/// on demand via `reader`. Parity counterpart of `Fts5ShadowQuery::exact_entries`
-/// for the lazy (reopened) path — the in-memory and lazy paths produce the same
-/// entries because both decode identical on-disk leaves; only the block source
-/// differs.
+/// on demand via `reader`.
+///
+/// Parity counterpart of `Fts5ShadowQuery::exact_entries` for the lazy
+/// (reopened) path. The in-memory and lazy paths produce the same entries
+/// because both decode identical on-disk leaves; only the block source differs.
 pub fn lazy_exact_doclist_entries(
     reader: &mut dyn Fts5OnDiskReader,
     structure: &Fts5StructureRecord,
@@ -2262,10 +2264,13 @@ pub fn lazy_exact_doclist_entries(
 }
 
 /// Decode an FTS5 `_docsize.sz` blob into per-column token counts. The blob is
-/// a sequence of varints (one per stored column). The result is normalized to
-/// exactly `column_count` entries: indexed columns are stored first, so any
-/// trailing UNINDEXED columns are correctly padded with zero, and a malformed
-/// or truncated blob degrades to zero lengths rather than failing the open.
+/// a sequence of varints (one per stored column).
+///
+/// The result is normalized to exactly `column_count` entries: indexed columns
+/// are stored first, so any trailing UNINDEXED columns are correctly padded
+/// with zero, and a malformed or truncated blob degrades to zero lengths
+/// rather than failing the open.
+///
 /// Validated against real cass `_docsize` blobs (e.g. `01010202130000` ->
 /// `[1,1,2,2,19,0,0]`; multi-byte `82081301050D0000` -> `[264,19,1,5,13,0,0]`).
 #[must_use]

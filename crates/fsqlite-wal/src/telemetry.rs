@@ -668,6 +668,9 @@ mod tests {
 
     #[test]
     fn composite_snapshot_captures_all_globals() {
+        let _group_metrics_guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
+            .lock()
+            .expect("global group commit metrics test lock poisoned");
         let _guard = crate::group_commit::GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
             .lock()
             .expect("global consolidation metrics test lock poisoned");
@@ -786,6 +789,9 @@ mod tests {
 
     #[test]
     fn wal_telemetry_snapshot_debug_and_serialize() {
+        let _group_metrics_guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
+            .lock()
+            .expect("global group commit metrics test lock poisoned");
         let _guard = crate::group_commit::GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
             .lock()
             .expect("lock");
@@ -819,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_buffer_wraps_at_capacity() {
+    fn ring_buffer_wraps_at_capacity_with_uniform_events() {
         let rb = WalTelemetryRingBuffer::new(2);
         for i in 0..5u64 {
             rb.on_event(&WalTelemetryEvent::WalReset {

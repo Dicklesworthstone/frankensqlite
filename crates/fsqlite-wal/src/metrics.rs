@@ -9,6 +9,8 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use serde::Serialize;
 
@@ -367,6 +369,10 @@ impl fmt::Display for WalRecoveryCountersSnapshot {
 
 /// Global group commit metrics singleton.
 pub static GLOBAL_GROUP_COMMIT_METRICS: GroupCommitMetrics = GroupCommitMetrics::new();
+
+#[cfg(test)]
+pub(crate) static GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK: LazyLock<Mutex<()>> =
+    LazyLock::new(|| Mutex::new(()));
 
 /// Atomic counters tracking parallel WAL group commit activity.
 pub struct GroupCommitMetrics {
@@ -998,21 +1004,25 @@ mod tests {
         };
         let display = format!("{snap}");
         assert!(display.contains("recovery_frames=50"));
-        assert!(display.contains("corruption=2"));
+        assert!(display.contains("corruption_detected=2"));
     }
 
     #[test]
     fn group_commit_snapshot_display() {
         let snap = GroupCommitMetricsSnapshot {
-            groups_flushed: 10,
-            frames_flushed: 200,
-            batches_consolidated: 15,
-            sync_count: 10,
-            bytes_flushed: 819200,
-            flush_duration_us_total: 5000,
+            group_commits_total: 10,
+            group_commit_size_sum: 200,
+            submissions_total: 15,
+            commit_latency_us_total: 5000,
+            fsync1_total: 10,
+            fsync2_total: 10,
+            fcw_conflicts_total: 1,
+            ssi_conflicts_total: 2,
+            shutdown_rejections_total: 3,
         };
         let display = format!("{snap}");
-        assert!(display.contains("groups_flushed=10"));
-        assert!(display.contains("frames_flushed=200"));
+        assert!(display.contains("group_commits=10"));
+        assert!(display.contains("size_sum=200"));
+        assert!(display.contains("shutdown_rejections=3"));
     }
 }

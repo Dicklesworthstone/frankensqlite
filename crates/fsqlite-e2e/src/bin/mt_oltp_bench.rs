@@ -192,7 +192,7 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     if lo == hi {
         sorted[lo]
     } else {
-        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+        sorted[hi].mul_add(frac, sorted[lo] * (1.0 - frac))
     }
 }
 
@@ -230,7 +230,9 @@ fn jain_fairness(values: &[f64]) -> f64 {
     if sum_sq <= 0.0 {
         return 1.0;
     }
-    (sum * sum) / (n * sum_sq)
+    let numerator = sum * sum;
+    let denominator = n * sum_sq;
+    numerator / denominator
 }
 
 fn median_of(mut values: Vec<f64>) -> f64 {
@@ -382,7 +384,6 @@ fn run_fsqlite_iter(
                             }
                             Err(e) if e.is_transient() => {
                                 thread::sleep(Duration::from_micros(100));
-                                continue;
                             }
                             Err(_) => break,
                         }

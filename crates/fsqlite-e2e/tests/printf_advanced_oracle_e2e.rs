@@ -98,7 +98,7 @@ fn printf_quote_q() {
 }
 
 #[test]
-fn printf_quote_Q_and_w() {
+fn printf_quote_q_and_w() {
     assert_scalar(
         &[
             "SELECT printf('%Q', 'hi')",       // 'hi' (with surrounding quotes)

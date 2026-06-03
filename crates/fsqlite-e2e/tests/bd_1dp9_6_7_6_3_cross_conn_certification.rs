@@ -780,7 +780,9 @@ fn c2_concurrent_writer_fairness() {
     let sum: f64 = per_thread.iter().map(|&x| x as f64).sum();
     let sum_sq: f64 = per_thread.iter().map(|&x| (x as f64) * (x as f64)).sum();
     let n = n_threads as f64;
-    let jain = (sum * sum) / (n * sum_sq);
+    let numerator = sum * sum;
+    let denominator = n * sum_sq;
+    let jain = numerator / denominator;
 
     eprintln!(
         "C2: fairness — per-thread: {:?}, total: {}, Jain's index: {:.4}",

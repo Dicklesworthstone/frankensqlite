@@ -174,7 +174,6 @@ fn h3_mixed_type_columns() {
 
         let f_int = match f_row.get(1) {
             Some(SqliteValue::Integer(v)) => Some(*v),
-            Some(SqliteValue::Null) | None => None,
             _ => None,
         };
         assert_eq!(f_int, c_row.1, "H3: integer col mismatch for id={f_id}");

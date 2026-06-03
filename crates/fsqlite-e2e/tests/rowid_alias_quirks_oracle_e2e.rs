@@ -9,6 +9,7 @@
 //!     alias does NOT imply NOT NULL (a long-standing compatibility bug SQLite
 //!     preserves): NULLs — even multiple — are allowed. INTEGER PRIMARY KEY
 //!     (the alias) is the exception and rejects NULL by auto-assigning a rowid.
+//!
 //! Fixed, deterministic data; each statement's success/failure is compared too.
 
 use fsqlite::Connection;
