@@ -2287,17 +2287,14 @@ pub fn lazy_exact_doclist_entries(
     structure: &Fts5StructureRecord,
     term: &[u8],
 ) -> Result<Vec<Fts5DoclistEntry>> {
-    // Segment terms are stored as the main-index key (FTS5_MAIN_PREFIX_BYTE ++
-    // token; prefix indexes use higher markers), so build the same key here.
-    let mut key = Vec::with_capacity(term.len().saturating_add(1));
-    key.push(FTS5_MAIN_PREFIX_BYTE);
-    key.extend_from_slice(term);
     let mut entries = Vec::new();
-    for level in &structure.levels {
-        for segment in &level.segments {
-            for entry in lazy_segment_exact_postings(reader, segment, &key)? {
-                if !entry.poslist.delete {
-                    entries.push(entry);
+    for key in segment_lookup_keys(term) {
+        for level in &structure.levels {
+            for segment in &level.segments {
+                for entry in lazy_segment_exact_postings(reader, segment, &key)? {
+                    if !entry.poslist.delete {
+                        entries.push(entry);
+                    }
                 }
             }
         }
@@ -6428,8 +6425,8 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
         };
 
         let row_set = Fts5SegmentRowSet::new(&self.rows.data, &self.rows.idx);
+        let mut entries = Vec::new();
         for key in segment_lookup_keys(term.as_bytes()) {
-            let mut entries = Vec::new();
             for level in &structure.levels {
                 for segment in &level.segments {
                     if let Some(postings) = row_set
@@ -6446,11 +6443,8 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
                     }
                 }
             }
-            if !entries.is_empty() {
-                return Ok(entries);
-            }
         }
-        Ok(Vec::new())
+        Ok(entries)
     }
 
     fn prefix_entries(
@@ -6462,8 +6456,8 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
         };
 
         let row_set = Fts5SegmentRowSet::new(&self.rows.data, &self.rows.idx);
+        let mut entries = Vec::new();
         for key in segment_lookup_keys(prefix.as_bytes()) {
-            let mut entries = Vec::new();
             for level in &structure.levels {
                 for segment in &level.segments {
                     for term_match in row_set
@@ -6481,11 +6475,8 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
                     }
                 }
             }
-            if !entries.is_empty() {
-                return Ok(entries);
-            }
         }
-        Ok(Vec::new())
+        Ok(entries)
     }
 
     fn term_rowids(
@@ -9865,6 +9856,117 @@ mod tests {
         }
     }
 
+    fn add_prefixed_brown_segment(rows: &mut Fts5ShadowRows) -> Fts5StructureRecord {
+        let structure = Fts5StructureRecord {
+            cookie: 0,
+            write_counter: 3,
+            origin_counter: 0,
+            levels: vec![Fts5StructureLevel::new(
+                0,
+                vec![
+                    Fts5StructureSegment::new(5, 1, 2),
+                    Fts5StructureSegment::new(6, 1, 1),
+                ],
+            )],
+        };
+        let structure_row = rows
+            .data
+            .iter_mut()
+            .find(|row| row.id == FTS5_STRUCTURE_ROWID)
+            .expect("sample rows include structure metadata");
+        structure_row.block = structure.encode();
+
+        let prefixed_brown = Fts5SegmentLeaf::new(vec![Fts5SegmentTerm::new(
+            b"0brown".to_vec(),
+            Fts5Doclist::new(vec![Fts5DoclistEntry::new(
+                30,
+                Fts5Poslist::new(false, vec![Fts5ColumnPositions::new(0, vec![0])]),
+            )]),
+        )]);
+        rows.data.push(prefixed_brown.to_data_row(6, 1).unwrap());
+
+        structure
+    }
+
+    struct SliceOnDiskReader {
+        data: Vec<Fts5DataRow>,
+        idx: Vec<Fts5IdxRow>,
+    }
+
+    impl Fts5OnDiskReader for SliceOnDiskReader {
+        fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
+            Ok(self
+                .data
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.block.clone()))
+        }
+
+        fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
+            Ok(self
+                .idx
+                .iter()
+                .filter(|row| row.segid == segid && row.term.as_slice() <= term)
+                .max_by(|left, right| left.term.cmp(&right.term))
+                .map(|row| row.btree_page))
+        }
+
+        fn read_docsize(
+            &mut self,
+            _rowid: i64,
+            _column_count: usize,
+        ) -> Result<Option<Fts5DocsizeRow>> {
+            Ok(None)
+        }
+
+        fn read_content(
+            &mut self,
+            _rowid: i64,
+            _column_count: usize,
+        ) -> Result<Option<Vec<String>>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_fts5_shadow_query_merges_raw_and_prefixed_segment_keys() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let mut rows = sample_shadow_query_rows(&base);
+        add_prefixed_brown_segment(&mut rows);
+
+        let tokenizer = create_tokenizer("unicode61").unwrap();
+        let query =
+            Fts5ShadowQuery::new(&rows, base.columns(), tokenizer.as_ref(), DetailMode::Full)
+                .unwrap();
+        let rowids = shadow_rowids_from_entries(&query.exact_entries("brown").unwrap(), None);
+        assert_eq!(rowids, vec![1, 4, 30]);
+
+        let prefix_rowids = shadow_rowids_from_entries(&query.prefix_entries("br").unwrap(), None);
+        assert_eq!(prefix_rowids, vec![1, 4, 30]);
+    }
+
+    #[test]
+    fn test_fts5_lazy_exact_doclist_merges_raw_and_prefixed_segment_keys() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let mut rows = sample_shadow_query_rows(&base);
+        let structure = add_prefixed_brown_segment(&mut rows);
+        let mut reader = SliceOnDiskReader {
+            data: rows.data,
+            idx: rows.idx,
+        };
+
+        let mut rowids: Vec<u64> = lazy_exact_doclist_entries(&mut reader, &structure, b"brown")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.rowid)
+            .collect();
+        rowids.sort_unstable();
+        rowids.dedup();
+        assert_eq!(rowids, vec![1, 4, 30]);
+    }
+
     #[test]
     fn test_fts5_idx_and_data_rowid_codecs_round_trip() {
         let idx = Fts5IdxRow::new(7, b"rusty".to_vec(), 3, true);
@@ -12006,11 +12108,7 @@ mod tests {
 
         assert_eq!(
             tokens,
-            vec![
-                ("abc".to_owned(), 0, 3),
-                ("def".to_owned(), 5, 8),
-                ("123xyz".to_owned(), 9, 15),
-            ]
+            vec![("abcédef".to_owned(), 0, 8), ("123xyz".to_owned(), 9, 15),]
         );
     }
 
@@ -12055,13 +12153,8 @@ mod tests {
             r#"Fts5AsciiTokenizerStructure {
     tokens: [
         (
-            "abc",
+            "abcédef",
             0,
-            3,
-        ),
-        (
-            "def",
-            5,
             8,
         ),
         (
@@ -12073,14 +12166,13 @@ mod tests {
     terms: [
         "123xyz",
         "abc",
+        "abcédef",
         "def",
     ],
     upper_matches: [
-        1,
         2,
     ],
     lower_matches: [
-        1,
         2,
     ],
     numeric_matches: [
