@@ -70,6 +70,18 @@ impl<'a> Transaction<'a> {
         self.conn.execute_with_params(sql, params)
     }
 
+    /// Execute a SQL statement with parameters, skipping the internal
+    /// statement savepoint when the transaction itself is the rollback
+    /// boundary for a prevalidated write batch.
+    pub fn execute_with_params_skip_statement_savepoint(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize, FrankenError> {
+        self.conn
+            .execute_with_params_skip_statement_savepoint_in_explicit_txn(sql, params)
+    }
+
     /// Execute a SQL statement with `ParamValue` parameters.
     pub fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();

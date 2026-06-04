@@ -218,10 +218,16 @@ fn window_count_star_counts_null_order_peers() {
     check(
         &f,
         &r,
-        &["SELECT id, COUNT(*) OVER (
+        &[
+            "SELECT id, COUNT(*) OVER (
                  ORDER BY CASE WHEN id <= 2 THEN NULL ELSE id END
                  RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-             ) FROM s ORDER BY id"],
+             ) FROM s ORDER BY id",
+            "SELECT id, COUNT() OVER (
+                 ORDER BY CASE WHEN id <= 2 THEN NULL ELSE id END
+                 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) FROM s ORDER BY id",
+        ],
         "window_count_star_counts_null_order_peers",
     );
 }
@@ -232,11 +238,21 @@ fn group_by_window_materializes_args_and_filter() {
     check(
         &f,
         &r,
-        &["SELECT grp,
+        &[
+            "SELECT grp,
                     SUM(SUM(score)) FILTER (WHERE grp = 'b') OVER ()
              FROM s
              GROUP BY grp
-             ORDER BY grp"],
+             ORDER BY grp",
+            "SELECT grp,
+                    COUNT() OVER (
+                        ORDER BY CASE WHEN grp = 'a' THEN NULL ELSE grp END
+                        RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    )
+             FROM s
+             GROUP BY grp
+             ORDER BY grp",
+        ],
         "group_by_window_materializes_args_and_filter",
     );
 }
