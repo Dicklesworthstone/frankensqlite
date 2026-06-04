@@ -10,11 +10,16 @@
 //! On **load**, a real `.db` file is read via B-tree cursors and its
 //! contents are replayed into a fresh `MemDatabase` + schema vector.
 
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#![cfg_attr(
+    any(target_arch = "wasm32", not(feature = "native")),
+    allow(dead_code, unused_imports)
+)]
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::collections::{HashMap, HashSet};
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::hash::BuildHasher;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::path::Path;
 
 use fsqlite_ast::{
@@ -22,49 +27,49 @@ use fsqlite_ast::{
     GeneratedStorage, IndexedColumn, Literal, SortDirection, Statement, TableConstraintKind,
     UnaryOp,
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_btree::BtreeCursorOps;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_parser::Parser;
 use fsqlite_types::StrictColumnType;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::cx::Cx;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
 use fsqlite_types::value::SqliteValue;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
-#[cfg(all(not(target_arch = "wasm32"), unix))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
 use fsqlite_vfs::UnixVfs as PlatformVfs;
-#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native", target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs as PlatformVfs;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_vfs::host_fs;
 
 /// SQLite file header magic bytes (first 16 bytes).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// Default page size used for newly-created databases.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
 
 /// Owned sqlite_master row payload used when persistence must preserve
 /// non-table entries such as views and triggers during file rebuilds.
 pub type SqliteMasterEntry = (String, String, String, u32, Option<String>);
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)> {
     let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1_bytes
         .get(..DATABASE_HEADER_SIZE)
@@ -89,7 +94,7 @@ fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)>
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn configure_btree_cursor_page_size<P: fsqlite_btree::PageReader>(
     cursor: &mut fsqlite_btree::BtCursor<P>,
     usable_size: u32,
@@ -121,7 +126,7 @@ pub struct LoadedState {
 /// Detect whether a file starts with the SQLite magic header.
 ///
 /// Returns `false` for non-existent, empty, or non-SQLite files.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub fn is_sqlite_format(path: &Path) -> bool {
     let Ok(data) = host_fs::read(path) else {
         return false;
@@ -140,7 +145,7 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// Returns an error on I/O failure or if the B-tree layer rejects an
 /// insertion (e.g. duplicate rowid in sqlite_master).
 #[allow(clippy::too_many_lines)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub fn persist_to_sqlite(
     cx: &Cx,
     path: &Path,
@@ -167,7 +172,7 @@ pub fn persist_to_sqlite(
 /// The supplied `header` controls page-size-sensitive layout plus header
 /// metadata that must survive rebuild flows like `VACUUM`.
 #[allow(clippy::too_many_lines)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub fn persist_to_sqlite_with_header(
     cx: &Cx,
     path: &Path,
@@ -189,7 +194,7 @@ pub fn persist_to_sqlite_with_header(
 /// Persist `schema` + `db` plus additional sqlite_master rows using the
 /// provided database header template.
 #[allow(clippy::too_many_lines)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
     cx: &Cx,
     path: &Path,
@@ -515,7 +520,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
 /// Returns an error if the file is not a valid SQLite database, or on
 /// I/O / B-tree navigation failures.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreCompatPersist);
     let vfs = PlatformVfs::new();
@@ -873,7 +878,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Initialize a page as an empty leaf table B-tree page (type 0x0D).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn init_leaf_table_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
@@ -901,7 +906,7 @@ fn init_leaf_table_page(
     txn.write_page(cx, page_no, &page)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn init_leaf_index_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,

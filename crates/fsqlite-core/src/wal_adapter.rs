@@ -30,10 +30,10 @@ use fsqlite_wal::{
     TransactionConflictSnapshot, WalFile, WalGenerationIdentity, execute_checkpoint,
 };
 use tracing::debug;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use tracing::warn;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 
 // ---------------------------------------------------------------------------
@@ -160,10 +160,10 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// Frames appended after the last published commit horizon.
     pending_publication_frames: Vec<PendingPublicationFrame>,
     /// Optional FEC commit hook for encoding repair symbols on commit.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fec_hook: Option<FecCommitHook>,
     /// Accumulated FEC commit results (for later sidecar persistence).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fec_pending: Vec<FecCommitResult>,
     /// Maximum number of unique pages the index will track. Defaults to a
     /// full authoritative index in steady state. Tests can lower the cap to
@@ -183,9 +183,9 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             next_publication_seq: 1,
             read_snapshot: None,
             pending_publication_frames: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_hook: None,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_pending: Vec::new(),
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
@@ -193,7 +193,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
 
     /// Wrap an existing [`WalFile`] with an FEC commit hook.
     #[must_use]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub fn with_fec_hook(wal: WalFile<F>, hook: FecCommitHook) -> Self {
         let generation = wal.generation_identity();
         Self {
@@ -489,14 +489,14 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 
     /// Take any pending FEC commit results for sidecar persistence.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub fn take_fec_pending(&mut self) -> Vec<FecCommitResult> {
         std::mem::take(&mut self.fec_pending)
     }
 
     /// Whether FEC encoding is active.
     #[must_use]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub fn fec_enabled(&self) -> bool {
         self.fec_hook
             .as_ref()
@@ -504,7 +504,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 
     /// Discard buffered FEC pages (e.g. on transaction rollback).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub fn fec_discard(&mut self) {
         if let Some(hook) = &mut self.fec_hook {
             hook.discard_buffered();
@@ -804,7 +804,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
         // Feed the frame to the FEC hook.  On commit, it encodes repair
         // symbols and stores them for later sidecar persistence.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(hook) = &mut self.fec_hook {
             match hook.on_frame(cx, page_number, page_data, db_size_if_commit) {
                 Ok(Some(result)) => {
@@ -858,7 +858,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 .map(|frame| (frame.page_number, frame.db_size_if_commit)),
         );
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(hook) = &mut self.fec_hook {
             for frame in frames {
                 match hook.on_frame(
@@ -986,7 +986,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 .map(|frame| (frame.page_number, frame.db_size_if_commit)),
         );
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(hook) = &mut self.fec_hook {
             for (index, frame) in prepared.frame_metas.iter().enumerate() {
                 match hook.on_frame(
@@ -1307,7 +1307,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // Checkpoint-aware FEC lifecycle: once frames are backfilled to the
         // database file, their FEC symbols are no longer needed.  Clear
         // pending FEC results for the checkpointed range.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if result.frames_backfilled > 0 {
             let drained = self.fec_pending.len();
             self.fec_pending.clear();
@@ -1322,7 +1322,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
         // If the WAL was fully reset, also discard any buffered FEC pages
         // and invalidate the page index (salts changed).
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if result.wal_was_reset {
             self.fec_discard();
         }

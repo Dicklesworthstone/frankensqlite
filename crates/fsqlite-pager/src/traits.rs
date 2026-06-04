@@ -18,12 +18,12 @@ use crate::pager::SimpleTransaction;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageData, PageNumber, PageSize};
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
-#[cfg(unix)]
+#[cfg(all(feature = "native", unix))]
 use fsqlite_vfs::UnixVfs;
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "native", target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs;
 use fsqlite_wal::{
     TransactionConflictSnapshot, WalGenerationIdentity, checksum::WalChecksumTransform,
@@ -1182,13 +1182,13 @@ pub enum TransactionKind {
     /// In-memory pager transaction (`:memory:` databases).
     Memory(SimpleTransaction<MemoryVfs>),
     /// Linux io_uring pager transaction.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     IoUring(SimpleTransaction<IoUringVfs>),
     /// Unix filesystem pager transaction.
-    #[cfg(unix)]
+    #[cfg(all(feature = "native", unix))]
     Unix(SimpleTransaction<UnixVfs>),
     /// Windows filesystem pager transaction.
-    #[cfg(target_os = "windows")]
+    #[cfg(all(feature = "native", target_os = "windows"))]
     Windows(SimpleTransaction<WindowsVfs>),
     /// Generic mock transaction used by cross-crate tests.
     Mock(MockTransaction),
@@ -1205,11 +1205,11 @@ impl std::fmt::Debug for TransactionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Memory(_) => f.write_str("TransactionKind::Memory"),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(_) => f.write_str("TransactionKind::IoUring"),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => f.write_str("TransactionKind::Unix"),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => f.write_str("TransactionKind::Windows"),
             Self::Mock(_) => f.write_str("TransactionKind::Mock"),
             Self::MemoryMock(_) => f.write_str("TransactionKind::MemoryMock"),
@@ -1222,11 +1222,11 @@ impl TransactionKind {
     fn with_handle<R>(&self, f: impl FnOnce(&dyn TransactionHandle) -> R) -> R {
         match self {
             Self::Memory(txn) => f(txn),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(txn) => f(txn),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(txn) => f(txn),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => f(txn),
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
@@ -1243,11 +1243,11 @@ impl TransactionKind {
     fn with_handle_mut<R>(&mut self, f: impl FnOnce(&mut dyn TransactionHandle) -> R) -> R {
         match self {
             Self::Memory(txn) => f(txn),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(txn) => f(txn),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(txn) => f(txn),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => f(txn),
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
@@ -1268,21 +1268,21 @@ impl From<SimpleTransaction<MemoryVfs>> for TransactionKind {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native", target_os = "linux"))]
 impl From<SimpleTransaction<IoUringVfs>> for TransactionKind {
     fn from(txn: SimpleTransaction<IoUringVfs>) -> Self {
         Self::IoUring(txn)
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "native", unix))]
 impl From<SimpleTransaction<UnixVfs>> for TransactionKind {
     fn from(txn: SimpleTransaction<UnixVfs>) -> Self {
         Self::Unix(txn)
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "native", target_os = "windows"))]
 impl From<SimpleTransaction<WindowsVfs>> for TransactionKind {
     fn from(txn: SimpleTransaction<WindowsVfs>) -> Self {
         Self::Windows(txn)
@@ -1314,11 +1314,11 @@ impl TransactionHandle for TransactionKind {
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         match self {
             Self::Memory(txn) => txn.get_page(cx, page_no),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(txn) => txn.get_page(cx, page_no),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(txn) => txn.get_page(cx, page_no),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.get_page(cx, page_no),
             Self::Mock(txn) => txn.get_page(cx, page_no),
             Self::MemoryMock(txn) => txn.get_page(cx, page_no),
@@ -1340,11 +1340,11 @@ impl TransactionHandle for TransactionKind {
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         match self {
             Self::Memory(txn) => txn.write_page_data(cx, page_no, data),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(txn) => txn.write_page_data(cx, page_no, data),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(txn) => txn.write_page_data(cx, page_no, data),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.write_page_data(cx, page_no, data),
             Self::Mock(txn) => txn.write_page_data(cx, page_no, data),
             Self::MemoryMock(txn) => txn.write_page_data(cx, page_no, data),
@@ -1371,11 +1371,11 @@ impl TransactionHandle for TransactionKind {
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         match self {
             Self::Memory(txn) => txn.free_page(cx, page_no),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(txn) => txn.free_page(cx, page_no),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(txn) => txn.free_page(cx, page_no),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.free_page(cx, page_no),
             Self::Mock(txn) => txn.free_page(cx, page_no),
             Self::MemoryMock(txn) => txn.free_page(cx, page_no),

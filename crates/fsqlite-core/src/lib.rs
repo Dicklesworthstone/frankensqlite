@@ -22,7 +22,7 @@ pub mod native_index;
 pub mod permeation_map;
 pub mod por;
 pub mod quiescence;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub mod raptorq_codec;
 pub mod raptorq_integration;
 pub mod region;
@@ -40,7 +40,7 @@ pub mod tiered_storage;
 pub mod transaction;
 pub mod vacuum;
 pub mod wal_adapter;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub mod wal_fec_adapter;
 
 use std::num::NonZeroUsize;

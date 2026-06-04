@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
+#[cfg(feature = "native")]
 use fsqlite_vfs::host_fs;
 use tracing::{Level, debug, error, info, span, warn};
 
@@ -898,6 +899,7 @@ pub struct DbHeaderFields {
 }
 
 /// Read the header fields from a SQLite database file.
+#[cfg(feature = "native")]
 pub fn read_db_header_fields(db_path: &Path) -> Result<DbHeaderFields> {
     let data = host_fs::read(db_path)?;
     parse_db_header_fields(&data)
@@ -1134,12 +1136,14 @@ pub fn generate_db_fec_from_bytes(db_data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Generate a `.db-fec` sidecar for a database file path.
+#[cfg(feature = "native")]
 pub fn generate_db_fec_sidecar(db_path: &Path) -> Result<Vec<u8>> {
     let db_data = host_fs::read(db_path)?;
     generate_db_fec_from_bytes(&db_data)
 }
 
 /// Generate and write a `.db-fec` sidecar file, returning the sidecar path.
+#[cfg(feature = "native")]
 pub fn write_db_fec_sidecar(db_path: &Path) -> Result<PathBuf> {
     let sidecar_data = generate_db_fec_sidecar(db_path)?;
     let sidecar_path = db_fec_path_for_db(db_path);
@@ -1157,6 +1161,7 @@ pub fn write_db_fec_sidecar(db_path: &Path) -> Result<PathBuf> {
 }
 
 /// Read the [`DbFecHeader`] from a `.db-fec` sidecar file.
+#[cfg(feature = "native")]
 pub fn read_db_fec_header(sidecar_path: &Path) -> Result<DbFecHeader> {
     let data = host_fs::read(sidecar_path)?;
     if data.len() < DB_FEC_HEADER_SIZE {

@@ -160,12 +160,12 @@ use fsqlite_vdbe::engine::{
     vdbe_jit_metrics_snapshot,
 };
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::IoUringVfs;
-#[cfg(unix)]
+#[cfg(all(feature = "native", unix))]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::uring::IoUringRuntimeStatus;
 use fsqlite_vfs::{MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
 #[cfg(not(target_arch = "wasm32"))]
@@ -208,7 +208,7 @@ use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 use crate::region::{RegionKind, RegionTree, TaskHandle};
 use crate::wal_adapter::WalBackendAdapter;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 const WRITE_COORDINATOR_SERVICE_BEAD_ID: &str = "bd-2jpu6.4";
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2139,13 +2139,13 @@ pub enum PagerBackend {
     /// In-memory VFS backend (`:memory:` databases).
     Memory(Arc<SimplePager<MemoryVfs>>),
     /// Linux io_uring VFS backend (file-backed databases on Linux).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     IoUring(Arc<SimplePager<IoUringVfs>>),
     /// Unix filesystem VFS backend (file-backed databases on all unix platforms).
-    #[cfg(unix)]
+    #[cfg(all(feature = "native", unix))]
     Unix(Arc<SimplePager<UnixVfs>>),
     /// Windows filesystem VFS backend (file-backed databases on Windows).
-    #[cfg(target_os = "windows")]
+    #[cfg(all(feature = "native", target_os = "windows"))]
     Windows(Arc<SimplePager<fsqlite_vfs::WindowsVfs>>),
 }
 
@@ -2153,11 +2153,11 @@ impl std::fmt::Debug for PagerBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Memory(_) => f.write_str("PagerBackend::Memory"),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(_) => f.write_str("PagerBackend::IoUring"),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => f.write_str("PagerBackend::Unix"),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => f.write_str("PagerBackend::Windows"),
         }
     }
@@ -2175,11 +2175,11 @@ impl PagerBackend {
     pub fn is_file_backed(&self) -> bool {
         match self {
             Self::Memory(_) => false,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(_) => true,
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => true,
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => true,
         }
     }
@@ -2188,11 +2188,11 @@ impl PagerBackend {
     pub fn set_vfs_busy_timeout_ms(&self, ms: u64) {
         match self {
             Self::Memory(p) => p.set_vfs_busy_timeout_ms(ms),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.set_vfs_busy_timeout_ms(ms),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.set_vfs_busy_timeout_ms(ms),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.set_vfs_busy_timeout_ms(ms),
         }
     }
@@ -2202,11 +2202,11 @@ impl PagerBackend {
     pub fn wal_frame_count(&self) -> usize {
         match self {
             Self::Memory(p) => p.wal_frame_count(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.wal_frame_count(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.wal_frame_count(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.wal_frame_count(),
         }
     }
@@ -2216,11 +2216,11 @@ impl PagerBackend {
     pub fn publication_write_count(&self) -> u64 {
         match self {
             Self::Memory(p) => p.publication_write_count(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.publication_write_count(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.publication_write_count(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.publication_write_count(),
         }
     }
@@ -2230,11 +2230,11 @@ impl PagerBackend {
     pub fn published_snapshot(&self) -> PagerPublishedSnapshot {
         match self {
             Self::Memory(p) => p.published_snapshot(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.published_snapshot(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.published_snapshot(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.published_snapshot(),
         }
     }
@@ -2244,11 +2244,11 @@ impl PagerBackend {
     pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         match self {
             Self::Memory(p) => p.refresh_published_snapshot(cx),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.refresh_published_snapshot(cx),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.refresh_published_snapshot(cx),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.refresh_published_snapshot(cx),
         }
     }
@@ -2260,11 +2260,11 @@ impl PagerBackend {
     ) -> Result<PagerPublishedSnapshot> {
         match self {
             Self::Memory(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.refresh_published_snapshot_for_clean_wal_read(cx),
         }
     }
@@ -2273,11 +2273,11 @@ impl PagerBackend {
     pub fn bind_shared_connection_count(&self, counter: Arc<AtomicUsize>) {
         match self {
             Self::Memory(p) => p.bind_shared_connection_count(Arc::clone(&counter)),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.bind_shared_connection_count(Arc::clone(&counter)),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.bind_shared_connection_count(Arc::clone(&counter)),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.bind_shared_connection_count(counter),
         }
     }
@@ -2287,11 +2287,11 @@ impl PagerBackend {
     pub fn published_read_retry_count(&self) -> u64 {
         match self {
             Self::Memory(p) => p.published_read_retry_count(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.published_read_retry_count(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.published_read_retry_count(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.published_read_retry_count(),
         }
     }
@@ -2301,16 +2301,16 @@ impl PagerBackend {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Memory(_) => "memory",
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(_) => "iouring",
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => "unix",
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => "windows",
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "native", target_os = "linux"))]
     fn io_uring_status(&self) -> Option<IoUringRuntimeStatus> {
         match self {
             Self::IoUring(p) => Some(p.vfs_handle().status_snapshot()),
@@ -2323,11 +2323,11 @@ impl PagerBackend {
     pub fn page_size(&self) -> PageSize {
         match self {
             Self::Memory(p) => p.page_size(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.page_size(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.page_size(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.page_size(),
         }
     }
@@ -2377,7 +2377,7 @@ impl PagerBackend {
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Memory(Arc::new(pager)))
         } else {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             {
                 let vfs = IoUringVfs::new();
                 let db_path = PathBuf::from(path);
@@ -2390,7 +2390,7 @@ impl PagerBackend {
                 )?;
                 Ok(Self::IoUring(Arc::new(pager)))
             }
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
             {
                 let vfs = UnixVfs::new();
                 let db_path = PathBuf::from(path);
@@ -2403,7 +2403,7 @@ impl PagerBackend {
                 )?;
                 Ok(Self::Unix(Arc::new(pager)))
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 let db_path = PathBuf::from(path);
@@ -2416,7 +2416,7 @@ impl PagerBackend {
                 )?;
                 Ok(Self::Windows(Arc::new(pager)))
             }
-            #[cfg(not(any(unix, target_os = "windows")))]
+            #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
             {
                 Err(FrankenError::NotImplemented(
                     "file-backed pager not available on this platform".to_owned(),
@@ -2442,7 +2442,7 @@ impl PagerBackend {
         if path == ":memory:" {
             return Self::open_with_page_buffer_max(path, cx, page_buffer_max, memory_vfs_config);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(feature = "native", target_os = "linux"))]
         {
             let vfs = IoUringVfs::new();
             let db_path = PathBuf::from(path);
@@ -2456,7 +2456,7 @@ impl PagerBackend {
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::IoUring(Arc::new(pager)))
         }
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
         {
             let vfs = UnixVfs::new();
             let db_path = PathBuf::from(path);
@@ -2470,7 +2470,7 @@ impl PagerBackend {
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Unix(Arc::new(pager)))
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(all(feature = "native", target_os = "windows"))]
         {
             let vfs = fsqlite_vfs::WindowsVfs::new();
             let db_path = PathBuf::from(path);
@@ -2484,7 +2484,7 @@ impl PagerBackend {
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Windows(Arc::new(pager)))
         }
-        #[cfg(not(any(unix, target_os = "windows")))]
+        #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
         {
             Err(FrankenError::NotImplemented(
                 "file-backed pager not available on this platform".to_owned(),
@@ -2496,11 +2496,11 @@ impl PagerBackend {
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<TransactionKind> {
         match self {
             Self::Memory(p) => Ok(p.begin(cx, mode)?.into()),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => Ok(p.begin(cx, mode)?.into()),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => Ok(p.begin(cx, mode)?.into()),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => Ok(p.begin(cx, mode)?.into()),
         }
     }
@@ -2508,11 +2508,11 @@ impl PagerBackend {
     fn journal_mode(&self) -> JournalMode {
         match self {
             Self::Memory(p) => p.journal_mode(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.journal_mode(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.journal_mode(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.journal_mode(),
         }
     }
@@ -2520,11 +2520,11 @@ impl PagerBackend {
     fn is_readonly(&self) -> bool {
         match self {
             Self::Memory(p) => p.is_readonly(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.is_readonly(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.is_readonly(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.is_readonly(),
         }
     }
@@ -2532,11 +2532,11 @@ impl PagerBackend {
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.set_journal_mode(cx, mode),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.set_journal_mode(cx, mode),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.set_journal_mode(cx, mode),
         }
     }
@@ -2548,17 +2548,17 @@ impl PagerBackend {
                 let vfs = p.vfs_handle();
                 install_wal_backend_with_vfs(p, vfs.as_ref(), cx, &wal_path)
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
@@ -2584,17 +2584,17 @@ impl PagerBackend {
                     allow_readonly,
                 )
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
                 install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
             }
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
                 install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
@@ -2613,11 +2613,11 @@ impl PagerBackend {
     fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
         match self {
             Self::Memory(p) => p.set_wal_commit_sync_policy(policy),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.set_wal_commit_sync_policy(policy),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.set_wal_commit_sync_policy(policy),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.set_wal_commit_sync_policy(policy),
         }
     }
@@ -2626,11 +2626,11 @@ impl PagerBackend {
     fn wal_commit_sync_policy(&self) -> WalCommitSyncPolicy {
         match self {
             Self::Memory(p) => p.wal_commit_sync_policy(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.wal_commit_sync_policy(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.wal_commit_sync_policy(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.wal_commit_sync_policy(),
         }
     }
@@ -2644,17 +2644,17 @@ impl PagerBackend {
                 let vfs = p.vfs_handle();
                 wal_file_present_with_vfs(vfs.as_ref(), cx, &wal_path)
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(_) => {
                 let vfs = IoUringVfs::new();
                 wal_file_present_with_vfs(&vfs, cx, &wal_path)
             }
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => {
                 let vfs = UnixVfs::new();
                 wal_file_present_with_vfs(&vfs, cx, &wal_path)
             }
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 wal_file_present_with_vfs(&vfs, cx, &wal_path)
@@ -2670,11 +2670,11 @@ impl PagerBackend {
     ) -> Result<fsqlite_pager::CheckpointResult> {
         match self {
             Self::Memory(p) => p.checkpoint(cx, mode),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.checkpoint(cx, mode),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.checkpoint(cx, mode),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.checkpoint(cx, mode),
         }
     }
@@ -2682,11 +2682,11 @@ impl PagerBackend {
     fn export_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
             Self::Memory(p) => p.export_database_bytes(cx),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.export_database_bytes(cx),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.export_database_bytes(cx),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.export_database_bytes(cx),
         }
     }
@@ -2695,11 +2695,11 @@ impl PagerBackend {
     fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         match self {
             Self::Memory(p) => p.cache_metrics_snapshot(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.cache_metrics_snapshot(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.cache_metrics_snapshot(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.cache_metrics_snapshot(),
         }
     }
@@ -2713,11 +2713,11 @@ impl PagerBackend {
     ) -> Result<fsqlite_pager::PageCacheLightweightSnapshot> {
         match self {
             Self::Memory(p) => p.cache_metrics_lightweight_snapshot(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.cache_metrics_lightweight_snapshot(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.cache_metrics_lightweight_snapshot(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.cache_metrics_lightweight_snapshot(),
         }
     }
@@ -2726,11 +2726,11 @@ impl PagerBackend {
     fn cache_page_snapshots(&self) -> Result<Vec<fsqlite_pager::PageCachePageSnapshot>> {
         match self {
             Self::Memory(p) => p.cache_page_snapshots(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.cache_page_snapshots(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.cache_page_snapshots(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.cache_page_snapshots(),
         }
     }
@@ -2740,11 +2740,11 @@ impl PagerBackend {
     fn reset_cache_metrics(&self) -> Result<()> {
         match self {
             Self::Memory(p) => p.reset_cache_metrics(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => p.reset_cache_metrics(),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => p.reset_cache_metrics(),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.reset_cache_metrics(),
         }
     }
@@ -2752,11 +2752,11 @@ impl PagerBackend {
     fn memory_vfs_usage_snapshot(&self) -> Result<Option<MemoryVfsUsageSnapshot>> {
         match self {
             Self::Memory(p) => p.vfs_handle().usage_snapshot().map(Some),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(_) => Ok(None),
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             Self::Unix(_) => Ok(None),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => Ok(None),
         }
     }
@@ -11174,11 +11174,11 @@ impl Connection {
     fn pager_backend_label(&self) -> &'static str {
         match &self.pager {
             PagerBackend::Memory(_) => "memory",
-            #[cfg(target_os = "linux")]
+            #[cfg(all(feature = "native", target_os = "linux"))]
             PagerBackend::IoUring(_) => "io_uring",
-            #[cfg(unix)]
+            #[cfg(all(feature = "native", unix))]
             PagerBackend::Unix(_) => "unix",
-            #[cfg(target_os = "windows")]
+            #[cfg(all(feature = "native", target_os = "windows"))]
             PagerBackend::Windows(_) => "windows",
         }
     }
@@ -13417,7 +13417,11 @@ impl Connection {
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
             let prepared = self.prepare_after_background_status(sql)?;
-            return self.execute_prepared_with_params_after_background_status(&prepared, &[]);
+            return self.execute_prepared_with_params_after_background_status(
+                &prepared,
+                &[],
+                false,
+            );
         }
         let mut last_count = 0;
         for statement in statements {
@@ -13474,6 +13478,32 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        self.execute_with_params_with_statement_savepoint_policy(sql, params, false)
+    }
+
+    /// Prepare and execute SQL with bound SQL parameters, skipping the
+    /// internal statement savepoint when the call runs inside an explicit
+    /// transaction.
+    ///
+    /// This is a narrow performance escape hatch for callers that prevalidate
+    /// statement inputs and treat the enclosing transaction as the rollback
+    /// boundary. If execution fails inside an explicit transaction, callers
+    /// must roll back that transaction to discard any partial effects.
+    /// Outside an explicit transaction this behaves like `execute_with_params`.
+    pub fn execute_with_params_skip_statement_savepoint_in_explicit_txn(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> Result<usize> {
+        self.execute_with_params_with_statement_savepoint_policy(sql, params, true)
+    }
+
+    fn execute_with_params_with_statement_savepoint_policy(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+        skip_statement_savepoint_in_explicit_txn: bool,
+    ) -> Result<usize> {
         self.background_status()?;
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
@@ -13495,7 +13525,11 @@ impl Connection {
             && self.ad_hoc_execute_supports_prepared_reuse(statements[0].as_ref())?
         {
             let prepared = self.prepare_after_background_status(sql)?;
-            return self.execute_prepared_with_params_after_background_status(&prepared, params);
+            return self.execute_prepared_with_params_after_background_status(
+                &prepared,
+                params,
+                skip_statement_savepoint_in_explicit_txn,
+            );
         }
         let mut last_count = 0;
         for statement in statements {
@@ -13574,13 +13608,14 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<usize> {
         self.background_status()?;
-        self.execute_prepared_with_params_after_background_status(stmt, params)
+        self.execute_prepared_with_params_after_background_status(stmt, params, false)
     }
 
     fn execute_prepared_with_params_after_background_status(
         &self,
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
+        force_skip_statement_savepoint_in_explicit_txn: bool,
     ) -> Result<usize> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         if !std::ptr::eq(self, stmt.conn) {
@@ -13670,7 +13705,8 @@ impl Connection {
                     dispatch.post_write_action,
                     dispatch.rollback_on_constraint_violation,
                     dispatch.preserve_prior_changes_on_constraint_violation,
-                    dispatch.skip_statement_savepoint_in_explicit_txn,
+                    dispatch.skip_statement_savepoint_in_explicit_txn
+                        || force_skip_statement_savepoint_in_explicit_txn,
                     entry_proof.publication,
                     p,
                     false,
@@ -13682,7 +13718,8 @@ impl Connection {
                         dispatch.kind,
                         dispatch.rollback_on_constraint_violation,
                         dispatch.preserve_prior_changes_on_constraint_violation,
-                        dispatch.skip_statement_savepoint_in_explicit_txn,
+                        dispatch.skip_statement_savepoint_in_explicit_txn
+                            || force_skip_statement_savepoint_in_explicit_txn,
                         entry_proof,
                         p,
                     ),
@@ -13757,7 +13794,8 @@ impl Connection {
                     fast_path.kind,
                     fast_path.rollback_on_constraint_violation,
                     fast_path.preserve_prior_changes_on_constraint_violation,
-                    fast_path.skip_statement_savepoint_in_explicit_txn,
+                    fast_path.skip_statement_savepoint_in_explicit_txn
+                        || force_skip_statement_savepoint_in_explicit_txn,
                     entry_proof,
                     p,
                 );
@@ -24409,6 +24447,7 @@ impl Connection {
                             )
                         })?,
                         row_values,
+                        false,
                     )
                 };
                 match row_result {
@@ -62721,22 +62760,22 @@ struct SharedRuntimeState {
     write_coordinator_region: Region,
     write_coordinator_service_starting: bool,
     write_coordinator_service_running: bool,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(any(target_arch = "wasm32", not(feature = "native")), allow(dead_code))]
     write_coordinator_service_generation: u64,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(any(target_arch = "wasm32", not(feature = "native")), allow(dead_code))]
     write_coordinator_service_launch_count: u64,
     write_coordinator_shutdown: Option<WriteCoordinatorShutdownTx>,
     open_connections: usize,
     poisoned: Option<String>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 struct WriteCoordinatorServiceStart {
     generation: u64,
     path_key: String,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 enum WriteCoordinatorServiceReservation {
     Running,
     Starting,
@@ -62952,7 +62991,7 @@ impl SharedMvccState {
         Ok((connection_region, connection_cx))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn reserve_write_coordinator_service_start(
         &self,
     ) -> Result<WriteCoordinatorServiceReservation> {
@@ -62987,7 +63026,7 @@ impl SharedMvccState {
         ))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn revert_write_coordinator_service_start(&self, reservation: &WriteCoordinatorServiceStart) {
         let mut state = lock_unpoisoned(&self.runtime_state);
         if !state.write_coordinator_service_starting
@@ -63001,7 +63040,7 @@ impl SharedMvccState {
         state.write_coordinator_shutdown = None;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn record_write_coordinator_service_launch(
         &self,
         reservation: &WriteCoordinatorServiceStart,
@@ -63022,7 +63061,7 @@ impl SharedMvccState {
         state.write_coordinator_shutdown = Some(shutdown);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn ensure_write_coordinator_service_started(&self) -> Result<()> {
         let wait_deadline = Instant::now()
             + if cfg!(test) {
@@ -63116,7 +63155,7 @@ impl SharedMvccState {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
     fn ensure_write_coordinator_service_started(&self) -> Result<()> {
         Ok(())
     }
@@ -71408,11 +71447,6 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Build arguments for a window function `step()` call.
-///
-/// For functions with explicit args (lag, lead, etc.), evaluates those args.
-/// For pure-numbering functions (row_number, rank, dense_rank) with no
-/// explicit args, passes the ORDER BY values so they can detect peer groups.
 /// Resolve a `FrameBound` to a numeric row offset for ROWS frames.
 /// Returns `None` for `UnboundedPreceding`/`UnboundedFollowing`/`CurrentRow`.
 fn resolve_frame_bound_offset(bound: &FrameBound) -> Option<usize> {
@@ -71940,20 +71974,21 @@ fn range_value_frame_bounds(
     }
 }
 
+/// Build the SQL-visible argument list for a window function `step()` call.
+///
+/// `COUNT()` and `COUNT(*)` both pass no per-row values. Peer comparisons use
+/// the window `ORDER BY` expressions separately, not as hidden function args.
 fn build_window_args(
     func_args: &[Expr],
     args_are_star: bool,
-    order_by: &[(Expr, bool)],
+    _order_by: &[(Expr, bool)],
     row: &[SqliteValue],
     col_map: &[(String, String, bool)],
 ) -> Result<Vec<SqliteValue>> {
-    if args_are_star {
+    // `COUNT()` is valid SQLite syntax and behaves like `COUNT(*)`;
+    // zero SQL-visible arguments must not become hidden ORDER BY arguments.
+    if args_are_star || func_args.is_empty() {
         Ok(Vec::new())
-    } else if func_args.is_empty() {
-        order_by
-            .iter()
-            .map(|(expr, _)| eval_join_expr(expr, row, col_map))
-            .collect()
     } else {
         func_args
             .iter()
@@ -133333,6 +133368,143 @@ mod pager_routing_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_execute_with_params_statement_savepoint_skip_is_opt_in() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE explicit_stmt_skip_opt_in (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                score INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX explicit_stmt_skip_opt_in_score_idx ON explicit_stmt_skip_opt_in(score);",
+        )
+        .unwrap();
+
+        let duplicate_insert = "INSERT INTO explicit_stmt_skip_opt_in (id, name, score) VALUES (?1, ?2, ?3), (?4, ?5, ?6)";
+        let duplicate_params = &[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("first".into()),
+            SqliteValue::Integer(10),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("duplicate".into()),
+            SqliteValue::Integer(20),
+        ];
+
+        conn.execute("BEGIN").unwrap();
+        let err = conn.execute_with_params(duplicate_insert, duplicate_params);
+        assert!(
+            err.is_err(),
+            "duplicate primary key should reject the statement"
+        );
+        let rows = conn
+            .query("SELECT id, name, score FROM explicit_stmt_skip_opt_in ORDER BY id")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "default execution must keep statement-level atomicity inside the transaction"
+        );
+        conn.execute("ROLLBACK").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        let err = conn.execute_with_params_skip_statement_savepoint_in_explicit_txn(
+            duplicate_insert,
+            duplicate_params,
+        );
+        assert!(
+            err.is_err(),
+            "duplicate primary key should still reject the statement"
+        );
+        let rows = conn
+            .query("SELECT id, name, score FROM explicit_stmt_skip_opt_in ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("first".into()),
+                SqliteValue::Integer(10)
+            ]],
+            "skip API makes the explicit transaction the rollback boundary"
+        );
+        conn.execute("ROLLBACK").unwrap();
+        let rows = conn
+            .query("SELECT id, name, score FROM explicit_stmt_skip_opt_in ORDER BY id")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "caller rollback must discard partial effects from the skip API"
+        );
+    }
+
+    #[test]
+    fn test_execute_with_params_statement_savepoint_skip_commits_indexed_insert() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        {
+            let conn = Connection::open(path.clone()).unwrap();
+            conn.execute(
+                "CREATE TABLE explicit_stmt_skip_commit (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    score INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE INDEX explicit_stmt_skip_commit_score_idx ON explicit_stmt_skip_commit(score);",
+            )
+            .unwrap();
+
+            conn.execute("BEGIN").unwrap();
+            conn.execute_with_params_skip_statement_savepoint_in_explicit_txn(
+                "INSERT INTO explicit_stmt_skip_commit (id, name, score)
+                 VALUES (?1, ?2, ?3), (?4, ?5, ?6)",
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("first".into()),
+                    SqliteValue::Integer(10),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("second".into()),
+                    SqliteValue::Integer(20),
+                ],
+            )
+            .unwrap();
+            conn.execute("COMMIT").unwrap();
+        }
+
+        let reopened = Connection::open(path).unwrap();
+        let rows = reopened
+            .query(
+                "SELECT id, name, score
+                 FROM explicit_stmt_skip_commit
+                 ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("first".into()),
+                    SqliteValue::Integer(10)
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("second".into()),
+                    SqliteValue::Integer(20)
+                ],
+            ]
+        );
     }
 
     #[test]

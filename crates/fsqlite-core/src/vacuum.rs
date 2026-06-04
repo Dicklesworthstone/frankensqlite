@@ -1,7 +1,7 @@
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -13,29 +13,29 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::codegen::TableSchema;
 use fsqlite_vdbe::engine::MemDatabase;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_vfs::host_fs;
 
 use crate::compat_persist::SqliteMasterEntry;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::compat_persist::persist_to_sqlite_with_header_and_master_entries;
 
 pub(crate) const ATTACHED_SCHEMA_UNSUPPORTED: &str = "VACUUM on attached schemas";
 pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 static NEXT_TEMP_REBUILD_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 static NEXT_TEMP_VACUUM_INTO_DISCARD_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 static TEMP_VACUUM_INTO_DISCARD_TARGETS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn temp_vacuum_into_discard_targets() -> &'static Mutex<HashSet<PathBuf>> {
     TEMP_VACUUM_INTO_DISCARD_TARGETS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn register_temp_vacuum_into_discard_target(path: &Path) {
     let mut targets = temp_vacuum_into_discard_targets()
         .lock()
@@ -43,7 +43,7 @@ fn register_temp_vacuum_into_discard_target(path: &Path) {
     targets.insert(path.to_path_buf());
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn take_temp_vacuum_into_discard_target(path: &Path) -> bool {
     let mut targets = temp_vacuum_into_discard_targets()
         .lock()
@@ -51,7 +51,7 @@ fn take_temp_vacuum_into_discard_target(path: &Path) -> bool {
     targets.remove(path)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn resolve_empty_vacuum_into_target(source_path: &str) -> PathBuf {
     let seq = NEXT_TEMP_VACUUM_INTO_DISCARD_ID.fetch_add(1, Ordering::Relaxed);
     let source = Path::new(source_path);
@@ -72,7 +72,7 @@ fn resolve_empty_vacuum_into_target(source_path: &str) -> PathBuf {
     path
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub(crate) fn persist_compacted_database(
     cx: &Cx,
     target_path: &Path,
@@ -97,7 +97,7 @@ pub(crate) fn persist_compacted_database(
     result
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", not(feature = "native")))]
 pub(crate) fn persist_compacted_database(
     _cx: &Cx,
     _target_path: &Path,
@@ -108,11 +108,11 @@ pub(crate) fn persist_compacted_database(
     _original_ddl: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     Err(FrankenError::not_implemented(
-        "VACUUM is not supported on wasm32",
+        "VACUUM requires native file support",
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub(crate) fn validate_vacuum_into_target(source_path: &str, target_path: &Path) -> Result<()> {
     if target_path.as_os_str().is_empty() {
         return Err(FrankenError::CannotOpen {
@@ -133,9 +133,9 @@ pub(crate) fn resolve_vacuum_into_target(
 ) -> Result<PathBuf> {
     let target_path = match target_value {
         SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(&**path),
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         SqliteValue::Text(_) => resolve_empty_vacuum_into_target(source_path),
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
         SqliteValue::Text(_) => {
             return Err(FrankenError::CannotOpen {
                 path: PathBuf::new(),
@@ -144,14 +144,14 @@ pub(crate) fn resolve_vacuum_into_target(
         _ => return Err(FrankenError::FunctionError(NON_TEXT_FILENAME.to_owned())),
     };
     if let Err(err) = validate_vacuum_into_target(source_path, &target_path) {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         let _ = take_temp_vacuum_into_discard_target(&target_path);
         return Err(err);
     }
     Ok(target_path)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", not(feature = "native")))]
 pub(crate) fn validate_vacuum_into_target(_source_path: &str, target_path: &Path) -> Result<()> {
     if target_path.as_os_str().is_empty() {
         return Err(FrankenError::CannotOpen {
@@ -159,11 +159,11 @@ pub(crate) fn validate_vacuum_into_target(_source_path: &str, target_path: &Path
         });
     }
     Err(FrankenError::not_implemented(
-        "VACUUM is not supported on wasm32",
+        "VACUUM requires native file support",
     ))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub(crate) fn temp_rebuild_path(source_path: &Path) -> PathBuf {
     let seq = NEXT_TEMP_REBUILD_ID.fetch_add(1, Ordering::Relaxed);
     let mut name = source_path
@@ -173,12 +173,12 @@ pub(crate) fn temp_rebuild_path(source_path: &Path) -> PathBuf {
     source_path.with_file_name(name)
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", not(feature = "native")))]
 pub(crate) fn temp_rebuild_path(source_path: &Path) -> PathBuf {
     source_path.to_path_buf()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 pub(crate) fn replace_database_file(target_path: &Path, rebuilt_path: &Path) -> Result<()> {
     match host_fs::copy_file(rebuilt_path, target_path) {
         Ok(_) => {
@@ -192,10 +192,10 @@ pub(crate) fn replace_database_file(target_path: &Path, rebuilt_path: &Path) -> 
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", not(feature = "native")))]
 pub(crate) fn replace_database_file(_target_path: &Path, _rebuilt_path: &Path) -> Result<()> {
     Err(FrankenError::not_implemented(
-        "VACUUM is not supported on wasm32",
+        "VACUUM requires native file support",
     ))
 }
 
