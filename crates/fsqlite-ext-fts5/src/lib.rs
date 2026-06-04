@@ -5135,7 +5135,12 @@ fn search_rows_with_weights_from_parts(
         })
         .collect();
 
-    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     Ok(results)
 }
 
@@ -5153,7 +5158,12 @@ fn search_docids_with_weights_from_parts(
         .map(|docid| (docid, bm25_score(index, docid, &query_terms, weights)))
         .collect();
 
-    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
     Ok(results)
 }
 
@@ -5884,6 +5894,16 @@ fn shadow_content_for_rowid(rows: &Fts5ShadowRows, rowid: i64) -> Option<&[Strin
         .map(|row| row.values.as_slice())
 }
 
+fn segment_lookup_keys(term: &[u8]) -> SmallVec<[Vec<u8>; 2]> {
+    let mut keys = SmallVec::new();
+    let mut main_key = Vec::with_capacity(term.len().saturating_add(1));
+    main_key.push(FTS5_MAIN_PREFIX_BYTE);
+    main_key.extend_from_slice(term);
+    keys.push(main_key);
+    keys.push(term.to_vec());
+    keys
+}
+
 /// The data-access primitives an FTS5 ranked search needs from a doclist
 /// source, plus the full query engine built on top of them as default methods.
 ///
@@ -6348,25 +6368,30 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
             return Ok(Vec::new());
         };
 
-        let mut entries = Vec::new();
         let row_set = Fts5SegmentRowSet::new(&self.rows.data, &self.rows.idx);
-        for level in &structure.levels {
-            for segment in &level.segments {
-                if let Some(postings) = row_set
-                    .reader(segment)
-                    .exact_postings(term.as_bytes())
-                    .map_err(shadow_query_storage_error)?
-                {
-                    entries.extend(
-                        postings
-                            .entries
-                            .into_iter()
-                            .filter(|entry| !entry.poslist.delete),
-                    );
+        for key in segment_lookup_keys(term.as_bytes()) {
+            let mut entries = Vec::new();
+            for level in &structure.levels {
+                for segment in &level.segments {
+                    if let Some(postings) = row_set
+                        .reader(segment)
+                        .exact_postings(&key)
+                        .map_err(shadow_query_storage_error)?
+                    {
+                        entries.extend(
+                            postings
+                                .entries
+                                .into_iter()
+                                .filter(|entry| !entry.poslist.delete),
+                        );
+                    }
                 }
             }
+            if !entries.is_empty() {
+                return Ok(entries);
+            }
         }
-        Ok(entries)
+        Ok(Vec::new())
     }
 
     fn prefix_entries(
@@ -6377,26 +6402,31 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
             return Ok(Vec::new());
         };
 
-        let mut entries = Vec::new();
         let row_set = Fts5SegmentRowSet::new(&self.rows.data, &self.rows.idx);
-        for level in &structure.levels {
-            for segment in &level.segments {
-                for term_match in row_set
-                    .reader(segment)
-                    .prefix_matches(prefix.as_bytes())
-                    .map_err(shadow_query_storage_error)?
-                {
-                    entries.extend(
-                        term_match
-                            .postings
-                            .entries
-                            .into_iter()
-                            .filter(|entry| !entry.poslist.delete),
-                    );
+        for key in segment_lookup_keys(prefix.as_bytes()) {
+            let mut entries = Vec::new();
+            for level in &structure.levels {
+                for segment in &level.segments {
+                    for term_match in row_set
+                        .reader(segment)
+                        .prefix_matches(&key)
+                        .map_err(shadow_query_storage_error)?
+                    {
+                        entries.extend(
+                            term_match
+                                .postings
+                                .entries
+                                .into_iter()
+                                .filter(|entry| !entry.poslist.delete),
+                        );
+                    }
                 }
             }
+            if !entries.is_empty() {
+                return Ok(entries);
+            }
         }
-        Ok(entries)
+        Ok(Vec::new())
     }
 
     fn term_rowids(
@@ -6887,6 +6917,7 @@ impl Fts5Table {
         locales: Vec<(usize, SmallText)>,
         tokenizer: &dyn Fts5Tokenizer,
     ) {
+        self.materialize_shadow_rows_for_mutation();
         if self.documents.contains_key(&rowid) {
             self.index.remove_document(rowid);
         }
@@ -6969,12 +7000,54 @@ impl Fts5Table {
     /// only layers the shadow-backed query state on top.
     pub fn bind_shadow_rows(&mut self, rows: Fts5ShadowRows) -> Result<Fts5ShadowOpenReport> {
         let report = rows.validate_for_open(self.columns.len())?;
+        self.bind_validated_shadow_rows(rows, &report);
+        Ok(report)
+    }
+
+    fn bind_validated_shadow_rows(&mut self, rows: Fts5ShadowRows, report: &Fts5ShadowOpenReport) {
         report.metadata.apply_to_runtime_config(&mut self.config);
+        self.index = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+        self.documents.clear();
+        self.row_locales.clear();
         if let Some(rowid) = report.max_seen_rowid {
             self.next_rowid = rowid.saturating_add(1).max(1);
         }
         self.shadow_rows = Some(rows);
-        Ok(report)
+    }
+
+    fn materialize_shadow_rows_for_mutation(&mut self) {
+        let Some(rows) = self.shadow_rows.take() else {
+            return;
+        };
+        let Fts5ShadowRows {
+            content, docsize, ..
+        } = rows;
+        let documents = content
+            .into_iter()
+            .map(|row| (row.rowid, row.values))
+            .collect();
+        self.rebuild_documents(documents);
+        self.apply_docsize_rows(&docsize);
+    }
+
+    fn has_document_or_shadow_rowid(&self, rowid: i64) -> bool {
+        self.documents.contains_key(&rowid)
+            || self.shadow_rows.as_ref().is_some_and(|rows| {
+                rows.content.iter().any(|row| row.rowid == rowid)
+                    || rows.docsize.iter().any(|row| row.rowid == rowid)
+            })
+    }
+
+    fn shadow_rows_have_persisted_segments(report: &Fts5ShadowOpenReport) -> bool {
+        report
+            .structure
+            .as_ref()
+            .is_some_and(|structure| structure.segment_count() > 0)
     }
 
     #[must_use]
@@ -7037,6 +7110,7 @@ impl Fts5Table {
 
     /// Delete a document from the FTS5 table.
     pub fn delete_document(&mut self, rowid: i64) {
+        self.materialize_shadow_rows_for_mutation();
         self.index.remove_document(rowid);
         self.documents.remove(&rowid);
         self.shadow_rows = None;
@@ -7386,10 +7460,17 @@ impl Fts5Table {
     }
 
     pub fn apply_shadow_rows(&mut self, rows: &Fts5ShadowRows) -> Result<Fts5ConfigMetadata> {
-        self.decode_data_rows(&rows.data)?;
+        let report = rows.validate_for_open(self.columns.len())?;
+        if Self::shadow_rows_have_persisted_segments(&report) {
+            self.bind_validated_shadow_rows(rows.clone(), &report);
+            return Ok(report.metadata);
+        }
+
         let metadata = self.apply_config_rows(&rows.config)?;
         if self.config.content_mode() != ContentMode::Contentless || !rows.content.is_empty() {
             self.apply_content_rows(&rows.content);
+        } else {
+            self.rebuild_documents(Vec::new());
         }
         self.apply_docsize_rows(&rows.docsize);
         Ok(metadata)
@@ -7894,6 +7975,9 @@ impl VirtualTable for Fts5Table {
                     "fts5: cannot delete from contentless table without contentless_delete=1",
                 ));
             }
+            if !self.has_document_or_shadow_rowid(rowid) {
+                return Ok(None);
+            }
             self.delete_document(rowid);
             return Ok(None);
         }
@@ -7914,7 +7998,7 @@ impl VirtualTable for Fts5Table {
                 self.next_rowid += 1;
                 r
             };
-            if self.documents.contains_key(&rowid) {
+            if self.has_document_or_shadow_rowid(rowid) {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
 
@@ -7949,10 +8033,10 @@ impl VirtualTable for Fts5Table {
         } else {
             old_rowid
         };
-        if old_rowid != new_rowid && self.documents.contains_key(&new_rowid) {
+        if old_rowid != new_rowid && self.has_document_or_shadow_rowid(new_rowid) {
             return Err(FrankenError::PrimaryKeyViolation);
         }
-        if !self.documents.contains_key(&old_rowid) {
+        if !self.has_document_or_shadow_rowid(old_rowid) {
             return Err(FrankenError::Internal(
                 "fts5 update referenced a missing rowid".to_owned(),
             ));
@@ -10641,12 +10725,13 @@ mod tests {
         let mut reopened =
             Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
         reopened.apply_shadow_rows(&rows).unwrap();
-        let matches: Vec<i64> = reopened
+        let mut matches: Vec<i64> = reopened
             .search("rust")
             .unwrap()
             .into_iter()
             .map(|(rowid, _rank)| rowid)
             .collect();
+        matches.sort_unstable();
         assert_eq!(matches, vec![7, 9]);
         assert_eq!(
             reopened.lookup_content_row(7),
@@ -10748,6 +10833,69 @@ mod tests {
         assert_eq!(opened.report.content_row_count, 2);
         assert_eq!(opened.report.docsize_row_count, 2);
         assert_eq!(opened.report.integrity.unwrap().term_count, 4);
+    }
+
+    #[test]
+    fn test_fts5_apply_shadow_rows_binds_segments_without_rebuild_and_hydrates_on_write() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let rows = sample_shadow_query_rows(&base);
+        let mut reopened =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+
+        reopened.apply_shadow_rows(&rows).unwrap();
+
+        assert!(
+            reopened.is_empty(),
+            "persisted segments should bind without hydrating content rows"
+        );
+        assert!(
+            reopened.shadow_rows.is_some(),
+            "apply_shadow_rows should keep segment-backed query state"
+        );
+        assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
+
+        reopened.insert_document(9, &["fresh rust".to_owned(), "new row".to_owned()]);
+
+        assert!(
+            reopened.shadow_rows.is_none(),
+            "first write should hydrate shadow content before mutating"
+        );
+        assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
+        assert_eq!(search_rowids(&reopened, "fresh").unwrap(), vec![9]);
+    }
+
+    #[test]
+    fn test_fts5_shadow_rows_failed_update_preserves_lazy_binding() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        let rows = sample_shadow_query_rows(&base);
+        let mut reopened =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+
+        reopened.apply_shadow_rows(&rows).unwrap();
+        let err = reopened
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(99),
+                    SqliteValue::Integer(99),
+                    SqliteValue::Text(SmallText::from_string("missing row")),
+                    SqliteValue::Text(SmallText::from_string("should not hydrate")),
+                ],
+            )
+            .expect_err("missing row update should fail");
+
+        assert!(err.to_string().contains("missing rowid"));
+        assert!(
+            reopened.shadow_rows.is_some(),
+            "failed validation should not consume lazy shadow rows"
+        );
+        assert!(
+            reopened.is_empty(),
+            "failed validation should not hydrate content rows"
+        );
+        assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
     }
 
     #[test]

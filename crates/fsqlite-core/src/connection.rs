@@ -55850,18 +55850,12 @@ impl Connection {
             .collect()
     }
 
-    /// Read the persisted FTS5 shadow tables (`<tbl>_data`, `<tbl>_docsize`,
-    /// `<tbl>_content`) for a reopened on-disk index so the table can be bound
-    /// to its existing posting-list index instead of re-tokenizing `_content`.
-    /// `_idx`/`_config` are `WITHOUT ROWID` (not walkable by the rowid table
-    /// reader) and are reconstructed inside `Fts5ShadowRows::from_storage_rows`.
-    // Reads the rowid-backed shadow tables (`_data`/`_docsize`/`_content`) into
-    // typed `Fts5ShadowRows`. NOT yet wired into reload — the shadow-bind query
-    // path it was written for is unsafe on writes and O(N^2) on large corpora
-    // (see the reverted call site). Retained for the corrected rebuild-from-
-    // postings fix (bd-fts5-lazy-shadow-reads). Decoder validated against cass.
+    /// Read persisted FTS5 shadow rows for a rootpage=0 table. `_data` carries
+    /// the real posting-list segments, `_docsize` carries ranking lengths, and
+    /// content is resolved through the same stored/external/contentless rules
+    /// used by SQLite FTS5. `_idx`/`_config` are `WITHOUT ROWID`; `_idx` is only
+    /// an accelerator, so the segment reader remains correct when it is absent.
     #[cfg(feature = "ext-fts5")]
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn read_fts5_shadow_rows_for_reload(
         &self,
@@ -55875,8 +55869,8 @@ impl Connection {
         args: &[String],
     ) -> Result<Fts5ShadowRows> {
         let column_count = parse_virtual_table_column_infos(args).len();
-        let mut shadow: [Vec<(i64, Vec<SqliteValue>)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for (slot, suffix) in shadow.iter_mut().zip(["_data", "_docsize", "_content"]) {
+        let mut shadow: [Vec<(i64, Vec<SqliteValue>)>; 2] = [Vec::new(), Vec::new()];
+        for (slot, suffix) in shadow.iter_mut().zip(["_data", "_docsize"]) {
             let name = format!("{table_name}{suffix}");
             if let Some(table) = schema
                 .iter()
@@ -55892,7 +55886,29 @@ impl Connection {
                 )?;
             }
         }
-        let [data, docsize, content] = shadow;
+        let [data, docsize] = shadow;
+        let content = self
+            .read_fts5_rootpage_zero_content_rows_for_reload(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                schema,
+                rowid_alias_columns,
+                table_name,
+                args,
+            )?
+            .into_iter()
+            .map(|(rowid, values)| {
+                (
+                    rowid,
+                    values
+                        .into_iter()
+                        .map(|value| SqliteValue::Text(value.into()))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
         Ok(Fts5ShadowRows::from_storage_rows(
             &data,
             &docsize,
@@ -55951,14 +55967,7 @@ impl Connection {
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
-                // NOTE (2026-06-01): the shadow-bind fast path was reverted
-                // here — binding `Fts5ShadowRows` for query is unsafe on the
-                // write path (the first insert clears shadow_rows, dropping the
-                // persisted index) and O(N^2) on large corpora (no `_idx`;
-                // linear `data_row`/`doc_length` scans). The correct fix
-                // rebuilds the in-memory `InvertedIndex` from persisted `_data`
-                // postings (no tokenization). See bd-fts5-lazy-shadow-reads.
-                let rows = self.read_fts5_rootpage_zero_content_rows_for_reload(
+                let rows = self.read_fts5_shadow_rows_for_reload(
                     cx,
                     txn,
                     page_size,
@@ -55968,7 +55977,7 @@ impl Connection {
                     table_name,
                     &create_stmt.args,
                 )?;
-                fts5.rebuild_documents(rows);
+                fts5.apply_shadow_rows(&rows)?;
                 reloaded.insert(table_key, instance);
                 continue;
             }
@@ -119753,6 +119762,19 @@ SELECT x FROM t;
                 conn.has_live_vtab_instance("docs_fts"),
                 "stock rootpage=0 FTS5 root should reconnect as a live virtual table"
             );
+            #[cfg(feature = "ext-fts5")]
+            {
+                let instances = conn.vtab_instances.borrow();
+                let fts5 = instances
+                    .get("DOCS_FTS")
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .expect("docs_fts should reconnect as FTS5");
+                assert!(
+                    fts5.is_empty(),
+                    "stock rootpage=0 reconnect should bind persisted segments without hydrating content rows"
+                );
+                assert_eq!(fts5.row_count(), 3);
+            }
             let rows = conn
                 .query(
                     "SELECT rowid, title, body \
