@@ -10146,15 +10146,26 @@ impl Connection {
         }
     }
 
-    fn transactional_live_vtab_registry_active(&self) -> bool {
-        let has_savepoints = match self.savepoints.try_borrow() {
+    fn savepoints_are_open_or_borrowed(&self) -> bool {
+        match self.savepoints.try_borrow() {
             Ok(savepoints) => !savepoints.is_empty(),
             Err(_) => true,
-        };
+        }
+    }
+
+    fn local_transaction_scope_is_active(&self) -> bool {
         self.in_transaction.get()
             || self.active_txn_is_open_or_borrowed()
-            || has_savepoints
+            || self.savepoints_are_open_or_borrowed()
             || self.internal_statement_savepoint_depth.get() > 0
+    }
+
+    fn committed_pager_refresh_allowed(&self) -> bool {
+        !self.pager.is_memory() && !self.local_transaction_scope_is_active()
+    }
+
+    fn transactional_live_vtab_registry_active(&self) -> bool {
+        self.local_transaction_scope_is_active()
     }
 
     fn can_preserve_existing_live_vtabs_after_reload(
@@ -12572,7 +12583,7 @@ impl Connection {
             // so skip the staleness check entirely. Schema changes within the
             // same connection are caught by the schema_generation comparison
             // in ensure_schema_unchanged, not by memdb staleness.
-            if !self.in_transaction.get() && !self.pager.is_memory() {
+            if self.committed_pager_refresh_allowed() {
                 match self.try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)? {
                     PreparedSchemaRefreshResult {
                         outcome: PreparedSchemaRefreshOutcome::Noop,
@@ -13086,7 +13097,7 @@ impl Connection {
         let op_cx = self.op_cx_after_background_status();
         self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)?;
         let _ = self.refresh_prepared_schema_state(&op_cx, true)?;
-        if !self.pager.is_memory() && !self.in_transaction.get() {
+        if self.committed_pager_refresh_allowed() {
             // File-backed autocommit prepares must refresh the committed MemDB
             // image before prepared-cache lookup so any cache hit is keyed
             // against the latest visible snapshot rather than stale local state.
@@ -24516,7 +24527,7 @@ impl Connection {
             return Ok(());
         }
 
-        if self.in_transaction.get() {
+        if self.local_transaction_scope_is_active() {
             // Inside an explicit transaction, the pager's published snapshot
             // does not contain uncommitted DDL changes (CREATE TABLE, DROP
             // TABLE, ALTER TABLE).  Reloading from the pager here would
@@ -32889,7 +32900,7 @@ impl Connection {
             }
         }
 
-        if !self.pager.is_memory() && !self.in_transaction.get() {
+        if self.committed_pager_refresh_allowed() {
             let hydrate_file_backed_fast_path = stmt
                 .prepared_query_fast_path
                 .as_ref()
@@ -34367,12 +34378,13 @@ impl Connection {
         if !was_auto {
             return Ok(());
         }
-        // bd-batched-commit-cliff: Respect the connection-level capture toggle.
-        // When capture is disabled, downstream fast-paths that would otherwise
-        // avoid retaining the txn-local MemDatabase state because of a pending
-        // capture can remain on the cheaper retained/private-memory lanes.
+        // DDL/schema boundaries must publish immediately even when historical
+        // time-travel capture is disabled. The caller's flag means "this
+        // statement is a commit boundary that may need a snapshot"; the
+        // connection-level toggle only controls the snapshot capture itself.
+        let force_immediate_autocommit_commit = capture_time_travel_snapshot;
         let capture_time_travel_snapshot =
-            capture_time_travel_snapshot && self.time_travel_capture_enabled.get();
+            force_immediate_autocommit_commit && self.time_travel_capture_enabled.get();
         // bd-db300.5.2.2.1: Count commit-side refresh work.
         if hot_path_profile_enabled() {
             FSQLITE_COMMIT_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
@@ -34525,11 +34537,11 @@ impl Connection {
             let can_retain_autocommit_batch = !is_concurrent_txn
                 && txn_has_pending_writes
                 && concurrent_plan.is_none()
-                && !capture_time_travel_snapshot
+                && !force_immediate_autocommit_commit
                 && self.autocommit_retain_enabled.get()
                 && self.live_vtab_transactions.borrow().is_empty();
             let can_retain_private_memory_batch = self.pager.is_memory()
-                && !capture_time_travel_snapshot
+                && !force_immediate_autocommit_commit
                 && !self.has_differential_subscribers();
             if can_retain_autocommit_batch
                 && (!self.pager.is_memory() || can_retain_private_memory_batch)
@@ -34574,7 +34586,7 @@ impl Connection {
                 && !is_concurrent_txn
                 && txn_has_pending_writes
                 && concurrent_plan.is_none()
-                && !capture_time_travel_snapshot
+                && !force_immediate_autocommit_commit
                 && self.live_vtab_transactions.borrow().is_empty()
                 && !retained_autocommit_flush_boundary
             {
@@ -49226,7 +49238,7 @@ impl Connection {
         &self,
         src: &JoinTableSource,
     ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
-        if !self.pager.is_file_backed() {
+        if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
             return None;
         }
         let binding_name = src.local_table_binding()?;
@@ -49353,17 +49365,15 @@ impl Connection {
         struct WinInfo {
             func: Arc<ErasedWindowFunction>,
             args: Vec<Expr>,
+            args_are_star: bool,
             order_by: Vec<(Expr, bool)>,
+            order_by_source: Vec<Expr>,
             partition_by: Vec<Expr>,
-            /// For each ORDER BY expr, if it's an aggregate, the index into
-            /// `extra_agg_exprs`; otherwise `None`.
-            ob_agg_map: Vec<Option<usize>>,
-            /// Same for PARTITION BY.
-            pb_agg_map: Vec<Option<usize>>,
+            partition_by_source: Vec<Expr>,
             two_pass: bool,
             name: String,
             frame: Option<FrameSpec>,
-            _filter: Option<Expr>,
+            filter: Option<Expr>,
         }
         // Track which output column indices are plain vs window.
         #[allow(clippy::large_enum_variant)]
@@ -49377,9 +49387,17 @@ impl Connection {
         let mut win_infos: Vec<WinInfo> = Vec::new();
         let mut col_kinds: Vec<GbwColKind> = Vec::new();
 
-        // Collect aggregate expressions from window ORDER BY/PARTITION BY
-        // that need to be added as extra columns to the GROUP BY query.
-        let mut extra_agg_exprs: Vec<(String, Expr)> = Vec::new(); // (alias, expr)
+        // Collect window expressions that need to be added as extra columns to
+        // the GROUP BY query before the grouped rows are fed into the window
+        // executor. Window args, filters, ORDER BY, and PARTITION BY are all
+        // evaluated after GROUP BY, so they must be materialized in phase 1.
+        let mut extra_window_exprs: Vec<(String, Expr)> = Vec::new(); // (alias, expr)
+        let materialize_window_expr =
+            |extra_exprs: &mut Vec<(String, Expr)>, expr: &Expr| -> Expr {
+                let alias = format!("__win_expr_{}", extra_exprs.len());
+                extra_exprs.push((alias.clone(), expr.clone()));
+                Expr::Column(ColumnRef::bare(alias), Span::new(0, 0))
+            };
 
         for col in columns {
             match col {
@@ -49395,24 +49413,35 @@ impl Connection {
                     ..
                 } => {
                     let spec = resolve_window_spec(raw_spec);
+                    let args_are_star = matches!(args, FunctionArgs::Star);
                     let arg_exprs = match args {
-                        FunctionArgs::List(exprs) => exprs.clone(),
+                        FunctionArgs::List(exprs) => exprs
+                            .iter()
+                            .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
+                            .collect(),
                         FunctionArgs::Star => vec![],
                     };
                     #[allow(clippy::cast_possible_wrap)]
                     let num_args = arg_exprs.len() as i32;
                     let func = find_window_function_checked(&registry, name, num_args)?;
+                    let order_by_source: Vec<Expr> =
+                        spec.order_by.iter().map(|term| term.expr.clone()).collect();
                     let ob: Vec<(Expr, bool)> = spec
                         .order_by
                         .iter()
                         .map(|t| {
                             (
-                                t.expr.clone(),
+                                materialize_window_expr(&mut extra_window_exprs, &t.expr),
                                 matches!(t.direction, Some(SortDirection::Desc)),
                             )
                         })
                         .collect();
-                    let pb = spec.partition_by.clone();
+                    let partition_by_source = spec.partition_by.clone();
+                    let pb = spec
+                        .partition_by
+                        .iter()
+                        .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
+                        .collect();
                     let upper = name.to_ascii_uppercase();
                     let needs_full_partition = matches!(
                         upper.as_str(),
@@ -49428,47 +49457,23 @@ impl Connection {
                     let aggregate_no_order = !needs_full_partition && spec.order_by.is_empty();
                     let two_pass = needs_full_partition || aggregate_no_order;
 
-                    // Collect aggregate exprs from ORDER BY/PARTITION BY,
-                    // tracking which index in extra_agg_exprs each maps to.
-                    let ob_agg_map: Vec<Option<usize>> = ob
-                        .iter()
-                        .map(|(oexpr, _)| {
-                            if expr_has_aggregate(oexpr) {
-                                let eidx = extra_agg_exprs.len();
-                                let alias = format!("__win_agg_{eidx}");
-                                extra_agg_exprs.push((alias, oexpr.clone()));
-                                Some(eidx)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let pb_agg_map: Vec<Option<usize>> = pb
-                        .iter()
-                        .map(|pexpr| {
-                            if expr_has_aggregate(pexpr) {
-                                let eidx = extra_agg_exprs.len();
-                                let alias = format!("__win_agg_{eidx}");
-                                extra_agg_exprs.push((alias, pexpr.clone()));
-                                Some(eidx)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    let filter = filter
+                        .as_deref()
+                        .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr));
 
                     let idx = win_infos.len();
                     win_infos.push(WinInfo {
                         func,
                         args: arg_exprs,
+                        args_are_star,
                         order_by: ob,
+                        order_by_source,
                         partition_by: pb,
-                        ob_agg_map,
-                        pb_agg_map,
+                        partition_by_source,
                         two_pass,
                         name: upper,
                         frame: spec.frame.clone(),
-                        _filter: filter.as_deref().cloned(),
+                        filter,
                     });
                     col_kinds.push(GbwColKind::Window(idx));
                 }
@@ -49480,24 +49485,38 @@ impl Connection {
                             )
                         })?;
                     let inner_spec = resolve_window_spec(&raw_inner_spec);
+                    let args_are_star = matches!(&inner_args, FunctionArgs::Star);
                     let arg_exprs = match &inner_args {
-                        FunctionArgs::List(exprs) => exprs.clone(),
+                        FunctionArgs::List(exprs) => exprs
+                            .iter()
+                            .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
+                            .collect(),
                         FunctionArgs::Star => vec![],
                     };
                     #[allow(clippy::cast_possible_wrap)]
                     let num_args = arg_exprs.len() as i32;
                     let func = find_window_function_checked(&registry, &inner_name, num_args)?;
+                    let order_by_source: Vec<Expr> = inner_spec
+                        .order_by
+                        .iter()
+                        .map(|term| term.expr.clone())
+                        .collect();
                     let ob: Vec<(Expr, bool)> = inner_spec
                         .order_by
                         .iter()
                         .map(|t| {
                             (
-                                t.expr.clone(),
+                                materialize_window_expr(&mut extra_window_exprs, &t.expr),
                                 matches!(t.direction, Some(SortDirection::Desc)),
                             )
                         })
                         .collect();
-                    let pb = inner_spec.partition_by.clone();
+                    let partition_by_source = inner_spec.partition_by.clone();
+                    let pb = inner_spec
+                        .partition_by
+                        .iter()
+                        .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr))
+                        .collect();
                     let upper = inner_name.to_ascii_uppercase();
                     let needs_full_partition = matches!(
                         upper.as_str(),
@@ -49513,44 +49532,22 @@ impl Connection {
                     let aggregate_no_order =
                         !needs_full_partition && inner_spec.order_by.is_empty();
                     let two_pass = needs_full_partition || aggregate_no_order;
-                    let ob_agg_map: Vec<Option<usize>> = ob
-                        .iter()
-                        .map(|(oexpr, _)| {
-                            if expr_has_aggregate(oexpr) {
-                                let eidx = extra_agg_exprs.len();
-                                let alias = format!("__win_agg_{eidx}");
-                                extra_agg_exprs.push((alias, oexpr.clone()));
-                                Some(eidx)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let pb_agg_map: Vec<Option<usize>> = pb
-                        .iter()
-                        .map(|pexpr| {
-                            if expr_has_aggregate(pexpr) {
-                                let eidx = extra_agg_exprs.len();
-                                let alias = format!("__win_agg_{eidx}");
-                                extra_agg_exprs.push((alias, pexpr.clone()));
-                                Some(eidx)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    let filter = inner_filter
+                        .as_ref()
+                        .map(|expr| materialize_window_expr(&mut extra_window_exprs, expr));
                     let idx = win_infos.len();
                     win_infos.push(WinInfo {
                         func,
                         args: arg_exprs,
+                        args_are_star,
                         order_by: ob,
+                        order_by_source,
                         partition_by: pb,
-                        ob_agg_map,
-                        pb_agg_map,
+                        partition_by_source,
                         two_pass,
                         name: upper,
                         frame: inner_spec.frame.clone(),
-                        _filter: inner_filter,
+                        filter,
                     });
                     let outer_with_placeholder = replace_window_with_placeholder(expr);
                     col_kinds.push(GbwColKind::WrappedWindow(idx, outer_with_placeholder));
@@ -49565,9 +49562,9 @@ impl Connection {
 
         // ── Phase 1b: Build and execute GROUP BY query ─────────────────────
 
-        // Build GROUP BY columns: non-window columns + extra aggregate columns.
+        // Build GROUP BY columns: non-window columns + materialized window expressions.
         let mut gb_columns = grouped_columns.clone();
-        for (alias, expr) in &extra_agg_exprs {
+        for (alias, expr) in &extra_window_exprs {
             gb_columns.push(ResultColumn::Expr {
                 expr: expr.clone(),
                 alias: Some(alias.clone()),
@@ -49598,8 +49595,8 @@ impl Connection {
 
         // Build col_map from the grouped result. We assign synthetic column
         // names: original column aliases/expressions for plain columns, and
-        // __win_agg_N for extra aggregate columns.
-        let total_gb_cols = grouped_columns.len() + extra_agg_exprs.len();
+        // __win_expr_N for materialized window expressions.
+        let total_gb_cols = grouped_columns.len() + extra_window_exprs.len();
         let mut col_map: Vec<(String, String, bool)> = Vec::with_capacity(total_gb_cols);
 
         // For plain grouped columns, derive names from their alias or expr.
@@ -49614,8 +49611,8 @@ impl Connection {
             };
             col_map.push((String::new(), name, false));
         }
-        // For extra aggregate columns.
-        for (alias, _) in &extra_agg_exprs {
+        // For materialized window expressions.
+        for (alias, _) in &extra_window_exprs {
             col_map.push((String::new(), alias.clone(), false));
         }
 
@@ -49640,42 +49637,15 @@ impl Connection {
         };
 
         for (wi, info) in win_infos.iter().enumerate() {
-            // Rewrite aggregate ORDER BY/PARTITION BY expressions as column
-            // references into the extra aggregate columns, using the
-            // tracked indices from Phase 1.
-            let rewritten_ob: Vec<(Expr, bool)> = info
-                .order_by
-                .iter()
-                .zip(info.ob_agg_map.iter())
-                .map(|((oexpr, desc), agg_idx)| {
-                    if let Some(eidx) = agg_idx {
-                        let alias = extra_agg_exprs[*eidx].0.clone();
-                        (Expr::Column(ColumnRef::bare(alias), Span::new(0, 0)), *desc)
-                    } else {
-                        (oexpr.clone(), *desc)
-                    }
-                })
-                .collect();
-            let rewritten_pb: Vec<Expr> = info
-                .partition_by
-                .iter()
-                .zip(info.pb_agg_map.iter())
-                .map(|(pexpr, agg_idx)| {
-                    if let Some(eidx) = agg_idx {
-                        let alias = extra_agg_exprs[*eidx].0.clone();
-                        Expr::Column(ColumnRef::bare(alias), Span::new(0, 0))
-                    } else {
-                        pexpr.clone()
-                    }
-                })
-                .collect();
+            let rewritten_ob = info.order_by.clone();
+            let rewritten_pb = info.partition_by.clone();
             let rewritten_ob_collations: Vec<Option<String>> = info
-                .order_by
+                .order_by_source
                 .iter()
-                .map(|(expr, _)| resolve_expr_collation(expr))
+                .map(&resolve_expr_collation)
                 .collect();
             let rewritten_pb_collations: Vec<Option<String>> = info
-                .partition_by
+                .partition_by_source
                 .iter()
                 .map(&resolve_expr_collation)
                 .collect();
@@ -49814,6 +49784,28 @@ impl Connection {
                     "NTILE" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
                 );
                 let uses_inverse_counter = matches!(fname.as_str(), "NTILE" | "LEAD" | "LAG");
+                let frame_sensitive = !matches!(
+                    fname.as_str(),
+                    "ROW_NUMBER"
+                        | "RANK"
+                        | "DENSE_RANK"
+                        | "PERCENT_RANK"
+                        | "CUME_DIST"
+                        | "NTILE"
+                        | "LAG"
+                        | "LEAD"
+                );
+                let win_filter = info.filter.as_ref();
+                let row_passes_filter = |ri: usize| -> bool {
+                    if let Some(filter_expr) = win_filter {
+                        match eval_join_expr(filter_expr, &row_values[ri], &col_map) {
+                            Ok(v) => is_sqlite_truthy(&v),
+                            Err(_) => false,
+                        }
+                    } else {
+                        true
+                    }
+                };
 
                 if fname == "NTH_VALUE" {
                     let default_frame;
@@ -49852,14 +49844,19 @@ impl Connection {
                         );
                         let current_args = build_window_args(
                             &info.args,
+                            info.args_are_star,
                             &rewritten_ob,
                             &row_values[ri],
                             &col_map,
                         )?;
                         let mut frame_arg_rows = Vec::with_capacity(included_rows.len());
                         for slot_ri in included_rows {
+                            if !row_passes_filter(slot_ri) {
+                                continue;
+                            }
                             frame_arg_rows.push(build_window_args(
                                 &info.args,
+                                info.args_are_star,
                                 &rewritten_ob,
                                 &row_values[slot_ri],
                                 &col_map,
@@ -49867,13 +49864,57 @@ impl Connection {
                         }
                         func_vals.push(nth_value_from_frame_args(&current_args, &frame_arg_rows)?);
                     }
+                } else if frame_sensitive && let Some(frame_spec) = frame.as_ref() {
+                    let peer_groups = build_peer_groups_collated_snapshot(
+                        partition_indices,
+                        &rewritten_ob,
+                        &row_values,
+                        &col_map,
+                        &rewritten_ob_collations,
+                        &collation_registry_snap,
+                    );
+                    for (pos, &ri) in partition_indices.iter().enumerate() {
+                        let frame_rows = window_frame_rows_for_current(
+                            pos,
+                            partition_indices,
+                            &rewritten_ob,
+                            &row_values,
+                            &col_map,
+                            &rewritten_ob_collations,
+                            &collation_registry_snap,
+                            frame_spec,
+                            &peer_groups,
+                        );
+                        let peer_rows = peer_rows_for_current_row(&peer_groups, ri);
+                        let included_rows =
+                            apply_frame_exclusion(frame_rows, ri, &peer_rows, frame_spec.exclude);
+                        let mut excluded_state = info.func.initial_state();
+                        for slot_ri in included_rows {
+                            if !row_passes_filter(slot_ri) {
+                                continue;
+                            }
+                            let args = build_window_args(
+                                &info.args,
+                                info.args_are_star,
+                                &rewritten_ob,
+                                &row_values[slot_ri],
+                                &col_map,
+                            )?;
+                            info.func.step(&mut excluded_state, &args)?;
+                        }
+                        func_vals.push(info.func.value(&excluded_state)?);
+                    }
                 } else if info.two_pass && !is_positional {
                     // Two-pass non-peer-aware: step all rows, then
                     // single value repeated (full-frame aggregate without
                     // ORDER BY, e.g. SUM() OVER ()).
                     for &ri in partition_indices {
+                        if !row_passes_filter(ri) {
+                            continue;
+                        }
                         let args = build_window_args(
                             &info.args,
+                            info.args_are_star,
                             &rewritten_ob,
                             &row_values[ri],
                             &col_map,
@@ -49888,28 +49929,81 @@ impl Connection {
                     let all_args: Vec<Vec<SqliteValue>> = partition_indices
                         .iter()
                         .map(|&ri| {
-                            build_window_args(&info.args, &rewritten_ob, &row_values[ri], &col_map)
+                            build_window_args(
+                                &info.args,
+                                info.args_are_star,
+                                &rewritten_ob,
+                                &row_values[ri],
+                                &col_map,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let mut st2 = info.func.initial_state();
-                    for row_args in &all_args {
+                    for (&ri, row_args) in partition_indices.iter().zip(all_args.iter()) {
+                        if !row_passes_filter(ri) {
+                            continue;
+                        }
                         info.func.step(&mut st2, row_args)?;
                     }
                     for _ in partition_indices {
                         func_vals.push(info.func.value(&st2)?);
                         info.func.inverse(&mut st2, &[])?;
                     }
+                } else if info.two_pass && (!has_order || frame_end_unbounded) {
+                    for &ri in partition_indices {
+                        if !row_passes_filter(ri) {
+                            continue;
+                        }
+                        let args = build_window_args(
+                            &info.args,
+                            info.args_are_star,
+                            &rewritten_ob,
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        info.func.step(&mut state, &args)?;
+                    }
+                    let val = info.func.value(&state)?;
+                    for _ in partition_indices {
+                        func_vals.push(val.clone());
+                    }
+                } else if info.two_pass && frame_start_unbounded {
+                    let mut running_state = info.func.initial_state();
+                    for &ri in partition_indices {
+                        if row_passes_filter(ri) {
+                            let args = build_window_args(
+                                &info.args,
+                                info.args_are_star,
+                                &rewritten_ob,
+                                &row_values[ri],
+                                &col_map,
+                            )?;
+                            info.func.step(&mut running_state, &args)?;
+                        }
+                        func_vals.push(info.func.value(&running_state)?);
+                    }
                 } else if is_positional {
                     // Positional functions need all row args.
                     let all_args: Vec<Vec<SqliteValue>> = partition_indices
                         .iter()
                         .map(|&ri| {
-                            build_window_args(&info.args, &rewritten_ob, &row_values[ri], &col_map)
+                            build_window_args(
+                                &info.args,
+                                info.args_are_star,
+                                &rewritten_ob,
+                                &row_values[ri],
+                                &col_map,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?;
                     for (pos, _) in partition_indices.iter().enumerate() {
                         let mut st2 = info.func.initial_state();
-                        for (j, row_args) in all_args.iter().enumerate() {
+                        for (j, (&ri, row_args)) in
+                            partition_indices.iter().zip(all_args.iter()).enumerate()
+                        {
+                            if !row_passes_filter(ri) {
+                                continue;
+                            }
                             info.func.step(&mut st2, row_args)?;
                             if j == pos && !info.two_pass {
                                 break;
@@ -49921,8 +50015,13 @@ impl Connection {
                 } else if frame_start_unbounded && !frame_end_unbounded {
                     // Running aggregate (UNBOUNDED PRECEDING TO CURRENT ROW).
                     for &ri in partition_indices {
+                        if !row_passes_filter(ri) {
+                            func_vals.push(info.func.value(&state)?);
+                            continue;
+                        }
                         let args = build_window_args(
                             &info.args,
+                            info.args_are_star,
                             &rewritten_ob,
                             &row_values[ri],
                             &col_map,
@@ -49933,8 +50032,12 @@ impl Connection {
                 } else {
                     // Full-frame aggregate.
                     for &ri in partition_indices {
+                        if !row_passes_filter(ri) {
+                            continue;
+                        }
                         let args = build_window_args(
                             &info.args,
+                            info.args_are_star,
                             &rewritten_ob,
                             &row_values[ri],
                             &col_map,
@@ -50180,6 +50283,7 @@ impl Connection {
         let mut col_kinds = Vec::with_capacity(expanded_columns.len());
         let mut win_funcs: Vec<Arc<ErasedWindowFunction>> = Vec::new();
         let mut win_args: Vec<Vec<Expr>> = Vec::new();
+        let mut win_args_are_star: Vec<bool> = Vec::new();
         let mut win_order_by: Vec<Vec<(Expr, bool)>> = Vec::new();
         let mut win_partition_by: Vec<Vec<Expr>> = Vec::new();
         let mut win_two_pass: Vec<bool> = Vec::new();
@@ -50232,6 +50336,7 @@ impl Connection {
                     ..
                 } => {
                     let spec = resolve_window_spec(raw_spec);
+                    let args_are_star = matches!(args, FunctionArgs::Star);
                     let arg_exprs = match args {
                         FunctionArgs::List(exprs) => exprs.clone(),
                         FunctionArgs::Star => vec![],
@@ -50267,6 +50372,7 @@ impl Connection {
                     let idx = win_funcs.len();
                     win_funcs.push(func);
                     win_args.push(arg_exprs);
+                    win_args_are_star.push(args_are_star);
                     win_order_by.push(ob);
                     win_partition_by.push(pb);
                     win_two_pass.push(two_pass);
@@ -50287,6 +50393,7 @@ impl Connection {
                             )
                         })?;
                     let inner_spec = resolve_window_spec(&raw_inner_spec);
+                    let args_are_star = matches!(&inner_args, FunctionArgs::Star);
                     let arg_exprs = match &inner_args {
                         FunctionArgs::List(exprs) => exprs.clone(),
                         FunctionArgs::Star => vec![],
@@ -50323,6 +50430,7 @@ impl Connection {
                     let idx = win_funcs.len();
                     win_funcs.push(func);
                     win_args.push(arg_exprs);
+                    win_args_are_star.push(args_are_star);
                     win_order_by.push(ob);
                     win_partition_by.push(pb);
                     win_two_pass.push(two_pass);
@@ -50638,6 +50746,7 @@ impl Connection {
                         );
                         let current_args = build_window_args(
                             &win_args[wi],
+                            win_args_are_star[wi],
                             &win_order_by[wi],
                             &row_values[ri],
                             &col_map,
@@ -50649,6 +50758,7 @@ impl Connection {
                             }
                             frame_arg_rows.push(build_window_args(
                                 &win_args[wi],
+                                win_args_are_star[wi],
                                 &win_order_by[wi],
                                 &row_values[slot_ri],
                                 &col_map,
@@ -50689,6 +50799,7 @@ impl Connection {
                             }
                             let args = build_window_args(
                                 &win_args[wi],
+                                win_args_are_star[wi],
                                 &win_order_by[wi],
                                 &row_values[slot_ri],
                                 &col_map,
@@ -50717,6 +50828,7 @@ impl Connection {
                             }
                             let args = build_window_args(
                                 &win_args[wi],
+                                win_args_are_star[wi],
                                 &win_order_by[wi],
                                 &row_values[slot_ri],
                                 &col_map,
@@ -50734,6 +50846,7 @@ impl Connection {
                         }
                         let args = build_window_args(
                             &win_args[wi],
+                            win_args_are_star[wi],
                             &win_order_by[wi],
                             &row_values[ri],
                             &col_map,
@@ -50770,6 +50883,7 @@ impl Connection {
                             if row_passes_filter(ri) {
                                 let args = build_window_args(
                                     &win_args[wi],
+                                    win_args_are_star[wi],
                                     &win_order_by[wi],
                                     &row_values[ri],
                                     &col_map,
@@ -50835,6 +50949,7 @@ impl Connection {
                                         }
                                         let args = build_window_args(
                                             &win_args[wi],
+                                            win_args_are_star[wi],
                                             &win_order_by[wi],
                                             &row_values[ri],
                                             &col_map,
@@ -50867,6 +50982,7 @@ impl Connection {
                                     }
                                     let args = build_window_args(
                                         &win_args[wi],
+                                        win_args_are_star[wi],
                                         &win_order_by[wi],
                                         &row_values[slot_ri],
                                         &col_map,
@@ -50905,6 +51021,7 @@ impl Connection {
                                 }
                                 let args = build_window_args(
                                     &win_args[wi],
+                                    win_args_are_star[wi],
                                     &win_order_by[wi],
                                     &row_values[ri],
                                     &col_map,
@@ -50922,6 +51039,7 @@ impl Connection {
                             if row_passes_filter(ri) {
                                 let args = build_window_args(
                                     &win_args[wi],
+                                    win_args_are_star[wi],
                                     &win_order_by[wi],
                                     &row_values[ri],
                                     &col_map,
@@ -71378,7 +71496,10 @@ fn build_peer_groups_collated_snapshot(
     }
     let mut groups: Vec<Vec<usize>> = vec![vec![partition_indices[0]]];
     for &ri in &partition_indices[1..] {
-        let prev_ri = *groups.last().unwrap().last().unwrap();
+        let Some(prev_ri) = groups.last().and_then(|group| group.last()).copied() else {
+            groups.push(vec![ri]);
+            continue;
+        };
         let same = order_by_keys_equal_collated_snapshot(
             prev_ri,
             ri,
@@ -71389,7 +71510,11 @@ fn build_peer_groups_collated_snapshot(
             registry,
         );
         if same {
-            groups.last_mut().unwrap().push(ri);
+            if let Some(group) = groups.last_mut() {
+                group.push(ri);
+            } else {
+                groups.push(vec![ri]);
+            }
         } else {
             groups.push(vec![ri]);
         }
@@ -71817,11 +71942,14 @@ fn range_value_frame_bounds(
 
 fn build_window_args(
     func_args: &[Expr],
+    args_are_star: bool,
     order_by: &[(Expr, bool)],
     row: &[SqliteValue],
     col_map: &[(String, String, bool)],
 ) -> Result<Vec<SqliteValue>> {
-    if func_args.is_empty() {
+    if args_are_star {
+        Ok(Vec::new())
+    } else if func_args.is_empty() {
         order_by
             .iter()
             .map(|(expr, _)| eval_join_expr(expr, row, col_map))
@@ -118687,6 +118815,35 @@ mod autocommit_txn_tests {
             .query_row("SELECT COUNT(*) FROM pragma_flush;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count_after, 1);
+    }
+
+    #[test]
+    fn test_schema_autocommit_boundaries_do_not_retain_when_capture_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("schema_autocommit_boundaries_do_not_retain.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.time_travel_capture_enabled.set(false);
+
+        conn.execute("CREATE TABLE schema_boundary (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
+            .unwrap();
+        assert!(
+            conn.retained_autocommit_txn.borrow().is_none(),
+            "CREATE TABLE must publish immediately, not park a retained autocommit txn"
+        );
+
+        conn.execute("CREATE INDEX idx_schema_boundary_val ON schema_boundary(val);")
+            .unwrap();
+        assert!(
+            conn.retained_autocommit_txn.borrow().is_none(),
+            "CREATE INDEX must publish immediately, not park a retained autocommit txn"
+        );
+
+        let rows = conn.query("PRAGMA table_info(schema_boundary);").unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

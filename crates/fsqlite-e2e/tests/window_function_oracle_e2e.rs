@@ -213,6 +213,35 @@ fn window_range_frame_peer_groups() {
 }
 
 #[test]
+fn window_count_star_counts_null_order_peers() {
+    let (f, r) = setup();
+    check(
+        &f,
+        &r,
+        &["SELECT id, COUNT(*) OVER (
+                 ORDER BY CASE WHEN id <= 2 THEN NULL ELSE id END
+                 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+             ) FROM s ORDER BY id"],
+        "window_count_star_counts_null_order_peers",
+    );
+}
+
+#[test]
+fn group_by_window_materializes_args_and_filter() {
+    let (f, r) = setup();
+    check(
+        &f,
+        &r,
+        &["SELECT grp,
+                    SUM(SUM(score)) FILTER (WHERE grp = 'b') OVER ()
+             FROM s
+             GROUP BY grp
+             ORDER BY grp"],
+        "group_by_window_materializes_args_and_filter",
+    );
+}
+
+#[test]
 fn window_named_window_clause() {
     let (f, r) = setup();
     check(
