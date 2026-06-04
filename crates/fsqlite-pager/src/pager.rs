@@ -1933,23 +1933,74 @@ fn normalize_freelist(pages: &[PageNumber], db_size: u32) -> Vec<PageNumber> {
             raw > 1 && raw <= db_size
         })
         .collect();
-    normalized.sort_unstable_by_key(|p| p.get());
+    if normalized
+        .windows(2)
+        .all(|window| window[0].get() > window[1].get())
+    {
+        return normalized;
+    }
+    // Keep the in-memory freelist descending so pop() yields the lowest page
+    // number first. That preserves compact file growth and lets returned pages
+    // merge back into large freelists without repeatedly sorting the full list.
+    normalized.sort_unstable_by_key(|page| std::cmp::Reverse(page.get()));
     normalized.dedup_by_key(|p| p.get());
     normalized
+}
+
+fn merge_descending_unique_freelists(left: &[PageNumber], right: &[PageNumber]) -> Vec<PageNumber> {
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let mut left_index = 0;
+    let mut right_index = 0;
+
+    while left_index < left.len() && right_index < right.len() {
+        let left_page = left[left_index];
+        let right_page = right[right_index];
+        match left_page.get().cmp(&right_page.get()) {
+            std::cmp::Ordering::Greater => {
+                merged.push(left_page);
+                left_index += 1;
+            }
+            std::cmp::Ordering::Less => {
+                merged.push(right_page);
+                right_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(left_page);
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    merged.extend_from_slice(&left[left_index..]);
+    merged.extend_from_slice(&right[right_index..]);
+    merged
 }
 
 fn return_pages_to_freelist(
     freelist: &mut Vec<PageNumber>,
     pages: impl IntoIterator<Item = PageNumber>,
 ) {
-    for page in pages {
-        if !freelist.contains(&page) {
-            freelist.push(page);
-        }
+    let mut returned_pages: Vec<PageNumber> = pages.into_iter().collect();
+    if returned_pages.is_empty() {
+        return;
     }
+
     // Sort descending so that pop() and rposition() yield the lowest page numbers first,
     // which keeps the database file compact and reduces file size growth.
-    freelist.sort_unstable_by_key(|page| std::cmp::Reverse(page.get()));
+    returned_pages.sort_unstable_by_key(|page| std::cmp::Reverse(page.get()));
+    returned_pages.dedup_by_key(|page| page.get());
+
+    if freelist
+        .windows(2)
+        .all(|window| window[0].get() > window[1].get())
+    {
+        *freelist = merge_descending_unique_freelists(freelist, &returned_pages);
+    } else {
+        freelist.extend(returned_pages);
+        freelist.sort_unstable_by_key(|page| std::cmp::Reverse(page.get()));
+        freelist.dedup_by_key(|page| page.get());
+    }
 }
 
 fn load_freelist_from_disk<F: VfsFile>(
@@ -11899,6 +11950,41 @@ mod tests {
             "bead_id={BEAD_ID} case=freelist_reuse p3={} p1={}",
             p2.get(),
             p.get()
+        );
+    }
+
+    #[test]
+    fn test_return_pages_to_freelist_keeps_unique_descending_order() {
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+        let p4 = PageNumber::new(4).unwrap();
+        let p5 = PageNumber::new(5).unwrap();
+        let p6 = PageNumber::new(6).unwrap();
+        let mut freelist = vec![p5, p3, p2];
+
+        return_pages_to_freelist(&mut freelist, [p4, p3, p6, p4]);
+
+        assert_eq!(
+            freelist,
+            vec![p6, p5, p4, p3, p2],
+            "bead_id={BEAD_ID} case=return_pages_dedupes_after_bulk_extend"
+        );
+    }
+
+    #[test]
+    fn test_normalize_freelist_keeps_unique_descending_order() {
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+        let p4 = PageNumber::new(4).unwrap();
+        let p5 = PageNumber::new(5).unwrap();
+        let p6 = PageNumber::new(6).unwrap();
+
+        let normalized = normalize_freelist(&[p3, p6, p4, p3, p5, p2], 5);
+
+        assert_eq!(
+            normalized,
+            vec![p5, p4, p3, p2],
+            "bead_id={BEAD_ID} case=normalize_freelist_dedupes_descending_and_filters"
         );
     }
 

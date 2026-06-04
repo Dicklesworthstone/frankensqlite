@@ -255,6 +255,9 @@ struct S3FifoQueueSnapshot {
     small_capacity: usize,
 }
 
+const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS: usize = 4_096;
+const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES: usize = 8_192;
+
 #[derive(Debug, Clone)]
 struct S3FifoEvictionTracker {
     config: S3FifoConfig,
@@ -267,7 +270,10 @@ struct S3FifoEvictionTracker {
 impl S3FifoEvictionTracker {
     fn new(config: S3FifoConfig) -> Self {
         let probe = S3Fifo::with_config(config);
-        let max_trace_entries = config.capacity().saturating_mul(8).max(64);
+        let max_trace_entries = config
+            .capacity()
+            .saturating_mul(8)
+            .clamp(64, S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES);
         Self {
             config,
             adaptation_interval: probe.adaptation_interval(),
@@ -289,6 +295,9 @@ impl S3FifoEvictionTracker {
     }
 
     fn forget(&mut self, page_no: PageNumber) {
+        if self.access_trace.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
+            return;
+        }
         self.access_trace.retain(|candidate| *candidate != page_no);
     }
 
@@ -360,7 +369,9 @@ impl S3FifoEvictionTracker {
     }
 
     fn build_model(&self, resident_pages: &[PageNumber]) -> Option<S3Fifo> {
-        if resident_pages.is_empty() {
+        if resident_pages.is_empty()
+            || resident_pages.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS
+        {
             return None;
         }
 
@@ -794,14 +805,18 @@ impl PageCache {
     pub fn evict_any(&mut self) -> bool {
         let policy = self.eviction_policy.borrow().policy();
         let key = match policy {
-            PageCacheEvictionPolicy::Arbitrary => self.pages.keys().next().copied(),
-            PageCacheEvictionPolicy::S3Fifo(_) => {
+            PageCacheEvictionPolicy::S3Fifo(_)
+                if self.pages.len() <= S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS =>
+            {
                 let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
                 let preferred = {
                     let tracker = self.eviction_policy.borrow();
                     tracker.choose_victim(&residents)
                 };
                 preferred.or_else(|| residents.first().copied())
+            }
+            PageCacheEvictionPolicy::Arbitrary | PageCacheEvictionPolicy::S3Fifo(_) => {
+                self.pages.keys().next().copied()
             }
         };
         if let Some(key) = key {
@@ -2772,17 +2787,7 @@ impl ShardedPageCache {
     /// Tries flat slots first, then iterates shards.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
-        let preferred_victim = if self.eviction_tracking_enabled() {
-            let tracker = self.eviction_policy.lock();
-            if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
-                let residents = self.resident_pages();
-                tracker.choose_victim(&residents)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let preferred_victim = self.preferred_s3_fifo_victim();
         if let Some(page_no) = preferred_victim
             && self.evict(page_no)
         {
@@ -2817,6 +2822,26 @@ impl ShardedPageCache {
             }
         }
         false
+    }
+
+    fn preferred_s3_fifo_victim(&self) -> Option<PageNumber> {
+        if !self.eviction_tracking_enabled() {
+            return None;
+        }
+        let tracks_s3_fifo = {
+            let tracker = self.eviction_policy.lock();
+            matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_))
+        };
+        if !tracks_s3_fifo
+            || self.metrics_lightweight_snapshot().cached_pages
+                > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS
+        {
+            return None;
+        }
+
+        let residents = self.resident_pages();
+        let tracker = self.eviction_policy.lock();
+        tracker.choose_victim(&residents)
     }
 
     /// Evict all pages from the cache.
@@ -4367,6 +4392,73 @@ mod tests {
         assert!(
             snapshot.t2_size >= 1,
             "S3-FIFO metrics should expose a non-empty main queue for sharded cache"
+        );
+    }
+
+    #[test]
+    fn test_s3_fifo_reconstructed_tracker_bounds_large_resident_sets() {
+        let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(
+            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 1,
+        ));
+        let residents: Vec<PageNumber> = (1..=S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 1)
+            .map(|page_no| PageNumber::new(u32::try_from(page_no).unwrap()).unwrap())
+            .collect();
+
+        for page_no in 1..=S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES + 10 {
+            let page_no = PageNumber::new(u32::try_from(page_no).unwrap()).unwrap();
+            tracker.record_access(page_no);
+        }
+
+        assert_eq!(
+            tracker.access_trace.len(),
+            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES,
+            "large reconstructed S3-FIFO trackers must keep bounded history"
+        );
+        let len_before_forget = tracker.access_trace.len();
+        tracker.forget(residents[0]);
+        assert_eq!(
+            tracker.access_trace.len(),
+            len_before_forget,
+            "large reconstructed S3-FIFO trackers must not linearly retain history on eviction"
+        );
+        assert!(
+            tracker.choose_victim(&residents).is_none(),
+            "large resident sets must fall back to the cache's O(1) arbitrary eviction path"
+        );
+        assert!(
+            tracker.queue_snapshot(&residents).is_none(),
+            "large resident sets must not rebuild S3-FIFO diagnostics on the hot path"
+        );
+    }
+
+    #[test]
+    fn test_sharded_s3_fifo_eviction_falls_back_before_collecting_large_residents() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(
+            PageSize::DEFAULT,
+            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 2,
+            1,
+        );
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 2,
+        )));
+
+        for page_no in 1..=S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS + 1 {
+            let page_no = PageNumber::new(u32::try_from(page_no).unwrap()).unwrap();
+            cache.insert_buffer(page_no, track_q_page_buf(page_no));
+        }
+
+        assert!(
+            cache.preferred_s3_fifo_victim().is_none(),
+            "large sharded caches must skip reconstructed S3-FIFO victim selection"
+        );
+        assert!(
+            cache.evict_any(),
+            "large sharded caches must still evict via arbitrary fallback"
+        );
+        assert_eq!(
+            cache.metrics_lightweight_snapshot().cached_pages,
+            S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS,
+            "arbitrary fallback must remove exactly one page"
         );
     }
 
