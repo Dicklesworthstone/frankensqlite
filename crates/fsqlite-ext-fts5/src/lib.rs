@@ -2057,6 +2057,48 @@ pub struct Fts5ShadowOpen {
     pub report: Fts5ShadowOpenReport,
 }
 
+#[derive(Debug, Clone)]
+enum Fts5ScoreSource {
+    InMemory(InvertedIndex),
+    Shadow(Fts5ShadowRows),
+}
+
+#[derive(Debug, Clone)]
+pub struct Fts5ScoreSnapshot {
+    columns: Vec<String>,
+    tokenizer_name: String,
+    detail: DetailMode,
+    source: Fts5ScoreSource,
+}
+
+impl Fts5ScoreSnapshot {
+    pub fn query_terms_for_queries(
+        &self,
+        queries: &[&str],
+    ) -> std::result::Result<Vec<String>, Fts5QueryError> {
+        let tokenizer = create_tokenizer(&self.tokenizer_name)
+            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+        query_terms_for_query_strings(&self.columns, queries, tokenizer.as_ref(), self.detail)
+    }
+
+    pub fn bm25_score_for_terms_with_weights(
+        &self,
+        rowid: i64,
+        query_terms: &[String],
+        weights: &[f64],
+    ) -> std::result::Result<f64, Fts5QueryError> {
+        match &self.source {
+            Fts5ScoreSource::InMemory(index) => Ok(bm25_score(index, rowid, query_terms, weights)),
+            Fts5ScoreSource::Shadow(rows) => {
+                let tokenizer = create_tokenizer(&self.tokenizer_name)
+                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
+                Fts5ShadowQuery::new(rows, &self.columns, tokenizer.as_ref(), self.detail)?
+                    .bm25_score(rowid, query_terms, weights)
+            }
+        }
+    }
+}
+
 impl Fts5ShadowRows {
     pub fn validate_for_open(&self, column_count: usize) -> Result<Fts5ShadowOpenReport> {
         let metadata = Fts5ConfigMetadata::decode_rows(&self.config)?;
@@ -5116,6 +5158,23 @@ fn evaluate_query_strings(
     Ok((combined_docs.unwrap_or_default(), query_terms))
 }
 
+fn query_terms_for_query_strings(
+    columns: &[String],
+    queries: &[&str],
+    tokenizer: &dyn Fts5Tokenizer,
+    detail: DetailMode,
+) -> std::result::Result<Vec<String>, Fts5QueryError> {
+    let mut query_terms = Vec::new();
+    for query in queries {
+        let tokens = parse_fts5_query(query)?;
+        let expr = normalize_query_expr_with_tokenizer(build_expr(&tokens)?, tokenizer);
+        validate_detail_mode(&expr, detail)?;
+        validate_column_filters(&expr, columns)?;
+        query_terms.extend(extract_query_terms(&expr));
+    }
+    Ok(query_terms)
+}
+
 fn search_rows_with_weights_from_parts(
     index: &InvertedIndex,
     columns: &[String],
@@ -7035,6 +7094,37 @@ impl Fts5Table {
         self.apply_docsize_rows(&docsize);
     }
 
+    fn has_bound_persisted_segments(&self) -> Result<bool> {
+        let Some(rows) = self.shadow_rows.as_ref() else {
+            return Ok(false);
+        };
+        let metadata = Fts5DataMetadata::decode_rows(&rows.data, self.columns.len())?;
+        Ok(metadata
+            .structure
+            .as_ref()
+            .is_some_and(|structure| structure.segment_count() > 0))
+    }
+
+    pub fn ensure_shadow_rows_materializable_for_mutation(&self) -> Result<()> {
+        if self.config.content_mode == ContentMode::Contentless
+            && self.has_bound_persisted_segments()?
+        {
+            return Err(FrankenError::function_error(
+                "fts5: cannot mutate a lazily opened contentless table with persisted segments",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn ensure_rebuild_supported(&self) -> Result<()> {
+        if self.config.content_mode == ContentMode::Contentless {
+            return Err(FrankenError::function_error(
+                "fts5: rebuild is not available with contentless tables",
+            ));
+        }
+        Ok(())
+    }
+
     fn has_document_or_shadow_rowid(&self, rowid: i64) -> bool {
         self.documents.contains_key(&rowid)
             || self.shadow_rows.as_ref().is_some_and(|rows| {
@@ -7220,13 +7310,26 @@ impl Fts5Table {
         queries: &[&str],
     ) -> std::result::Result<Vec<String>, Fts5QueryError> {
         let tokenizer = self.create_tokenizer_instance();
-        evaluate_query_strings(
-            &self.index,
+        query_terms_for_query_strings(
             &self.columns,
             queries,
-            Some(tokenizer.as_ref()),
+            tokenizer.as_ref(),
+            self.config.detail_mode(),
         )
-        .map(|(_docs, terms)| terms)
+    }
+
+    #[must_use]
+    pub fn auxiliary_score_snapshot(&self) -> Fts5ScoreSnapshot {
+        let source = self.shadow_rows.as_ref().map_or_else(
+            || Fts5ScoreSource::InMemory(self.index.clone()),
+            |rows| Fts5ScoreSource::Shadow(rows.clone()),
+        );
+        Fts5ScoreSnapshot {
+            columns: self.columns.clone(),
+            tokenizer_name: self.tokenizer_name.clone(),
+            detail: self.config.detail_mode(),
+            source,
+        }
     }
 
     #[must_use]
@@ -7978,6 +8081,7 @@ impl VirtualTable for Fts5Table {
             if !self.has_document_or_shadow_rowid(rowid) {
                 return Ok(None);
             }
+            self.ensure_shadow_rows_materializable_for_mutation()?;
             self.delete_document(rowid);
             return Ok(None);
         }
@@ -8001,6 +8105,7 @@ impl VirtualTable for Fts5Table {
             if self.has_document_or_shadow_rowid(rowid) {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
+            self.ensure_shadow_rows_materializable_for_mutation()?;
 
             let column_args = match args.get(2..) {
                 Some(values) => values,
@@ -8041,6 +8146,7 @@ impl VirtualTable for Fts5Table {
                 "fts5 update referenced a missing rowid".to_owned(),
             ));
         }
+        self.ensure_shadow_rows_materializable_for_mutation()?;
 
         let column_args = match args.get(2..) {
             Some(values) => values,
@@ -10896,6 +11002,59 @@ mod tests {
             "failed validation should not hydrate content rows"
         );
         assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
+    }
+
+    #[test]
+    fn test_fts5_contentless_lazy_shadow_mutation_rejects_without_losing_segments() {
+        let cx = Cx::new();
+        let base = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+        let mut rows = sample_shadow_query_rows(&base);
+        rows.content.clear();
+        let mut reopened = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+
+        reopened.apply_shadow_rows(&rows).unwrap();
+        assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
+
+        let err = reopened
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(99),
+                    SqliteValue::Text(SmallText::from_string("fresh")),
+                    SqliteValue::Text(SmallText::from_string("row")),
+                ],
+            )
+            .expect_err("contentless lazy mutation cannot preserve persisted postings");
+
+        assert!(err.to_string().contains("lazily opened contentless"));
+        assert!(reopened.shadow_rows.is_some());
+        assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
+        assert!(search_rowids(&reopened, "fresh").unwrap().is_empty());
     }
 
     #[test]

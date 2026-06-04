@@ -76,9 +76,9 @@ use fsqlite_btree::{set_btree_copy_profile_enabled, set_btree_metrics_enabled};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
-    Fts5DocsizeRow, Fts5Expr, Fts5IdxRow, Fts5OnDiskReader, Fts5ShadowRows, Fts5Table,
-    InvertedIndex, bm25_score, build_expr, decode_docsize_blob, highlight as fts5_highlight,
-    parse_fts5_query, snippet as fts5_snippet,
+    Fts5DocsizeRow, Fts5Expr, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows,
+    Fts5Table, build_expr, decode_docsize_blob, highlight as fts5_highlight, parse_fts5_query,
+    snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -10119,6 +10119,20 @@ impl Connection {
             .contains_key(&table_name.to_ascii_uppercase())
     }
 
+    #[cfg(feature = "ext-fts5")]
+    fn has_live_fts5_instance(&self, table_name: &str) -> bool {
+        let instances = self.vtab_instances.borrow();
+        instances
+            .get(&table_name.to_ascii_uppercase())
+            .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            .is_some()
+    }
+
+    #[cfg(not(feature = "ext-fts5"))]
+    fn has_live_fts5_instance(&self, _table_name: &str) -> bool {
+        false
+    }
+
     fn has_primary_live_vtab_source(&self, select: &SelectStatement) -> bool {
         has_primary_live_vtab_source_inner(select, |table_name| {
             self.has_live_vtab_instance(table_name)
@@ -11019,11 +11033,12 @@ impl Connection {
         };
 
         let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-        let query_terms = fts5
+        let score_snapshot = fts5.auxiliary_score_snapshot();
+        let query_terms = score_snapshot
             .query_terms_for_queries(&query_refs)
             .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))?;
         Ok(Some(Fts5AuxTableContext {
-            index: fts5.index().clone(),
+            score_snapshot,
             query_terms,
             column_count: fts5.columns().len(),
             row_table_label: src.alias.clone().unwrap_or_else(|| src.table_name.clone()),
@@ -22861,7 +22876,7 @@ impl Connection {
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
-                if self.execute_fts5_maintenance_insert(insert) {
+                if self.execute_fts5_maintenance_insert(insert)? {
                     return Ok(Vec::new());
                 }
                 #[cfg(feature = "ext-fts5")]
@@ -30335,6 +30350,7 @@ impl Connection {
                 && fts5.is_empty()
                 && !cursor.first(cx)?
             {
+                fts5.ensure_shadow_rows_materializable_for_mutation()?;
                 let tokenizer = fts5.create_tokenizer_instance();
                 let mut seen_rowids = HashSet::new();
                 if let Some(direct_projection) = layout.direct_projection.as_ref() {
@@ -30681,12 +30697,15 @@ impl Connection {
     }
 
     #[cfg(feature = "ext-fts5")]
-    fn execute_fts5_maintenance_insert(&self, insert: &fsqlite_ast::InsertStatement) -> bool {
+    fn execute_fts5_maintenance_insert(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<bool> {
         let Some(command) = fts5_maintenance_insert_command(insert) else {
-            return false;
+            return Ok(false);
         };
         if !self.insert_targets_live_fts5_command_column(insert) {
-            return false;
+            return Ok(false);
         }
 
         match command {
@@ -30698,6 +30717,8 @@ impl Connection {
                 if let Some(instance) = instances.get_mut(&key)
                     && let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>()
                 {
+                    fts5.ensure_rebuild_supported()?;
+                    fts5.ensure_shadow_rows_materializable_for_mutation()?;
                     let rows = fts5.all_rows();
                     for (rowid, _) in &rows {
                         fts5.delete_document(*rowid);
@@ -30710,12 +30731,15 @@ impl Connection {
         }
 
         self.reset_statement_change_count();
-        true
+        Ok(true)
     }
 
     #[cfg(not(feature = "ext-fts5"))]
-    fn execute_fts5_maintenance_insert(&self, _insert: &fsqlite_ast::InsertStatement) -> bool {
-        false
+    fn execute_fts5_maintenance_insert(
+        &self,
+        _insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     fn persist_materialized_live_vtab_rows(
@@ -53517,6 +53541,15 @@ impl Connection {
         } else {
             Some(&using_skip_indices)
         };
+        let mut fts5_rank_table_names = Vec::new();
+        for src in &table_sources {
+            if src.local_table_binding().is_some() && self.has_live_fts5_instance(&src.table_name) {
+                fts5_rank_table_names.push(src.table_name.as_str());
+                if let Some(alias) = src.alias.as_deref() {
+                    fts5_rank_table_names.push(alias);
+                }
+            }
+        }
         validate_join_select_column_references(
             columns,
             &from.joins,
@@ -53524,6 +53557,7 @@ impl Connection {
             where_clause.as_deref(),
             &col_map,
             using_skip,
+            &fts5_rank_table_names,
         )?;
 
         let primary_width = table_sources[0].scan_width();
@@ -53816,7 +53850,13 @@ impl Connection {
             }
             let already_resolved = resolve_order_term_idx(&term.expr, &expanded_columns).is_some();
             if !already_resolved {
-                validate_join_column_references(&term.expr, &col_map, using_skip, &[])?;
+                validate_join_column_references(
+                    &term.expr,
+                    &col_map,
+                    using_skip,
+                    &[],
+                    &fts5_rank_table_names,
+                )?;
                 extra_order_exprs.push(term.expr.clone());
                 expanded_columns.push(ResultColumn::Expr {
                     expr: term.expr.clone(),
@@ -79503,7 +79543,7 @@ fn is_rtree_instance(_instance: &dyn ErasedVtabInstance) -> bool {
 #[cfg(feature = "ext-fts5")]
 #[derive(Debug, Clone)]
 struct Fts5AuxTableContext {
-    index: InvertedIndex,
+    score_snapshot: Fts5ScoreSnapshot,
     query_terms: Vec<String>,
     column_count: usize,
     row_table_label: String,
@@ -80702,6 +80742,18 @@ fn current_fts5_visible_columns<'a>(
 }
 
 #[cfg(feature = "ext-fts5")]
+fn fts5_aux_bm25_score(
+    table_ctx: &Fts5AuxTableContext,
+    rowid: i64,
+    weights: &[f64],
+) -> Result<f64> {
+    table_ctx
+        .score_snapshot
+        .bm25_score_for_terms_with_weights(rowid, &table_ctx.query_terms, weights)
+        .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))
+}
+
+#[cfg(feature = "ext-fts5")]
 fn try_eval_fts5_rank_column(
     col_ref: &fsqlite_ast::ColumnRef,
     row: &[SqliteValue],
@@ -80743,12 +80795,9 @@ fn try_eval_fts5_rank_column(
         };
 
         let weights = vec![1.0; table_ctx.column_count];
-        Ok(Some(SqliteValue::Float(bm25_score(
-            &table_ctx.index,
-            rowid,
-            &table_ctx.query_terms,
-            &weights,
-        ))))
+        Ok(Some(SqliteValue::Float(fts5_aux_bm25_score(
+            table_ctx, rowid, &weights,
+        )?)))
     })
 }
 
@@ -80867,12 +80916,9 @@ fn eval_fts5_aux_function(
                     };
                     weights.push(weight);
                 }
-                Ok(SqliteValue::Float(bm25_score(
-                    &table_ctx.index,
-                    rowid,
-                    &table_ctx.query_terms,
-                    &weights,
-                )))
+                Ok(SqliteValue::Float(fts5_aux_bm25_score(
+                    table_ctx, rowid, &weights,
+                )?))
             }
             "highlight" => {
                 if arguments.len() != 4 {
@@ -82786,6 +82832,7 @@ fn validate_join_select_column_references(
     where_clause: Option<&Expr>,
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
+    fts5_rank_table_names: &[&str],
 ) -> Result<()> {
     let match_table_names: Vec<&str> = sources
         .iter()
@@ -82796,16 +82843,34 @@ fn validate_join_select_column_references(
         .collect();
     for join in joins {
         if let Some(JoinConstraint::On(expr)) = join.constraint.as_ref() {
-            validate_join_column_references(expr, col_map, None, &match_table_names)?;
+            validate_join_column_references(
+                expr,
+                col_map,
+                None,
+                &match_table_names,
+                fts5_rank_table_names,
+            )?;
         }
     }
     if let Some(expr) = where_clause {
-        validate_join_column_references(expr, col_map, using_skip, &match_table_names)?;
+        validate_join_column_references(
+            expr,
+            col_map,
+            using_skip,
+            &match_table_names,
+            fts5_rank_table_names,
+        )?;
     }
     for column in columns {
         match column {
             ResultColumn::Expr { expr, .. } => {
-                validate_join_column_references(expr, col_map, using_skip, &match_table_names)?;
+                validate_join_column_references(
+                    expr,
+                    col_map,
+                    using_skip,
+                    &match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
             ResultColumn::TableStar(name) => {
                 if !sources
@@ -82826,43 +82891,105 @@ fn validate_join_column_references(
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
     match_table_names: &[&str],
+    fts5_rank_table_names: &[&str],
 ) -> Result<()> {
     match expr {
         Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => Ok(()),
-        Expr::Column(col_ref, _) => find_col_in_map(
-            col_map,
-            col_ref.table.as_deref(),
-            &col_ref.column,
-            using_skip,
-        )
-        .map(|_| ()),
+        Expr::Column(col_ref, _) => {
+            if find_col_in_map(
+                col_map,
+                col_ref.table.as_deref(),
+                &col_ref.column,
+                using_skip,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+            if is_fts5_rank_column_reference(col_ref, fts5_rank_table_names) {
+                return Ok(());
+            }
+            find_col_in_map(
+                col_map,
+                col_ref.table.as_deref(),
+                &col_ref.column,
+                using_skip,
+            )
+            .map(|_| ())
+        }
         Expr::BinaryOp { left, right, .. } => {
-            validate_join_column_references(left, col_map, using_skip, match_table_names)?;
-            validate_join_column_references(right, col_map, using_skip, match_table_names)
+            validate_join_column_references(
+                left,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )?;
+            validate_join_column_references(
+                right,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
-        | Expr::IsNull { expr: inner, .. } => {
-            validate_join_column_references(inner, col_map, using_skip, match_table_names)
-        }
+        | Expr::IsNull { expr: inner, .. } => validate_join_column_references(
+            inner,
+            col_map,
+            using_skip,
+            match_table_names,
+            fts5_rank_table_names,
+        ),
         Expr::Between {
             expr: inner,
             low,
             high,
             ..
         } => {
-            validate_join_column_references(inner, col_map, using_skip, match_table_names)?;
-            validate_join_column_references(low, col_map, using_skip, match_table_names)?;
-            validate_join_column_references(high, col_map, using_skip, match_table_names)
+            validate_join_column_references(
+                inner,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )?;
+            validate_join_column_references(
+                low,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )?;
+            validate_join_column_references(
+                high,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )
         }
         Expr::In {
             expr: inner, set, ..
         } => {
-            validate_join_column_references(inner, col_map, using_skip, match_table_names)?;
+            validate_join_column_references(
+                inner,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )?;
             if let InSet::List(values) = set {
                 for value in values {
-                    validate_join_column_references(value, col_map, using_skip, match_table_names)?;
+                    validate_join_column_references(
+                        value,
+                        col_map,
+                        using_skip,
+                        match_table_names,
+                        fts5_rank_table_names,
+                    )?;
                 }
             }
             Ok(())
@@ -82877,15 +83004,28 @@ fn validate_join_column_references(
             if !matches!(op, LikeOp::Match)
                 || !is_join_match_table_operand(inner, match_table_names)
             {
-                validate_join_column_references(inner, col_map, using_skip, match_table_names)?;
+                validate_join_column_references(
+                    inner,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
-            validate_join_column_references(pattern, col_map, using_skip, match_table_names)?;
+            validate_join_column_references(
+                pattern,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )?;
             if let Some(escape_expr) = escape {
                 validate_join_column_references(
                     escape_expr,
                     col_map,
                     using_skip,
                     match_table_names,
+                    fts5_rank_table_names,
                 )?;
             }
             Ok(())
@@ -82897,14 +83037,38 @@ fn validate_join_column_references(
             ..
         } => {
             if let Some(operand) = operand {
-                validate_join_column_references(operand, col_map, using_skip, match_table_names)?;
+                validate_join_column_references(
+                    operand,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
             for (when_expr, then_expr) in whens {
-                validate_join_column_references(when_expr, col_map, using_skip, match_table_names)?;
-                validate_join_column_references(then_expr, col_map, using_skip, match_table_names)?;
+                validate_join_column_references(
+                    when_expr,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
+                validate_join_column_references(
+                    then_expr,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
             if let Some(else_expr) = else_expr {
-                validate_join_column_references(else_expr, col_map, using_skip, match_table_names)?;
+                validate_join_column_references(
+                    else_expr,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
             Ok(())
         }
@@ -82929,6 +83093,7 @@ fn validate_join_column_references(
                         col_map,
                         using_skip,
                         match_table_names,
+                        fts5_rank_table_names,
                     )?;
                 }
             }
@@ -82937,9 +83102,16 @@ fn validate_join_column_references(
                 col_map,
                 using_skip,
                 match_table_names,
+                fts5_rank_table_names,
             )?;
             if let Some(filter) = filter {
-                validate_join_column_references(filter, col_map, using_skip, match_table_names)?;
+                validate_join_column_references(
+                    filter,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
             if let Some(window) = over {
                 validate_join_window_spec_column_references(
@@ -82947,6 +83119,7 @@ fn validate_join_column_references(
                     col_map,
                     using_skip,
                     match_table_names,
+                    fts5_rank_table_names,
                 )?;
             }
             Ok(())
@@ -82954,12 +83127,30 @@ fn validate_join_column_references(
         Expr::JsonAccess {
             expr: inner, path, ..
         } => {
-            validate_join_column_references(inner, col_map, using_skip, match_table_names)?;
-            validate_join_column_references(path, col_map, using_skip, match_table_names)
+            validate_join_column_references(
+                inner,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )?;
+            validate_join_column_references(
+                path,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                validate_join_column_references(value, col_map, using_skip, match_table_names)?;
+                validate_join_column_references(
+                    value,
+                    col_map,
+                    using_skip,
+                    match_table_names,
+                    fts5_rank_table_names,
+                )?;
             }
             Ok(())
         }
@@ -82972,9 +83163,16 @@ fn validate_join_ordering_terms_column_references(
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
     match_table_names: &[&str],
+    fts5_rank_table_names: &[&str],
 ) -> Result<()> {
     for term in order_by {
-        validate_join_column_references(&term.expr, col_map, using_skip, match_table_names)?;
+        validate_join_column_references(
+            &term.expr,
+            col_map,
+            using_skip,
+            match_table_names,
+            fts5_rank_table_names,
+        )?;
     }
     Ok(())
 }
@@ -82984,15 +83182,23 @@ fn validate_join_window_spec_column_references(
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
     match_table_names: &[&str],
+    fts5_rank_table_names: &[&str],
 ) -> Result<()> {
     for expr in &window.partition_by {
-        validate_join_column_references(expr, col_map, using_skip, match_table_names)?;
+        validate_join_column_references(
+            expr,
+            col_map,
+            using_skip,
+            match_table_names,
+            fts5_rank_table_names,
+        )?;
     }
     validate_join_ordering_terms_column_references(
         &window.order_by,
         col_map,
         using_skip,
         match_table_names,
+        fts5_rank_table_names,
     )?;
     if let Some(frame) = &window.frame {
         validate_join_frame_bound_column_references(
@@ -83000,6 +83206,7 @@ fn validate_join_window_spec_column_references(
             col_map,
             using_skip,
             match_table_names,
+            fts5_rank_table_names,
         )?;
         if let Some(end) = &frame.end {
             validate_join_frame_bound_column_references(
@@ -83007,6 +83214,7 @@ fn validate_join_window_spec_column_references(
                 col_map,
                 using_skip,
                 match_table_names,
+                fts5_rank_table_names,
             )?;
         }
     }
@@ -83018,10 +83226,17 @@ fn validate_join_frame_bound_column_references(
     col_map: &[(String, String, bool)],
     using_skip: Option<&HashSet<usize>>,
     match_table_names: &[&str],
+    fts5_rank_table_names: &[&str],
 ) -> Result<()> {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            validate_join_column_references(expr, col_map, using_skip, match_table_names)
+            validate_join_column_references(
+                expr,
+                col_map,
+                using_skip,
+                match_table_names,
+                fts5_rank_table_names,
+            )
         }
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
@@ -83038,6 +83253,20 @@ fn is_join_match_table_operand(expr: &Expr, table_names: &[&str]) -> bool {
                     .iter()
                     .any(|table_name| col_ref.column.eq_ignore_ascii_case(table_name))
     )
+}
+
+fn is_fts5_rank_column_reference(col_ref: &ColumnRef, table_names: &[&str]) -> bool {
+    if !col_ref.column.eq_ignore_ascii_case("rank") {
+        return false;
+    }
+    col_ref
+        .table
+        .as_deref()
+        .map_or(!table_names.is_empty(), |prefix| {
+            table_names
+                .iter()
+                .any(|table_name| prefix.eq_ignore_ascii_case(table_name))
+        })
 }
 
 fn rewrite_join_expr_using_columns(
@@ -107888,6 +108117,44 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_contentless_rebuild_rejects_without_losing_live_index() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body, content='')")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO docs(rowid, body) VALUES
+                (1, 'alpha rust beta'),
+                (2, 'gamma rust delta'),
+                (3, 'plain text')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rowid")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+        );
+
+        let err = conn
+            .execute("INSERT INTO docs(docs) VALUES('rebuild')")
+            .expect_err("contentless FTS5 rebuild is unsupported");
+        assert!(
+            err.to_string().contains("contentless"),
+            "unexpected rebuild error: {err}"
+        );
+
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rowid")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]],
+        );
+    }
+
+    #[test]
     fn test_live_fts5_rowid_projection_survives_schema_probe() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
@@ -119791,6 +120058,170 @@ SELECT x FROM t;
                 "FrankenSQLite MATCH results should match rusqlite after stock FTS5 reconnect"
             );
         }
+    }
+
+    #[test]
+    fn test_reopen_stock_contentless_fts5_rebuild_rejects_without_losing_shadow_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stock_contentless_fts5_rebuild.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(body, content='');
+                    INSERT INTO docs_fts(rowid, body) VALUES
+                        (1, 'alpha rust rust rust beta'),
+                        (2, 'gamma rust delta'),
+                        (3, 'plain text');
+                    INSERT INTO docs_fts(docs_fts) VALUES('optimize');
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let rows = conn
+            .query(
+                "SELECT rowid FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+        let ranked_rows = conn
+            .query(
+                "SELECT rowid, bm25(docs_fts) FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY bm25(docs_fts), rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            ranked_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+        let first_score = match ranked_rows[0].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected bm25 score, got {other:?}"),
+        };
+        let second_score = match ranked_rows[1].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected bm25 score, got {other:?}"),
+        };
+        assert!(
+            first_score < second_score,
+            "shadow-backed contentless bm25 should rank repeated terms higher: {first_score} >= {second_score}",
+        );
+        let rank_rows = conn
+            .query(
+                "SELECT rowid, rank FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY rank, rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rank_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+        let first_rank = match rank_rows[0].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected rank score, got {other:?}"),
+        };
+        let second_rank = match rank_rows[1].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected rank score, got {other:?}"),
+        };
+        assert!(
+            first_rank < second_rank,
+            "shadow-backed contentless rank should rank repeated terms higher: {first_rank} >= {second_rank}",
+        );
+
+        let err = conn
+            .execute("INSERT INTO docs_fts(docs_fts) VALUES('rebuild')")
+            .expect_err("contentless FTS5 rebuild is unsupported");
+        assert!(
+            err.to_string().contains("contentless"),
+            "unexpected rebuild error: {err}"
+        );
+
+        let rows = conn
+            .query(
+                "SELECT rowid FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+        let ranked_rows = conn
+            .query(
+                "SELECT rowid, bm25(docs_fts) FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY bm25(docs_fts), rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            ranked_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+        let first_score = match ranked_rows[0].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected bm25 score, got {other:?}"),
+        };
+        let second_score = match ranked_rows[1].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected bm25 score, got {other:?}"),
+        };
+        assert!(
+            first_score < second_score,
+            "shadow-backed contentless bm25 should survive rejected rebuild: {first_score} >= {second_score}",
+        );
+        let rank_rows = conn
+            .query(
+                "SELECT rowid, rank FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY rank, rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rank_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+        let first_rank = match rank_rows[0].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected rank score, got {other:?}"),
+        };
+        let second_rank = match rank_rows[1].values()[1] {
+            SqliteValue::Float(score) => score,
+            ref other => panic!("expected rank score, got {other:?}"),
+        };
+        assert!(
+            first_rank < second_rank,
+            "shadow-backed contentless rank should survive rejected rebuild: {first_rank} >= {second_rank}",
+        );
     }
 
     #[test]
