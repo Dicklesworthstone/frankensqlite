@@ -46,11 +46,14 @@ use crate::{FunctionRegistry, ScalarFunction};
 // Used by the 'localtime' and 'utc' modifiers.  We compute the UTC offset
 // for the *specific* datetime being converted so that DST transitions are
 // handled correctly (matching C SQLite's per-call localtime_r behaviour).
+// wasm32 has no stable host-local timezone provider through this crate path,
+// so wasm builds keep these modifiers as explicit UTC no-ops.
 
 /// Return the UTC offset in seconds, interpreting the components as **local** time.
 ///
 /// Used by the `utc` modifier (local → UTC): the input JDN is local time,
 /// so we ask chrono "what UTC offset applies at this local time?"
+#[cfg(not(target_arch = "wasm32"))]
 fn utc_offset_for_local_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
     use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
     let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap_or_default();
@@ -62,12 +65,18 @@ fn utc_offset_for_local_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u3
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn utc_offset_for_local_datetime(_y: i32, _mo: u32, _d: u32, _h: u32, _mi: u32, _s: u32) -> i64 {
+    0
+}
+
 /// Return the UTC offset in seconds, interpreting the components as **UTC** time.
 ///
 /// Used by the `localtime` modifier (UTC → local): the input JDN is UTC,
 /// so we convert to a UTC instant and ask chrono what the local offset is
 /// at that moment. This correctly handles DST transitions where the UTC
 /// time and the resulting local time fall in different DST phases.
+#[cfg(not(target_arch = "wasm32"))]
 fn utc_offset_for_utc_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
     use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
     let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap_or_default();
@@ -76,6 +85,11 @@ fn utc_offset_for_utc_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32)
     let utc_dt = Utc.from_utc_datetime(&naive);
     let local_dt = utc_dt.with_timezone(&Local);
     local_dt.offset().local_minus_utc() as i64
+}
+
+#[cfg(target_arch = "wasm32")]
+fn utc_offset_for_utc_datetime(_y: i32, _mo: u32, _d: u32, _h: u32, _mi: u32, _s: u32) -> i64 {
+    0
 }
 
 /// Compute the UTC offset for the `localtime` modifier (UTC → local).
