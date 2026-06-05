@@ -23,7 +23,7 @@
 //! - Log level DEBUG when `retries > 0`.
 //! - Counters: `fsqlite_seqlock_reads_total`, `fsqlite_seqlock_retries_total`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::Serialize;
 
@@ -31,8 +31,72 @@ use serde::Serialize;
 // Global metrics (lock-free, Relaxed ordering)
 // ---------------------------------------------------------------------------
 
-static FSQLITE_SEQLOCK_READS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_SEQLOCK_RETRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+const SEQLOCK_COUNTER_STRIPE_COUNT: usize = 64;
+
+static NEXT_SEQLOCK_COUNTER_STRIPE: AtomicUsize = AtomicUsize::new(0);
+static FSQLITE_SEQLOCK_READS_TOTAL: StripedSeqlockCounter = StripedSeqlockCounter::new();
+static FSQLITE_SEQLOCK_RETRIES_TOTAL: StripedSeqlockCounter = StripedSeqlockCounter::new();
+
+std::thread_local! {
+    static SEQLOCK_COUNTER_STRIPE_INDEX: usize =
+        NEXT_SEQLOCK_COUNTER_STRIPE.fetch_add(1, Ordering::Relaxed)
+            % SEQLOCK_COUNTER_STRIPE_COUNT;
+}
+
+#[repr(align(64))]
+struct CacheAlignedAtomicU64(AtomicU64);
+
+impl CacheAlignedAtomicU64 {
+    const fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+
+    fn fetch_add(&self, value: u64, ordering: Ordering) {
+        self.0.fetch_add(value, ordering);
+    }
+
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.0.load(ordering)
+    }
+
+    fn store(&self, value: u64, ordering: Ordering) {
+        self.0.store(value, ordering);
+    }
+}
+
+struct StripedSeqlockCounter {
+    stripes: [CacheAlignedAtomicU64; SEQLOCK_COUNTER_STRIPE_COUNT],
+}
+
+impl StripedSeqlockCounter {
+    const fn new() -> Self {
+        Self {
+            stripes: [const { CacheAlignedAtomicU64::new(0) }; SEQLOCK_COUNTER_STRIPE_COUNT],
+        }
+    }
+
+    fn increment(&self) {
+        self.add(1);
+    }
+
+    fn add(&self, value: u64) {
+        SEQLOCK_COUNTER_STRIPE_INDEX.with(|stripe| {
+            self.stripes[*stripe].fetch_add(value, Ordering::Relaxed);
+        });
+    }
+
+    fn load(&self) -> u64 {
+        self.stripes.iter().fold(0_u64, |sum, stripe| {
+            sum.saturating_add(stripe.load(Ordering::Acquire))
+        })
+    }
+
+    fn reset(&self) {
+        for stripe in &self.stripes {
+            stripe.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Snapshot of seqlock metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,15 +109,15 @@ pub struct SeqlockMetrics {
 #[must_use]
 pub fn seqlock_metrics() -> SeqlockMetrics {
     SeqlockMetrics {
-        fsqlite_seqlock_reads_total: FSQLITE_SEQLOCK_READS_TOTAL.load(Ordering::Relaxed),
-        fsqlite_seqlock_retries_total: FSQLITE_SEQLOCK_RETRIES_TOTAL.load(Ordering::Relaxed),
+        fsqlite_seqlock_reads_total: FSQLITE_SEQLOCK_READS_TOTAL.load(),
+        fsqlite_seqlock_retries_total: FSQLITE_SEQLOCK_RETRIES_TOTAL.load(),
     }
 }
 
 /// Reset metrics (for tests).
 pub fn reset_seqlock_metrics() {
-    FSQLITE_SEQLOCK_READS_TOTAL.store(0, Ordering::Relaxed);
-    FSQLITE_SEQLOCK_RETRIES_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_SEQLOCK_READS_TOTAL.reset();
+    FSQLITE_SEQLOCK_RETRIES_TOTAL.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -125,9 +189,9 @@ impl SeqLock {
             std::hint::spin_loop();
         };
 
-        FSQLITE_SEQLOCK_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        FSQLITE_SEQLOCK_READS_TOTAL.increment();
         if retries > 0 {
-            FSQLITE_SEQLOCK_RETRIES_TOTAL.fetch_add(u64::from(retries), Ordering::Relaxed);
+            FSQLITE_SEQLOCK_RETRIES_TOTAL.add(u64::from(retries));
         }
         emit_trace(data_key, retries);
 
@@ -230,9 +294,9 @@ impl SeqLockPair {
             std::hint::spin_loop();
         };
 
-        FSQLITE_SEQLOCK_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        FSQLITE_SEQLOCK_READS_TOTAL.increment();
         if retries > 0 {
-            FSQLITE_SEQLOCK_RETRIES_TOTAL.fetch_add(u64::from(retries), Ordering::Relaxed);
+            FSQLITE_SEQLOCK_RETRIES_TOTAL.add(u64::from(retries));
         }
         emit_trace(data_key, retries);
 
@@ -330,9 +394,9 @@ impl SeqLockTriple {
             std::hint::spin_loop();
         };
 
-        FSQLITE_SEQLOCK_READS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        FSQLITE_SEQLOCK_READS_TOTAL.increment();
         if retries > 0 {
-            FSQLITE_SEQLOCK_RETRIES_TOTAL.fetch_add(u64::from(retries), Ordering::Relaxed);
+            FSQLITE_SEQLOCK_RETRIES_TOTAL.add(u64::from(retries));
         }
         emit_trace(data_key, retries);
 
@@ -379,7 +443,7 @@ fn emit_trace(data_key: &str, retries: u32) {
             retries,
             "seqlock_read contended"
         );
-    } else {
+    } else if tracing::enabled!(target: "fsqlite.seqlock", tracing::Level::TRACE) {
         tracing::trace!(
             target: "fsqlite.seqlock",
             data_key,
@@ -801,13 +865,9 @@ mod tests {
             "[test_seqlock_throughput_vs_mutex] mutex={mutex_total} seqlock={sl_total} speedup={speedup:.1}x"
         );
 
-        // On most systems, seqlock is 10-100x faster for pure reads.
-        // We assert >1.0x (or no assert) as a conservative floor, as CI environments can be
-        // extremely noisy and mutexes can sometimes act like fast spinlocks.
-        if speedup <= 1.0 {
-            println!(
-                "WARNING: bd-3wop3.6: seqlock throughput was not faster than mutex (got {speedup:.1}x). This is expected in some noisy CI environments."
-            );
-        }
+        assert!(
+            speedup > 5.0,
+            "bd-3wop3.6: expected seqlock reads >5x mutex under 8-reader contention, got {speedup:.1}x"
+        );
     }
 }
