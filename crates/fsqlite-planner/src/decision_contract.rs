@@ -582,6 +582,7 @@ impl DecisionLog {
     ///
     /// # Errors
     /// Returns error if serialization fails.
+    #[cfg(feature = "decision-log-json")]
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&self.decisions)
     }
@@ -1062,6 +1063,7 @@ mod tests {
         assert!((stats.median_ratio - 1.0).abs() < 0.5);
     }
 
+    #[cfg(feature = "decision-log-json")]
     #[test]
     fn decision_log_to_json() {
         let tables = sample_tables();

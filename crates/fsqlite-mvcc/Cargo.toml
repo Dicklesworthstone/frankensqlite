@@ -36,7 +36,6 @@ serde = { workspace = true, features = ["derive"] }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
-serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 asupersync = { workspace = true }

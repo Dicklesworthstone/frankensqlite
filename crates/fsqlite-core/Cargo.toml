@@ -33,7 +33,7 @@ wasm = [
     "wasm-tracing-max-level-error",
 ]
 linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
-diagnostic-pragmas = []
+diagnostic-pragmas = ["dep:serde_json"]
 wasm-tracing-max-level-error = ["tracing/release_max_level_error"]
 wasm-tracing-max-level-warn = ["tracing/release_max_level_warn"]
 extensions = ["ext-json", "ext-fts5", "ext-icu", "ext-misc", "ext-rtree"]
@@ -70,7 +70,7 @@ tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 itoa = { workspace = true }
 hashbrown = { workspace = true }
 lru = { workspace = true }
@@ -89,6 +89,7 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

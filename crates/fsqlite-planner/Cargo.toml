@@ -9,8 +9,9 @@ rust-version.workspace = true
 
 [features]
 default = ["native"]
-native = []
+native = ["decision-log-json"]
 wasm = []
+decision-log-json = ["dep:serde_json"]
 
 [dependencies]
 fsqlite-types = { workspace = true }
@@ -19,7 +20,7 @@ fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 blake3 = { workspace = true }
 lru = { workspace = true }
 xxhash-rust = { workspace = true }
@@ -27,6 +28,7 @@ xxhash-rust = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "plan_cache_hot_paths"
