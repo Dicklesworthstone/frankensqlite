@@ -2064,6 +2064,10 @@ pub fn encode_batch(
         return Ok(());
     }
 
+    if encode_batch_homogeneous_into(rows, out, offsets) {
+        return Ok(());
+    }
+
     // ── Pass 1: measure header + body sizes per row, compute total size ─
     //
     // We store (header_size, body_size) per row in a column-oriented scratch
@@ -2160,8 +2164,14 @@ fn encode_batch_integer_columns(
     if column_count == 0 {
         return false;
     }
-    if rows.iter().any(|row| row.len() != column_count) {
-        return false;
+    for row in rows {
+        if row.len() != column_count
+            || row
+                .iter()
+                .any(|value| !matches!(value, SqliteValue::Integer(_)))
+        {
+            return false;
+        }
     }
 
     let layout_count = match rows.len().checked_mul(column_count) {
@@ -2262,6 +2272,18 @@ fn encode_batch_integer_columns(
 /// probe overhead is not amortized.
 const ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS: usize = 16;
 
+fn collect_row_serial_layouts(row: &[SqliteValue]) -> SmallVec<[(u64, usize); 16]> {
+    row.iter().map(serialized_value_layout).collect()
+}
+
+fn row_matches_serial_layouts(row: &[SqliteValue], layouts: &[(u64, usize)]) -> bool {
+    row.len() == layouts.len()
+        && row
+            .iter()
+            .zip(layouts.iter())
+            .all(|(value, layout)| serialized_value_layout(value) == *layout)
+}
+
 /// Cheap homogeneity probe — O(R·C) equality check of each row's
 /// (serial_type, payload_len) tuple against the first row.
 ///
@@ -2280,18 +2302,10 @@ pub fn rows_have_identical_serial_types(rows: &[&[SqliteValue]]) -> bool {
     if rows.len() < 2 {
         return false;
     }
-    let first = rows[0];
-    for row in &rows[1..] {
-        if row.len() != first.len() {
-            return false;
-        }
-        for (a, b) in first.iter().zip(row.iter()) {
-            if serialized_value_layout(a) != serialized_value_layout(b) {
-                return false;
-            }
-        }
-    }
-    true
+    let template_layouts = collect_row_serial_layouts(rows[0]);
+    rows[1..]
+        .iter()
+        .all(|row| row_matches_serial_layouts(row, &template_layouts))
 }
 
 /// Homogeneous-batch fast path for `encode_batch`.
@@ -2314,50 +2328,74 @@ pub fn rows_have_identical_serial_types(rows: &[&[SqliteValue]]) -> bool {
 /// bit-for-bit identical in shape.
 #[must_use]
 pub fn encode_batch_homogeneous(rows: &[&[SqliteValue]]) -> Option<Vec<u8>> {
-    if rows.len() < ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS {
-        return None;
-    }
-    if !rows_have_identical_serial_types(rows) {
-        return None;
-    }
+    let mut out = Vec::new();
+    let mut offsets = Vec::new();
+    encode_batch_homogeneous_into(rows, &mut out, &mut offsets).then_some(out)
+}
 
-    let template_row = rows[0];
+fn encode_batch_homogeneous_into(
+    rows: &[&[SqliteValue]],
+    out: &mut Vec<u8>,
+    offsets: &mut Vec<usize>,
+) -> bool {
+    if rows.len() < ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS {
+        return false;
+    }
+    let template_layouts = collect_row_serial_layouts(rows[0]);
+    if rows[1..]
+        .iter()
+        .any(|row| !row_matches_serial_layouts(row, &template_layouts))
+    {
+        return false;
+    }
 
     // Compute header content size and body size once.
     let mut header_content_size = 0usize;
     let mut body_size = 0usize;
-    for value in template_row.iter() {
-        let (serial_type, payload_len) = serialized_value_layout(value);
-        header_content_size = header_content_size.checked_add(varint_len(serial_type))?;
-        body_size = body_size.checked_add(payload_len)?;
+    for &(serial_type, payload_len) in &template_layouts {
+        let Some(next_header_content_size) =
+            header_content_size.checked_add(varint_len(serial_type))
+        else {
+            return false;
+        };
+        let Some(next_body_size) = body_size.checked_add(payload_len) else {
+            return false;
+        };
+        header_content_size = next_header_content_size;
+        body_size = next_body_size;
     }
     let header_size = compute_header_size(header_content_size);
-    let row_total = header_size.checked_add(body_size)?;
-    let total_size = row_total.checked_mul(rows.len())?;
+    let Some(row_total) = header_size.checked_add(body_size) else {
+        return false;
+    };
+    let Some(total_size) = row_total.checked_mul(rows.len()) else {
+        return false;
+    };
 
     // Build the single reusable header template.
-    let mut header_template = vec![0_u8; header_size];
+    let mut header_template = SmallVec::<[u8; 64]>::new();
+    header_template.resize(header_size, 0);
     let mut hoff = write_varint(
-        &mut header_template,
+        header_template.as_mut_slice(),
         u64::try_from(header_size).unwrap_or(u64::MAX),
     );
-    for value in template_row.iter() {
-        let (serial_type, _) = serialized_value_layout(value);
+    for &(serial_type, _) in &template_layouts {
         hoff += write_varint(&mut header_template[hoff..], serial_type);
     }
     debug_assert_eq!(hoff, header_size);
 
     // Allocate the full output, memcpy the header into each row slot,
     // then write bodies in a tight loop.
-    let mut out = vec![0_u8; total_size];
+    out.resize(total_size, 0);
+    offsets.reserve(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let row_start = i * row_total;
+        offsets.push(row_start);
         let header_end = row_start + header_size;
         out[row_start..header_end].copy_from_slice(&header_template);
 
         let mut body_offset = header_end;
-        for value in row.iter() {
-            let (_, payload_len) = serialized_value_layout(value);
+        for (value, &(_, payload_len)) in row.iter().zip(template_layouts.iter()) {
             let end = body_offset + payload_len;
             encode_serialized_value(value, payload_len, &mut out[body_offset..end]);
             body_offset = end;
@@ -2365,43 +2403,19 @@ pub fn encode_batch_homogeneous(rows: &[&[SqliteValue]]) -> Option<Vec<u8>> {
         debug_assert_eq!(body_offset, row_start + row_total);
     }
 
-    Some(out)
+    true
 }
 
-/// Auto-probing variant of `encode_batch`: tries the homogeneous fast
-/// path first, falls back to the generic `encode_batch` otherwise.
+/// Fresh-buffer convenience variant of [`encode_batch`].
 ///
-/// The probe is intentionally cheap — it only compares the first three
-/// rows' layouts up front. `encode_batch_homogeneous` re-validates all
-/// rows before committing to the fast path, so a false-positive probe
-/// just wastes one re-scan, never produces wrong output.
-///
-/// Returns a freshly allocated `Vec<u8>` matching `encode_batch`'s
-/// `out` payload byte-for-byte. Row offsets can be reconstructed
-/// trivially when the batch is homogeneous (every row has width
-/// `out.len() / rows.len()`); callers that need them alongside a
-/// heterogeneous batch should call `encode_batch` directly.
+/// Returns a freshly allocated `Vec<u8>` matching [`encode_batch`]'s
+/// `out` payload byte-for-byte. Call [`encode_batch`] directly when row
+/// offsets are needed alongside the payload.
 ///
 /// # Errors
 ///
-/// Propagates any error from the fallback `encode_batch` (today none).
+/// Propagates any error from [`encode_batch`] (today none).
 pub fn encode_batch_auto(rows: &[&[SqliteValue]]) -> fsqlite_error::Result<Vec<u8>> {
-    // Cheap probe: if the first three rows don't match, it's almost
-    // certainly heterogeneous — skip the full homogeneity scan.
-    let probe_ok = if rows.len() < ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS {
-        false
-    } else {
-        let probe_len = rows.len().min(3);
-        let probe: &[&[SqliteValue]] = &rows[..probe_len];
-        rows_have_identical_serial_types(probe)
-    };
-
-    if probe_ok {
-        if let Some(bytes) = encode_batch_homogeneous(rows) {
-            return Ok(bytes);
-        }
-    }
-
     let mut out = Vec::new();
     let mut offsets = Vec::new();
     encode_batch(rows, &mut out, &mut offsets)?;
@@ -4666,6 +4680,72 @@ mod tests {
             fast, slow,
             "homogeneous fast-path output must be byte-identical to encode_batch"
         );
+    }
+
+    #[test]
+    fn record_batch_mixed_columns_preserves_offsets_and_reuses_buffers() {
+        let mut rows: Vec<Vec<SqliteValue>> = Vec::with_capacity(32);
+        let large_base: i64 = 0x0010_0000_0000_0000; // forces serial_type == 6
+        for i in 0_i64..32 {
+            let text = format!("name_{i:04}");
+            assert_eq!(text.len(), 9);
+            let first_blob_byte = u8::try_from(i & 0xFF).expect("masked byte fits");
+            let second_blob_byte =
+                u8::try_from(i.wrapping_mul(3) & 0xFF).expect("masked byte fits");
+            rows.push(vec![
+                SqliteValue::Integer(large_base + i),
+                SqliteValue::Text(text.into()),
+                SqliteValue::Integer(large_base + i.wrapping_mul(7)),
+                SqliteValue::Float(f64::from(i32::try_from(i).unwrap_or(0)) * 0.25),
+                SqliteValue::Blob(Arc::from(
+                    [first_blob_byte, second_blob_byte, 0xA5, 0x5A].as_slice(),
+                )),
+                SqliteValue::Null,
+            ]);
+        }
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        let (expected_bytes, expected_offsets) = concat_scalar_encodings(&rows);
+        let mut fast = Vec::with_capacity(expected_bytes.len());
+        let fast_capacity = fast.capacity();
+        let mut fast_offsets = Vec::with_capacity(rows.len());
+        let fast_offsets_capacity = fast_offsets.capacity();
+
+        assert!(
+            encode_batch_homogeneous_into(&row_refs, &mut fast, &mut fast_offsets),
+            "fixed-layout mixed-column rows should use the homogeneous encoder"
+        );
+        assert_eq!(fast, expected_bytes);
+        assert_eq!(fast_offsets, expected_offsets);
+        assert_eq!(
+            fast.capacity(),
+            fast_capacity,
+            "homogeneous encoder should fill the preallocated contiguous buffer without growing it"
+        );
+        assert_eq!(
+            fast_offsets.capacity(),
+            fast_offsets_capacity,
+            "homogeneous encoder should fill the preallocated offset table without growing it"
+        );
+
+        for _ in 0..256 {
+            fast.clear();
+            fast_offsets.clear();
+            assert!(
+                encode_batch_homogeneous_into(&row_refs, &mut fast, &mut fast_offsets),
+                "fixed-layout mixed-column rows should keep using the homogeneous encoder"
+            );
+            assert_eq!(fast, expected_bytes);
+            assert_eq!(fast_offsets, expected_offsets);
+            assert_eq!(fast.capacity(), fast_capacity);
+            assert_eq!(fast_offsets.capacity(), fast_offsets_capacity);
+        }
+
+        let mut public = Vec::with_capacity(expected_bytes.len());
+        let mut public_offsets = Vec::with_capacity(rows.len());
+        encode_batch(&row_refs, &mut public, &mut public_offsets)
+            .expect("public batch encoder must succeed");
+        assert_eq!(public, expected_bytes);
+        assert_eq!(public_offsets, expected_offsets);
     }
 
     #[test]

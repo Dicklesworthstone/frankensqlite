@@ -116,6 +116,7 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
 }
 
 fn batch_record_rows(row_count: usize) -> Vec<Vec<SqliteValue>> {
+    let large_base: i64 = 0x0010_0000_0000_0000; // forces integer serial_type == 6
     (0..row_count)
         .map(|idx| {
             let idx_i64 = i64::try_from(idx).expect("benchmark row count should fit into i64");
@@ -125,9 +126,9 @@ fn batch_record_rows(row_count: usize) -> Vec<Vec<SqliteValue>> {
             let second_blob_byte =
                 u8::try_from(idx.wrapping_mul(3) & 0xFF).expect("masked byte fits");
             vec![
-                SqliteValue::Integer(idx_i64),
+                SqliteValue::Integer(large_base + idx_i64),
                 SqliteValue::Text(format!("name_{idx:04}").into()),
-                SqliteValue::Integer(idx_i64 * 7),
+                SqliteValue::Integer(large_base + idx_i64 * 7),
                 SqliteValue::Float(idx_f64 * 0.25),
                 SqliteValue::Blob(Arc::from(
                     [first_blob_byte, second_blob_byte, 0xA5, 0x5A].as_slice(),
