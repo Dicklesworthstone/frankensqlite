@@ -3,7 +3,7 @@ name = "fsqlite-ext-fts3"
 version = "0.1.5"
 description = "FTS3/FTS4 full-text search extension"
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

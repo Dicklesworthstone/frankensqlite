@@ -3,7 +3,7 @@ name = "fsqlite-func"
 version = "0.1.5"
 description = "Built-in scalar, aggregate, and window functions"
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

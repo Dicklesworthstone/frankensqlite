@@ -3,7 +3,7 @@ name = "fsqlite-ext-rtree"
 version = "0.1.5"
 description = "R-tree and geopoly spatial index extension"
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

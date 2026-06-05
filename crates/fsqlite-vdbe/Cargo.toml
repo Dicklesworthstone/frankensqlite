@@ -3,7 +3,7 @@ name = "fsqlite-vdbe"
 version = "0.1.5"
 description = "Virtual database engine bytecode interpreter"
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

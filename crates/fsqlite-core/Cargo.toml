@@ -3,7 +3,7 @@ name = "fsqlite-core"
 version = "0.1.5"
 description = "Core engine: connection, prepare, schema, DDL/DML codegen"
 edition.workspace = true
-license-file.workspace = true
+license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

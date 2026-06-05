@@ -33,7 +33,10 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license-file = "LICENSE"
+# "MIT License (with OpenAI/Anthropic Rider)" (see ./LICENSE) — a restrictive custom
+# license (no rights to OpenAI/Anthropic or ML training/eval use), NOT permissive MIT.
+# Expressed as an SPDX LicenseRef so package metadata is honest and cargo-deny can gate it.
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 repository = "https://github.com/Dicklesworthstone/frankensqlite"
 rust-version = "1.85"
 readme = "README.md"
