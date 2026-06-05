@@ -28,7 +28,7 @@ xxhash-rust = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 

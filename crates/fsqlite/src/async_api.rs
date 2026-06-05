@@ -124,9 +124,10 @@ fn blocking_wait_send_err<T>(_: oneshot::SendError<Result<T, FrankenError>>) {}
 
 fn native_cx_for_local<Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>>(
     cx: &Cx<Caps>,
-) -> NativeCx {
+) -> Result<NativeCx, FrankenError> {
     cx.attached_native_cx()
-        .unwrap_or_else(NativeCx::for_request)
+        .or_else(NativeCx::current)
+        .ok_or_else(requires_runtime_err)
 }
 
 async fn recv_sync_response<
@@ -138,7 +139,7 @@ async fn recv_sync_response<
 ) -> Result<T, FrankenError> {
     let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
     let pool = runtime.blocking_handle().ok_or_else(requires_runtime_err)?;
-    let native_cx = native_cx_for_local(cx);
+    let native_cx = native_cx_for_local(cx)?;
     let waiter_cx = native_cx.clone();
     let (result_tx, mut result_rx) = oneshot::channel::<Result<T, FrankenError>>();
 
@@ -162,12 +163,8 @@ async fn recv_sync_response<
 // Worker task
 // ---------------------------------------------------------------------------
 
-fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>, worker_cx: NativeCx) {
+fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
     loop {
-        if worker_cx.checkpoint().is_err() {
-            return;
-        }
-
         let cmd = match rx.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(cmd) => cmd,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -220,7 +217,6 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>, worker_cx: Nat
 
 fn spawn_worker_task(
     runtime: &RuntimeHandle,
-    worker_cx: NativeCx,
     path: String,
     env: ConnectionEnv,
     cmd_rx: mpsc::Receiver<Command>,
@@ -230,7 +226,7 @@ fn spawn_worker_task(
         .spawn_blocking(move || match Connection::open_with_env(path, env) {
             Ok(conn) => {
                 let _ = open_tx.send(Ok(()));
-                worker_loop(conn, cmd_rx, worker_cx);
+                worker_loop(conn, cmd_rx);
             }
             Err(error) => {
                 let _ = open_tx.send(Err(error));
@@ -312,7 +308,6 @@ fn send_err<T>(_: mpsc::SendError<T>) -> FrankenError {
 pub struct AsyncConnection {
     cmd_tx: Option<mpsc::SyncSender<Command>>,
     worker: Option<BlockingTaskHandle>,
-    worker_cx: Option<NativeCx>,
     owned_runtime: Option<Runtime>,
     /// Tracks whether the worker task's connection has an active transaction.
     /// Updated by `begin_transaction`, `commit_transaction`, and
@@ -350,22 +345,13 @@ impl AsyncConnection {
         let path = path.into();
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
-        let worker_cx = NativeCx::for_request();
         let (owned_runtime, runtime_handle) = current_or_owned_runtime()?;
-        let worker = spawn_worker_task(
-            &runtime_handle,
-            worker_cx.clone(),
-            path,
-            env,
-            cmd_rx,
-            open_tx,
-        )?;
+        let worker = spawn_worker_task(&runtime_handle, path, env, cmd_rx, open_tx)?;
 
         match wait_for_worker_open(open_rx) {
             Ok(()) => Ok(Self {
                 cmd_tx: Some(cmd_tx),
                 worker: Some(worker),
-                worker_cx: Some(worker_cx),
                 owned_runtime,
                 in_txn: Arc::new(AtomicBool::new(false)),
             }),
@@ -394,8 +380,7 @@ impl AsyncConnection {
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
         let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
-        let worker_cx = NativeCx::for_request();
-        let worker = spawn_worker_task(&runtime, worker_cx.clone(), path, env, cmd_rx, open_tx)?;
+        let worker = spawn_worker_task(&runtime, path, env, cmd_rx, open_tx)?;
 
         // Wait for the open result.
         if let Err(error) = recv_sync_response(cx, open_rx).await? {
@@ -406,7 +391,6 @@ impl AsyncConnection {
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             worker: Some(worker),
-            worker_cx: Some(worker_cx),
             owned_runtime: None,
             in_txn: Arc::new(AtomicBool::new(false)),
         })
@@ -623,9 +607,6 @@ impl AsyncConnection {
             cmd_tx.send(Command::Close { tx }).map_err(send_err)?;
             let result = recv_sync_response(cx, rx).await?;
 
-            if let Some(worker_cx) = self.worker_cx.take() {
-                worker_cx.cancel();
-            }
             if let Some(handle) = self.worker.take() {
                 join_worker_task(handle);
             }
@@ -643,9 +624,6 @@ impl Drop for AsyncConnection {
     fn drop(&mut self) {
         if let Some(cmd_tx) = self.cmd_tx.take() {
             let _ = cmd_tx.send(Command::Shutdown);
-        }
-        if let Some(worker_cx) = self.worker_cx.take() {
-            worker_cx.cancel();
         }
         if let Some(handle) = self.worker.take() {
             join_worker_task(handle);

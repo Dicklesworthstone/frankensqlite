@@ -640,7 +640,7 @@ impl Cx<FullCaps> {
 }
 
 impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
-    #[cfg(feature = "native")]
+    #[cfg(all(feature = "native", test))]
     #[must_use]
     #[allow(dead_code)]
     fn effective_native_cx(&self) -> NativeCx {

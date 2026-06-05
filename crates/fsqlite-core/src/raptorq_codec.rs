@@ -9,8 +9,11 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+#[cfg(test)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use asupersync::Budget as AsBudget;
 use asupersync::error::ErrorKind as AsErrorKind;
 use asupersync::raptorq::{RaptorQReceiverBuilder, RaptorQSenderBuilder};
 use asupersync::security::AuthenticationTag;
@@ -18,12 +21,13 @@ use asupersync::security::authenticated::AuthenticatedSymbol;
 use asupersync::transport::error::{SinkError, StreamError};
 use asupersync::transport::sink::SymbolSink;
 use asupersync::transport::stream::SymbolStream;
+#[cfg(test)]
 use asupersync::types::Time as AsTime;
 use asupersync::types::{
     CancelKind as AsCancelKind, CancelReason as AsCancelReason, ObjectId as AsObjectId,
     ObjectParams, Symbol, SymbolId, SymbolKind,
 };
-use asupersync::{Budget as AsBudget, Cx as AsCx, RaptorQConfig};
+use asupersync::{Cx as AsCx, RaptorQConfig};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -209,6 +213,7 @@ impl Default for AsupersyncCodec {
     }
 }
 
+#[cfg(test)]
 fn native_budget_from_local(cx: &Cx) -> AsBudget {
     let budget = cx.budget();
     let mut native_budget = AsBudget::new()
@@ -223,12 +228,14 @@ fn native_budget_from_local(cx: &Cx) -> AsBudget {
     native_budget
 }
 
+#[cfg(test)]
 fn wall_clock_now_since_epoch() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
 }
 
+#[cfg(test)]
 fn local_deadline_to_native_time(deadline: Duration) -> AsTime {
     let absolute_deadline = wall_clock_now_since_epoch()
         .checked_add(deadline)
@@ -264,7 +271,7 @@ fn native_reason_to_local(reason: &AsCancelReason) -> fsqlite_types::cx::CancelR
     }
 }
 
-fn sync_local_cancel_from_attached_native(codec_cx: &Cx, native_cx: &AsCx) {
+fn sync_local_cancel_from_native(codec_cx: &Cx, native_cx: &AsCx) {
     if let Some(reason) = native_cx.cancel_reason() {
         codec_cx.cancel_with_reason(native_reason_to_local(&reason));
     } else if native_cx.is_cancel_requested() {
@@ -272,21 +279,27 @@ fn sync_local_cancel_from_attached_native(codec_cx: &Cx, native_cx: &AsCx) {
     }
 }
 
-fn derive_native_request_cx(cx: &Cx) -> (Cx, AsCx) {
+fn missing_native_cx_error() -> FrankenError {
+    FrankenError::Internal(format!(
+        "{BEAD_ID}: asupersync RaptorQ codec requires an attached native Cx or an ambient asupersync runtime Cx"
+    ))
+}
+
+fn derive_native_request_cx(cx: &Cx) -> Result<(Cx, AsCx)> {
     let codec_cx = cx.create_child();
     if let Some(reason) = cx.cancel_reason() {
         codec_cx.cancel_with_reason(reason);
     } else if cx.is_cancel_requested() {
         codec_cx.cancel();
     }
-    let attached_native_cx = cx.attached_native_cx();
-    if let Some(native_cx) = attached_native_cx.as_ref() {
-        sync_local_cancel_from_attached_native(&codec_cx, native_cx);
-    }
-    let native_cx = attached_native_cx
-        .unwrap_or_else(|| AsCx::for_request_with_budget(native_budget_from_local(&codec_cx)));
+
+    let native_cx = cx
+        .attached_native_cx()
+        .or_else(AsCx::current)
+        .ok_or_else(missing_native_cx_error)?;
+    sync_local_cancel_from_native(&codec_cx, &native_cx);
     codec_cx.set_native_cx(native_cx.clone());
-    (codec_cx, native_cx)
+    Ok((codec_cx, native_cx))
 }
 
 fn decode_object_params(
@@ -373,7 +386,7 @@ impl SymbolCodec for AsupersyncCodec {
         config.encoding.max_block_size = self.max_block_size;
         config.encoding.repair_overhead = repair_overhead;
 
-        let (codec_cx, native_cx) = derive_native_request_cx(cx);
+        let (codec_cx, native_cx) = derive_native_request_cx(cx)?;
         codec_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let object_id = AsObjectId::new_for_test(PRODUCTION_OBJECT_ID);
         let mut sender = RaptorQSenderBuilder::new()
@@ -451,7 +464,7 @@ impl SymbolCodec for AsupersyncCodec {
             ));
         }
 
-        let (codec_cx, native_cx) = derive_native_request_cx(cx);
+        let (codec_cx, native_cx) = derive_native_request_cx(cx)?;
         codec_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let mut receiver = RaptorQReceiverBuilder::new()
             .config(config)
@@ -492,7 +505,9 @@ mod tests {
     use fsqlite_types::cx::{CancelReason, Cx};
 
     fn test_cx() -> Cx {
-        Cx::new()
+        let cx = Cx::new();
+        cx.set_native_cx(AsCx::for_testing());
+        cx
     }
 
     #[test]
@@ -835,11 +850,23 @@ mod tests {
         cx.set_native_cx(native.clone());
         native.set_cancel_reason(AsCancelReason::timeout());
 
-        let (codec_cx, derived_native) = derive_native_request_cx(&cx);
+        let (codec_cx, derived_native) =
+            derive_native_request_cx(&cx).expect("attached native cx should derive");
 
         assert_eq!(codec_cx.cancel_reason(), Some(CancelReason::Timeout));
         assert!(codec_cx.is_cancel_requested());
         assert!(codec_cx.checkpoint().is_err());
         assert!(derived_native.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_derive_native_request_cx_requires_runtime_or_attachment() {
+        let cx = Cx::new();
+
+        let err = derive_native_request_cx(&cx).unwrap_err();
+
+        assert!(
+            matches!(err, FrankenError::Internal(message) if message.contains("requires an attached native Cx"))
+        );
     }
 }
