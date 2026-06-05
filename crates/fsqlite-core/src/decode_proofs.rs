@@ -350,7 +350,7 @@ impl EcsDecodeProof {
 
     /// Whether the decode used the minimum possible symbols (fragile recovery).
     #[must_use]
-    pub fn is_minimum_decode(&self) -> bool {
+    pub fn uses_minimum_symbols(&self) -> bool {
         #[allow(clippy::cast_possible_truncation)]
         let received = self.symbols_received.len() as u32;
         received == self.k_source
@@ -457,10 +457,10 @@ impl EcsDecodeProof {
     ) -> bool {
         let expected_symbol_digests = canonicalize_symbol_digests(symbol_digests.to_vec());
         let expected_rejected = canonicalize_rejected_symbols(rejected_symbols.to_vec());
-        if self.symbol_digests != expected_symbol_digests {
+        if !self.symbol_digests.eq(&expected_symbol_digests) {
             return false;
         }
-        if self.rejected_symbols != expected_rejected {
+        if !self.rejected_symbols.eq(&expected_rejected) {
             return false;
         }
         self.input_hashes.symbol_digests_xxh3 == hash_symbol_digests(&expected_symbol_digests)
@@ -479,8 +479,8 @@ impl EcsDecodeProof {
         let expected_symbol_digests = canonicalize_symbol_digests(symbol_digests.to_vec());
         let expected_rejected = canonicalize_rejected_symbols(rejected_symbols.to_vec());
 
-        let schema_version_ok = self.schema_version == config.expected_schema_version;
-        let policy_id_ok = self.policy_id == config.expected_policy_id;
+        let schema_version_ok = self.schema_version.eq(&config.expected_schema_version);
+        let policy_id_ok = self.policy_id.eq(&config.expected_policy_id);
         let internal_consistency_ok = self.is_consistent();
         let metadata_hash_ok = self.input_hashes.metadata_xxh3 == hash_metadata(self);
         let source_hash_ok =
@@ -813,11 +813,7 @@ mod tests {
         bytes.extend_from_slice(&proof.schema_version.to_le_bytes());
         bytes.extend_from_slice(&proof.policy_id.to_le_bytes());
         bytes.extend_from_slice(proof.object_id.as_bytes());
-        bytes.extend_from_slice(
-            &proof
-                .changeset_id
-                .map_or([0_u8; 16], |changeset_id| changeset_id),
-        );
+        bytes.extend_from_slice(&proof.changeset_id.unwrap_or([0_u8; 16]));
         bytes.extend_from_slice(&proof.k_source.to_le_bytes());
         bytes.extend_from_slice(&proof.repair_count.to_le_bytes());
         bytes.extend_from_slice(&proof.symbol_size.to_le_bytes());
@@ -1133,7 +1129,7 @@ mod tests {
         let proof_min =
             EcsDecodeProof::from_esis(oid, k_source, &esis_min, true, Some(10), 100, 42);
         assert!(
-            proof_min.is_minimum_decode(),
+            proof_min.uses_minimum_symbols(),
             "K=10 received=10 should be minimum decode"
         );
 
@@ -1142,7 +1138,7 @@ mod tests {
         let proof_extra =
             EcsDecodeProof::from_esis(oid, k_source, &esis_extra, true, Some(10), 100, 42);
         assert!(
-            !proof_extra.is_minimum_decode(),
+            !proof_extra.uses_minimum_symbols(),
             "K=10 received=12 should not be minimum decode"
         );
     }

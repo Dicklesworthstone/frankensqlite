@@ -228,11 +228,12 @@ impl BetaBinomialStats {
 fn student_t_log_pdf(x: f64, mu: f64, scale_sq: f64, df: f64) -> f64 {
     // log p(x) = const - ((df+1)/2) * ln(1 + (x-mu)^2/(df*scale_sq))
     let z_sq = (x - mu).powi(2) / (df * scale_sq);
+    let half_df_plus_one = f64::midpoint(df, 1.0);
     let log_norm = 0.5f64.mul_add(
         -(df * std::f64::consts::PI * scale_sq).ln(),
-        ln_gamma(0.5 * (df + 1.0)) - ln_gamma(0.5 * df),
+        ln_gamma(half_df_plus_one) - ln_gamma(0.5 * df),
     );
-    (0.5 * (df + 1.0)).mul_add(-z_sq.ln_1p(), log_norm)
+    half_df_plus_one.mul_add(-z_sq.ln_1p(), log_norm)
 }
 
 /// Lanczos approximation of ln(Gamma(x)).

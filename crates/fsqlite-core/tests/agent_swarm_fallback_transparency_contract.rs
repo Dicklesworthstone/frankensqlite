@@ -42,6 +42,31 @@ const REQUIRED_BOUNDARY_IDS: &[&str] = &[
     "e2e.file_backed_default_strict_parity",
     "vdbe.open_cursor.parity_cert_rejection",
 ];
+const FALLBACK_DECISION_REQUIRED_FIELDS: &[&str] = &[
+    "trace_id",
+    "run_id",
+    "scenario_id",
+    "statement_fingerprint",
+    "statement_kind",
+    "backend_identity",
+    "fallback_boundary",
+    "decision_reason",
+    "certifying_mode",
+    "strict_mode",
+    "decision_outcome",
+    "source_touchpoint",
+    "first_failure_diag",
+];
+const FALLBACK_DECISION_ALLOWED_OUTCOMES: &[&str] = &[
+    "denied",
+    "allowed_compatibility_fallback",
+    "real_backend_dispatch",
+    "real_backend_refresh",
+    "vdbe_mempage_fallback_rejected",
+    "vdbe_mempage_fallback_allowed",
+    "intentional_time_travel_snapshot",
+    "refused",
+];
 
 struct FallbackEvent<'a> {
     event_seq: i64,
@@ -57,6 +82,23 @@ struct FallbackEvent<'a> {
     memory_impact: &'a str,
     latency_impact: &'a str,
     diagnostics_available: bool,
+    first_failure_diag: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct FallbackDecisionEvent<'a> {
+    trace_id: &'a str,
+    run_id: &'a str,
+    scenario_id: &'a str,
+    statement_fingerprint: &'a str,
+    statement_kind: &'a str,
+    backend_identity: &'a str,
+    fallback_boundary: &'a str,
+    decision_reason: &'a str,
+    certifying_mode: bool,
+    strict_mode: bool,
+    decision_outcome: &'a str,
+    source_touchpoint: &'a str,
     first_failure_diag: &'a str,
 }
 
@@ -116,6 +158,34 @@ fn install_fallback_schema(conn: &Connection) -> TestResult {
                 table_name,
                 workload_lane,
                 fallback_reason
+            );",
+    )?;
+    conn.execute(
+        "CREATE TABLE fsqlite_fallback_decision_events_contract(
+            event_seq INTEGER NOT NULL PRIMARY KEY,
+            trace_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            statement_fingerprint TEXT NOT NULL,
+            statement_kind TEXT NOT NULL,
+            backend_identity TEXT NOT NULL,
+            fallback_boundary TEXT NOT NULL,
+            decision_reason TEXT NOT NULL,
+            certifying_mode INTEGER NOT NULL,
+            strict_mode INTEGER NOT NULL,
+            decision_outcome TEXT NOT NULL,
+            source_touchpoint TEXT NOT NULL,
+            first_failure_diag TEXT NOT NULL
+        );",
+    )?;
+    conn.execute(
+        "CREATE INDEX idx_fsqlite_fallback_decision_events_contract_lookup
+            ON fsqlite_fallback_decision_events_contract(
+                statement_fingerprint,
+                statement_kind,
+                backend_identity,
+                fallback_boundary,
+                decision_outcome
             );",
     )?;
     seed_fallback_reason_codes(conn)?;
@@ -262,6 +332,160 @@ fn trace_fallback_event(event: &FallbackEvent<'_>) {
         first_failure_diag = event.first_failure_diag,
         "fallback transparency contract event"
     );
+}
+
+fn fallback_decision_contract_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()).into()
+}
+
+fn fallback_decision_required_text_fields<'a>(
+    event: &'a FallbackDecisionEvent<'a>,
+) -> [(&'static str, &'a str); 11] {
+    [
+        ("trace_id", event.trace_id),
+        ("run_id", event.run_id),
+        ("scenario_id", event.scenario_id),
+        ("statement_fingerprint", event.statement_fingerprint),
+        ("statement_kind", event.statement_kind),
+        ("backend_identity", event.backend_identity),
+        ("fallback_boundary", event.fallback_boundary),
+        ("decision_reason", event.decision_reason),
+        ("decision_outcome", event.decision_outcome),
+        ("source_touchpoint", event.source_touchpoint),
+        ("first_failure_diag", event.first_failure_diag),
+    ]
+}
+
+fn validate_fallback_decision_event(event: &FallbackDecisionEvent<'_>) -> TestResult {
+    for (field, value) in fallback_decision_required_text_fields(event) {
+        if value.trim().is_empty() {
+            return Err(fallback_decision_contract_error(format!(
+                "fallback decision field {field} must not be empty"
+            )));
+        }
+    }
+
+    if !FALLBACK_DECISION_ALLOWED_OUTCOMES.contains(&event.decision_outcome) {
+        return Err(fallback_decision_contract_error(format!(
+            "unknown fallback decision outcome {}",
+            event.decision_outcome
+        )));
+    }
+    if !event.backend_identity.contains(':') {
+        return Err(fallback_decision_contract_error(format!(
+            "backend_identity {} must include backend kind and mode",
+            event.backend_identity
+        )));
+    }
+    for expected_diag_part in [
+        event.statement_kind,
+        event.fallback_boundary,
+        event.source_touchpoint,
+        event.decision_reason,
+    ] {
+        if !event.first_failure_diag.contains(expected_diag_part) {
+            return Err(fallback_decision_contract_error(format!(
+                "first_failure_diag {:?} must include {:?}",
+                event.first_failure_diag, expected_diag_part
+            )));
+        }
+    }
+
+    match event.decision_outcome {
+        "denied" => {
+            if !event.certifying_mode || !event.strict_mode {
+                return Err(fallback_decision_contract_error(
+                    "strict denial must carry certifying_mode=true and strict_mode=true",
+                ));
+            }
+        }
+        "allowed_compatibility_fallback" | "intentional_time_travel_snapshot" => {
+            if event.strict_mode {
+                return Err(fallback_decision_contract_error(
+                    "allowed compatibility fallback must not carry strict_mode=true",
+                ));
+            }
+        }
+        "real_backend_dispatch" | "real_backend_refresh" => {
+            if event.backend_identity.starts_with("mem:") {
+                return Err(fallback_decision_contract_error(format!(
+                    "{} must not be reported with MemDatabase backend_identity {}",
+                    event.decision_outcome, event.backend_identity
+                )));
+            }
+        }
+        "vdbe_mempage_fallback_rejected" => {
+            if !event.certifying_mode {
+                return Err(fallback_decision_contract_error(
+                    "VDBE MemPageStore rejection must carry certifying_mode=true",
+                ));
+            }
+        }
+        "vdbe_mempage_fallback_allowed" | "refused" => {}
+        other => {
+            return Err(fallback_decision_contract_error(format!(
+                "unhandled fallback decision outcome {other}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn record_fallback_decision_event(
+    conn: &Connection,
+    event_seq: i64,
+    event: FallbackDecisionEvent<'_>,
+) -> TestResult {
+    validate_fallback_decision_event(&event)?;
+    conn.execute(&format!(
+        "INSERT INTO fsqlite_fallback_decision_events_contract(
+            event_seq,
+            trace_id,
+            run_id,
+            scenario_id,
+            statement_fingerprint,
+            statement_kind,
+            backend_identity,
+            fallback_boundary,
+            decision_reason,
+            certifying_mode,
+            strict_mode,
+            decision_outcome,
+            source_touchpoint,
+            first_failure_diag
+        ) VALUES (
+            {event_seq},
+            {trace_id},
+            {run_id},
+            {scenario_id},
+            {statement_fingerprint},
+            {statement_kind},
+            {backend_identity},
+            {fallback_boundary},
+            {decision_reason},
+            {certifying_mode},
+            {strict_mode},
+            {decision_outcome},
+            {source_touchpoint},
+            {first_failure_diag}
+        );",
+        event_seq = event_seq,
+        trace_id = sql_text(event.trace_id),
+        run_id = sql_text(event.run_id),
+        scenario_id = sql_text(event.scenario_id),
+        statement_fingerprint = sql_text(event.statement_fingerprint),
+        statement_kind = sql_text(event.statement_kind),
+        backend_identity = sql_text(event.backend_identity),
+        fallback_boundary = sql_text(event.fallback_boundary),
+        decision_reason = sql_text(event.decision_reason),
+        certifying_mode = sql_bool(event.certifying_mode),
+        strict_mode = sql_bool(event.strict_mode),
+        decision_outcome = sql_text(event.decision_outcome),
+        source_touchpoint = sql_text(event.source_touchpoint),
+        first_failure_diag = sql_text(event.first_failure_diag)
+    ))?;
+    Ok(())
 }
 
 fn row_values(row: &Row) -> &[SqliteValue] {
@@ -468,6 +692,220 @@ fn fallback_boundary_inventory_covers_runtime_reason_strings() {
             "runtime fallback/storage decision reason {reason:?} is missing from inventory"
         );
     }
+}
+
+#[test]
+fn fallback_decision_contract_validates_schema_fields_and_outcomes() -> TestResult {
+    let conn = Connection::open(":memory:")?;
+    assert!(
+        conn.is_concurrent_mode_default(),
+        "fallback telemetry must not disable concurrent-writer mode"
+    );
+    install_fallback_schema(&conn)?;
+
+    let decision_events = [
+        FallbackDecisionEvent {
+            trace_id: "trace-real-backend",
+            run_id: "run-g9",
+            scenario_id: "scenario-real-backend",
+            statement_fingerprint: "select-real-table",
+            statement_kind: "select",
+            backend_identity: "txn:parity_cert_strict",
+            fallback_boundary: "conn.select.real_backend_dispatch",
+            decision_reason: "valid_btree_page",
+            certifying_mode: true,
+            strict_mode: true,
+            decision_outcome: "real_backend_dispatch",
+            source_touchpoint: "VdbeEngine::open_storage_cursor",
+            first_failure_diag: "statement_kind=select; fallback_boundary=conn.select.real_backend_dispatch; source_touchpoint=VdbeEngine::open_storage_cursor; decision_reason=valid_btree_page",
+        },
+        FallbackDecisionEvent {
+            trace_id: "trace-denied",
+            run_id: "run-g9",
+            scenario_id: "scenario-denied",
+            statement_fingerprint: "select-with",
+            statement_kind: "select",
+            backend_identity: "memory:parity_cert_strict",
+            fallback_boundary: "conn.select.with_clause_materialization",
+            decision_reason: "with_clause_materialization",
+            certifying_mode: true,
+            strict_mode: true,
+            decision_outcome: "denied",
+            source_touchpoint: "execute_statement_dispatch:select:with_clause_materialization",
+            first_failure_diag: "statement_kind=select; fallback_boundary=conn.select.with_clause_materialization; source_touchpoint=execute_statement_dispatch:select:with_clause_materialization; decision_reason=with_clause_materialization",
+        },
+        FallbackDecisionEvent {
+            trace_id: "trace-allowed",
+            run_id: "run-g9",
+            scenario_id: "scenario-allowed",
+            statement_fingerprint: "select-view",
+            statement_kind: "select",
+            backend_identity: "memory:fallback_allowed",
+            fallback_boundary: "conn.select.view_materialization",
+            decision_reason: "view_materialization",
+            certifying_mode: false,
+            strict_mode: false,
+            decision_outcome: "allowed_compatibility_fallback",
+            source_touchpoint: "execute_statement_dispatch:select:view_materialization",
+            first_failure_diag: "statement_kind=select; fallback_boundary=conn.select.view_materialization; source_touchpoint=execute_statement_dispatch:select:view_materialization; decision_reason=view_materialization",
+        },
+        FallbackDecisionEvent {
+            trace_id: "trace-vdbe-rejected",
+            run_id: "run-g9",
+            scenario_id: "scenario-vdbe",
+            statement_fingerprint: "vdbe-open-storage-cursor:2:2:parity_cert_rejection",
+            statement_kind: "vdbe_open_cursor",
+            backend_identity: "mem:parity_cert",
+            fallback_boundary: "vdbe.open_cursor.parity_cert_rejection",
+            decision_reason: "parity_cert_rejection",
+            certifying_mode: true,
+            strict_mode: false,
+            decision_outcome: "vdbe_mempage_fallback_rejected",
+            source_touchpoint: "VdbeEngine::open_storage_cursor",
+            first_failure_diag: "statement_kind=vdbe_open_cursor; fallback_boundary=vdbe.open_cursor.parity_cert_rejection; source_touchpoint=VdbeEngine::open_storage_cursor; decision_reason=parity_cert_rejection",
+        },
+        FallbackDecisionEvent {
+            trace_id: "trace-refresh",
+            run_id: "run-g9",
+            scenario_id: "scenario-refresh",
+            statement_fingerprint: "memdb-refresh",
+            statement_kind: "statement",
+            backend_identity: "txn:parity_cert",
+            fallback_boundary: "conn.memdb.refresh_from_pager_publication",
+            decision_reason: "refresh_from_pager_publication",
+            certifying_mode: true,
+            strict_mode: false,
+            decision_outcome: "real_backend_refresh",
+            source_touchpoint: "refresh_from_pager_publication",
+            first_failure_diag: "statement_kind=statement; fallback_boundary=conn.memdb.refresh_from_pager_publication; source_touchpoint=refresh_from_pager_publication; decision_reason=refresh_from_pager_publication",
+        },
+    ];
+    for (idx, event) in decision_events.into_iter().enumerate() {
+        record_fallback_decision_event(
+            &conn,
+            i64::try_from(idx + 1).expect("test event count fits i64"),
+            event,
+        )?;
+    }
+
+    let rows = conn.query(
+        "SELECT decision_outcome, count(*)
+           FROM fsqlite_fallback_decision_events_contract
+          GROUP BY decision_outcome
+          ORDER BY decision_outcome;",
+    )?;
+    assert_eq!(
+        rows.len(),
+        5,
+        "decision event contract should preserve every standardized outcome"
+    );
+
+    let mut empty_field = decision_events[1];
+    empty_field.statement_fingerprint = "";
+    assert!(
+        validate_fallback_decision_event(&empty_field).is_err(),
+        "empty required identifiers must fail schema validation"
+    );
+
+    let mut unknown_outcome = decision_events[1];
+    unknown_outcome.decision_outcome = "maybe_fallback";
+    assert!(
+        validate_fallback_decision_event(&unknown_outcome).is_err(),
+        "unknown decision outcomes must fail schema validation"
+    );
+
+    let mut inconsistent_backend = decision_events[0];
+    inconsistent_backend.backend_identity = "mem:parity_cert_strict";
+    assert!(
+        validate_fallback_decision_event(&inconsistent_backend).is_err(),
+        "real-backend dispatch must not validate as a MemDatabase backend"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn production_fallback_decision_sources_expose_required_schema_fields() {
+    for field in FALLBACK_DECISION_REQUIRED_FIELDS {
+        assert!(
+            CONNECTION_SOURCE.contains(field),
+            "connection fallback-decision logs must expose required field {field}"
+        );
+        assert!(
+            VDBE_ENGINE_SOURCE.contains(field),
+            "VDBE fallback-decision logs must expose required field {field}"
+        );
+    }
+    for outcome in FALLBACK_DECISION_ALLOWED_OUTCOMES {
+        assert!(
+            FALLBACK_BOUNDARY_INVENTORY.contains(outcome)
+                || CONNECTION_SOURCE.contains(outcome)
+                || VDBE_ENGINE_SOURCE.contains(outcome),
+            "fallback-decision outcome {outcome} must be documented or emitted"
+        );
+    }
+    for target in [CONNECTION_SOURCE, VDBE_ENGINE_SOURCE] {
+        assert!(
+            target.contains("target: \"fsqlite.fallback_decision\""),
+            "fallback decision telemetry must use the stable tracing target"
+        );
+    }
+}
+
+#[test]
+fn strict_denial_error_names_fallback_boundary_and_outcome() -> TestResult {
+    let conn = Connection::open(":memory:")?;
+    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+    let err = conn
+        .query("WITH c(x) AS (SELECT 1) SELECT x FROM c;")
+        .expect_err("strict parity-cert must reject WITH-clause MemDatabase materialization");
+    let message = err.to_string();
+    for expected in [
+        "in-memory fallback disabled in strict parity-cert mode",
+        "statement_kind=select",
+        "decision_reason=with_clause_materialization",
+        "decision_outcome=denied",
+        "fallback_boundary=conn.select.with_clause_materialization",
+        "source_touchpoint=",
+        "first_failure_diag=",
+    ] {
+        assert!(
+            message.contains(expected),
+            "strict fallback denial did not include {expected:?}: {message}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn real_backend_strict_execution_and_non_cert_fallback_remain_distinguishable() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("g9_decision_real_backend.db");
+    let db = db_path.to_string_lossy();
+    let conn = Connection::open(db.as_ref())?;
+    conn.execute("CREATE TABLE agent_jobs(id INTEGER PRIMARY KEY, status TEXT);")?;
+    conn.execute("INSERT INTO agent_jobs(status) VALUES ('ready');")?;
+    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+    let rows = conn.query("SELECT status FROM agent_jobs WHERE id = 1;")?;
+    assert_eq!(
+        row_values(&rows[0]),
+        &[SqliteValue::Text("ready".into())],
+        "strict certifying mode should still execute real backend table reads"
+    );
+
+    let compat = Connection::open(":memory:")?;
+    compat.execute("PRAGMA fsqlite.parity_cert = OFF;")?;
+    let rows = compat.query("WITH c(x) AS (SELECT 7) SELECT x FROM c;")?;
+    assert_eq!(
+        row_values(&rows[0]),
+        &[SqliteValue::Integer(7)],
+        "non-cert compatibility fallback must remain allowed and distinguishable from strict denial"
+    );
+
+    Ok(())
 }
 
 #[test]

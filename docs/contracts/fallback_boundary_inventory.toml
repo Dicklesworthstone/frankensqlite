@@ -33,6 +33,12 @@ allowed_non_cert_policies = [
 ]
 allowed_decision_outcomes = [
   "denied",
+  "allowed_compatibility_fallback",
+  "real_backend_dispatch",
+  "real_backend_refresh",
+  "vdbe_mempage_fallback_rejected",
+  "vdbe_mempage_fallback_allowed",
+  "intentional_time_travel_snapshot",
   "mem_fallback",
   "real_backend",
   "refused",

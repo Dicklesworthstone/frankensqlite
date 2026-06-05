@@ -6612,6 +6612,86 @@ impl VdbeEngine {
         self.execution_cx.clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn log_open_storage_cursor_fallback_decision(
+        trace_id: u64,
+        certifying_mode: bool,
+        cursor_id: i32,
+        root_page: i32,
+        writable: bool,
+        backend_kind: &'static str,
+        decision_reason: &'static str,
+        decision_outcome: &'static str,
+        detail: &str,
+    ) {
+        let rejected = decision_outcome == "vdbe_mempage_fallback_rejected";
+        let trace_enabled = if rejected {
+            tracing::enabled!(target: "fsqlite.fallback_decision", tracing::Level::WARN)
+        } else {
+            tracing::enabled!(target: "fsqlite.fallback_decision", tracing::Level::DEBUG)
+        };
+        if !trace_enabled {
+            return;
+        }
+
+        let mode = if certifying_mode {
+            "parity_cert"
+        } else {
+            "fallback_allowed"
+        };
+        let statement_fingerprint =
+            format!("vdbe-open-storage-cursor:{cursor_id}:{root_page}:{decision_reason}");
+        let statement_kind = "vdbe_open_cursor";
+        let backend_identity = format!("{backend_kind}:{mode}");
+        let fallback_boundary = format!("vdbe.open_cursor.{decision_reason}");
+        let source_touchpoint = "VdbeEngine::open_storage_cursor";
+        let first_failure_diag = format!(
+            "statement_kind={statement_kind}; fallback_boundary={fallback_boundary}; \
+             source_touchpoint={source_touchpoint}; decision_reason={decision_reason}; \
+             cursor_id={cursor_id}; root_page={root_page}; writable={writable}; detail={detail}"
+        );
+        let run_id = "(none)";
+        let scenario_id = "(none)";
+        let strict_mode = false;
+        if rejected {
+            tracing::warn!(
+                target: "fsqlite.fallback_decision",
+                trace_id,
+                run_id,
+                scenario_id,
+                statement_fingerprint = %statement_fingerprint,
+                statement_kind,
+                backend_identity = %backend_identity,
+                fallback_boundary = %fallback_boundary,
+                decision_reason,
+                certifying_mode,
+                strict_mode,
+                decision_outcome,
+                source_touchpoint,
+                first_failure_diag = %first_failure_diag,
+                "fallback decision telemetry"
+            );
+        } else {
+            tracing::debug!(
+                target: "fsqlite.fallback_decision",
+                trace_id,
+                run_id,
+                scenario_id,
+                statement_fingerprint = %statement_fingerprint,
+                statement_kind,
+                backend_identity = %backend_identity,
+                fallback_boundary = %fallback_boundary,
+                decision_reason,
+                certifying_mode,
+                strict_mode,
+                decision_outcome,
+                source_touchpoint,
+                first_failure_diag = %first_failure_diag,
+                "fallback decision telemetry"
+            );
+        }
+    }
+
     fn index_desc_flags_for_root(&self, root_page: i32) -> Vec<bool> {
         self.index_desc_flags_by_root_page
             .get(&root_page)
@@ -14744,6 +14824,8 @@ impl VdbeEngine {
         let _page_size_u32 = self.page_size.get();
         // bd-1xrs: storage_cursors_enabled check removed.
         // StorageCursor is now the ONLY cursor path.
+        let trace_id = self.execution_cx.trace_id();
+        let certifying_mode = self.reject_mem_fallback;
         let mode = if self.reject_mem_fallback {
             "parity_cert"
         } else {
@@ -14751,6 +14833,17 @@ impl VdbeEngine {
         };
 
         let Some(root_pgno) = PageNumber::new(root_page as u32) else {
+            Self::log_open_storage_cursor_fallback_decision(
+                trace_id,
+                certifying_mode,
+                cursor_id,
+                root_page,
+                writable,
+                "none",
+                "invalid_page_number",
+                "refused",
+                "invalid root page number",
+            );
             tracing::debug!(
                 cursor_id,
                 root_page,
@@ -14825,6 +14918,17 @@ impl VdbeEngine {
                             .is_some_and(|db| db.get_table(root_page).is_some());
                         if has_mem_table && !self.reject_mem_fallback && !writable {
                             mem_decision_reason = "pager_read_failed_mem_fallback";
+                            Self::log_open_storage_cursor_fallback_decision(
+                                trace_id,
+                                certifying_mode,
+                                cursor_id,
+                                root_page,
+                                writable,
+                                "mem",
+                                "pager_read_failed_mem_fallback",
+                                "vdbe_mempage_fallback_allowed",
+                                "pager read failed and MemDatabase owns read-only root page",
+                            );
                             tracing::debug!(
                                 cursor_id,
                                 page_id = root_page,
@@ -14839,6 +14943,17 @@ impl VdbeEngine {
                             // Break out of pager_block to fall through to MemDatabase path.
                             break 'pager_block;
                         }
+                        Self::log_open_storage_cursor_fallback_decision(
+                            trace_id,
+                            certifying_mode,
+                            cursor_id,
+                            root_page,
+                            writable,
+                            "txn",
+                            "pager_read_failed",
+                            "refused",
+                            "pager read failed before storage cursor dispatch",
+                        );
                         tracing::warn!(
                             cursor_id,
                             page_id = root_page,
@@ -14951,6 +15066,17 @@ impl VdbeEngine {
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
+                    Self::log_open_storage_cursor_fallback_decision(
+                        trace_id,
+                        certifying_mode,
+                        cursor_id,
+                        root_page,
+                        writable,
+                        "txn",
+                        "valid_btree_page",
+                        "real_backend_dispatch",
+                        "pager transaction opened a valid B-tree page",
+                    );
                     tracing::debug!(
                         cursor_id,
                         page_id = root_page,
@@ -15011,6 +15137,17 @@ impl VdbeEngine {
 
                     // Write the initialized page to pager.
                     if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
+                        Self::log_open_storage_cursor_fallback_decision(
+                            trace_id,
+                            certifying_mode,
+                            cursor_id,
+                            root_page,
+                            writable,
+                            "txn",
+                            "zero_page_init_failed",
+                            "refused",
+                            "failed to initialize writable root page in pager",
+                        );
                         tracing::warn!(
                             cursor_id,
                             page_id = root_page,
@@ -15077,6 +15214,17 @@ impl VdbeEngine {
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
+                    Self::log_open_storage_cursor_fallback_decision(
+                        trace_id,
+                        certifying_mode,
+                        cursor_id,
+                        root_page,
+                        writable,
+                        "txn",
+                        "zero_page_initialized",
+                        "real_backend_dispatch",
+                        "initialized empty root page through pager transaction",
+                    );
                     tracing::debug!(
                         cursor_id,
                         page_id = root_page,
@@ -15102,6 +15250,17 @@ impl VdbeEngine {
                     .is_some_and(|db| db.get_table(root_page).is_some());
                 if !has_mem_table || writable {
                     // No MemDatabase fallback available — refuse to open.
+                    Self::log_open_storage_cursor_fallback_decision(
+                        trace_id,
+                        certifying_mode,
+                        cursor_id,
+                        root_page,
+                        writable,
+                        "none",
+                        "invalid_page_no_mem_fallback",
+                        "refused",
+                        "invalid transaction-backed root page has no allowed MemDatabase fallback",
+                    );
                     tracing::warn!(
                         cursor_id,
                         page_id = root_page,
@@ -15119,6 +15278,17 @@ impl VdbeEngine {
                 }
                 // else: fall through to MemDatabase path
                 mem_decision_reason = "txn_page_invalid_mem_fallback";
+                Self::log_open_storage_cursor_fallback_decision(
+                    trace_id,
+                    certifying_mode,
+                    cursor_id,
+                    root_page,
+                    writable,
+                    "mem",
+                    "txn_page_invalid_mem_fallback",
+                    "vdbe_mempage_fallback_allowed",
+                    "invalid pager page can be served by read-only MemDatabase table",
+                );
                 tracing::debug!(
                     cursor_id,
                     page_id = root_page,
@@ -15134,6 +15304,17 @@ impl VdbeEngine {
 
         // bd-2ttd8.1: Parity-certification mode — reject MemPageStore fallback.
         if self.reject_mem_fallback {
+            Self::log_open_storage_cursor_fallback_decision(
+                trace_id,
+                certifying_mode,
+                cursor_id,
+                root_page,
+                writable,
+                "mem",
+                "parity_cert_rejection",
+                "vdbe_mempage_fallback_rejected",
+                "MemPageStore fallback rejected in parity-cert mode",
+            );
             tracing::warn!(
                 cursor_id,
                 page_id = root_page,
@@ -15225,6 +15406,17 @@ impl VdbeEngine {
             },
         );
         self.cursor_root_pages.insert(cursor_id, root_page);
+        Self::log_open_storage_cursor_fallback_decision(
+            trace_id,
+            certifying_mode,
+            cursor_id,
+            root_page,
+            writable,
+            "mem",
+            mem_decision_reason,
+            "vdbe_mempage_fallback_allowed",
+            "routed through transient MemPageStore fallback",
+        );
         tracing::debug!(
             cursor_id,
             page_id = root_page,

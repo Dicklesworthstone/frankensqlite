@@ -11282,6 +11282,122 @@ impl Connection {
         "insert_select_row_by_row_fallback",
     ];
 
+    #[must_use]
+    fn fallback_boundary_id(statement_kind: &'static str, decision_reason: &'static str) -> String {
+        format!("conn.{statement_kind}.{decision_reason}")
+    }
+
+    #[must_use]
+    fn fallback_statement_fingerprint(
+        statement_kind: &'static str,
+        decision_reason: &'static str,
+    ) -> String {
+        format!(
+            "{:016x}",
+            Self::sql_hash(&format!("fallback:{statement_kind}:{decision_reason}"))
+        )
+    }
+
+    #[must_use]
+    fn fallback_source_touchpoint(
+        source_context: &'static str,
+        statement_kind: &'static str,
+        decision_reason: &'static str,
+    ) -> String {
+        format!("{source_context}:{statement_kind}:{decision_reason}")
+    }
+
+    #[must_use]
+    fn fallback_first_failure_diag(
+        statement_kind: &'static str,
+        fallback_boundary: &str,
+        decision_reason: &'static str,
+        source_touchpoint: &str,
+    ) -> String {
+        format!(
+            "statement_kind={statement_kind}; fallback_boundary={fallback_boundary}; \
+             source_touchpoint={source_touchpoint}; decision_reason={decision_reason}"
+        )
+    }
+
+    #[must_use]
+    fn fallback_decision_outcome(
+        decision_reason: &'static str,
+        certifying_mode: bool,
+        strict_mode: bool,
+    ) -> &'static str {
+        if certifying_mode && strict_mode {
+            "denied"
+        } else if decision_reason == "time_travel_snapshot" {
+            "intentional_time_travel_snapshot"
+        } else {
+            "allowed_compatibility_fallback"
+        }
+    }
+
+    fn log_fallback_decision_event(
+        &self,
+        statement_kind: &'static str,
+        decision_reason: &'static str,
+        source_context: &'static str,
+    ) -> (&'static str, String) {
+        let certifying_mode = *self.reject_mem_fallback.borrow();
+        let strict_mode = *self.reject_mem_fallback_strict.borrow();
+        let decision_outcome =
+            Self::fallback_decision_outcome(decision_reason, certifying_mode, strict_mode);
+        let fallback_boundary = Self::fallback_boundary_id(statement_kind, decision_reason);
+        let source_touchpoint =
+            Self::fallback_source_touchpoint(source_context, statement_kind, decision_reason);
+        let first_failure_diag = Self::fallback_first_failure_diag(
+            statement_kind,
+            fallback_boundary.as_str(),
+            decision_reason,
+            source_touchpoint.as_str(),
+        );
+        let statement_fingerprint =
+            Self::fallback_statement_fingerprint(statement_kind, decision_reason);
+        let backend_identity = self.backend_identity();
+        let (run_id, scenario_id) = statement_reuse_log_context_from_env();
+        if decision_outcome == "denied" {
+            tracing::warn!(
+                target: "fsqlite.fallback_decision",
+                trace_id = self.root_cx.trace_id(),
+                run_id = %run_id.as_str(),
+                scenario_id = %scenario_id.as_str(),
+                statement_fingerprint = %statement_fingerprint,
+                statement_kind,
+                backend_identity = %backend_identity,
+                fallback_boundary = %fallback_boundary,
+                decision_reason,
+                certifying_mode,
+                strict_mode,
+                decision_outcome,
+                source_touchpoint = %source_touchpoint,
+                first_failure_diag = %first_failure_diag,
+                "fallback decision telemetry"
+            );
+        } else {
+            tracing::debug!(
+                target: "fsqlite.fallback_decision",
+                trace_id = self.root_cx.trace_id(),
+                run_id = %run_id.as_str(),
+                scenario_id = %scenario_id.as_str(),
+                statement_fingerprint = %statement_fingerprint,
+                statement_kind,
+                backend_identity = %backend_identity,
+                fallback_boundary = %fallback_boundary,
+                decision_reason,
+                certifying_mode,
+                strict_mode,
+                decision_outcome,
+                source_touchpoint = %source_touchpoint,
+                first_failure_diag = %first_failure_diag,
+                "fallback decision telemetry"
+            );
+        }
+        (decision_outcome, first_failure_diag)
+    }
+
     fn log_mem_execution_fallback(
         &self,
         statement_kind: &'static str,
@@ -11290,6 +11406,11 @@ impl Connection {
         let mode = self.backend_mode_label();
         let reject_mem = *self.reject_mem_fallback.borrow();
         let strict_reject = *self.reject_mem_fallback_strict.borrow();
+        let (decision_outcome, first_failure_diag) = self.log_fallback_decision_event(
+            statement_kind,
+            decision_reason,
+            "execute_statement_dispatch",
+        );
         if reject_mem {
             if strict_reject {
                 tracing::warn!(
@@ -11302,7 +11423,10 @@ impl Connection {
                     "execute_statement_dispatch: using in-memory fallback path while parity-cert mode is enabled"
                 );
                 return Err(FrankenError::not_implemented(format!(
-                    "in-memory fallback disabled in strict parity-cert mode: statement_kind={statement_kind}, decision_reason={decision_reason}"
+                    "in-memory fallback disabled in strict parity-cert mode: \
+                     statement_kind={statement_kind}, decision_reason={decision_reason}, \
+                     decision_outcome={decision_outcome}, \
+                     first_failure_diag={first_failure_diag}"
                 )));
             }
             // Non-strict parity-cert: known-benign fallbacks log at DEBUG to
@@ -11351,8 +11475,16 @@ impl Connection {
     ) -> Result<MemFallbackRejectionOverrideGuard<'_>> {
         let previous_reject = *self.reject_mem_fallback.borrow();
         if previous_reject && *self.reject_mem_fallback_strict.borrow() {
+            let (decision_outcome, first_failure_diag) = self.log_fallback_decision_event(
+                statement_kind,
+                decision_reason,
+                "internal_mem_fallback_guard",
+            );
             return Err(FrankenError::not_implemented(format!(
-                "in-memory fallback disabled in strict parity-cert mode: statement_kind={statement_kind}, decision_reason={decision_reason}"
+                "in-memory fallback disabled in strict parity-cert mode: \
+                 statement_kind={statement_kind}, decision_reason={decision_reason}, \
+                 decision_outcome={decision_outcome}, \
+                 first_failure_diag={first_failure_diag}"
             )));
         }
         self.set_reject_mem_fallback(false);
