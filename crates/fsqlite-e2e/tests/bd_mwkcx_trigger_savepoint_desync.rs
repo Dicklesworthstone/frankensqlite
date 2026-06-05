@@ -26,9 +26,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use fsqlite::Connection;
+use fsqlite::{Connection, SqliteValue};
 
 const STRESS_DURATION: Duration = Duration::from_secs(2);
+
+fn sql_int(value: u64) -> SqliteValue {
+    SqliteValue::Integer(value as i64)
+}
 
 fn test_tmpdir() -> tempfile::TempDir {
     tempfile::tempdir_in(std::env::temp_dir())
@@ -39,8 +43,7 @@ fn test_tmpdir() -> tempfile::TempDir {
 // ─── T1: Basic trigger + savepoint + rollback ──────────────────────
 
 #[test]
-#[ignore = "bd-mwkcx: CONFIRMED BUG — INSERT returns Busy inside savepoint on in-memory single-connection DB with trigger"]
-fn t1_trigger_savepoint_rollback_basic() {
+fn t1_trigger_savepoint_rollback_basic() -> Result<(), String> {
     let conn = Connection::open(":memory:").expect("open");
 
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER)")
@@ -65,19 +68,18 @@ fn t1_trigger_savepoint_rollback_basic() {
     // Savepoint → trigger → rollback
     for round in 0..20 {
         conn.execute("SAVEPOINT sp").expect("savepoint");
-        let insert_result = conn.execute(&format!(
-            "INSERT INTO orders VALUES ({}, {})",
-            100 + round,
-            round * 10
-        ));
+        let insert_result = conn.execute_with_params(
+            "INSERT INTO orders VALUES (?1, ?2)",
+            &[sql_int(100 + round), sql_int(round * 10)],
+        );
         if let Err(e) = insert_result {
             // Busy on in-memory single-connection is a trigger+savepoint bug
             conn.execute("ROLLBACK TO sp").ok();
             conn.execute("RELEASE sp").ok();
-            panic!(
+            return Err(format!(
                 "BUG CONFIRMED: round {round}: INSERT inside savepoint returned {e} \
                  on in-memory single-connection DB (trigger+savepoint desync)"
-            );
+            ));
         }
 
         // Verify trigger fired
@@ -92,6 +94,7 @@ fn t1_trigger_savepoint_rollback_basic() {
         assert_eq!(after_audit, 1, "round {round}: audit should be back to 1");
     }
     eprintln!("T1: 20 rounds of trigger+savepoint+rollback — correct");
+    Ok(())
 }
 
 // ─── T2: Nested triggers + nested savepoints + rollback ────────────
@@ -164,11 +167,11 @@ fn t2_nested_triggers_nested_savepoints() {
 #[test]
 fn t3_concurrent_trigger_contention() {
     let dir = test_tmpdir();
-    let db_path = dir.path().join("t3.db");
-    let path_str = db_path.to_str().expect("path");
+    let database_file = dir.path().join("t3.db");
+    let database_name = database_file.to_str().expect("database path");
 
     {
-        let conn = Connection::open(path_str).expect("open");
+        let conn = Connection::open(database_name).expect("open");
         conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("create events");
         conn.execute("CREATE TABLE event_log (event_id INTEGER, ts TEXT)")
@@ -185,11 +188,11 @@ fn t3_concurrent_trigger_contention() {
 
     let threads: Vec<_> = (0..4)
         .map(|tid| {
-            let path = path_str.to_string();
+            let database_name_for_thread = database_name.to_string();
             let s = Arc::clone(&stop);
             let tc = Arc::clone(&total_committed);
             std::thread::spawn(move || {
-                let conn = Connection::open(&path).expect("open");
+                let conn = Connection::open(&database_name_for_thread).expect("open");
                 let mut seq = 0u64;
                 let mut committed = 0u64;
                 while !s.load(Ordering::Relaxed) {
@@ -198,9 +201,13 @@ fn t3_concurrent_trigger_contention() {
                         // Use savepoint inside transaction
                         if conn.execute("SAVEPOINT sp").is_ok() {
                             if conn
-                                .execute(&format!(
-                                    "INSERT INTO events VALUES ({id}, 'event_{tid}_{seq}')"
-                                ))
+                                .execute_with_params(
+                                    "INSERT INTO events VALUES (?1, ?2)",
+                                    &[
+                                        sql_int(id),
+                                        SqliteValue::Text(format!("event_{tid}_{seq}").into()),
+                                    ],
+                                )
                                 .is_ok()
                             {
                                 // Randomly rollback 1/4 of the time
@@ -234,7 +241,7 @@ fn t3_concurrent_trigger_contention() {
     let committed = total_committed.load(Ordering::Relaxed);
 
     // Verify data integrity
-    let verify = Connection::open(path_str).expect("verify");
+    let verify = Connection::open(database_name).expect("verify");
     let events = verify.query("SELECT * FROM events").expect("events").len();
     let log_entries = verify.query("SELECT * FROM event_log").expect("log").len();
 
@@ -312,11 +319,11 @@ fn t4_before_after_trigger_savepoint() {
 #[test]
 fn t5_concurrent_trigger_savepoint_storm() {
     let dir = test_tmpdir();
-    let db_path = dir.path().join("t5.db");
-    let path_str = db_path.to_str().expect("path");
+    let database_file = dir.path().join("t5.db");
+    let database_name = database_file.to_str().expect("database path");
 
     {
-        let conn = Connection::open(path_str).expect("open");
+        let conn = Connection::open(database_name).expect("open");
         conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER)")
             .expect("create accounts");
         conn.execute("CREATE TABLE transfers (id INTEGER PRIMARY KEY, from_id INTEGER, to_id INTEGER, amount INTEGER)")
@@ -332,7 +339,7 @@ fn t5_concurrent_trigger_savepoint_storm() {
 
         conn.execute("BEGIN").expect("begin");
         for i in 1..=10 {
-            conn.execute(&format!("INSERT INTO accounts VALUES ({i}, 1000)"))
+            conn.execute_with_params("INSERT INTO accounts VALUES (?1, 1000)", &[sql_int(i)])
                 .expect("seed");
         }
         conn.execute("COMMIT").expect("commit");
@@ -343,11 +350,11 @@ fn t5_concurrent_trigger_savepoint_storm() {
 
     let threads: Vec<_> = (0..4)
         .map(|tid| {
-            let path = path_str.to_string();
+            let database_name_for_thread = database_name.to_string();
             let s = Arc::clone(&stop);
             let tt = Arc::clone(&total_transfers);
             std::thread::spawn(move || {
-                let conn = Connection::open(&path).expect("open");
+                let conn = Connection::open(&database_name_for_thread).expect("open");
                 let mut local_transfers = 0u64;
                 let mut next_id = tid as u64 * 1_000_000;
                 while !s.load(Ordering::Relaxed) {
@@ -361,15 +368,17 @@ fn t5_concurrent_trigger_savepoint_storm() {
                     if conn.execute("BEGIN").is_ok() {
                         conn.execute("SAVEPOINT sp").ok();
                         if conn
-                            .execute(&format!(
-                                "INSERT INTO transfers VALUES ({next_id}, {from}, {to}, 10)"
-                            ))
+                            .execute_with_params(
+                                "INSERT INTO transfers VALUES (?1, ?2, ?3, 10)",
+                                &[sql_int(next_id), sql_int(from), sql_int(to)],
+                            )
                             .is_ok()
                         {
                             // Check if balance would go negative
-                            if let Ok(rows) = conn
-                                .query(&format!("SELECT balance FROM accounts WHERE id = {from}"))
-                            {
+                            if let Ok(rows) = conn.query_with_params(
+                                "SELECT balance FROM accounts WHERE id = ?1",
+                                &[sql_int(from)],
+                            ) {
                                 if rows.is_empty() {
                                     conn.execute("ROLLBACK TO sp").ok();
                                 }
@@ -400,7 +409,7 @@ fn t5_concurrent_trigger_savepoint_storm() {
     let transfers = total_transfers.load(Ordering::Relaxed);
 
     // Verify: total balance should still be 10 * 1000 = 10000
-    let verify = Connection::open(path_str).expect("verify");
+    let verify = Connection::open(database_name).expect("verify");
     let rows = verify
         .query("SELECT SUM(balance) FROM accounts")
         .expect("sum");

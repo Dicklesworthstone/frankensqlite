@@ -186,10 +186,10 @@ use fsqlite_mvcc::{
     InProcessPageLockTable, MvccError, PreparedConcurrentCommit, SharedConcurrentHandle,
     SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEProcessConfig,
     SsiEProcessGate, SsiEProcessSnapshot, SsiEvidenceLedger, VersionStore, concurrent_abort,
-    concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_track_write_conflict_page,
-    finalize_prepared_concurrent_commit_with_ssi, flat_combining_metrics,
-    morsel_parallel_insert::MorselScheduler, prepare_concurrent_commit_fcw_only,
-    prepare_concurrent_commit_with_ssi, ssi_metrics_snapshot,
+    concurrent_commit_read_only, concurrent_rollback_to_savepoint, concurrent_savepoint,
+    concurrent_track_write_conflict_page, finalize_prepared_concurrent_commit_with_ssi,
+    flat_combining_metrics, morsel_parallel_insert::MorselScheduler,
+    prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi, ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 #[cfg(feature = "diagnostic-pragmas")]
@@ -41361,8 +41361,10 @@ impl Connection {
                 return;
             };
             let snapshot = {
-                let handle = shared_handle.lock();
-                Self::capture_ssi_snapshot(&handle)
+                let mut handle = shared_handle.lock();
+                let snapshot = Self::capture_ssi_snapshot(&handle);
+                concurrent_commit_read_only(&mut handle, &self.concurrent_lock_table, session_id);
+                snapshot
             };
             self.clear_cached_concurrent_handle();
             registry.recycle_handle(shared_handle);

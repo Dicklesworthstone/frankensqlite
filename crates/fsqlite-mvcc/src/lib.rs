@@ -374,9 +374,9 @@ mod metadata_publication_contract_tests {
 pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentPageState, ConcurrentRegistry, ConcurrentSavepoint, FcwResult,
     MAX_CONCURRENT_WRITERS, PreparedConcurrentCommit, SharedConcurrentHandle, SsiResult,
-    concurrent_abort, concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
-    concurrent_free_page, concurrent_has_page_state, concurrent_is_metadata_exempt,
-    concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+    concurrent_abort, concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
+    concurrent_commit_with_ssi, concurrent_free_page, concurrent_has_page_state,
+    concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt, concurrent_page_is_freed,
     concurrent_page_is_synthetic_conflict_only, concurrent_page_read_state,
     concurrent_page_read_status, concurrent_page_state, concurrent_prepare_write_page,
     concurrent_read_page, concurrent_record_metadata_read, concurrent_restore_page_state,

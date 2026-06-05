@@ -3601,6 +3601,27 @@ pub fn concurrent_abort(
     handle.mark_aborted();
 }
 
+/// Finalize a concurrent transaction that has no remaining staged writes.
+///
+/// `ROLLBACK TO` deliberately preserves page locks for the outer transaction
+/// window.  If those writes are all rolled back, the commit path may become
+/// logically read-only while still owning locks.  This helper releases that
+/// preserved lock surface and marks the handle committed.
+pub fn concurrent_commit_read_only(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+) {
+    debug_assert!(
+        handle.write_set_pages().is_empty(),
+        "read-only concurrent commit cannot finalize tracked write/conflict pages"
+    );
+    if let Some(txn_id) = TxnId::new(session_id) {
+        release_tracked_page_locks(lock_table, handle, txn_id);
+    }
+    handle.mark_committed();
+}
+
 /// Create a savepoint within a concurrent transaction.
 ///
 /// Captures the current write set state so it can be restored on
@@ -3733,16 +3754,16 @@ mod tests {
     use super::{
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
         ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort,
-        concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
-        concurrent_free_page, concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt,
-        concurrent_page_is_freed, concurrent_page_is_synthetic_conflict_only,
-        concurrent_page_read_status, concurrent_page_state, concurrent_prepare_write_page,
-        concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
-        concurrent_savepoint, concurrent_stage_prepared_write_marker,
-        concurrent_track_write_conflict_page, concurrent_write_metadata_page,
-        concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
-        prepare_concurrent_commit_with_ssi, same_txn_identity, summarize_witness_keys,
-        validate_first_committer_wins, witness_is_page,
+        concurrent_clear_page_state, concurrent_commit, concurrent_commit_read_only,
+        concurrent_commit_with_ssi, concurrent_free_page, concurrent_is_metadata_exempt,
+        concurrent_mark_metadata_exempt, concurrent_page_is_freed,
+        concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
+        concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
+        concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
+        concurrent_stage_prepared_write_marker, concurrent_track_write_conflict_page,
+        concurrent_write_metadata_page, concurrent_write_page,
+        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
+        same_txn_identity, summarize_witness_keys, validate_first_committer_wins, witness_is_page,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -4986,6 +5007,39 @@ mod tests {
         let mut handle2 = registry.get_mut(s2).expect("handle 2");
         concurrent_write_page(&mut handle2, &lock_table, s2, test_page(6), test_data())
             .expect("savepoint-preserved lock should be available after abort");
+    }
+
+    #[test]
+    fn test_read_only_commit_releases_savepoint_preserved_lock() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            let savepoint = concurrent_savepoint(&handle, "sp1").unwrap();
+            concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+            assert!(
+                handle.write_set_pages().is_empty(),
+                "ROLLBACK TO removed every staged write/conflict page"
+            );
+            assert!(
+                handle.held_locks().contains(&test_page(6)),
+                "ROLLBACK TO keeps post-savepoint page locks until transaction end"
+            );
+            concurrent_commit_read_only(&mut handle, &lock_table, s1);
+            assert!(!handle.is_active());
+        }
+
+        let s2 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 2");
+        let mut handle2 = registry.get_mut(s2).expect("handle 2");
+        concurrent_write_page(&mut handle2, &lock_table, s2, test_page(6), test_data())
+            .expect("savepoint-preserved lock should be available after read-only commit");
     }
 
     // -----------------------------------------------------------------------
