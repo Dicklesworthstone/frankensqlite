@@ -1,0 +1,618 @@
+  [2m2026-06-05T13:06:32.825215Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ts2 at ubuntu@192.168.1.124 (28 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:33.494207Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankensqlite (hash: 230bef104ad04c09)[0m
+    [2;3mat[0m rch/src/hook.rs:5987 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:33.494464Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 28 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6009 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:35.153778Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ts2...[0m
+    [2;3mat[0m rch/src/hook.rs:6039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:35.153940Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 3 pattern(s) from .rchignore (total: 39)[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:35.153972Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:35.807225Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 653ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:35.807874Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:36.169767Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 361ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:36.170003Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:36.530130Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 359ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:36.531200Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:36.898984Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 367ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:36.899363Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-c-api -> /data/projects/frankensqlite/crates/fsqlite-c-api on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:37.257031Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 357ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:37.257728Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-cli -> /data/projects/frankensqlite/crates/fsqlite-cli on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:37.603088Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 345ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:37.603276Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:37.953149Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 349ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:37.953454Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-e2e -> /data/projects/frankensqlite/crates/fsqlite-e2e on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:38.311929Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 358ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:38.312698Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:38.680698Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 367ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:38.680901Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts3 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts3 on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:39.040768Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 359ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:39.041221Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:39.418024Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 376ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:39.418727Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:39.795452Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 376ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:39.795695Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:40.147017Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 351ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:40.147185Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:40.505132Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 357ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:40.506038Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:40.875459Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 369ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:40.875812Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-session -> /data/projects/frankensqlite/crates/fsqlite-ext-session on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:41.236281Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 359ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:41.236828Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:41.587168Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 350ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:41.587538Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-harness -> /data/projects/frankensqlite/crates/fsqlite-harness on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:41.952813Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 365ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:41.952965Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:42.311121Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 358ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:42.311590Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:42.679202Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 367ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:42.680039Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:43.061100Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 381ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:43.061340Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:43.413324Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 351ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:43.413489Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:43.759078Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 345ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:43.759691Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:44.124208Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 364ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:44.124440Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:44.476160Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 351ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:44.476351Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:44.827063Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 350ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:44.827254Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:45.181956Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 354ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:45.182275Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wasm -> /data/projects/frankensqlite/crates/fsqlite-wasm on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1400 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:45.530799Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 348ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1469 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:45.530958Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 8177 files, 283388 bytes in 10347ms[0m
+    [2;3mat[0m rch/src/hook.rs:6202 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:49.685552Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: env cargo run -p fsqlite-e2e --profile release-perf --bin realdb-e2e -- bench --engine sqlite3 --db frankensqlite --preset mixed_read_write --concurrency 4 --placement-profile adversarial_cross_node --storage-profile file_backed --warmup 0 --repeat 1 --output-jsonl /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/results.jsonl --output-md /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/summary.md[0m
+    [2;3mat[0m rch/src/hook.rs:6240 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:06:49.686016Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_bd_db300_8_3_2_bd-db300.8.3.2-20260605T122244Z-3555737 -> /data/projects/frankensqlite/.rch-target-ts2-job-29874297577144373-1780664795153764582-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded thiserror-impl v2.0.18
+  Downloaded thread_local v1.1.9
+  Downloaded tempfile v3.27.0
+  Downloaded aead v0.5.2
+  Downloaded thiserror v2.0.18
+  Downloaded toml v0.8.23
+  Downloaded virtue-next v0.1.3
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded toml_datetime v0.6.11
+  Downloaded winnow v0.7.15
+  Downloaded universal-hash v0.5.1
+  Downloaded tracing-serde v0.2.0
+  Downloaded opaque-debug v0.3.1
+  Downloaded os-thread-local v0.1.3
+  Downloaded toml_write v0.1.2
+  Downloaded curve25519-dalek-derive v0.1.1
+  Downloaded unty-next v0.1.1
+  Downloaded arrayref v0.3.9
+  Downloaded crypto-common v0.2.1
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded array-macro v2.1.8
+  Downloaded cfg-if v1.0.4
+  Downloaded cfg_aliases v0.2.1
+  Downloaded crossbeam-queue v0.3.12
+  Downloaded fallible-streaming-iterator v0.1.9
+  Downloaded block-buffer v0.10.4
+  Downloaded once_cell v1.21.4
+  Downloaded faa_array_queue v0.1.2
+  Downloaded futures-core v0.3.32
+  Downloaded num-traits v0.2.19
+  Downloaded cpufeatures v0.2.17
+  Downloaded errno v0.3.14
+  Downloaded block-buffer v0.12.0
+  Downloaded crypto-common v0.1.7
+  Downloaded equivalent v1.0.2
+  Downloaded bincode_derive-next v2.1.0
+  Downloaded crc32c v0.6.8
+  Downloaded futures-io v0.3.32
+  Downloaded generic-array v0.14.7
+  Downloaded cpufeatures v0.3.0
+  Downloaded pollster v0.4.0
+  Downloaded ctutils v0.4.2
+  Downloaded version_check v0.9.5
+  Downloaded zeroize v1.8.2
+  Downloaded lazy_static v1.5.0
+  Downloaded memoffset v0.9.1
+  Downloaded tracing-log v0.2.0
+  Downloaded base64ct v1.8.3
+  Downloaded xxhash-rust v0.8.15
+  Downloaded arrayvec v0.7.6
+  Downloaded poly1305 v0.8.0
+  Downloaded dashmap v6.1.0
+  Downloaded digest v0.10.7
+  Downloaded ed25519 v2.2.3
+  Downloaded either v1.15.0
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded argon2 v0.5.3
+  Downloaded digest v0.11.2
+  Downloaded foldhash v0.2.0
+  Downloaded franken-evidence v0.3.1
+  Downloaded autocfg v1.5.0
+  Downloaded cipher v0.4.4
+  Downloaded fastrand v2.4.1
+  Downloaded fallible-iterator v0.3.0
+  Downloaded zmij v1.0.21
+  Downloaded constant_time_eq v0.4.2
+  Downloaded serde_spanned v0.6.9
+  Downloaded franken-decision v0.3.2
+  Downloaded franken-kernel v0.3.1
+  Downloaded tracing-attributes v0.1.31
+  Downloaded tracing-core v0.1.36
+  Downloaded const-oid v0.9.6
+  Downloaded bitflags v2.11.1
+  Downloaded cmov v0.5.3
+  Downloaded crc32fast v1.5.0
+  Downloaded data-encoding v2.10.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded getrandom v0.2.17
+  Downloaded ahash v0.8.12
+  Downloaded anyhow v1.0.102
+  Downloaded iana-time-zone v0.1.65
+  Downloaded ucd-trie v0.1.7
+  Downloaded unicode-ident v1.0.24
+  Downloaded chacha20 v0.9.1
+  Downloaded rustc_version v0.4.1
+  Downloaded blake2 v0.10.6
+  Downloaded const-oid v0.10.2
+  Downloaded getrandom v0.4.2
+  Downloaded peril v0.4.2
+  Downloaded futures-lite v2.6.1
+  Downloaded getrandom v0.3.4
+  Downloaded hex v0.4.3
+  Downloaded chacha20poly1305 v0.10.1
+  Downloaded bytes v1.11.1
+  Downloaded allocator-api2 v0.2.21
+  Downloaded bincode-next v2.1.0
+  Downloaded base64 v0.22.1
+  Downloaded toml_edit v0.22.27
+  Downloaded bumpalo v3.20.2
+  Downloaded cc v1.2.60
+  Downloaded ed25519-dalek v2.2.0
+  Downloaded typenum v1.20.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded der v0.7.10
+  Downloaded parking v2.2.1
+  Downloaded rand_chacha v0.3.1
+  Downloaded itertools v0.10.5
+  Downloaded matchers v0.2.0
+  Downloaded pkcs8 v0.10.2
+  Downloaded pkg-config v0.3.33
+  Downloaded pem-rfc7468 v0.7.0
+  Downloaded scopeguard v1.2.0
+  Downloaded hashbrown v0.16.1
+  Downloaded hkdf v0.12.4
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded aho-corasick v1.1.4
+  Downloaded vcpkg v0.2.15
+  Downloaded blake3 v1.8.4
+  Downloaded chrono v0.4.44
+  Downloaded curve25519-dalek v4.1.3
+  Downloaded zerocopy v0.8.48
+  Downloaded tracing v0.1.44
+  Downloaded subtle v2.6.1
+  Downloaded inout v0.1.4
+  Downloaded libc v0.2.185
+  Downloaded sha1 v0.11.0
+  Downloaded shlex v1.3.0
+  Downloaded password-hash v0.5.0
+  Downloaded signature v2.2.0
+  Downloaded prost-derive v0.14.3
+  Downloaded sha2 v0.10.9
+  Downloaded spki v0.7.3
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded simdutf8 v0.1.5
+  Downloaded itoa v1.0.18
+  Downloaded lock_api v0.4.14
+  Downloaded lru v0.16.4
+  Downloaded pin-project-lite v0.2.17
+  Downloaded rand_core v0.6.4
+  Downloaded nkeys v0.4.5
+  Downloaded quote v1.0.45
+  Downloaded rmp v0.8.15
+  Downloaded rmp-serde v1.3.1
+  Downloaded smallvec v1.15.1
+  Downloaded semver v1.0.28
+  Downloaded signal-hook v0.4.4
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded polling v3.11.0
+  Downloaded parking_lot_core v0.9.12
+  Downloaded slab v0.4.12
+  Downloaded hashlink v0.9.1
+  Downloaded hmac v0.12.1
+  Downloaded hmac v0.13.0
+  Downloaded pin-project-internal v1.1.11
+  Downloaded prost v0.14.3
+  Downloaded serde_derive v1.0.228
+  Downloaded sha2 v0.11.0
+  Downloaded serde_core v1.0.228
+  Downloaded socket2 v0.6.3
+  Downloaded parking_lot v0.12.5
+  Downloaded asupersync v0.3.2
+  Downloaded pin-project v1.1.11
+  Downloaded proc-macro2 v1.0.106
+  Downloaded log v0.4.29
+  Downloaded json5 v1.3.1
+  Downloaded sharded-slab v0.1.7
+  Downloaded hybrid-array v0.4.10
+  Downloaded serde v1.0.228
+  Downloaded memchr v2.8.0
+  Downloaded rand v0.8.6
+  Downloaded hashbrown v0.14.5
+  Downloaded indexmap v2.14.0
+  Downloaded signatory v0.27.1
+  Downloaded io-uring v0.7.12
+  Downloaded rusqlite v0.32.1
+  Downloaded serde_json v1.0.149
+  Downloaded hashbrown v0.17.0
+  Downloaded syn v2.0.117
+  Downloaded nix v0.29.0
+  Downloaded regex-syntax v0.8.10
+  Downloaded nix v0.31.2
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded libsqlite3-sys v0.30.1
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.0
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling subtle v2.6.1
+   Compiling allocator-api2 v0.2.21
+   Compiling autocfg v1.5.0
+   Compiling once_cell v1.21.4
+   Compiling zerocopy v0.8.48
+   Compiling foldhash v0.2.0
+   Compiling equivalent v1.0.2
+   Compiling semver v1.0.28
+   Compiling cpufeatures v0.2.17
+   Compiling base64ct v1.8.3
+   Compiling zeroize v1.8.2
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg_aliases v0.2.1
+   Compiling zmij v1.0.21
+   Compiling const-oid v0.9.6
+   Compiling smallvec v1.15.1
+   Compiling cmov v0.5.3
+   Compiling serde_json v1.0.149
+   Compiling rustix v1.1.4
+   Compiling memchr v2.8.0
+   Compiling const-oid v0.10.2
+   Compiling parking_lot_core v0.9.12
+   Compiling itoa v1.0.18
+   Compiling anyhow v1.0.102
+   Compiling scopeguard v1.2.0
+   Compiling getrandom v0.3.4
+   Compiling cpufeatures v0.3.0
+   Compiling pin-project-lite v0.2.17
+   Compiling either v1.15.0
+   Compiling linux-raw-sys v0.12.1
+   Compiling log v0.4.29
+   Compiling thiserror v2.0.18
+   Compiling virtue-next v0.1.3
+   Compiling getrandom v0.4.2
+   Compiling crc32fast v1.5.0
+   Compiling fastrand v2.4.1
+   Compiling signal-hook v0.4.4
+   Compiling io-uring v0.7.12
+   Compiling bytes v1.11.1
+   Compiling parking v2.2.1
+   Compiling futures-core v0.3.32
+   Compiling futures-io v0.3.32
+   Compiling data-encoding v2.10.0
+   Compiling unty-next v0.1.1
+   Compiling array-macro v2.1.8
+   Compiling hex v0.4.3
+   Compiling slab v0.4.12
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.6
+   Compiling arrayref v0.3.9
+   Compiling base64 v0.22.1
+   Compiling xxhash-rust v0.8.15
+   Compiling simdutf8 v0.1.5
+   Compiling iana-time-zone v0.1.65
+   Compiling opaque-debug v0.3.1
+   Compiling pollster v0.4.0
+   Compiling bumpalo v3.20.2
+   Compiling ucd-trie v0.1.7
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.33
+   Compiling lazy_static v1.5.0
+   Compiling regex-syntax v0.8.10
+   Compiling toml_write v0.1.2
+   Compiling winnow v0.7.15
+   Compiling fallible-iterator v0.3.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling thread_local v1.1.9
+   Compiling nu-ansi-term v0.50.3
+   Compiling lock_api v0.4.14
+   Compiling generic-array v0.14.7
+   Compiling tracing-core v0.1.36
+   Compiling nix v0.31.2
+   Compiling ahash v0.8.12
+   Compiling nix v0.29.0
+   Compiling sharded-slab v0.1.7
+   Compiling num-traits v0.2.19
+   Compiling memoffset v0.9.1
+   Compiling rustc_version v0.4.1
+   Compiling hashbrown v0.17.0
+   Compiling hashbrown v0.16.1
+   Compiling futures-lite v2.6.1
+   Compiling cc v1.2.60
+   Compiling pem-rfc7468 v0.7.0
+   Compiling bincode_derive-next v2.1.0
+   Compiling ctutils v0.4.2
+   Compiling hybrid-array v0.4.10
+   Compiling curve25519-dalek v4.1.3
+   Compiling itertools v0.10.5
+   Compiling crc32c v0.6.8
+   Compiling der v0.7.10
+   Compiling tracing-log v0.2.0
+   Compiling syn v2.0.117
+   Compiling crypto-common v0.2.1
+   Compiling block-buffer v0.12.0
+   Compiling crossbeam-epoch v0.9.18
+   Compiling crossbeam-queue v0.3.12
+   Compiling indexmap v2.14.0
+   Compiling lru v0.16.4
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling crossbeam-deque v0.8.6
+   Compiling regex-automata v0.4.14
+   Compiling blake3 v1.8.4
+   Compiling libsqlite3-sys v0.30.1
+   Compiling rmp v0.8.15
+   Compiling chrono v0.4.44
+   Compiling digest v0.11.2
+   Compiling spki v0.7.3
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling os-thread-local v0.1.3
+   Compiling socket2 v0.6.3
+   Compiling sha1 v0.11.0
+   Compiling sha2 v0.11.0
+   Compiling hmac v0.13.0
+   Compiling peril v0.4.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand_core v0.6.4
+   Compiling pkcs8 v0.10.2
+   Compiling parking_lot v0.12.5
+   Compiling faa_array_queue v0.1.2
+   Compiling crypto-common v0.1.7
+   Compiling password-hash v0.5.0
+   Compiling digest v0.10.7
+   Compiling universal-hash v0.5.1
+   Compiling cipher v0.4.4
+   Compiling aead v0.5.2
+   Compiling poly1305 v0.8.0
+   Compiling signature v2.2.0
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling blake2 v0.10.6
+   Compiling chacha20 v0.9.1
+   Compiling ed25519 v2.2.3
+   Compiling signatory v0.27.1
+   Compiling hkdf v0.12.4
+   Compiling chacha20poly1305 v0.10.1
+   Compiling argon2 v0.5.3
+   Compiling bitflags v2.11.1
+   Compiling matchers v0.2.0
+   Compiling serde_derive v1.0.228
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling thiserror-impl v2.0.18
+   Compiling prost-derive v0.14.3
+   Compiling tracing-attributes v0.1.31
+   Compiling pin-project-internal v1.1.11
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling pin-project v1.1.11
+   Compiling rand v0.8.6
+   Compiling tracing v0.1.44
+   Compiling fsqlite-error v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-error)
+   Compiling prost v0.14.3
+   Compiling ed25519-dalek v2.2.0
+   Compiling nkeys v0.4.5
+   Compiling polling v3.11.0
+   Compiling tempfile v3.27.0
+   Compiling franken-kernel v0.3.1
+   Compiling franken-evidence v0.3.1
+   Compiling rmp-serde v1.3.1
+   Compiling hashbrown v0.14.5
+   Compiling json5 v1.3.1
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling tracing-serde v0.2.0
+   Compiling bincode-next v2.1.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling toml_edit v0.22.27
+   Compiling franken-decision v0.3.2
+   Compiling dashmap v6.1.0
+   Compiling hashlink v0.9.1
+   Compiling asupersync v0.3.2
+   Compiling toml v0.8.23
+   Compiling rusqlite v0.32.1
+   Compiling fsqlite-types v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-types)
+   Compiling fsqlite-func v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-func)
+   Compiling fsqlite-observability v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-observability)
+   Compiling fsqlite-ast v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-ast)
+   Compiling fsqlite-vfs v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-vfs)
+   Compiling fsqlite-parser v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-parser)
+   Compiling fsqlite-ext-fts5 v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)
+   Compiling fsqlite-ext-misc v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)
+   Compiling fsqlite-ext-rtree v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)
+   Compiling fsqlite-ext-icu v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)
+   Compiling fsqlite-ext-json v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-ext-json)
+   Compiling fsqlite-wal v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-wal)
+   Compiling fsqlite-planner v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-planner)
+   Compiling fsqlite-pager v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-pager)
+   Compiling fsqlite-btree v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-btree)
+   Compiling fsqlite-mvcc v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-mvcc)
+   Compiling fsqlite-vdbe v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-vdbe)
+   Compiling fsqlite-core v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-core)
+   Compiling fsqlite v0.1.7 (/data/projects/frankensqlite/crates/fsqlite)
+   Compiling fsqlite-harness v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-harness)
+   Compiling fsqlite-e2e v0.1.7 (/data/projects/frankensqlite/crates/fsqlite-e2e)
+    Finished `release-perf` profile [optimized] target(s) in 6m 47s
+     Running `.rch-target-ts2-job-29874297577144373-1780664795153764582-0/release-perf/realdb-e2e bench --engine sqlite3 --db frankensqlite --preset mixed_read_write --concurrency 4 --placement-profile adversarial_cross_node --storage-profile file_backed --warmup 0 --repeat 1 --output-jsonl /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/results.jsonl --output-md /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/summary.md`
+{"benchmark_id":"sqlite3:mixed_read_write:frankensqlite:c4","engine":"sqlite3","workload":"mixed_read_write","fixture_id":"frankensqlite","concurrency":4,"methodology":{"version":"fsqlite-e2e.methodology.v1","warmup_iterations":0,"min_measurement_iterations":1,"measurement_time_secs":0,"primary_statistic":"median","tail_statistic":"p95","fresh_db_per_iteration":true,"identical_pragmas_enforced":true},"environment":{"capture_mode":"captured","os":"Linux 6.17.0-23-generic","arch":"x86_64","cpu_count":128,"cpu_model":"AMD Ryzen Threadripper PRO 5995WX 64-Cores","ram_bytes":265479249920,"rustc_version":"rustc 1.98.0-nightly (b354133fb 2026-06-03)","cargo_profile":"release","build_hygiene":{"authoritative_cargo_profile":"release-perf","matches_authoritative_profile":false,"opt_level":"unknown","debug_assertions":false,"panic_strategy":"abort","profile_lto":true,"profile_codegen_units":1,"profile_debug_symbols":true,"profile_strip":false}},"warmup_count":0,"measurement_count":1,"total_measurement_ms":109,"latency":{"min_ms":109.0,"max_ms":109.0,"mean_ms":109.0,"median_ms":109.0,"p95_ms":109.0,"p99_ms":109.0,"stddev_ms":0.0},"throughput":{"mean_ops_per_sec":2485.7094389359813,"median_ops_per_sec":2485.7094389359813,"peak_ops_per_sec":2485.7094389359813},"comparison":{"row_identity":{"row_id":"mixed_read_write_c4","fixture_id":"frankensqlite","workload":"mixed_read_write","concurrency":4,"mode_id":"sqlite_reference","build_profile_id":"release_perf","placement_profile_id":"adversarial_cross_node","run_id":"bench-1780665217428","source_revision":"d6e391274235b966c9da5f2bd1d668d3b6c072eb"},"provenance":{"retry_policy_id":"instrumented_busy_retry_v1","seed_policy_id":"fixed_seed_42","hardware_class_id":"linux_x86_64_many_core_numa","hardware_signature":"linux:x86_64:many_core_numa","beads_data_hash":"776d45e0774c84a33d71a373b9407e082d8360fe932235650e403bfb87204d3a"},"counter_schema":{"comparable":[{"counter_id":"measurement_iteration_count","unit":"count","aggregation":"per benchmark summary","semantics":"exact measurement iterations in this benchmark row","value":{"value_kind":"integer","value":1}},{"counter_id":"measurement_wall_time_total_ms","unit":"ms","aggregation":"sum across measurement iterations","semantics":"reported wall time spent in successful or failed measurement iterations","value":{"value_kind":"integer","value":109}},{"counter_id":"measurement_ops_total","unit":"ops","aggregation":"sum across measurement iterations","semantics":"successful logical operations executed during measurement","value":{"value_kind":"integer","value":200}},{"counter_id":"latency_median_ms","unit":"ms","aggregation":"median across measurement iterations","semantics":"median measurement iteration latency","value":{"value_kind":"float","value":109.0}},{"counter_id":"latency_p95_ms","unit":"ms","aggregation":"p95 across measurement iterations","semantics":"95th percentile measurement iteration latency","value":{"value_kind":"float","value":109.0}},{"counter_id":"latency_p99_ms","unit":"ms","aggregation":"p99 across measurement iterations","semantics":"99th percentile measurement iteration latency","value":{"value_kind":"float","value":109.0}},{"counter_id":"throughput_median_ops_per_sec","unit":"ops_per_sec","aggregation":"median across measurement iterations","semantics":"median measurement iteration throughput","value":{"value_kind":"float","value":2485.7094389359813}},{"counter_id":"throughput_peak_ops_per_sec","unit":"ops_per_sec","aggregation":"max across measurement iterations","semantics":"peak measurement iteration throughput","value":{"value_kind":"float","value":2485.7094389359813}},{"counter_id":"retry_total","unit":"count","aggregation":"sum across measurement iterations","semantics":"contention retries reported by the engine during measurement","value":{"value_kind":"integer","value":12}},{"counter_id":"abort_total","unit":"count","aggregation":"sum across measurement iterations","semantics":"transaction aborts reported by the engine during measurement","value":{"value_kind":"integer","value":12}}],"mode_specific":[]},"artifact_layout":{"artifact_bundle_key":"mixed_read_write_c4:frankensqlite:mixed_read_write:c4:sqlite_reference:adversarial_cross_node:release_perf:run_bench-1780665217428:rev_d6e391274235:beads_776d45e0774c","artifact_bundle_relpath":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c","artifact_manifest_path":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c/manifest.json","result_jsonl_path":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c/results.jsonl","summary_md_path":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c/summary.md","logs_dir_relpath":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c/logs","profiles_dir_relpath":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c/profiles"},"canonical_artifact_manifest":{"schema_version":"fsqlite-e2e.beads_benchmark_artifact_manifest.v1","campaign_id":"bd-db300.1.2","campaign_manifest_path":"sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json","row_id":"mixed_read_write_c4","fixture_id":"frankensqlite","workload":"mixed_read_write","concurrency":4,"mode":"sqlite_reference","placement_profile_id":"adversarial_cross_node","hardware_class_id":"linux_x86_64_many_core_numa","retry_policy_id":"instrumented_busy_retry_v1","build_profile_id":"release_perf","seed_policy_id":"fixed_seed_42","run_id":"bench-1780665217428","artifact_bundle_key":"mixed_read_write_c4:frankensqlite:mixed_read_write:c4:sqlite_reference:adversarial_cross_node:release_perf:run_bench-1780665217428:rev_d6e391274235:beads_776d45e0774c","artifact_bundle_name":"mixed_read_write_c4 frankensqlite mixed_read_write c4 sqlite_reference adversarial_cross_node release_perf run bench-1780665217428 rev d6e391274235 beads 776d45e0774c","artifact_bundle_dir":"mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c","artifact_bundle_relpath":"artifacts/perf/bd-db300.1.2/mixed_read_write_c4__mixed_read_write__c4__frankensqlite__sqlite_reference__adversarial_cross_node__release_perf__run_bench-1780665217428__rev_d6e391274235__beads_776d45e0774c","artifact_names":{"result_jsonl":"results.jsonl","summary_md":"summary.md","manifest_json":"manifest.json","hardware_discovery_bundle_json":"hardware_discovery_bundle.json","hardware_discovery_summary_md":"hardware_discovery_summary.md","logs_dir":"logs","profiles_dir":"profiles"},"retention_policy":{"class":"full_proof","description":"Full validation/proof-quality bundle kept for before/after comparison.","superseded_by_newer":false,"immutable":true,"authoritative":true},"provenance":{"command_entrypoint":"realdb-e2e bench","source_revision":"d6e391274235b966c9da5f2bd1d668d3b6c072eb","beads_data_hash":"776d45e0774c84a33d71a373b9407e082d8360fe932235650e403bfb87204d3a","kernel_release":"Linux 6.17.0-23-generic","fixture":{"fixture_id":"frankensqlite","source_path":"/data/projects/frankensqlite/.beads/beads.db","source_sha256":"054194ca48d1334769f6c0277eaa2d51adb6fdbd481c1a67ae3d254f486210bc","source_size_bytes":11649024,"working_copy_relpath":"sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensqlite_beads.db","working_copy_sha256":"c0ff9da1fcd3c1fa06cc9d16e60d0d49bc817a3142ddd8472495612adc6a86c7","working_copy_size_bytes":10862592,"page_size":4096,"journal_mode":"wal","capture_rule":"Run benchmarks from the pinned working copy under beads_bench_20260310; only refresh it via an explicit re-capture that records both source and working-copy digests."},"build_profile":{"id":"release_perf","cargo_profile":"release-perf","cargo_args":["--profile","release-perf"],"notes":"Canonical build profile for many-core performance evidence in Track A."},"hardware_class":{"id":"linux_x86_64_many_core_numa","id_fields":{"os_family":"linux","cpu_arch":"x86_64","topology_class":"many_core_numa"},"min_logical_cores":16,"min_numa_nodes":2,"description":"Many-core Linux x86_64 host with NUMA or CCD boundaries suitable for pinned and adversarial topology evidence."},"placement_policy":{"placement_profile_id":"adversarial_cross_node","hardware_class_id":"linux_x86_64_many_core_numa","availability":"topology_aware","command_hint":"Use taskset/numactl to place workers across nodes or CCDs instead of one locality domain.","required":true,"execution_contract":{"cpu_affinity_policy":"split_across_locality_domains","smt_policy":"avoid_primary_sibling_reuse","memory_policy":"match_cross_domain_placement","helper_lane_policy":"outside_primary_worker_domains","required_environment_disclosures":["placement_profile_id","hardware_class_id","hardware_signature","cpu_affinity_mask","smt_policy_state","memory_policy","helper_lane_cpu_set","numa_balancing_state"],"suite_selection":{"selector_kind":"matrix_placement_variant","selector_field":"matrix_rows[].placement_variants[].placement_profile_id"},"focused_rerun":{"selector_kind":"explicit_bindings","required_bindings":["RUN_ID","ARTIFACT_BUNDLE_DIR","ARTIFACT_BUNDLE_RELPATH","PLACEMENT_PROFILE_ID","HARDWARE_CLASS_ID","MANIFEST_JSON","SOURCE_REVISION","BEADS_HASH"]},"fixed_knobs":["split_workers_across_locality_domains","avoid_smt_sibling_reuse_inside_primary_worker_set","match_memory_policy_to_cross_domain_worker_split","place_helper_lane_outside_primary_worker_domains"],"optional_knobs":["exact_remote_domain_pair","exact_cross_domain_worker_split","extra_profiler_capture"],"claim_contract":{"mandatory_for":["cross_node_sensitivity_claims","placement_regression_guard_claims"],"optional_for":["stress_reruns"],"avoid_for":["headline_speedup_claims","portable_baseline_claims"]},"violation_disposition":"not_comparable"}},"commands":[{"tool":"realdb-e2e","command_line":"realdb-e2e bench --engine sqlite3 --db frankensqlite --preset mixed_read_write --concurrency 4 --placement-profile adversarial_cross_node --storage-profile file_backed --warmup 0 --repeat 1 --output-jsonl /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/results.jsonl --output-md /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/summary.md"}],"tool_versions":[{"tool":"cargo","version":"cargo 1.98.0-nightly (0b1123a48 2026-06-01)"},{"tool":"git","version":"git version 2.54.0"},{"tool":"rch","version":"rch 1.0.37 (commit c02a01b4af09)"},{"tool":"rustc","version":"rustc 1.98.0-nightly (b354133fb 2026-06-03)"}],"fallback_notes":[]}}},"iterations":[{"iteration":0,"wall_time_ms":109,"ops_per_sec":2485.7094389359813,"ops_total":200,"retries":12,"aborts":12,"error":null}]}
+Wrote markdown report: /data/projects/frankensqlite/artifacts/perf/bd-db300.8.3.2/bd-db300.8.3.2-20260605T122244Z-3555737/packs/mixed_read_write_c4__frankensqlite__adversarial_cross_node__file_backed__run_bd_db300_8_3_2_20260605T122244Z_3555737__rev_c3ece3240536__beads_a91225904d9e/sqlite_reference/summary.md
+  [2m2026-06-05T13:13:37.809119Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 408122ms[0m
+    [2;3mat[0m rch/src/hook.rs:6364 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:37.810047Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:6413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:37.810124Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:2072 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:37.810267Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 4 retrieval exclude pattern(s) from .rchignore (total: 8)[0m
+    [2;3mat[0m rch/src/transfer.rs:909 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:38.181929Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 371ms (1 files, 9809 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2111 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:38.181965Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1 files, 9809 bytes in 371ms[0m
+    [2;3mat[0m rch/src/hook.rs:6446 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:38.182205Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite/.rch-target-ts2-job-29874297577144373-1780664795153764582-0 on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:2072 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:48.055278Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 9872ms (2184 files, 35940 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2111 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-05T13:13:48.055936Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 2184 files, 35940 bytes in 9872ms[0m
+    [2;3mat[0m rch/src/hook.rs:6570 [2;3mon[0m ThreadId(1)
+
+[RCH] remote ts2 (435.3s)
