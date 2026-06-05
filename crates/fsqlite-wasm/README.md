@@ -4,8 +4,9 @@
 WebAssembly package.
 
 The intended npm artifact is published as `@frankensqlite/core` and exposes the
-generated `wasm-bindgen` glue plus the `FrankenDB` / `FrankenPreparedStatement`
-APIs implemented in [`src/lib.rs`](./src/lib.rs).
+generated `wasm-bindgen` glue plus the `FrankenDB` API implemented in
+[`src/lib.rs`](./src/lib.rs). Builds that enable the `prepared-statements`
+feature also export `FrankenPreparedStatement`.
 
 ## Package Build
 
@@ -38,6 +39,8 @@ The helper script:
   `FSQLITE_WASM_NO_DEFAULT_FEATURES=1`
 - can opt into SQLite image import/export bindings with
   `FSQLITE_WASM_FEATURES=backup`
+- can opt into the reusable prepared-statement wrapper with
+  `FSQLITE_WASM_FEATURES=prepared-statements`
 - can enable opt-in diagnostics such as
   `FSQLITE_WASM_FEATURES=diagnostics,tracing,panic-hook`
 - can make optimizer availability explicit with `FSQLITE_WASM_WASM_OPT`
@@ -76,10 +79,13 @@ placeholders, richer JavaScript value-type descriptions in error messages, or
 other debug/advisor surfaces. Diagnostics builds also retain the expanded
 out-of-memory advisory text with memory knob names; the default core package
 uses a compact out-of-memory message. Default JavaScript errors still include `code`,
-`sqliteCode`, `extendedCode`, and `message`; default prepared statements still
-keep `execute()` and `query()` available. The `tracing` feature is also opt-in
-because it restores warning-level tracing and pulls in extra browser logging
-glue. The `panic-hook` feature is available for browser
+`sqliteCode`, `extendedCode`, and `message`; default parameterized execution
+stays available through `executeWithParams()` and `queryWithParams()`. Enable
+the `prepared-statements` feature when a package needs `db.prepare()` and the
+`FrankenPreparedStatement` wrapper with reusable `execute()` / `query()`
+methods. The `tracing` feature is also opt-in because it restores warning-level
+tracing and pulls in extra browser logging glue. The `panic-hook` feature is
+available for browser
 crash reports when a larger diagnostic package is acceptable:
 
 ```bash
@@ -90,6 +96,12 @@ The `backup` feature is separate from diagnostics. Enable it when the browser
 package needs `FrankenDB.import()`, `FrankenDB.importWithOptions()`, or
 `db.export()` for SQLite image round-trips. The minimum core package omits those
 backup bindings and keeps the common in-memory `open`/`execute`/`query` surface.
+
+The `prepared-statements` feature is separate from diagnostics. Enable it when
+the package needs `FrankenDB.prepare()` and the exported
+`FrankenPreparedStatement` class. The minimum core package omits that wrapper
+and keeps parameterized one-shot SQL available through `executeWithParams()` and
+`queryWithParams()`.
 
 The `row-arrays` feature restores positional `result.rowArrays` for consumers
 that need array-indexed rows in addition to the default labeled `result.rows`

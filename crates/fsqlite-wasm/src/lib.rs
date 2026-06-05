@@ -26,10 +26,9 @@ use std::sync::Once;
 
 #[cfg(feature = "diagnostics")]
 use fsqlite_core::connection::ConnectionMemoryStats;
-use fsqlite_core::connection::{
-    Connection as CoreConnection, ConnectionEnv, PreparedStatement as CorePreparedStatement,
-    Row as CoreRow,
-};
+#[cfg(feature = "prepared-statements")]
+use fsqlite_core::connection::PreparedStatement as CorePreparedStatement;
+use fsqlite_core::connection::{Connection as CoreConnection, ConnectionEnv, Row as CoreRow};
 use fsqlite_error::FrankenError;
 use fsqlite_types::{SmallText, SqliteValue};
 #[cfg(feature = "diagnostics")]
@@ -131,7 +130,7 @@ struct FrankenDbState {
     memory_warning_callback: RefCell<Option<Function>>,
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
 struct PreparedMetadata {
     column_count: usize,
     column_names: Vec<String>,
@@ -218,6 +217,7 @@ fn memory_warning_transition(
     (above_threshold, crossed_threshold)
 }
 
+#[cfg(feature = "prepared-statements")]
 #[wasm_bindgen(js_name = FrankenPreparedStatement)]
 pub struct FrankenPreparedStatement {
     state: Rc<FrankenDbState>,
@@ -333,6 +333,7 @@ impl FrankenDb {
         })
     }
 
+    #[cfg(feature = "prepared-statements")]
     pub fn prepare(&self, sql: &str) -> Result<FrankenPreparedStatement, JsValue> {
         #[cfg(feature = "diagnostics")]
         let metadata = self.with_connection(|conn| {
@@ -556,6 +557,7 @@ fn connection_env_from_options(
     Ok(env)
 }
 
+#[cfg(feature = "prepared-statements")]
 #[wasm_bindgen(js_class = FrankenPreparedStatement)]
 impl FrankenPreparedStatement {
     #[cfg(feature = "diagnostics")]
@@ -612,6 +614,7 @@ impl FrankenPreparedStatement {
     }
 }
 
+#[cfg(feature = "prepared-statements")]
 impl FrankenPreparedStatement {
     fn with_prepared_statement<T>(
         &self,
@@ -2059,6 +2062,7 @@ mod tests {
         assert!(matches!(error, FrankenError::OutOfMemory));
     }
 
+    #[cfg(feature = "prepared-statements")]
     #[test]
     fn franken_db_prepare_and_execute_batch_work_on_host() {
         let _guard = host_connection_test_guard();
@@ -2498,7 +2502,7 @@ mod wasm_tests {
         assert!(unsupported_message.contains("Object"));
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
     #[wasm_bindgen_test]
     fn wasm_prepare_roundtrip_uses_core_column_names() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2565,6 +2569,7 @@ mod wasm_tests {
         }
     }
 
+    #[cfg(feature = "prepared-statements")]
     #[wasm_bindgen_test]
     fn wasm_prepare_supports_sql_query_execute_without_params() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2594,7 +2599,7 @@ mod wasm_tests {
         );
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
     #[wasm_bindgen_test]
     fn wasm_diagnostics_explain_methods_return_program_text() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2622,6 +2627,7 @@ mod wasm_tests {
         );
     }
 
+    #[cfg(feature = "prepared-statements")]
     #[wasm_bindgen_test]
     fn wasm_prepared_execute_with_params_inserts_rows() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2764,6 +2770,7 @@ mod wasm_tests {
         assert_eq!(row.get(1).as_string().as_deref(), Some("alpha"));
     }
 
+    #[cfg(feature = "prepared-statements")]
     #[wasm_bindgen_test]
     fn wasm_prepared_statement_reuses_sql_with_different_params() {
         let db = FrankenDb::new(None).expect("db should open");
