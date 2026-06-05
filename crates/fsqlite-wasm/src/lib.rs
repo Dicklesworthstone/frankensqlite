@@ -47,6 +47,12 @@ pub use fsqlite_types as types;
 
 static WASM_RUNTIME_INIT: Once = Once::new();
 const WASM_LINEAR_MEMORY_PAGE_BYTES: usize = 64 * 1024;
+#[cfg(not(feature = "diagnostics"))]
+const WASM_OUT_OF_MEMORY_MESSAGE: &str = "FrankenSQLite WASM ran out of memory";
+#[cfg(feature = "diagnostics")]
+const WASM_OUT_OF_MEMORY_MESSAGE: &str = "FrankenSQLite WASM ran out of memory; adjust memory.maxPages or memory.maxBytes, \
+     memory.growthChunkPages or memory.growthChunkBytes, or pageBufferMax, and remember \
+     the browser WebAssembly linear-memory ceiling is 4 GiB";
 
 /// Parse a SQL string into a list of AST statements.
 ///
@@ -493,9 +499,7 @@ impl FrankenDbState {
             let _ = set_property(
                 &object,
                 "message",
-                &JsValue::from_str(
-                    "FrankenSQLite WASM ran out of memory; adjust memory.maxPages or memory.maxBytes, memory.growthChunkPages or memory.growthChunkBytes, or pageBufferMax, and remember the browser WebAssembly linear-memory ceiling is 4 GiB",
-                ),
+                &JsValue::from_str(WASM_OUT_OF_MEMORY_MESSAGE),
             );
             let _ = set_property(&object, "oom", &JsValue::from_bool(true));
             #[cfg(feature = "diagnostics")]

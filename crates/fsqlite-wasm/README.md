@@ -71,7 +71,9 @@ prepared-statement `explain()`, prepared-statement metadata getters (`stmt.sql`,
 JavaScript NaN coercion warnings, or diagnostic error recovery fields such as
 `transient`, `userRecoverable`, and `suggestion`, query-result `changes`
 placeholders, richer JavaScript value-type descriptions in error messages, or
-other debug/advisor surfaces. Default JavaScript errors still include `code`,
+other debug/advisor surfaces. Diagnostics builds also retain the expanded
+out-of-memory advisory text with memory knob names; the default core package
+uses a compact out-of-memory message. Default JavaScript errors still include `code`,
 `sqliteCode`, `extendedCode`, and `message`; default prepared statements still
 keep `execute()` and `query()` available. The `tracing` feature is also opt-in
 because it restores warning-level tracing and pulls in extra browser logging
