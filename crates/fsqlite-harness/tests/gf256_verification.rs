@@ -4,10 +4,12 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
 use asupersync::raptorq::gf256::{Gf256, gf256_add_slice, gf256_addmul_slice, gf256_mul_slice};
 use asupersync::raptorq::{RaptorQReceiverBuilder, RaptorQSenderBuilder};
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use asupersync::transport::error::{SinkError, StreamError};
 use asupersync::transport::sink::SymbolSink;
 use asupersync::transport::stream::SymbolStream;
@@ -16,6 +18,16 @@ use asupersync::{Cx, RaptorQConfig};
 use proptest::prelude::*;
 
 const BEAD_ID: &str = "bd-1hi.1";
+
+fn test_cx() -> Cx {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime should build")
+    });
+    runtime.block_on(async { Cx::current().expect("runtime block_on should install Cx") })
+}
 
 // RFC 6330 §5.7: p(x) = x^8 + x^4 + x^3 + x^2 + 1 = 0x11D.
 const POLY_FULL: u16 = 0x11D;
@@ -407,7 +419,7 @@ impl SymbolStream for VecStream {
 
 #[test]
 fn test_e2e_raptorq_roundtrip_uses_gf256_tables() {
-    let cx = Cx::for_testing();
+    let cx = test_cx();
 
     let mut config = RaptorQConfig::default();
     // Keep the object in a single block for determinism.

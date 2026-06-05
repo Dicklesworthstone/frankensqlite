@@ -3,7 +3,7 @@ mod commit_pipeline;
 
 use std::future::Future;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll, Waker};
@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use asupersync::channel::mpsc::{RecvError, SendError};
 use asupersync::channel::session;
 use asupersync::cx::Cx;
-use asupersync::types::{Budget, RegionId, TaskId};
-use asupersync::util::ArenaIndex;
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 use commit_pipeline::{
     CommitPipeline, CommitRequest, DEFAULT_COMMIT_CHANNEL_CAPACITY, GroupCommitCoordinator,
@@ -22,11 +21,13 @@ use commit_pipeline::{
 };
 
 fn test_cx() -> Cx {
-    Cx::new(
-        RegionId::from_arena(ArenaIndex::new(0, 0)),
-        TaskId::from_arena(ArenaIndex::new(0, 0)),
-        Budget::INFINITE,
-    )
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime should build")
+    });
+    runtime.block_on(async { Cx::current().expect("runtime block_on should install Cx") })
 }
 
 fn cancelled_cx() -> Cx {

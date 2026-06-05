@@ -390,8 +390,8 @@ fn test_tla_asupersync_trace_export() {
     use asupersync::types::{RegionId, TaskId, Time};
 
     // Minimal deterministic trace: one region, one task lifecycle.
-    let region = RegionId::new_for_test(1, 0);
-    let task = TaskId::new_for_test(2, 0);
+    let region = RegionId::testing_default();
+    let task = TaskId::testing_default();
     let t0 = Time::from_nanos(0);
     let t1 = Time::from_nanos(1);
     let t2 = Time::from_nanos(2);

@@ -14,12 +14,14 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
 use asupersync::raptorq::gf256::{Gf256, gf256_add_slice, gf256_mul_slice};
 use asupersync::raptorq::systematic::SystematicEncoder;
 use asupersync::raptorq::{RaptorQReceiverBuilder, RaptorQSenderBuilder};
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use asupersync::transport::error::{SinkError, StreamError};
 use asupersync::transport::sink::SymbolSink;
 use asupersync::transport::stream::SymbolStream;
@@ -36,6 +38,16 @@ use fsqlite_types::ObjectId;
 use fsqlite_types::ecs::{SymbolRecord, SymbolRecordFlags};
 
 const BEAD_ID: &str = "bd-m0l2";
+
+fn test_cx() -> Cx {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime should build")
+    });
+    runtime.block_on(async { Cx::current().expect("runtime block_on should install Cx") })
+}
 
 // ============================================================================
 // Transport helpers (in-memory symbol sink / source for roundtrip tests)
@@ -271,7 +283,7 @@ fn test_e2e_gf256_mul_slice_roundtrip() {
 #[test]
 fn test_e2e_raptorq_encode_decode_small() {
     // Encode/decode a small object and verify exact roundtrip.
-    let cx = Cx::for_testing();
+    let cx = test_cx();
     let mut config = RaptorQConfig::default();
     config.encoding.max_block_size = 64 * 1024;
     config.encoding.repair_overhead = 1.30; // 30% overhead
@@ -323,7 +335,7 @@ fn test_e2e_raptorq_encode_decode_small() {
 #[test]
 fn test_e2e_raptorq_encode_decode_large() {
     // Encode ~10000 bytes, verify decode with < 2% overhead.
-    let cx = Cx::for_testing();
+    let cx = test_cx();
     let mut config = RaptorQConfig::default();
     config.encoding.max_block_size = 128 * 1024;
     config.encoding.repair_overhead = 1.05; // 5% overhead

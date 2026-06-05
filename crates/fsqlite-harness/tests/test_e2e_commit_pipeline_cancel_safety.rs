@@ -3,14 +3,13 @@ mod commit_pipeline;
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use asupersync::channel::mpsc::SendError;
 use asupersync::cx::Cx;
-use asupersync::types::{Budget, RegionId, TaskId};
-use asupersync::util::ArenaIndex;
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 use commit_pipeline::{CommitPipeline, CommitRequest};
 
@@ -30,11 +29,13 @@ enum WorkerOutcome {
 }
 
 fn test_cx() -> Cx {
-    Cx::new(
-        RegionId::from_arena(ArenaIndex::new(0, 0)),
-        TaskId::from_arena(ArenaIndex::new(0, 0)),
-        Budget::INFINITE,
-    )
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime should build")
+    });
+    runtime.block_on(async { Cx::current().expect("runtime block_on should install Cx") })
 }
 
 fn cancelled_cx() -> Cx {
