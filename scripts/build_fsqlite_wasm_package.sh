@@ -211,6 +211,21 @@ write_size_report() {
         }' > "${size_report_path}"
 }
 
+write_twiggy_report() {
+    case "${twiggy_mode}" in
+        auto)
+            if command -v twiggy >/dev/null 2>&1; then
+                twiggy top "${out_dir}/${out_name}_bg.wasm" > "${out_dir}/twiggy-top.txt"
+            fi
+            ;;
+        required)
+            require_cmd twiggy
+            twiggy top "${out_dir}/${out_name}_bg.wasm" > "${out_dir}/twiggy-top.txt"
+            ;;
+        disabled) ;;
+    esac
+}
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     usage
     exit 0
@@ -484,24 +499,12 @@ fi
 if [[ -n "${wasm_opt_kept}" ]]; then
     echo "wasm-opt gzip comparison: original=${wasm_opt_original_gzip_bytes} optimized=${wasm_opt_optimized_gzip_bytes} kept=${wasm_opt_kept}"
 fi
+write_twiggy_report
 if [[ "${max_gzip_bytes}" != "0" ]] && (( gzip_bytes > max_gzip_bytes )); then
     write_size_report
     echo "Gzipped wasm artifact exceeds size budget: ${gzip_bytes} > ${max_gzip_bytes} bytes" >&2
     exit 1
 fi
-
-case "${twiggy_mode}" in
-    auto)
-        if command -v twiggy >/dev/null 2>&1; then
-            twiggy top "${out_dir}/${out_name}_bg.wasm" > "${out_dir}/twiggy-top.txt"
-        fi
-        ;;
-    required)
-        require_cmd twiggy
-        twiggy top "${out_dir}/${out_name}_bg.wasm" > "${out_dir}/twiggy-top.txt"
-        ;;
-    disabled) ;;
-esac
 
 packed_file="$(npm pack "${out_dir}" --pack-destination "${out_dir}")"
 packed_path="${out_dir}/${packed_file}"

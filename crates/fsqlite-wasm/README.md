@@ -47,8 +47,9 @@ The helper script:
   cargo-shaped work must happen through `rch`
 - strips caller-location file/line/column detail from release/profiling builds
   by default with `-Zlocation-detail=none`
-- emits `twiggy-top.txt` when `twiggy` is available, or requires it with
-  `FSQLITE_WASM_TWIGGY=required`
+- emits `twiggy-top.txt` before enforcing the gzip budget when `twiggy` is
+  available, or requires it with `FSQLITE_WASM_TWIGGY=required`, so over-budget
+  failures retain a size-attribution artifact
 - writes `frankensqlite_wasm_bg.wasm.gz` and enforces the 800 KB core gzip
   budget by default (`FSQLITE_WASM_MAX_GZIP_BYTES=0` disables the guard)
 - writes `size-report.json` with the raw wasm bytes, gzipped wasm bytes,
@@ -86,9 +87,11 @@ FSQLITE_WASM_FEATURES=diagnostics,tracing,panic-hook ./scripts/build_fsqlite_was
 All release packages must emit the raw `.wasm`, a gzipped `.wasm.gz`, and a
 Twiggy top report in CI. The helper also writes `size-report.json` so CI and
 manual runs preserve the exact wasm-opt decision, raw/gzip bytes, active
-budgets, and packed archive size next to the package artifacts. The core package
-budget is enforced against the gzipped WebAssembly artifact because that is the
-browser transfer shape.
+budgets, Twiggy report path, and packed archive size next to the package
+artifacts. Twiggy runs before the gzip-budget failure path, so an over-budget
+core package can still be diagnosed from the same output directory. The core
+package budget is enforced against the gzipped WebAssembly artifact because that
+is the browser transfer shape.
 
 | Feature combo | Build command | Gzip budget |
 | --- | --- | --- |
