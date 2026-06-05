@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "fsqlite-ast",
@@ -910,14 +910,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-types",
 ]
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-c-api"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite",
  "fsqlite-ast",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-cli"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite",
  "fsqlite-core",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-e2e"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1032,14 +1032,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts3"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-session"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-harness"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "argon2",
  "asupersync",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "bitflags 2.11.1",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "criterion",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wasm"
-version = "0.1.0"
+version = "0.1.7"
 dependencies = [
  "console_error_panic_hook",
  "fsqlite-ast",

@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-func"
-version = "0.1.5"
+version = "0.1.7"
 description = "Built-in scalar, aggregate, and window functions"
 edition.workspace = true
 license.workspace = true

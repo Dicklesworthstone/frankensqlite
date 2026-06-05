@@ -17,6 +17,82 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.7] -- 2026-06-05 (MVCC transaction-local self-conflict + FTS5 reload regressions; full-workspace release)
+
+Full-workspace lockstep release: every publishable crate is bumped to `0.1.7`
+(`0.1.5 → 0.1.7`, with `fsqlite-btree`/`fsqlite-vfs` `0.1.6 → 0.1.7`) and
+republished together, so the dependency graph carries a single coherent version
+with no inter-crate skew. The two fix families below were committed on `main`
+but unreleased; cutting an intermediate `0.1.5`/`0.1.6` release would have
+propagated the MVCC regression below to every consumer, so the release waited
+until both were resolved. Downstream consumers (beads_rust, cass,
+mcp_agent_mail) were blocked on this release.
+
+### Fixed
+
+- **MVCC: spurious `BusySnapshot` self-conflict when a sole `BEGIN EXCLUSIVE`
+  writer grows the database** —
+  [#106](https://github.com/Dicklesworthstone/frankensqlite/issues/106),
+  fixed in
+  [`ab4fa4d0`](https://github.com/Dicklesworthstone/frankensqlite/commit/ab4fa4d0).
+  A single connection (no concurrency) running a schema-migration / table-rebuild
+  transaction under `BEGIN EXCLUSIVE` failed deterministically with
+  `BusySnapshot { conflicting_pages: "page N > snapshot db_size M (latest: M)" }`
+  — the sole writer conflicting with *its own* uncommitted page growth.
+  Introduced by the 0.1.5/0.1.6 btree-reload and allocation changes. Root cause:
+  the committed-pager refresh and fast-path scan gates keyed only on
+  `in_transaction`, which missed savepoints, active transaction borrows, and
+  internal statement savepoints; prepared-metadata refreshes and committed
+  read-only scans could therefore observe the published pager image while the
+  same connection still held uncommitted DDL plus EOF/freelist page allocations,
+  rejecting a later intra-transaction write past the snapshot `db_size`. The fix
+  adds a single `local_transaction_scope_is_active` predicate, routes the
+  committed-pager refresh gates through it, keeps file-backed fast-path scans out
+  of explicit transaction scopes, and forces schema/autocommit boundaries to
+  publish immediately even when time-travel capture is disabled. Adds
+  `crates/fsqlite/tests/issue_106_rebuild_db_size.rs` (rebuild-then-read, a
+  beads-like 38-column rebuild + index burst, and a single-grow variant) — all
+  three fail against 0.1.5 and pass here.
+
+- **FTS5: command-column deletes, `WITHOUT ROWID` reload, and order-by fast-path
+  regressions** —
+  [#99/#102/#103](https://github.com/Dicklesworthstone/frankensqlite/issues/102),
+  fixed in
+  [`af4abb27`](https://github.com/Dicklesworthstone/frankensqlite/commit/af4abb27).
+  Live FTS5 command-column INSERTs (the magic-row delete form) are now detected
+  before ordinary virtual-table INSERT dispatch, validated, routed through the
+  live `xUpdate` delete path, and counted correctly, while regular user columns
+  named like the command column stay on the normal insert path. Populated
+  `WITHOUT ROWID` tables (including FTS5 `_config`/`_idx` shadow tables) load
+  through index-btree payload records with synthesized stable rowids so they
+  survive reopen, and the MemDB `SimpleOrderByLimit` fast path no longer
+  mis-claims ordering it cannot satisfy.
+
+- **FTS5: lazy-bind persisted shadow segments instead of full re-tokenization on
+  reopen** — fixed in
+  [`39eaa54f`](https://github.com/Dicklesworthstone/frankensqlite/commit/39eaa54f).
+  A reopened on-disk index now binds its existing posting-list segments
+  (rowid-walkable `_data` + `_docsize` shadow tables, resolving content via the
+  stored/external/contentless rules SQLite FTS5 applies) instead of
+  re-tokenizing the entire `_content` table on every connection — the root cause
+  of the multi-hour `cass` open on large corpora. Replaces the previously
+  reverted shadow-bind fast path (which was unsafe on the first write and
+  `O(N²)` on large corpora) with a correct rebuild-from-postings path.
+
+### Notes for downstream consumers
+
+- **beads_rust** ([#316](https://github.com/Dicklesworthstone/beads_rust/issues/316)):
+  the `fsqlite 0.1.3 → 0.1.x` bump previously failed its schema-migration tests
+  (`test_migration_adds_missing_*`) with the #106 `BusySnapshot`. Pin
+  `fsqlite = "0.1.7"` (and the explicit transitive `fsqlite-*` entries) to clear it.
+- **cass** (#266/#268/#269/#271): large populated-DB growth and FTS5 rebuild-pipeline
+  wedges were the #106 MVCC self-conflict and the FTS5 reload regressions
+  manifesting in cass's `messages` ingest and `watch_startup` rebuild paths.
+  Bump to `fsqlite 0.1.7` (feature `fts5`).
+- **mcp_agent_mail**: no action required beyond a routine `cargo update`.
+
+---
+
 ## [0.1.6] -- 2026-05-28 (fsqlite-btree patch)
 
 Single-crate patch release of `fsqlite-btree` (0.1.5 → 0.1.6). No other crate

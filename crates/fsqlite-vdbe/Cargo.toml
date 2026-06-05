@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vdbe"
-version = "0.1.5"
+version = "0.1.7"
 description = "Virtual database engine bytecode interpreter"
 edition.workspace = true
 license.workspace = true
@@ -25,11 +25,11 @@ wasm = [
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-pager = { version = "0.1.5", path = "../fsqlite-pager", default-features = false }
-fsqlite-btree = { version = "0.1.5", path = "../fsqlite-btree", default-features = false }
+fsqlite-pager = { version = "0.1.7", path = "../fsqlite-pager", default-features = false }
+fsqlite-btree = { version = "0.1.7", path = "../fsqlite-btree", default-features = false }
 fsqlite-ast = { workspace = true }
-fsqlite-mvcc = { version = "0.1.5", path = "../fsqlite-mvcc", default-features = false }
-fsqlite-wal = { version = "0.1.5", path = "../fsqlite-wal", default-features = false }
+fsqlite-mvcc = { version = "0.1.7", path = "../fsqlite-mvcc", default-features = false }
+fsqlite-wal = { version = "0.1.7", path = "../fsqlite-wal", default-features = false }
 fsqlite-func = { workspace = true }
 fsqlite-parser = { workspace = true }
 tracing = { workspace = true }
