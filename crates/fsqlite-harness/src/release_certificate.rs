@@ -28,7 +28,9 @@ use crate::certification_policy::{
     CERTIFICATION_MAX_HIGH_SEVERITY_COUNTEREXAMPLES, CERTIFICATION_MIN_VERIFICATION_PCT,
     CertificationPolicy, canonical_certification_policy, certification_gate_config,
 };
-use crate::ci_gate_matrix::{ArtifactEntry, ArtifactManifest, GlobalFlakeBudgetResult};
+use crate::ci_gate_matrix::{
+    ArtifactEntry, ArtifactManifest, FallbackTransparencyGateSummary, GlobalFlakeBudgetResult,
+};
 use crate::confidence_gates::{
     EvidenceLedger, ExpectedLossRanking, GateConfig, GateDecision, GateReport,
     build_evidence_ledger, evaluate_full,
@@ -218,6 +220,20 @@ pub struct CertificationEvidenceStatus {
     pub verification_contract_passed: Option<bool>,
     /// Whether final gate enforcement passed.
     pub final_gate_passed: Option<bool>,
+    /// Whether G9 fallback-transparency gate evidence was embedded in the manifest.
+    pub fallback_transparency_gate_present: bool,
+    /// Whether G9 fallback-transparency gate enforcement passed.
+    pub fallback_transparency_gate_passed: Option<bool>,
+    /// Number of standardized G9 gate failures.
+    pub fallback_transparency_gate_failure_count: usize,
+    /// Number of fallback boundaries missing strict-denial or real-backend proof.
+    pub fallback_transparency_missing_boundary_count: usize,
+    /// Number of stale fallback-transparency artifacts.
+    pub fallback_transparency_stale_artifact_count: usize,
+    /// Count of certifying-mode compatibility fallback events.
+    pub fallback_transparency_certifying_fallback_event_count: usize,
+    /// Replay command for the G9 fallback-denial bundle.
+    pub fallback_transparency_replay_command: Option<String>,
     /// Count of missing-evidence beads from verification-contract enforcement.
     pub missing_evidence_beads: usize,
     /// Count of invalid-reference beads from verification-contract enforcement.
@@ -500,6 +516,21 @@ fn build_certification_evidence_status(
     let verification_contract_present = artifact_manifest
         .and_then(|manifest| manifest.verification_contract.as_ref())
         .is_some();
+    let fallback_transparency_gate =
+        artifact_manifest.and_then(|manifest| manifest.fallback_transparency_gate.as_ref());
+    let fallback_transparency_gate_present = fallback_transparency_gate.is_some();
+    let fallback_transparency_gate_passed =
+        fallback_transparency_gate.map(FallbackTransparencyGateSummary::gate_passed);
+    let fallback_transparency_gate_failure_count =
+        fallback_transparency_gate.map_or(0, |gate| gate.gate_failures.len());
+    let fallback_transparency_missing_boundary_count =
+        fallback_transparency_gate.map_or(0, |gate| gate.missing_boundary_ids.len());
+    let fallback_transparency_stale_artifact_count =
+        fallback_transparency_gate.map_or(0, |gate| gate.stale_artifacts.len());
+    let fallback_transparency_certifying_fallback_event_count =
+        fallback_transparency_gate.map_or(0, |gate| gate.certifying_fallback_events);
+    let fallback_transparency_replay_command =
+        fallback_transparency_gate.map(|gate| gate.replay_command.clone());
 
     let missing_evidence_beads = artifact_manifest
         .and_then(|manifest| manifest.verification_contract.as_ref())
@@ -517,6 +548,13 @@ fn build_certification_evidence_status(
         verification_contract_present,
         verification_contract_passed,
         final_gate_passed,
+        fallback_transparency_gate_present,
+        fallback_transparency_gate_passed,
+        fallback_transparency_gate_failure_count,
+        fallback_transparency_missing_boundary_count,
+        fallback_transparency_stale_artifact_count,
+        fallback_transparency_certifying_fallback_event_count,
+        fallback_transparency_replay_command,
         missing_evidence_beads,
         invalid_reference_beads,
         reported_artifact_count,
@@ -625,6 +663,27 @@ pub fn build_certificate(
         ),
     });
 
+    if let Some(gate) = inputs
+        .artifact_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.fallback_transparency_gate.as_ref())
+    {
+        let gate_json = serde_json::to_string(gate).unwrap_or_default();
+        evidence_chain.push(EvidenceChainEntry {
+            source_bead: "bd-2yqp6.7.9".to_owned(),
+            schema_version: 1,
+            content_hash: sha256_hex(&gate_json),
+            summary: format!(
+                "G9 fallback transparency: status={} covered={} missing={} stale={} certifying_fallbacks={}",
+                gate.status.as_str(),
+                gate.covered_boundary_ids.len(),
+                gate.missing_boundary_ids.len(),
+                gate.stale_artifacts.len(),
+                gate.certifying_fallback_events,
+            ),
+        });
+    }
+
     // ---- Unresolved risks ----
     let mut unresolved_risks = Vec::new();
 
@@ -731,6 +790,36 @@ pub fn build_certificate(
         });
     }
 
+    if certification_evidence.artifact_manifest_present
+        && !certification_evidence.fallback_transparency_gate_present
+    {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "fallback_transparency_gate".to_owned(),
+            severity: "High".to_owned(),
+            description:
+                "Artifact manifest is present but G9 fallback-transparency evidence is missing."
+                    .to_owned(),
+        });
+    }
+
+    if certification_evidence.fallback_transparency_gate_passed == Some(false) {
+        unresolved_risks.push(UnresolvedRisk {
+            source: "fallback_transparency_gate".to_owned(),
+            severity: "High".to_owned(),
+            description: format!(
+                "G9 fallback-transparency gate failed (gate_failures={}, missing_boundaries={}, stale_artifacts={}, certifying_fallback_events={}, replay_command={}).",
+                certification_evidence.fallback_transparency_gate_failure_count,
+                certification_evidence.fallback_transparency_missing_boundary_count,
+                certification_evidence.fallback_transparency_stale_artifact_count,
+                certification_evidence.fallback_transparency_certifying_fallback_event_count,
+                certification_evidence
+                    .fallback_transparency_replay_command
+                    .as_deref()
+                    .unwrap_or("missing"),
+            ),
+        });
+    }
+
     // ---- Drift summary ----
     let drift_alert_categories = drift
         .category_states
@@ -751,7 +840,7 @@ pub fn build_certificate(
     let summary = format!(
         "Release certificate {}: gate={} verified={:.1}% ({}/{} invariants), \
          drift_rejected={}, adversarial={} ({} counterexamples, {} high), \
-         traceability={}/{} manifest={}, {} unresolved risk(s)",
+         traceability={}/{} manifest={}, g9_gate={}, {} unresolved risk(s)",
         verdict,
         gate_report.global_decision,
         truncate_score(gate_report.global_verification_pct),
@@ -764,6 +853,9 @@ pub fn build_certificate(
         certification_traceability.fully_linked_entries,
         certification_traceability.entries.len(),
         certification_traceability.manifest_present,
+        certification_evidence
+            .fallback_transparency_gate_passed
+            .map_or("missing", |passed| if passed { "pass" } else { "fail" }),
         unresolved_risks.len(),
     );
 
@@ -829,6 +921,14 @@ fn determine_verdict(
         return CertificateVerdict::Rejected;
     }
     if certification_evidence.final_gate_passed == Some(false) {
+        return CertificateVerdict::Rejected;
+    }
+    if certification_evidence.artifact_manifest_present
+        && !certification_evidence.fallback_transparency_gate_present
+    {
+        return CertificateVerdict::Rejected;
+    }
+    if certification_evidence.fallback_transparency_gate_passed == Some(false) {
         return CertificateVerdict::Rejected;
     }
     if certification_evidence.missing_artifact_ref_count > 0 {
@@ -1231,6 +1331,13 @@ mod tests {
                 verification_contract_present: false,
                 verification_contract_passed: None,
                 final_gate_passed: None,
+                fallback_transparency_gate_present: false,
+                fallback_transparency_gate_passed: None,
+                fallback_transparency_gate_failure_count: 0,
+                fallback_transparency_missing_boundary_count: 0,
+                fallback_transparency_stale_artifact_count: 0,
+                fallback_transparency_certifying_fallback_event_count: 0,
+                fallback_transparency_replay_command: None,
                 missing_evidence_beads: 0,
                 invalid_reference_beads: 0,
                 reported_artifact_count: 0,

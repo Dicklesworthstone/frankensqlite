@@ -36,6 +36,13 @@ fn passing_input() -> WorkflowInput {
             artifact("parity_evidence_matrix", "parity_evidence_matrix_json"),
             artifact("parity_status_json", "parity_status_json"),
             artifact("parity_status_markdown", "parity_status_markdown"),
+            artifact(
+                "fallback_boundary_inventory",
+                "fallback_boundary_inventory_toml",
+            ),
+            artifact("fallback_decision_schema", "fallback_decision_schema_json"),
+            artifact("fallback_denial_replay", "fallback_denial_replay_json"),
+            artifact("g9_gate_summary", "g9_gate_summary_json"),
             artifact("events", "workflow_events_jsonl"),
         ],
     }
@@ -57,6 +64,10 @@ fn artifact_ids_for_phase(phase: WorkflowPhase) -> Vec<String> {
             "differential_manifest".to_owned(),
             "parity_evidence_matrix".to_owned(),
             "parity_status_json".to_owned(),
+            "fallback_boundary_inventory".to_owned(),
+            "fallback_decision_schema".to_owned(),
+            "fallback_denial_replay".to_owned(),
+            "g9_gate_summary".to_owned(),
         ],
     }
 }
@@ -94,7 +105,7 @@ fn successful_workflow_is_certificate_ready() {
     );
     assert!(report.certificate_ready);
     assert!(report.first_failure.is_none());
-    assert_eq!(report.artifact_index.len(), 6);
+    assert_eq!(report.artifact_index.len(), 10);
 
     let markdown = render_workflow_markdown(&report);
     assert!(markdown.contains("## Ordered Gates"));

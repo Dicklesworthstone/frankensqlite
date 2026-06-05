@@ -15,12 +15,16 @@ pub const SCHEMA_VERSION: &str = "fsqlite.parity_verification_workflow.v1";
 /// Default freshness budget: 24 hours.
 pub const DEFAULT_FRESHNESS_BUDGET_MS: u128 = 24 * 60 * 60 * 1_000;
 
-const REQUIRED_ARTIFACT_ROLES: [&str; 5] = [
+const REQUIRED_ARTIFACT_ROLES: [&str; 9] = [
     "oracle_preflight_json",
     "differential_manifest_json",
     "parity_evidence_matrix_json",
     "parity_status_json",
     "parity_status_markdown",
+    "fallback_boundary_inventory_toml",
+    "fallback_decision_schema_json",
+    "fallback_denial_replay_json",
+    "g9_gate_summary_json",
 ];
 
 /// Ordered workflow phases for the user command.

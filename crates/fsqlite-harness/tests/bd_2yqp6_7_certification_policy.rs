@@ -10,7 +10,11 @@ use fsqlite_harness::certification_policy::{
     CertificationRatchetCandidate, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
     evaluate_certification_ratchets,
 };
-use fsqlite_harness::ci_gate_matrix::{ArtifactEntry, ArtifactKind, ArtifactManifest};
+use fsqlite_harness::ci_gate_matrix::{
+    ArtifactEntry, ArtifactKind, ArtifactManifest, FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION,
+    FallbackTransparencyArtifactRef, FallbackTransparencyGateStatus,
+    FallbackTransparencyGateSummary,
+};
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
 use fsqlite_harness::drift_monitor::ParityDriftMonitor;
 use fsqlite_harness::parity_invariant_catalog::{
@@ -60,6 +64,72 @@ fn failing_contract_outcome() -> ContractEnforcementOutcome {
     }
 }
 
+fn g9_artifact_ref(
+    artifact_id: &str,
+    path: &str,
+    schema_version: &str,
+) -> FallbackTransparencyArtifactRef {
+    FallbackTransparencyArtifactRef {
+        artifact_id: artifact_id.to_owned(),
+        path: path.to_owned(),
+        content_hash: "f".repeat(64),
+        schema_version: schema_version.to_owned(),
+        validation_command: "rch exec -- cargo test -p fsqlite-core --test agent_swarm_fallback_transparency_contract deterministic_fallback_denial_replay -- --nocapture".to_owned(),
+        validation_passed: true,
+    }
+}
+
+fn passing_g9_gate() -> FallbackTransparencyGateSummary {
+    FallbackTransparencyGateSummary {
+        schema_version: FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION.to_owned(),
+        status: FallbackTransparencyGateStatus::Pass,
+        source_commit: "deadbeefcafebabe".to_owned(),
+        generated_at: "2026-06-05T10:00:00Z".to_owned(),
+        inventory: g9_artifact_ref(
+            "fallback_boundary_inventory",
+            "docs/contracts/fallback_boundary_inventory.toml",
+            "fallback_boundary_inventory.v1",
+        ),
+        schema_validation: g9_artifact_ref(
+            "fallback_decision_schema",
+            "crates/fsqlite-core/tests/agent_swarm_fallback_transparency_contract.rs",
+            "fallback_decision_schema.v1",
+        ),
+        replay_bundle: g9_artifact_ref(
+            "fallback_denial_replay",
+            "artifacts/g9/fallback_denial_replay_summary.json",
+            "fallback_denial_replay.v1",
+        ),
+        backend_identity_summary: "fsqlite:pager_wal_mvcc_btree:parity_cert_strict".to_owned(),
+        covered_boundary_ids: vec![
+            "conn.select.with_clause_materialization".to_owned(),
+            "conn.select.view_materialization".to_owned(),
+            "vdbe.open_storage_cursor.mempage_fallback".to_owned(),
+        ],
+        missing_boundary_ids: Vec::new(),
+        stale_artifacts: Vec::new(),
+        certifying_fallback_events: 0,
+        non_cert_control_events: 1,
+        gate_failures: Vec::new(),
+        replay_command: "rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-g9-fallback-denial-replay-target cargo test -p fsqlite-core --test agent_swarm_fallback_transparency_contract deterministic_fallback_denial_replay -- --nocapture".to_owned(),
+    }
+}
+
+fn failing_g9_gate() -> FallbackTransparencyGateSummary {
+    FallbackTransparencyGateSummary {
+        status: FallbackTransparencyGateStatus::Fail,
+        missing_boundary_ids: vec!["conn.select.sqlite_schema_virtual_materialization".to_owned()],
+        stale_artifacts: vec!["fallback_denial_replay".to_owned()],
+        certifying_fallback_events: 1,
+        gate_failures: vec![
+            "missing_boundary_coverage".to_owned(),
+            "certifying_fallback_allowed".to_owned(),
+            "stale_fallback_artifact".to_owned(),
+        ],
+        ..passing_g9_gate()
+    }
+}
+
 fn certification_manifest(contract: Option<ContractEnforcementOutcome>) -> ArtifactManifest {
     ArtifactManifest {
         schema_version: "1.0.0".to_owned(),
@@ -81,6 +151,17 @@ fn certification_manifest(contract: Option<ContractEnforcementOutcome>) -> Artif
         bisect_request: None,
         bisect_result_summary: None,
         verification_contract: contract,
+        fallback_transparency_gate: Some(passing_g9_gate()),
+    }
+}
+
+fn certification_manifest_with_g9(
+    contract: Option<ContractEnforcementOutcome>,
+    fallback_transparency_gate: Option<FallbackTransparencyGateSummary>,
+) -> ArtifactManifest {
+    ArtifactManifest {
+        fallback_transparency_gate,
+        ..certification_manifest(contract)
     }
 }
 
@@ -294,6 +375,12 @@ fn release_certificate_embeds_feature_test_run_artifact_chain() {
         cert.certification_traceability.fully_linked_entries, 1,
         "bead_id={BEAD_ID} case=linked_entries",
     );
+    assert_eq!(
+        cert.certification_evidence
+            .fallback_transparency_gate_passed,
+        Some(true),
+        "bead_id={BEAD_ID} case=g9_gate_passed",
+    );
 
     let entry = &cert.certification_traceability.entries[0];
     assert_eq!(
@@ -308,6 +395,52 @@ fn release_certificate_embeds_feature_test_run_artifact_chain() {
     assert_eq!(
         entry.artifacts[0].content_hash,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+}
+
+#[test]
+fn release_certificate_rejects_manifest_missing_g9_fallback_gate() {
+    let (mut inputs, config) = strict_ready_inputs(passing_contract_outcome());
+    inputs.artifact_manifest = Some(certification_manifest_with_g9(
+        Some(passing_contract_outcome()),
+        None,
+    ));
+
+    let cert = build_certificate(&inputs, &config);
+    assert_eq!(cert.verdict, CertificateVerdict::Rejected);
+    assert!(
+        cert.unresolved_risks
+            .iter()
+            .any(|risk| risk.source == "fallback_transparency_gate"
+                && risk.description.contains("evidence is missing")),
+        "bead_id={BEAD_ID} case=missing_g9_gate_risk",
+    );
+}
+
+#[test]
+fn release_certificate_rejects_failed_g9_fallback_gate() {
+    let (mut inputs, config) = strict_ready_inputs(passing_contract_outcome());
+    inputs.artifact_manifest = Some(certification_manifest_with_g9(
+        Some(passing_contract_outcome()),
+        Some(failing_g9_gate()),
+    ));
+
+    let cert = build_certificate(&inputs, &config);
+    assert_eq!(cert.verdict, CertificateVerdict::Rejected);
+    assert_eq!(
+        cert.certification_evidence
+            .fallback_transparency_certifying_fallback_event_count,
+        1,
+        "bead_id={BEAD_ID} case=g9_certifying_fallback_count",
+    );
+    assert!(
+        cert.unresolved_risks
+            .iter()
+            .any(|risk| risk.source == "fallback_transparency_gate"
+                && risk
+                    .description
+                    .contains("G9 fallback-transparency gate failed")),
+        "bead_id={BEAD_ID} case=failed_g9_gate_risk",
     );
 }
 

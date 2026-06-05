@@ -1084,6 +1084,176 @@ pub enum ArtifactKind {
     Benchmark,
 }
 
+/// Schema version for G9 fallback-transparency gate summaries.
+pub const FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION: &str = "g9_gate_summary.v1";
+
+/// Terminal status for the G9 fallback-transparency certificate gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackTransparencyGateStatus {
+    /// All fallback-transparency checks passed for the candidate manifest.
+    Pass,
+    /// One or more fallback-transparency checks failed.
+    Fail,
+}
+
+impl FallbackTransparencyGateStatus {
+    /// Stable string identifier for summaries and tests.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+/// Hash-bearing reference to one G9 proof artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FallbackTransparencyArtifactRef {
+    /// Stable artifact id in the producer's proof bundle.
+    pub artifact_id: String,
+    /// Path or URI to the artifact.
+    pub path: String,
+    /// SHA-256 content hash.
+    pub content_hash: String,
+    /// Artifact schema or logical key.
+    pub schema_version: String,
+    /// One-command validation or replay command.
+    pub validation_command: String,
+    /// Whether validation passed for this artifact.
+    pub validation_passed: bool,
+}
+
+impl FallbackTransparencyArtifactRef {
+    fn validate(&self, field: &str) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, value) in [
+            ("artifact_id", self.artifact_id.as_str()),
+            ("path", self.path.as_str()),
+            ("schema_version", self.schema_version.as_str()),
+            ("validation_command", self.validation_command.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(format!("{field}.{name} must not be empty"));
+            }
+        }
+        if !is_sha256_hex(&self.content_hash) {
+            errors.push(format!(
+                "{field}.content_hash must be a 64-char SHA-256 hex digest"
+            ));
+        }
+        if !self.validation_passed {
+            errors.push(format!("{field}.validation_passed must be true"));
+        }
+        errors
+    }
+}
+
+/// Machine-readable G9 fallback-transparency gate consumed by release certificates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FallbackTransparencyGateSummary {
+    /// Logical schema key.
+    pub schema_version: String,
+    /// Overall G9 gate status.
+    pub status: FallbackTransparencyGateStatus,
+    /// Candidate source commit.
+    pub source_commit: String,
+    /// Generation timestamp.
+    pub generated_at: String,
+    /// Machine-readable fallback-boundary inventory artifact.
+    pub inventory: FallbackTransparencyArtifactRef,
+    /// Fallback-decision schema validation artifact.
+    pub schema_validation: FallbackTransparencyArtifactRef,
+    /// Deterministic fallback-denial replay artifact.
+    pub replay_bundle: FallbackTransparencyArtifactRef,
+    /// Backend identity summary for strict certifying scenarios.
+    pub backend_identity_summary: String,
+    /// Covered fallback boundary ids.
+    pub covered_boundary_ids: Vec<String>,
+    /// Boundaries missing strict-denial or real-backend proof.
+    pub missing_boundary_ids: Vec<String>,
+    /// Artifact ids or paths that are stale for the candidate.
+    pub stale_artifacts: Vec<String>,
+    /// Certifying-mode fallback events that were allowed; any nonzero count blocks certification.
+    pub certifying_fallback_events: usize,
+    /// Non-cert compatibility controls, reported but never counted as certifying success.
+    pub non_cert_control_events: usize,
+    /// Stable failure classes for G9.5 remediation UX.
+    pub gate_failures: Vec<String>,
+    /// One-command replay path for the proof bundle.
+    pub replay_command: String,
+}
+
+impl FallbackTransparencyGateSummary {
+    /// Whether the G9 gate allows certificate generation to proceed.
+    #[must_use]
+    pub const fn gate_passed(&self) -> bool {
+        matches!(self.status, FallbackTransparencyGateStatus::Pass)
+    }
+
+    /// Validate the G9 gate summary contract.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION {
+            errors.push(format!(
+                "schema_version must be {FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION}, got {}",
+                self.schema_version
+            ));
+        }
+        for (field, value) in [
+            ("source_commit", self.source_commit.as_str()),
+            ("generated_at", self.generated_at.as_str()),
+            (
+                "backend_identity_summary",
+                self.backend_identity_summary.as_str(),
+            ),
+            ("replay_command", self.replay_command.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(format!("{field} must not be empty"));
+            }
+        }
+        if self.covered_boundary_ids.is_empty() {
+            errors.push("covered_boundary_ids must not be empty".to_owned());
+        }
+        if self
+            .covered_boundary_ids
+            .iter()
+            .any(|boundary| boundary.trim().is_empty())
+        {
+            errors.push("covered_boundary_ids must not contain empty values".to_owned());
+        }
+        for error in self.inventory.validate("inventory") {
+            errors.push(error);
+        }
+        for error in self.schema_validation.validate("schema_validation") {
+            errors.push(error);
+        }
+        for error in self.replay_bundle.validate("replay_bundle") {
+            errors.push(error);
+        }
+        if self.gate_passed() {
+            if !self.missing_boundary_ids.is_empty() {
+                errors.push("passing G9 gate must not list missing_boundary_ids".to_owned());
+            }
+            if !self.stale_artifacts.is_empty() {
+                errors.push("passing G9 gate must not list stale_artifacts".to_owned());
+            }
+            if self.certifying_fallback_events > 0 {
+                errors.push("passing G9 gate must not allow certifying fallback events".to_owned());
+            }
+            if !self.gate_failures.is_empty() {
+                errors.push("passing G9 gate must not list gate_failures".to_owned());
+            }
+        } else if self.gate_failures.is_empty() {
+            errors.push("failing G9 gate must list at least one gate_failure".to_owned());
+        }
+        errors
+    }
+}
+
 /// Complete artifact manifest for a CI gate run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactManifest {
@@ -1105,6 +1275,9 @@ pub struct ArtifactManifest {
     /// Verification contract enforcement payload (bd-1dp9.7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_contract: Option<ContractEnforcementOutcome>,
+    /// Fallback-transparency certificate gate payload (bd-2yqp6.7.9.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_transparency_gate: Option<FallbackTransparencyGateSummary>,
 }
 
 impl ArtifactManifest {
@@ -1140,10 +1313,21 @@ impl ArtifactManifest {
             }
         }
         if let Some(contract) = &self.verification_contract {
-            if contract.final_gate_passed != self.gate_passed {
+            if !contract.final_gate_passed && self.gate_passed {
                 errors.push(format!(
-                    "verification_contract.final_gate_passed={} must match gate_passed={}",
+                    "verification_contract.final_gate_passed={} cannot allow gate_passed={}",
                     contract.final_gate_passed, self.gate_passed
+                ));
+            }
+        }
+        if let Some(gate) = &self.fallback_transparency_gate {
+            for error in gate.validate() {
+                errors.push(format!("fallback_transparency_gate.{error}"));
+            }
+            if !gate.gate_passed() && self.gate_passed {
+                errors.push(format!(
+                    "fallback_transparency_gate.status={} cannot allow gate_passed=true",
+                    gate.status.as_str()
                 ));
             }
         }
@@ -1230,6 +1414,18 @@ impl ArtifactManifest {
                 contract.invalid_reference_beads,
             );
         }
+        if let Some(ref gate) = self.fallback_transparency_gate {
+            let _ = writeln!(
+                out,
+                "  G9 fallback transparency: {} covered={} missing={} stale={} certifying_fallbacks={}",
+                gate.status.as_str().to_ascii_uppercase(),
+                gate.covered_boundary_ids.len(),
+                gate.missing_boundary_ids.len(),
+                gate.stale_artifacts.len(),
+                gate.certifying_fallback_events,
+            );
+            let _ = writeln!(out, "    replay={}", gate.replay_command);
+        }
         out
     }
 }
@@ -1271,9 +1467,44 @@ pub fn build_artifact_manifest_with_contract(
     bisect_request: Option<BisectRequest>,
     verification_contract: Option<ContractEnforcementOutcome>,
 ) -> ArtifactManifest {
-    let gate_passed = verification_contract
+    build_artifact_manifest_with_contract_and_fallback_gate(
+        lane,
+        run_id,
+        git_sha,
+        seed,
+        base_gate_passed,
+        artifacts,
+        bisect_request,
+        verification_contract,
+        None,
+    )
+}
+
+/// Build an artifact manifest with both verification-contract and G9
+/// fallback-transparency gate payloads.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_artifact_manifest_with_contract_and_fallback_gate(
+    lane: CiLane,
+    run_id: &str,
+    git_sha: &str,
+    seed: u64,
+    base_gate_passed: bool,
+    artifacts: Vec<ArtifactEntry>,
+    bisect_request: Option<BisectRequest>,
+    verification_contract: Option<ContractEnforcementOutcome>,
+    fallback_transparency_gate: Option<FallbackTransparencyGateSummary>,
+) -> ArtifactManifest {
+    let contract_gate_passed = verification_contract
         .as_ref()
-        .map_or(base_gate_passed, |contract| contract.final_gate_passed);
+        .map_or(base_gate_passed, |contract| {
+            base_gate_passed && contract.final_gate_passed
+        });
+    let gate_passed = fallback_transparency_gate
+        .as_ref()
+        .map_or(contract_gate_passed, |gate| {
+            contract_gate_passed && gate.gate_passed()
+        });
 
     ArtifactManifest {
         schema_version: "1.0.0".to_owned(),
@@ -1288,7 +1519,12 @@ pub fn build_artifact_manifest_with_contract(
         bisect_request,
         bisect_result_summary: None,
         verification_contract,
+        fallback_transparency_gate,
     }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 // ---- Tests ----
@@ -1336,6 +1572,74 @@ mod tests {
                 invalid_reference_count: 0,
                 details: Vec::new(),
             }],
+        }
+    }
+
+    fn g9_artifact_ref(
+        artifact_id: &str,
+        path: &str,
+        schema_version: &str,
+    ) -> FallbackTransparencyArtifactRef {
+        FallbackTransparencyArtifactRef {
+            artifact_id: artifact_id.to_owned(),
+            path: path.to_owned(),
+            content_hash: "f".repeat(64),
+            schema_version: schema_version.to_owned(),
+            validation_command: "rch exec -- cargo test -p fsqlite-core --test agent_swarm_fallback_transparency_contract deterministic_fallback_denial_replay -- --nocapture".to_owned(),
+            validation_passed: true,
+        }
+    }
+
+    fn passing_fallback_transparency_gate() -> FallbackTransparencyGateSummary {
+        FallbackTransparencyGateSummary {
+            schema_version: FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION.to_owned(),
+            status: FallbackTransparencyGateStatus::Pass,
+            source_commit: "abc123".to_owned(),
+            generated_at: "2026-06-05T10:00:00Z".to_owned(),
+            inventory: g9_artifact_ref(
+                "fallback_boundary_inventory",
+                "docs/contracts/fallback_boundary_inventory.toml",
+                "fallback_boundary_inventory.v1",
+            ),
+            schema_validation: g9_artifact_ref(
+                "fallback_decision_schema",
+                "crates/fsqlite-core/tests/agent_swarm_fallback_transparency_contract.rs",
+                "fallback_decision_schema.v1",
+            ),
+            replay_bundle: g9_artifact_ref(
+                "fallback_denial_replay",
+                "artifacts/g9/fallback_denial_replay_summary.json",
+                "fallback_denial_replay.v1",
+            ),
+            backend_identity_summary: "fsqlite:pager_wal_mvcc_btree:parity_cert_strict".to_owned(),
+            covered_boundary_ids: vec![
+                "conn.select.with_clause_materialization".to_owned(),
+                "conn.select.view_materialization".to_owned(),
+                "vdbe.open_storage_cursor.mempage_fallback".to_owned(),
+            ],
+            missing_boundary_ids: Vec::new(),
+            stale_artifacts: Vec::new(),
+            certifying_fallback_events: 0,
+            non_cert_control_events: 1,
+            gate_failures: Vec::new(),
+            replay_command: "rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-g9-fallback-denial-replay-target cargo test -p fsqlite-core --test agent_swarm_fallback_transparency_contract deterministic_fallback_denial_replay -- --nocapture".to_owned(),
+        }
+    }
+
+    fn failing_fallback_transparency_gate() -> FallbackTransparencyGateSummary {
+        FallbackTransparencyGateSummary {
+            status: FallbackTransparencyGateStatus::Fail,
+            missing_boundary_ids: vec![
+                "conn.select.sqlite_schema_virtual_materialization".to_owned(),
+            ],
+            stale_artifacts: vec!["fallback_denial_replay".to_owned()],
+            certifying_fallback_events: 1,
+            gate_failures: vec![
+                "missing_boundary_coverage".to_owned(),
+                "certifying_fallback_allowed".to_owned(),
+                "stale_fallback_artifact".to_owned(),
+            ],
+            ..passing_fallback_transparency_gate()
         }
     }
 
@@ -1898,6 +2202,7 @@ mod tests {
             bisect_request: None,
             bisect_result_summary: None,
             verification_contract: None,
+            fallback_transparency_gate: None,
         };
         let errors = manifest.validate();
         assert!(
@@ -1948,6 +2253,65 @@ mod tests {
             errors
                 .iter()
                 .any(|error| { error.contains("verification_contract.final_gate_passed") })
+        );
+    }
+
+    #[test]
+    fn fallback_transparency_gate_validation_passes_for_complete_summary() {
+        let gate = passing_fallback_transparency_gate();
+        let errors = gate.validate();
+        assert!(errors.is_empty(), "G9 gate should validate: {errors:?}");
+    }
+
+    #[test]
+    fn artifact_manifest_with_fallback_gate_blocks_gate_when_g9_fails() {
+        let manifest = build_artifact_manifest_with_contract_and_fallback_gate(
+            CiLane::SchemaValidation,
+            "run-g9-block",
+            "abc123",
+            42,
+            true,
+            Vec::new(),
+            None,
+            Some(synthetic_contract_outcome(true, true)),
+            Some(failing_fallback_transparency_gate()),
+        );
+
+        assert!(
+            !manifest.gate_passed,
+            "G9 fallback-transparency failure should block final gate pass"
+        );
+        let errors = manifest.validate();
+        assert!(
+            errors.is_empty(),
+            "failing G9 manifest is internally valid: {errors:?}"
+        );
+        let summary = manifest.render_summary();
+        assert!(summary.contains("G9 fallback transparency: FAIL"));
+        assert!(summary.contains("certifying_fallbacks=1"));
+    }
+
+    #[test]
+    fn artifact_manifest_validate_flags_fallback_gate_mismatch() {
+        let mut manifest = build_artifact_manifest_with_contract_and_fallback_gate(
+            CiLane::SchemaValidation,
+            "run-g9-mismatch",
+            "abc123",
+            42,
+            true,
+            Vec::new(),
+            None,
+            Some(synthetic_contract_outcome(true, true)),
+            Some(failing_fallback_transparency_gate()),
+        );
+
+        manifest.gate_passed = true;
+        let errors = manifest.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("fallback_transparency_gate.status")),
+            "expected G9 gate mismatch validation error: {errors:?}"
         );
     }
 
