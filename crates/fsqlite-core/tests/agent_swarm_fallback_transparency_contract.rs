@@ -7,6 +7,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const FALLBACK_BOUNDARY_INVENTORY: &str =
     include_str!("../../../docs/contracts/fallback_boundary_inventory.toml");
+const G9_FALLBACK_DENIAL_REPLAY_SCRIPT: &str =
+    include_str!("../../../scripts/verify_g9_fallback_denial_replay.sh");
 const CONNECTION_SOURCE: &str = include_str!("../src/connection.rs");
 const E2E_EXECUTOR_SOURCE: &str = include_str!("../../fsqlite-e2e/src/fsqlite_executor.rs");
 const VDBE_ENGINE_SOURCE: &str = include_str!("../../fsqlite-vdbe/src/engine.rs");
@@ -101,6 +103,218 @@ struct FallbackDecisionEvent<'a> {
     source_touchpoint: &'a str,
     first_failure_diag: &'a str,
 }
+
+#[derive(Clone, Copy)]
+enum ReplayOperation {
+    Execute,
+    Query,
+}
+
+#[derive(Clone, Copy)]
+struct StrictSqlReplayScenario {
+    scenario_id: &'static str,
+    setup_sql: &'static [&'static str],
+    operation: ReplayOperation,
+    sql: &'static str,
+    statement_kind: &'static str,
+    decision_reason: &'static str,
+    fallback_boundary: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct ReplayMatrixScenario {
+    scenario_id: &'static str,
+    boundary_id: &'static str,
+    statement_kind: &'static str,
+    decision_reason: &'static str,
+    decision_outcome: &'static str,
+    certifying_mode: bool,
+    strict_mode: bool,
+    backend_identity: &'static str,
+    source_touchpoint: &'static str,
+}
+
+const G9_REPLAY_COMMAND: &str = "rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-g9-fallback-denial-replay-target cargo test -p fsqlite-core --test agent_swarm_fallback_transparency_contract deterministic_fallback_denial_replay -- --nocapture";
+
+const STRICT_SQL_REPLAY_SCENARIOS: &[StrictSqlReplayScenario] = &[
+    StrictSqlReplayScenario {
+        scenario_id: "g9-deny-select-cte",
+        setup_sql: &[],
+        operation: ReplayOperation::Query,
+        sql: "WITH c(x) AS (SELECT 1) SELECT x FROM c;",
+        statement_kind: "select",
+        decision_reason: "with_clause_materialization",
+        fallback_boundary: "conn.select.with_clause_materialization",
+    },
+    StrictSqlReplayScenario {
+        scenario_id: "g9-deny-view-materialization",
+        setup_sql: &[
+            "CREATE TABLE g9_jobs(id INTEGER PRIMARY KEY, status TEXT);",
+            "INSERT INTO g9_jobs(status) VALUES ('ready');",
+            "CREATE VIEW g9_ready_jobs AS SELECT status FROM g9_jobs WHERE status = 'ready';",
+        ],
+        operation: ReplayOperation::Query,
+        sql: "SELECT status FROM g9_ready_jobs;",
+        statement_kind: "select",
+        decision_reason: "view_materialization",
+        fallback_boundary: "conn.select.view_materialization",
+    },
+    StrictSqlReplayScenario {
+        scenario_id: "g9-deny-sqlite-schema",
+        setup_sql: &["CREATE TABLE g9_schema_probe(id INTEGER PRIMARY KEY);"],
+        operation: ReplayOperation::Query,
+        sql: "SELECT name FROM sqlite_schema WHERE type = 'table';",
+        statement_kind: "select",
+        decision_reason: "sqlite_schema_virtual_materialization",
+        fallback_boundary: "conn.select.sqlite_schema_virtual_materialization",
+    },
+    StrictSqlReplayScenario {
+        scenario_id: "g9-deny-insert-cte",
+        setup_sql: &["CREATE TABLE g9_insert_cte_dst(x INTEGER);"],
+        operation: ReplayOperation::Execute,
+        sql: "WITH c(x) AS (SELECT 1) INSERT INTO g9_insert_cte_dst(x) SELECT x FROM c;",
+        statement_kind: "insert",
+        decision_reason: "with_clause_materialization",
+        fallback_boundary: "conn.insert.with_clause_materialization",
+    },
+    StrictSqlReplayScenario {
+        scenario_id: "g9-deny-insert-select-replay",
+        setup_sql: &[
+            "CREATE TABLE g9_insert_select_src(x INTEGER);",
+            "CREATE TABLE g9_insert_select_dst(x INTEGER);",
+            "INSERT INTO g9_insert_select_src(x) VALUES (1), (2);",
+        ],
+        operation: ReplayOperation::Execute,
+        sql: "INSERT INTO g9_insert_select_dst(x) SELECT x FROM g9_insert_select_src WHERE x > 0;",
+        statement_kind: "insert_select",
+        decision_reason: "insert_select_row_by_row_fallback",
+        fallback_boundary: "conn.insert_select.insert_select_row_by_row_fallback",
+    },
+];
+
+const REPLAY_MATRIX_SCENARIOS: &[ReplayMatrixScenario] = &[
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-select-cte",
+        boundary_id: "conn.select.with_clause_materialization",
+        statement_kind: "select",
+        decision_reason: "with_clause_materialization",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:select:with_clause_materialization",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-view-materialization",
+        boundary_id: "conn.select.view_materialization",
+        statement_kind: "select",
+        decision_reason: "view_materialization",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:select:view_materialization",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-sqlite-schema",
+        boundary_id: "conn.select.sqlite_schema_virtual_materialization",
+        statement_kind: "select",
+        decision_reason: "sqlite_schema_virtual_materialization",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:select:sqlite_schema_virtual_materialization",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-insert-cte",
+        boundary_id: "conn.insert.with_clause_materialization",
+        statement_kind: "insert",
+        decision_reason: "with_clause_materialization",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:insert:with_clause_materialization",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-update-cte",
+        boundary_id: "conn.update.with_clause_materialization",
+        statement_kind: "update",
+        decision_reason: "with_clause_materialization",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:update:with_clause_materialization",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-delete-cte",
+        boundary_id: "conn.delete.with_clause_materialization",
+        statement_kind: "delete",
+        decision_reason: "with_clause_materialization",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:delete:with_clause_materialization",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-insert-select-replay",
+        boundary_id: "conn.insert_select.insert_select_row_by_row_fallback",
+        statement_kind: "insert_select",
+        decision_reason: "insert_select_row_by_row_fallback",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "execute_statement_dispatch:insert_select:insert_select_row_by_row_fallback",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-materialized-temp-table",
+        boundary_id: "conn.statement.materialized_temp_table_execution",
+        statement_kind: "statement",
+        decision_reason: "materialized_temp_table_execution",
+        decision_outcome: "denied",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "memory:parity_cert_strict",
+        source_touchpoint: "internal_mem_fallback_guard:statement:materialized_temp_table_execution",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-deny-vdbe-mempage",
+        boundary_id: "vdbe.open_cursor.parity_cert_rejection",
+        statement_kind: "vdbe_open_cursor",
+        decision_reason: "parity_cert_rejection",
+        decision_outcome: "vdbe_mempage_fallback_rejected",
+        certifying_mode: true,
+        strict_mode: false,
+        backend_identity: "mem:parity_cert",
+        source_touchpoint: "VdbeEngine::open_storage_cursor",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-control-real-backend",
+        boundary_id: "vdbe.open_cursor.valid_btree_page",
+        statement_kind: "vdbe_open_cursor",
+        decision_reason: "valid_btree_page",
+        decision_outcome: "real_backend_dispatch",
+        certifying_mode: true,
+        strict_mode: true,
+        backend_identity: "txn:parity_cert_strict",
+        source_touchpoint: "VdbeEngine::open_storage_cursor",
+    },
+    ReplayMatrixScenario {
+        scenario_id: "g9-control-non-cert-view",
+        boundary_id: "conn.select.view_materialization",
+        statement_kind: "select",
+        decision_reason: "view_materialization",
+        decision_outcome: "allowed_compatibility_fallback",
+        certifying_mode: false,
+        strict_mode: false,
+        backend_identity: "memory:fallback_allowed",
+        source_touchpoint: "execute_statement_dispatch:select:view_materialization",
+    },
+];
 
 fn sql_text(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -511,6 +725,66 @@ fn inventory_has_decision_reason(reason: &str) -> bool {
     FALLBACK_BOUNDARY_INVENTORY.contains(&format!("decision_reason = \"{reason}\""))
 }
 
+fn inventory_has_boundary_id(boundary_id: &str) -> bool {
+    FALLBACK_BOUNDARY_INVENTORY.contains(&format!("boundary_id = \"{boundary_id}\""))
+}
+
+fn assert_strict_replay_denial(scenario: &StrictSqlReplayScenario) -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir
+        .path()
+        .join(format!("{}.db", scenario.scenario_id.replace('-', "_")));
+    let db = db_path.to_string_lossy();
+    let conn = Connection::open(db.as_ref())?;
+    assert!(
+        conn.is_concurrent_mode_default(),
+        "G9 replay scenarios must not disable concurrent-writer mode"
+    );
+
+    for setup in scenario.setup_sql {
+        conn.execute(setup)?;
+    }
+    conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")?;
+
+    let error = match scenario.operation {
+        ReplayOperation::Execute => conn
+            .execute(scenario.sql)
+            .map(|_| ())
+            .expect_err("strict replay scenario should deny compatibility fallback"),
+        ReplayOperation::Query => conn
+            .query(scenario.sql)
+            .map(|_| ())
+            .expect_err("strict replay scenario should deny compatibility fallback"),
+    };
+    let message = error.to_string();
+    for expected in [
+        "in-memory fallback disabled in strict parity-cert mode",
+        &format!("statement_kind={}", scenario.statement_kind),
+        &format!("decision_reason={}", scenario.decision_reason),
+        "decision_outcome=denied",
+        &format!("fallback_boundary={}", scenario.fallback_boundary),
+        "source_touchpoint=",
+        "first_failure_diag=",
+    ] {
+        assert!(
+            message.contains(expected),
+            "{} did not include {expected:?}: {message}",
+            scenario.scenario_id
+        );
+    }
+    Ok(())
+}
+
+fn replay_matrix_first_failure_diag(scenario: &ReplayMatrixScenario) -> String {
+    format!(
+        "statement_kind={}; fallback_boundary={}; source_touchpoint={}; decision_reason={}",
+        scenario.statement_kind,
+        scenario.boundary_id,
+        scenario.source_touchpoint,
+        scenario.decision_reason
+    )
+}
+
 fn quoted_literals_after(source: &'static str, start: usize, max_len: usize) -> Vec<&'static str> {
     let end = source.len().min(start.saturating_add(max_len));
     let mut rest = &source[start..end];
@@ -877,6 +1151,166 @@ fn strict_denial_error_names_fallback_boundary_and_outcome() -> TestResult {
     }
 
     Ok(())
+}
+
+#[test]
+fn deterministic_fallback_denial_replay_matrix_covers_inventory_and_controls() -> TestResult {
+    assert!(
+        REPLAY_MATRIX_SCENARIOS.len() >= 10,
+        "G9.3 replay matrix must include strict denials plus controls"
+    );
+
+    let mut scenario_ids = BTreeSet::new();
+    let mut strict_denials = 0;
+    let mut non_cert_controls = 0;
+    let mut real_backend_controls = 0;
+    let conn = Connection::open(":memory:")?;
+    install_fallback_schema(&conn)?;
+
+    for (idx, scenario) in REPLAY_MATRIX_SCENARIOS.iter().copied().enumerate() {
+        assert!(
+            scenario_ids.insert(scenario.scenario_id),
+            "duplicate G9 replay scenario id {}",
+            scenario.scenario_id
+        );
+        assert!(
+            inventory_has_boundary_id(scenario.boundary_id),
+            "G9 replay scenario {} references boundary missing from inventory: {}",
+            scenario.scenario_id,
+            scenario.boundary_id
+        );
+        assert!(
+            inventory_has_decision_reason(scenario.decision_reason),
+            "G9 replay scenario {} references reason missing from inventory: {}",
+            scenario.scenario_id,
+            scenario.decision_reason
+        );
+
+        let first_failure_diag = replay_matrix_first_failure_diag(&scenario);
+        let event = FallbackDecisionEvent {
+            trace_id: "trace-g9-replay-matrix",
+            run_id: "run-g9-replay-matrix",
+            scenario_id: scenario.scenario_id,
+            statement_fingerprint: scenario.scenario_id,
+            statement_kind: scenario.statement_kind,
+            backend_identity: scenario.backend_identity,
+            fallback_boundary: scenario.boundary_id,
+            decision_reason: scenario.decision_reason,
+            certifying_mode: scenario.certifying_mode,
+            strict_mode: scenario.strict_mode,
+            decision_outcome: scenario.decision_outcome,
+            source_touchpoint: scenario.source_touchpoint,
+            first_failure_diag: first_failure_diag.as_str(),
+        };
+        record_fallback_decision_event(
+            &conn,
+            i64::try_from(idx + 1).expect("G9 replay matrix event count fits i64"),
+            event,
+        )?;
+
+        let known_outcome = match scenario.decision_outcome {
+            "denied" | "vdbe_mempage_fallback_rejected" => {
+                assert!(
+                    scenario.certifying_mode,
+                    "strict-denial replay {} must be certifying",
+                    scenario.scenario_id
+                );
+                strict_denials += 1;
+                true
+            }
+            "allowed_compatibility_fallback" | "intentional_time_travel_snapshot" => {
+                assert!(
+                    !scenario.certifying_mode,
+                    "compatibility control {} must not certify parity",
+                    scenario.scenario_id
+                );
+                non_cert_controls += 1;
+                true
+            }
+            "real_backend_dispatch" | "real_backend_refresh" => {
+                assert!(
+                    scenario.certifying_mode,
+                    "real-backend control {} should run in certifying mode",
+                    scenario.scenario_id
+                );
+                real_backend_controls += 1;
+                true
+            }
+            _ => false,
+        };
+        assert!(
+            known_outcome,
+            "G9 replay matrix scenario {} used unsupported outcome {}",
+            scenario.scenario_id, scenario.decision_outcome
+        );
+    }
+
+    assert!(
+        strict_denials >= 8,
+        "G9.3 should cover a broad strict-denial matrix, saw {strict_denials}"
+    );
+    assert!(
+        non_cert_controls >= 1,
+        "G9.3 must keep non-cert compatibility controls separate"
+    );
+    assert!(
+        real_backend_controls >= 1,
+        "G9.3 must include at least one positive real-backend control"
+    );
+
+    let rows = conn.query(
+        "SELECT decision_outcome, count(*)
+           FROM fsqlite_fallback_decision_events_contract
+          GROUP BY decision_outcome
+          ORDER BY decision_outcome;",
+    )?;
+    assert!(
+        rows.len() >= 4,
+        "G9 replay matrix should persist denied, VDBE rejected, real-backend, and non-cert outcomes"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn deterministic_fallback_denial_replay_exercises_real_strict_sql_boundaries() -> TestResult {
+    for scenario in STRICT_SQL_REPLAY_SCENARIOS {
+        assert!(
+            inventory_has_boundary_id(scenario.fallback_boundary),
+            "strict SQL replay scenario {} references boundary missing from inventory: {}",
+            scenario.scenario_id,
+            scenario.fallback_boundary
+        );
+        assert!(
+            inventory_has_decision_reason(scenario.decision_reason),
+            "strict SQL replay scenario {} references reason missing from inventory: {}",
+            scenario.scenario_id,
+            scenario.decision_reason
+        );
+        assert_strict_replay_denial(scenario)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn deterministic_fallback_denial_replay_script_is_copyable_rch_gate() {
+    for expected in [
+        "BEAD_ID=\"bd-2yqp6.7.9.3\"",
+        "FSQLITE_G9_REPLAY_ARTIFACT_ROOT",
+        "fallback_denial_replay_summary.json",
+        "fallback_denial_replay_test.log",
+        "rch exec -- env CARGO_TARGET_DIR=",
+        "cargo test -p fsqlite-core --test agent_swarm_fallback_transparency_contract deterministic_fallback_denial_replay -- --nocapture",
+    ] {
+        assert!(
+            G9_FALLBACK_DENIAL_REPLAY_SCRIPT.contains(expected),
+            "G9 replay script must contain {expected:?}"
+        );
+    }
+    assert!(
+        G9_REPLAY_COMMAND.contains("rch exec -- env CARGO_TARGET_DIR="),
+        "documented G9 replay command must offload cargo through rch"
+    );
 }
 
 #[test]

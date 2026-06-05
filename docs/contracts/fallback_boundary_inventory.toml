@@ -387,7 +387,7 @@ covered_by_test = "fallback_boundary_inventory_covers_runtime_reason_strings"
 notes = "The boundary protects against certifying a known VDBE correlated-EXISTS gap."
 
 [[boundary]]
-boundary_id = "conn.insert.insert_select_row_by_row_fallback"
+boundary_id = "conn.insert_select.insert_select_row_by_row_fallback"
 boundary_family = "connection_dispatch"
 statement_kind = "insert_select"
 trigger_condition = "INSERT SELECT is complex or must replay rows for triggers or foreign keys."
@@ -405,7 +405,7 @@ covered_by_test = "fallback_boundary_inventory_covers_runtime_reason_strings"
 notes = "Known-benign non-strict compatibility path for trigger and FK side effects."
 
 [[boundary]]
-boundary_id = "conn.insert.insert_values_row_by_row_trigger_or_fk_fallback"
+boundary_id = "conn.insert_values.insert_values_row_by_row_trigger_or_fk_fallback"
 boundary_family = "connection_dispatch"
 statement_kind = "insert_values"
 trigger_condition = "Multi-row INSERT VALUES needs trigger or foreign-key row-by-row replay."
@@ -423,7 +423,7 @@ covered_by_test = "fallback_boundary_inventory_covers_runtime_reason_strings"
 notes = "This row is intentionally separate from INSERT SELECT replay."
 
 [[boundary]]
-boundary_id = "conn.insert.morsel_insert_dispatch"
+boundary_id = "conn.insert_values.morsel_insert_dispatch"
 boundary_family = "connection_dispatch"
 statement_kind = "insert_values"
 trigger_condition = "Large trigger-free multi-row VALUES input routes through morsel-driven row batching."
