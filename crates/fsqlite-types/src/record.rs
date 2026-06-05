@@ -4533,6 +4533,48 @@ mod tests {
         assert!(out.capacity() >= initial_cap, "capacity must not shrink");
     }
 
+    #[test]
+    fn encode_batch_multi_row_uses_preallocated_contiguous_buffer() {
+        let rows = vec![
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Null,
+            ],
+            vec![
+                SqliteValue::Integer(i64::MIN),
+                SqliteValue::Blob(Arc::from([0xCA_u8, 0xFE, 0xBA, 0xBE].as_slice())),
+                SqliteValue::Float(-0.0),
+            ],
+            vec![
+                SqliteValue::Integer(i64::MAX),
+                SqliteValue::Text("omega".into()),
+                SqliteValue::Float(42.25),
+            ],
+        ];
+        let row_refs: Vec<&[SqliteValue]> = rows.iter().map(Vec::as_slice).collect();
+        let (expected_bytes, expected_offsets) = concat_scalar_encodings(&rows);
+        let mut out = Vec::with_capacity(expected_bytes.len());
+        let initial_cap = out.capacity();
+        let mut offsets = Vec::with_capacity(rows.len());
+
+        encode_batch(&row_refs, &mut out, &mut offsets).expect("encode_batch must succeed");
+
+        assert_eq!(
+            out, expected_bytes,
+            "multi-row batch must stay byte-identical to scalar record encoding"
+        );
+        assert_eq!(
+            offsets, expected_offsets,
+            "multi-row offsets must describe each record in the contiguous output"
+        );
+        assert_eq!(
+            out.capacity(),
+            initial_cap,
+            "multi-row batch should fill the preplanned contiguous buffer without growing it"
+        );
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(100))]
 
