@@ -18,20 +18,22 @@
 //! - `Infinity` and `-Infinity` are rejected
 //! - `Date` inputs are stored as ISO 8601 `TEXT`
 
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Once;
 
+#[cfg(feature = "memory-options")]
+use fsqlite_core::connection::ConnectionEnv;
 #[cfg(feature = "diagnostics")]
 use fsqlite_core::connection::ConnectionMemoryStats;
 #[cfg(feature = "prepared-statements")]
 use fsqlite_core::connection::PreparedStatement as CorePreparedStatement;
-use fsqlite_core::connection::{Connection as CoreConnection, ConnectionEnv, Row as CoreRow};
+use fsqlite_core::connection::{Connection as CoreConnection, Row as CoreRow};
 use fsqlite_error::FrankenError;
 use fsqlite_types::{SmallText, SqliteValue};
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 use js_sys::Function;
 use js_sys::{Array, BigInt, Date, Number, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
@@ -45,10 +47,11 @@ pub use fsqlite_planner as planner;
 pub use fsqlite_types as types;
 
 static WASM_RUNTIME_INIT: Once = Once::new();
+#[cfg(any(feature = "diagnostics", feature = "memory-options"))]
 const WASM_LINEAR_MEMORY_PAGE_BYTES: usize = 64 * 1024;
-#[cfg(not(feature = "diagnostics"))]
+#[cfg(not(all(feature = "diagnostics", feature = "memory-options")))]
 const WASM_OUT_OF_MEMORY_MESSAGE: &str = "FrankenSQLite WASM ran out of memory";
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 const WASM_OUT_OF_MEMORY_MESSAGE: &str = "FrankenSQLite WASM ran out of memory; adjust memory.maxPages or memory.maxBytes, \
      memory.growthChunkPages or memory.growthChunkBytes, or pageBufferMax, and remember \
      the browser WebAssembly linear-memory ceiling is 4 GiB";
@@ -120,13 +123,13 @@ struct FrankenDbState {
     #[cfg(feature = "diagnostics")]
     path: String,
     inner: RefCell<Option<CoreConnection>>,
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     memory_warning_threshold_bytes: Cell<Option<usize>>,
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     memory_warning_threshold_percent: Cell<Option<usize>>,
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     memory_warning_above_threshold: Cell<bool>,
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     memory_warning_callback: RefCell<Option<Function>>,
 }
 
@@ -137,6 +140,7 @@ struct PreparedMetadata {
 }
 
 #[derive(Default, Clone)]
+#[cfg(feature = "memory-options")]
 struct WasmDatabaseOptions {
     page_buffer_max: Option<usize>,
     initial_reserve_bytes: Option<usize>,
@@ -150,6 +154,7 @@ struct WasmDatabaseOptions {
     warning_callback: Option<Function>,
 }
 
+#[cfg(feature = "memory-options")]
 impl WasmDatabaseOptions {
     #[cfg(feature = "diagnostics")]
     fn effective_warning_threshold_bytes(&self) -> Result<Option<usize>, FrankenError> {
@@ -206,7 +211,7 @@ impl WasmDatabaseOptions {
     }
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 fn memory_warning_transition(
     estimated_used_bytes: usize,
     threshold: usize,
@@ -234,10 +239,15 @@ impl FrankenDb {
     pub fn new(name: Option<String>) -> Result<Self, JsValue> {
         install_wasm_runtime();
         let path = name.unwrap_or_else(|| ":memory:".to_owned());
-        let options = WasmDatabaseOptions::default();
-        let conn =
-            open_core_connection_with_options(&path, &options).map_err(franken_error_to_js)?;
-        Self::from_parts(path, conn, options)
+        let conn = open_core_connection(&path).map_err(franken_error_to_js)?;
+        #[cfg(feature = "memory-options")]
+        {
+            Self::from_parts(path, conn, WasmDatabaseOptions::default())
+        }
+        #[cfg(not(feature = "memory-options"))]
+        {
+            Self::from_parts(path, conn)
+        }
     }
 
     #[wasm_bindgen(js_name = open)]
@@ -245,6 +255,7 @@ impl FrankenDb {
         Self::new(name)
     }
 
+    #[cfg(feature = "memory-options")]
     #[wasm_bindgen(js_name = openWithOptions)]
     pub fn open_with_options(
         name: Option<String>,
@@ -262,13 +273,18 @@ impl FrankenDb {
     #[wasm_bindgen(js_name = import)]
     pub fn import(data: Uint8Array) -> Result<Self, JsValue> {
         install_wasm_runtime();
-        let options = WasmDatabaseOptions::default();
-        let conn = import_core_connection_with_options(&data.to_vec(), &options)
-            .map_err(franken_error_to_js)?;
-        Self::from_parts(":memory:".to_owned(), conn, options)
+        let conn = import_core_connection(&data.to_vec()).map_err(franken_error_to_js)?;
+        #[cfg(feature = "memory-options")]
+        {
+            Self::from_parts(":memory:".to_owned(), conn, WasmDatabaseOptions::default())
+        }
+        #[cfg(not(feature = "memory-options"))]
+        {
+            Self::from_parts(":memory:".to_owned(), conn)
+        }
     }
 
-    #[cfg(feature = "backup")]
+    #[cfg(all(feature = "backup", feature = "memory-options"))]
     #[wasm_bindgen(js_name = importWithOptions)]
     pub fn import_with_options(
         data: Uint8Array,
@@ -384,32 +400,32 @@ impl FrankenDb {
     fn from_parts(
         path: String,
         conn: CoreConnection,
-        options: WasmDatabaseOptions,
+        #[cfg(feature = "memory-options")] options: WasmDatabaseOptions,
     ) -> Result<Self, JsValue> {
         #[cfg(not(feature = "diagnostics"))]
         let _ = &path;
-        #[cfg(not(feature = "diagnostics"))]
+        #[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
         let _ = &options;
         let db = Self {
             state: Rc::new(FrankenDbState {
                 #[cfg(feature = "diagnostics")]
                 path,
                 inner: RefCell::new(Some(conn)),
-                #[cfg(feature = "diagnostics")]
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                 memory_warning_threshold_bytes: Cell::new(
                     options
                         .effective_warning_threshold_bytes()
                         .map_err(franken_error_to_js)?,
                 ),
-                #[cfg(feature = "diagnostics")]
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                 memory_warning_threshold_percent: Cell::new(options.warning_threshold_percent),
-                #[cfg(feature = "diagnostics")]
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                 memory_warning_above_threshold: Cell::new(false),
-                #[cfg(feature = "diagnostics")]
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                 memory_warning_callback: RefCell::new(options.warning_callback),
             }),
         };
-        #[cfg(feature = "diagnostics")]
+        #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
         db.state.observe_memory_warning();
         Ok(db)
     }
@@ -434,7 +450,7 @@ impl FrankenDbState {
         })?;
         match f(conn) {
             Ok(value) => {
-                #[cfg(feature = "diagnostics")]
+                #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                 self.observe_memory_warning();
                 Ok(value)
             }
@@ -455,12 +471,18 @@ impl FrankenDbState {
         connection_memory_stats_to_js(
             conn,
             stats,
+            #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
             self.memory_warning_threshold_bytes.get(),
+            #[cfg(not(all(feature = "diagnostics", feature = "memory-options")))]
+            None,
+            #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
             self.memory_warning_threshold_percent.get(),
+            #[cfg(not(all(feature = "diagnostics", feature = "memory-options")))]
+            None,
         )
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     fn observe_memory_warning(&self) {
         let Some(threshold) = self.memory_warning_threshold_bytes.get() else {
             return;
@@ -511,8 +533,14 @@ impl FrankenDbState {
                 && let Ok(stats_js) = connection_memory_stats_to_js(
                     conn,
                     stats,
+                    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                     self.memory_warning_threshold_bytes.get(),
+                    #[cfg(not(all(feature = "diagnostics", feature = "memory-options")))]
+                    None,
+                    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
                     self.memory_warning_threshold_percent.get(),
+                    #[cfg(not(all(feature = "diagnostics", feature = "memory-options")))]
+                    None,
                 )
             {
                 let _ = set_property(&object, "memoryStats", &stats_js);
@@ -522,6 +550,7 @@ impl FrankenDbState {
     }
 }
 
+#[cfg(feature = "memory-options")]
 fn open_core_connection_with_options(
     path: &str,
     options: &WasmDatabaseOptions,
@@ -531,6 +560,11 @@ fn open_core_connection_with_options(
 }
 
 #[cfg(feature = "backup")]
+fn import_core_connection(bytes: &[u8]) -> Result<CoreConnection, FrankenError> {
+    CoreConnection::import_bytes(bytes)
+}
+
+#[cfg(all(feature = "backup", feature = "memory-options"))]
 fn import_core_connection_with_options(
     bytes: &[u8],
     options: &WasmDatabaseOptions,
@@ -539,11 +573,11 @@ fn import_core_connection_with_options(
     CoreConnection::import_bytes_with_env(bytes, env)
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
 fn open_core_connection(path: &str) -> Result<CoreConnection, FrankenError> {
-    open_core_connection_with_options(path, &WasmDatabaseOptions::default())
+    CoreConnection::open(path)
 }
 
+#[cfg(feature = "memory-options")]
 fn connection_env_from_options(
     options: &WasmDatabaseOptions,
 ) -> Result<ConnectionEnv, FrankenError> {
@@ -1019,6 +1053,7 @@ fn describe_js_value(value: &JsValue) -> String {
         .unwrap_or_else(|| "unknown JavaScript value".to_owned())
 }
 
+#[cfg(feature = "memory-options")]
 fn parse_database_options(options: Option<JsValue>) -> Result<WasmDatabaseOptions, JsValue> {
     let Some(options) = options.filter(|value| !value.is_null() && !value.is_undefined()) else {
         return Ok(WasmDatabaseOptions::default());
@@ -1096,6 +1131,7 @@ fn parse_database_options(options: Option<JsValue>) -> Result<WasmDatabaseOption
     Ok(parsed)
 }
 
+#[cfg(feature = "memory-options")]
 fn get_optional_property(object: &JsValue, key: &str) -> Result<Option<JsValue>, FrankenError> {
     let value = Reflect::get(object, &JsValue::from_str(key)).map_err(|error| {
         FrankenError::internal(format!(
@@ -1110,6 +1146,7 @@ fn get_optional_property(object: &JsValue, key: &str) -> Result<Option<JsValue>,
     }
 }
 
+#[cfg(feature = "memory-options")]
 fn parse_optional_usize_property(
     object: &JsValue,
     key: &str,
@@ -1120,7 +1157,7 @@ fn parse_optional_usize_property(
     parse_js_usize(&value, key).map(Some)
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 fn parse_optional_percent_property(
     object: &JsValue,
     key: &str,
@@ -1138,7 +1175,7 @@ fn parse_optional_percent_property(
     Ok(Some(percent))
 }
 
-#[cfg(not(feature = "diagnostics"))]
+#[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
 fn reject_diagnostics_memory_options(object: &JsValue) -> Result<(), FrankenError> {
     for key in ["warningThresholdBytes", "warnAtPercent", "onWarning"] {
         if get_optional_property(object, key)?.is_some() {
@@ -1151,7 +1188,7 @@ fn reject_diagnostics_memory_options(object: &JsValue) -> Result<(), FrankenErro
     Ok(())
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 fn parse_optional_function_property(
     object: &JsValue,
     key: &str,
@@ -1169,6 +1206,7 @@ fn parse_optional_function_property(
         .map(Some)
 }
 
+#[cfg(feature = "memory-options")]
 fn parse_js_usize(value: &JsValue, key: &str) -> Result<usize, FrankenError> {
     let Some(number) = value.as_f64() else {
         return Err(FrankenError::TypeMismatch {
@@ -1192,6 +1230,7 @@ fn parse_js_usize(value: &JsValue, key: &str) -> Result<usize, FrankenError> {
     })
 }
 
+#[cfg(feature = "memory-options")]
 fn resolve_byte_or_page_memory_setting(
     byte_value: Option<usize>,
     page_value: Option<usize>,
@@ -1215,6 +1254,7 @@ fn resolve_byte_or_page_memory_setting(
     }
 }
 
+#[cfg(feature = "memory-options")]
 fn wasm_pages_to_bytes(pages: usize, key: &str) -> Result<usize, FrankenError> {
     pages
         .checked_mul(WASM_LINEAR_MEMORY_PAGE_BYTES)
@@ -1224,7 +1264,7 @@ fn wasm_pages_to_bytes(pages: usize, key: &str) -> Result<usize, FrankenError> {
         })
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 fn threshold_bytes_from_percent(max_bytes: usize, percent: usize) -> Result<usize, FrankenError> {
     max_bytes
         .checked_mul(percent)
@@ -1637,6 +1677,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "memory-options")]
     fn set_js_number_property(object: &Object, key: &str, value: usize) {
         set_property(object, key, &JsValue::from_f64(value as f64)).unwrap();
     }
@@ -1656,6 +1697,7 @@ mod tests {
             .as_string()
     }
 
+    #[cfg(feature = "memory-options")]
     fn js_error_message_field(error: &JsValue) -> String {
         Reflect::get(error, &JsValue::from_str("message"))
             .unwrap()
@@ -1720,6 +1762,7 @@ mod tests {
         assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
     }
 
+    #[cfg(feature = "memory-options")]
     #[test]
     fn core_connection_memory_stats_follow_wasm_memory_options() {
         let _guard = host_connection_test_guard();
@@ -1728,6 +1771,12 @@ mod tests {
             initial_reserve_bytes: Some(64 * 1024),
             growth_chunk_bytes: Some(16 * 1024),
             max_bytes: Some(128 * 1024),
+            #[cfg(feature = "diagnostics")]
+            warning_threshold_bytes: None,
+            #[cfg(feature = "diagnostics")]
+            warning_threshold_percent: None,
+            #[cfg(feature = "diagnostics")]
+            warning_callback: None,
         };
         let conn = open_core_connection_with_options(":memory:", &options)
             .expect("in-memory connection with explicit memory policy should open");
@@ -1745,7 +1794,7 @@ mod tests {
         assert_eq!(memory_vfs.file_reserved_bytes, 64 * 1024);
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[test]
     fn parse_database_options_accepts_page_aliases_and_warn_at_percent() {
         let options = Object::new();
@@ -1775,7 +1824,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "diagnostics"))]
+    #[cfg(all(feature = "memory-options", not(feature = "diagnostics")))]
     #[test]
     fn parse_database_options_rejects_memory_warning_options_without_diagnostics() {
         let options = Object::new();
@@ -1792,6 +1841,7 @@ mod tests {
         assert!(message.contains("memory.warnAtPercent"));
     }
 
+    #[cfg(feature = "memory-options")]
     #[test]
     fn parse_database_options_rejects_conflicting_page_and_byte_aliases() {
         let options = Object::new();
@@ -1830,7 +1880,7 @@ mod tests {
         assert_eq!(describe_js_value(&Array::new().into()), "object");
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[test]
     fn parse_database_options_requires_tracked_cap_for_warn_at_percent() {
         let options = Object::new();
@@ -1844,7 +1894,7 @@ mod tests {
         assert!(js_error_message_field(&error).contains("memory.maxBytes or memory.maxPages"));
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[test]
     fn connection_memory_stats_surface_page_aliases_and_warning_percent() {
         let _guard = host_connection_test_guard();
@@ -1901,7 +1951,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[test]
     fn memory_warning_transition_fires_on_upward_crossing_and_rearms_after_recovery() {
         let (above, crossed) = memory_warning_transition(63, 64, false);
@@ -2042,7 +2092,7 @@ mod tests {
         assert_eq!(advisory.recommended_page_buffer_max_bytes, Some(262_144));
     }
 
-    #[cfg(feature = "backup")]
+    #[cfg(all(feature = "backup", feature = "memory-options"))]
     #[test]
     fn import_with_wasm_memory_cap_returns_out_of_memory() {
         let _guard = host_connection_test_guard();
@@ -2235,7 +2285,7 @@ mod wasm_tests {
         assert!(error_message(&error).contains("closed"));
     }
 
-    #[cfg(feature = "diagnostics")]
+    #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[wasm_bindgen_test]
     fn wasm_memory_warning_callback_receives_stats_payload_once_while_above_threshold() {
         use wasm_bindgen::closure::Closure;

@@ -39,6 +39,8 @@ The helper script:
   `FSQLITE_WASM_NO_DEFAULT_FEATURES=1`
 - can opt into SQLite image import/export bindings with
   `FSQLITE_WASM_FEATURES=backup`
+- can opt into browser memory-policy constructors and parser glue with
+  `FSQLITE_WASM_FEATURES=memory-options`
 - can opt into the reusable prepared-statement wrapper with
   `FSQLITE_WASM_FEATURES=prepared-statements`
 - can enable opt-in diagnostics such as
@@ -76,26 +78,30 @@ prepared-statement `explain()`, prepared-statement metadata getters (`stmt.sql`,
 JavaScript NaN coercion warnings, or diagnostic error recovery fields such as
 `transient`, `userRecoverable`, and `suggestion`, query-result `changes`
 placeholders, richer JavaScript value-type descriptions in error messages, or
-other debug/advisor surfaces. Diagnostics builds also retain the expanded
-out-of-memory advisory text with memory knob names; the default core package
-uses a compact out-of-memory message. Default JavaScript errors still include `code`,
-`sqliteCode`, `extendedCode`, and `message`; default parameterized execution
-stays available through `executeWithParams()` and `queryWithParams()`. Enable
-the `prepared-statements` feature when a package needs `db.prepare()` and the
-`FrankenPreparedStatement` wrapper with reusable `execute()` / `query()`
-methods. The `tracing` feature is also opt-in because it restores warning-level
-tracing and pulls in extra browser logging glue. The `panic-hook` feature is
-available for browser
-crash reports when a larger diagnostic package is acceptable:
+other debug/advisor surfaces. Diagnostics builds that also enable
+`memory-options` retain the expanded out-of-memory advisory text with memory
+knob names; the default core package uses a compact out-of-memory message.
+Default JavaScript errors still include `code`, `sqliteCode`, `extendedCode`,
+and `message`; default parameterized execution stays available through
+`executeWithParams()` and `queryWithParams()`. Enable the `memory-options`
+feature when a package needs `FrankenDB.openWithOptions()`, memory sizing
+options, or the option parser. Enable `backup,memory-options` together when a
+package needs `FrankenDB.importWithOptions()`. Enable the `prepared-statements`
+feature when a package needs `db.prepare()` and the `FrankenPreparedStatement`
+wrapper with reusable `execute()` / `query()` methods. The `tracing` feature is
+also opt-in because it restores warning-level tracing and pulls in extra browser
+logging glue. The `panic-hook` feature is available for browser crash reports
+when a larger diagnostic package is acceptable:
 
 ```bash
 FSQLITE_WASM_FEATURES=diagnostics,tracing,panic-hook ./scripts/build_fsqlite_wasm_package.sh
 ```
 
 The `backup` feature is separate from diagnostics. Enable it when the browser
-package needs `FrankenDB.import()`, `FrankenDB.importWithOptions()`, or
-`db.export()` for SQLite image round-trips. The minimum core package omits those
-backup bindings and keeps the common in-memory `open`/`execute`/`query` surface.
+package needs `FrankenDB.import()` or `db.export()` for SQLite image
+round-trips. `FrankenDB.importWithOptions()` additionally requires
+`memory-options`. The minimum core package omits those backup bindings and keeps
+the common in-memory `open`/`execute`/`query` surface.
 
 The `prepared-statements` feature is separate from diagnostics. Enable it when
 the package needs `FrankenDB.prepare()` and the exported
@@ -123,6 +129,7 @@ is the browser transfer shape.
 | --- | --- | --- |
 | Minimum core | `FSQLITE_WASM_NO_DEFAULT_FEATURES=1 FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Default core | `FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
+| Memory options | `FSQLITE_WASM_FEATURES=memory-options FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Diagnostics | `FSQLITE_WASM_FEATURES=diagnostics,tracing FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Extension bundle | `FSQLITE_WASM_FEATURES=extensions FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | report-only until each extension has its own tracked budget; set `FSQLITE_WASM_MAX_GZIP_BYTES=0` for exploratory measurement |
 
@@ -184,9 +191,10 @@ console.log(result.rows);
 
 FrankenSQLite's WASM package runs inside the browser's WebAssembly linear
 memory, so the hard upper bound remains 4 GiB for the whole module. The
-database-specific knobs exposed by `FrankenDB.openWithOptions()` and
-the backup-feature `FrankenDB.importWithOptions()` let you budget
-FrankenSQLite's own heap usage inside that ceiling:
+database-specific knobs exposed by the `memory-options` feature let you budget
+FrankenSQLite's own heap usage inside that ceiling. Enable
+`FSQLITE_WASM_FEATURES=memory-options` for `FrankenDB.openWithOptions()`, or
+`FSQLITE_WASM_FEATURES=backup,memory-options` for the backup import variant:
 
 ```ts
 const db = FrankenDB.openWithOptions(":memory:", {
@@ -208,10 +216,11 @@ const db = FrankenDB.openWithOptions(":memory:", {
   `MemoryVfs` heap usage. When the engine crosses that cap, operations fail
   with a structured out-of-memory error instead of trapping through an
   `unreachable`.
-- With `FSQLITE_WASM_FEATURES=diagnostics`, `memory.warnAtPercent` derives a
-  warning threshold from the tracked max, `memory.warningThresholdBytes` accepts
-  exact byte thresholds, and `memory.onWarning` fires once with the same
-  byte-level and page-oriented payload as `db.memoryStats()`.
+- With `FSQLITE_WASM_FEATURES=diagnostics,memory-options`,
+  `memory.warnAtPercent` derives a warning threshold from the tracked max,
+  `memory.warningThresholdBytes` accepts exact byte thresholds, and
+  `memory.onWarning` fires once with the same byte-level and page-oriented
+  payload as `db.memoryStats()`.
 - Diagnostic builds also expose `db.memoryStats()` and emit
   page-cache pressure advisory fields:
   `pageCachePressureLevel`, `pageCachePressureBudgetBytes`,
@@ -220,6 +229,7 @@ const db = FrankenDB.openWithOptions(":memory:", {
   `pageBufferMax` down before the tracked heap reaches its hard cap.
 
 Diagnostic builds can call `db.memoryStats()` at any point to inspect tracked
-heap bytes, page-cache resident bytes, page-cache capacity, configured warning
-thresholds, growth events, current linear-memory size/pages (when running under
-`wasm32`), and the derived page-cache pressure recommendation.
+heap bytes, page-cache resident bytes, page-cache capacity, growth events,
+current linear-memory size/pages (when running under `wasm32`), and the derived
+page-cache pressure recommendation. Configured warning thresholds are reported
+when `diagnostics,memory-options` are enabled together.
