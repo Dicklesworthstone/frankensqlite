@@ -91,6 +91,11 @@ package needs `FrankenDB.import()`, `FrankenDB.importWithOptions()`, or
 `db.export()` for SQLite image round-trips. The minimum core package omits those
 backup bindings and keeps the common in-memory `open`/`execute`/`query` surface.
 
+The `row-arrays` feature restores positional `result.rowArrays` for consumers
+that need array-indexed rows in addition to the default labeled `result.rows`
+objects. The minimum core package omits `rowArrays` to avoid carrying duplicate
+row materialization glue.
+
 ## Size Budgets
 
 All release packages must emit the raw `.wasm`, a gzipped `.wasm.gz`, and a

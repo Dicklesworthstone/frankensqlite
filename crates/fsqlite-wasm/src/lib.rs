@@ -108,10 +108,10 @@ pub fn parse_sql_js(input: &str) -> Result<JsValue, JsValue> {
 
 /// Minimal JavaScript-facing database wrapper.
 ///
-/// Query results expose `rows` as JavaScript objects keyed by column label,
-/// preserve positional access in `rowArrays`, and include best-effort
-/// `columnTypes` metadata. Labels use core inference when available and fall
-/// back to `_cN` for unnamed expressions.
+/// Query results expose `rows` as JavaScript objects keyed by column label and
+/// include best-effort `columnTypes` metadata. Labels use core inference when
+/// available and fall back to `_cN` for unnamed expressions. Enable the
+/// `row-arrays` feature when consumers also need positional `rowArrays`.
 #[wasm_bindgen(js_name = FrankenDB)]
 pub struct FrankenDb {
     state: Rc<FrankenDbState>,
@@ -641,10 +641,15 @@ fn query_result_to_js(
     }
 
     let js_rows = Array::new();
+    #[cfg(feature = "row-arrays")]
     let row_arrays = Array::new();
     for row in &rows {
-        let row_array = row_to_js_array(row)?;
-        row_arrays.push(&row_array.clone().into());
+        #[cfg(feature = "row-arrays")]
+        {
+            let row_array = row_to_js_array(row)?;
+            let row_value = JsValue::from(row_array);
+            row_arrays.push(&row_value);
+        }
         js_rows.push(&row_to_js_object(row, &resolved_columns)?);
     }
 
@@ -657,6 +662,7 @@ fn query_result_to_js(
     )?;
     set_property(&result, "columnTypes", &column_types.into())?;
     set_property(&result, "rows", &js_rows.into())?;
+    #[cfg(feature = "row-arrays")]
     set_property(&result, "rowArrays", &row_arrays.into())?;
     #[cfg(feature = "diagnostics")]
     set_property(&result, "changes", &JsValue::from_f64(0.0))?;
@@ -703,6 +709,7 @@ fn sqlite_value_type_name(value: &SqliteValue) -> &'static str {
     }
 }
 
+#[cfg(feature = "row-arrays")]
 fn row_to_js_array(row: &CoreRow) -> Result<Array, FrankenError> {
     let values = Array::new();
     for value in row.values() {
@@ -2167,6 +2174,17 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    fn rows(result: &JsValue) -> Array {
+        Reflect::get(result, &JsValue::from_str("rows"))
+            .expect("rows field should exist")
+            .unchecked_into::<Array>()
+    }
+
+    fn row_property(row: &Object, key: &str) -> JsValue {
+        Reflect::get(row, &JsValue::from_str(key)).expect("row field should exist")
+    }
+
+    #[cfg(feature = "row-arrays")]
     fn row_arrays(result: &JsValue) -> Array {
         Reflect::get(result, &JsValue::from_str("rowArrays"))
             .expect("rowArrays field should exist")
@@ -2274,13 +2292,16 @@ mod wasm_tests {
         )
         .expect("batch execution should succeed");
 
-        let rows = row_arrays(
+        let rows = rows(
             &db.query("SELECT id, name FROM wasm_counts ORDER BY id")
                 .expect("query should succeed"),
         );
         assert_eq!(rows.length(), 3);
-        let second_row = rows.get(1).unchecked_into::<Array>();
-        assert_eq!(second_row.get(1).as_string().as_deref(), Some("delta"));
+        let second_row = rows.get(1).unchecked_into::<Object>();
+        assert_eq!(
+            row_property(&second_row, "name").as_string().as_deref(),
+            Some("delta")
+        );
     }
 
     #[wasm_bindgen_test]
@@ -2318,25 +2339,34 @@ mod wasm_tests {
         #[cfg(feature = "diagnostics")]
         assert_eq!(imported.path(), ":memory:");
 
-        let rows = row_arrays(
+        let rows = rows(
             &imported
                 .query("SELECT id, name, payload FROM wasm_export ORDER BY id")
                 .expect("query should succeed after import"),
         );
         assert_eq!(rows.length(), 2);
 
-        let first_row = rows.get(0).unchecked_into::<Array>();
-        assert_eq!(first_row.get(0).as_f64(), Some(1.0));
-        assert_eq!(first_row.get(1).as_string().as_deref(), Some("alpha"));
+        let first_row = rows.get(0).unchecked_into::<Object>();
+        assert_eq!(row_property(&first_row, "id").as_f64(), Some(1.0));
         assert_eq!(
-            Uint8Array::new(&first_row.get(2)).to_vec(),
+            row_property(&first_row, "name").as_string().as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            Uint8Array::new(&row_property(&first_row, "payload")).to_vec(),
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
 
-        let second_row = rows.get(1).unchecked_into::<Array>();
-        assert_eq!(second_row.get(0).as_f64(), Some(2.0));
-        assert_eq!(second_row.get(1).as_string().as_deref(), Some("beta"));
-        assert_eq!(Uint8Array::new(&second_row.get(2)).to_vec(), vec![1, 2, 3]);
+        let second_row = rows.get(1).unchecked_into::<Object>();
+        assert_eq!(row_property(&second_row, "id").as_f64(), Some(2.0));
+        assert_eq!(
+            row_property(&second_row, "name").as_string().as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            Uint8Array::new(&row_property(&second_row, "payload")).to_vec(),
+            vec![1, 2, 3]
+        );
     }
 
     #[cfg(feature = "backup")]
@@ -2402,19 +2432,17 @@ mod wasm_tests {
         let result = db
             .query("SELECT safe_i, big_i, real_v, text_v, blob_v, null_v, date_v FROM wasm_types")
             .expect("query should succeed");
-        let rows = Reflect::get(&result, &JsValue::from_str("rowArrays"))
-            .expect("rowArrays field should exist")
-            .unchecked_into::<Array>();
+        let rows = rows(&result);
         assert_eq!(rows.length(), 1);
 
-        let row = rows.get(0).unchecked_into::<Array>();
-        assert_eq!(row.get(0).as_f64(), Some(42.0));
+        let row = rows.get(0).unchecked_into::<Object>();
+        assert_eq!(row_property(&row, "safe_i").as_f64(), Some(42.0));
         assert!(
-            row.get(1).is_bigint(),
+            row_property(&row, "big_i").is_bigint(),
             "large INTEGER should surface as BigInt"
         );
-        let roundtrip_bigint =
-            BigInt::new(&row.get(1)).expect("returned large integer should be a BigInt");
+        let roundtrip_bigint = BigInt::new(&row_property(&row, "big_i"))
+            .expect("returned large integer should be a BigInt");
         assert_eq!(
             String::from(
                 roundtrip_bigint
@@ -2423,15 +2451,21 @@ mod wasm_tests {
             ),
             "9007199254740992"
         );
-        assert_eq!(row.get(2).as_f64(), Some(3.5));
-        assert_eq!(row.get(3).as_string().as_deref(), Some("hello"));
+        assert_eq!(row_property(&row, "real_v").as_f64(), Some(3.5));
+        assert_eq!(
+            row_property(&row, "text_v").as_string().as_deref(),
+            Some("hello")
+        );
 
-        let blob = Uint8Array::new(&row.get(4));
+        let blob = Uint8Array::new(&row_property(&row, "blob_v"));
         assert_eq!(blob.to_vec(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
 
-        assert!(row.get(5).is_null(), "NULL should remain null in JS");
+        assert!(
+            row_property(&row, "null_v").is_null(),
+            "NULL should remain null in JS"
+        );
         assert_eq!(
-            row.get(6).as_string().as_deref(),
+            row_property(&row, "date_v").as_string().as_deref(),
             Some(expected_iso.as_str())
         );
     }
@@ -2522,12 +2556,13 @@ mod wasm_tests {
             Some("beta")
         );
 
-        let row_arrays = Reflect::get(&result, &JsValue::from_str("rowArrays"))
-            .expect("rowArrays field should exist")
-            .unchecked_into::<Array>();
-        let raw_row = row_arrays.get(0).unchecked_into::<Array>();
-        assert_eq!(raw_row.get(0).as_f64(), Some(2.0));
-        assert_eq!(raw_row.get(1).as_string().as_deref(), Some("beta"));
+        #[cfg(feature = "row-arrays")]
+        {
+            let row_arrays = row_arrays(&result);
+            let raw_row = row_arrays.get(0).unchecked_into::<Array>();
+            assert_eq!(raw_row.get(0).as_f64(), Some(2.0));
+            assert_eq!(raw_row.get(1).as_string().as_deref(), Some("beta"));
+        }
     }
 
     #[wasm_bindgen_test]
@@ -2549,11 +2584,14 @@ mod wasm_tests {
             2
         );
 
-        let rows = row_arrays(&stmt.query().expect("prepared query should succeed"));
+        let rows = rows(&stmt.query().expect("prepared query should succeed"));
         assert_eq!(rows.length(), 2);
-        let first_row = rows.get(0).unchecked_into::<Array>();
-        assert_eq!(first_row.get(0).as_f64(), Some(1.0));
-        assert_eq!(first_row.get(1).as_string().as_deref(), Some("alpha"));
+        let first_row = rows.get(0).unchecked_into::<Object>();
+        assert_eq!(row_property(&first_row, "id").as_f64(), Some(1.0));
+        assert_eq!(
+            row_property(&first_row, "name").as_string().as_deref(),
+            Some("alpha")
+        );
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2602,14 +2640,17 @@ mod wasm_tests {
             1
         );
 
-        let rows = row_arrays(
+        let rows = rows(
             &db.query("SELECT id, name FROM wasm_stmt_insert")
                 .expect("query should succeed"),
         );
         assert_eq!(rows.length(), 1);
-        let row = rows.get(0).unchecked_into::<Array>();
-        assert_eq!(row.get(0).as_f64(), Some(1.0));
-        assert_eq!(row.get(1).as_string().as_deref(), Some("alpha"));
+        let row = rows.get(0).unchecked_into::<Object>();
+        assert_eq!(row_property(&row, "id").as_f64(), Some(1.0));
+        assert_eq!(
+            row_property(&row, "name").as_string().as_deref(),
+            Some("alpha")
+        );
     }
 
     #[wasm_bindgen_test]
@@ -2620,13 +2661,11 @@ mod wasm_tests {
         let params = Array::new();
         params.push(&JsValue::from_f64(number));
         let result = db
-            .query_with_params("SELECT ?", params.into())
+            .query_with_params("SELECT ? AS value", params.into())
             .expect("representable fractional JS numbers should stay REAL");
-        let row_arrays = Reflect::get(&result, &JsValue::from_str("rowArrays"))
-            .expect("rowArrays field should exist")
-            .unchecked_into::<Array>();
-        let row = row_arrays.get(0).unchecked_into::<Array>();
-        assert_eq!(row.get(0).as_f64(), Some(number));
+        let rows = rows(&result);
+        let row = rows.get(0).unchecked_into::<Object>();
+        assert_eq!(row_property(&row, "value").as_f64(), Some(number));
     }
 
     #[wasm_bindgen_test]
@@ -2703,6 +2742,26 @@ mod wasm_tests {
                 .as_deref(),
             Some("alpha")
         );
+    }
+
+    #[cfg(feature = "row-arrays")]
+    #[wasm_bindgen_test]
+    fn wasm_row_arrays_feature_exposes_positional_rows() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute_batch(
+            "CREATE TABLE wasm_row_arrays (id INTEGER PRIMARY KEY, name TEXT);\
+             INSERT INTO wasm_row_arrays (id, name) VALUES (1, 'alpha');",
+        )
+        .expect("batch execution should succeed");
+
+        let result = db
+            .query("SELECT id, name FROM wasm_row_arrays")
+            .expect("query should succeed");
+        let row_arrays = row_arrays(&result);
+        assert_eq!(row_arrays.length(), 1);
+        let row = row_arrays.get(0).unchecked_into::<Array>();
+        assert_eq!(row.get(0).as_f64(), Some(1.0));
+        assert_eq!(row.get(1).as_string().as_deref(), Some("alpha"));
     }
 
     #[wasm_bindgen_test]
