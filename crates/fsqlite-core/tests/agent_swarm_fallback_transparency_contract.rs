@@ -1,7 +1,47 @@
+use std::collections::BTreeSet;
+
 use fsqlite_core::connection::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const FALLBACK_BOUNDARY_INVENTORY: &str =
+    include_str!("../../../docs/contracts/fallback_boundary_inventory.toml");
+const CONNECTION_SOURCE: &str = include_str!("../src/connection.rs");
+const E2E_EXECUTOR_SOURCE: &str = include_str!("../../fsqlite-e2e/src/fsqlite_executor.rs");
+const VDBE_ENGINE_SOURCE: &str = include_str!("../../fsqlite-vdbe/src/engine.rs");
+const INVENTORY_REQUIRED_FIELDS: &[&str] = &[
+    "boundary_id",
+    "boundary_family",
+    "statement_kind",
+    "trigger_condition",
+    "decision_reason",
+    "source_file",
+    "source_touchpoint",
+    "source_anchor",
+    "certifying_policy",
+    "non_cert_policy",
+    "expected_backend_identity",
+    "decision_outcome",
+    "first_failure_diag",
+    "owner_bead",
+    "covered_by_test",
+    "notes",
+];
+const REQUIRED_BOUNDARY_IDS: &[&str] = &[
+    "conn.select.with_clause_materialization",
+    "conn.select.view_materialization",
+    "conn.select.sqlite_schema_virtual_materialization",
+    "conn.select.live_vtab_select_fallback",
+    "conn.select.time_travel_snapshot",
+    "conn.memdb.refresh_from_pager_publication",
+    "conn.memdb.refresh_from_active_txn",
+    "conn.prepared_update_delete.static_fallback_reason",
+    "conn.virtual_table.live_vtab_scan",
+    "conn.virtual_table.legacy_fts5_create_materialization",
+    "e2e.file_backed_default_strict_parity",
+    "vdbe.open_cursor.parity_cert_rejection",
+];
 
 struct FallbackEvent<'a> {
     event_seq: i64,
@@ -228,6 +268,117 @@ fn row_values(row: &Row) -> &[SqliteValue] {
     row.values()
 }
 
+fn inventory_boundary_sections() -> Vec<&'static str> {
+    FALLBACK_BOUNDARY_INVENTORY
+        .split("\n[[boundary]]")
+        .skip(1)
+        .collect()
+}
+
+fn inventory_field_value<'a>(section: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key} = ");
+    section.lines().find_map(|line| {
+        let raw = line.trim_start().strip_prefix(prefix.as_str())?.trim();
+        raw.strip_prefix('"')?.strip_suffix('"')
+    })
+}
+
+fn inventory_has_decision_reason(reason: &str) -> bool {
+    FALLBACK_BOUNDARY_INVENTORY.contains(&format!("decision_reason = \"{reason}\""))
+}
+
+fn quoted_literals_after(source: &'static str, start: usize, max_len: usize) -> Vec<&'static str> {
+    let end = source.len().min(start.saturating_add(max_len));
+    let mut rest = &source[start..end];
+    let mut literals = Vec::new();
+    while let Some(open_quote) = rest.find('"') {
+        let after_open = &rest[open_quote + 1..];
+        let Some(close_quote) = after_open.find('"') else {
+            break;
+        };
+        literals.push(&after_open[..close_quote]);
+        rest = &after_open[close_quote + 1..];
+    }
+    literals
+}
+
+fn connection_second_argument_reasons(needle: &str) -> BTreeSet<&'static str> {
+    let mut reasons = BTreeSet::new();
+    for (index, _) in CONNECTION_SOURCE.match_indices(needle) {
+        let literals = quoted_literals_after(CONNECTION_SOURCE, index, 320);
+        if let Some(reason) = literals.get(1) {
+            reasons.insert(*reason);
+        }
+    }
+    reasons
+}
+
+fn connection_first_argument_reasons(needle: &str) -> BTreeSet<&'static str> {
+    let mut reasons = BTreeSet::new();
+    for (index, _) in CONNECTION_SOURCE.match_indices(needle) {
+        let literals = quoted_literals_after(CONNECTION_SOURCE, index, 320);
+        if let Some(reason) = literals.first() {
+            reasons.insert(*reason);
+        }
+    }
+    reasons
+}
+
+fn vdbe_open_storage_cursor_source() -> &'static str {
+    let start = VDBE_ENGINE_SOURCE
+        .find("fn open_storage_cursor(")
+        .expect("VDBE source should define open_storage_cursor");
+    let relative_end = VDBE_ENGINE_SOURCE[start..]
+        .find("\n    fn trace_opcode(")
+        .expect("VDBE source should define trace_opcode after open_storage_cursor");
+    &VDBE_ENGINE_SOURCE[start..start + relative_end]
+}
+
+fn vdbe_open_storage_cursor_decision_reasons() -> BTreeSet<&'static str> {
+    let source = vdbe_open_storage_cursor_source();
+    let mut reasons = BTreeSet::new();
+    for needle in ["decision_reason = \"", "mem_decision_reason = \""] {
+        let mut rest = source;
+        while let Some(offset) = rest.find(needle) {
+            let after_prefix = &rest[offset + needle.len()..];
+            let Some(close_quote) = after_prefix.find('"') else {
+                break;
+            };
+            reasons.insert(&after_prefix[..close_quote]);
+            rest = &after_prefix[close_quote + 1..];
+        }
+    }
+    reasons
+}
+
+fn runtime_fallback_boundary_reasons() -> BTreeSet<&'static str> {
+    let mut reasons = connection_second_argument_reasons("self.log_mem_execution_fallback(");
+    reasons.extend(connection_second_argument_reasons(
+        "self.disable_mem_fallback_rejection_for_internal_scope(",
+    ));
+    reasons.extend(connection_first_argument_reasons(
+        "self.log_aggregate_window_storage_substrate_dispatch(",
+    ));
+    reasons.extend(connection_first_argument_reasons(
+        "self.try_execute_group_by_storage_substrate(",
+    ));
+    reasons.extend([
+        "join_vdbe_storage_cursors",
+        "derived_source_flattened_vdbe_storage_cursors",
+    ]);
+    reasons.extend(vdbe_open_storage_cursor_decision_reasons());
+    reasons
+}
+
+fn source_contains_anchor(source_file: &str, source_anchor: &str) -> bool {
+    match source_file {
+        "crates/fsqlite-core/src/connection.rs" => CONNECTION_SOURCE.contains(source_anchor),
+        "crates/fsqlite-e2e/src/fsqlite_executor.rs" => E2E_EXECUTOR_SOURCE.contains(source_anchor),
+        "crates/fsqlite-vdbe/src/engine.rs" => VDBE_ENGINE_SOURCE.contains(source_anchor),
+        _ => false,
+    }
+}
+
 fn fallback_count(conn: &Connection) -> TestResult<i64> {
     let rows = conn.query("SELECT count(*) FROM fsqlite_fallback_events_contract;")?;
     let row = rows.first().ok_or_else(|| {
@@ -243,6 +394,79 @@ fn fallback_count(conn: &Connection) -> TestResult<i64> {
             format!("expected integer fallback event count, got {other:?}"),
         )
         .into()),
+    }
+}
+
+#[test]
+fn fallback_boundary_inventory_covers_runtime_reason_strings() {
+    assert!(
+        FALLBACK_BOUNDARY_INVENTORY.contains("logical_key = \"fallback_boundary_inventory.v1\""),
+        "inventory must identify the stable contract key"
+    );
+    let sections = inventory_boundary_sections();
+    assert!(
+        sections.len() >= 30,
+        "fallback inventory should cover connection and VDBE boundary families"
+    );
+
+    let mut boundary_ids = BTreeSet::new();
+    for section in &sections {
+        for field in INVENTORY_REQUIRED_FIELDS {
+            assert!(
+                section.contains(&format!("{field} = ")),
+                "inventory boundary is missing required field {field}: {section}"
+            );
+        }
+
+        let boundary_id = inventory_field_value(section, "boundary_id")
+            .expect("boundary section should have boundary_id");
+        assert!(
+            boundary_ids.insert(boundary_id),
+            "duplicate fallback boundary id {boundary_id}"
+        );
+
+        let source_file = inventory_field_value(section, "source_file")
+            .expect("boundary section should have source_file");
+        let source_anchor = inventory_field_value(section, "source_anchor")
+            .expect("boundary section should have source_anchor");
+        assert!(
+            source_contains_anchor(source_file, source_anchor),
+            "source anchor {source_anchor:?} was not found in {source_file:?}"
+        );
+    }
+
+    for &boundary_id in REQUIRED_BOUNDARY_IDS {
+        assert!(
+            boundary_ids.contains(boundary_id),
+            "required fallback boundary {boundary_id} is missing from inventory"
+        );
+    }
+
+    for policy in [
+        "certifying_policy = \"strict_deny\"",
+        "certifying_policy = \"strict_real_backend_only\"",
+        "certifying_policy = \"strict_refuse_invalid\"",
+        "non_cert_policy = \"allow_with_event\"",
+        "non_cert_policy = \"allow_transient_mem_read_only\"",
+        "non_cert_policy = \"real_backend_only\"",
+        "non_cert_policy = \"refuse_invalid\"",
+    ] {
+        assert!(
+            FALLBACK_BOUNDARY_INVENTORY.contains(policy),
+            "inventory should include policy assignment {policy}"
+        );
+    }
+
+    let runtime_reasons = runtime_fallback_boundary_reasons();
+    assert!(
+        runtime_reasons.len() >= 25,
+        "runtime reason scanner should find connection and VDBE decisions"
+    );
+    for reason in runtime_reasons {
+        assert!(
+            inventory_has_decision_reason(reason),
+            "runtime fallback/storage decision reason {reason:?} is missing from inventory"
+        );
     }
 }
 

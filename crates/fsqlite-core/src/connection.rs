@@ -8634,6 +8634,17 @@ impl Drop for StatementLookasideGrowthGuard<'_> {
     }
 }
 
+struct MemFallbackRejectionOverrideGuard<'a> {
+    conn: &'a Connection,
+    previous_reject: bool,
+}
+
+impl Drop for MemFallbackRejectionOverrideGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.set_reject_mem_fallback(self.previous_reject);
+    }
+}
+
 impl Connection {
     /// Open a connection.
     ///
@@ -11265,6 +11276,7 @@ impl Connection {
         "group_by_fallback",
         "window_function_fallback",
         "live_vtab_select_fallback",
+        "time_travel_snapshot",
         "match_operator_fallback",
         "join_or_subquery_fallback",
         "insert_select_row_by_row_fallback",
@@ -11330,6 +11342,24 @@ impl Connection {
             );
         }
         Ok(())
+    }
+
+    fn disable_mem_fallback_rejection_for_internal_scope(
+        &self,
+        statement_kind: &'static str,
+        decision_reason: &'static str,
+    ) -> Result<MemFallbackRejectionOverrideGuard<'_>> {
+        let previous_reject = *self.reject_mem_fallback.borrow();
+        if previous_reject && *self.reject_mem_fallback_strict.borrow() {
+            return Err(FrankenError::not_implemented(format!(
+                "in-memory fallback disabled in strict parity-cert mode: statement_kind={statement_kind}, decision_reason={decision_reason}"
+            )));
+        }
+        self.set_reject_mem_fallback(false);
+        Ok(MemFallbackRejectionOverrideGuard {
+            conn: self,
+            previous_reject,
+        })
     }
 
     #[must_use]
@@ -22481,6 +22511,7 @@ impl Connection {
                 // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
+                    self.log_mem_execution_fallback("select", "time_travel_snapshot")?;
                     return self.execute_time_travel_select(select, params, &target);
                 }
                 // CTE (WITH clause): materialize as temporary tables.
@@ -39838,8 +39869,8 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self
+            .disable_mem_fallback_rejection_for_internal_scope("select", "view_materialization")?;
         let result = {
             let view_defs: Vec<ViewDef> = self.views.borrow().clone();
             let mut materialized: Vec<(String, i32)> = Vec::new();
@@ -40000,7 +40031,6 @@ impl Connection {
 
             exec_result
         };
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -40050,8 +40080,10 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "select",
+            "sqlite_schema_virtual_materialization",
+        )?;
         let result = (|| -> Result<Vec<Row>> {
             let referenced = self.collect_sqlite_schema_references(select);
             if referenced.is_empty() {
@@ -40184,7 +40216,6 @@ impl Connection {
 
             exec_result
         })();
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -51416,29 +51447,22 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "select",
+            "with_clause_materialization",
+        )?;
         match self.execute_recursive_cte_direct_sum_consumer(select, params) {
-            Ok(Some(rows)) => {
-                self.set_reject_mem_fallback(prev_reject);
-                return Ok(rows);
-            }
+            Ok(Some(rows)) => return Ok(rows),
             Ok(None) => {}
-            Err(error) => {
-                self.set_reject_mem_fallback(prev_reject);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         }
         if let Some(rows) = self.execute_top_category_cte_join_fast_path(select, params)? {
-            self.set_reject_mem_fallback(prev_reject);
             return Ok(rows);
         }
         if let Some(inlined) = self.inline_single_use_non_recursive_cte_join_select(select) {
             let rewritten = self.rewrite_in_subqueries_select(&inlined, params)?;
             let bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-            let result = self.execute_join_select(&bound, None);
-            self.set_reject_mem_fallback(prev_reject);
-            return result;
+            return self.execute_join_select(&bound, None);
         }
         let mut temp_tables = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
@@ -51509,7 +51533,6 @@ impl Connection {
             })
         })();
         self.cleanup_cte_tables(&temp_tables);
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -52635,8 +52658,10 @@ impl Connection {
             return Ok(rows);
         }
 
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "delete",
+            "with_clause_materialization",
+        )?;
         let mut temp_tables = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_tables)?;
@@ -52647,7 +52672,6 @@ impl Connection {
             })
         })();
         self.cleanup_cte_tables(&temp_tables);
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -52711,8 +52735,10 @@ impl Connection {
             };
         }
 
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "update",
+            "with_clause_materialization",
+        )?;
         let mut temp_tables = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(update.with.as_ref(), params, &mut temp_tables)?;
@@ -52723,7 +52749,6 @@ impl Connection {
             })
         })();
         self.cleanup_cte_tables(&temp_tables);
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -52777,8 +52802,10 @@ impl Connection {
             };
         }
 
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "insert",
+            "with_clause_materialization",
+        )?;
         let mut temp_tables = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(insert.with.as_ref(), params, &mut temp_tables)?;
@@ -52829,7 +52856,6 @@ impl Connection {
             }
         })();
         self.cleanup_cte_tables(&temp_tables);
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -52926,15 +52952,16 @@ impl Connection {
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<MaterializedTempTable>> {
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "statement",
+            "with_clause_materialization",
+        )?;
         let mut temp_tables = Vec::new();
         let result = (|| -> Result<Vec<MaterializedTempTable>> {
             self.materialize_with_clause(with, params, &mut temp_tables)?;
             self.snapshot_materialized_temp_tables(&temp_tables)
         })();
         self.cleanup_cte_tables(&temp_tables);
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -53013,8 +53040,10 @@ impl Connection {
         temp_tables: &[MaterializedTempTable],
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let prev_reject = *self.reject_mem_fallback.borrow();
-        self.set_reject_mem_fallback(false);
+        let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+            "statement",
+            "materialized_temp_table_execution",
+        )?;
         let op_cx = self.op_cx_after_background_status();
         if self.memdb_requires_active_txn_reload.get()
             || !self.pending_memdb_direct_upserts.borrow().is_empty()
@@ -53058,7 +53087,6 @@ impl Connection {
             })
         });
         self.cleanup_cte_tables(&installed);
-        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -127925,6 +127953,68 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_zjisk1_internal_mem_fallback_guard_rejects_strict_certifying_scope() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+
+        let err = match conn
+            .disable_mem_fallback_rejection_for_internal_scope("select", "view_materialization")
+        {
+            Ok(_) => panic!("strict parity-cert mode must reject helper-local fallback bypass"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string()
+                .contains("in-memory fallback disabled in strict parity-cert mode"),
+            "unexpected strict helper fallback error: {err}"
+        );
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "failed helper scope must leave Mem fallback rejection enabled"
+        );
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.backend_mode;").unwrap()[0].values()[0],
+            SqliteValue::Text("parity_cert_strict".into())
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_internal_mem_fallback_guard_restores_nonstrict_scope() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "parity-cert fallback rejection must default ON"
+        );
+
+        {
+            let _guard = conn
+                .disable_mem_fallback_rejection_for_internal_scope(
+                    "select",
+                    "with_clause_materialization",
+                )
+                .unwrap();
+            assert!(
+                !*conn.reject_mem_fallback.borrow(),
+                "helper scope should temporarily allow Mem fallback in non-strict mode"
+            );
+            assert_eq!(
+                conn.query("PRAGMA fsqlite.backend_mode;").unwrap()[0].values()[0],
+                SqliteValue::Text("fallback_allowed".into())
+            );
+        }
+
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "helper scope must restore parity-cert fallback rejection on drop"
+        );
+        assert_eq!(
+            conn.query("PRAGMA fsqlite.backend_mode;").unwrap()[0].values()[0],
+            SqliteValue::Text("parity_cert".into())
+        );
+    }
+
+    #[test]
     fn test_zjisk1_strict_mode_allows_file_backed_named_table_join_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("strict_join_native.db");
@@ -143609,6 +143699,24 @@ mod pager_routing_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_time_travel_select_rejects_strict_parity_cert_snapshot_fallback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+
+        let err = conn
+            .query("SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 1;")
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("strict parity-cert") && msg.contains("time_travel_snapshot"),
+            "strict time-travel fallback rejection should identify the boundary, got: {msg}"
+        );
     }
 
     #[test]
