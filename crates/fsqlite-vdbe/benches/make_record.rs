@@ -1,12 +1,17 @@
+use std::sync::Arc;
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::opcode::{Opcode, P4};
-use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind, serialize_record};
+use fsqlite_types::record::{
+    PrecomputedRecordHeader, PrecomputedSerialTypeKind, encode_batch, serialize_record,
+};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{Cx, PageSize};
 use fsqlite_vdbe::ProgramBuilder;
 use fsqlite_vdbe::engine::{VdbeEngine, set_vdbe_jit_enabled};
 
 const MAKE_RECORD_REPEATS: usize = 256;
+const BATCH_RECORD_ROW_COUNTS: [usize; 3] = [16, 128, 1024];
 
 fn fixed_schema_row(column_count: usize) -> Vec<SqliteValue> {
     (0..column_count)
@@ -110,5 +115,92 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_make_record_fixed_schema);
+fn batch_record_rows(row_count: usize) -> Vec<Vec<SqliteValue>> {
+    (0..row_count)
+        .map(|idx| {
+            let idx_i64 = i64::try_from(idx).expect("benchmark row count should fit into i64");
+            let idx_f64 =
+                f64::from(i32::try_from(idx).expect("benchmark row count should fit into i32"));
+            let first_blob_byte = u8::try_from(idx & 0xFF).expect("masked byte fits");
+            let second_blob_byte =
+                u8::try_from(idx.wrapping_mul(3) & 0xFF).expect("masked byte fits");
+            vec![
+                SqliteValue::Integer(idx_i64),
+                SqliteValue::Text(format!("name_{idx:04}").into()),
+                SqliteValue::Integer(idx_i64 * 7),
+                SqliteValue::Float(idx_f64 * 0.25),
+                SqliteValue::Blob(Arc::from(
+                    [first_blob_byte, second_blob_byte, 0xA5, 0x5A].as_slice(),
+                )),
+                SqliteValue::Null,
+            ]
+        })
+        .collect()
+}
+
+fn scalar_batch_bytes(rows: &[Vec<SqliteValue>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.extend_from_slice(&serialize_record(row));
+    }
+    out
+}
+
+fn bench_record_batch_encoding(c: &mut Criterion) {
+    let mut group = c.benchmark_group("record_batch_encoding");
+
+    for row_count in BATCH_RECORD_ROW_COUNTS {
+        let rows = batch_record_rows(row_count);
+        let expected = scalar_batch_bytes(&rows);
+        let expected_len = expected.len();
+        group.throughput(Throughput::Bytes(
+            u64::try_from(expected_len).unwrap_or(u64::MAX),
+        ));
+
+        group.bench_with_input(
+            BenchmarkId::new("scalar_loop", row_count),
+            &rows,
+            |b, rows| {
+                let mut out = Vec::with_capacity(expected_len);
+                b.iter(|| {
+                    out.clear();
+                    for row in rows {
+                        let record = serialize_record(criterion::black_box(row));
+                        out.extend_from_slice(&record);
+                    }
+                    criterion::black_box(&out);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("encode_batch", row_count),
+            &rows,
+            |b, rows| {
+                let row_refs = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let mut out = Vec::with_capacity(expected_len);
+                let mut offsets = Vec::with_capacity(rows.len());
+                encode_batch(&row_refs, &mut out, &mut offsets)
+                    .expect("batch encoder should encode benchmark rows");
+                assert_eq!(
+                    out, expected,
+                    "batch benchmark setup must stay byte-identical to scalar encoding"
+                );
+                b.iter(|| {
+                    encode_batch(criterion::black_box(&row_refs), &mut out, &mut offsets)
+                        .expect("batch encoder should encode benchmark rows");
+                    criterion::black_box((&out, &offsets));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_make_record_fixed_schema,
+    bench_record_batch_encoding
+);
 criterion_main!(benches);
