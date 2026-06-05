@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-cli"
-version = "0.1.5"
+version = "0.1.7"
 description = "Interactive SQL shell"
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-parser"
-version = "0.1.5"
+version = "0.1.7"
 description = "Hand-written recursive descent SQL parser"
 edition.workspace = true
 license.workspace = true

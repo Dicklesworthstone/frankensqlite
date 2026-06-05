@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-wal"
-version = "0.1.5"
+version = "0.1.7"
 description = "Write-ahead logging"
 edition.workspace = true
 license.workspace = true
@@ -16,7 +16,7 @@ fault-injection = []
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.6", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.7", default-features = false }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }

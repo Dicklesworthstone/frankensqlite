@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-btree"
-version = "0.1.6"
+version = "0.1.7"
 description = "B-tree storage engine"
 edition.workspace = true
 license.workspace = true
@@ -13,10 +13,10 @@ native = ["fsqlite-pager/native"]
 wasm = ["fsqlite-pager/wasm"]
 
 [dependencies]
-fsqlite-types = { path = "../fsqlite-types", version = "0.1.5", default-features = false }
+fsqlite-types = { path = "../fsqlite-types", version = "0.1.7", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-func = { workspace = true }
-fsqlite-pager = { version = "0.1.5", path = "../fsqlite-pager", default-features = false }
+fsqlite-pager = { version = "0.1.7", path = "../fsqlite-pager", default-features = false }
 tracing = { workspace = true }
 hashbrown = { workspace = true }
 serde = { workspace = true }
