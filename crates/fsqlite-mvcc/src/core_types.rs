@@ -1007,10 +1007,23 @@ impl InProcessPageLockTable {
     /// per-page waiter path, but aggregates across the whole lock table.
     #[must_use]
     pub fn wait_for_release_progress(&self, observed_epoch: u64, timeout: Duration) -> bool {
+        self.wait_for_release_progress_with_gate_hook(observed_epoch, timeout, || {})
+    }
+
+    fn wait_for_release_progress_with_gate_hook<F>(
+        &self,
+        observed_epoch: u64,
+        timeout: Duration,
+        before_gate_lock: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
         if self.change_epoch.load(Ordering::Acquire) != observed_epoch {
             return true;
         }
 
+        before_gate_lock();
         let mut gate = self.change_gate.lock();
         if self.change_epoch.load(Ordering::Acquire) != observed_epoch {
             return true;
@@ -3793,6 +3806,32 @@ mod tests {
         assert!(
             waiter.join().unwrap(),
             "aggregate release-progress waiter should observe release before timing out"
+        );
+    }
+
+    #[test]
+    fn test_in_process_lock_table_wait_for_release_progress_sees_pre_gate_epoch_advance() {
+        let table = InProcessPageLockTable::new();
+        let observed_epoch = table.release_progress_epoch();
+        let started = Instant::now();
+
+        let woke = table.wait_for_release_progress_with_gate_hook(
+            observed_epoch,
+            Duration::from_millis(200),
+            || {
+                let _gate = table.change_gate.lock();
+                table.change_epoch.fetch_add(1, Ordering::Release);
+                table.change_cv.notify_all();
+            },
+        );
+
+        assert!(
+            woke,
+            "bd-65byl: waiter must observe an epoch advance that happens before gate acquisition"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "bd-65byl: pre-gate epoch advance must not sleep until timeout"
         );
     }
 
