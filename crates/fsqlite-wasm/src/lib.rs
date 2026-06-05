@@ -258,6 +258,7 @@ impl FrankenDb {
         Self::from_parts(path, conn, options)
     }
 
+    #[cfg(feature = "backup")]
     #[wasm_bindgen(js_name = import)]
     pub fn import(data: Uint8Array) -> Result<Self, JsValue> {
         install_wasm_runtime();
@@ -267,6 +268,7 @@ impl FrankenDb {
         Self::from_parts(":memory:".to_owned(), conn, options)
     }
 
+    #[cfg(feature = "backup")]
     #[wasm_bindgen(js_name = importWithOptions)]
     pub fn import_with_options(
         data: Uint8Array,
@@ -363,6 +365,7 @@ impl FrankenDb {
         })
     }
 
+    #[cfg(feature = "backup")]
     pub fn export(&self) -> Result<Uint8Array, JsValue> {
         let bytes = self.with_connection(|conn| conn.export_bytes())?;
         Ok(Uint8Array::from(bytes.as_slice()))
@@ -526,6 +529,7 @@ fn open_core_connection_with_options(
     CoreConnection::open_with_env(path, env)
 }
 
+#[cfg(feature = "backup")]
 fn import_core_connection_with_options(
     bytes: &[u8],
     options: &WasmDatabaseOptions,
@@ -2028,6 +2032,7 @@ mod tests {
         assert_eq!(advisory.recommended_page_buffer_max_bytes, Some(262_144));
     }
 
+    #[cfg(feature = "backup")]
     #[test]
     fn import_with_wasm_memory_cap_returns_out_of_memory() {
         let _guard = host_connection_test_guard();
@@ -2291,6 +2296,7 @@ mod wasm_tests {
         );
     }
 
+    #[cfg(feature = "backup")]
     #[wasm_bindgen_test]
     fn wasm_export_import_roundtrips_sqlite_image() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2333,6 +2339,7 @@ mod wasm_tests {
         assert_eq!(Uint8Array::new(&second_row.get(2)).to_vec(), vec![1, 2, 3]);
     }
 
+    #[cfg(feature = "backup")]
     #[wasm_bindgen_test]
     fn wasm_import_rejects_empty_database_image() {
         let error = FrankenDb::import(Uint8Array::new_with_length(0))

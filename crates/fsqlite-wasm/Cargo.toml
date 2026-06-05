@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+backup = []
 diagnostics = ["fsqlite-core/diagnostic-pragmas"]
 extensions = ["ext-json", "ext-fts5", "ext-icu", "ext-misc", "ext-rtree"]
 ext-json = ["fsqlite-core/ext-json"]

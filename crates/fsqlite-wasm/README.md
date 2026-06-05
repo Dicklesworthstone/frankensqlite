@@ -36,6 +36,8 @@ The helper script:
 - validates the generated `.wasm`, `.js`, and `.d.ts` artifacts exist
 - can build a minimum-feature core package with
   `FSQLITE_WASM_NO_DEFAULT_FEATURES=1`
+- can opt into SQLite image import/export bindings with
+  `FSQLITE_WASM_FEATURES=backup`
 - can enable opt-in diagnostics such as
   `FSQLITE_WASM_FEATURES=diagnostics,tracing,panic-hook`
 - can make optimizer availability explicit with `FSQLITE_WASM_WASM_OPT`
@@ -83,6 +85,11 @@ crash reports when a larger diagnostic package is acceptable:
 ```bash
 FSQLITE_WASM_FEATURES=diagnostics,tracing,panic-hook ./scripts/build_fsqlite_wasm_package.sh
 ```
+
+The `backup` feature is separate from diagnostics. Enable it when the browser
+package needs `FrankenDB.import()`, `FrankenDB.importWithOptions()`, or
+`db.export()` for SQLite image round-trips. The minimum core package omits those
+backup bindings and keeps the common in-memory `open`/`execute`/`query` surface.
 
 ## Size Budgets
 
@@ -161,8 +168,8 @@ console.log(result.rows);
 FrankenSQLite's WASM package runs inside the browser's WebAssembly linear
 memory, so the hard upper bound remains 4 GiB for the whole module. The
 database-specific knobs exposed by `FrankenDB.openWithOptions()` and
-`FrankenDB.importWithOptions()` let you budget FrankenSQLite's own heap usage
-inside that ceiling:
+the backup-feature `FrankenDB.importWithOptions()` let you budget
+FrankenSQLite's own heap usage inside that ceiling:
 
 ```ts
 const db = FrankenDB.openWithOptions(":memory:", {
