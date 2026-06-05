@@ -12,8 +12,8 @@ use fsqlite_harness::certification_policy::{
 };
 use fsqlite_harness::ci_gate_matrix::{
     ArtifactEntry, ArtifactKind, ArtifactManifest, FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION,
-    FallbackTransparencyArtifactRef, FallbackTransparencyGateStatus,
-    FallbackTransparencyGateSummary,
+    FallbackTransparencyArtifactRef, FallbackTransparencyFailureClass,
+    FallbackTransparencyGateStatus, FallbackTransparencyGateSummary,
 };
 use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
 use fsqlite_harness::drift_monitor::ParityDriftMonitor;
@@ -121,11 +121,10 @@ fn failing_g9_gate() -> FallbackTransparencyGateSummary {
         missing_boundary_ids: vec!["conn.select.sqlite_schema_virtual_materialization".to_owned()],
         stale_artifacts: vec!["fallback_denial_replay".to_owned()],
         certifying_fallback_events: 1,
-        gate_failures: vec![
-            "missing_boundary_coverage".to_owned(),
-            "certifying_fallback_allowed".to_owned(),
-            "stale_fallback_artifact".to_owned(),
-        ],
+        gate_failures: FallbackTransparencyFailureClass::ALL
+            .iter()
+            .map(|failure_class| failure_class.as_str().to_owned())
+            .collect(),
         ..passing_g9_gate()
     }
 }
@@ -442,6 +441,29 @@ fn release_certificate_rejects_failed_g9_fallback_gate() {
                     .contains("G9 fallback-transparency gate failed")),
         "bead_id={BEAD_ID} case=failed_g9_gate_risk",
     );
+    let g9_risk = cert
+        .unresolved_risks
+        .iter()
+        .find(|risk| risk.source == "fallback_transparency_gate")
+        .expect("G9 risk should be present");
+    assert!(
+        g9_risk
+            .description
+            .contains("remediation=missing_inventory_artifact"),
+        "bead_id={BEAD_ID} case=g9_remediation_present risk={g9_risk:?}",
+    );
+    assert!(
+        g9_risk
+            .description
+            .contains("backend_identity=fsqlite:pager_wal_mvcc_btree"),
+        "bead_id={BEAD_ID} case=g9_backend_identity_present risk={g9_risk:?}",
+    );
+    assert!(
+        g9_risk
+            .description
+            .contains("deterministic_fallback_denial_replay"),
+        "bead_id={BEAD_ID} case=g9_replay_present risk={g9_risk:?}",
+    );
 }
 
 #[test]
@@ -454,7 +476,7 @@ fn release_certificate_rejects_failed_verification_contract_from_manifest() {
     assert!(
         cert.unresolved_risks
             .iter()
-            .any(|risk| risk.source == "verification_contract"),
+            .any(|risk| matches!(risk.source.as_str(), "verification_contract")),
         "bead_id={BEAD_ID} case=contract_risk",
     );
 }

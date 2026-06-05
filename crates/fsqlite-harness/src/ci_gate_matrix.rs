@@ -1108,6 +1108,148 @@ impl FallbackTransparencyGateStatus {
     }
 }
 
+/// Operator-facing severity for G9 fallback-transparency remediation messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackTransparencyRemediationSeverity {
+    /// The certificate must not be generated until this failure is resolved.
+    CertificateBlocker,
+    /// Non-certifying compatibility control that should remain separate from cert evidence.
+    ControlWarning,
+}
+
+impl FallbackTransparencyRemediationSeverity {
+    /// Stable string identifier for summaries and CI logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CertificateBlocker => "certificate_blocker",
+            Self::ControlWarning => "control_warning",
+        }
+    }
+}
+
+/// Standardized G9 fallback-transparency failure classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackTransparencyFailureClass {
+    MissingInventoryArtifact,
+    MissingSchemaValidation,
+    MissingReplayBundle,
+    StaleFallbackArtifact,
+    MissingBoundaryCoverage,
+    CertifyingFallbackAllowed,
+    StrictDenialMissingDiagnostic,
+    BackendIdentityMismatch,
+    NonCertControlMisclassified,
+    GateManifestSchemaInvalid,
+}
+
+impl FallbackTransparencyFailureClass {
+    /// All standardized classes expected by G9.5 remediation UX.
+    pub const ALL: [Self; 10] = [
+        Self::MissingInventoryArtifact,
+        Self::MissingSchemaValidation,
+        Self::MissingReplayBundle,
+        Self::StaleFallbackArtifact,
+        Self::MissingBoundaryCoverage,
+        Self::CertifyingFallbackAllowed,
+        Self::StrictDenialMissingDiagnostic,
+        Self::BackendIdentityMismatch,
+        Self::NonCertControlMisclassified,
+        Self::GateManifestSchemaInvalid,
+    ];
+
+    /// Parse a standardized class string.
+    #[must_use]
+    pub fn from_class_str(value: &str) -> Option<Self> {
+        match value {
+            "missing_inventory_artifact" => Some(Self::MissingInventoryArtifact),
+            "missing_schema_validation" => Some(Self::MissingSchemaValidation),
+            "missing_replay_bundle" => Some(Self::MissingReplayBundle),
+            "stale_fallback_artifact" => Some(Self::StaleFallbackArtifact),
+            "missing_boundary_coverage" => Some(Self::MissingBoundaryCoverage),
+            "certifying_fallback_allowed" => Some(Self::CertifyingFallbackAllowed),
+            "strict_denial_missing_diagnostic" => Some(Self::StrictDenialMissingDiagnostic),
+            "backend_identity_mismatch" => Some(Self::BackendIdentityMismatch),
+            "non_cert_control_misclassified" => Some(Self::NonCertControlMisclassified),
+            "gate_manifest_schema_invalid" => Some(Self::GateManifestSchemaInvalid),
+            _ => None,
+        }
+    }
+
+    /// Stable string identifier.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingInventoryArtifact => "missing_inventory_artifact",
+            Self::MissingSchemaValidation => "missing_schema_validation",
+            Self::MissingReplayBundle => "missing_replay_bundle",
+            Self::StaleFallbackArtifact => "stale_fallback_artifact",
+            Self::MissingBoundaryCoverage => "missing_boundary_coverage",
+            Self::CertifyingFallbackAllowed => "certifying_fallback_allowed",
+            Self::StrictDenialMissingDiagnostic => "strict_denial_missing_diagnostic",
+            Self::BackendIdentityMismatch => "backend_identity_mismatch",
+            Self::NonCertControlMisclassified => "non_cert_control_misclassified",
+            Self::GateManifestSchemaInvalid => "gate_manifest_schema_invalid",
+        }
+    }
+
+    /// Certificate severity for this failure class.
+    #[must_use]
+    pub const fn severity(self) -> FallbackTransparencyRemediationSeverity {
+        let _ = self;
+        FallbackTransparencyRemediationSeverity::CertificateBlocker
+    }
+
+    fn likely_owner(self) -> &'static str {
+        match self {
+            Self::MissingInventoryArtifact | Self::MissingBoundaryCoverage => "bd-2yqp6.7.9.1",
+            Self::MissingSchemaValidation
+            | Self::CertifyingFallbackAllowed
+            | Self::StrictDenialMissingDiagnostic
+            | Self::BackendIdentityMismatch
+            | Self::NonCertControlMisclassified => "bd-2yqp6.7.9.2",
+            Self::MissingReplayBundle | Self::StaleFallbackArtifact => "bd-2yqp6.7.9.3",
+            Self::GateManifestSchemaInvalid => "bd-2yqp6.7.9.4",
+        }
+    }
+
+    fn remediation_hint(self) -> &'static str {
+        match self {
+            Self::MissingInventoryArtifact => {
+                "Regenerate fallback_boundary_inventory.v1 for this candidate and validate every logged or guarded fallback reason maps to one inventory row."
+            }
+            Self::MissingSchemaValidation => {
+                "Run fallback-decision schema validation and ensure G9.2 required fields and enum values are present before certificate generation."
+            }
+            Self::MissingReplayBundle => {
+                "Run the G9.3 deterministic fallback-denial replay command and attach the replay artifact index and hash before certifying."
+            }
+            Self::StaleFallbackArtifact => {
+                "Regenerate the fallback proof bundle from the current source commit, inventory hash, schema hash, and replay index hash."
+            }
+            Self::MissingBoundaryCoverage => {
+                "Add strict-denial replay or real-backend dispatch proof for the named fallback boundary before certifying."
+            }
+            Self::CertifyingFallbackAllowed => {
+                "Move the statement shape to real storage backend execution or make strict parity mode deny before compatibility fallback executes."
+            }
+            Self::StrictDenialMissingDiagnostic => {
+                "Add an actionable first-failure diagnostic with statement shape, boundary, source touchpoint, and replay command."
+            }
+            Self::BackendIdentityMismatch => {
+                "Re-run with file-backed strict parity defaults and verify backend identity propagation in every event and report."
+            }
+            Self::NonCertControlMisclassified => {
+                "Move this compatibility-control event out of certifying evidence and remove it from parity success counts."
+            }
+            Self::GateManifestSchemaInvalid => {
+                "Fix g9_gate_summary.v1 schema fields before certificate generation can proceed."
+            }
+        }
+    }
+}
+
 /// Hash-bearing reference to one G9 proof artifact.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FallbackTransparencyArtifactRef {
@@ -1147,6 +1289,71 @@ impl FallbackTransparencyArtifactRef {
             errors.push(format!("{field}.validation_passed must be true"));
         }
         errors
+    }
+}
+
+/// User-facing remediation message for one G9 fallback-transparency failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FallbackTransparencyRemediationMessage {
+    /// Standardized G9 failure class.
+    pub failure_class: String,
+    /// Operator severity.
+    pub severity: FallbackTransparencyRemediationSeverity,
+    /// Trace id when the producer has one available.
+    pub trace_id: Option<String>,
+    /// Run id when the producer has one available.
+    pub run_id: Option<String>,
+    /// Scenario id when the producer has one available.
+    pub scenario_id: Option<String>,
+    /// Statement kind when available.
+    pub statement_kind: Option<String>,
+    /// Statement fingerprint when available.
+    pub statement_fingerprint: Option<String>,
+    /// Fallback boundary id or family when available.
+    pub fallback_boundary: Option<String>,
+    /// Decision reason when available.
+    pub decision_reason: Option<String>,
+    /// Decision outcome when available.
+    pub decision_outcome: Option<String>,
+    /// Backend identity must always remain visible to operators.
+    pub backend_identity: String,
+    /// Source touchpoint or schema/artifact surface that needs action.
+    pub source_touchpoint: String,
+    /// Owning bead or subsystem expected to remediate the failure.
+    pub likely_owner: String,
+    /// Relevant artifact path when available.
+    pub artifact_path: Option<String>,
+    /// Relevant artifact content hash when available.
+    pub artifact_hash: Option<String>,
+    /// One-command replay path.
+    pub replay_command: String,
+    /// Short operator remediation hint.
+    pub remediation_hint: String,
+}
+
+impl FallbackTransparencyRemediationMessage {
+    /// Concise CI-safe rendering for artifact summaries and certificate risks.
+    #[must_use]
+    pub fn render_concise(&self) -> String {
+        let boundary = self
+            .fallback_boundary
+            .as_deref()
+            .unwrap_or("boundary_unavailable");
+        let artifact = self
+            .artifact_path
+            .as_deref()
+            .unwrap_or("artifact_unavailable");
+        format!(
+            "{} [{}]: backend_identity={} boundary={} owner={} artifact={} replay={} hint={}",
+            self.failure_class,
+            self.severity.as_str(),
+            self.backend_identity,
+            boundary,
+            self.likely_owner,
+            artifact,
+            self.replay_command,
+            self.remediation_hint,
+        )
     }
 }
 
@@ -1192,6 +1399,149 @@ impl FallbackTransparencyGateSummary {
         matches!(self.status, FallbackTransparencyGateStatus::Pass)
     }
 
+    /// Build operator-facing remediation messages for every G9 failure class.
+    #[must_use]
+    pub fn remediation_messages(&self) -> Vec<FallbackTransparencyRemediationMessage> {
+        self.gate_failures
+            .iter()
+            .map(|failure| {
+                let failure_class = FallbackTransparencyFailureClass::from_class_str(failure)
+                    .unwrap_or(FallbackTransparencyFailureClass::GateManifestSchemaInvalid);
+                let artifact = self.artifact_for_failure(failure_class);
+                FallbackTransparencyRemediationMessage {
+                    failure_class: failure.clone(),
+                    severity: failure_class.severity(),
+                    trace_id: None,
+                    run_id: None,
+                    scenario_id: None,
+                    statement_kind: None,
+                    statement_fingerprint: None,
+                    fallback_boundary: self.boundary_for_failure(failure_class),
+                    decision_reason: Some(failure_class.as_str().to_owned()),
+                    decision_outcome: Some(Self::decision_outcome_for_failure(failure_class)),
+                    backend_identity: self.backend_identity_summary.clone(),
+                    source_touchpoint: self.source_touchpoint_for_failure(failure_class),
+                    likely_owner: failure_class.likely_owner().to_owned(),
+                    artifact_path: artifact.map(|artifact| artifact.path.clone()),
+                    artifact_hash: artifact.map(|artifact| artifact.content_hash.clone()),
+                    replay_command: self.replay_command.clone(),
+                    remediation_hint: failure_class.remediation_hint().to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    fn artifact_for_failure(
+        &self,
+        failure_class: FallbackTransparencyFailureClass,
+    ) -> Option<&FallbackTransparencyArtifactRef> {
+        match failure_class {
+            FallbackTransparencyFailureClass::MissingInventoryArtifact => Some(&self.inventory),
+            FallbackTransparencyFailureClass::MissingSchemaValidation => {
+                Some(&self.schema_validation)
+            }
+            FallbackTransparencyFailureClass::MissingReplayBundle => Some(&self.replay_bundle),
+            FallbackTransparencyFailureClass::StaleFallbackArtifact => {
+                self.first_stale_artifact_ref()
+            }
+            FallbackTransparencyFailureClass::MissingBoundaryCoverage
+            | FallbackTransparencyFailureClass::CertifyingFallbackAllowed
+            | FallbackTransparencyFailureClass::StrictDenialMissingDiagnostic
+            | FallbackTransparencyFailureClass::BackendIdentityMismatch
+            | FallbackTransparencyFailureClass::NonCertControlMisclassified
+            | FallbackTransparencyFailureClass::GateManifestSchemaInvalid => None,
+        }
+    }
+
+    fn first_stale_artifact_ref(&self) -> Option<&FallbackTransparencyArtifactRef> {
+        self.stale_artifacts
+            .iter()
+            .find_map(|artifact| match artifact.as_str() {
+                "fallback_boundary_inventory" | "inventory" => Some(&self.inventory),
+                "fallback_decision_schema" | "schema_validation" => Some(&self.schema_validation),
+                "fallback_denial_replay" | "replay_bundle" => Some(&self.replay_bundle),
+                _ => None,
+            })
+    }
+
+    fn boundary_for_failure(
+        &self,
+        failure_class: FallbackTransparencyFailureClass,
+    ) -> Option<String> {
+        match failure_class {
+            FallbackTransparencyFailureClass::MissingBoundaryCoverage
+            | FallbackTransparencyFailureClass::CertifyingFallbackAllowed
+            | FallbackTransparencyFailureClass::StrictDenialMissingDiagnostic
+            | FallbackTransparencyFailureClass::BackendIdentityMismatch
+            | FallbackTransparencyFailureClass::NonCertControlMisclassified => self
+                .missing_boundary_ids
+                .first()
+                .or_else(|| self.covered_boundary_ids.first())
+                .cloned(),
+            FallbackTransparencyFailureClass::MissingInventoryArtifact
+            | FallbackTransparencyFailureClass::MissingSchemaValidation
+            | FallbackTransparencyFailureClass::MissingReplayBundle
+            | FallbackTransparencyFailureClass::StaleFallbackArtifact
+            | FallbackTransparencyFailureClass::GateManifestSchemaInvalid => None,
+        }
+    }
+
+    fn source_touchpoint_for_failure(
+        &self,
+        failure_class: FallbackTransparencyFailureClass,
+    ) -> String {
+        match failure_class {
+            FallbackTransparencyFailureClass::MissingInventoryArtifact => {
+                self.inventory.path.clone()
+            }
+            FallbackTransparencyFailureClass::MissingSchemaValidation => {
+                self.schema_validation.path.clone()
+            }
+            FallbackTransparencyFailureClass::MissingReplayBundle => {
+                self.replay_bundle.path.clone()
+            }
+            FallbackTransparencyFailureClass::StaleFallbackArtifact => {
+                self.first_stale_artifact_ref().map_or_else(
+                    || "stale_artifacts".to_owned(),
+                    |artifact| artifact.path.clone(),
+                )
+            }
+            FallbackTransparencyFailureClass::MissingBoundaryCoverage
+            | FallbackTransparencyFailureClass::CertifyingFallbackAllowed
+            | FallbackTransparencyFailureClass::StrictDenialMissingDiagnostic
+            | FallbackTransparencyFailureClass::BackendIdentityMismatch
+            | FallbackTransparencyFailureClass::NonCertControlMisclassified => self
+                .boundary_for_failure(failure_class)
+                .unwrap_or_else(|| "fallback_boundary_unavailable".to_owned()),
+            FallbackTransparencyFailureClass::GateManifestSchemaInvalid => {
+                FALLBACK_TRANSPARENCY_GATE_SCHEMA_VERSION.to_owned()
+            }
+        }
+    }
+
+    fn decision_outcome_for_failure(failure_class: FallbackTransparencyFailureClass) -> String {
+        match failure_class {
+            FallbackTransparencyFailureClass::CertifyingFallbackAllowed => {
+                "allowed_compatibility_fallback".to_owned()
+            }
+            FallbackTransparencyFailureClass::StrictDenialMissingDiagnostic => {
+                "denied_missing_diagnostic".to_owned()
+            }
+            FallbackTransparencyFailureClass::NonCertControlMisclassified => {
+                "non_cert_control_misclassified".to_owned()
+            }
+            FallbackTransparencyFailureClass::MissingInventoryArtifact
+            | FallbackTransparencyFailureClass::MissingSchemaValidation
+            | FallbackTransparencyFailureClass::MissingReplayBundle
+            | FallbackTransparencyFailureClass::StaleFallbackArtifact
+            | FallbackTransparencyFailureClass::MissingBoundaryCoverage
+            | FallbackTransparencyFailureClass::BackendIdentityMismatch
+            | FallbackTransparencyFailureClass::GateManifestSchemaInvalid => {
+                "certificate_blocked".to_owned()
+            }
+        }
+    }
+
     /// Validate the G9 gate summary contract.
     #[must_use]
     pub fn validate(&self) -> Vec<String> {
@@ -1233,6 +1583,13 @@ impl FallbackTransparencyGateSummary {
         }
         for error in self.replay_bundle.validate("replay_bundle") {
             errors.push(error);
+        }
+        for failure in &self.gate_failures {
+            if FallbackTransparencyFailureClass::from_class_str(failure).is_none() {
+                errors.push(format!(
+                    "gate_failures must use known G9 failure classes, got {failure}"
+                ));
+            }
         }
         if self.gate_passed() {
             if !self.missing_boundary_ids.is_empty() {
@@ -1425,6 +1782,9 @@ impl ArtifactManifest {
                 gate.certifying_fallback_events,
             );
             let _ = writeln!(out, "    replay={}", gate.replay_command);
+            for remediation in gate.remediation_messages() {
+                let _ = writeln!(out, "    remediation: {}", remediation.render_concise());
+            }
         }
         out
     }
@@ -1639,6 +1999,20 @@ mod tests {
                 "certifying_fallback_allowed".to_owned(),
                 "stale_fallback_artifact".to_owned(),
             ],
+            ..passing_fallback_transparency_gate()
+        }
+    }
+
+    fn failing_fallback_transparency_gate_with_all_classes() -> FallbackTransparencyGateSummary {
+        FallbackTransparencyGateSummary {
+            status: FallbackTransparencyGateStatus::Fail,
+            missing_boundary_ids: vec!["conn.select.view_materialization".to_owned()],
+            stale_artifacts: vec!["fallback_denial_replay".to_owned()],
+            certifying_fallback_events: 1,
+            gate_failures: FallbackTransparencyFailureClass::ALL
+                .iter()
+                .map(|failure_class| failure_class.as_str().to_owned())
+                .collect(),
             ..passing_fallback_transparency_gate()
         }
     }
@@ -2264,6 +2638,53 @@ mod tests {
     }
 
     #[test]
+    fn fallback_transparency_remediation_covers_all_failure_classes() {
+        let gate = failing_fallback_transparency_gate_with_all_classes();
+        let errors = gate.validate();
+        assert!(errors.is_empty(), "G9 gate should validate: {errors:?}");
+
+        let messages = gate.remediation_messages();
+        assert_eq!(messages.len(), FallbackTransparencyFailureClass::ALL.len());
+
+        for failure_class in FallbackTransparencyFailureClass::ALL {
+            let failure = failure_class.as_str();
+            let message = messages
+                .iter()
+                .find(|message| message.failure_class == failure)
+                .expect("every standardized failure class should have a remediation message");
+            assert_eq!(
+                message.severity,
+                FallbackTransparencyRemediationSeverity::CertificateBlocker,
+                "bead_id={BEAD_ID} case=g9_remediation_severity class={failure}",
+            );
+            assert!(
+                message
+                    .backend_identity
+                    .contains("fsqlite:pager_wal_mvcc_btree"),
+                "bead_id={BEAD_ID} case=g9_backend_identity_visible class={failure}",
+            );
+            assert!(
+                !message.source_touchpoint.is_empty(),
+                "bead_id={BEAD_ID} case=g9_source_touchpoint class={failure}",
+            );
+            assert!(
+                !message.likely_owner.is_empty(),
+                "bead_id={BEAD_ID} case=g9_owner class={failure}",
+            );
+            assert!(
+                message
+                    .replay_command
+                    .contains("deterministic_fallback_denial_replay"),
+                "bead_id={BEAD_ID} case=g9_replay class={failure}",
+            );
+            assert!(
+                !message.remediation_hint.is_empty(),
+                "bead_id={BEAD_ID} case=g9_hint class={failure}",
+            );
+        }
+    }
+
+    #[test]
     fn artifact_manifest_with_fallback_gate_blocks_gate_when_g9_fails() {
         let manifest = build_artifact_manifest_with_contract_and_fallback_gate(
             CiLane::SchemaValidation,
@@ -2289,6 +2710,8 @@ mod tests {
         let summary = manifest.render_summary();
         assert!(summary.contains("G9 fallback transparency: FAIL"));
         assert!(summary.contains("certifying_fallbacks=1"));
+        assert!(summary.contains("remediation: missing_boundary_coverage"));
+        assert!(summary.contains("backend_identity=fsqlite:pager_wal_mvcc_btree"));
     }
 
     #[test]

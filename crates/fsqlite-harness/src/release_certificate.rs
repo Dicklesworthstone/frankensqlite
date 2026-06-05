@@ -422,6 +422,25 @@ fn sha256_hex(data: &str) -> String {
     format!("{h:016x}{h:016x}{h:016x}{h:016x}", h = h)
 }
 
+fn fallback_transparency_remediation_summary(
+    gate: Option<&FallbackTransparencyGateSummary>,
+) -> String {
+    let Some(gate) = gate else {
+        return "none".to_owned();
+    };
+    let messages = gate.remediation_messages();
+    let rendered: Vec<_> = messages
+        .iter()
+        .take(3)
+        .map(|message| message.render_concise())
+        .collect();
+    if rendered.is_empty() {
+        "none".to_owned()
+    } else {
+        rendered.join(" | ")
+    }
+}
+
 /// Build the embedded certification traceability view.
 #[must_use]
 fn build_certification_traceability(
@@ -803,11 +822,17 @@ pub fn build_certificate(
     }
 
     if certification_evidence.fallback_transparency_gate_passed == Some(false) {
+        let remediation_summary = fallback_transparency_remediation_summary(
+            inputs
+                .artifact_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.fallback_transparency_gate.as_ref()),
+        );
         unresolved_risks.push(UnresolvedRisk {
             source: "fallback_transparency_gate".to_owned(),
             severity: "High".to_owned(),
             description: format!(
-                "G9 fallback-transparency gate failed (gate_failures={}, missing_boundaries={}, stale_artifacts={}, certifying_fallback_events={}, replay_command={}).",
+                "G9 fallback-transparency gate failed (gate_failures={}, missing_boundaries={}, stale_artifacts={}, certifying_fallback_events={}, replay_command={}, remediation={}).",
                 certification_evidence.fallback_transparency_gate_failure_count,
                 certification_evidence.fallback_transparency_missing_boundary_count,
                 certification_evidence.fallback_transparency_stale_artifact_count,
@@ -816,6 +841,7 @@ pub fn build_certificate(
                     .fallback_transparency_replay_command
                     .as_deref()
                     .unwrap_or("missing"),
+                remediation_summary,
             ),
         });
     }
