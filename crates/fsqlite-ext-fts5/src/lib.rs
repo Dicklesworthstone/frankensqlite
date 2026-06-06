@@ -2302,6 +2302,73 @@ pub fn lazy_exact_doclist_entries(
     Ok(entries)
 }
 
+/// Lazily collect the doclist entries for every term within one on-disk segment
+/// that begins with `prefix` (the exact byte key, index marker already applied),
+/// reading only the leaf pages from the prefix's candidate page onward. Mirrors
+/// the leaf scan in [`Fts5SegmentReader::prefix_matches`] but sources leaf
+/// blocks through an [`Fts5OnDiskReader`].
+fn lazy_segment_prefix_postings(
+    reader: &mut dyn Fts5OnDiskReader,
+    segment: &Fts5StructureSegment,
+    prefix: &[u8],
+) -> Result<Vec<Fts5DoclistEntry>> {
+    let start = reader
+        .idx_candidate_page(segment.segid, prefix)?
+        .unwrap_or(segment.pgno_first)
+        .clamp(segment.pgno_first, segment.pgno_last);
+    let mut entries = Vec::new();
+    let mut pgno = start;
+    while pgno <= segment.pgno_last {
+        let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
+        let block = reader
+            .read_data_block(id)?
+            .ok_or_else(|| fts5_data_error("missing segment leaf page"))?;
+        let leaf = Fts5SegmentLeaf::decode(&block)?;
+        for seg_term in leaf.terms {
+            if seg_term.term.starts_with(prefix) {
+                entries.extend(seg_term.doclist.entries);
+                continue;
+            }
+            // Segment terms are sorted: once we have collected a match and moved
+            // past the prefix run, or we have scanned past where the prefix could
+            // first appear, no later term in this segment can match.
+            if !entries.is_empty() || seg_term.term.as_slice() > prefix {
+                return Ok(entries);
+            }
+        }
+        pgno = pgno.saturating_add(1);
+    }
+    Ok(entries)
+}
+
+/// Lazily collect doclist entries (FTS5 delete markers filtered out) for every
+/// term beginning with `prefix` across every on-disk segment of `structure`,
+/// reading leaf pages on demand via `reader`.
+///
+/// Parity counterpart of `Fts5ShadowQuery::prefix_entries` for the lazy
+/// (reopened) path; the dual main/raw lookup keys make it correct against both
+/// stock-SQLite segments (terms stored as `FTS5_MAIN_PREFIX_BYTE ++ token`) and
+/// frankensqlite-encoded segments.
+pub fn lazy_prefix_doclist_entries(
+    reader: &mut dyn Fts5OnDiskReader,
+    structure: &Fts5StructureRecord,
+    prefix: &[u8],
+) -> Result<Vec<Fts5DoclistEntry>> {
+    let mut entries = Vec::new();
+    for key in segment_lookup_keys(prefix) {
+        for level in &structure.levels {
+            for segment in &level.segments {
+                for entry in lazy_segment_prefix_postings(reader, segment, &key)? {
+                    if !entry.poslist.delete {
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// Decode an FTS5 `_docsize.sz` blob into per-column token counts. The blob is
 /// a sequence of varints (one per stored column).
 ///
@@ -6479,241 +6546,6 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
         Ok(entries)
     }
 
-    fn term_rowids(
-        &self,
-        term: &str,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
-        Ok(shadow_rowids_from_entries(
-            &self.exact_entries(term)?,
-            allowed_columns,
-        ))
-    }
-
-    fn prefix_rowids(
-        &self,
-        prefix: &str,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
-        Ok(shadow_rowids_from_entries(
-            &self.prefix_entries(prefix)?,
-            allowed_columns,
-        ))
-    }
-
-    fn term_spans(
-        &self,
-        term: &str,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
-        Ok(shadow_spans_from_entries(
-            &self.exact_entries(term)?,
-            allowed_columns,
-        ))
-    }
-
-    fn prefix_spans(
-        &self,
-        prefix: &str,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
-        Ok(shadow_spans_from_entries(
-            &self.prefix_entries(prefix)?,
-            allowed_columns,
-        ))
-    }
-
-    fn phrase_spans(
-        &self,
-        words: &[String],
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
-        let Some(first) = words.first() else {
-            return Ok(Vec::new());
-        };
-
-        let mut spans = self.term_spans(first, allowed_columns)?;
-        for word in &words[1..] {
-            let next_spans = self.term_spans(word, allowed_columns)?;
-            let mut combined = Vec::new();
-            for left in &spans {
-                combined.extend(
-                    next_spans
-                        .iter()
-                        .filter(|right| {
-                            left.docid == right.docid
-                                && left.column == right.column
-                                && right.start == left.end.saturating_add(1)
-                        })
-                        .map(|right| Fts5NearSpan {
-                            docid: left.docid,
-                            column: left.column,
-                            start: left.start,
-                            end: right.end,
-                        }),
-                );
-            }
-            combined.sort_unstable_by_key(|span| (span.docid, span.column, span.start, span.end));
-            combined.dedup_by_key(|span| (span.docid, span.column, span.start, span.end));
-            spans = combined;
-            if spans.is_empty() {
-                break;
-            }
-        }
-        Ok(spans)
-    }
-
-    fn phrase_prefix_spans(
-        &self,
-        words: &[String],
-        prefix: &str,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
-        if words.is_empty() {
-            return self.prefix_spans(prefix, allowed_columns);
-        }
-
-        let phrase_spans = self.phrase_spans(words, allowed_columns)?;
-        let prefix_spans = self.prefix_spans(prefix, allowed_columns)?;
-        let mut combined = Vec::new();
-        for left in &phrase_spans {
-            combined.extend(
-                prefix_spans
-                    .iter()
-                    .filter(|right| {
-                        left.docid == right.docid
-                            && left.column == right.column
-                            && right.start == left.end.saturating_add(1)
-                    })
-                    .map(|right| Fts5NearSpan {
-                        docid: left.docid,
-                        column: left.column,
-                        start: left.start,
-                        end: right.end,
-                    }),
-            );
-        }
-        combined.sort_unstable_by_key(|span| (span.docid, span.column, span.start, span.end));
-        combined.dedup_by_key(|span| (span.docid, span.column, span.start, span.end));
-        Ok(combined)
-    }
-
-    fn near_operand_spans(
-        &self,
-        operand: &Fts5NearOperand,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<Fts5NearSpan>, Fts5QueryError> {
-        match operand {
-            Fts5NearOperand::Term(term) => self.term_spans(term, allowed_columns),
-            Fts5NearOperand::Prefix(prefix) => self.prefix_spans(prefix, allowed_columns),
-            Fts5NearOperand::Phrase(words) => self.phrase_spans(words, allowed_columns),
-        }
-    }
-
-    fn near_rowids(
-        &self,
-        operands: &[Fts5NearOperand],
-        distance: u32,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
-        if operands.len() < 2 {
-            return Ok(Vec::new());
-        }
-
-        let operand_spans: Vec<Vec<Fts5NearSpan>> = operands
-            .iter()
-            .map(|operand| self.near_operand_spans(operand, allowed_columns))
-            .collect::<std::result::Result<_, _>>()?;
-        if operand_spans.iter().any(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
-
-        let mut operand_order: Vec<usize> = (0..operand_spans.len()).collect();
-        operand_order.sort_by_key(|&operand_index| operand_spans[operand_index].len());
-        let anchor_operand = operand_order[0];
-        let mut result = Vec::new();
-
-        for anchor_span in &operand_spans[anchor_operand] {
-            let mut selected = SmallVec::new();
-            selected.push(*anchor_span);
-            if find_near_clump(&operand_spans, &operand_order, 1, &mut selected, distance)
-                && !result.contains(&anchor_span.docid)
-            {
-                result.push(anchor_span.docid);
-            }
-        }
-
-        result.sort_unstable();
-        Ok(result)
-    }
-
-    fn evaluate_initial_expr(
-        &self,
-        expr: &Fts5Expr,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
-        let spans = match expr {
-            Fts5Expr::Term(term) => self.term_spans(term, allowed_columns)?,
-            Fts5Expr::Prefix(prefix) => self.prefix_spans(prefix, allowed_columns)?,
-            Fts5Expr::Phrase(words) => self.phrase_spans(words, allowed_columns)?,
-            Fts5Expr::PhrasePrefix(words, prefix) => {
-                self.phrase_prefix_spans(words, prefix, allowed_columns)?
-            }
-            _ => return self.evaluate_expr(expr, allowed_columns),
-        };
-        Ok(shadow_rowids_from_spans(
-            spans.into_iter().filter(|span| span.start == 0).collect(),
-        ))
-    }
-
-    fn evaluate_expr(
-        &self,
-        expr: &Fts5Expr,
-        allowed_columns: Option<&[u32]>,
-    ) -> std::result::Result<Vec<i64>, Fts5QueryError> {
-        match expr {
-            Fts5Expr::Term(term) => self.term_rowids(term, allowed_columns),
-            Fts5Expr::Prefix(prefix) => self.prefix_rowids(prefix, allowed_columns),
-            Fts5Expr::Phrase(words) => Ok(shadow_rowids_from_spans(
-                self.phrase_spans(words, allowed_columns)?,
-            )),
-            Fts5Expr::PhrasePrefix(words, prefix) => Ok(shadow_rowids_from_spans(
-                self.phrase_prefix_spans(words, prefix, allowed_columns)?,
-            )),
-            Fts5Expr::And(left, right) => {
-                let left_docs = self.evaluate_expr(left, allowed_columns)?;
-                let right_docs = self.evaluate_expr(right, allowed_columns)?;
-                Ok(intersect_sorted(&left_docs, &right_docs))
-            }
-            Fts5Expr::Or(left, right) => {
-                let left_docs = self.evaluate_expr(left, allowed_columns)?;
-                let right_docs = self.evaluate_expr(right, allowed_columns)?;
-                Ok(union_sorted(&left_docs, &right_docs))
-            }
-            Fts5Expr::Not(left, right) => {
-                let left_docs = self.evaluate_expr(left, allowed_columns)?;
-                let right_docs = self.evaluate_expr(right, allowed_columns)?;
-                Ok(difference_sorted(&left_docs, &right_docs))
-            }
-            Fts5Expr::Near(operands, distance) => {
-                self.near_rowids(operands, *distance, allowed_columns)
-            }
-            Fts5Expr::ColumnFilter(column_filter, inner) => {
-                let Some(filter_spec) = parse_column_filter_spec(column_filter) else {
-                    return Ok(Vec::new());
-                };
-                let Some(resolved_columns) =
-                    resolve_column_filter_columns(self.columns, &filter_spec)
-                else {
-                    return Ok(Vec::new());
-                };
-                let combined_columns = combine_allowed_columns(allowed_columns, &resolved_columns);
-                self.evaluate_expr(inner, Some(combined_columns.as_slice()))
-            }
-            Fts5Expr::InitialToken(inner) => self.evaluate_initial_expr(inner, allowed_columns),
-        }
-    }
-
     fn total_docs(&self) -> std::result::Result<u64, Fts5QueryError> {
         if let Some(averages) = self.averages.as_ref()
             && averages.total_rows > 0
@@ -6761,83 +6593,196 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
             .find(|row| row.rowid == rowid)
             .map_or(0, Fts5DocsizeRow::total_tokens))
     }
+}
 
-    fn doc_frequency(&self, term: &str) -> std::result::Result<u64, Fts5QueryError> {
-        Ok(self
-            .exact_entries(term)?
-            .into_iter()
-            .filter(|entry| !entry.poslist.delete)
-            .filter_map(|entry| rowid_u64_to_i64(entry.rowid))
-            .collect::<BTreeSet<_>>()
-            .len()
-            .try_into()
-            .unwrap_or(u64::MAX))
+/// Lazy on-disk MATCH evaluator for reopened FTS5 indexes.
+///
+/// Answers FTS5 queries by point-reading ONLY the persisted segments/postings a
+/// query touches through an [`Fts5OnDiskReader`], instead of rebuilding the
+/// whole in-memory inverted index on every connection.
+///
+/// It shares the entire ranked-search engine (boolean/phrase/NEAR evaluation,
+/// column filters, BM25) with [`Fts5ShadowQuery`] via [`Fts5DoclistProvider`],
+/// so a reopened on-disk index returns IDENTICAL rowids, ordering, and scores to
+/// the in-memory path — only the doclist primitives differ (on-demand segment
+/// reads vs. an in-memory row set).
+///
+/// Per-query caches collapse the several consultations a single MATCH makes of
+/// each term's postings (expression evaluation, then BM25 `df`/`tf`) and each
+/// result's `_docsize` into ONE on-disk scan/read apiece, so cost stays bounded
+/// by the doclists a query actually touches rather than the whole corpus.
+pub struct Fts5LazyQuery<'a> {
+    reader: std::cell::RefCell<&'a mut dyn Fts5OnDiskReader>,
+    columns: &'a [String],
+    tokenizer: &'a dyn Fts5Tokenizer,
+    detail: DetailMode,
+    structure: Fts5StructureRecord,
+    averages: Option<Fts5AveragesRecord>,
+    column_count: usize,
+    exact_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Fts5DoclistEntry>>>>,
+    prefix_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<Fts5DoclistEntry>>>>,
+    docsize_cache: std::cell::RefCell<HashMap<i64, u32>>,
+}
+
+impl<'a> Fts5LazyQuery<'a> {
+    /// Build a lazy query over `reader`, reading the structure (id=10) and
+    /// averages (id=1) records ONCE up front. A missing structure row means an
+    /// empty index (every query yields nothing); a missing averages row leaves
+    /// BM25 `N`/`avgdl` at zero (a freshly flushed segment always writes it).
+    pub fn new(
+        reader: &'a mut dyn Fts5OnDiskReader,
+        columns: &'a [String],
+        tokenizer: &'a dyn Fts5Tokenizer,
+        detail: DetailMode,
+    ) -> std::result::Result<Self, Fts5QueryError> {
+        let column_count = columns.len();
+        let structure = match reader
+            .read_data_block(FTS5_STRUCTURE_ROWID)
+            .map_err(shadow_query_storage_error)?
+        {
+            Some(block) => {
+                Fts5StructureRecord::decode(&block).map_err(shadow_query_storage_error)?
+            }
+            None => Fts5StructureRecord::empty_legacy(0),
+        };
+        let averages = match reader
+            .read_data_block(FTS5_AVERAGES_ROWID)
+            .map_err(shadow_query_storage_error)?
+        {
+            Some(block) => Some(
+                Fts5AveragesRecord::decode(&block, column_count)
+                    .map_err(shadow_query_storage_error)?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            reader: std::cell::RefCell::new(reader),
+            columns,
+            tokenizer,
+            detail,
+            structure,
+            averages,
+            column_count,
+            exact_cache: std::cell::RefCell::new(HashMap::new()),
+            prefix_cache: std::cell::RefCell::new(HashMap::new()),
+            docsize_cache: std::cell::RefCell::new(HashMap::new()),
+        })
     }
 
-    fn term_column_frequencies(
+    /// Run a single MATCH query, returning `(rowid, bm25)` pairs sorted by score.
+    pub fn search(
+        &self,
+        query: &str,
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        self.search_with_weights(&[query], weights)
+    }
+
+    /// Run one or more MATCH queries (AND-combined), mirroring
+    /// [`Fts5ShadowQuery::search_queries_with_weights`].
+    pub fn search_queries_with_weights(
+        &self,
+        queries: &[&str],
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+        self.search_with_weights(queries, weights)
+    }
+
+    /// Point-read the `_content` row for a (result) `rowid`, so projection reads
+    /// only the LIMITed result set rather than the whole corpus.
+    pub fn content_for_rowid(
+        &self,
+        rowid: i64,
+    ) -> std::result::Result<Option<Vec<String>>, Fts5QueryError> {
+        self.reader
+            .borrow_mut()
+            .read_content(rowid, self.column_count)
+            .map_err(shadow_query_storage_error)
+    }
+}
+
+impl Fts5DoclistProvider for Fts5LazyQuery<'_> {
+    fn columns(&self) -> &[String] {
+        self.columns
+    }
+
+    fn tokenizer(&self) -> &dyn Fts5Tokenizer {
+        self.tokenizer
+    }
+
+    fn detail(&self) -> DetailMode {
+        self.detail
+    }
+
+    fn exact_entries(
         &self,
         term: &str,
-        rowid: i64,
-    ) -> std::result::Result<Vec<(u32, u32)>, Fts5QueryError> {
-        let mut frequencies = BTreeMap::new();
-        for entry in self.exact_entries(term)? {
-            if rowid_u64_to_i64(entry.rowid) != Some(rowid) || entry.poslist.delete {
-                continue;
-            }
-            for column in entry.poslist.columns {
-                let count = u32::try_from(column.offsets.len()).unwrap_or(u32::MAX);
-                *frequencies.entry(column.column).or_insert(0_u32) = frequencies
-                    .get(&column.column)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(count);
-            }
+    ) -> std::result::Result<Vec<Fts5DoclistEntry>, Fts5QueryError> {
+        if let Some(cached) = self.exact_cache.borrow().get(term) {
+            return Ok((**cached).clone());
         }
-        Ok(frequencies.into_iter().collect())
+        let entries = lazy_exact_doclist_entries(
+            &mut **self.reader.borrow_mut(),
+            &self.structure,
+            term.as_bytes(),
+        )
+        .map_err(shadow_query_storage_error)?;
+        self.exact_cache
+            .borrow_mut()
+            .insert(term.to_owned(), std::rc::Rc::new(entries.clone()));
+        Ok(entries)
     }
 
-    fn bm25_score(
+    fn prefix_entries(
         &self,
-        rowid: i64,
-        query_terms: &[String],
-        weights: &[f64],
-    ) -> std::result::Result<f64, Fts5QueryError> {
-        let n = self.total_docs()? as f64;
-        let avgdl = self.avg_doc_length()?;
-        let dl = f64::from(self.doc_length(rowid)?);
-        let mut score = 0.0;
-
-        for term in query_terms {
-            let df_int = self.doc_frequency(term)?;
-            if df_int == 0 {
-                continue;
-            }
-            let df = df_int as f64;
-            let idf = ((n - df + 0.5) / (df + 0.5)).ln().max(BM25_IDF_FLOOR);
-
-            let mut weighted_tf = 0.0;
-            for (column, tf_u32) in self.term_column_frequencies(term, rowid)? {
-                let tf = f64::from(tf_u32);
-                let column_weight = usize::try_from(column)
-                    .ok()
-                    .and_then(|index| weights.get(index).copied())
-                    .unwrap_or(1.0);
-                weighted_tf += column_weight * tf;
-            }
-
-            if weighted_tf == 0.0 {
-                continue;
-            }
-
-            let denom = if avgdl > 0.0 {
-                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, weighted_tf)
-            } else {
-                weighted_tf + BM25_K1
-            };
-            score += idf * (weighted_tf * (BM25_K1 + 1.0)) / denom;
+        prefix: &str,
+    ) -> std::result::Result<Vec<Fts5DoclistEntry>, Fts5QueryError> {
+        if let Some(cached) = self.prefix_cache.borrow().get(prefix) {
+            return Ok((**cached).clone());
         }
+        let entries = lazy_prefix_doclist_entries(
+            &mut **self.reader.borrow_mut(),
+            &self.structure,
+            prefix.as_bytes(),
+        )
+        .map_err(shadow_query_storage_error)?;
+        self.prefix_cache
+            .borrow_mut()
+            .insert(prefix.to_owned(), std::rc::Rc::new(entries.clone()));
+        Ok(entries)
+    }
 
-        Ok(-score)
+    fn doc_length(&self, rowid: i64) -> std::result::Result<u32, Fts5QueryError> {
+        if let Some(cached) = self.docsize_cache.borrow().get(&rowid) {
+            return Ok(*cached);
+        }
+        let length = self
+            .reader
+            .borrow_mut()
+            .read_docsize(rowid, self.column_count)
+            .map_err(shadow_query_storage_error)?
+            .as_ref()
+            .map_or(0, Fts5DocsizeRow::total_tokens);
+        self.docsize_cache.borrow_mut().insert(rowid, length);
+        Ok(length)
+    }
+
+    fn total_docs(&self) -> std::result::Result<u64, Fts5QueryError> {
+        Ok(self
+            .averages
+            .as_ref()
+            .map_or(0, |averages| averages.total_rows))
+    }
+
+    fn avg_doc_length(&self) -> std::result::Result<f64, Fts5QueryError> {
+        let Some(averages) = self.averages.as_ref() else {
+            return Ok(0.0);
+        };
+        if averages.total_rows == 0 {
+            return Ok(0.0);
+        }
+        let total_tokens: u64 = averages.column_token_totals.iter().sum();
+        Ok(total_tokens as f64 / averages.total_rows as f64)
     }
 }
 

@@ -121128,6 +121128,180 @@ fts5(title, body, content=docs, content_rowid=id)'
         .unwrap();
     }
 
+    /// bd-fts5-lazy-shadow-reads-itcc4.2(c): differential parity of the lazy
+    /// on-disk query engine (`Fts5LazyQuery`) against stock SQLite across the
+    /// FTS5 operator matrix (term, AND/OR/NOT, prefix, phrase, NEAR, column
+    /// filter). The lazy path point-reads the persisted segments a query needs;
+    /// it MUST return exactly the documents stock SQLite returns. Stock is the
+    /// reference: its MATCH results are captured up front, then compared to the
+    /// shared query engine running over the same on-disk index via the `.1`
+    /// reader. A ranking-direction check confirms BM25 ordering is wired (the
+    /// term-frequency winner ranks first in both engines).
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_lazy_query_matches_stock_sqlite_across_operator_matrix() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_lazy_diffparity_fixture.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        // Two indexed columns so column filters are discriminating. `rust`
+        // appears in different columns and with different term frequencies so
+        // BM25 ordering is observable.
+        let docs: &[(i64, &str, &str)] = &[
+            (1, "alpha", "rust beta gamma"),
+            (2, "gamma news", "rust delta rust"),
+            (3, "epsilon", "zeta eta theta"),
+            (4, "rust weekly", "programming language"),
+            (5, "gamma", "delta epsilon"),
+            (6, "metals", "rusty beta"),
+            (7, "alpha beta", "gamma delta"),
+        ];
+
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(title, body);")
+                .unwrap();
+            for (rowid, title, body) in docs {
+                sqlite
+                    .execute(
+                        "INSERT INTO docs(rowid, title, body) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![rowid, title, body],
+                    )
+                    .unwrap();
+            }
+            // Force a single merged on-disk segment so the read path exercises
+            // structure + idx + leaf decoding exactly as a mature index would.
+            sqlite
+                .execute("INSERT INTO docs(docs) VALUES('optimize')", [])
+                .unwrap();
+            sqlite.close().unwrap();
+        }
+
+        // The operator matrix. Stock SQLite is the oracle for every entry.
+        let queries: &[&str] = &[
+            "rust",
+            "gamma",
+            "epsilon",
+            "rust AND gamma",
+            "rust OR zeta",
+            "rust NOT gamma",
+            "rust*",
+            "\"gamma delta\"",
+            "NEAR(rust gamma, 5)",
+            "title:rust",
+            "body:rust",
+            "title:gamma OR body:gamma",
+        ];
+
+        // Capture stock results (ordered by rank) up front, then drop the
+        // sqlite handle before opening the frankensqlite connection.
+        let stock: Vec<(String, Vec<i64>)> = {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let captured = queries
+                .iter()
+                .map(|query| {
+                    let mut stmt = sqlite
+                        .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rank")
+                        .unwrap();
+                    let ids: Vec<i64> = stmt
+                        .query_map(rusqlite::params![query], |row| row.get::<_, i64>(0))
+                        .unwrap()
+                        .map(std::result::Result::unwrap)
+                        .collect();
+                    ((*query).to_owned(), ids)
+                })
+                .collect();
+            sqlite.close().unwrap();
+            captured
+        };
+
+        let conn = Connection::open(&db_str).unwrap();
+        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
+            let rows = conn
+                .query(&format!(
+                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
+                ))
+                .ok()?;
+            let raw = rows.first()?.values().first()?.to_integer();
+            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
+        };
+        let data_root = root("docs_data").expect("docs_data rootpage");
+        let idx_root = root("docs_idx");
+        let docsize_root = root("docs_docsize");
+        let content_root = root("docs_content");
+
+        conn.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
+            let header = super::parse_database_header_checked(page1.as_ref())?;
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(
+                fsqlite_func::collation::CollationRegistry::new(),
+            ));
+            let mut reader = super::Fts5LiveShadowReader::with_roots(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                data_root,
+                idx_root,
+                docsize_root,
+                content_root,
+                registry,
+            );
+
+            let columns = vec!["title".to_owned(), "body".to_owned()];
+            let tokenizer = fsqlite_ext_fts5::create_tokenizer("unicode61")
+                .expect("unicode61 tokenizer available");
+            let weights = vec![1.0_f64; columns.len()];
+            let query = fsqlite_ext_fts5::Fts5LazyQuery::new(
+                &mut reader,
+                &columns,
+                tokenizer.as_ref(),
+                fsqlite_ext_fts5::DetailMode::Full,
+            )
+            .expect("build lazy query");
+
+            let sorted = |mut ids: Vec<i64>| -> Vec<i64> {
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+
+            for (q, expected_ids) in &stock {
+                let ranked = query
+                    .search_queries_with_weights(&[q.as_str()], &weights)
+                    .map_err(|e| FrankenError::function_error(format!("lazy query `{q}`: {e}")))?;
+                let lazy_ids: Vec<i64> = ranked.iter().map(|(rowid, _score)| *rowid).collect();
+
+                assert_eq!(
+                    sorted(lazy_ids.clone()),
+                    sorted(expected_ids.clone()),
+                    "lazy MATCH `{q}` document set must equal stock SQLite (lazy={lazy_ids:?}, stock={expected_ids:?})"
+                );
+
+                // Ranking-direction check on the `rust` term: doc 2 carries two
+                // `rust` occurrences in a short document, so BM25 ranks it first
+                // in stock; the lazy engine must agree.
+                if q == "rust" {
+                    assert_eq!(
+                        lazy_ids.first(),
+                        expected_ids.first(),
+                        "lazy BM25 top result for `rust` must match stock (lazy={lazy_ids:?}, stock={expected_ids:?})"
+                    );
+                    assert_eq!(
+                        expected_ids.first(),
+                        Some(&2),
+                        "fixture sanity: doc 2 (rust x2) should rank first in stock"
+                    );
+                }
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn test_reopen_rebinds_materialized_fts5_for_match_queries_and_new_inserts() {
         let dir = tempfile::tempdir().unwrap();
