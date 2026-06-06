@@ -121177,14 +121177,14 @@ fts5(title, body, content=docs, content_rowid=id)'
         }
 
         let queries: &[&str] = &[
-            "rust",          // 1, 4 (2 deleted, 3 updated away)
-            "alpha",         // 1
-            "beta",          // none (2 deleted)
-            "gamma",         // none (3 updated away)
-            "replaced",      // 3 (new content)
-            "epsilon",       // 3
-            "zeta",          // 5
-            "rust*",         // 1, 4
+            "rust",            // 1, 4 (2 deleted, 3 updated away)
+            "alpha",           // 1
+            "beta",            // none (2 deleted)
+            "gamma",           // none (3 updated away)
+            "replaced",        // 3 (new content)
+            "epsilon",         // 3
+            "zeta",            // 5
+            "rust*",           // 1, 4
             "rust OR epsilon", // 1, 3, 4
         ];
 

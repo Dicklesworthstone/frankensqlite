@@ -2319,12 +2319,14 @@ fn rowid_tombstoned_in_segment(
 }
 
 /// Merge per-segment `(stored_term, entries)` groups across `structure` in FTS5
-/// recency order — newest segment first — keeping the FIRST (newest) occurrence
-/// of each `(term, rowid)` and dropping it when that occurrence is a delete
-/// marker or the rowid is tombstoned in its segment. This is the on-disk
-/// counterpart of FTS5's multi-segment doclist merge (`fts5MultiIterNew`):
-/// levels iterate ascending (level 0 newest) and segments within a level
-/// iterate in reverse (the structure stores them oldest→newest).
+/// recency order.
+///
+/// Newest segment first, keeping the FIRST (newest) occurrence of each
+/// `(term, rowid)` and dropping it when that occurrence is a delete marker or
+/// the rowid is tombstoned in its segment. This is the on-disk counterpart of
+/// FTS5's multi-segment doclist merge (`fts5MultiIterNew`): levels iterate
+/// ascending (level 0 newest) and segments within a level iterate in reverse
+/// (the structure stores them oldest→newest).
 ///
 /// Recency is keyed by `(term, rowid)`, NOT by `rowid` alone, so an UPDATE that
 /// deletes term `t` for a row while inserting a different term `t2` for the same
@@ -2368,14 +2370,13 @@ where
     Ok(out)
 }
 
-/// Lazily collect the LIVE doclist entries for an exact `term` across every
-/// on-disk segment of `structure`, reading leaf pages on demand via `reader` and
-/// applying FTS5 multi-segment recency + tombstone semantics (a delete or
-/// updated-away document is correctly excluded even though its original posting
-/// still physically exists in an older segment).
+/// Lazily collect the LIVE doclist entries for an exact `term`.
 ///
-/// Parity counterpart of `Fts5ShadowQuery::exact_entries` for the lazy
-/// (reopened) path.
+/// Reads leaf pages on demand via `reader` across every on-disk segment of
+/// `structure`, applying FTS5 multi-segment recency + tombstone semantics (a
+/// deleted or updated-away document is correctly excluded even though its
+/// original posting still physically exists in an older segment). Parity
+/// counterpart of `Fts5ShadowQuery::exact_entries` for the lazy (reopened) path.
 pub fn lazy_exact_doclist_entries(
     reader: &mut dyn Fts5OnDiskReader,
     structure: &Fts5StructureRecord,
@@ -2442,9 +2443,11 @@ fn lazy_segment_prefix_groups(
 }
 
 /// Lazily collect the LIVE doclist entries for every term beginning with
-/// `prefix` across every on-disk segment of `structure`, reading leaf pages on
-/// demand via `reader` and applying FTS5 multi-segment recency + tombstone
-/// semantics per `(term, rowid)`.
+/// `prefix`.
+///
+/// Reads leaf pages on demand via `reader` across every on-disk segment of
+/// `structure`, applying FTS5 multi-segment recency + tombstone semantics per
+/// `(term, rowid)`.
 ///
 /// Parity counterpart of `Fts5ShadowQuery::prefix_entries` for the lazy
 /// (reopened) path; the dual main/raw lookup keys make it correct against both
