@@ -16,7 +16,8 @@
 //! - `BLOB` <-> `Uint8Array`
 //! - `NaN` coerces to `NULL` with a browser warning
 //! - `Infinity` and `-Infinity` are rejected
-//! - `Date` inputs are stored as ISO 8601 `TEXT`
+//! - `Date` inputs are stored as ISO 8601 `TEXT` when the `date-params`
+//!   feature is enabled
 
 #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 use std::cell::Cell;
@@ -32,10 +33,14 @@ use fsqlite_core::connection::ConnectionMemoryStats;
 use fsqlite_core::connection::PreparedStatement as CorePreparedStatement;
 use fsqlite_core::connection::{Connection as CoreConnection, Row as CoreRow};
 use fsqlite_error::FrankenError;
-use fsqlite_types::{SmallText, SqliteValue};
+#[cfg(feature = "date-params")]
+use fsqlite_types::SmallText;
+use fsqlite_types::SqliteValue;
+#[cfg(feature = "date-params")]
+use js_sys::Date;
 #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
 use js_sys::Function;
-use js_sys::{Array, BigInt, Date, Number, Object, Reflect, Uint8Array};
+use js_sys::{Array, BigInt, Number, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
@@ -812,6 +817,7 @@ fn js_value_to_sqlite_value(value: &JsValue) -> Result<SqliteValue, JsValue> {
     if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
         return Ok(SqliteValue::Blob(bytes.to_vec().into()));
     }
+    #[cfg(feature = "date-params")]
     if let Some(date) = value.dyn_ref::<Date>() {
         return date_to_sqlite_value(date).map_err(franken_error_to_js);
     }
@@ -996,6 +1002,7 @@ fn parse_bigint_sqlite_value(value: &str) -> Result<SqliteValue, FrankenError> {
         })
 }
 
+#[cfg(feature = "date-params")]
 fn date_to_sqlite_value(date: &Date) -> Result<SqliteValue, FrankenError> {
     let timestamp = date.get_time();
     if !timestamp.is_finite() {
@@ -1020,6 +1027,7 @@ fn describe_js_value(value: &JsValue) -> String {
     if value.is_bigint() {
         return "bigint".to_owned();
     }
+    #[cfg(feature = "date-params")]
     if value.dyn_ref::<Date>().is_some() {
         return "Date".to_owned();
     }
@@ -2484,8 +2492,7 @@ mod wasm_tests {
                 real_v REAL,
                 text_v TEXT,
                 blob_v BLOB,
-                null_v,
-                date_v TEXT
+                null_v
             )",
         )
         .expect("table create should succeed");
@@ -2498,18 +2505,15 @@ mod wasm_tests {
         let input_blob = Uint8Array::from([0xDE_u8, 0xAD, 0xBE, 0xEF].as_slice());
         params.push(&input_blob.clone().into());
         params.push(&JsValue::NULL);
-        let input_date = Date::new(&JsValue::from_str("2026-03-11T12:34:56.000Z"));
-        let expected_iso = String::from(input_date.to_iso_string());
-        params.push(&input_date.into());
 
         db.execute_with_params(
-            "INSERT INTO wasm_types VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO wasm_types VALUES (?, ?, ?, ?, ?, ?)",
             params.into(),
         )
         .expect("parameterized insert should succeed");
 
         let result = db
-            .query("SELECT safe_i, big_i, real_v, text_v, blob_v, null_v, date_v FROM wasm_types")
+            .query("SELECT safe_i, big_i, real_v, text_v, blob_v, null_v FROM wasm_types")
             .expect("query should succeed");
         let rows = rows(&result);
         assert_eq!(rows.length(), 1);
@@ -2543,6 +2547,28 @@ mod wasm_tests {
             row_property(&row, "null_v").is_null(),
             "NULL should remain null in JS"
         );
+    }
+
+    #[cfg(feature = "date-params")]
+    #[wasm_bindgen_test]
+    fn wasm_date_parameter_converts_to_iso_text() {
+        let db = FrankenDb::new(None).expect("db should open");
+        db.execute("CREATE TABLE wasm_dates (date_v TEXT)")
+            .expect("table create should succeed");
+
+        let input_date = Date::new(&JsValue::from_str("2026-03-11T12:34:56.000Z"));
+        let expected_iso = String::from(input_date.to_iso_string());
+        let params = Array::new();
+        params.push(&input_date.into());
+
+        db.execute_with_params("INSERT INTO wasm_dates VALUES (?)", params.into())
+            .expect("Date parameter insert should succeed");
+
+        let result = db
+            .query("SELECT date_v FROM wasm_dates")
+            .expect("query should succeed");
+        let rows = rows(&result);
+        let row = rows.get(0).unchecked_into::<Object>();
         assert_eq!(
             row_property(&row, "date_v").as_string().as_deref(),
             Some(expected_iso.as_str())

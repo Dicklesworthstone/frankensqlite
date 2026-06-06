@@ -41,6 +41,8 @@ The helper script:
   `FSQLITE_WASM_FEATURES=backup`
 - can opt into multi-statement batch execution with
   `FSQLITE_WASM_FEATURES=batch-execution`
+- can opt into JavaScript `Date` parameter coercion with
+  `FSQLITE_WASM_FEATURES=date-params`
 - can opt into JavaScript convenience APIs with
   `FSQLITE_WASM_FEATURES=api-extras`
 - can opt into browser memory-policy constructors and parser glue with
@@ -91,6 +93,9 @@ and `message`; default parameterized execution stays available through
 feature when a package needs `FrankenDB.executeBatch()` for multi-statement SQL
 strings. Enable the `api-extras` feature when a package needs the duplicate
 static constructor `FrankenDB.open()` or the generic `db.pragma()` helper. Enable
+the `date-params` feature when a package needs JavaScript `Date` parameters to
+coerce to ISO 8601 SQLite `TEXT`; the minimum core accepts explicit string
+timestamps and omits Date-specific glue. Enable
 the `memory-options` feature when a package needs
 `FrankenDB.openWithOptions()`, memory sizing options, or the option parser.
 Enable `backup,memory-options` together when a package needs
@@ -121,6 +126,11 @@ package needs convenience wrappers such as `FrankenDB.open()` or `db.pragma()`.
 The minimum core package keeps the constructor plus `execute()` / `query()` and
 omits those duplicate helper exports.
 
+The `date-params` feature is separate from diagnostics. Enable it when browser
+callers want to pass JavaScript `Date` values directly to parameterized SQL.
+The minimum core package keeps string timestamps as the explicit date/time input
+shape and omits Date `instanceof` / `toISOString()` glue.
+
 The `prepared-statements` feature is separate from diagnostics. Enable it when
 the package needs `FrankenDB.prepare()` and the exported
 `FrankenPreparedStatement` class. The minimum core package omits that wrapper
@@ -148,6 +158,7 @@ is the browser transfer shape.
 | Minimum core | `FSQLITE_WASM_NO_DEFAULT_FEATURES=1 FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Default core | `FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Batch execution | `FSQLITE_WASM_FEATURES=batch-execution FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
+| Date parameters | `FSQLITE_WASM_FEATURES=date-params FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | API extras | `FSQLITE_WASM_FEATURES=api-extras FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Memory options | `FSQLITE_WASM_FEATURES=memory-options FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Diagnostics | `FSQLITE_WASM_FEATURES=diagnostics,tracing FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
