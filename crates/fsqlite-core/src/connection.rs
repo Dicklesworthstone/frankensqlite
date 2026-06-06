@@ -121128,6 +121128,152 @@ fts5(title, body, content=docs, content_rowid=id)'
         .unwrap();
     }
 
+    /// bd-fts5-lazy-shadow-reads-itcc4.3: multi-segment recency parity. With
+    /// docs spread across many on-disk segments (separate autocommit inserts)
+    /// plus a DELETE and an UPDATE, stock SQLite records the removals as
+    /// delete-markers / tombstones in NEWER segments while the original live
+    /// postings still physically exist in older segments. The lazy merge must
+    /// apply FTS5 newest-wins recency per `(term, rowid)` so a deleted or
+    /// updated-away document never resurfaces. Stock is the oracle.
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_lazy_query_matches_stock_after_multisegment_delete_update() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_multiseg_recency.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+                .unwrap();
+            // Separate autocommit statements => separate level-0 segments.
+            for (rowid, body) in [
+                (1_i64, "rust alpha"),
+                (2, "rust beta"),
+                (3, "rust gamma"),
+                (4, "rust delta"),
+                (5, "zeta only"),
+            ] {
+                sqlite
+                    .execute(
+                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
+                        rusqlite::params![rowid, body],
+                    )
+                    .unwrap();
+            }
+            // doc 2 deleted; doc 3 updated so it no longer contains `rust`/`gamma`.
+            sqlite
+                .execute("DELETE FROM docs WHERE rowid = 2", [])
+                .unwrap();
+            sqlite
+                .execute(
+                    "UPDATE docs SET body = 'replaced epsilon' WHERE rowid = 3",
+                    [],
+                )
+                .unwrap();
+            sqlite.close().unwrap();
+        }
+
+        let queries: &[&str] = &[
+            "rust",          // 1, 4 (2 deleted, 3 updated away)
+            "alpha",         // 1
+            "beta",          // none (2 deleted)
+            "gamma",         // none (3 updated away)
+            "replaced",      // 3 (new content)
+            "epsilon",       // 3
+            "zeta",          // 5
+            "rust*",         // 1, 4
+            "rust OR epsilon", // 1, 3, 4
+        ];
+
+        let stock: Vec<(String, Vec<i64>)> = {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let captured = queries
+                .iter()
+                .map(|query| {
+                    let mut stmt = sqlite
+                        .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+                        .unwrap();
+                    let ids: Vec<i64> = stmt
+                        .query_map(rusqlite::params![query], |row| row.get::<_, i64>(0))
+                        .unwrap()
+                        .map(std::result::Result::unwrap)
+                        .collect();
+                    ((*query).to_owned(), ids)
+                })
+                .collect();
+            sqlite.close().unwrap();
+            captured
+        };
+
+        let conn = Connection::open(&db_str).unwrap();
+        let root = |name: &str| -> Option<fsqlite_types::PageNumber> {
+            let rows = conn
+                .query(&format!(
+                    "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
+                ))
+                .ok()?;
+            let raw = rows.first()?.values().first()?.to_integer();
+            fsqlite_types::PageNumber::new(u32::try_from(raw).ok()?)
+        };
+        let data_root = root("docs_data").expect("docs_data rootpage");
+        let idx_root = root("docs_idx");
+        let docsize_root = root("docs_docsize");
+        let content_root = root("docs_content");
+
+        conn.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, fsqlite_types::PageNumber::ONE)?;
+            let header = super::parse_database_header_checked(page1.as_ref())?;
+            let registry = std::sync::Arc::new(std::sync::Mutex::new(
+                fsqlite_func::collation::CollationRegistry::new(),
+            ));
+            let mut reader = super::Fts5LiveShadowReader::with_roots(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                data_root,
+                idx_root,
+                docsize_root,
+                content_root,
+                registry,
+            );
+
+            let columns = vec!["body".to_owned()];
+            let tokenizer = fsqlite_ext_fts5::create_tokenizer("unicode61")
+                .expect("unicode61 tokenizer available");
+            let weights = vec![1.0_f64; columns.len()];
+            let query = fsqlite_ext_fts5::Fts5LazyQuery::new(
+                &mut reader,
+                &columns,
+                tokenizer.as_ref(),
+                fsqlite_ext_fts5::DetailMode::Full,
+            )
+            .expect("build lazy query");
+
+            for (q, expected_ids) in &stock {
+                let ranked = query
+                    .search_queries_with_weights(&[q.as_str()], &weights)
+                    .map_err(|e| FrankenError::function_error(format!("lazy query `{q}`: {e}")))?;
+                let mut lazy_ids: Vec<i64> = ranked.iter().map(|(rowid, _)| *rowid).collect();
+                lazy_ids.sort_unstable();
+                lazy_ids.dedup();
+                let mut want = expected_ids.clone();
+                want.sort_unstable();
+                want.dedup();
+                assert_eq!(
+                    lazy_ids, want,
+                    "multi-segment recency: lazy MATCH `{q}` must equal stock (lazy={lazy_ids:?}, stock={want:?})"
+                );
+            }
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// bd-fts5-lazy-shadow-reads-itcc4.2(c): differential parity of the lazy
     /// on-disk query engine (`Fts5LazyQuery`) against stock SQLite across the
     /// FTS5 operator matrix (term, AND/OR/NOT, prefix, phrase, NEAR, column

@@ -2275,48 +2275,132 @@ fn lazy_segment_exact_postings(
     Ok(Vec::new())
 }
 
-/// Lazily collect doclist entries (FTS5 delete markers filtered out) for an
-/// exact `term` across every on-disk segment of `structure`, reading leaf pages
-/// on demand via `reader`.
+/// Return the doclist for an exact `term` within one on-disk segment as a
+/// single `(stored_term, entries)` group, trying both the main-index marker key
+/// and the raw token (a given segment uses one encoding, so the first non-empty
+/// lookup is authoritative). Empty when the term is absent from the segment.
+fn lazy_segment_exact_group(
+    reader: &mut dyn Fts5OnDiskReader,
+    segment: &Fts5StructureSegment,
+    term: &[u8],
+) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
+    for key in segment_lookup_keys(term) {
+        let entries = lazy_segment_exact_postings(reader, segment, &key)?;
+        if !entries.is_empty() {
+            return Ok(vec![(key, entries)]);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// True if `rowid` is recorded in `segment`'s tombstone hash — a deleted doc
+/// whose doclist entries still physically live in the segment. Reads only the
+/// single hash page the rowid maps to (`rowid % tombstone_page_count`). A
+/// segment with no tombstone pages can never tombstone a rowid.
+fn rowid_tombstoned_in_segment(
+    reader: &mut dyn Fts5OnDiskReader,
+    segment: &Fts5StructureSegment,
+    rowid: u64,
+) -> Result<bool> {
+    let count = segment.tombstone_page_count;
+    if count == 0 {
+        return Ok(false);
+    }
+    let hash_pgno = u32::try_from(rowid % u64::from(count)).unwrap_or(0);
+    let id = Fts5DataRowid::Tombstone {
+        segid: segment.segid,
+        hash_pgno,
+    }
+    .encode()?;
+    let Some(block) = reader.read_data_block(id)? else {
+        return Ok(false);
+    };
+    Ok(Fts5TombstonePage::decode(&block)?.contains_rowid(count, rowid))
+}
+
+/// Merge per-segment `(stored_term, entries)` groups across `structure` in FTS5
+/// recency order — newest segment first — keeping the FIRST (newest) occurrence
+/// of each `(term, rowid)` and dropping it when that occurrence is a delete
+/// marker or the rowid is tombstoned in its segment. This is the on-disk
+/// counterpart of FTS5's multi-segment doclist merge (`fts5MultiIterNew`):
+/// levels iterate ascending (level 0 newest) and segments within a level
+/// iterate in reverse (the structure stores them oldest→newest).
+///
+/// Recency is keyed by `(term, rowid)`, NOT by `rowid` alone, so an UPDATE that
+/// deletes term `t` for a row while inserting a different term `t2` for the same
+/// row does not let `t`'s delete marker suppress the live `t2` entry — essential
+/// for correct prefix queries that span several terms of one document.
+fn collect_doclist_recency<F>(
+    reader: &mut dyn Fts5OnDiskReader,
+    structure: &Fts5StructureRecord,
+    mut per_segment: F,
+) -> Result<Vec<Fts5DoclistEntry>>
+where
+    F: FnMut(
+        &mut dyn Fts5OnDiskReader,
+        &Fts5StructureSegment,
+    ) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>>,
+{
+    let mut out = Vec::new();
+    let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
+    for level in &structure.levels {
+        for segment in level.segments.iter().rev() {
+            for (term, entries) in per_segment(reader, segment)? {
+                for entry in entries {
+                    if !seen.insert((term.clone(), entry.rowid)) {
+                        // An older segment's occurrence of this (term, rowid):
+                        // shadowed by the newer one already recorded.
+                        continue;
+                    }
+                    if entry.poslist.delete {
+                        // Delete marker is the newest occurrence: rowid is dead
+                        // for this term (and shadows older live occurrences).
+                        continue;
+                    }
+                    if rowid_tombstoned_in_segment(reader, segment, entry.rowid)? {
+                        continue;
+                    }
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Lazily collect the LIVE doclist entries for an exact `term` across every
+/// on-disk segment of `structure`, reading leaf pages on demand via `reader` and
+/// applying FTS5 multi-segment recency + tombstone semantics (a delete or
+/// updated-away document is correctly excluded even though its original posting
+/// still physically exists in an older segment).
 ///
 /// Parity counterpart of `Fts5ShadowQuery::exact_entries` for the lazy
-/// (reopened) path. The in-memory and lazy paths produce the same entries
-/// because both decode identical on-disk leaves; only the block source differs.
+/// (reopened) path.
 pub fn lazy_exact_doclist_entries(
     reader: &mut dyn Fts5OnDiskReader,
     structure: &Fts5StructureRecord,
     term: &[u8],
 ) -> Result<Vec<Fts5DoclistEntry>> {
-    let mut entries = Vec::new();
-    for key in segment_lookup_keys(term) {
-        for level in &structure.levels {
-            for segment in &level.segments {
-                for entry in lazy_segment_exact_postings(reader, segment, &key)? {
-                    if !entry.poslist.delete {
-                        entries.push(entry);
-                    }
-                }
-            }
-        }
-    }
-    Ok(entries)
+    collect_doclist_recency(reader, structure, |reader, segment| {
+        lazy_segment_exact_group(reader, segment, term)
+    })
 }
 
-/// Lazily collect the doclist entries for every term within one on-disk segment
-/// that begins with `prefix` (the exact byte key, index marker already applied),
-/// reading only the leaf pages from the prefix's candidate page onward. Mirrors
-/// the leaf scan in [`Fts5SegmentReader::prefix_matches`] but sources leaf
-/// blocks through an [`Fts5OnDiskReader`].
-fn lazy_segment_prefix_postings(
+/// Collect the matching terms within one on-disk segment whose stored term
+/// begins with `prefix` (exact byte key, index marker already applied), each as
+/// a `(stored_term, entries)` group preserving the term identity so the recency
+/// merge can key on `(term, rowid)`. Reads only the leaf pages from the prefix's
+/// candidate page onward; mirrors [`Fts5SegmentReader::prefix_matches`].
+fn lazy_segment_prefix_term_groups(
     reader: &mut dyn Fts5OnDiskReader,
     segment: &Fts5StructureSegment,
     prefix: &[u8],
-) -> Result<Vec<Fts5DoclistEntry>> {
+) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
     let start = reader
         .idx_candidate_page(segment.segid, prefix)?
         .unwrap_or(segment.pgno_first)
         .clamp(segment.pgno_first, segment.pgno_last);
-    let mut entries = Vec::new();
+    let mut groups = Vec::new();
     let mut pgno = start;
     while pgno <= segment.pgno_last {
         let id = fts5_data_rowid(segment.segid, false, 0, pgno, "segment leaf")?;
@@ -2326,24 +2410,41 @@ fn lazy_segment_prefix_postings(
         let leaf = Fts5SegmentLeaf::decode(&block)?;
         for seg_term in leaf.terms {
             if seg_term.term.starts_with(prefix) {
-                entries.extend(seg_term.doclist.entries);
+                groups.push((seg_term.term, seg_term.doclist.entries));
                 continue;
             }
             // Segment terms are sorted: once we have collected a match and moved
             // past the prefix run, or we have scanned past where the prefix could
             // first appear, no later term in this segment can match.
-            if !entries.is_empty() || seg_term.term.as_slice() > prefix {
-                return Ok(entries);
+            if !groups.is_empty() || seg_term.term.as_slice() > prefix {
+                return Ok(groups);
             }
         }
         pgno = pgno.saturating_add(1);
     }
-    Ok(entries)
+    Ok(groups)
 }
 
-/// Lazily collect doclist entries (FTS5 delete markers filtered out) for every
-/// term beginning with `prefix` across every on-disk segment of `structure`,
-/// reading leaf pages on demand via `reader`.
+/// Per-segment prefix lookup over both the marked and raw lookup keys (a segment
+/// uses one encoding, so the first non-empty result is authoritative).
+fn lazy_segment_prefix_groups(
+    reader: &mut dyn Fts5OnDiskReader,
+    segment: &Fts5StructureSegment,
+    prefix: &[u8],
+) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
+    for key in segment_lookup_keys(prefix) {
+        let groups = lazy_segment_prefix_term_groups(reader, segment, &key)?;
+        if !groups.is_empty() {
+            return Ok(groups);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Lazily collect the LIVE doclist entries for every term beginning with
+/// `prefix` across every on-disk segment of `structure`, reading leaf pages on
+/// demand via `reader` and applying FTS5 multi-segment recency + tombstone
+/// semantics per `(term, rowid)`.
 ///
 /// Parity counterpart of `Fts5ShadowQuery::prefix_entries` for the lazy
 /// (reopened) path; the dual main/raw lookup keys make it correct against both
@@ -2354,19 +2455,9 @@ pub fn lazy_prefix_doclist_entries(
     structure: &Fts5StructureRecord,
     prefix: &[u8],
 ) -> Result<Vec<Fts5DoclistEntry>> {
-    let mut entries = Vec::new();
-    for key in segment_lookup_keys(prefix) {
-        for level in &structure.levels {
-            for segment in &level.segments {
-                for entry in lazy_segment_prefix_postings(reader, segment, &key)? {
-                    if !entry.poslist.delete {
-                        entries.push(entry);
-                    }
-                }
-            }
-        }
-    }
-    Ok(entries)
+    collect_doclist_recency(reader, structure, |reader, segment| {
+        lazy_segment_prefix_groups(reader, segment, prefix)
+    })
 }
 
 /// Decode an FTS5 `_docsize.sz` blob into per-column token counts. The blob is
