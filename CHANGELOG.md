@@ -17,6 +17,51 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.8] -- 2026-06-05 (asupersync 0.3.2 production-context fix; full-workspace release)
+
+Full-workspace lockstep release (`0.1.7 → 0.1.8`). Ships the fix for a build
+regression in 0.1.7 that broke **fresh downstream installs**.
+
+### Fixed
+
+- **`fsqlite-types` no longer mints asupersync request contexts in production
+  code** — [#108](https://github.com/Dicklesworthstone/frankensqlite/issues/108),
+  fixed on `main` in
+  [`57e89a94`](https://github.com/Dicklesworthstone/frankensqlite/commit/57e89a94)
+  ("fix(native): stop minting asupersync request contexts").
+
+  0.1.7 shipped a `Cx::effective_native_cx` helper (added post-0.1.5) that called
+  `NativeCx::for_request_with_budget` from **non-test** code. Under asupersync
+  0.3.2 that constructor is `#[cfg(any(test, feature = "test-internals"))]`-gated
+  — production consumers are expected to mint request contexts through the
+  runtime boundary instead. The frankensqlite workspace's own builds compiled
+  because their test profile enables `test-internals`, **masking** the breakage;
+  any plain downstream (`default-features` minus `test-internals`) that resolved
+  asupersync 0.3.2 failed with:
+
+  ```
+  error[E0599]: no function or associated item named `for_request_with_budget`
+                found for struct `NativeCx`  (cx.rs:662)
+  ```
+
+  Because the published requirement was `asupersync ^0.3.1`, a fresh
+  `cargo add fsqlite` resolved asupersync 0.3.2 (not yanked) and **did not
+  compile**. Existing consumers survived only because their lockfiles pinned an
+  older asupersync. The fix test-gates the helper, requires RaptorQ to use an
+  attached/ambient native `Cx`, switches commit-repair to synchronous
+  capacity/signaling instead of blocking on asupersync futures, and stops the
+  async API from creating synthetic worker/request native contexts. Validated
+  with `cargo check -p fsqlite --no-default-features --features 'native fts5'`
+  (production, no `test-internals`) — clean.
+
+### Notes for downstream consumers
+
+- This is the version to depend on for any fresh integration of `fsqlite` —
+  0.1.7 will fail to compile against asupersync 0.3.2. beads_rust, cass, and
+  meta_skill are bumped to 0.1.8.
+
+---
+
 ## [0.1.7] -- 2026-06-05 (MVCC transaction-local self-conflict + FTS5 reload regressions; full-workspace release)
 
 Full-workspace lockstep release: every publishable crate is bumped to `0.1.7`

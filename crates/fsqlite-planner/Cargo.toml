@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-planner"
-version = "0.1.7"
+version = "0.1.8"
 description = "Query planner: name resolution, WHERE analysis, join ordering"
 edition.workspace = true
 license.workspace = true

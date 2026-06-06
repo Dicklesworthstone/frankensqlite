@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-error"
-version = "0.1.7"
+version = "0.1.8"
 description = "Structured error types for FrankenSQLite"
 edition.workspace = true
 license.workspace = true
