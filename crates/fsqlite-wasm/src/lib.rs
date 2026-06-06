@@ -311,6 +311,7 @@ impl FrankenDb {
         self.with_connection(|conn| conn.execute(sql))
     }
 
+    #[cfg(feature = "batch-execution")]
     #[wasm_bindgen(js_name = executeBatch)]
     pub fn execute_batch(&self, sql: &str) -> Result<(), JsValue> {
         self.with_connection(|conn| conn.execute_batch(sql))
@@ -2112,7 +2113,7 @@ mod tests {
         assert!(matches!(error, FrankenError::OutOfMemory));
     }
 
-    #[cfg(feature = "prepared-statements")]
+    #[cfg(all(feature = "batch-execution", feature = "prepared-statements"))]
     #[test]
     fn franken_db_prepare_and_execute_batch_work_on_host() {
         let _guard = host_connection_test_guard();
@@ -2132,6 +2133,7 @@ mod tests {
         assert_eq!(stmt.execute().expect("select execute should count rows"), 2);
     }
 
+    #[cfg(feature = "batch-execution")]
     #[test]
     fn franken_db_execute_batch_allows_empty_and_comment_only_input_on_host() {
         let _guard = host_connection_test_guard();
@@ -2245,6 +2247,12 @@ mod wasm_tests {
             .unchecked_into::<Array>()
     }
 
+    fn execute_seed_statements(db: &FrankenDb, statements: &[&str]) {
+        for sql in statements {
+            db.execute(sql).expect("seed statement should succeed");
+        }
+    }
+
     fn error_message(error: &JsValue) -> String {
         Reflect::get(error, &JsValue::from_str("message"))
             .expect("message field should exist")
@@ -2326,6 +2334,7 @@ mod wasm_tests {
         assert_eq!(warning_count.get(), 1);
     }
 
+    #[cfg(feature = "batch-execution")]
     #[wasm_bindgen_test]
     fn wasm_execute_reports_changes_and_batch_runs_multiple_statements() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2358,6 +2367,7 @@ mod wasm_tests {
         );
     }
 
+    #[cfg(feature = "batch-execution")]
     #[wasm_bindgen_test]
     fn wasm_execute_batch_allows_empty_and_comment_only_input() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2375,12 +2385,14 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_export_import_roundtrips_sqlite_image() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_export (id INTEGER PRIMARY KEY, name TEXT, payload BLOB);\
-             INSERT INTO wasm_export VALUES (1, 'alpha', X'DEADBEEF');\
-             INSERT INTO wasm_export VALUES (2, 'beta', X'010203');",
-        )
-        .expect("seed batch should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_export (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)",
+                "INSERT INTO wasm_export VALUES (1, 'alpha', X'DEADBEEF')",
+                "INSERT INTO wasm_export VALUES (2, 'beta', X'010203')",
+            ],
+        );
 
         let exported = db.export().expect("export should succeed");
         let exported_bytes = exported.to_vec();
@@ -2556,12 +2568,14 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_prepare_roundtrip_uses_core_column_names() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_prepared (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_prepared (id, name) VALUES (1, 'alpha');\
-             INSERT INTO wasm_prepared (id, name) VALUES (2, 'beta');",
-        )
-        .expect("batch execution should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_prepared (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO wasm_prepared (id, name) VALUES (1, 'alpha')",
+                "INSERT INTO wasm_prepared (id, name) VALUES (2, 'beta')",
+            ],
+        );
 
         let stmt = db
             .prepare("SELECT id AS user_id, name FROM wasm_prepared WHERE id = ?")
@@ -2623,12 +2637,14 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_prepare_supports_sql_query_execute_without_params() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha');\
-             INSERT INTO wasm_stmt_surface (id, name) VALUES (2, 'beta');",
-        )
-        .expect("batch execution should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha')",
+                "INSERT INTO wasm_stmt_surface (id, name) VALUES (2, 'beta')",
+            ],
+        );
 
         let stmt = db
             .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
@@ -2653,11 +2669,13 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_diagnostics_explain_methods_return_program_text() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha');",
-        )
-        .expect("batch execution should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_stmt_surface (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO wasm_stmt_surface (id, name) VALUES (1, 'alpha')",
+            ],
+        );
 
         let stmt = db
             .prepare("SELECT id, name FROM wasm_stmt_surface ORDER BY id")
@@ -2744,12 +2762,14 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_query_exposes_column_metadata() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_meta (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_meta (id, name) VALUES (1, 'alpha');\
-             INSERT INTO wasm_meta (id, name) VALUES (2, 'beta');",
-        )
-        .expect("batch execution should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_meta (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO wasm_meta (id, name) VALUES (1, 'alpha')",
+                "INSERT INTO wasm_meta (id, name) VALUES (2, 'beta')",
+            ],
+        );
 
         let result = db
             .query("SELECT id AS user_id, name FROM wasm_meta ORDER BY id")
@@ -2804,11 +2824,13 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_row_arrays_feature_exposes_positional_rows() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_row_arrays (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_row_arrays (id, name) VALUES (1, 'alpha');",
-        )
-        .expect("batch execution should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_row_arrays (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO wasm_row_arrays (id, name) VALUES (1, 'alpha')",
+            ],
+        );
 
         let result = db
             .query("SELECT id, name FROM wasm_row_arrays")
@@ -2824,12 +2846,14 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     fn wasm_prepared_statement_reuses_sql_with_different_params() {
         let db = FrankenDb::new(None).expect("db should open");
-        db.execute_batch(
-            "CREATE TABLE wasm_reuse (id INTEGER PRIMARY KEY, name TEXT);\
-             INSERT INTO wasm_reuse (id, name) VALUES (1, 'alpha');\
-             INSERT INTO wasm_reuse (id, name) VALUES (2, 'beta');",
-        )
-        .expect("batch execution should succeed");
+        execute_seed_statements(
+            &db,
+            &[
+                "CREATE TABLE wasm_reuse (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO wasm_reuse (id, name) VALUES (1, 'alpha')",
+                "INSERT INTO wasm_reuse (id, name) VALUES (2, 'beta')",
+            ],
+        );
 
         let stmt = db
             .prepare("SELECT name FROM wasm_reuse WHERE id = ?")
