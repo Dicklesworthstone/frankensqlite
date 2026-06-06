@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+api-extras = []
 backup = []
 batch-execution = []
 diagnostics = ["fsqlite-core/diagnostic-pragmas"]

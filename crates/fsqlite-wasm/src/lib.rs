@@ -250,6 +250,7 @@ impl FrankenDb {
         }
     }
 
+    #[cfg(feature = "api-extras")]
     #[wasm_bindgen(js_name = open)]
     pub fn open(name: Option<String>) -> Result<Self, JsValue> {
         Self::new(name)
@@ -341,6 +342,7 @@ impl FrankenDb {
         })
     }
 
+    #[cfg(feature = "api-extras")]
     pub fn pragma(&self, pragma: &str) -> Result<JsValue, JsValue> {
         let sql = format!("PRAGMA {pragma}");
         self.with_connection(|conn| {
@@ -2280,7 +2282,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     fn wasm_open_and_close_is_idempotent() {
-        let db = FrankenDb::open(None).expect("db should open via static constructor");
+        let db = FrankenDb::new(None).expect("db should open via constructor");
         #[cfg(feature = "diagnostics")]
         assert_eq!(db.path(), ":memory:");
 
@@ -2291,6 +2293,17 @@ mod wasm_tests {
             .query("SELECT 1")
             .expect_err("queries after close should produce a JS error");
         assert!(error_message(&error).contains("closed"));
+    }
+
+    #[cfg(feature = "api-extras")]
+    #[wasm_bindgen_test]
+    fn wasm_static_open_constructor_creates_database() {
+        let db = FrankenDb::open(None).expect("db should open via static constructor");
+        assert_eq!(
+            db.execute("CREATE TABLE wasm_static_open (id INTEGER PRIMARY KEY)")
+                .expect("table create should succeed"),
+            0
+        );
     }
 
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
@@ -2896,6 +2909,7 @@ mod wasm_tests {
         );
     }
 
+    #[cfg(feature = "api-extras")]
     #[wasm_bindgen_test]
     fn wasm_pragma_surface_returns_query_result_shape() {
         let db = FrankenDb::new(None).expect("db should open");

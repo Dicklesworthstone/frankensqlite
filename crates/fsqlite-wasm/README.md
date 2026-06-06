@@ -41,6 +41,8 @@ The helper script:
   `FSQLITE_WASM_FEATURES=backup`
 - can opt into multi-statement batch execution with
   `FSQLITE_WASM_FEATURES=batch-execution`
+- can opt into JavaScript convenience APIs with
+  `FSQLITE_WASM_FEATURES=api-extras`
 - can opt into browser memory-policy constructors and parser glue with
   `FSQLITE_WASM_FEATURES=memory-options`
 - can opt into the reusable prepared-statement wrapper with
@@ -87,7 +89,9 @@ Default JavaScript errors still include `code`, `sqliteCode`, `extendedCode`,
 and `message`; default parameterized execution stays available through
 `executeWithParams()` and `queryWithParams()`. Enable the `batch-execution`
 feature when a package needs `FrankenDB.executeBatch()` for multi-statement SQL
-strings. Enable the `memory-options` feature when a package needs
+strings. Enable the `api-extras` feature when a package needs the duplicate
+static constructor `FrankenDB.open()` or the generic `db.pragma()` helper. Enable
+the `memory-options` feature when a package needs
 `FrankenDB.openWithOptions()`, memory sizing options, or the option parser.
 Enable `backup,memory-options` together when a package needs
 `FrankenDB.importWithOptions()`. Enable the `prepared-statements` feature when a
@@ -105,12 +109,17 @@ The `backup` feature is separate from diagnostics. Enable it when the browser
 package needs `FrankenDB.import()` or `db.export()` for SQLite image
 round-trips. `FrankenDB.importWithOptions()` additionally requires
 `memory-options`. The minimum core package omits those backup bindings and keeps
-the common in-memory `open`/`execute`/`query` surface.
+the common in-memory constructor/`execute`/`query` surface.
 
 The `batch-execution` feature is separate from diagnostics. Enable it when the
 package needs `FrankenDB.executeBatch()` for semicolon-delimited multi-statement
 scripts. The minimum core package keeps one-shot `execute()` and
 `executeWithParams()` available and omits the batch wrapper.
+
+The `api-extras` feature is separate from diagnostics. Enable it when the
+package needs convenience wrappers such as `FrankenDB.open()` or `db.pragma()`.
+The minimum core package keeps the constructor plus `execute()` / `query()` and
+omits those duplicate helper exports.
 
 The `prepared-statements` feature is separate from diagnostics. Enable it when
 the package needs `FrankenDB.prepare()` and the exported
@@ -139,6 +148,7 @@ is the browser transfer shape.
 | Minimum core | `FSQLITE_WASM_NO_DEFAULT_FEATURES=1 FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Default core | `FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes |
 | Batch execution | `FSQLITE_WASM_FEATURES=batch-execution FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
+| API extras | `FSQLITE_WASM_FEATURES=api-extras FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Memory options | `FSQLITE_WASM_FEATURES=memory-options FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Diagnostics | `FSQLITE_WASM_FEATURES=diagnostics,tracing FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | `800000` bytes unless the release owner intentionally raises `FSQLITE_WASM_MAX_GZIP_BYTES` |
 | Extension bundle | `FSQLITE_WASM_FEATURES=extensions FSQLITE_WASM_TWIGGY=required ./scripts/build_fsqlite_wasm_package.sh` | report-only until each extension has its own tracked budget; set `FSQLITE_WASM_MAX_GZIP_BYTES=0` for exploratory measurement |
