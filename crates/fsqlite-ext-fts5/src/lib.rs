@@ -6903,6 +6903,16 @@ pub struct Fts5Table {
     documents: HashMap<i64, Vec<String>>,
     /// Shadow-table rows bound from an existing on-disk FTS5 table.
     shadow_rows: Option<Fts5ShadowRows>,
+    /// Lazy on-disk mode: the table was reopened over persisted `_data` posting
+    /// segments and is answered by POINT-READING those segments on demand (via a
+    /// host-supplied [`Fts5OnDiskReader`]) instead of loading the whole index
+    /// into memory. When set, `index`/`documents`/`shadow_rows` are intentionally
+    /// empty; the host must "promote" (rebuild from `_content`, clear this flag)
+    /// before any mutation or full-table scan.
+    lazy_on_disk: bool,
+    /// Cached live document count for lazy mode (the persisted averages
+    /// `total_rows`), so `row_count()` / `COUNT(*)` answer without a reader.
+    lazy_doc_count: usize,
     /// Locale metadata decoded from fts5_locale() values: (docid, column) -> locale.
     row_locales: HashMap<(i64, usize), SmallText>,
     /// Next auto-generated rowid.
@@ -6920,6 +6930,8 @@ struct Fts5TableSnapshot {
     index: InvertedIndex,
     documents: HashMap<i64, Vec<String>>,
     shadow_rows: Option<Fts5ShadowRows>,
+    lazy_on_disk: bool,
+    lazy_doc_count: usize,
     row_locales: HashMap<(i64, usize), SmallText>,
     next_rowid: i64,
 }
@@ -6943,6 +6955,8 @@ impl Fts5Table {
             index: InvertedIndex::with_options(true, &[], DetailMode::Full),
             documents: HashMap::new(),
             shadow_rows: None,
+            lazy_on_disk: false,
+            lazy_doc_count: 0,
             row_locales: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
@@ -6958,6 +6972,8 @@ impl Fts5Table {
             index: self.index.clone(),
             documents: self.documents.clone(),
             shadow_rows: self.shadow_rows.clone(),
+            lazy_on_disk: self.lazy_on_disk,
+            lazy_doc_count: self.lazy_doc_count,
             row_locales: self.row_locales.clone(),
             next_rowid: self.next_rowid,
         }
@@ -6971,6 +6987,8 @@ impl Fts5Table {
         self.index = snapshot.index;
         self.documents = snapshot.documents;
         self.shadow_rows = snapshot.shadow_rows;
+        self.lazy_on_disk = snapshot.lazy_on_disk;
+        self.lazy_doc_count = snapshot.lazy_doc_count;
         self.row_locales = snapshot.row_locales;
         self.next_rowid = snapshot.next_rowid;
     }
@@ -7335,6 +7353,64 @@ impl Fts5Table {
         )
     }
 
+    /// Enter lazy on-disk mode: the table is answered by point-reading the
+    /// persisted `_data` segments via a host [`Fts5OnDiskReader`] rather than
+    /// loading the whole index into memory. `doc_count` is the persisted live
+    /// document count (averages `total_rows`) so `row_count()`/`COUNT(*)` answer
+    /// without a reader. Clears any in-memory state so it cannot mask the
+    /// on-disk index.
+    pub fn mark_lazy_on_disk(&mut self, doc_count: usize) {
+        self.lazy_on_disk = true;
+        self.lazy_doc_count = doc_count;
+        self.documents.clear();
+        self.shadow_rows = None;
+        self.index = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+    }
+
+    /// Whether the table is in lazy on-disk mode (see [`Self::mark_lazy_on_disk`]).
+    #[must_use]
+    pub const fn is_lazy_on_disk(&self) -> bool {
+        self.lazy_on_disk
+    }
+
+    /// Leave lazy on-disk mode (after the host has materialized in-memory state,
+    /// e.g. via [`Self::rebuild_documents`]).
+    pub fn clear_lazy_on_disk(&mut self) {
+        self.lazy_on_disk = false;
+        self.lazy_doc_count = 0;
+    }
+
+    /// Answer MATCH queries in lazy mode by point-reading the persisted on-disk
+    /// segments through `reader`, returning `(rowid, bm25, content-columns)`.
+    /// Content is read per result row from `_content` via the reader, so only
+    /// the result set is projected (never the whole corpus).
+    pub fn search_rows_lazy(
+        &self,
+        reader: &mut dyn Fts5OnDiskReader,
+        queries: &[&str],
+        weights: &[f64],
+    ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
+        let tokenizer = self.create_tokenizer_instance();
+        let query = Fts5LazyQuery::new(
+            reader,
+            &self.columns,
+            tokenizer.as_ref(),
+            self.config.detail_mode(),
+        )?;
+        let ranked = query.search_queries_with_weights(queries, weights)?;
+        let mut out = Vec::with_capacity(ranked.len());
+        for (rowid, score) in ranked {
+            let columns = query.content_for_rowid(rowid)?.unwrap_or_default();
+            out.push((rowid, score, columns));
+        }
+        Ok(out)
+    }
+
     pub fn query_terms_for_queries(
         &self,
         queries: &[&str],
@@ -7386,6 +7462,9 @@ impl Fts5Table {
 
     #[must_use]
     pub fn row_count(&self) -> usize {
+        if self.lazy_on_disk {
+            return self.lazy_doc_count;
+        }
         if self.documents.is_empty()
             && let Some(shadow) = self.shadow_rows.as_ref()
         {

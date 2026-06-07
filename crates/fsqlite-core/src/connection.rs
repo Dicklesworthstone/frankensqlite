@@ -10704,15 +10704,51 @@ impl Connection {
         let key = src.table_name.to_ascii_uppercase();
         let num_cols = src.col_names.len();
 
+        // FTS5 tables are answered without the generic cursor: either lazily by
+        // point-reading on-disk segments (reopened `_data`-backed index) or from
+        // the in-memory index. Handle them entirely here so a lazy table never
+        // falls through to `open_cursor` (which would see empty in-memory state).
+        #[cfg(feature = "ext-fts5")]
+        {
+            let lazy_fts5 = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .map(Fts5Table::is_lazy_on_disk)
+            };
+            if let Some(is_lazy) = lazy_fts5 {
+                if is_lazy {
+                    if plan.idx_num == 1 {
+                        // MATCH: answer from the persisted segments on demand.
+                        return self.scan_lazy_fts5_match(src, plan);
+                    }
+                    // Full-table scan (idx_num == 0) and any other strategy need
+                    // the whole row set / in-memory machinery; promote first.
+                    self.promote_lazy_fts5_table(&src.table_name)?;
+                }
+                let instances = self.vtab_instances.borrow();
+                let instance = instances.get(&key).ok_or_else(|| {
+                    FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
+                })?;
+                let fts5 = instance
+                    .as_any()
+                    .downcast_ref::<Fts5Table>()
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "virtual table changed type during scan: {}",
+                            src.table_name
+                        ))
+                    })?;
+                return Self::scan_live_fts5_rows(fts5, src, plan);
+            }
+        }
+
         let mut cursor = {
             let instances = self.vtab_instances.borrow();
             let instance = instances.get(&key).ok_or_else(|| {
                 FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
             })?;
-            #[cfg(feature = "ext-fts5")]
-            if let Some(fts5) = instance.as_any().downcast_ref::<Fts5Table>() {
-                return Self::scan_live_fts5_rows(fts5, src, plan);
-            }
             instance.open_cursor()?
         };
 
@@ -11035,6 +11071,286 @@ impl Connection {
             .collect())
     }
 
+    /// Whether `<table_name>` can be answered lazily on disk.
+    ///
+    /// True when it has persisted `_data` posting segments AND uses regular
+    /// (stored) content (`_content` present, no `content=` option), so the lazy
+    /// reader can both search the segments and project result content.
+    /// External/contentless tables and frankensqlite-written tables (which have
+    /// no `_data` segments) keep the in-memory path.
+    #[cfg(feature = "ext-fts5")]
+    fn fts5_table_is_lazy_capable(
+        schema: &[TableSchema],
+        table_name: &str,
+        args: &[String],
+    ) -> bool {
+        let has_shadow = |suffix: &str| {
+            let name = format!("{table_name}{suffix}");
+            schema
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(&name) && table.root_page > 0)
+        };
+        let regular_content = virtual_table_option_value(args, "content").is_none();
+        has_shadow("_data") && regular_content && has_shadow("_content")
+    }
+
+    /// Read the persisted live document count for a lazy FTS5 table.
+    ///
+    /// A single point read of the averages record (`total_rows`, `_data` id=1),
+    /// so the cached count powers `row_count()`/`COUNT(*)` without loading the
+    /// index. Returns 0 when the index has no averages record yet (empty index).
+    #[cfg(feature = "ext-fts5")]
+    fn read_fts5_lazy_doc_count(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        table_name: &str,
+        column_count: usize,
+    ) -> Result<usize> {
+        let resolve = |suffix: &str| -> Result<Option<PageNumber>> {
+            let name = format!("{table_name}{suffix}");
+            match schema
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
+            {
+                Some(table) if table.root_page > 0 => Ok(Some(page_number_from_schema_root(
+                    table.root_page,
+                    &name,
+                    "fts5 lazy shadow",
+                )?)),
+                _ => Ok(None),
+            }
+        };
+        let Some(data_root) = resolve("_data")? else {
+            return Ok(0);
+        };
+        let registry = Arc::clone(&self.collation_registry);
+        let mut reader = Fts5LiveShadowReader::with_roots(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            data_root,
+            resolve("_idx")?,
+            resolve("_docsize")?,
+            resolve("_content")?,
+            registry,
+        );
+        match reader.read_data_block(fsqlite_ext_fts5::FTS5_AVERAGES_ROWID)? {
+            Some(block) => Ok(usize::try_from(
+                fsqlite_ext_fts5::Fts5AveragesRecord::decode(&block, column_count)?.total_rows,
+            )
+            .unwrap_or(usize::MAX)),
+            None => Ok(0),
+        }
+    }
+
+    /// Build a transaction-backed [`Fts5LiveShadowReader`] and run `f` on it.
+    ///
+    /// Resolves `table_name`'s shadow rootpages from the current schema; the
+    /// reader reuses the active read snapshot (via [`Self::with_integrity_txn`])
+    /// so its point reads are MVCC-consistent with the surrounding query.
+    #[cfg(feature = "ext-fts5")]
+    fn with_lazy_fts5_reader<R>(
+        &self,
+        table_name: &str,
+        f: impl FnOnce(&mut Fts5LiveShadowReader) -> Result<R>,
+    ) -> Result<R> {
+        let (data_root, idx_root, docsize_root, content_root) = {
+            let schema = self.schema.borrow();
+            let resolve = |suffix: &str| -> Result<Option<PageNumber>> {
+                let name = format!("{table_name}{suffix}");
+                match schema
+                    .iter()
+                    .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
+                {
+                    Some(table) if table.root_page > 0 => Ok(Some(page_number_from_schema_root(
+                        table.root_page,
+                        &name,
+                        "fts5 lazy shadow",
+                    )?)),
+                    _ => Ok(None),
+                }
+            };
+            let data_root = resolve("_data")?.ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "fts5 lazy table `{table_name}` missing `_data` shadow table"
+                ))
+            })?;
+            (
+                data_root,
+                resolve("_idx")?,
+                resolve("_docsize")?,
+                resolve("_content")?,
+            )
+        };
+        let registry = Arc::clone(&self.collation_registry);
+        self.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let header = parse_database_header_checked(page1.as_ref())?;
+            let mut reader = Fts5LiveShadowReader::with_roots(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                data_root,
+                idx_root,
+                docsize_root,
+                content_root,
+                registry,
+            );
+            f(&mut reader)
+        })
+    }
+
+    /// Answer an FTS5 MATCH scan (idx_num == 1) for a lazy table.
+    ///
+    /// Point-reads the persisted on-disk segments and projects `_content` only
+    /// for the result rows.
+    #[cfg(feature = "ext-fts5")]
+    fn scan_lazy_fts5_match(
+        &self,
+        src: &JoinTableSource,
+        plan: &LiveVtabScanPlan,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        if plan.args.is_empty() {
+            return Err(FrankenError::Internal(
+                "fts5 MATCH scan missing query argument".to_owned(),
+            ));
+        }
+        let key = src.table_name.to_ascii_uppercase();
+        let column_count = {
+            let instances = self.vtab_instances.borrow();
+            instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .map(|fts5| fts5.columns().len())
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
+                })?
+        };
+        let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
+        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+        let weights = vec![1.0_f64; column_count];
+
+        let scored = self.with_lazy_fts5_reader(&src.table_name, |reader| {
+            let instances = self.vtab_instances.borrow();
+            let fts5 = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
+                })?;
+            fts5.search_rows_lazy(reader, &query_refs, &weights)
+                .map_err(|error| {
+                    FrankenError::function_error(format!("fts5 query failed: {error}"))
+                })
+        })?;
+
+        Ok(scored
+            .into_iter()
+            .map(|(rowid, _score, columns)| {
+                let mut row = columns
+                    .into_iter()
+                    .take(src.col_names.len())
+                    .map(|s| SqliteValue::Text(s.into()))
+                    .collect::<Vec<_>>();
+                while row.len() < src.col_names.len() {
+                    row.push(SqliteValue::Null);
+                }
+                if src.hidden_rowid_projection.is_some() {
+                    row.push(SqliteValue::Integer(rowid));
+                }
+                row
+            })
+            .collect())
+    }
+
+    /// Promote a lazy on-disk FTS5 table into the in-memory representation.
+    ///
+    /// Rebuilds from `_content`, then clears the lazy flag. Used for operations
+    /// the lazy reader does not (yet) cover directly — full-table scans, ranked /
+    /// snippet auxiliary functions, and mutations. Idempotent: a no-op if the
+    /// table is not (or no longer) lazy.
+    #[cfg(feature = "ext-fts5")]
+    fn promote_lazy_fts5_table(&self, table_name: &str) -> Result<()> {
+        let key = table_name.to_ascii_uppercase();
+        {
+            let instances = self.vtab_instances.borrow();
+            let still_lazy = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .is_some_and(Fts5Table::is_lazy_on_disk);
+            if !still_lazy {
+                return Ok(());
+            }
+        }
+        // Snapshot schema/alias to avoid holding their RefCell borrows across
+        // the content read (which re-borrows neither, but cloning is cheap and
+        // keeps the borrow discipline obviously safe).
+        let schema_snapshot: Vec<TableSchema> = self.schema.borrow().clone();
+        let alias_snapshot: HashMap<String, usize> = self.rowid_alias_columns.borrow().clone();
+        let content = self.with_integrity_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let header = parse_database_header_checked(page1.as_ref())?;
+            let master = Self::read_sqlite_master_rows_in_txn(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+            )?;
+            let create_sql = master
+                .iter()
+                .find_map(|row| {
+                    let name = row.get(1).map(SqliteValue::to_text)?;
+                    name.eq_ignore_ascii_case(table_name)
+                        .then(|| row.get(4).map(SqliteValue::to_text))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "fts5 table `{table_name}` missing from sqlite_master during promotion"
+                    ))
+                })?;
+            let args = match parse_single_statement(&create_sql) {
+                Ok(Statement::CreateVirtualTable(stmt)) => stmt.args,
+                _ => {
+                    return Err(FrankenError::Internal(format!(
+                        "fts5 table `{table_name}` CREATE did not reparse during promotion"
+                    )));
+                }
+            };
+            self.read_fts5_rootpage_zero_content_rows_for_reload(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                &schema_snapshot,
+                &alias_snapshot,
+                table_name,
+                &args,
+            )
+        })?;
+        let mut instances = self.vtab_instances.borrow_mut();
+        let instance = instances.get_mut(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("virtual table not found: {table_name}"))
+        })?;
+        let fts5 = instance
+            .as_any_mut()
+            .downcast_mut::<Fts5Table>()
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "virtual table changed type during promotion: {table_name}"
+                ))
+            })?;
+        fts5.rebuild_documents(content);
+        fts5.clear_lazy_on_disk();
+        Ok(())
+    }
+
     #[cfg(feature = "ext-fts5")]
     fn build_fts5_aux_context_for_source(
         &self,
@@ -11046,6 +11362,22 @@ impl Connection {
         }
 
         let key = src.table_name.to_ascii_uppercase();
+        // Auxiliary scoring (bm25/rank, snippet, highlight) needs the in-memory
+        // index; promote a lazy table before building its score snapshot so
+        // ranked/snippet results stay correct. (The lazy reader covers plain
+        // MATCH filtering + count; ranked/snippet remain on the in-memory path.)
+        {
+            let is_lazy = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(Fts5Table::is_lazy_on_disk)
+            };
+            if is_lazy {
+                self.promote_lazy_fts5_table(&src.table_name)?;
+            }
+        }
         let instances = self.vtab_instances.borrow();
         let instance = instances.get(&key).ok_or_else(|| {
             FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
@@ -30549,6 +30881,22 @@ impl Connection {
         };
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let key = table_name.to_ascii_uppercase();
+        // A lazy on-disk FTS5 table must become in-memory before it is mutated
+        // (frankensqlite writes do not append on-disk segments), so promote it
+        // up front, outside the write transaction's borrows.
+        #[cfg(feature = "ext-fts5")]
+        {
+            let is_lazy = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(Fts5Table::is_lazy_on_disk)
+            };
+            if is_lazy {
+                self.promote_lazy_fts5_table(table_name)?;
+            }
+        }
         let mut inserted_row_count = 0usize;
         let mut source_row_count = 0usize;
         let streamed = self.with_pager_write_txn(|cx, txn| {
@@ -30919,6 +31267,22 @@ impl Connection {
         };
         if !self.insert_targets_live_fts5_command_column(insert) {
             return Ok(false);
+        }
+
+        // Maintenance commands (rebuild/optimize/merge/integrity-check/...) run
+        // against the in-memory index; promote a lazy on-disk table first.
+        {
+            let key = insert.table.name.to_ascii_uppercase();
+            let is_lazy = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(Fts5Table::is_lazy_on_disk)
+            };
+            if is_lazy {
+                self.promote_lazy_fts5_table(insert.table.name.as_str())?;
+            }
         }
 
         match command {
@@ -53913,18 +54277,27 @@ impl Connection {
             #[cfg(feature = "ext-fts5")]
             {
                 let mut context = Fts5AuxContext::default();
-                for src in &table_sources {
-                    if src.local_table_binding().is_none() {
-                        continue;
-                    }
-                    let queries = collect_fts5_match_queries_for_source(
-                        where_clause.as_deref(),
-                        &src.table_name,
-                    );
-                    if let Some(aux_table) =
-                        self.build_fts5_aux_context_for_source(src, &queries)?
-                    {
-                        context.insert(src.table_name.clone(), aux_table);
+                // Build the (in-memory) auxiliary context only when it is needed:
+                // for rank/bm25/snippet/highlight scoring, OR for a join, where a
+                // MATCH predicate on a non-primary source is evaluated through the
+                // aux context rather than pushed into the primary scan. A
+                // single-table plain MATCH needs neither, so a lazily-reopened
+                // FTS5 table stays on its on-disk scan path instead of promoting.
+                let needs_aux = table_sources.len() > 1 || select_uses_fts5_auxiliary(select);
+                if needs_aux {
+                    for src in &table_sources {
+                        if src.local_table_binding().is_none() {
+                            continue;
+                        }
+                        let queries = collect_fts5_match_queries_for_source(
+                            where_clause.as_deref(),
+                            &src.table_name,
+                        );
+                        if let Some(aux_table) =
+                            self.build_fts5_aux_context_for_source(src, &queries)?
+                        {
+                            context.insert(src.table_name.clone(), aux_table);
+                        }
                     }
                 }
                 context
@@ -56326,6 +56699,26 @@ impl Connection {
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
+                // Lazy on-disk path: a `_data`-backed regular-content index is
+                // answered by point-reading its persisted segments on demand
+                // (MATCH / count), so DON'T load the whole `_data`/`_content`
+                // into memory here — just mark it lazy. Non-MATCH/ranked/mutating
+                // access promotes it to the in-memory path on first use.
+                if Self::fts5_table_is_lazy_capable(schema, table_name, &create_stmt.args) {
+                    let column_count = fts5.columns().len();
+                    let doc_count = self.read_fts5_lazy_doc_count(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        schema,
+                        table_name,
+                        column_count,
+                    )?;
+                    fts5.mark_lazy_on_disk(doc_count);
+                    reloaded.insert(table_key, instance);
+                    continue;
+                }
                 let rows = self.read_fts5_shadow_rows_for_reload(
                     cx,
                     txn,
@@ -80780,6 +81173,135 @@ fn is_fts5_table_label_match(expr: &Expr, table_name: &str) -> bool {
 }
 
 #[cfg(feature = "ext-fts5")]
+/// Whether `expr` references an FTS5 auxiliary feature — the special `rank`
+/// column or a `bm25` / `snippet` / `highlight` / `offsets` call — which require
+/// the in-memory auxiliary scoring context. Plain MATCH filtering does not, so
+/// gating aux construction on this keeps a lazily-reopened index on its on-disk
+/// scan path instead of promoting it.
+#[cfg(feature = "ext-fts5")]
+fn expr_uses_fts5_auxiliary(expr: &Expr) -> bool {
+    fn is_aux_fn(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "bm25" | "snippet" | "highlight" | "offsets"
+        )
+    }
+    match expr {
+        Expr::Column(col_ref, _) => col_ref.column.eq_ignore_ascii_case("rank"),
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over,
+            ..
+        } => {
+            if is_aux_fn(name) {
+                return true;
+            }
+            let args_aux = match args {
+                FunctionArgs::List(exprs) => exprs.iter().any(expr_uses_fts5_auxiliary),
+                FunctionArgs::Star => false,
+            };
+            let over_aux = over.as_ref().is_some_and(|window| {
+                window.partition_by.iter().any(expr_uses_fts5_auxiliary)
+                    || window
+                        .order_by
+                        .iter()
+                        .any(|ordering| expr_uses_fts5_auxiliary(&ordering.expr))
+            });
+            args_aux || filter.as_deref().is_some_and(expr_uses_fts5_auxiliary) || over_aux
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_uses_fts5_auxiliary(expr)
+                || expr_uses_fts5_auxiliary(pattern)
+                || escape.as_deref().is_some_and(expr_uses_fts5_auxiliary)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_uses_fts5_auxiliary(left) || expr_uses_fts5_auxiliary(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_uses_fts5_auxiliary(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_uses_fts5_auxiliary(expr)
+                || expr_uses_fts5_auxiliary(low)
+                || expr_uses_fts5_auxiliary(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_uses_fts5_auxiliary(expr)
+                || match set {
+                    InSet::List(exprs) => exprs.iter().any(expr_uses_fts5_auxiliary),
+                    InSet::Subquery(query) => select_uses_fts5_auxiliary(query),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_uses_fts5_auxiliary)
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_uses_fts5_auxiliary(w) || expr_uses_fts5_auxiliary(t))
+                || else_expr.as_deref().is_some_and(expr_uses_fts5_auxiliary)
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            select_uses_fts5_auxiliary(subquery)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_uses_fts5_auxiliary(expr) || expr_uses_fts5_auxiliary(path)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_uses_fts5_auxiliary),
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+    }
+}
+
+/// Whether any expression in `select` (projection, ORDER BY, GROUP BY, HAVING,
+/// or WHERE) references an FTS5 auxiliary feature (see
+/// [`expr_uses_fts5_auxiliary`]).
+#[cfg(feature = "ext-fts5")]
+fn select_uses_fts5_auxiliary(select: &SelectStatement) -> bool {
+    if select
+        .order_by
+        .iter()
+        .any(|ordering| expr_uses_fts5_auxiliary(&ordering.expr))
+    {
+        return true;
+    }
+    match &select.body.select {
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(expr_uses_fts5_auxiliary),
+        SelectCore::Select {
+            columns,
+            where_clause,
+            group_by,
+            having,
+            ..
+        } => {
+            columns.iter().any(|col| match col {
+                ResultColumn::Expr { expr, .. } => expr_uses_fts5_auxiliary(expr),
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            }) || where_clause
+                .as_ref()
+                .is_some_and(|expr| expr_uses_fts5_auxiliary(expr))
+                || group_by.iter().any(expr_uses_fts5_auxiliary)
+                || having.as_deref().is_some_and(expr_uses_fts5_auxiliary)
+        }
+    }
+}
+
 fn collect_fts5_match_queries_for_source(
     where_clause: Option<&Expr>,
     table_name: &str,
@@ -121126,6 +121648,277 @@ fts5(title, body, content=docs, content_rowid=id)'
             Ok(())
         })
         .unwrap();
+    }
+
+    /// bd-fts5-lazy-shadow-reads-itcc4.4: pins the architectural discriminator
+    /// for lazy on-disk reads. frankensqlite's OWN FTS5 write path stores
+    /// `_content` plus an in-memory inverted index (rebuilt from `_content` on
+    /// reload); it does NOT persist stock SQLite's `_data` posting segments. The
+    /// lazy point-reader therefore applies to `_data`-backed indexes (stock-built
+    /// / cass), while frank-built tables keep using the in-memory path. If frank
+    /// later persists `_data` segments on write, this tripwire fires so the scan
+    /// wiring can switch those tables to lazy reads too.
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_frank_built_index_has_no_data_segments() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_frank_no_data.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+                .unwrap();
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (1, 'rust alpha')")
+                .unwrap();
+            conn.execute("INSERT INTO docs(rowid, body) VALUES (2, 'rust beta')")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let has_table = |name: &str| -> bool {
+            conn.query(&format!(
+                "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
+            ))
+            .ok()
+            .and_then(|rows| {
+                rows.first()
+                    .and_then(|row| row.values().first().map(SqliteValue::to_integer))
+            })
+            .is_some_and(|root| root > 0)
+        };
+
+        // MATCH still works through the in-memory path...
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rowid")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "frank in-memory FTS5 MATCH should find both docs"
+        );
+
+        // ...but there are no on-disk `_data` posting segments (the lazy reader's
+        // input); frank rebuilds the index from `_content` instead.
+        assert!(
+            !has_table("docs_data"),
+            "frank-built FTS5 unexpectedly has a docs_data segment table — \
+             lazy scan wiring should now cover frank-built tables (update this test)"
+        );
+    }
+
+    /// bd-fts5-lazy-shadow-reads-itcc4.4: end-to-end regression guard for the
+    /// PUBLIC query path. A stock-SQLite FTS5 index, reopened by a frankensqlite
+    /// `Connection`, must answer `SELECT rowid FROM t WHERE t MATCH ?` through
+    /// the real VDBE/scan pipeline with the same documents stock SQLite returns.
+    /// This pins the behaviour the lazy on-disk scan wiring must preserve.
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_public_match_query_on_reopened_index_matches_stock() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_public_match.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let docs: &[(i64, &str)] = &[
+            (1, "rust alpha beta"),
+            (2, "rust gamma delta"),
+            (3, "epsilon zeta eta"),
+            (4, "rust programming"),
+            (5, "gamma delta epsilon"),
+        ];
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+                .unwrap();
+            for (rowid, body) in docs {
+                sqlite
+                    .execute(
+                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
+                        rusqlite::params![rowid, body],
+                    )
+                    .unwrap();
+            }
+            sqlite.close().unwrap();
+        }
+
+        let match_queries: &[&str] = &["rust", "gamma", "rust AND gamma", "epsilon"];
+        let stock: Vec<(String, Vec<i64>)> = {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let captured = match_queries
+                .iter()
+                .map(|q| {
+                    let mut stmt = sqlite
+                        .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+                        .unwrap();
+                    let ids: Vec<i64> = stmt
+                        .query_map(rusqlite::params![q], |row| row.get::<_, i64>(0))
+                        .unwrap()
+                        .map(std::result::Result::unwrap)
+                        .collect();
+                    ((*q).to_owned(), ids)
+                })
+                .collect();
+            sqlite.close().unwrap();
+            captured
+        };
+
+        let conn = Connection::open(&db_str).unwrap();
+        for (q, expected) in &stock {
+            let rows = conn
+                .query(&format!(
+                    "SELECT rowid FROM docs WHERE docs MATCH '{q}' ORDER BY rowid"
+                ))
+                .unwrap_or_else(|e| panic!("frank MATCH `{q}` failed: {e}"));
+            let mut got: Vec<i64> = rows
+                .iter()
+                .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
+                .collect();
+            got.sort_unstable();
+            got.dedup();
+            let mut want = expected.clone();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(
+                got, want,
+                "public MATCH `{q}`: frank must equal stock (frank={got:?}, stock={want:?})"
+            );
+        }
+    }
+
+    /// bd-fts5-lazy-shadow-reads-itcc4.4: exercise the public READ paths of a
+    /// lazily reopened (`_data`-backed) FTS5 index through `Connection` and
+    /// confirm each stays correct vs stock SQLite: lazy MATCH (answered from the
+    /// persisted segments), COUNT(*) (cached averages, no scan), ranked MATCH
+    /// (promotes for auxiliary scoring), and full-table scan (promotes). Writing
+    /// to a stock `_data`-backed table is a separate, pre-existing limitation
+    /// (frankensqlite does not maintain on-disk `_data` segments), so it is not
+    /// covered here; the lazy reopen path targets read-mostly indexes (cass).
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_lazy_public_paths_stay_correct_vs_stock() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_lazy_public_paths.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let docs: &[(i64, &str)] = &[
+            (1, "rust alpha beta"),
+            (2, "rust gamma delta rust"),
+            (3, "epsilon zeta"),
+            (4, "rust programming language"),
+            (5, "gamma delta epsilon"),
+        ];
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+                .unwrap();
+            for (rowid, body) in docs {
+                sqlite
+                    .execute(
+                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
+                        rusqlite::params![rowid, body],
+                    )
+                    .unwrap();
+            }
+            sqlite
+                .execute("INSERT INTO docs(docs) VALUES('optimize')", [])
+                .unwrap();
+            sqlite.close().unwrap();
+        }
+
+        let stock_match = |q: &str| -> Vec<i64> {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = sqlite
+                .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+                .unwrap();
+            let mut ids: Vec<i64> = stmt
+                .query_map(rusqlite::params![q], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .map(std::result::Result::unwrap)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        let frank_match_set = |conn: &Connection, sql: &str| -> Vec<i64> {
+            let rows = conn
+                .query(sql)
+                .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
+            let mut ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        let conn = Connection::open(&db_str).unwrap();
+
+        // Lazy MATCH (no ranking) — answered from on-disk segments.
+        for q in ["rust", "gamma", "rust AND gamma", "rust*", "epsilon"] {
+            assert_eq!(
+                frank_match_set(
+                    &conn,
+                    &format!("SELECT rowid FROM docs WHERE docs MATCH '{q}' ORDER BY rowid")
+                ),
+                stock_match(q),
+                "lazy MATCH `{q}`"
+            );
+        }
+        // Plain (un-ranked) MATCH must be answered from the on-disk segments
+        // WITHOUT promoting to the in-memory path — i.e. `scan_lazy_fts5_match`
+        // actually ran. (Ranked / snippet queries promote; plain ones do not.)
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should be an FTS5 table");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "plain MATCH must stay lazy (no promote); the on-disk scan path was bypassed"
+            );
+        }
+
+        // COUNT(*) from the cached averages record (no scan, no load).
+        let count = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+        assert_eq!(
+            count[0].values()[0],
+            SqliteValue::Integer(5),
+            "lazy COUNT(*) should equal the averages row count"
+        );
+
+        // Ranked MATCH — promotes the table for auxiliary scoring; the matching
+        // SET must still equal stock (doc 2 has rust x2, so it is a real match).
+        assert_eq!(
+            frank_match_set(
+                &conn,
+                "SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rank"
+            ),
+            stock_match("rust"),
+            "ranked MATCH set must equal stock"
+        );
+
+        // Full-table scan path (idx_num == 0) on a freshly-reopened lazy table —
+        // promotes to in-memory, then returns every row.
+        let conn = Connection::open(&db_str).unwrap();
+        let all = conn.query("SELECT rowid FROM docs ORDER BY rowid").unwrap();
+        let all_ids: Vec<i64> = all
+            .iter()
+            .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
+            .collect();
+        assert_eq!(
+            all_ids,
+            vec![1, 2, 3, 4, 5],
+            "full scan should return every row"
+        );
     }
 
     /// bd-fts5-lazy-shadow-reads-itcc4.3: multi-segment recency parity. With
