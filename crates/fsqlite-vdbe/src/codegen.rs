@@ -7996,6 +7996,130 @@ fn codegen_select_without_from(
     b.resolve_label(end_label);
 }
 
+/// Which end of the table B-tree a `MIN`/`MAX(rowid)` extremum lives at.
+#[derive(Clone, Copy)]
+enum RowidSeekEnd {
+    /// `MIN(rowid)` → leftmost leaf (first row).
+    First,
+    /// `MAX(rowid)` → rightmost leaf (last row).
+    Last,
+}
+
+/// Detect the `MAX(rowid)` / `MIN(rowid)` leaf-seek special case.
+///
+/// Fires only when the parsed aggregate columns reduce to *exactly one* output
+/// aggregate over the rowid / INTEGER PRIMARY KEY, with no other aggregate or
+/// bare columns, no `DISTINCT`, and no `FILTER`. An optional scalar wrapper
+/// (e.g. `COALESCE(MAX(id), 0)`) is allowed because it is applied unchanged
+/// after finalization. Any additional output column (a second aggregate or a
+/// bare `SELECT max(id), other` column) disqualifies the fast path so its
+/// semantics — bare columns take the value of the *last scanned row* — are
+/// never altered. Returns the end of the B-tree to seek when applicable.
+fn minmax_rowid_seek_plan(agg_columns: &[AggColumn]) -> Option<RowidSeekEnd> {
+    let [agg] = agg_columns else {
+        return None;
+    };
+    if !agg.arg_is_rowid
+        || agg.distinct
+        || agg.filter.is_some()
+        || agg.hidden
+        || agg.bare_expr.is_some()
+        || !agg.multi_agg_indices.is_empty()
+        || !agg.extra_args.is_empty()
+        || agg.num_args != 1
+    {
+        return None;
+    }
+    match agg.name.as_str() {
+        "MIN" => Some(RowidSeekEnd::First),
+        "MAX" => Some(RowidSeekEnd::Last),
+        _ => None,
+    }
+}
+
+/// Emit the `MAX(rowid)` / `MIN(rowid)` leaf-seek fast path.
+///
+/// Instead of `Rewind` + AggStep-per-row + `Next` (an O(n) walk), this seeks a
+/// single leaf — `Last` for `MAX`, `Rewind` for `MIN` — feeds that one row's
+/// rowid through the *same* `AggStep`/`AggFinal`/wrapper sequence the slow path
+/// uses, and emits the result. On an empty table the seek jumps straight to
+/// finalize with the accumulator still `NULL`, so `MAX(id)` → `NULL` and
+/// `COALESCE(MAX(id), 0)` → `0`, identical to stock SQLite.
+///
+/// Returns `Result` to mirror the sibling codegen entry points and the
+/// dispatcher's `return codegen_select_minmax_rowid_seek(...)` call site, even
+/// though this path is infallible.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_minmax_rowid_seek(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    agg_columns: &[AggColumn],
+    seek_end: RowidSeekEnd,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let agg = &agg_columns[0];
+
+    // Single accumulator, initialized to NULL (AggStep protocol). When the
+    // table is empty the seek skips AggStep and the accumulator stays NULL.
+    let accum_reg = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, accum_reg, 0, P4::None, 0);
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // Seek the single extremum row; jump past AggStep to finalize when empty.
+    let finalize_label = b.emit_label();
+    let seek_op = match seek_end {
+        RowidSeekEnd::First => Opcode::Rewind,
+        RowidSeekEnd::Last => Opcode::Last,
+    };
+    b.emit_jump_to_label(seek_op, cursor, 0, finalize_label, P4::None, 0);
+
+    // AggStep over exactly one row: the rowid of the leaf we landed on.
+    let arg_reg = b.alloc_reg();
+    b.emit_op(Opcode::Rowid, cursor, arg_reg, 0, P4::None, 0);
+    let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
+    b.emit_op(Opcode::AggStep, 0, arg_reg, accum_reg, agg_p4, 1);
+
+    b.resolve_label(finalize_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_reg,
+        agg.num_args,
+        0,
+        P4::FuncName(agg.name.clone()),
+        0,
+    );
+
+    // Move the finalized value into the output register (when distinct).
+    if accum_reg != out_regs {
+        b.emit_op(Opcode::Copy, accum_reg, out_regs, 0, P4::None, 0);
+    }
+
+    // Apply any scalar wrapper (e.g. COALESCE(..., 0)) exactly as the slow path.
+    if let Some(wrapper) = &agg.wrapper_expr {
+        emit_agg_wrapper(b, wrapper, out_regs);
+    }
+
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
 /// Generate VDBE bytecode for an aggregate SELECT (no GROUP BY yet).
 ///
 /// Pattern:
@@ -8030,6 +8154,30 @@ fn codegen_select_aggregate(
 
     // Parse aggregate columns: extract function name, arg count, arg column index.
     let mut agg_columns = parse_aggregate_columns(columns, table)?;
+
+    // Leaf-seek fast path for `MAX(rowid)` / `MIN(rowid)` with no WHERE/HAVING
+    // (this function is only reached when GROUP BY is empty). Stock SQLite
+    // special-cases the extremum of the INTEGER PRIMARY KEY as a single seek to
+    // the rightmost/leftmost leaf (O(log n)) instead of a full B-tree walk.
+    // The accumulate/finalize/wrapper machinery is reused verbatim so the
+    // produced result is bit-identical to the full-scan path; only the row that
+    // feeds AggStep changes (the single extremum row instead of every row).
+    if where_clause.is_none()
+        && having.is_none()
+        && let Some(seek) = minmax_rowid_seek_plan(&agg_columns)
+    {
+        return codegen_select_minmax_rowid_seek(
+            b,
+            cursor,
+            table,
+            &agg_columns,
+            seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
 
     // Collect aggregates from the HAVING clause that are not in the SELECT list.
     // Without this, HAVING-only aggregates (e.g. `HAVING SUM(x) > 10` when SUM(x)
