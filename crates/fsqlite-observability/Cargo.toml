@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-observability"
-version = "0.1.8"
+version = "0.1.9"
 description = "Conflict analytics and observability infrastructure for FrankenSQLite MVCC"
 edition.workspace = true
 license.workspace = true
