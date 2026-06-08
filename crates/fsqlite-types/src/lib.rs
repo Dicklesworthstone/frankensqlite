@@ -1,5 +1,5 @@
 #![cfg_attr(
-    all(target_arch = "x86_64", not(target_arch = "wasm32")),
+    all(feature = "nightly-simd", target_arch = "x86_64", not(target_arch = "wasm32")),
     feature(portable_simd)
 )]
 

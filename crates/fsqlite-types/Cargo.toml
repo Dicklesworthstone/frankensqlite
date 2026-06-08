@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-types"
-version = "0.1.9"
+version = "0.1.8"
 description = "Core type definitions for FrankenSQLite"
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,12 @@ rust-version.workspace = true
 default = ["native"]
 native = ["dep:asupersync"]
 wasm = []
+# Opt-in nightly `portable_simd` fast path for integer-block classification on
+# x86_64. OFF by default so downstream `cargo build` works on stable Rust (the
+# `#![feature(portable_simd)]` attribute is gated behind this); enable on a
+# nightly toolchain to get the SIMD classifier. The scalar fallback is
+# functionally identical, so correctness never depends on this feature.
+nightly-simd = []
 
 [dependencies]
 bitflags = { workspace = true }
