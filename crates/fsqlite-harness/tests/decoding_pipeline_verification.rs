@@ -100,7 +100,9 @@ fn build_full_decode_input(
     let k_u32 = k as u32;
     let l_u32 = params.l as u32;
     for esi in k_u32..l_u32 {
-        let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
+        let (cols, coeffs) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
     }
@@ -152,7 +154,9 @@ fn build_decode_with_erasures(
     let k_u32 = k as u32;
     let repair_count = drop_indices.len() + params.s + params.h;
     for esi in k_u32..k_u32 + repair_count as u32 {
-        let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
+        let (cols, coeffs) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
     }
@@ -175,7 +179,9 @@ fn build_repair_only_input(
 
     // Only repair symbols, starting at ESI = K.
     for esi in (k as u32)..(k as u32 + l as u32 + extra_repair as u32) {
-        let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
+        let (cols, coeffs) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
     }
@@ -221,7 +227,9 @@ fn build_mixed_isi_input(
     }
 
     for &esi in repair_esis {
-        let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
+        let (cols, coeffs) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
     }
@@ -910,7 +918,9 @@ fn test_decode_success_rate_at_k_plus_2() {
         // Add 2 extra repair symbols.
         let k_u32 = k as u32;
         for esi in k_u32..k_u32 + 2 {
-            let (cols, coeffs) = decoder.repair_equation_rfc6330(esi);
+            let (cols, coeffs) = decoder
+                .repair_equation_rfc6330(esi)
+                .expect("repair symbol should have an RFC6330 repair equation");
             let repair_data = enc.repair_symbol(esi);
             received.push(ReceivedSymbol::repair(esi, cols, coeffs, repair_data));
         }

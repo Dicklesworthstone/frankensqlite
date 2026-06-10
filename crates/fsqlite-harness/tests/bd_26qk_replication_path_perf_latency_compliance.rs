@@ -155,7 +155,10 @@ fn run_raptorq_decode_latency_ns(fixture: &RaptorqDecodeFixture) -> (u128, usize
         fixture.dropped_source_symbols + fixture.decoder.params().s + fixture.decoder.params().h;
     for offset in 0..repair_symbols_needed {
         let esi = u32::try_from(RAPTORQ_K_SOURCE + offset).expect("repair ESI must fit u32");
-        let (columns, coefficients) = fixture.decoder.repair_equation_rfc6330(esi);
+        let (columns, coefficients) = fixture
+            .decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = fixture.encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(
             esi,

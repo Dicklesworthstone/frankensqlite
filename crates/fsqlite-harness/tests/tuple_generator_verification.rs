@@ -584,7 +584,9 @@ fn verify_roundtrip(k: usize, symbol_size: usize, seed: u64) {
 
     // Add repair symbols to reach L total.
     for esi in k_u32..l_u32 {
-        let (cols, coefs) = decoder.repair_equation_rfc6330(esi);
+        let (cols, coefs) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(esi, cols, coefs, repair_data));
     }
@@ -816,8 +818,12 @@ fn test_repair_equation_deterministic() {
     let d2 = InactivationDecoder::new(k, 64, 42);
 
     for esi in 20..40_u32 {
-        let (cols1, coefs1) = d1.repair_equation_rfc6330(esi);
-        let (cols2, coefs2) = d2.repair_equation_rfc6330(esi);
+        let (cols1, coefs1) = d1
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
+        let (cols2, coefs2) = d2
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         assert_eq!(
             cols1, cols2,
             "bead_id={BEAD_ID} case=repair_eq_columns_deterministic esi={esi}"
@@ -837,7 +843,9 @@ fn test_repair_equation_columns_valid() {
     let l = decoder.params().l;
 
     for esi in 50..100_u32 {
-        let (cols, coefs) = decoder.repair_equation_rfc6330(esi);
+        let (cols, coefs) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         assert_eq!(
             cols.len(),
             coefs.len(),

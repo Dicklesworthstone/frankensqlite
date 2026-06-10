@@ -62,7 +62,9 @@ fn append_repair_symbols(
 ) {
     for offset in 0..count {
         let esi = start_esi + u32::try_from(offset).expect("offset must fit u32");
-        let (columns, coefficients) = decoder.repair_equation_rfc6330(esi);
+        let (columns, coefficients) = decoder
+            .repair_equation_rfc6330(esi)
+            .expect("repair symbol should have an RFC6330 repair equation");
         let repair_data = encoder.repair_symbol(esi);
         received.push(ReceivedSymbol::repair(
             esi,
