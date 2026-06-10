@@ -54874,7 +54874,14 @@ impl Connection {
                         .get(src_idx)
                         .and_then(Option::as_ref)
                         .and_then(|plan| plan.residual_where.as_ref());
-                    let match_query_source = if needs_projected_fts5_aux_context {
+                    // Only the PRIMARY source's scan plan rewrites the
+                    // effective WHERE evaluated against joined rows. A MATCH
+                    // claimed by a NON-primary source's own plan therefore
+                    // still reaches the generic join filter, which can only
+                    // evaluate the table-label operand through this aux
+                    // context — so non-primary sources must collect from the
+                    // full WHERE clause, not their residual.
+                    let match_query_source = if needs_projected_fts5_aux_context || src_idx > 0 {
                         where_clause.as_deref()
                     } else {
                         residual_where
@@ -57246,11 +57253,18 @@ impl Connection {
         schema: &[TableSchema],
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String, Vec<ColumnInfo>)],
+        preserve_existing_live_vtabs: bool,
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let mut reloaded = HashMap::new();
 
         for (table_name, create_sql, _) in specs {
             let table_key = table_name.to_ascii_uppercase();
+            if preserve_existing_live_vtabs {
+                if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
+                    reloaded.insert(table_key, instance);
+                    continue;
+                }
+            }
             let create_stmt = match parse_single_statement(create_sql) {
                 Ok(Statement::CreateVirtualTable(stmt)) => stmt,
                 Ok(_) => continue,
@@ -58235,6 +58249,7 @@ impl Connection {
                     &new_schema,
                     &new_alias_map,
                     &pending_rootpage_zero_virtual_tables,
+                    preserve_existing_live_vtabs,
                 )?;
             reloaded.extend(rootpage_zero_live_vtabs);
             Some(reloaded)
