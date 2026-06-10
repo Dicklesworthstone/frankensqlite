@@ -1394,6 +1394,21 @@ impl Fts5PendingHash {
             .push_position(column, position);
     }
 
+    fn push_index_posting(
+        &mut self,
+        index: Fts5PendingIndex,
+        term: &str,
+        posting: &Posting,
+    ) -> Result<()> {
+        let rowid = u64::try_from(posting.docid)
+            .map_err(|_| fts5_data_error("pending rowid is negative"))?;
+        let key = Fts5PendingTermKey::new(index, term);
+        for position in &posting.positions {
+            self.push_occurrence(key.clone(), rowid, posting.column, *position);
+        }
+        Ok(())
+    }
+
     pub fn flush_to_segment(
         &self,
         segid: u32,
@@ -2100,6 +2115,37 @@ impl Fts5ScoreSnapshot {
 }
 
 impl Fts5ShadowRows {
+    #[must_use]
+    pub fn full_scan_rows(&self) -> Vec<(i64, Vec<String>)> {
+        let mut rows = self
+            .content
+            .iter()
+            .map(|row| (row.rowid, row.values.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        for row in &self.docsize {
+            rows.entry(row.rowid).or_default();
+        }
+
+        rows.into_iter().collect()
+    }
+
+    #[must_use]
+    pub fn row_count(&self, column_count: usize) -> usize {
+        if let Some(row) = self.data.iter().find(|row| row.id == FTS5_AVERAGES_ROWID)
+            && let Ok(averages) = Fts5AveragesRecord::decode(&row.block, column_count)
+        {
+            return usize::try_from(averages.total_rows).unwrap_or(usize::MAX);
+        }
+
+        self.content
+            .iter()
+            .map(|row| row.rowid)
+            .chain(self.docsize.iter().map(|row| row.rowid))
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
     pub fn validate_for_open(&self, column_count: usize) -> Result<Fts5ShadowOpenReport> {
         let metadata = Fts5ConfigMetadata::decode_rows(&self.config)?;
         let data = Fts5DataMetadata::decode_rows(&self.data, column_count)?;
@@ -5048,6 +5094,42 @@ impl InvertedIndex {
             doc_lengths.insert(row.rowid, row.total_tokens());
         }
     }
+
+    pub fn build_pending_hash(&self, prefix_lengths: &[usize]) -> Result<Fts5PendingHash> {
+        let mut normalized_prefix_lengths = prefix_lengths.to_vec();
+        normalized_prefix_lengths.sort_unstable();
+        normalized_prefix_lengths.dedup();
+        let mut pending = Fts5PendingHash::new(
+            &normalized_prefix_lengths,
+            self.detail_mode(),
+            self.tokendata_enabled(),
+        );
+
+        for (term, postings) in &self.index {
+            for posting in postings {
+                pending.push_index_posting(Fts5PendingIndex::Main, term, posting)?;
+                for (ordinal, prefix_length) in
+                    normalized_prefix_lengths.iter().copied().enumerate()
+                {
+                    if let Some(prefix) = prefix_slice(term, prefix_length)
+                        && let Ok(ordinal) = u8::try_from(ordinal)
+                    {
+                        pending.push_index_posting(
+                            Fts5PendingIndex::Prefix {
+                                ordinal,
+                                length: prefix_length,
+                            },
+                            prefix,
+                            posting,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        pending.row_count = self.doc_ids.len();
+        Ok(pending)
+    }
 }
 
 fn append_position_to_postings(postings: &mut PostingList, docid: i64, column: u32, position: u32) {
@@ -6903,15 +6985,12 @@ pub struct Fts5Table {
     documents: HashMap<i64, Vec<String>>,
     /// Shadow-table rows bound from an existing on-disk FTS5 table.
     shadow_rows: Option<Fts5ShadowRows>,
-    /// Lazy on-disk mode: the table was reopened over persisted `_data` posting
-    /// segments and is answered by POINT-READING those segments on demand (via a
-    /// host-supplied [`Fts5OnDiskReader`]) instead of loading the whole index
-    /// into memory. When set, `index`/`documents`/`shadow_rows` are intentionally
-    /// empty; the host must "promote" (rebuild from `_content`, clear this flag)
-    /// before any mutation or full-table scan.
+    /// Lazy on-disk mode: the table was reopened over persisted `_data`
+    /// posting segments and is answered by point-reading those segments via a
+    /// host-supplied [`Fts5OnDiskReader`] instead of loading the whole index.
     lazy_on_disk: bool,
-    /// Cached live document count for lazy mode (the persisted averages
-    /// `total_rows`), so `row_count()` / `COUNT(*)` answer without a reader.
+    /// Cached live document count for lazy mode, read from the persisted
+    /// averages row so `COUNT(*)` does not scan or materialize the index.
     lazy_doc_count: usize,
     /// Locale metadata decoded from fts5_locale() values: (docid, column) -> locale.
     row_locales: HashMap<(i64, usize), SmallText>,
@@ -7268,6 +7347,7 @@ impl Fts5Table {
         );
         self.documents = HashMap::with_capacity(rows.len());
         self.shadow_rows = None;
+        self.clear_lazy_on_disk();
         self.row_locales.clear();
         self.next_rowid = 1;
         let tokenizer = create_tokenizer(&self.tokenizer_name)
@@ -7356,9 +7436,7 @@ impl Fts5Table {
     /// Enter lazy on-disk mode: the table is answered by point-reading the
     /// persisted `_data` segments via a host [`Fts5OnDiskReader`] rather than
     /// loading the whole index into memory. `doc_count` is the persisted live
-    /// document count (averages `total_rows`) so `row_count()`/`COUNT(*)` answer
-    /// without a reader. Clears any in-memory state so it cannot mask the
-    /// on-disk index.
+    /// document count from the averages row.
     pub fn mark_lazy_on_disk(&mut self, doc_count: usize) {
         self.lazy_on_disk = true;
         self.lazy_doc_count = doc_count;
@@ -7372,23 +7450,20 @@ impl Fts5Table {
         );
     }
 
-    /// Whether the table is in lazy on-disk mode (see [`Self::mark_lazy_on_disk`]).
+    /// Whether the table is in lazy on-disk mode.
     #[must_use]
     pub const fn is_lazy_on_disk(&self) -> bool {
         self.lazy_on_disk
     }
 
-    /// Leave lazy on-disk mode (after the host has materialized in-memory state,
-    /// e.g. via [`Self::rebuild_documents`]).
+    /// Leave lazy on-disk mode after the host materializes table rows.
     pub fn clear_lazy_on_disk(&mut self) {
         self.lazy_on_disk = false;
         self.lazy_doc_count = 0;
     }
 
-    /// Answer MATCH queries in lazy mode by point-reading the persisted on-disk
-    /// segments through `reader`, returning `(rowid, bm25, content-columns)`.
-    /// Content is read per result row from `_content` via the reader, so only
-    /// the result set is projected (never the whole corpus).
+    /// Answer MATCH queries in lazy mode by point-reading persisted on-disk
+    /// segments through `reader`, projecting `_content` only for result rows.
     pub fn search_rows_lazy(
         &self,
         reader: &mut dyn Fts5OnDiskReader,
@@ -7441,15 +7516,12 @@ impl Fts5Table {
     #[must_use]
     pub fn all_rows(&self) -> Vec<(i64, Vec<String>)> {
         // When the table is bound to persisted shadow rows (reopened on-disk
-        // index, no in-memory documents), full-scan rows come from `_content`.
+        // index, no in-memory documents), full-scan rows come from `_content`
+        // plus `_docsize` rowids for contentless tables.
         let mut rows: Vec<(i64, Vec<String>)> = if self.documents.is_empty()
             && let Some(shadow) = self.shadow_rows.as_ref()
         {
-            shadow
-                .content
-                .iter()
-                .map(|row| (row.rowid, row.values.clone()))
-                .collect()
+            shadow.full_scan_rows()
         } else {
             self.documents
                 .iter()
@@ -7468,7 +7540,7 @@ impl Fts5Table {
         if self.documents.is_empty()
             && let Some(shadow) = self.shadow_rows.as_ref()
         {
-            return shadow.content.len();
+            return shadow.row_count(self.columns.len());
         }
         self.documents.len()
     }
@@ -7628,10 +7700,22 @@ impl Fts5Table {
             Fts5StructureRecord::empty_legacy(0)
         };
 
-        vec![
-            Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode()),
-            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()),
-        ]
+        let mut rows = vec![Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode())];
+        let pending = if self.config.content_mode == ContentMode::Contentless {
+            self.index.build_pending_hash(&self.prefix_lengths)
+        } else {
+            self.build_pending_hash()
+        };
+        if let Ok(pending) = pending
+            && !pending.is_empty()
+            && let Ok(flush) = pending.flush_to_segment(1, structure.clone())
+        {
+            rows.extend(flush.data_rows);
+            return rows;
+        }
+
+        rows.push(Fts5DataRow::new(FTS5_STRUCTURE_ROWID, structure.encode()));
+        rows
     }
 
     pub fn decode_data_rows(&self, rows: &[Fts5DataRow]) -> Result<Fts5DataMetadata> {
@@ -8363,9 +8447,9 @@ impl VirtualTableCursor for Fts5Cursor {
             // Full table scan (idx_num == 0): return all documents.
             let mut rows: Vec<(i64, f64)> = if let Some(shadow_rows) = self.shadow_rows.as_ref() {
                 shadow_rows
-                    .content
-                    .iter()
-                    .map(|row| (row.rowid, 0.0))
+                    .full_scan_rows()
+                    .into_iter()
+                    .map(|(rowid, _)| (rowid, 0.0))
                     .collect()
             } else {
                 self.documents
@@ -11085,6 +11169,24 @@ mod tests {
             Some(Fts5DocsizeRow::new(3, vec![3]))
         );
         assert_eq!(table.lookup_content_row(3), None);
+
+        let rows = table.encode_shadow_rows();
+        let opened = Fts5Table::open_shadow_rows(
+            &cx,
+            &["fts5", "main", "docs", "body", "content=''"],
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(opened.table.row_count(), 1);
+        assert_eq!(opened.table.all_rows(), vec![(3_i64, Vec::<String>::new())]);
+
+        let mut cursor =
+            fsqlite_func::vtab::ErasedVtabInstance::open_cursor(&opened.table).unwrap();
+        cursor.erased_filter(&cx, 0, None, &[]).unwrap();
+        assert!(!cursor.erased_eof());
+        assert_eq!(cursor.erased_rowid().unwrap(), 3);
+        cursor.erased_next(&cx).unwrap();
+        assert!(cursor.erased_eof());
     }
 
     #[test]

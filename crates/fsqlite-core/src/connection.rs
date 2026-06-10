@@ -76,9 +76,10 @@ use fsqlite_btree::{set_btree_copy_profile_enabled, set_btree_metrics_enabled};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
-    Fts5DocsizeRow, Fts5Expr, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows,
-    Fts5Table, build_expr, decode_docsize_blob, highlight as fts5_highlight, parse_fts5_query,
-    snippet as fts5_snippet,
+    FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DocsizeRow, Fts5Expr,
+    Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows, Fts5StructureRecord,
+    Fts5Table, Fts5Tokenizer, build_expr, decode_docsize_blob, highlight as fts5_highlight,
+    parse_fts5_query, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -10706,8 +10707,9 @@ impl Connection {
 
         // FTS5 tables are answered without the generic cursor: either lazily by
         // point-reading on-disk segments (reopened `_data`-backed index) or from
-        // the in-memory index. Handle them entirely here so a lazy table never
-        // falls through to `open_cursor` (which would see empty in-memory state).
+        // the in-memory/shadow-bound table state. Handle them here so a lazy
+        // table never falls through to `open_cursor`, which intentionally has
+        // no in-memory postings.
         #[cfg(feature = "ext-fts5")]
         {
             let lazy_fts5 = {
@@ -10720,11 +10722,8 @@ impl Connection {
             if let Some(is_lazy) = lazy_fts5 {
                 if is_lazy {
                     if plan.idx_num == 1 {
-                        // MATCH: answer from the persisted segments on demand.
                         return self.scan_lazy_fts5_match(src, plan);
                     }
-                    // Full-table scan (idx_num == 0) and any other strategy need
-                    // the whole row set / in-memory machinery; promote first.
                     self.promote_lazy_fts5_table(&src.table_name)?;
                 }
                 let instances = self.vtab_instances.borrow();
@@ -11071,13 +11070,12 @@ impl Connection {
             .collect())
     }
 
-    /// Whether `<table_name>` can be answered lazily on disk.
+    /// Whether `<table_name>` has the catalog shape needed for lazy on-disk FTS5.
     ///
-    /// True when it has persisted `_data` posting segments AND uses regular
-    /// (stored) content (`_content` present, no `content=` option), so the lazy
-    /// reader can both search the segments and project result content.
-    /// External/contentless tables and frankensqlite-written tables (which have
-    /// no `_data` segments) keep the in-memory path.
+    /// Only regular stored-content FTS5 tables are lazy-capable: the lazy reader
+    /// needs `_data` for MATCH and `_content` for result projection. The caller
+    /// must also verify that `_data` has a non-empty structure row; metadata-only
+    /// FrankenSQLite-created indexes should rebuild from `_content` instead.
     #[cfg(feature = "ext-fts5")]
     fn fts5_table_is_lazy_capable(
         schema: &[TableSchema],
@@ -11096,9 +11094,8 @@ impl Connection {
 
     /// Read the persisted live document count for a lazy FTS5 table.
     ///
-    /// A single point read of the averages record (`total_rows`, `_data` id=1),
-    /// so the cached count powers `row_count()`/`COUNT(*)` without loading the
-    /// index. Returns 0 when the index has no averages record yet (empty index).
+    /// This point-reads `_data` id=1 (the averages row) so `COUNT(*)` can stay
+    /// cheap without loading all segment leaves into memory.
     #[cfg(feature = "ext-fts5")]
     fn read_fts5_lazy_doc_count(
         &self,
@@ -11139,20 +11136,57 @@ impl Connection {
             resolve("_content")?,
             registry,
         );
-        match reader.read_data_block(fsqlite_ext_fts5::FTS5_AVERAGES_ROWID)? {
+        match reader.read_data_block(FTS5_AVERAGES_ROWID)? {
             Some(block) => Ok(usize::try_from(
-                fsqlite_ext_fts5::Fts5AveragesRecord::decode(&block, column_count)?.total_rows,
+                Fts5AveragesRecord::decode(&block, column_count)?.total_rows,
             )
             .unwrap_or(usize::MAX)),
             None => Ok(0),
         }
     }
 
+    #[cfg(feature = "ext-fts5")]
+    fn read_fts5_lazy_has_segments(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        table_name: &str,
+    ) -> Result<bool> {
+        let data_name = format!("{table_name}_data");
+        let Some(data_table) = schema
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(&data_name))
+            .filter(|table| table.root_page > 0)
+        else {
+            return Ok(false);
+        };
+        let data_root =
+            page_number_from_schema_root(data_table.root_page, &data_name, "fts5 lazy shadow")?;
+        let registry = Arc::clone(&self.collation_registry);
+        let mut reader = Fts5LiveShadowReader::with_roots(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            data_root,
+            None,
+            None,
+            None,
+            registry,
+        );
+        let Some(block) = reader.read_data_block(FTS5_STRUCTURE_ROWID)? else {
+            return Ok(false);
+        };
+        Ok(Fts5StructureRecord::decode(&block)?.segment_count() > 0)
+    }
+
     /// Build a transaction-backed [`Fts5LiveShadowReader`] and run `f` on it.
     ///
-    /// Resolves `table_name`'s shadow rootpages from the current schema; the
-    /// reader reuses the active read snapshot (via [`Self::with_integrity_txn`])
-    /// so its point reads are MVCC-consistent with the surrounding query.
+    /// The reader reuses the query's read snapshot, so segment, idx, docsize,
+    /// and content point reads stay MVCC-consistent with the surrounding query.
     #[cfg(feature = "ext-fts5")]
     fn with_lazy_fts5_reader<R>(
         &self,
@@ -11206,10 +11240,8 @@ impl Connection {
         })
     }
 
-    /// Answer an FTS5 MATCH scan (idx_num == 1) for a lazy table.
-    ///
-    /// Point-reads the persisted on-disk segments and projects `_content` only
-    /// for the result rows.
+    /// Answer an FTS5 MATCH scan for a lazy table by point-reading persisted
+    /// segments and projecting `_content` only for matched rowids.
     #[cfg(feature = "ext-fts5")]
     fn scan_lazy_fts5_match(
         &self,
@@ -11269,12 +11301,9 @@ impl Connection {
             .collect())
     }
 
-    /// Promote a lazy on-disk FTS5 table into the in-memory representation.
-    ///
-    /// Rebuilds from `_content`, then clears the lazy flag. Used for operations
-    /// the lazy reader does not (yet) cover directly — full-table scans, ranked /
-    /// snippet auxiliary functions, and mutations. Idempotent: a no-op if the
-    /// table is not (or no longer) lazy.
+    /// Promote a lazy on-disk FTS5 table into the in-memory representation for
+    /// operations that need materialized rows: full scans, auxiliary scoring,
+    /// rebuild, and writes.
     #[cfg(feature = "ext-fts5")]
     fn promote_lazy_fts5_table(&self, table_name: &str) -> Result<()> {
         let key = table_name.to_ascii_uppercase();
@@ -11288,9 +11317,7 @@ impl Connection {
                 return Ok(());
             }
         }
-        // Snapshot schema/alias to avoid holding their RefCell borrows across
-        // the content read (which re-borrows neither, but cloning is cheap and
-        // keeps the borrow discipline obviously safe).
+
         let schema_snapshot: Vec<TableSchema> = self.schema.borrow().clone();
         let alias_snapshot: HashMap<String, usize> = self.rowid_alias_columns.borrow().clone();
         let content = self.with_integrity_txn(|cx, txn| {
@@ -11334,6 +11361,7 @@ impl Connection {
                 &args,
             )
         })?;
+
         let mut instances = self.vtab_instances.borrow_mut();
         let instance = instances.get_mut(&key).ok_or_else(|| {
             FrankenError::Internal(format!("virtual table not found: {table_name}"))
@@ -11362,10 +11390,6 @@ impl Connection {
         }
 
         let key = src.table_name.to_ascii_uppercase();
-        // Auxiliary scoring (bm25/rank, snippet, highlight) needs the in-memory
-        // index; promote a lazy table before building its score snapshot so
-        // ranked/snippet results stay correct. (The lazy reader covers plain
-        // MATCH filtering + count; ranked/snippet remain on the in-memory path.)
         {
             let is_lazy = {
                 let instances = self.vtab_instances.borrow();
@@ -30879,24 +30903,12 @@ impl Connection {
                 .map(|table| table.root_page)
                 .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
         };
+        #[cfg(feature = "ext-fts5")]
+        if root_page == 0 && self.is_live_fts5_instance(table_name) {
+            return Ok(None);
+        }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let key = table_name.to_ascii_uppercase();
-        // A lazy on-disk FTS5 table must become in-memory before it is mutated
-        // (frankensqlite writes do not append on-disk segments), so promote it
-        // up front, outside the write transaction's borrows.
-        #[cfg(feature = "ext-fts5")]
-        {
-            let is_lazy = {
-                let instances = self.vtab_instances.borrow();
-                instances
-                    .get(&key)
-                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                    .is_some_and(Fts5Table::is_lazy_on_disk)
-            };
-            if is_lazy {
-                self.promote_lazy_fts5_table(table_name)?;
-            }
-        }
         let mut inserted_row_count = 0usize;
         let mut source_row_count = 0usize;
         let streamed = self.with_pager_write_txn(|cx, txn| {
@@ -31056,6 +31068,19 @@ impl Connection {
     ) -> Result<Vec<i64>> {
         let cx = self.op_cx()?;
         let key = table_name.to_ascii_uppercase();
+        #[cfg(feature = "ext-fts5")]
+        {
+            let is_lazy = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(Fts5Table::is_lazy_on_disk)
+            };
+            if is_lazy {
+                self.promote_lazy_fts5_table(table_name)?;
+            }
+        }
         let mut instances = self.vtab_instances.borrow_mut();
         let instance = instances.get_mut(&key).ok_or_else(|| {
             FrankenError::Internal(format!("virtual table not found: {table_name}"))
@@ -31086,6 +31111,11 @@ impl Connection {
             self.record_last_insert_rowid(rowid);
         }
         drop(instances);
+
+        #[cfg(feature = "ext-fts5")]
+        if self.persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids)? {
+            return Ok(inserted_rowids);
+        }
 
         self.persist_materialized_live_vtab_rows(
             table_name,
@@ -31174,6 +31204,39 @@ impl Connection {
                 .map(|table| table.root_page)
                 .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
         };
+        #[cfg(feature = "ext-fts5")]
+        {
+            let is_lazy = {
+                let instances = self.vtab_instances.borrow();
+                instances
+                    .get(&key)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                    .is_some_and(Fts5Table::is_lazy_on_disk)
+            };
+            if is_lazy {
+                self.promote_lazy_fts5_table(table_name)?;
+            }
+        }
+        #[cfg(feature = "ext-fts5")]
+        if root_page == 0 && self.is_live_fts5_instance(table_name) {
+            let cx = self.op_cx()?;
+            let deleted = {
+                let mut instances = self.vtab_instances.borrow_mut();
+                let instance = instances.get_mut(&key).ok_or_else(|| {
+                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
+                })?;
+                self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), &cx)?;
+                let mut count = 0usize;
+                for rowid in rowids {
+                    // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
+                    instance.update(&cx, &[SqliteValue::Integer(*rowid)])?;
+                    count = count.saturating_add(1);
+                }
+                count
+            };
+            self.persist_rootpage_zero_fts5_deleted_rowids(table_name, rowids)?;
+            return Ok(deleted);
+        }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
 
         // First route each rowid through the module's delete branch so the
@@ -31269,8 +31332,6 @@ impl Connection {
             return Ok(false);
         }
 
-        // Maintenance commands (rebuild/optimize/merge/integrity-check/...) run
-        // against the in-memory index; promote a lazy on-disk table first.
         {
             let key = insert.table.name.to_ascii_uppercase();
             let is_lazy = {
@@ -31304,6 +31365,8 @@ impl Connection {
                         fts5.insert_document(*rowid, columns);
                     }
                 }
+                drop(instances);
+                self.persist_rootpage_zero_fts5_shadow_rows(&insert.table.name)?;
             }
         }
 
@@ -31402,6 +31465,511 @@ impl Connection {
             }
             Ok(())
         })
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn persist_rootpage_zero_fts5_shadow_rows(&self, table_name: &str) -> Result<bool> {
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        if root_page != 0 {
+            return Ok(false);
+        }
+
+        let shadow_rows = {
+            let instances = self.vtab_instances.borrow();
+            let key = table_name.to_ascii_uppercase();
+            let instance = instances.get(&key).ok_or_else(|| {
+                FrankenError::Internal(format!("virtual table not found: {table_name}"))
+            })?;
+            let fts5 = instance
+                .as_any()
+                .downcast_ref::<Fts5Table>()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "rootpage=0 virtual table {table_name} is not an FTS5 instance"
+                    ))
+                })?;
+            fts5.encode_shadow_rows()
+        };
+
+        self.replace_storage_table_rows(
+            &format!("{table_name}_data"),
+            shadow_rows.data.into_iter().map(|row| {
+                (
+                    row.id,
+                    vec![
+                        SqliteValue::Integer(row.id),
+                        SqliteValue::Blob(Arc::from(row.block.into_boxed_slice())),
+                    ],
+                )
+            }),
+        )?;
+
+        self.replace_storage_table_rows(
+            &format!("{table_name}_idx"),
+            shadow_rows.idx.into_iter().enumerate().map(|(index, row)| {
+                (
+                    i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
+                    vec![
+                        SqliteValue::Integer(i64::from(row.segid)),
+                        SqliteValue::Blob(Arc::from(row.term.into_boxed_slice())),
+                        SqliteValue::Integer(i64::from(row.btree_page)),
+                    ],
+                )
+            }),
+        )?;
+
+        self.replace_storage_table_rows(
+            &format!("{table_name}_config"),
+            shadow_rows
+                .config
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    (
+                        i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
+                        vec![SqliteValue::Text(row.key.into()), row.value],
+                    )
+                }),
+        )?;
+
+        let content_name = format!("{table_name}_content");
+        if self.schema_table_exists(&content_name) {
+            self.replace_storage_table_rows(
+                &content_name,
+                shadow_rows.content.into_iter().map(|row| {
+                    let mut values = Vec::with_capacity(row.values.len() + 1);
+                    values.push(SqliteValue::Integer(row.rowid));
+                    values.extend(
+                        row.values
+                            .into_iter()
+                            .map(|value| SqliteValue::Text(value.into())),
+                    );
+                    (row.rowid, values)
+                }),
+            )?;
+        }
+
+        let docsize_name = format!("{table_name}_docsize");
+        if self.schema_table_exists(&docsize_name) {
+            self.replace_storage_table_rows(
+                &docsize_name,
+                shadow_rows.docsize.into_iter().map(|row| {
+                    let sz = encode_fts5_docsize_blob(&row.column_token_counts);
+                    (
+                        row.rowid,
+                        vec![
+                            SqliteValue::Integer(row.rowid),
+                            SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
+                        ],
+                    )
+                }),
+            )?;
+        }
+
+        Ok(true)
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn persist_rootpage_zero_fts5_insert_rows(
+        &self,
+        table_name: &str,
+        rows: &[LiveVtabInsertRow],
+        inserted_rowids: &[i64],
+    ) -> Result<bool> {
+        if rows.len() != inserted_rowids.len() {
+            return Err(FrankenError::Internal(format!(
+                "live FTS5 insert row count mismatch for {table_name}: {} rows vs {} rowids",
+                rows.len(),
+                inserted_rowids.len()
+            )));
+        }
+        let Some(layout) = self.rootpage_zero_fts5_persistence_layout(table_name)? else {
+            return Ok(false);
+        };
+        if !layout.has_internal_content_shadow {
+            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+        }
+
+        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)?;
+
+        let content_name = format!("{table_name}_content");
+        if self.schema_table_exists(&content_name) {
+            self.upsert_storage_table_rows(
+                &content_name,
+                rows.iter()
+                    .zip(inserted_rowids.iter().copied())
+                    .map(|(row, rowid)| {
+                        let texts = fts5_live_insert_row_text_values(row, layout.column_count);
+                        let mut values = Vec::with_capacity(texts.len() + 1);
+                        values.push(SqliteValue::Integer(rowid));
+                        values.extend(
+                            texts
+                                .into_iter()
+                                .map(|value| SqliteValue::Text(value.into())),
+                        );
+                        (rowid, values)
+                    }),
+            )?;
+        }
+
+        let docsize_name = format!("{table_name}_docsize");
+        if self.schema_table_exists(&docsize_name) {
+            let (indexed_columns, tokenizer) = {
+                let instances = self.vtab_instances.borrow();
+                let key = table_name.to_ascii_uppercase();
+                let instance = instances.get(&key).ok_or_else(|| {
+                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
+                })?;
+                let fts5 = instance
+                    .as_any()
+                    .downcast_ref::<Fts5Table>()
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "rootpage=0 virtual table {table_name} is not an FTS5 instance"
+                        ))
+                    })?;
+                (
+                    fts5.indexed_columns().to_vec(),
+                    fts5.create_tokenizer_instance(),
+                )
+            };
+            self.upsert_storage_table_rows(
+                &docsize_name,
+                rows.iter()
+                    .zip(inserted_rowids.iter().copied())
+                    .map(|(row, rowid)| {
+                        let texts = fts5_live_insert_row_text_values(row, layout.column_count);
+                        let counts = fts5_docsize_counts_for_values(
+                            &texts,
+                            &indexed_columns,
+                            tokenizer.as_ref(),
+                        );
+                        let sz = encode_fts5_docsize_blob(&counts);
+                        (
+                            rowid,
+                            vec![
+                                SqliteValue::Integer(rowid),
+                                SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
+                            ],
+                        )
+                    }),
+            )?;
+        }
+
+        Ok(true)
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn persist_rootpage_zero_fts5_deleted_rowids(
+        &self,
+        table_name: &str,
+        rowids: &[i64],
+    ) -> Result<bool> {
+        let Some(layout) = self.rootpage_zero_fts5_persistence_layout(table_name)? else {
+            return Ok(false);
+        };
+        if !layout.has_internal_content_shadow {
+            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+        }
+
+        self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)?;
+
+        let content_name = format!("{table_name}_content");
+        if self.schema_table_exists(&content_name) {
+            self.delete_storage_table_rowids(&content_name, rowids)?;
+        }
+        let docsize_name = format!("{table_name}_docsize");
+        if self.schema_table_exists(&docsize_name) {
+            self.delete_storage_table_rowids(&docsize_name, rowids)?;
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn rootpage_zero_fts5_persistence_layout(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<RootpageZeroFts5PersistenceLayout>> {
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        if root_page != 0 {
+            return Ok(None);
+        }
+        let has_internal_content_shadow =
+            self.rootpage_zero_fts5_has_internal_content_shadow(table_name);
+        let instances = self.vtab_instances.borrow();
+        let key = table_name.to_ascii_uppercase();
+        let instance = instances.get(&key).ok_or_else(|| {
+            FrankenError::Internal(format!("virtual table not found: {table_name}"))
+        })?;
+        let fts5 = instance
+            .as_any()
+            .downcast_ref::<Fts5Table>()
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "rootpage=0 virtual table {table_name} is not an FTS5 instance"
+                ))
+            })?;
+        Ok(Some(RootpageZeroFts5PersistenceLayout {
+            column_count: fts5.columns().len(),
+            has_internal_content_shadow,
+        }))
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn rootpage_zero_fts5_has_internal_content_shadow(&self, table_name: &str) -> bool {
+        let fallback_content_name = format!("{table_name}_content");
+        let fallback = || self.schema_table_exists(&fallback_content_name);
+        let ddl = self.original_ddl_sql.borrow();
+        let Some(create_sql) = ddl.get(&table_name.to_ascii_lowercase()) else {
+            return fallback();
+        };
+        let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
+        else {
+            return fallback();
+        };
+        if !create_stmt.module.eq_ignore_ascii_case("fts5") {
+            return false;
+        }
+        virtual_table_option_value(&create_stmt.args, "content").is_none()
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn reset_rootpage_zero_fts5_segment_metadata(
+        &self,
+        table_name: &str,
+        column_count: usize,
+    ) -> Result<()> {
+        self.replace_storage_table_rows(
+            &format!("{table_name}_data"),
+            empty_fts5_data_storage_rows(column_count),
+        )?;
+        self.replace_storage_table_rows(
+            &format!("{table_name}_idx"),
+            std::iter::empty::<(i64, Vec<SqliteValue>)>(),
+        )
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn is_live_fts5_instance(&self, table_name: &str) -> bool {
+        let key = table_name.to_ascii_uppercase();
+        self.vtab_instances
+            .borrow()
+            .get(&key)
+            .is_some_and(|instance| instance.as_any().downcast_ref::<Fts5Table>().is_some())
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn schema_table_exists(&self, table_name: &str) -> bool {
+        self.schema
+            .borrow()
+            .iter()
+            .any(|table| table.name.eq_ignore_ascii_case(table_name))
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn replace_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
+    {
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+        let rows = rows.into_iter().collect::<Vec<_>>();
+
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            let mut existing_rowids = Vec::new();
+            if cursor.first(cx)? {
+                loop {
+                    existing_rowids.push(cursor.rowid(cx)?);
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+            }
+            for rowid in existing_rowids {
+                if cursor.table_move_to(cx, rowid)?.is_found() {
+                    cursor.delete(cx)?;
+                }
+            }
+            for (rowid, values) in rows {
+                let record = serialize_record(&values);
+                cursor.table_insert(cx, rowid, &record)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn upsert_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
+    {
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+        let rows = rows.into_iter().collect::<Vec<_>>();
+
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            for (rowid, values) in rows {
+                if cursor.table_move_to(cx, rowid)?.is_found() {
+                    cursor.delete(cx)?;
+                }
+                let record = serialize_record(&values);
+                cursor.table_insert(cx, rowid, &record)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn delete_storage_table_rowids(&self, table_name: &str, rowids: &[i64]) -> Result<()> {
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            for rowid in rowids {
+                if cursor.table_move_to(cx, *rowid)?.is_found() {
+                    cursor.delete(cx)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn create_rootpage_zero_fts5_virtual_table(
+        &self,
+        table_name: &str,
+        col_infos: Vec<ColumnInfo>,
+        create_sql: &str,
+        instance: Box<dyn ErasedVtabInstance>,
+        args: &[String],
+    ) -> Result<()> {
+        self.preflight_fts5_shadow_table_names(table_name, args)?;
+        self.schema.borrow_mut().push(TableSchema {
+            name: table_name.to_owned(),
+            root_page: 0,
+            columns: col_infos.clone(),
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+        self.rebuild_schema_indices();
+        let replaced = self
+            .vtab_instances
+            .borrow_mut()
+            .insert(table_name.to_ascii_uppercase(), instance);
+        if replaced.is_some() {
+            return Err(FrankenError::Internal(format!(
+                "live virtual table registry already contains {table_name}"
+            )));
+        }
+        self.note_live_vtab_created(table_name);
+        self.insert_sqlite_master_row("table", table_name, table_name, 0, create_sql)?;
+        self.create_fts5_shadow_tables(table_name, args, &col_infos)?;
+        self.persist_rootpage_zero_fts5_shadow_rows(table_name)?;
+        self.increment_schema_cookie()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn preflight_fts5_shadow_table_names(&self, table_name: &str, args: &[String]) -> Result<()> {
+        let shadow_names = fts5_shadow_drop_names(table_name, args);
+        let schema = self.schema.borrow();
+        if let Some(existing) = shadow_names.iter().find(|shadow_name| {
+            schema
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case(shadow_name))
+        }) {
+            return Err(FrankenError::Internal(format!(
+                "table {existing} already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn create_fts5_shadow_tables(
+        &self,
+        table_name: &str,
+        args: &[String],
+        fts_columns: &[ColumnInfo],
+    ) -> Result<()> {
+        for table in fts5_shadow_table_defs(table_name, args, fts_columns) {
+            self.create_fts5_shadow_table(table)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    fn create_fts5_shadow_table(&self, table: Fts5ShadowTableDef) -> Result<()> {
+        let root_page = self.allocate_root_page()?;
+        self.db
+            .borrow_mut()
+            .create_table_at(root_page, table.columns.len());
+        if let Some(rowid_alias_idx) = table.columns.iter().position(|column| column.is_ipk) {
+            self.rowid_alias_columns
+                .borrow_mut()
+                .insert(table.name.to_ascii_lowercase(), rowid_alias_idx);
+        }
+        self.schema.borrow_mut().push(TableSchema {
+            name: table.name.clone(),
+            root_page,
+            columns: table.columns,
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+        self.rebuild_schema_indices();
+        self.insert_sqlite_master_row(
+            "table",
+            &table.name,
+            &table.name,
+            root_page,
+            &table.create_sql,
+        )
     }
 
     #[allow(clippy::unused_self)]
@@ -37636,6 +38204,18 @@ impl Connection {
                 },
             );
             drop(modules);
+            #[cfg(feature = "ext-fts5")]
+            if module_key.eq_ignore_ascii_case("FTS5")
+                && instance.as_any().downcast_ref::<Fts5Table>().is_some()
+            {
+                return self.create_rootpage_zero_fts5_virtual_table(
+                    &table_name,
+                    col_infos,
+                    &create.to_string(),
+                    instance,
+                    &create.args,
+                );
+            }
             let root_page = self.allocate_root_page()?;
             self.db
                 .borrow_mut()
@@ -54277,27 +54857,34 @@ impl Connection {
             #[cfg(feature = "ext-fts5")]
             {
                 let mut context = Fts5AuxContext::default();
-                // Build the (in-memory) auxiliary context only when it is needed:
-                // for rank/bm25/snippet/highlight scoring, OR for a join, where a
-                // MATCH predicate on a non-primary source is evaluated through the
-                // aux context rather than pushed into the primary scan. A
-                // single-table plain MATCH needs neither, so a lazily-reopened
-                // FTS5 table stays on its on-disk scan path instead of promoting.
-                let needs_aux = table_sources.len() > 1 || select_uses_fts5_auxiliary(select);
-                if needs_aux {
-                    for src in &table_sources {
-                        if src.local_table_binding().is_none() {
-                            continue;
-                        }
-                        let queries = collect_fts5_match_queries_for_source(
-                            where_clause.as_deref(),
-                            &src.table_name,
-                        );
-                        if let Some(aux_table) =
-                            self.build_fts5_aux_context_for_source(src, &queries)?
-                        {
-                            context.insert(src.table_name.clone(), aux_table);
-                        }
+                for (src_idx, src) in table_sources.iter().enumerate() {
+                    if src.local_table_binding().is_none() {
+                        continue;
+                    }
+                    let mut fts5_source_names = vec![src.table_name.as_str()];
+                    if let Some(alias) = src.alias.as_deref() {
+                        fts5_source_names.push(alias);
+                    }
+                    let needs_projected_fts5_aux_context = columns.iter().any(|column| {
+                        result_column_needs_fts5_aux_context(column, &fts5_source_names)
+                    }) || select.order_by.iter().any(
+                        |ordering| expr_needs_fts5_aux_context(&ordering.expr, &fts5_source_names),
+                    );
+                    let residual_where = live_vtab_scan_plans
+                        .get(src_idx)
+                        .and_then(Option::as_ref)
+                        .and_then(|plan| plan.residual_where.as_ref());
+                    let match_query_source = if needs_projected_fts5_aux_context {
+                        where_clause.as_deref()
+                    } else {
+                        residual_where
+                    };
+                    let queries =
+                        collect_fts5_match_queries_for_source(match_query_source, &src.table_name);
+                    if let Some(aux_table) =
+                        self.build_fts5_aux_context_for_source(src, &queries)?
+                    {
+                        context.insert(src.table_name.clone(), aux_table);
                     }
                 }
                 context
@@ -56585,8 +57172,8 @@ impl Connection {
     /// Read persisted FTS5 shadow rows for a rootpage=0 table. `_data` carries
     /// the real posting-list segments, `_docsize` carries ranking lengths, and
     /// content is resolved through the same stored/external/contentless rules
-    /// used by SQLite FTS5. `_idx`/`_config` are `WITHOUT ROWID`; `_idx` is only
-    /// an accelerator, so the segment reader remains correct when it is absent.
+    /// used by SQLite FTS5. `_idx` is only an accelerator, so the segment
+    /// reader remains correct when it is absent.
     #[cfg(feature = "ext-fts5")]
     #[allow(clippy::too_many_arguments)]
     fn read_fts5_shadow_rows_for_reload(
@@ -56699,13 +57286,17 @@ impl Connection {
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
-                // Lazy on-disk path: a `_data`-backed regular-content index is
-                // answered by point-reading its persisted segments on demand
-                // (MATCH / count), so DON'T load the whole `_data`/`_content`
-                // into memory here — just mark it lazy. Non-MATCH/ranked/mutating
-                // access promotes it to the in-memory path on first use.
-                if Self::fts5_table_is_lazy_capable(schema, table_name, &create_stmt.args) {
-                    let column_count = fts5.columns().len();
+                if Self::fts5_table_is_lazy_capable(schema, table_name, &create_stmt.args)
+                    && self.read_fts5_lazy_has_segments(
+                        cx,
+                        txn,
+                        page_size,
+                        reserved_per_page,
+                        schema,
+                        table_name,
+                    )?
+                {
+                    let column_count = parse_virtual_table_column_infos(&create_stmt.args).len();
                     let doc_count = self.read_fts5_lazy_doc_count(
                         cx,
                         txn,
@@ -56719,6 +57310,7 @@ impl Connection {
                     reloaded.insert(table_key, instance);
                     continue;
                 }
+
                 let rows = self.read_fts5_shadow_rows_for_reload(
                     cx,
                     txn,
@@ -60767,6 +61359,158 @@ fn frame_bound_contains_match(bound: &fsqlite_ast::FrameBound) -> bool {
     }
 }
 
+#[cfg(feature = "ext-fts5")]
+fn result_column_needs_fts5_aux_context(
+    column: &ResultColumn,
+    fts5_rank_table_names: &[&str],
+) -> bool {
+    match column {
+        ResultColumn::Expr { expr, .. } => expr_needs_fts5_aux_context(expr, fts5_rank_table_names),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }
+}
+
+#[cfg(feature = "ext-fts5")]
+fn expr_needs_fts5_aux_context(expr: &Expr, fts5_rank_table_names: &[&str]) -> bool {
+    match expr {
+        Expr::Column(col_ref, _) => is_fts5_rank_column_reference(col_ref, fts5_rank_table_names),
+        Expr::FunctionCall {
+            name,
+            args,
+            filter,
+            over,
+            ..
+        } => {
+            let function_targets_source = is_fts5_aux_function_name(name)
+                && fts5_aux_function_targets_source(args, fts5_rank_table_names);
+            let args_need_context = match args {
+                FunctionArgs::List(exprs) => exprs
+                    .iter()
+                    .any(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names)),
+                FunctionArgs::Star => false,
+            };
+            let over_needs_context = over.as_ref().is_some_and(|window| {
+                window
+                    .partition_by
+                    .iter()
+                    .any(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names))
+                    || window.order_by.iter().any(|ordering| {
+                        expr_needs_fts5_aux_context(&ordering.expr, fts5_rank_table_names)
+                    })
+                    || match &window.frame {
+                        Some(frame) => {
+                            frame_bound_needs_fts5_aux_context(&frame.start, fts5_rank_table_names)
+                                || frame.end.as_ref().is_some_and(|bound| {
+                                    frame_bound_needs_fts5_aux_context(bound, fts5_rank_table_names)
+                                })
+                        }
+                        None => false,
+                    }
+            });
+            function_targets_source
+                || args_need_context
+                || filter
+                    .as_deref()
+                    .is_some_and(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names))
+                || over_needs_context
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_needs_fts5_aux_context(expr, fts5_rank_table_names)
+                || expr_needs_fts5_aux_context(pattern, fts5_rank_table_names)
+                || escape
+                    .as_deref()
+                    .is_some_and(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names))
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_needs_fts5_aux_context(left, fts5_rank_table_names)
+                || expr_needs_fts5_aux_context(right, fts5_rank_table_names)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_needs_fts5_aux_context(expr, fts5_rank_table_names),
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_needs_fts5_aux_context(expr, fts5_rank_table_names)
+                || expr_needs_fts5_aux_context(path, fts5_rank_table_names)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_needs_fts5_aux_context(expr, fts5_rank_table_names)
+                || expr_needs_fts5_aux_context(low, fts5_rank_table_names)
+                || expr_needs_fts5_aux_context(high, fts5_rank_table_names)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_needs_fts5_aux_context(expr, fts5_rank_table_names)
+                || match set {
+                    InSet::List(exprs) => exprs
+                        .iter()
+                        .any(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names)),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names))
+                || whens.iter().any(|(when, then)| {
+                    expr_needs_fts5_aux_context(when, fts5_rank_table_names)
+                        || expr_needs_fts5_aux_context(then, fts5_rank_table_names)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names))
+        }
+        Expr::RowValue(values, _) => values
+            .iter()
+            .any(|expr| expr_needs_fts5_aux_context(expr, fts5_rank_table_names)),
+        Expr::Literal(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Raise { .. } => false,
+    }
+}
+
+#[cfg(feature = "ext-fts5")]
+fn fts5_aux_function_targets_source(args: &FunctionArgs, table_names: &[&str]) -> bool {
+    let FunctionArgs::List(exprs) = args else {
+        return false;
+    };
+    let Some(Expr::Column(col_ref, _)) = exprs.first() else {
+        return false;
+    };
+    col_ref.table.is_none()
+        && table_names
+            .iter()
+            .any(|table_name| col_ref.column.eq_ignore_ascii_case(table_name))
+}
+
+#[cfg(feature = "ext-fts5")]
+fn frame_bound_needs_fts5_aux_context(
+    bound: &fsqlite_ast::FrameBound,
+    fts5_rank_table_names: &[&str],
+) -> bool {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            expr_needs_fts5_aux_context(expr, fts5_rank_table_names)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => false,
+    }
+}
+
 /// Parse virtual-table column definitions from module args.
 fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
     let mut columns = parse_declared_virtual_table_column_infos(args);
@@ -60905,6 +61649,73 @@ fn fts5_maintenance_insert_command(
         }
         _ => None,
     }
+}
+
+#[cfg(feature = "ext-fts5")]
+fn encode_fts5_docsize_blob(column_token_counts: &[u32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(column_token_counts.len());
+    let mut scratch = [0; 9];
+    for count in column_token_counts {
+        let len = write_varint(&mut scratch, u64::from(*count));
+        blob.extend_from_slice(&scratch[..len]);
+    }
+    blob
+}
+
+#[cfg(feature = "ext-fts5")]
+fn empty_fts5_data_storage_rows(column_count: usize) -> Vec<(i64, Vec<SqliteValue>)> {
+    let averages = Fts5AveragesRecord::new(0, vec![0; column_count]).encode();
+    let structure = Fts5StructureRecord::empty_legacy(0).encode();
+    vec![
+        (
+            FTS5_AVERAGES_ROWID,
+            vec![
+                SqliteValue::Integer(FTS5_AVERAGES_ROWID),
+                SqliteValue::Blob(Arc::from(averages.into_boxed_slice())),
+            ],
+        ),
+        (
+            FTS5_STRUCTURE_ROWID,
+            vec![
+                SqliteValue::Integer(FTS5_STRUCTURE_ROWID),
+                SqliteValue::Blob(Arc::from(structure.into_boxed_slice())),
+            ],
+        ),
+    ]
+}
+
+#[cfg(feature = "ext-fts5")]
+fn fts5_live_insert_row_text_values(row: &LiveVtabInsertRow, column_count: usize) -> Vec<String> {
+    let mut values = row
+        .values
+        .iter()
+        .take(column_count)
+        .map(SqliteValue::to_text)
+        .collect::<Vec<_>>();
+    values.resize_with(column_count, String::new);
+    values
+}
+
+#[cfg(feature = "ext-fts5")]
+fn fts5_docsize_counts_for_values(
+    values: &[String],
+    indexed_columns: &[bool],
+    tokenizer: &dyn Fts5Tokenizer,
+) -> Vec<u32> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if !indexed_columns.get(idx).copied().unwrap_or(true) {
+                return 0;
+            }
+            let mut count = 0_u32;
+            tokenizer.visit_tokens(value, &mut |_term, _start, _end, _colocated| {
+                count = count.saturating_add(1);
+            });
+            count
+        })
+        .collect()
 }
 
 fn canonical_sqlite_schema_name(name: &str) -> Option<&'static str> {
@@ -77520,6 +78331,105 @@ fn fts5_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
     names
 }
 
+#[cfg(feature = "ext-fts5")]
+fn fts5_shadow_table_defs(
+    table_name: &str,
+    args: &[String],
+    fts_columns: &[ColumnInfo],
+) -> Vec<Fts5ShadowTableDef> {
+    let data_name = format!("{table_name}_data");
+    let idx_name = format!("{table_name}_idx");
+    let config_name = format!("{table_name}_config");
+    let mut defs = vec![
+        Fts5ShadowTableDef {
+            create_sql: format!(
+                "CREATE TABLE {}(id INTEGER PRIMARY KEY, block BLOB)",
+                quote_identifier(&data_name)
+            ),
+            name: data_name,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("block", 'A', false),
+            ],
+        },
+        Fts5ShadowTableDef {
+            create_sql: format!(
+                "CREATE TABLE {}(segid INTEGER, term BLOB, pgno INTEGER)",
+                quote_identifier(&idx_name)
+            ),
+            name: idx_name,
+            columns: vec![
+                ColumnInfo::basic("segid", 'D', false),
+                ColumnInfo::basic("term", 'A', false),
+                ColumnInfo::basic("pgno", 'D', false),
+            ],
+        },
+        Fts5ShadowTableDef {
+            create_sql: format!(
+                "CREATE TABLE {}(k TEXT PRIMARY KEY, v)",
+                quote_identifier(&config_name)
+            ),
+            name: config_name,
+            columns: vec![
+                ColumnInfo::basic("k", 'B', false),
+                ColumnInfo::basic("v", 'C', false),
+            ],
+        },
+    ];
+
+    if virtual_table_option_value(args, "content").is_none() {
+        let content_name = format!("{table_name}_content");
+        let mut columns = Vec::with_capacity(fts_columns.len() + 1);
+        columns.push(ColumnInfo::basic("id", 'D', true));
+        columns.extend(
+            fts_columns
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| ColumnInfo::basic(format!("c{idx}"), 'B', false)),
+        );
+        let content_columns = (0..fts_columns.len())
+            .map(|idx| format!("c{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let create_sql = if content_columns.is_empty() {
+            format!(
+                "CREATE TABLE {}(id INTEGER PRIMARY KEY)",
+                quote_identifier(&content_name)
+            )
+        } else {
+            format!(
+                "CREATE TABLE {}(id INTEGER PRIMARY KEY, {content_columns})",
+                quote_identifier(&content_name)
+            )
+        };
+        defs.push(Fts5ShadowTableDef {
+            create_sql,
+            name: content_name,
+            columns,
+        });
+    }
+
+    if !matches!(
+        virtual_table_option_value(args, "columnsize").as_deref(),
+        Some("0")
+    ) {
+        let docsize_name = format!("{table_name}_docsize");
+        defs.push(Fts5ShadowTableDef {
+            create_sql: format!(
+                "CREATE TABLE {}(id INTEGER PRIMARY KEY, sz BLOB)",
+                quote_identifier(&docsize_name)
+            ),
+            name: docsize_name,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("sz", 'A', false),
+            ],
+        });
+    }
+
+    defs
+}
+
 fn fts4_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
     let mut names = Vec::new();
     if virtual_table_option_value(args, "content").is_none() {
@@ -80371,6 +81281,21 @@ struct LiveVtabInsertRow {
     values: Vec<SqliteValue>,
 }
 
+#[cfg(feature = "ext-fts5")]
+#[derive(Debug, Clone)]
+struct Fts5ShadowTableDef {
+    name: String,
+    columns: Vec<ColumnInfo>,
+    create_sql: String,
+}
+
+#[cfg(feature = "ext-fts5")]
+#[derive(Debug, Clone, Copy)]
+struct RootpageZeroFts5PersistenceLayout {
+    column_count: usize,
+    has_internal_content_shadow: bool,
+}
+
 #[derive(Debug, Clone)]
 struct LiveVtabInsertLayout {
     default_sqls: Vec<Option<String>>,
@@ -81173,135 +82098,6 @@ fn is_fts5_table_label_match(expr: &Expr, table_name: &str) -> bool {
 }
 
 #[cfg(feature = "ext-fts5")]
-/// Whether `expr` references an FTS5 auxiliary feature — the special `rank`
-/// column or a `bm25` / `snippet` / `highlight` / `offsets` call — which require
-/// the in-memory auxiliary scoring context. Plain MATCH filtering does not, so
-/// gating aux construction on this keeps a lazily-reopened index on its on-disk
-/// scan path instead of promoting it.
-#[cfg(feature = "ext-fts5")]
-fn expr_uses_fts5_auxiliary(expr: &Expr) -> bool {
-    fn is_aux_fn(name: &str) -> bool {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "bm25" | "snippet" | "highlight" | "offsets"
-        )
-    }
-    match expr {
-        Expr::Column(col_ref, _) => col_ref.column.eq_ignore_ascii_case("rank"),
-        Expr::FunctionCall {
-            name,
-            args,
-            filter,
-            over,
-            ..
-        } => {
-            if is_aux_fn(name) {
-                return true;
-            }
-            let args_aux = match args {
-                FunctionArgs::List(exprs) => exprs.iter().any(expr_uses_fts5_auxiliary),
-                FunctionArgs::Star => false,
-            };
-            let over_aux = over.as_ref().is_some_and(|window| {
-                window.partition_by.iter().any(expr_uses_fts5_auxiliary)
-                    || window
-                        .order_by
-                        .iter()
-                        .any(|ordering| expr_uses_fts5_auxiliary(&ordering.expr))
-            });
-            args_aux || filter.as_deref().is_some_and(expr_uses_fts5_auxiliary) || over_aux
-        }
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_uses_fts5_auxiliary(expr)
-                || expr_uses_fts5_auxiliary(pattern)
-                || escape.as_deref().is_some_and(expr_uses_fts5_auxiliary)
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            expr_uses_fts5_auxiliary(left) || expr_uses_fts5_auxiliary(right)
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. }
-        | Expr::IsNull { expr, .. } => expr_uses_fts5_auxiliary(expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            expr_uses_fts5_auxiliary(expr)
-                || expr_uses_fts5_auxiliary(low)
-                || expr_uses_fts5_auxiliary(high)
-        }
-        Expr::In { expr, set, .. } => {
-            expr_uses_fts5_auxiliary(expr)
-                || match set {
-                    InSet::List(exprs) => exprs.iter().any(expr_uses_fts5_auxiliary),
-                    InSet::Subquery(query) => select_uses_fts5_auxiliary(query),
-                    InSet::Table(_) => false,
-                }
-        }
-        Expr::Case {
-            operand,
-            whens,
-            else_expr,
-            ..
-        } => {
-            operand.as_deref().is_some_and(expr_uses_fts5_auxiliary)
-                || whens
-                    .iter()
-                    .any(|(w, t)| expr_uses_fts5_auxiliary(w) || expr_uses_fts5_auxiliary(t))
-                || else_expr.as_deref().is_some_and(expr_uses_fts5_auxiliary)
-        }
-        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
-            select_uses_fts5_auxiliary(subquery)
-        }
-        Expr::JsonAccess { expr, path, .. } => {
-            expr_uses_fts5_auxiliary(expr) || expr_uses_fts5_auxiliary(path)
-        }
-        Expr::RowValue(values, _) => values.iter().any(expr_uses_fts5_auxiliary),
-        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
-    }
-}
-
-/// Whether any expression in `select` (projection, ORDER BY, GROUP BY, HAVING,
-/// or WHERE) references an FTS5 auxiliary feature (see
-/// [`expr_uses_fts5_auxiliary`]).
-#[cfg(feature = "ext-fts5")]
-fn select_uses_fts5_auxiliary(select: &SelectStatement) -> bool {
-    if select
-        .order_by
-        .iter()
-        .any(|ordering| expr_uses_fts5_auxiliary(&ordering.expr))
-    {
-        return true;
-    }
-    match &select.body.select {
-        SelectCore::Values(rows) => rows
-            .iter()
-            .flat_map(|row| row.iter())
-            .any(expr_uses_fts5_auxiliary),
-        SelectCore::Select {
-            columns,
-            where_clause,
-            group_by,
-            having,
-            ..
-        } => {
-            columns.iter().any(|col| match col {
-                ResultColumn::Expr { expr, .. } => expr_uses_fts5_auxiliary(expr),
-                ResultColumn::Star | ResultColumn::TableStar(_) => false,
-            }) || where_clause
-                .as_ref()
-                .is_some_and(|expr| expr_uses_fts5_auxiliary(expr))
-                || group_by.iter().any(expr_uses_fts5_auxiliary)
-                || having.as_deref().is_some_and(expr_uses_fts5_auxiliary)
-        }
-    }
-}
-
 fn collect_fts5_match_queries_for_source(
     where_clause: Option<&Expr>,
     table_name: &str,
@@ -120860,6 +121656,556 @@ SELECT x FROM t;
         );
     }
 
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_reopen_stock_fts5_regular_content_stays_lazy_for_match_and_count() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stock_fts5_lazy_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs USING fts5(body);
+                    INSERT INTO docs(rowid, body) VALUES
+                        (1, 'rust alpha beta'),
+                        (2, 'rust gamma delta rust'),
+                        (3, 'epsilon zeta'),
+                        (4, 'rust programming language'),
+                        (5, 'gamma delta epsilon');
+                    INSERT INTO docs(docs) VALUES('optimize');
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should reconnect as an FTS5 table");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "stored-content FTS5 should reopen lazily instead of loading all _data rows"
+            );
+        }
+
+        let matched = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'rust';")
+            .unwrap();
+        let mut matched_ids = matched
+            .iter()
+            .map(|row| row.values()[0].clone())
+            .collect::<Vec<_>>();
+        matched_ids.sort_by_key(SqliteValue::to_integer);
+        assert_eq!(
+            matched_ids,
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(4),
+            ]
+        );
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should still be an FTS5 table");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "plain MATCH should stay on the lazy segment-reader path"
+            );
+        }
+
+        let count = conn.query("SELECT COUNT(*) FROM docs;").unwrap();
+        assert_eq!(count[0].values()[0], SqliteValue::Integer(5));
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should still be an FTS5 table");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "COUNT(*) should use cached averages without materializing the index"
+            );
+        }
+
+        let all = conn
+            .query("SELECT rowid FROM docs ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(4),
+                SqliteValue::Integer(5),
+            ]
+        );
+        let instances = conn.vtab_instances.borrow();
+        let fts5 = instances
+            .get("DOCS")
+            .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            .expect("docs should still be an FTS5 table");
+        assert!(
+            !fts5.is_lazy_on_disk(),
+            "full scans should promote because they need the materialized row set"
+        );
+    }
+
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_fts5_lazy_public_paths_stay_correct_vs_stock() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_lazy_public_paths.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let docs: &[(i64, &str)] = &[
+            (1, "rust alpha beta"),
+            (2, "rust gamma delta rust"),
+            (3, "epsilon zeta"),
+            (4, "rust programming language"),
+            (5, "gamma delta epsilon"),
+        ];
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+                .unwrap();
+            for (rowid, body) in docs {
+                sqlite
+                    .execute(
+                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
+                        rusqlite::params![rowid, body],
+                    )
+                    .unwrap();
+            }
+            sqlite
+                .execute("INSERT INTO docs(docs) VALUES('optimize')", [])
+                .unwrap();
+            sqlite.close().unwrap();
+        }
+
+        let stock_match = |q: &str| -> Vec<i64> {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = sqlite
+                .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
+                .unwrap();
+            let mut ids: Vec<i64> = stmt
+                .query_map(rusqlite::params![q], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .map(std::result::Result::unwrap)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        let frank_match_set = |conn: &Connection, sql: &str| -> Vec<i64> {
+            let rows = conn
+                .query(sql)
+                .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
+            let mut ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+
+        let conn = Connection::open(&db_str).unwrap();
+
+        for q in ["rust", "gamma", "rust AND gamma", "rust*", "epsilon"] {
+            assert_eq!(
+                frank_match_set(
+                    &conn,
+                    &format!("SELECT rowid FROM docs WHERE docs MATCH '{q}'")
+                ),
+                stock_match(q),
+                "lazy MATCH `{q}`"
+            );
+        }
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should be an FTS5 table");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "plain MATCH queries must stay on the lazy segment-reader path"
+            );
+        }
+
+        let count = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+        assert_eq!(
+            count[0].values()[0],
+            SqliteValue::Integer(5),
+            "lazy COUNT(*) should equal the averages row count"
+        );
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should be an FTS5 table");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "COUNT(*) should not promote a lazy FTS5 table"
+            );
+        }
+
+        assert_eq!(
+            frank_match_set(
+                &conn,
+                "SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rank"
+            ),
+            stock_match("rust"),
+            "ranked MATCH set must equal stock"
+        );
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs should be an FTS5 table");
+            assert!(
+                !fts5.is_lazy_on_disk(),
+                "ranked MATCH should promote because rank needs auxiliary scoring context"
+            );
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let all = conn.query("SELECT rowid FROM docs ORDER BY rowid").unwrap();
+        let all_ids: Vec<i64> = all
+            .iter()
+            .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
+            .collect();
+        assert_eq!(
+            all_ids,
+            vec![1, 2, 3, 4, 5],
+            "full scan should return every row"
+        );
+        let instances = conn.vtab_instances.borrow();
+        let fts5 = instances
+            .get("DOCS")
+            .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+            .expect("docs should be an FTS5 table");
+        assert!(
+            !fts5.is_lazy_on_disk(),
+            "full scan should promote because it needs materialized rows"
+        );
+    }
+
+    #[test]
+    fn test_fsqlite_created_fts5_persists_shadow_tables_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fsqlite_created_fts5_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE skills_fts USING fts5(name, description);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO skills_fts(rowid, name, description) VALUES \
+                 (1, 'Rust skill', 'persistent shadow tables survive reopen');",
+            )
+            .unwrap();
+            let catalog_rows = conn
+                .query(
+                    "SELECT name, rootpage FROM sqlite_master \
+                     WHERE name = 'skills_fts' OR name LIKE 'skills_fts_%' \
+                     ORDER BY name;",
+                )
+                .unwrap();
+            let catalog = catalog_rows
+                .iter()
+                .map(|row| match row.values() {
+                    [SqliteValue::Text(name), SqliteValue::Integer(rootpage)] => {
+                        (name.to_string(), *rootpage)
+                    }
+                    values => panic!("unexpected sqlite_master row shape: {values:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                catalog
+                    .iter()
+                    .any(|(name, rootpage)| name == "skills_fts" && *rootpage == 0),
+                "FrankenSQLite-created FTS5 roots must be stock-style rootpage=0: {catalog:?}"
+            );
+            for shadow_name in [
+                "skills_fts_config",
+                "skills_fts_content",
+                "skills_fts_data",
+                "skills_fts_docsize",
+                "skills_fts_idx",
+            ] {
+                assert!(
+                    catalog
+                        .iter()
+                        .any(|(name, rootpage)| name == shadow_name && *rootpage > 0),
+                    "missing persisted shadow table {shadow_name}: {catalog:?}"
+                );
+            }
+
+            let rows = conn
+                .query(
+                    "SELECT rowid, name, description FROM skills_fts \
+                     WHERE skills_fts MATCH 'persistent' \
+                     ORDER BY rowid;",
+                )
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("Rust skill".into()),
+                    SqliteValue::Text("persistent shadow tables survive reopen".into()),
+                ]]
+            );
+            let config_rows = conn
+                .query("SELECT k, v FROM skills_fts_config WHERE k = 'version';")
+                .unwrap();
+            assert_eq!(
+                config_rows
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Text("version".into()),
+                    SqliteValue::Integer(4),
+                ]]
+            );
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            assert!(
+                conn.has_live_vtab_instance("skills_fts"),
+                "FrankenSQLite-created rootpage=0 FTS5 table should reconnect as a live vtab"
+            );
+            let rows = conn
+                .query(
+                    "SELECT rowid, name, description FROM skills_fts \
+                     WHERE skills_fts MATCH 'persistent' \
+                     ORDER BY rowid;",
+                )
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("Rust skill".into()),
+                    SqliteValue::Text("persistent shadow tables survive reopen".into()),
+                ]]
+            );
+
+            conn.execute(
+                "INSERT INTO skills_fts(rowid, name, description) VALUES \
+                 (2, 'Meta skill', 'fresh connection mutations also persist');",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let rows = conn
+            .query(
+                "SELECT rowid, name FROM skills_fts \
+                 WHERE skills_fts MATCH 'fresh' \
+                 ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("Meta skill".into()),
+            ]]
+        );
+
+        let integrity_rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(integrity_rows.len(), 1);
+        assert_eq!(
+            integrity_rows[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+    }
+
+    #[test]
+    fn test_fsqlite_created_contentless_fts5_persists_segments_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fsqlite_contentless_fts5_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(body, content='');")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO docs_fts(rowid, body) VALUES \
+                 (1, 'alpha rust rust beta'), \
+                 (2, 'gamma rust delta');",
+            )
+            .unwrap();
+
+            let data_ids = conn
+                .query("SELECT id FROM docs_fts_data ORDER BY id;")
+                .unwrap();
+            assert!(
+                data_ids.iter().any(|row| {
+                    matches!(
+                        row.values().first(),
+                        Some(SqliteValue::Integer(id))
+                            if *id != FTS5_AVERAGES_ROWID && *id != FTS5_STRUCTURE_ROWID
+                    )
+                }),
+                "contentless FTS5 must persist posting-list segment rows, not just metadata"
+            );
+
+            let rows = conn
+                .query(
+                    "SELECT rowid FROM docs_fts \
+                     WHERE docs_fts MATCH 'rust' \
+                     ORDER BY rowid;",
+                )
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+            );
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let rows = conn
+            .query(
+                "SELECT rowid FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2)]
+        );
+
+        let count_rows = conn.query("SELECT COUNT(*) FROM docs_fts;").unwrap();
+        assert_eq!(
+            count_rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "reopened contentless FTS5 COUNT(*) must use persisted row-count metadata"
+        );
+
+        let full_scan_rows = conn
+            .query("SELECT rowid, body FROM docs_fts ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            full_scan_rows
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Null],
+                vec![SqliteValue::Integer(2), SqliteValue::Null],
+            ],
+            "reopened contentless FTS5 full scans must preserve rowids and return NULL content"
+        );
+    }
+
+    #[test]
+    fn test_fsqlite_created_external_content_fts5_reopen_uses_persisted_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fsqlite_external_content_fts5_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO docs(id, title, body) VALUES \
+                 (1, 'Indexed', 'target rust row'), \
+                 (2, 'Not indexed', 'target rust should not match');",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE docs_fts USING \
+                 fts5(title, body, content=docs, content_rowid=id);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO docs_fts(rowid, title, body) \
+                 VALUES (1, 'Indexed', 'target rust row');",
+            )
+            .unwrap();
+
+            let data_ids = conn
+                .query("SELECT id FROM docs_fts_data ORDER BY id;")
+                .unwrap();
+            assert!(
+                data_ids.iter().any(|row| {
+                    matches!(
+                        row.values().first(),
+                        Some(SqliteValue::Integer(id))
+                            if *id != FTS5_AVERAGES_ROWID && *id != FTS5_STRUCTURE_ROWID
+                    )
+                }),
+                "external-content FTS5 must persist the inserted posting-list, not rebuild every content row"
+            );
+
+            let rows = conn
+                .query(
+                    "SELECT rowid FROM docs_fts \
+                     WHERE docs_fts MATCH 'rust' \
+                     ORDER BY rowid;",
+                )
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![SqliteValue::Integer(1)]
+            );
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let rows = conn
+            .query(
+                "SELECT rowid FROM docs_fts \
+                 WHERE docs_fts MATCH 'rust' \
+                 ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1)]
+        );
+    }
+
     #[test]
     fn test_reopen_stock_fts5_rootpage_zero_connects_live_match_runtime() {
         let dir = tempfile::tempdir().unwrap();
@@ -121648,277 +122994,6 @@ fts5(title, body, content=docs, content_rowid=id)'
             Ok(())
         })
         .unwrap();
-    }
-
-    /// bd-fts5-lazy-shadow-reads-itcc4.4: pins the architectural discriminator
-    /// for lazy on-disk reads. frankensqlite's OWN FTS5 write path stores
-    /// `_content` plus an in-memory inverted index (rebuilt from `_content` on
-    /// reload); it does NOT persist stock SQLite's `_data` posting segments. The
-    /// lazy point-reader therefore applies to `_data`-backed indexes (stock-built
-    /// / cass), while frank-built tables keep using the in-memory path. If frank
-    /// later persists `_data` segments on write, this tripwire fires so the scan
-    /// wiring can switch those tables to lazy reads too.
-    #[cfg(all(unix, feature = "ext-fts5"))]
-    #[test]
-    fn test_fts5_frank_built_index_has_no_data_segments() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_frank_no_data.db");
-        let db_str = db_path.to_string_lossy().into_owned();
-
-        {
-            let conn = Connection::open(&db_str).unwrap();
-            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
-                .unwrap();
-            conn.execute("INSERT INTO docs(rowid, body) VALUES (1, 'rust alpha')")
-                .unwrap();
-            conn.execute("INSERT INTO docs(rowid, body) VALUES (2, 'rust beta')")
-                .unwrap();
-            conn.close().unwrap();
-        }
-
-        let conn = Connection::open(&db_str).unwrap();
-        let has_table = |name: &str| -> bool {
-            conn.query(&format!(
-                "SELECT rootpage FROM sqlite_master WHERE name = '{name}';"
-            ))
-            .ok()
-            .and_then(|rows| {
-                rows.first()
-                    .and_then(|row| row.values().first().map(SqliteValue::to_integer))
-            })
-            .is_some_and(|root| root > 0)
-        };
-
-        // MATCH still works through the in-memory path...
-        let rows = conn
-            .query("SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rowid")
-            .unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "frank in-memory FTS5 MATCH should find both docs"
-        );
-
-        // ...but there are no on-disk `_data` posting segments (the lazy reader's
-        // input); frank rebuilds the index from `_content` instead.
-        assert!(
-            !has_table("docs_data"),
-            "frank-built FTS5 unexpectedly has a docs_data segment table — \
-             lazy scan wiring should now cover frank-built tables (update this test)"
-        );
-    }
-
-    /// bd-fts5-lazy-shadow-reads-itcc4.4: end-to-end regression guard for the
-    /// PUBLIC query path. A stock-SQLite FTS5 index, reopened by a frankensqlite
-    /// `Connection`, must answer `SELECT rowid FROM t WHERE t MATCH ?` through
-    /// the real VDBE/scan pipeline with the same documents stock SQLite returns.
-    /// This pins the behaviour the lazy on-disk scan wiring must preserve.
-    #[cfg(all(unix, feature = "ext-fts5"))]
-    #[test]
-    fn test_fts5_public_match_query_on_reopened_index_matches_stock() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_public_match.db");
-        let db_str = db_path.to_string_lossy().into_owned();
-
-        let docs: &[(i64, &str)] = &[
-            (1, "rust alpha beta"),
-            (2, "rust gamma delta"),
-            (3, "epsilon zeta eta"),
-            (4, "rust programming"),
-            (5, "gamma delta epsilon"),
-        ];
-        {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            sqlite
-                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
-                .unwrap();
-            for (rowid, body) in docs {
-                sqlite
-                    .execute(
-                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
-                        rusqlite::params![rowid, body],
-                    )
-                    .unwrap();
-            }
-            sqlite.close().unwrap();
-        }
-
-        let match_queries: &[&str] = &["rust", "gamma", "rust AND gamma", "epsilon"];
-        let stock: Vec<(String, Vec<i64>)> = {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            let captured = match_queries
-                .iter()
-                .map(|q| {
-                    let mut stmt = sqlite
-                        .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
-                        .unwrap();
-                    let ids: Vec<i64> = stmt
-                        .query_map(rusqlite::params![q], |row| row.get::<_, i64>(0))
-                        .unwrap()
-                        .map(std::result::Result::unwrap)
-                        .collect();
-                    ((*q).to_owned(), ids)
-                })
-                .collect();
-            sqlite.close().unwrap();
-            captured
-        };
-
-        let conn = Connection::open(&db_str).unwrap();
-        for (q, expected) in &stock {
-            let rows = conn
-                .query(&format!(
-                    "SELECT rowid FROM docs WHERE docs MATCH '{q}' ORDER BY rowid"
-                ))
-                .unwrap_or_else(|e| panic!("frank MATCH `{q}` failed: {e}"));
-            let mut got: Vec<i64> = rows
-                .iter()
-                .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
-                .collect();
-            got.sort_unstable();
-            got.dedup();
-            let mut want = expected.clone();
-            want.sort_unstable();
-            want.dedup();
-            assert_eq!(
-                got, want,
-                "public MATCH `{q}`: frank must equal stock (frank={got:?}, stock={want:?})"
-            );
-        }
-    }
-
-    /// bd-fts5-lazy-shadow-reads-itcc4.4: exercise the public READ paths of a
-    /// lazily reopened (`_data`-backed) FTS5 index through `Connection` and
-    /// confirm each stays correct vs stock SQLite: lazy MATCH (answered from the
-    /// persisted segments), COUNT(*) (cached averages, no scan), ranked MATCH
-    /// (promotes for auxiliary scoring), and full-table scan (promotes). Writing
-    /// to a stock `_data`-backed table is a separate, pre-existing limitation
-    /// (frankensqlite does not maintain on-disk `_data` segments), so it is not
-    /// covered here; the lazy reopen path targets read-mostly indexes (cass).
-    #[cfg(all(unix, feature = "ext-fts5"))]
-    #[test]
-    fn test_fts5_lazy_public_paths_stay_correct_vs_stock() {
-        let _serial = super::fsqlite_core_test_serializer();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("fts5_lazy_public_paths.db");
-        let db_str = db_path.to_string_lossy().into_owned();
-
-        let docs: &[(i64, &str)] = &[
-            (1, "rust alpha beta"),
-            (2, "rust gamma delta rust"),
-            (3, "epsilon zeta"),
-            (4, "rust programming language"),
-            (5, "gamma delta epsilon"),
-        ];
-        {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            sqlite
-                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
-                .unwrap();
-            for (rowid, body) in docs {
-                sqlite
-                    .execute(
-                        "INSERT INTO docs(rowid, body) VALUES (?1, ?2)",
-                        rusqlite::params![rowid, body],
-                    )
-                    .unwrap();
-            }
-            sqlite
-                .execute("INSERT INTO docs(docs) VALUES('optimize')", [])
-                .unwrap();
-            sqlite.close().unwrap();
-        }
-
-        let stock_match = |q: &str| -> Vec<i64> {
-            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
-            let mut stmt = sqlite
-                .prepare("SELECT rowid FROM docs WHERE docs MATCH ?1 ORDER BY rowid")
-                .unwrap();
-            let mut ids: Vec<i64> = stmt
-                .query_map(rusqlite::params![q], |row| row.get::<_, i64>(0))
-                .unwrap()
-                .map(std::result::Result::unwrap)
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        };
-
-        let frank_match_set = |conn: &Connection, sql: &str| -> Vec<i64> {
-            let rows = conn
-                .query(sql)
-                .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
-            let mut ids: Vec<i64> = rows
-                .iter()
-                .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        };
-
-        let conn = Connection::open(&db_str).unwrap();
-
-        // Lazy MATCH (no ranking) — answered from on-disk segments.
-        for q in ["rust", "gamma", "rust AND gamma", "rust*", "epsilon"] {
-            assert_eq!(
-                frank_match_set(
-                    &conn,
-                    &format!("SELECT rowid FROM docs WHERE docs MATCH '{q}' ORDER BY rowid")
-                ),
-                stock_match(q),
-                "lazy MATCH `{q}`"
-            );
-        }
-        // Plain (un-ranked) MATCH must be answered from the on-disk segments
-        // WITHOUT promoting to the in-memory path — i.e. `scan_lazy_fts5_match`
-        // actually ran. (Ranked / snippet queries promote; plain ones do not.)
-        {
-            let instances = conn.vtab_instances.borrow();
-            let fts5 = instances
-                .get("DOCS")
-                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                .expect("docs should be an FTS5 table");
-            assert!(
-                fts5.is_lazy_on_disk(),
-                "plain MATCH must stay lazy (no promote); the on-disk scan path was bypassed"
-            );
-        }
-
-        // COUNT(*) from the cached averages record (no scan, no load).
-        let count = conn.query("SELECT COUNT(*) FROM docs").unwrap();
-        assert_eq!(
-            count[0].values()[0],
-            SqliteValue::Integer(5),
-            "lazy COUNT(*) should equal the averages row count"
-        );
-
-        // Ranked MATCH — promotes the table for auxiliary scoring; the matching
-        // SET must still equal stock (doc 2 has rust x2, so it is a real match).
-        assert_eq!(
-            frank_match_set(
-                &conn,
-                "SELECT rowid FROM docs WHERE docs MATCH 'rust' ORDER BY rank"
-            ),
-            stock_match("rust"),
-            "ranked MATCH set must equal stock"
-        );
-
-        // Full-table scan path (idx_num == 0) on a freshly-reopened lazy table —
-        // promotes to in-memory, then returns every row.
-        let conn = Connection::open(&db_str).unwrap();
-        let all = conn.query("SELECT rowid FROM docs ORDER BY rowid").unwrap();
-        let all_ids: Vec<i64> = all
-            .iter()
-            .filter_map(|row| row.values().first().map(SqliteValue::to_integer))
-            .collect();
-        assert_eq!(
-            all_ids,
-            vec![1, 2, 3, 4, 5],
-            "full scan should return every row"
-        );
     }
 
     /// bd-fts5-lazy-shadow-reads-itcc4.3: multi-segment recency parity. With
