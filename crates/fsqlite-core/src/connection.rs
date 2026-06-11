@@ -54943,7 +54943,8 @@ impl Connection {
                     )?);
                     continue;
                 }
-                let row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src) {
+                let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
+                {
                     row_data
                 } else if let Some(result) = self.try_scan_join_source_from_pager(src) {
                     result?
@@ -54952,6 +54953,23 @@ impl Connection {
                     let rows = self.query(&scan_sql)?;
                     rows.iter().map(|r| r.values().to_vec()).collect()
                 };
+                // Normalize every scanned row to the source's logical scan
+                // width. Physical records written before an ALTER TABLE ADD
+                // COLUMN are shorter than the current schema; the memdb /
+                // pager fast paths return them raw, and the downstream
+                // `row[..primary_width]` join slices would panic on them
+                // (observed via an INSERT…SELECT with correlated JOIN
+                // subqueries during a schema migration over pre-ALTER rows).
+                // Pad/trim to schema width mirrors the prepared-direct-update
+                // convention; Null matches the missing-column read value for
+                // defaultless ADD COLUMN (default-aware padding is the memdb
+                // reload path's job, not the scan's).
+                let scan_width = src.scan_width();
+                for row in &mut row_data {
+                    if row.len() != scan_width {
+                        row.resize(scan_width, SqliteValue::Null);
+                    }
+                }
                 // Only clone into the cache when the same table might appear
                 // again (self-join, CTE).  Check remaining sources for a match.
                 let might_reuse = table_sources[i + 1..]
@@ -124656,6 +124674,67 @@ fts5(title, body, content=docs, content_rowid=id)'
 
         let integrity = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(integrity[0].values()[0], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_join_scan_pads_pre_alter_short_rows_instead_of_panicking() {
+        // Physical records written before ALTER TABLE ADD COLUMN are
+        // shorter than the current schema width. The join executor's
+        // memdb/pager scan paths return them raw, and the
+        // `row[..primary_width]` join slices panicked on them (observed
+        // through an INSERT…SELECT whose correlated scalar subqueries
+        // contain JOINs, executed during a schema migration). The scan now
+        // pads to the logical width with Null.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("join-short-rows.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, name TEXT, updated_at TEXT);")
+                .unwrap();
+            conn.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, w_id INTEGER, body TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO w VALUES (1, 'alpha', 't0');").unwrap();
+            conn.execute("INSERT INTO m VALUES (10, 1, 'row');").unwrap();
+            // Widen BOTH tables past the physical width of the stored rows.
+            for ddl in [
+                "ALTER TABLE w ADD COLUMN scope TEXT;",
+                "ALTER TABLE w ADD COLUMN root TEXT;",
+                "ALTER TABLE w ADD COLUMN extra1 TEXT;",
+                "ALTER TABLE w ADD COLUMN extra2 TEXT;",
+                "ALTER TABLE m ADD COLUMN extra TEXT;",
+            ] {
+                conn.execute(ddl).unwrap();
+            }
+        }
+
+        // Reopen so the scan reads the short physical records back.
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT w.id, m.id FROM w JOIN m ON m.w_id = w.id ORDER BY w.id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(10));
+
+        // The migration shape that surfaced the bug: INSERT…SELECT over a
+        // single-table FROM whose scalar subqueries contain JOINs.
+        conn.execute("CREATE TABLE g (w_id INTEGER PRIMARY KEY, n INTEGER, at TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO g (w_id, n, at)
+             SELECT w.id,
+                    (SELECT COUNT(*) FROM m JOIN w w2 ON w2.id = m.w_id WHERE w2.id = w.id),
+                    w.updated_at
+             FROM w;",
+        )
+        .unwrap();
+        let seeded = conn.query("SELECT w_id, n, at FROM g;").unwrap();
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(seeded[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(seeded[0].values()[2], SqliteValue::Text("t0".into()));
     }
 
     #[test]
