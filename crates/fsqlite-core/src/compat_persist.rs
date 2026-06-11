@@ -4742,29 +4742,55 @@ PRAGMA integrity_check;
         }
 
         let loaded = load_test_db(&db_path).unwrap();
-        let table = loaded
+        // FrankenSQLite-created FTS5 tables are now stock-compatible
+        // rootpage=0 virtual tables. The low-level compat loader deliberately
+        // skips rootpage=0 virtual-table catalog rows (they have no
+        // materialized root b-tree of their own; the live vtab is reconstructed
+        // at the higher connection-reload layer instead), so the `docs` row is
+        // NOT present here — but the durable document content it persisted DOES
+        // survive, in the positive-rootpage `docs_content` shadow table.
+        assert!(
+            loaded
+                .schema
+                .iter()
+                .all(|table| !table.name.eq_ignore_ascii_case("docs")),
+            "rootpage=0 FTS5 virtual-table catalog row must be skipped by the low-level loader"
+        );
+
+        // The persisted document content lives in the `docs_content` shadow
+        // table, laid out as (id INTEGER PRIMARY KEY, c0=subject, c1=body).
+        let content = loaded
             .schema
             .iter()
-            .find(|table| table.name.eq_ignore_ascii_case("docs"))
-            .expect("materialized virtual table should survive direct load");
-        let column_names: Vec<&str> = table
+            .find(|table| table.name.eq_ignore_ascii_case("docs_content"))
+            .expect("FTS5 content shadow table should survive direct load");
+        let content_columns: Vec<&str> = content
             .columns
             .iter()
             .map(|column| column.name.as_str())
             .collect();
-        assert_eq!(column_names, vec!["subject", "body"]);
+        assert_eq!(content_columns, vec!["id", "c0", "c1"]);
+        assert!(
+            content.root_page > 0,
+            "the _content shadow table is a real positive-rootpage b-tree"
+        );
         let mem_table = loaded
             .db
-            .get_table(table.root_page)
-            .expect("loaded table should exist in MemDatabase");
+            .get_table(content.root_page)
+            .expect("loaded content shadow table should exist in MemDatabase");
+        // The _content shadow b-tree stores the full record (id, c0, c1): the
+        // INTEGER PRIMARY KEY `id` is both the rowid and the first record value,
+        // followed by the document columns subject (c0) and body (c1).
         let rows: Vec<_> = mem_table.iter_rows().collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 1);
-        assert_eq!(rows[0].1[0], SqliteValue::Text("Hello".into()));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("Rust world".into()));
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("Hello".into()));
+        assert_eq!(rows[0].1[2], SqliteValue::Text("Rust world".into()));
         assert_eq!(rows[1].0, 2);
-        assert_eq!(rows[1].1[0], SqliteValue::Text("Other".into()));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("Nothing".into()));
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("Other".into()));
+        assert_eq!(rows[1].1[2], SqliteValue::Text("Nothing".into()));
     }
 
     #[test]

@@ -122756,17 +122756,30 @@ fts5(title, body, content=docs, content_rowid=id)'
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE VIRTUAL TABLE docs USING fts5(content)")
             .unwrap();
-        conn.execute("CREATE TABLE docs_data (marker INTEGER);")
+        // `docs_data` is now a REAL shadow table owned by `docs` (the
+        // rootpage-zero shadow-backed FTS5 model reserves the _content/_data/
+        // _idx/_docsize suffixes), so a user table cannot claim that name. The
+        // surviving intent of this test is that DROP TABLE on the FTS5 vtab
+        // cascades to its own shadow tables ONLY and leaves an unrelated user
+        // table — one whose name merely *resembles* a shadow suffix but is
+        // owned by no virtual table — untouched.
+        conn.execute("CREATE TABLE notes_data (marker INTEGER);")
             .unwrap();
-        conn.execute("INSERT INTO docs_data VALUES (42);").unwrap();
+        conn.execute("INSERT INTO notes_data VALUES (42);").unwrap();
 
         conn.execute("DROP TABLE docs;").unwrap();
 
+        // The vtab and all of its owned shadow tables are gone.
         let dropped = conn
-            .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs';")
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' \
+                   AND name IN ('docs', 'docs_data', 'docs_content', 'docs_idx', 'docs_docsize');",
+            )
             .unwrap();
         assert_eq!(dropped[0].values()[0], SqliteValue::Integer(0));
-        let preserved = conn.query("SELECT marker FROM docs_data;").unwrap();
+        // The unrelated, shadow-resembling user table survives intact.
+        let preserved = conn.query("SELECT marker FROM notes_data;").unwrap();
         assert_eq!(preserved[0].values()[0], SqliteValue::Integer(42));
     }
 
@@ -122795,9 +122808,17 @@ fts5(title, body, content=docs, content_rowid=id)'
                 SqliteValue::Integer(value) => *value,
                 other => panic!("expected integer rootpage, got {other:?}"),
             };
-            assert!(
-                root_page > 0,
-                "materialized virtual table should persist with a real root page"
+            // FrankenSQLite-created FTS5 tables are now stock-compatible
+            // rootpage=0 virtual tables backed by real shadow tables (359eb0a3 /
+            // the shadow-backed FTS5 contract: "Catalog row for the virtual
+            // table uses rootpage=0" is mandatory parity). The durable state
+            // lives in the _content/_data/_idx/_docsize shadow tables, not in a
+            // positive-rootpage materialized b-tree, so the catalog row must
+            // carry rootpage=0 — and the table must still survive reopen with
+            // its rows fully readable (asserted below).
+            assert_eq!(
+                root_page, 0,
+                "FrankenSQLite-created FTS5 virtual table must use a stock-compatible rootpage=0 catalog row"
             );
             conn.close().unwrap();
         }
@@ -123331,6 +123352,89 @@ fts5(title, body, content=docs, content_rowid=id)'
         .unwrap();
     }
 
+    /// Regression for meta_skill#113 ("`ms search` broken — `skills_fts`
+    /// virtual table never usable; internal error: column not found:
+    /// skills_fts"). A FrankenSQLite-created FTS5 table must be fully usable on
+    /// a *subsequent* connection: after create→insert→close→reopen, both a
+    /// plain `SELECT rowid FROM t` scan and a `... WHERE t MATCH 'word'` query
+    /// must succeed and return the right rows. Before the rootpage-zero
+    /// shadow-table persistence work (359eb0a3 / c09135c4) the vtab lived only
+    /// in in-memory state and was not re-registered on reopen, so the bare
+    /// table label in the MATCH predicate fell through to the column resolver
+    /// and errored `column not found: <table>` — and a plain scan found no live
+    /// instance at all. This test pins the full reopen contract end to end.
+    #[test]
+    fn test_reopen_fsqlite_created_fts5_usable_after_close_meta_skill_113() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fts5_reopen_issue_113.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Connection 1: create the FTS5 table, insert rows, close.
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE t USING fts5(content)")
+                .unwrap();
+            conn.execute("INSERT INTO t(rowid, content) VALUES (1, 'the quick brown fox')")
+                .unwrap();
+            conn.execute("INSERT INTO t(rowid, content) VALUES (2, 'lazy dog sleeps')")
+                .unwrap();
+            conn.execute("INSERT INTO t(rowid, content) VALUES (3, 'quick rust engine')")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        // Connection 2 (the failing-before path): REOPEN the file and exercise
+        // both query shapes the issue reported as broken.
+        {
+            let conn = Connection::open(&db_str).unwrap();
+
+            // (a) Plain scan must see the live vtab and return every rowid.
+            assert!(
+                conn.has_live_vtab_instance("t"),
+                "reopened FrankenSQLite-created FTS5 table must reconnect as a live vtab"
+            );
+            let scan = conn
+                .query("SELECT rowid FROM t ORDER BY rowid")
+                .expect("plain SELECT rowid FROM t must succeed after reopen");
+            assert_eq!(
+                scan.iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(3),
+                ],
+                "plain scan after reopen must return all persisted rowids"
+            );
+
+            // (b) MATCH must resolve the bare table label and return the right
+            // rows (this is the exact `t MATCH 'word'` shape from the issue).
+            let matched = conn
+                .query("SELECT rowid FROM t WHERE t MATCH 'quick' ORDER BY rowid")
+                .expect("MATCH after reopen must succeed (issue #113 regression)");
+            assert_eq!(
+                matched
+                    .iter()
+                    .map(|row| row.values()[0].clone())
+                    .collect::<Vec<_>>(),
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(3)],
+                "MATCH after reopen must return the rows whose content matched, with content preserved (not re-tokenized from empty)"
+            );
+
+            // A non-matching token must return nothing — proves we restored the
+            // real posting lists, not a blanket "everything matches" fallback.
+            let none = conn
+                .query("SELECT rowid FROM t WHERE t MATCH 'nonexistentword'")
+                .unwrap();
+            assert!(
+                none.is_empty(),
+                "a token absent from every document must match no rows after reopen"
+            );
+            conn.close().unwrap();
+        }
+    }
+
     #[test]
     fn test_reopen_rebinds_materialized_fts5_for_match_queries_and_new_inserts() {
         let dir = tempfile::tempdir().unwrap();
@@ -123449,14 +123553,19 @@ fts5(title, body, content=docs, content_rowid=id)'
             .iter()
             .filter(|table| table.name.eq_ignore_ascii_case("docs"))
             .collect();
+        // FrankenSQLite-created FTS5 tables are now natively rootpage=0
+        // (shadow-backed), so the original CREATE already wrote a rootpage=0
+        // catalog row and the injected writable_schema row is a genuine
+        // duplicate of it. Schema reload must dedup the duplicate catalog rows
+        // down to exactly one live virtual table.
         assert_eq!(
             docs_tables.len(),
             1,
-            "schema reload should keep the materialized virtual table exactly once"
+            "schema reload should dedup duplicate FTS5 catalog rows to exactly one virtual table"
         );
-        assert!(
-            docs_tables[0].root_page > 0,
-            "schema reload should prefer the positive-rootpage materialized entry"
+        assert_eq!(
+            docs_tables[0].root_page, 0,
+            "FrankenSQLite-created FTS5 virtual table reloads as a stock-compatible rootpage=0 catalog row"
         );
         drop(schema);
 
@@ -123467,7 +123576,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(
             after_drop[0].values()[0],
             SqliteValue::Integer(0),
-            "DROP TABLE should remove both the materialized entry and any duplicate legacy rootpage=0 row"
+            "DROP TABLE should remove every duplicate rootpage=0 catalog row for the table"
         );
     }
 
