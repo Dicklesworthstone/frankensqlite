@@ -1420,6 +1420,8 @@ pub mod pragma {
         pub foreign_keys: bool,
         /// Recursive trigger toggle (`PRAGMA recursive_triggers`).
         pub recursive_triggers: bool,
+        /// Query-only toggle (`PRAGMA query_only`).
+        pub query_only: bool,
         /// Connection-level SSI toggle (`PRAGMA fsqlite.serializable`).
         pub serializable: bool,
         /// Differential-view streaming toggle (`PRAGMA fsqlite_differential_views`).
@@ -1452,6 +1454,7 @@ pub mod pragma {
                 application_id: 0,
                 foreign_keys: false,
                 recursive_triggers: false,
+                query_only: false,
                 serializable: true,
                 differential_views: DifferentialViewsSetting::Off,
                 raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
@@ -1547,6 +1550,9 @@ pub mod pragma {
         }
         if name.eq_ignore_ascii_case("recursive_triggers") {
             return apply_recursive_triggers(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("query_only") {
+            return apply_query_only(state, stmt);
         }
         if name.eq_ignore_ascii_case("writable_schema") {
             return apply_writable_schema(state, stmt);
@@ -1832,6 +1838,20 @@ pub mod pragma {
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
                 let enabled = parse_bool(expr)?;
                 state.recursive_triggers = enabled;
+                Ok(PragmaOutput::Int(i64::from(enabled)))
+            }
+        }
+    }
+
+    fn apply_query_only(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(i64::from(state.query_only))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.query_only = enabled;
                 Ok(PragmaOutput::Int(i64::from(enabled)))
             }
         }
@@ -2883,6 +2903,40 @@ mod tests {
         let mut state = pragma::ConnectionPragmaState::default();
 
         let stmt = parse_pragma("PRAGMA fsqlite_differential_views = 2").expect("parse pragma");
+        assert!(matches!(
+            pragma::apply_connection_pragma(&mut state, &stmt),
+            Err(FrankenError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_connection_pragma_query_only_set_and_query() {
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        let query = parse_pragma("PRAGMA query_only").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &query).expect("query pragma"),
+            pragma::PragmaOutput::Int(0)
+        );
+
+        let set_on = parse_pragma("PRAGMA query_only = ON").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &set_on).expect("set pragma"),
+            pragma::PragmaOutput::Int(1)
+        );
+        assert!(state.query_only);
+
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &query).expect("query pragma"),
+            pragma::PragmaOutput::Int(1)
+        );
+    }
+
+    #[test]
+    fn test_connection_pragma_query_only_rejects_non_boolean_values() {
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        let stmt = parse_pragma("PRAGMA query_only = 2").expect("parse pragma");
         assert!(matches!(
             pragma::apply_connection_pragma(&mut state, &stmt),
             Err(FrankenError::TypeMismatch { .. })

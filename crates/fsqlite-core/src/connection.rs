@@ -14141,6 +14141,11 @@ impl Connection {
                 "prepared statement belongs to a different connection",
             ));
         }
+        if self.pragma_state.borrow().query_only
+            && (stmt.precompiled_dml().is_some() || stmt.deferred_dml_statement().is_some())
+        {
+            return Err(FrankenError::ReadOnly);
+        }
         if let Some(dispatch) = stmt.precompiled_dml() {
             // bd-6eyrg.1: FAST PATH — precompiled DML with valid schema.
             if hot_path_profile_enabled() {
@@ -22736,6 +22741,11 @@ impl Connection {
         let schema_change_boundary =
             statement_starts_fresh_schema_change_boundary(statement.as_ref())
                 || writable_schema_dml;
+        if self.pragma_state.borrow().query_only
+            && (statement_writes_under_query_only(statement.as_ref()) || writable_schema_dml)
+        {
+            return Err(FrankenError::ReadOnly);
+        }
         // `PRAGMA writable_schema` DML edits page-1 schema rows directly and
         // may be repairing malformed rows. Do not refresh the normal MemDB
         // schema image before the raw edit has had a chance to run.
@@ -75949,6 +75959,25 @@ fn statement_starts_fresh_schema_change_boundary(statement: &Statement) -> bool 
     )
 }
 
+fn statement_writes_under_query_only(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::CreateTable(_)
+            | Statement::CreateVirtualTable(_)
+            | Statement::CreateView(_)
+            | Statement::CreateTrigger(_)
+            | Statement::Drop(_)
+            | Statement::AlterTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::Analyze(_)
+            | Statement::Reindex(_)
+            | Statement::Vacuum(_)
+    )
+}
+
 fn eqp_detail_is_scan_or_search(detail: &str) -> bool {
     detail.starts_with("SCAN ") || detail.starts_with("SEARCH ")
 }
@@ -114648,6 +114677,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pragma_query_only_set_query_and_enforce() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let rows = conn.query("PRAGMA query_only;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+
+        conn.execute("PRAGMA query_only = ON;").unwrap();
+        let rows = conn.query("PRAGMA query_only;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        let err = conn
+            .execute("INSERT INTO t(id) VALUES (1);")
+            .expect_err("query_only should reject writes");
+        assert!(matches!(err, FrankenError::ReadOnly));
+
+        conn.execute("PRAGMA query_only = OFF;").unwrap();
+        conn.execute("INSERT INTO t(id) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+    }
+
+    #[test]
     fn test_pragma_state_accessor() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pragma_state_accessor.db");
@@ -124695,8 +124748,10 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .unwrap();
             conn.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, w_id INTEGER, body TEXT);")
                 .unwrap();
-            conn.execute("INSERT INTO w VALUES (1, 'alpha', 't0');").unwrap();
-            conn.execute("INSERT INTO m VALUES (10, 1, 'row');").unwrap();
+            conn.execute("INSERT INTO w VALUES (1, 'alpha', 't0');")
+                .unwrap();
+            conn.execute("INSERT INTO m VALUES (10, 1, 'row');")
+                .unwrap();
             // Widen BOTH tables past the physical width of the stored rows.
             for ddl in [
                 "ALTER TABLE w ADD COLUMN scope TEXT;",
