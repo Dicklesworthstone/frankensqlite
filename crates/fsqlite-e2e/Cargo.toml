@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-e2e"
-version = "0.1.9"
+version = "0.1.10"
 publish = false
 edition.workspace = true
 autobins = false
@@ -20,14 +20,14 @@ linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring", "fsqlite-core/li
 
 [dependencies]
 asupersync = { workspace = true }
-fsqlite = { path = "../fsqlite", version = "0.1.9", default-features = false, features = ["json", "fts5", "rtree"] }
+fsqlite = { path = "../fsqlite", version = "0.1.10", default-features = false, features = ["json", "fts5", "rtree"] }
 fsqlite-btree = { workspace = true }
-fsqlite-core = { path = "../fsqlite-core", version = "0.1.9", default-features = false }
+fsqlite-core = { path = "../fsqlite-core", version = "0.1.10", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-vdbe = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.9", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.10", default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
 ftui = { workspace = true, features = ["crossterm"], optional = true }

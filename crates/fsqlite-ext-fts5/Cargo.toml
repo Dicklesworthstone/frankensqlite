@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-fts5"
-version = "0.1.9"
+version = "0.1.10"
 description = "FTS5 full-text search extension"
 edition.workspace = true
 license.workspace = true
