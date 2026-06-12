@@ -356,3 +356,7 @@ heaptrack.*.zst
 /bd-*.md
 # br doctor per-run artifacts
 .doctor/
+
+# Ephemeral run artifacts / stray temp dumps
+/tmp_total.txt
+tests/artifacts/parity-status/
