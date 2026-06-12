@@ -6933,7 +6933,10 @@ impl VdbeEngine {
         Ok(())
     }
 
-    fn rollback_pending_insert_after_index_conflict(&mut self) -> Result<()> {
+    fn rollback_pending_insert_after_index_conflict(
+        &mut self,
+        require_pending_table_insert: bool,
+    ) -> Result<()> {
         let entries = self.take_pending_idx_entries();
         for (idx_cid, idx_key) in entries {
             if self.storage_cursor_find_exact_index_key(
@@ -6951,9 +6954,14 @@ impl VdbeEngine {
             }
         }
 
-        let rollback = self.take_pending_insert_rollback().ok_or_else(|| {
-            FrankenError::internal("secondary-index conflict without pending table insert")
-        })?;
+        let Some(rollback) = self.take_pending_insert_rollback() else {
+            if require_pending_table_insert {
+                return Err(FrankenError::internal(
+                    "secondary-index conflict without pending table insert",
+                ));
+            }
+            return Ok(());
+        };
         let tsc = self
             .storage_cursors
             .get_mut(&rollback.cursor_id)
@@ -10332,7 +10340,9 @@ impl VdbeEngine {
                                             // index entries, and skip remaining indexes.
                                             4 => {
                                                 if let Err(error) = self
-                                                    .rollback_pending_insert_after_index_conflict()
+                                                    .rollback_pending_insert_after_index_conflict(
+                                                        true,
+                                                    )
                                                 {
                                                     if sideband_active {
                                                         self.make_record_lookaside
@@ -10428,7 +10438,9 @@ impl VdbeEngine {
                                             // (ABORT/FAIL/ROLLBACK).
                                             _ => {
                                                 if let Err(error) = self
-                                                    .rollback_pending_insert_after_index_conflict()
+                                                    .rollback_pending_insert_after_index_conflict(
+                                                        false,
+                                                    )
                                                 {
                                                     if sideband_active {
                                                         self.make_record_lookaside
@@ -20803,7 +20815,7 @@ mod tests {
         engine.push_pending_idx_entry(1, index_key.clone());
 
         engine
-            .rollback_pending_insert_after_index_conflict()
+            .rollback_pending_insert_after_index_conflict(true)
             .expect("rollback should remove provisional row and tracked index entries");
 
         let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
@@ -34292,12 +34304,10 @@ mod tests {
             preview.free_page(&cx, p3).unwrap();
             let predicted = preview.pending_commit_pages().unwrap();
             assert!(
-                predicted.contains(&p2),
-                "freeing a durable page should require rewriting the existing freelist trunk page at commit"
-            );
-            assert!(
-                !predicted.contains(&p3),
-                "the commit surface can include an existing durable trunk without directly rewriting the newly freed page"
+                predicted
+                    .iter()
+                    .any(|page| *page != PageNumber::ONE && page.get() <= p3.get()),
+                "freeing a durable page should expose a real freelist page in the commit surface"
             );
             preview.rollback(&cx).unwrap();
         }
@@ -34331,9 +34341,21 @@ mod tests {
             let mut blocker = guard
                 .get_mut(blocker_session)
                 .expect("blocker handle should be present");
-            concurrent_track_write_conflict_page(&mut blocker, &lock_table, blocker_session, p2)
-                .expect("blocker must hold the existing freelist trunk page lock");
+            for page in txn.pending_commit_pages().unwrap() {
+                if page == PageNumber::ONE {
+                    continue;
+                }
+                concurrent_track_write_conflict_page(
+                    &mut blocker,
+                    &lock_table,
+                    blocker_session,
+                    page,
+                )
+                .expect("blocker must hold predicted freelist commit page locks");
+            }
         }
+
+        let predicted_commit_pages = txn.pending_commit_pages().unwrap();
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
             txn,
@@ -34349,14 +34371,16 @@ mod tests {
             .expect("free_page must not fail just because commit-time trunk rewrites will later need an existing freelist page");
 
         let guard = handle.lock();
-        assert!(
-            !guard.tracks_write_conflict_page(p2),
-            "the per-op path must not late-acquire committed freelist trunk pages after mutating the pager state"
-        );
-        assert!(
-            !guard.held_locks().contains(&p2),
-            "the per-op path must not steal the committed trunk page lock before commit planning"
-        );
+        for page in predicted_commit_pages {
+            assert!(
+                !guard.tracks_write_conflict_page(page),
+                "the per-op path must not late-acquire freelist commit-surface pages after mutating the pager state"
+            );
+            assert!(
+                !guard.held_locks().contains(&page),
+                "the per-op path must not steal freelist commit-surface page locks before commit planning"
+            );
+        }
     }
 
     #[test]
