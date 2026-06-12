@@ -1207,6 +1207,9 @@ fn filter_float_between(
     let SqliteValue::Float(upper) = upper else {
         return Err(DataflowError::PredicateValueNotFloat { column });
     };
+    if lower.is_nan() || upper.is_nan() {
+        return Ok(Vec::new());
+    }
 
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
@@ -1235,6 +1238,9 @@ fn filter_float_not_between(
     let SqliteValue::Float(upper) = upper else {
         return Err(DataflowError::PredicateValueNotFloat { column });
     };
+    if lower.is_nan() || upper.is_nan() {
+        return Ok(Vec::new());
+    }
 
     rows.iter()
         .filter_map(|row| match row.values.get(column) {
