@@ -18404,7 +18404,11 @@ impl Connection {
             // bd-perf: Skip memdb refresh — VDBE uses storage cursors
             stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)?
         };
-        if !fk_enforced_by_inner
+        // Gate FK enforcement on a row actually landing: an OR IGNORE PK
+        // conflict drops the row (affected == 0) and SQLite does not FK-check a
+        // row it never inserted (#111).
+        if affected > 0
+            && !fk_enforced_by_inner
             && self.fk_enforcement_enabled()
             && self.table_has_outbound_foreign_keys(table_name)
         {
@@ -18478,7 +18482,12 @@ impl Connection {
         // Gate on `table_has_outbound_foreign_keys` to avoid the
         // `collect_insert_trigger_rows` re-evaluation cost when the table
         // has no FKs and the fallback fired for a non-FK NotImplemented case.
-        if self.fk_enforcement_enabled() && self.table_has_outbound_foreign_keys(&insert.table.name)
+        // OR IGNORE PK-conflict rows are dropped by the table program
+        // (outcome.0 == 0); SQLite does not run FK checks on a row it never
+        // inserted, so gate FK enforcement on a row actually landing (#111).
+        if outcome.0 > 0
+            && self.fk_enforcement_enabled()
+            && self.table_has_outbound_foreign_keys(&insert.table.name)
         {
             self.enforce_fk_on_insert(&insert, &insert.table.name, params)?;
         }
@@ -21557,22 +21566,48 @@ impl Connection {
     }
 
     fn statement_lookaside_retained_bytes(&self) -> usize {
-        self.statement_parse_scratch
-            .borrow()
-            .retained_bytes()
-            .saturating_add(
-                self.prepared_direct_insert_record_scratch
-                    .borrow()
-                    .capacity(),
-            )
-            .saturating_add(
-                self.prepared_direct_insert_row_scratch
-                    .borrow()
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<SqliteValue>()),
-            )
-            .saturating_add(self.prepared_direct_insert_text_scratch.borrow().capacity())
-            .saturating_add(self.prepared_direct_insert_cell_scratch.borrow().capacity())
+        // Diagnostic-only measurement (hot-path profiling). It can run from the
+        // StatementLookasideGrowthGuard Drop while one of these scratch cells is
+        // still mutably borrowed by an in-flight INSERT — e.g. the direct-simple
+        // lane holds `prepared_direct_insert_row_scratch` (as `mem_row_values`)
+        // across the FK precheck/bail and the FK existence check. A hard
+        // borrow() would panic there ("already mutably borrowed"), so read each
+        // cell with try_borrow() and treat a busy cell as 0: undercounting a
+        // single arena-growth sample is acceptable for a diagnostic counter; a
+        // panic is not (#111).
+        let parse_bytes = self
+            .statement_parse_scratch
+            .try_borrow()
+            .map(|s| s.retained_bytes())
+            .unwrap_or(0);
+        let record_bytes = self
+            .prepared_direct_insert_record_scratch
+            .try_borrow()
+            .map(|s| s.capacity())
+            .unwrap_or(0);
+        let row_bytes = self
+            .prepared_direct_insert_row_scratch
+            .try_borrow()
+            .map(|s| {
+                s.capacity()
+                    .saturating_mul(std::mem::size_of::<SqliteValue>())
+            })
+            .unwrap_or(0);
+        let text_bytes = self
+            .prepared_direct_insert_text_scratch
+            .try_borrow()
+            .map(|s| s.capacity())
+            .unwrap_or(0);
+        let cell_bytes = self
+            .prepared_direct_insert_cell_scratch
+            .try_borrow()
+            .map(|s| s.capacity())
+            .unwrap_or(0);
+        parse_bytes
+            .saturating_add(record_bytes)
+            .saturating_add(row_bytes)
+            .saturating_add(text_bytes)
+            .saturating_add(cell_bytes)
     }
 
     fn note_statement_lookaside_alloc_growth(&self, before_bytes: usize) {
@@ -23739,7 +23774,10 @@ impl Connection {
                 )?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
-                if self.fk_enforcement_enabled() {
+                // Skip FK enforcement when no row was written (e.g. an OR IGNORE
+                // PK conflict, affected == 0): SQLite does not FK-check a row it
+                // never inserted (#111).
+                if affected > 0 && self.fk_enforcement_enabled() {
                     self.enforce_fk_on_insert(insert, table_name, params)?;
                 }
 
