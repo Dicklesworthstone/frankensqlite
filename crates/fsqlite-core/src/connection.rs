@@ -4394,6 +4394,12 @@ struct PreparedPrecompiledDml {
     runtime_requirements: TableExecutionRuntimeRequirements,
     static_runtime_inputs: Option<TableExecutionRuntimeInputs>,
     direct_simple_insert: Option<PreparedDirectSimpleInsert>,
+    /// Issue #110: `true` when this is an `INSERT OR REPLACE` or an upsert
+    /// (`ON CONFLICT`), i.e. an INSERT that can delete or mutate an existing
+    /// row (potentially a parent of a previously cached child FK). Only
+    /// meaningful for `kind == Insert`. Plain INSERTs (the hot path) leave this
+    /// `false`, so the transaction-scoped FK parent-validation cache survives.
+    insert_may_invalidate_fk_parent_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -8332,8 +8338,26 @@ pub struct Connection {
     /// actions (matches C SQLite behavior where FK actions do not re-trigger
     /// FK checking).
     fk_cascade_depth: Cell<usize>,
-    /// Statement-scoped cache for successful FK parent probes while replaying
-    /// multi-row INSERT streams.  Cleared at statement boundaries.
+    /// Cache for successful FK parent-existence probes.
+    ///
+    /// Two activation modes share this slot:
+    ///
+    /// * **Statement-scoped** (`enter_fk_parent_validation_cache_scope`): used
+    ///   while replaying a single multi-row `INSERT … SELECT`/`VALUES` stream.
+    ///   The RAII guard restores the previous cache at the statement boundary.
+    ///
+    /// * **Transaction-scoped** (`ensure_fk_parent_validation_cache`,
+    ///   issue #110): lazily created on the first child INSERT inside an
+    ///   explicit transaction so that repeated parent ids across successive
+    ///   prepared/direct INSERTs skip both the FK existence SELECT and its
+    ///   O(rows-so-far) memdb reload side effect. A positive entry means "this
+    ///   parent value was confirmed present in THIS transaction scope". It is
+    ///   cleared at every transaction boundary (commit/rollback) and on any
+    ///   statement that could remove or alter a parent row (UPDATE, DELETE,
+    ///   INSERT OR REPLACE / upsert, DDL), so a validated parent can never be
+    ///   accepted after it has been rolled away or deleted. Negatives are never
+    ///   cached, so the "insert the parent later in the same txn" pattern stays
+    ///   correct.
     fk_parent_validation_cache: RefCell<Option<FkParentValidationCache>>,
     // ── MVCC conflict observability (bd-t6sv2.1) ──────────────────────────
     /// Shared observer for MVCC conflict analytics. Records metrics
@@ -17896,6 +17920,17 @@ impl Connection {
         capture_time_travel_snapshot: bool,
     ) -> Result<usize> {
         self.clear_table_program_error_state();
+        // Issue #110: an `INSERT OR REPLACE` / upsert can delete or mutate an
+        // existing row (possibly a parent of a previously cached child FK).
+        // This prepared lane bypasses the central dispatcher, so drop the
+        // transaction-scoped FK parent-validation cache here. The hot plain-
+        // INSERT path leaves the flag `false`, so the cache survives.
+        if stmt
+            .precompiled_dml()
+            .is_some_and(|dml| dml.insert_may_invalidate_fk_parent_cache)
+        {
+            self.clear_fk_parent_validation_cache();
+        }
         if stmt.may_observe_change_tracking {
             self.sync_change_tracking_context();
         }
@@ -20872,6 +20907,12 @@ impl Connection {
         entry_proof: PreparedDmlEntryProof,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
+        // Issue #110: a prepared UPDATE or DELETE may mutate or remove a parent
+        // row that an earlier child INSERT validated and cached this
+        // transaction. This fast lane bypasses the central statement
+        // dispatcher, so drop the transaction-scoped FK parent-validation
+        // cache here before executing.
+        self.clear_fk_parent_validation_cache();
         // Direct-simple UPDATE/DELETE in-transaction fast lane.
         //
         // Mirrors the INSERT `execute_precompiled_prepared_insert_fast` shape:
@@ -22712,6 +22753,16 @@ impl Connection {
                 | Statement::Analyze(_)
                 | Statement::Reindex(_)
         );
+        // Issue #110: any statement that may delete or alter a parent row
+        // invalidates a cached "parent present" result. Plain INSERTs only add
+        // rows (safe), but UPDATE/DELETE, DDL, and INSERT OR REPLACE / upsert
+        // (which can delete or mutate an existing — possibly parent — row)
+        // must drop the transaction-scoped FK parent-validation cache. The
+        // prepared UPDATE/DELETE fast lanes bypass this dispatcher and clear
+        // the cache at their own entry point.
+        if Self::statement_may_invalidate_fk_parent_cache(statement.as_ref()) {
+            self.clear_fk_parent_validation_cache();
+        }
         let is_txn_control = matches!(
             statement.as_ref(),
             Statement::Begin(_)
@@ -26121,6 +26172,9 @@ impl Connection {
                                 static_runtime_inputs: self
                                     .prepared_static_table_runtime_inputs(runtime_requirements),
                                 direct_simple_insert,
+                                insert_may_invalidate_fk_parent_cache: insert.or_conflict
+                                    == Some(fsqlite_ast::ConflictAction::Replace)
+                                    || !insert.upsert.is_empty(),
                             }))
                         } else {
                             PreparedDmlDispatch::Deferred(Arc::new(statement.clone()))
@@ -40115,6 +40169,13 @@ impl Connection {
         let fk_defs = table.foreign_keys.clone();
         drop(schema);
 
+        // Issue #110: activate the transaction-scoped parent-validation cache
+        // (no-op if a statement-scoped INSERT … SELECT cache is already live,
+        // if FK enforcement is off, or outside an explicit transaction). This
+        // lets repeated parent ids across successive prepared/direct INSERTs
+        // skip the FK existence SELECT and its O(rows-so-far) memdb reload.
+        self.ensure_fk_parent_validation_cache();
+
         for fk in &fk_defs {
             // Collect child column values for this FK.
             let fk_values: Vec<&SqliteValue> = fk
@@ -40214,6 +40275,89 @@ impl Connection {
         })
     }
 
+    /// Issue #110: lazily activate a transaction-scoped FK parent-validation
+    /// cache so repeated parent ids across successive prepared/direct INSERTs
+    /// skip both the FK existence SELECT and its O(rows-so-far) memdb reload.
+    ///
+    /// Only created when FK enforcement is active (so cascades, which run at
+    /// `fk_cascade_depth > 0`, never seed it) and an explicit transaction is
+    /// open (autocommit each-statement-its-own-txn workloads would clear it at
+    /// every boundary, so there is nothing to amortize). A statement-scoped
+    /// cache already present (the `INSERT … SELECT` replay scope) is left
+    /// untouched — it takes precedence and is restored by its RAII guard.
+    ///
+    /// Correctness rests on aggressive invalidation: the cache is cleared at
+    /// every transaction boundary and on every statement that could remove or
+    /// alter a parent row (see `clear_fk_parent_validation_cache` call sites).
+    fn ensure_fk_parent_validation_cache(&self) {
+        if !self.fk_enforcement_enabled() || !self.in_transaction.get() {
+            return;
+        }
+        if self.fk_parent_validation_cache.borrow().is_some() {
+            return;
+        }
+        *self.fk_parent_validation_cache.borrow_mut() =
+            Some(FkParentValidationCache::new_transaction_scoped());
+    }
+
+    /// Drop any active transaction-scoped FK parent-validation cache.
+    ///
+    /// Called whenever a previously validated parent row could have become
+    /// invalid: transaction commit/rollback, savepoint rollback, and any
+    /// statement that may delete or alter a parent row (UPDATE, DELETE,
+    /// INSERT OR REPLACE / upsert, DDL). Clearing only ever forces a fresh
+    /// re-probe, so it can never turn a real FK violation into a false pass.
+    ///
+    /// A statement-scoped (`INSERT … SELECT` replay) cache is intentionally NOT
+    /// cleared here: it is bounded to a single statement whose own RAII guard
+    /// restores the prior state, and the conservative clear sites below never
+    /// fire in the middle of that replay.
+    fn clear_fk_parent_validation_cache(&self) {
+        let is_statement_scoped = self
+            .fk_parent_validation_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.target_table.is_some());
+        if is_statement_scoped {
+            return;
+        }
+        *self.fk_parent_validation_cache.borrow_mut() = None;
+    }
+
+    /// Issue #110: does executing `statement` potentially invalidate a cached
+    /// "parent row present" result?
+    ///
+    /// Conservative: returns `true` for anything that can delete or mutate an
+    /// existing row (which might be a parent of an already-cached child FK),
+    /// and for schema changes. A plain INSERT (including `OR IGNORE` /
+    /// `OR ABORT` / `OR FAIL` / `OR ROLLBACK`, which reject conflicts rather
+    /// than deleting the existing row) only ever adds rows, so it preserves
+    /// every cached positive and returns `false`. `INSERT OR REPLACE` and
+    /// upsert (`ON CONFLICT`) can delete or update an existing row, so they
+    /// return `true`.
+    fn statement_may_invalidate_fk_parent_cache(statement: &Statement) -> bool {
+        match statement {
+            Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::CreateTable(_)
+            | Statement::CreateVirtualTable(_)
+            | Statement::CreateView(_)
+            | Statement::CreateTrigger(_)
+            | Statement::CreateIndex(_)
+            | Statement::Drop(_)
+            | Statement::AlterTable(_)
+            | Statement::Reindex(_)
+            | Statement::Vacuum(_) => true,
+            Statement::Insert(insert) => {
+                matches!(
+                    insert.or_conflict,
+                    Some(fsqlite_ast::ConflictAction::Replace)
+                ) || !insert.upsert.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn build_fk_parent_validation_cache_key(
         &self,
         child_table: &str,
@@ -40224,6 +40368,16 @@ impl Connection {
         let cache = self.fk_parent_validation_cache.borrow();
         let cache = cache.as_ref()?;
         if !cache.can_cache_parent(parent_table) {
+            return None;
+        }
+        // Per-FK self-reference guard. The transaction-scoped cache (issue
+        // #110) has no single target table, so reject self-referential FKs
+        // (child table == parent table) here: an in-flight row in the same
+        // transaction can be referenced by a later row, so a parent value's
+        // presence is not stable enough to cache for self-references. For the
+        // statement-scoped cache this is already covered by `can_cache_parent`
+        // (target == child), making this check a harmless no-op there.
+        if child_table.eq_ignore_ascii_case(parent_table) {
             return None;
         }
         Some(FkParentValidationKey {
@@ -42393,6 +42547,9 @@ impl Connection {
                 *self.txn_snapshot.borrow_mut() = None;
                 self.savepoints.borrow_mut().clear();
                 self.in_transaction.set(false);
+                // Issue #110: forced rollback tore down the txn — drop the
+                // transaction-scoped FK parent-validation cache.
+                self.clear_fk_parent_validation_cache();
                 // IMPL-28 / AG-O3: txn torn down — close the IN_TRANSACTION gate.
                 self.set_fast_path_bit(fast_path_gate::IN_TRANSACTION, false);
                 self.implicit_txn.set(false);
@@ -42591,6 +42748,9 @@ impl Connection {
         *self.txn_snapshot.borrow_mut() = None;
         self.savepoints.borrow_mut().clear();
         self.in_transaction.set(false);
+        // Issue #110: the transaction-scoped FK parent-validation cache is
+        // bound to this transaction; drop it now that the txn is torn down.
+        self.clear_fk_parent_validation_cache();
         // IMPL-28 / AG-O3: explicit transaction committed — close the
         // IN_TRANSACTION gate bit so fast-lane consumers (once migrated)
         // take the autocommit path until the next BEGIN.
@@ -42822,6 +42982,12 @@ impl Connection {
             }
             self.txn_metrics_note_rollback();
             self.clear_pending_memdb_direct_upserts();
+            // Issue #110: ROLLBACK TO SAVEPOINT may have rolled away a parent
+            // row that was confirmed present and cached earlier in this
+            // transaction. Drop the transaction-scoped FK parent-validation
+            // cache so subsequent child INSERTs re-probe against the restored
+            // (post-savepoint-rollback) state.
+            self.clear_fk_parent_validation_cache();
             // IMPL-9a: ROLLBACK TO SAVEPOINT may have discarded
             // direct-simple INSERT/DELETE work that was already
             // reflected in a quotient filter. Invalidate every filter
@@ -42884,6 +43050,10 @@ impl Connection {
             *self.txn_snapshot.borrow_mut() = None;
             self.savepoints.borrow_mut().clear();
             self.in_transaction.set(false);
+            // Issue #110: full ROLLBACK discards every in-transaction write,
+            // including parents validated and cached this transaction. Drop
+            // the transaction-scoped FK parent-validation cache.
+            self.clear_fk_parent_validation_cache();
             // IMPL-28 / AG-O3: rollback tore down the txn — close the
             // IN_TRANSACTION gate.
             self.set_fast_path_bit(fast_path_gate::IN_TRANSACTION, false);
@@ -74728,20 +74898,43 @@ struct PrecomputedInSetCache {
 }
 
 struct FkParentValidationCache {
-    target_table: String,
+    /// The child table being replayed for a statement-scoped cache (the single
+    /// `INSERT … SELECT`/`VALUES` target). `None` for a transaction-scoped
+    /// cache, which spans inserts into many different child tables; self-
+    /// reference is then guarded per-FK at key-build time instead.
+    target_table: Option<String>,
     validated: HashSet<FkParentValidationKey>,
 }
 
 impl FkParentValidationCache {
+    /// Statement-scoped cache for a single `INSERT … SELECT`/`VALUES` replay.
     fn new(target_table: &str) -> Self {
         Self {
-            target_table: target_table.to_ascii_lowercase(),
+            target_table: Some(target_table.to_ascii_lowercase()),
+            validated: HashSet::new(),
+        }
+    }
+
+    /// Transaction-scoped cache (issue #110): not bound to a single target
+    /// table. Self-referential FKs are excluded per-FK in
+    /// `build_fk_parent_validation_cache_key`.
+    fn new_transaction_scoped() -> Self {
+        Self {
+            target_table: None,
             validated: HashSet::new(),
         }
     }
 
     fn can_cache_parent(&self, parent_table: &str) -> bool {
-        !self.target_table.eq_ignore_ascii_case(parent_table)
+        // A statement-scoped cache must never cache a parent that is the same
+        // table being inserted into (self-referential / single-target replay):
+        // a later row in the same statement may reference an earlier in-flight
+        // row, so the target table's membership is not stable for caching.
+        // A transaction-scoped cache makes the equivalent decision per-FK using
+        // the child table recorded in the key (see the key builder).
+        self.target_table
+            .as_deref()
+            .is_none_or(|target| !target.eq_ignore_ascii_case(parent_table))
     }
 }
 
@@ -113902,6 +114095,173 @@ mod tests {
 
         let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+    }
+
+    // ── Issue #110: transaction-scoped FK parent-validation cache ──────────
+
+    /// Repeated parent ids across many prepared INSERTs in one transaction
+    /// must succeed (the cache short-circuits redundant probes) and still see
+    /// parents inserted earlier in the same transaction.
+    #[test]
+    fn test_issue110_fk_parent_cache_repeated_parent_inserts() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+        let stmt = conn
+            .prepare("INSERT INTO child (id, parent_id) VALUES (?1, ?2)")
+            .unwrap();
+        for i in 1..=200i64 {
+            // Every child references parent id=1; only the first probe should
+            // actually query, the rest are cache hits.
+            conn.execute_prepared_with_params(
+                &stmt,
+                &[SqliteValue::Integer(i), SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        }
+        // A child referencing a non-existent parent must still fail even though
+        // a different parent id is cached.
+        let err = conn
+            .execute_prepared_with_params(
+                &stmt,
+                &[SqliteValue::Integer(999), SqliteValue::Integer(7)],
+            )
+            .expect_err("missing parent must fail");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(200));
+    }
+
+    /// Deleting a parent inside the same transaction after it was validated
+    /// and cached must invalidate the cache so a later child INSERT referencing
+    /// the now-deleted parent fails.
+    #[test]
+    fn test_issue110_fk_parent_cache_invalidated_by_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        // First child validates and caches parent id=1.
+        conn.execute("INSERT INTO child VALUES (10, 1);").unwrap();
+        // Remove the child, then the parent, within the same transaction.
+        // (Deleting the parent while a child references it would itself be an
+        // FK violation — that is separately correct SQLite behavior.)
+        conn.execute("DELETE FROM child WHERE id = 10;").unwrap();
+        conn.execute("DELETE FROM parent WHERE id = 1;").unwrap();
+        // A subsequent child referencing id=1 must NOT be accepted from cache.
+        let err = conn
+            .execute("INSERT INTO child VALUES (11, 1);")
+            .expect_err("parent was deleted this txn — cache must be invalidated");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    /// `INSERT OR REPLACE` that deletes a conflicting parent row (via a UNIQUE
+    /// constraint) must invalidate a previously cached parent value.
+    #[test]
+    fn test_issue110_fk_parent_cache_invalidated_by_insert_or_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, tag TEXT UNIQUE);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1, 'a');").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        // Validate + cache parent id=1.
+        conn.execute("INSERT INTO child VALUES (10, 1);").unwrap();
+        // REPLACE on the UNIQUE tag deletes the row with id=1 and inserts id=2,
+        // so parent id=1 no longer exists.
+        conn.execute("INSERT OR REPLACE INTO parent VALUES (2, 'a');")
+            .unwrap();
+        let err = conn
+            .execute("INSERT INTO child VALUES (11, 1);")
+            .expect_err("REPLACE deleted parent id=1 — cache must be invalidated");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    /// ROLLBACK TO SAVEPOINT can roll away a parent inserted (and cached) after
+    /// the savepoint; a later child INSERT referencing it must re-probe and
+    /// fail.
+    #[test]
+    fn test_issue110_fk_parent_cache_invalidated_by_savepoint_rollback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp;").unwrap();
+        conn.execute("INSERT INTO parent VALUES (5);").unwrap();
+        // Validate + cache parent id=5 (it exists right now).
+        conn.execute("INSERT INTO child VALUES (50, 5);").unwrap();
+        // Roll the savepoint back: parent id=5 AND child id=50 are gone.
+        conn.execute("ROLLBACK TO sp;").unwrap();
+        // Referencing id=5 again must re-probe and fail (parent rolled away).
+        let err = conn
+            .execute("INSERT INTO child VALUES (51, 5);")
+            .expect_err("savepoint rollback removed parent id=5 — cache must be invalidated");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+    }
+
+    /// The cache must not leak across transactions: a parent validated in one
+    /// transaction that is then deleted (in a later committed transaction)
+    /// must not be accepted from a stale cache entry.
+    #[test]
+    fn test_issue110_fk_parent_cache_does_not_leak_across_transactions() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO child VALUES (10, 1);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        // Separate transaction deletes the parent (and its children first).
+        conn.execute("DELETE FROM child;").unwrap();
+        conn.execute("DELETE FROM parent WHERE id = 1;").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let err = conn
+            .execute("INSERT INTO child VALUES (11, 1);")
+            .expect_err("parent id=1 was deleted — no stale cross-txn cache hit");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
