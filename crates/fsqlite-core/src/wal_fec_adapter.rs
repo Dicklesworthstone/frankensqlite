@@ -191,8 +191,7 @@ impl FecCommitHook {
     /// `page_size` is the database page size to use as the symbol size.
     pub fn from_env(page_size: u32) -> Result<Self> {
         let enabled = std::env::var("FSQLITE_RAPTORQ_ENABLED")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
         if !enabled {
             return Ok(Self::disabled());

@@ -9557,7 +9557,7 @@ impl<P: PageWriter> BtCursor<P> {
             )?;
             Ok(hint.map(|value| value.leaf_page()))
         });
-        if result.as_ref().ok().is_some_and(|page| page.is_some()) {
+        if result.as_ref().is_ok_and(|page| page.is_some()) {
             self.bump_row_image_epoch();
         }
         result
@@ -9593,7 +9593,7 @@ impl<P: PageWriter> BtCursor<P> {
                 false,
             )
         });
-        if result.as_ref().ok().is_some_and(|hint| hint.is_some()) {
+        if result.as_ref().is_ok_and(|hint| hint.is_some()) {
             self.bump_row_image_epoch();
         }
         result
