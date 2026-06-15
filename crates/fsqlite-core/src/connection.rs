@@ -18472,14 +18472,15 @@ impl Connection {
         // path only exists as a correctness fallback for the direct lane.
         let outcome =
             fallback_stmt.execute_table_program_dml_with_reuse(execution_cx, params, true)?;
-        // s76h fix: the direct-simple INSERT lane bails out with
-        // NotImplemented for explicit-rowid + outbound-FK inserts (see
-        // direct_simple_insert_can_precheck_fk), and the resulting fallback
-        // ran the table program via reuse but missed FK enforcement. The
-        // non-prepared dispatch path enforces FK after the table program
-        // (see Statement::Insert handler); mirror that here so violations
-        // propagate as Err and the autocommit txn rolls back the bad row.
-        // Gate on `table_has_outbound_foreign_keys` to avoid the
+        // s76h fix: this VDBE fallback runs the table program via reuse but
+        // does not itself enforce FK. The non-prepared dispatch path enforces
+        // FK after the table program (see Statement::Insert handler); mirror
+        // that here so violations propagate as Err and the autocommit txn
+        // rolls back the bad row. (Single-row VALUES FK inserts now stay on
+        // the direct-simple lane with its own post-insert FK enforcement —
+        // #111 — so this fallback FK path now covers the non-direct shapes:
+        // multi-row VALUES, INSERT … SELECT, and any other NotImplemented
+        // case.) Gate on `table_has_outbound_foreign_keys` to avoid the
         // `collect_insert_trigger_rows` re-evaluation cost when the table
         // has no FKs and the fallback fired for a non-FK NotImplemented case.
         // OR IGNORE PK-conflict rows are dropped by the table program
@@ -18939,17 +18940,28 @@ impl Connection {
         }
         self.flush_pending_direct_update_leaf_patch_run(execution_cx)?;
         self.flush_pending_direct_delete_leaf_run(execution_cx)?;
+        let direct_insert_requires_fk_check =
+            self.fk_enforcement_enabled() && self.table_has_outbound_foreign_keys(table_name);
         let track_memdb_delta = self.should_track_prepared_direct_insert_memdb_delta();
         let defer_memdb_upsert =
             track_memdb_delta && self.in_transaction.get() && !self.pager.is_memory();
+        // #111: FK-checked inserts must keep the MemDatabase row mirror EXACT
+        // (apply each landed row's delta) rather than abandoning it. The
+        // post-insert FK existence SELECT reads the parent table through the
+        // memdb on `:memory:`; abandoning the mirror would mark
+        // `memdb_requires_active_txn_reload` and force `fk_validation_query`
+        // to re-hydrate every user table (including the growing child) on the
+        // next insert — O(rows-so-far) per insert, i.e. the O(N^2) regression.
+        // Applying the delta keeps the mirror current and exact so the FK
+        // SELECT finds the parent without a reload. FK inserts already pay for
+        // that SELECT, so the marginal cost of one `upsert_row` is negligible.
         let defer_lazy_memdb_materialization = track_memdb_delta
             && !defer_memdb_upsert
+            && !direct_insert_requires_fk_check
             && (self.pager.is_memory()
                 || (self.retained_autocommit_batch_active()
                     && self.retained_autocommit_stmt_count.get()
                         < self.adaptive_flush_threshold()));
-        let direct_insert_requires_fk_check =
-            self.fk_enforcement_enabled() && self.table_has_outbound_foreign_keys(table_name);
         let can_use_prebuilt_constant_record = direct.prebuilt_constant_record.is_some()
             && (!track_memdb_delta || defer_lazy_memdb_materialization);
         let can_use_prebuilt_constant_record =
@@ -19089,19 +19101,23 @@ impl Connection {
             &FSQLITE_PREPARED_DIRECT_INSERT_ROW_BUILD_TIME_NS,
             row_build_start,
         );
-        if direct_insert_requires_fk_check {
-            if !self.direct_simple_insert_can_precheck_fk(
-                table_name,
-                direct,
-                mem_row_values.as_slice(),
-                explicit_rowid,
-            ) {
-                return Err(FrankenError::NotImplemented(
-                    "direct FK insert falls back for rowid-dependent FK shape".to_owned(),
-                ));
-            }
-            self.check_fk_parent_exists(table_name, mem_row_values.as_slice())?;
-        }
+        // #111: capture the FK row image BEFORE the storage insert. FK
+        // enforcement on the direct lane must run AFTER the row physically
+        // lands (gated on a row actually landing), to match SQLite's
+        // PK-before-FK ordering: a dup-PK conflict (ABORT/FAIL/ROLLBACK) must
+        // win over FK, and OR IGNORE must drop the conflicting row WITHOUT
+        // raising FK. The storage insert below detects the PK conflict and
+        // resolves the conflict clause; a row that survives returns
+        // `Ok(Some(rowid))`. We then FK-check the surviving row. The statement
+        // savepoint (kept for FK tables, see
+        // `prepared_insert_can_skip_statement_savepoint_in_explicit_txn`)
+        // rolls back the just-inserted row AND its applied memdb delta on an
+        // FK Err. Cloning here is required because
+        // `finish_prepared_direct_simple_insert_after_storage` may take/clear
+        // `mem_row_values` (exact-apply / deferred-upsert branches). The clone
+        // is O(columns) and only paid on FK-checked tables.
+        let fk_check_row_values: Option<Vec<SqliteValue>> =
+            direct_insert_requires_fk_check.then(|| mem_row_values.to_vec());
 
         let can_defer_page_run = self.pager.is_memory()
             && self.in_transaction.get()
@@ -19258,6 +19274,28 @@ impl Connection {
         };
         if matches!(result.as_ref(), Ok(Some(_))) {
             self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
+        }
+        // #111: POST-insert FK enforcement. Only fires when a row actually
+        // landed (`Ok(Some(rowid))`) — never for an OR IGNORE drop
+        // (`Ok(None)`) or a PK conflict (`Err`), matching SQLite's
+        // FK-after-PK / OR-IGNORE-drops-FK semantics. The row + its memdb
+        // delta are already applied; on FK violation the surrounding statement
+        // savepoint rolls both back. The just-inserted (and earlier in-flight)
+        // rows are visible to a self-referential FK because the exact mirror
+        // was updated before this check.
+        if let Some(mut fk_row_values) = fk_check_row_values
+            && let Ok(Some(rowid)) = result.as_ref()
+        {
+            // For an implicit (auto-assigned) rowid whose IPK column is itself
+            // an FK child column, the captured clone holds NULL; patch in the
+            // actual assigned rowid so the FK existence check sees the true
+            // value. Explicit rowids already carry their value in the clone.
+            if let Some(ipk_idx) = direct.rowid_alias_col_idx
+                && fk_row_values.get(ipk_idx).is_some_and(SqliteValue::is_null)
+            {
+                fk_row_values[ipk_idx] = SqliteValue::Integer(*rowid);
+            }
+            self.check_fk_parent_exists(table_name, &fk_row_values)?;
         }
         result
     }
@@ -27730,37 +27768,6 @@ impl Connection {
         schema
             .get(idx)
             .is_some_and(|table| !table.foreign_keys.is_empty())
-    }
-
-    fn direct_simple_insert_can_precheck_fk(
-        &self,
-        table_name: &str,
-        direct: &PreparedDirectSimpleInsert,
-        row_values: &[SqliteValue],
-        explicit_rowid: Option<i64>,
-    ) -> bool {
-        if explicit_rowid.is_some() {
-            return false;
-        }
-        let Some(idx) = self.schema_index_of(table_name) else {
-            return false;
-        };
-        let schema = self.schema.borrow();
-        let Some(table) = schema.get(idx) else {
-            return false;
-        };
-        for fk in &table.foreign_keys {
-            if fk.parent_table.eq_ignore_ascii_case(table_name) {
-                return false;
-            }
-            if let Some(ipk_idx) = direct.rowid_alias_col_idx
-                && fk.child_columns.contains(&ipk_idx)
-                && row_values.get(ipk_idx).is_some_and(SqliteValue::is_null)
-            {
-                return false;
-            }
-        }
-        true
     }
 
     fn table_has_foreign_key_work(&self, table_name: &str) -> bool {
