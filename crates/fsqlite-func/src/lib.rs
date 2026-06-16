@@ -109,7 +109,7 @@ pub use collation::{
 };
 pub use datetime::register_datetime_builtins;
 pub use math::register_math_builtins;
-pub use scalar::ScalarFunction;
+pub use scalar::{JSON_SUBTYPE, ScalarFunction};
 pub use vtab::{
     ColumnContext, ConstraintOp, IndexConstraint, IndexConstraintUsage, IndexInfo, IndexOrderBy,
     VirtualTable, VirtualTableCursor,

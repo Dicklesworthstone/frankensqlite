@@ -10959,10 +10959,22 @@ impl Connection {
                 |alias| qualifier.eq_ignore_ascii_case(alias),
             );
             if !qualifier_matches {
+                // When the table is aliased, its original name is no longer a
+                // valid qualifier (C SQLite: `FROM t AS a WHERE t.x ...` →
+                // "no such column: t.x"). Since this fast path requires a
+                // single un-joined table, a non-matching qualifier is
+                // definitively unresolvable, so surface the typed column error
+                // directly instead of deferring to a fallback that would report
+                // a generic internal error.
+                if table_alias.is_some() {
+                    return Err(FrankenError::NoSuchColumn {
+                        name: format!("{qualifier}.{}", col_ref.column),
+                    });
+                }
                 return Ok(None);
             }
         }
-        let (root_page, col_idx, rowid_alias_column_index) = {
+        let (root_page, col_idx, rowid_alias_column_index, column_affinity) = {
             let schema = self.schema.borrow();
             let table = schema
                 .iter()
@@ -10990,7 +11002,12 @@ impl Connection {
                 .borrow()
                 .get(&table.name.to_ascii_lowercase())
                 .copied();
-            (table.root_page, col_idx, rowid_alias)
+            (
+                table.root_page,
+                col_idx,
+                rowid_alias,
+                Self::type_affinity_for_direct_insert(column.affinity),
+            )
         };
         let mut set: std::collections::HashSet<SqliteValueHashable> =
             std::collections::HashSet::with_capacity(literals.len());
@@ -11008,6 +11025,11 @@ impl Connection {
                 Literal::False => SqliteValue::Integer(0),
                 _ => return Ok(None),
             };
+            // C SQLite applies the column's affinity to both sides of an
+            // `x IN (...)` comparison, so `n IN ('1')` (INTEGER column) matches
+            // `n = 1` and `label IN (1)` (TEXT column) matches `label = '1'`.
+            // The probed column value below is coerced with the same affinity.
+            let sv = sv.apply_affinity(column_affinity);
             set.insert(SqliteValueHashable(sv));
         }
         if set.is_empty() {
@@ -11028,7 +11050,8 @@ impl Connection {
                         row_values,
                         col_idx,
                         rowid_alias_column_index,
-                    );
+                    )
+                    .apply_affinity(column_affinity);
                     set.contains(&SqliteValueHashable(val))
                 })
                 .count(),
@@ -20849,6 +20872,7 @@ impl Connection {
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
         skip_statement_savepoint_in_explicit_txn: bool,
+        prebound_publication: Option<BoundPagerPublication>,
         params: Option<&[SqliteValue]>,
     ) -> Option<Result<usize>> {
         if self.in_transaction.get()
@@ -20870,7 +20894,13 @@ impl Connection {
             return None;
         }
 
-        let was_auto = match self.ensure_autocommit_txn_with_publication_hint(execution_cx, None) {
+        // Reuse the publication that the prepared-schema-refresh step already
+        // bound, mirroring the INSERT fast path. Without this the autocommit
+        // begin would re-bind (a second `pager_publication_refresh`) for every
+        // prepared UPDATE/DELETE (bd-db300.5.2.2.4 / T13).
+        let was_auto = match self
+            .ensure_autocommit_txn_with_publication_hint(execution_cx, prebound_publication)
+        {
             Ok(was_auto) => was_auto,
             Err(error) => return Some(Err(error)),
         };
@@ -20976,6 +21006,7 @@ impl Connection {
         // the specific rowid-eq shape we accept. The direct-simple
         // eligibility gate forbids subqueries, function calls, and anything
         // else that could actually observe change tracking.
+        let mut entry_proof = entry_proof;
         let in_txn_confirmed = if entry_proof.microbatch_carry_verified_in_txn {
             self.in_transaction.get()
         } else {
@@ -20994,6 +21025,7 @@ impl Connection {
                     rollback_on_constraint_violation,
                     preserve_prior_changes_on_constraint_violation,
                     skip_statement_savepoint_in_explicit_txn,
+                    entry_proof.publication.take(),
                     params,
                 )
         {
@@ -21803,11 +21835,36 @@ impl Connection {
         result
     }
 
+    /// Commit epoch used for prepared-template cache identity, both on insert
+    /// and on lookup.
+    ///
+    /// When a retained (deferred-finalization) autocommit transaction is pending
+    /// on this connection, the finalized `stable_commit_seq` floor has not yet
+    /// advanced to cover that write even though the template was compiled
+    /// against its (already MemDB-visible) row image. `next_commit_seq` is the
+    /// sequence the retained commit will eventually claim, so folding it in via
+    /// `max` keeps insert and lookup observing the *same* epoch while the
+    /// retained transaction is still pending — without it the insert recorded a
+    /// higher epoch (`next`) than the immediate lookup compared against
+    /// (`stable`), so every freshly inserted template missed and was evicted on
+    /// the very next lookup. Computing the epoch identically on both paths is
+    /// what makes the entry reusable; a cross-connection commit still raises
+    /// `stable_commit_seq` past this value, so the bd-#70 stale-read wedge keeps
+    /// invalidating non-direct-DML plans.
+    fn prepared_cache_commit_epoch(&self) -> u64 {
+        let stable = self.current_global_commit_seq().get();
+        if self.retained_autocommit_txn.borrow().is_some() {
+            stable.max(self.next_commit_seq.load(AtomicOrdering::Acquire))
+        } else {
+            stable
+        }
+    }
+
     fn lookup_prepared_cache(&self, key: u64, sql: &str) -> Option<Arc<PreparedCacheEntry>> {
         let schema_cookie = self.schema_cookie();
         let schema_generation = self.schema_generation();
         let function_registry_generation = self.function_registry_generation();
-        let current_commit_epoch = self.current_global_commit_seq().get();
+        let current_commit_epoch = self.prepared_cache_commit_epoch();
         let mut cache = self.prepared_cache.borrow_mut();
         let entry = cache.get(&key)?;
         if entry.sql == sql
@@ -21832,10 +21889,13 @@ impl Connection {
         sql: &str,
         stmt: &PreparedStatement<'_>,
     ) -> Arc<PreparedCacheEntry> {
-        // bd-#70 plan-cache epoch wedge: snapshot the current finalized
-        // commit epoch so cross-connection commits invalidate the template at
-        // the next lookup (see `matches_cache_identity`).
-        let commit_epoch = self.current_global_commit_seq().get();
+        // bd-#70 plan-cache epoch wedge: snapshot the current finalized commit
+        // epoch so cross-connection commits invalidate the template at the next
+        // lookup (see `matches_cache_identity`). The retained-autocommit fold is
+        // applied identically here and in `lookup_prepared_cache` via
+        // `prepared_cache_commit_epoch`, so a freshly inserted template hits on
+        // its very next lookup while a retained write is still pending.
+        let commit_epoch = self.prepared_cache_commit_epoch();
         let mut cache = self.prepared_cache.borrow_mut();
         let entry = Arc::new(PreparedCacheEntry {
             sql: sql.to_owned(),
@@ -47585,6 +47645,16 @@ impl Connection {
         // the internal join scan can project hidden rowid slots in the same
         // order later aggregation uses.
         let col_map = self.build_join_col_map(select);
+        // Indices that JOIN ... USING / NATURAL JOIN coalesce away, so an
+        // unqualified reference to a shared column (e.g. `GROUP BY dept_id`)
+        // resolves to the single surviving occurrence instead of being
+        // reported ambiguous / not found.
+        let using_skip_indices = self.build_join_using_skip_indices(select);
+        let using_skip: Option<&HashSet<usize>> = if using_skip_indices.is_empty() {
+            None
+        } else {
+            Some(&using_skip_indices)
+        };
 
         // Step 1: Execute the JOIN (SELECT * without GROUP BY/HAVING).
         let mut join_select = select.clone();
@@ -47629,6 +47699,17 @@ impl Connection {
             } else {
                 self.execute_join_select(&join_select, params)?
             };
+
+        // SQLite materializes a join over an un-indexed right table through an
+        // automatic covering index keyed `(join_cols, referenced_non_key_cols,
+        // rowid)`, so within each left/group key the matching right rows arrive
+        // sorted by those columns rather than physical rowid order. Aggregates
+        // like `group_concat` without an in-aggregate ORDER BY observe that
+        // order, so reorder the materialized join rows the same way before
+        // grouping to match the oracle. (No-op when the right source carries no
+        // such key, or is a subquery/view that gets no automatic index.)
+        let mut join_rows = join_rows;
+        self.reorder_grouped_join_rows_as_automatic_index(select, &col_map, &mut join_rows);
 
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
@@ -47816,7 +47897,8 @@ impl Connection {
                 let key: Vec<SqliteValue> = group_by_exprs
                     .iter()
                     .map(|expr| {
-                        eval_join_expr(expr, &row_values, &col_map).unwrap_or(SqliteValue::Null)
+                        eval_join_expr_with_using(expr, &row_values, &col_map, using_skip)
+                            .unwrap_or(SqliteValue::Null)
                     })
                     .collect();
                 let key_hash = HashableJoinKey(
@@ -47841,7 +47923,7 @@ impl Connection {
                     let key: Vec<SqliteValue> = group_by_exprs
                         .iter()
                         .map(|expr| {
-                            eval_join_expr(expr, row.values(), &col_map)
+                            eval_join_expr_with_using(expr, row.values(), &col_map, using_skip)
                                 .unwrap_or(SqliteValue::Null)
                         })
                         .collect();
@@ -47914,11 +47996,11 @@ impl Connection {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (**expr).clone());
-                                eval_join_expr(&inlined, r, &col_map)
+                                eval_join_expr_with_using(&inlined, r, &col_map, using_skip)
                             })?
                         } else {
                             group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
-                                eval_join_expr(expr, r, &col_map)
+                                eval_join_expr_with_using(expr, r, &col_map, using_skip)
                             })?
                         };
                         values.push(val);
@@ -48280,11 +48362,11 @@ impl Connection {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (*expr).clone());
-                                eval_join_expr(&inlined, r, &col_map)
+                                eval_join_expr_with_using(&inlined, r, &col_map, using_skip)
                             })?
                         } else {
                             group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
-                                eval_join_expr(expr, r, &col_map)
+                                eval_join_expr_with_using(expr, r, &col_map, using_skip)
                             })?
                         };
                         row.values.push(val);
@@ -48328,6 +48410,170 @@ impl Connection {
         Ok(result)
     }
 
+    /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
+    /// each left/group key, the right-table rows are visited in the order
+    /// SQLite's automatic covering index would yield: sorted by the join key,
+    /// then the referenced (covered) right-table columns in column order, then
+    /// the right-table rowid. This mirrors C SQLite for order-sensitive
+    /// aggregates (`group_concat` without an in-aggregate `ORDER BY`) over an
+    /// un-indexed right table. Rows are a permutation of the input, so grouping
+    /// and matching are unaffected — only intra-group order changes.
+    fn reorder_grouped_join_rows_as_automatic_index(
+        &self,
+        select: &SelectStatement,
+        col_map: &[(String, String, bool)],
+        join_rows: &mut [Row],
+    ) {
+        if join_rows.len() < 2 {
+            return;
+        }
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having,
+            ..
+        } = &select.body.select
+        else {
+            return;
+        };
+        // Only meaningful when there is at least one join whose right side is a
+        // plain base table; a single un-joined source keeps storage order.
+        if from.joins.is_empty() {
+            return;
+        }
+
+        let mut visible_ctes = Vec::new();
+        if let Some(with) = &select.with {
+            visible_ctes.extend(with.ctes.clone());
+        }
+
+        // Columns referenced anywhere the visitation order is observable.
+        let mut referenced_indices: HashSet<usize> = HashSet::new();
+        let mut record_ref = |col_ref: &ColumnRef| {
+            if let Ok(idx) =
+                find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None)
+            {
+                referenced_indices.insert(idx);
+            }
+        };
+        for column in columns {
+            if let ResultColumn::Expr { expr, .. } = column {
+                for_each_column_ref_in_expr(expr, &mut record_ref);
+            }
+        }
+        if let Some(where_clause) = where_clause {
+            for_each_column_ref_in_expr(where_clause, &mut record_ref);
+        }
+        for expr in group_by {
+            for_each_column_ref_in_expr(expr, &mut record_ref);
+        }
+        if let Some(having) = having {
+            for_each_column_ref_in_expr(having, &mut record_ref);
+        }
+        for term in &select.order_by {
+            for_each_column_ref_in_expr(&term.expr, &mut record_ref);
+        }
+
+        // Walk sources in col_map order, accumulating a list of sort keys:
+        // for every base-table right source, (join-key cols, referenced covered
+        // cols, rowid) by absolute col_map index. The primary source's own
+        // columns lead the sort key so left/group order is preserved.
+        let mut offset = 0usize;
+        let mut sort_indices: Vec<usize> = Vec::new();
+
+        let primary_names = self.source_column_names_for_join_layout(&from.source, &visible_ctes);
+        let primary_width = primary_names.len()
+            + usize::from(
+                self.hidden_rowid_projection_for_source(&from.source, &primary_names)
+                    .is_some(),
+            );
+        // Lead with every primary-source column (visible + rowid) so the left
+        // rows keep their relative scan order across the stable sort.
+        sort_indices.extend(offset..offset + primary_width);
+        offset += primary_width;
+
+        let mut left_visible_names: Vec<String> = primary_names;
+
+        for join in &from.joins {
+            let right_names = self.source_column_names_for_join_layout(&join.table, &visible_ctes);
+            let right_hidden_rowid = self
+                .hidden_rowid_projection_for_source(&join.table, &right_names)
+                .is_some();
+            let right_start = offset;
+            let visible_width = right_names.len();
+            offset += visible_width + usize::from(right_hidden_rowid);
+
+            let is_base_table =
+                matches!(&join.table, TableOrSubquery::Table { .. }) && right_hidden_rowid;
+
+            // Join-key column names for this join.
+            let key_names: Vec<String> = if join.join_type.natural {
+                right_names
+                    .iter()
+                    .filter(|right_name| {
+                        left_visible_names
+                            .iter()
+                            .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
+                    })
+                    .cloned()
+                    .collect()
+            } else if let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref() {
+                cols.clone()
+            } else {
+                Vec::new()
+            };
+
+            if is_base_table {
+                // Key columns first.
+                for key_name in &key_names {
+                    if let Some(local) = right_names
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(key_name))
+                    {
+                        sort_indices.push(right_start + local);
+                    }
+                }
+                // Referenced non-key covered columns, in column order.
+                for (local, _) in right_names.iter().enumerate() {
+                    let abs = right_start + local;
+                    let is_key = key_names
+                        .iter()
+                        .any(|k| right_names[local].eq_ignore_ascii_case(k));
+                    if !is_key && referenced_indices.contains(&abs) {
+                        sort_indices.push(abs);
+                    }
+                }
+                // Rowid tail-breaker.
+                if right_hidden_rowid {
+                    sort_indices.push(right_start + visible_width);
+                }
+            }
+
+            // Right columns become visible to subsequent joins.
+            left_visible_names.extend(right_names);
+        }
+
+        if sort_indices.len() <= primary_width {
+            // No base-table right source contributed an ordering key.
+            return;
+        }
+
+        join_rows.sort_by(|a, b| {
+            for &idx in &sort_indices {
+                let ord = cmp_values_no_affinity(
+                    a.get(idx).unwrap_or(&SqliteValue::Null),
+                    b.get(idx).unwrap_or(&SqliteValue::Null),
+                );
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
     /// Build a col_map with original table labels for a SELECT with JOINs.
     fn build_join_col_map(&self, select: &SelectStatement) -> Vec<(String, String, bool)> {
         let mut col_map = Vec::new();
@@ -48345,6 +48591,78 @@ impl Connection {
             }
         }
         col_map
+    }
+
+    /// Compute the set of `col_map` indices that JOIN ... USING / NATURAL JOIN
+    /// coalesce away (the right-hand duplicate of each shared column). The
+    /// indices line up with the `col_map` produced by [`Self::build_join_col_map`]
+    /// so that an unqualified reference to a USING column resolves to the single
+    /// surviving (left) occurrence instead of being reported ambiguous.
+    fn build_join_using_skip_indices(&self, select: &SelectStatement) -> HashSet<usize> {
+        let mut skip = HashSet::new();
+        let mut visible_ctes = Vec::new();
+        if let Some(with) = &select.with {
+            visible_ctes.extend(with.ctes.clone());
+        }
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            return skip;
+        };
+
+        // Per-source column-name slices in col_map order (hidden rowid columns
+        // are appended after the visible columns, but never participate in
+        // USING/NATURAL coalescing, so we track only the visible names while
+        // advancing the running offset past every appended col_map entry).
+        let mut offset = 0usize;
+        let mut left_visible_names: Vec<String> = Vec::new();
+        let record_source =
+            |source: &TableOrSubquery, offset: &mut usize| -> (usize, Vec<String>) {
+                let names = self.source_column_names_for_join_layout(source, &visible_ctes);
+                let start = *offset;
+                *offset += names.len();
+                if self
+                    .hidden_rowid_projection_for_source(source, &names)
+                    .is_some()
+                {
+                    *offset += 1;
+                }
+                (start, names)
+            };
+
+        let (_, primary_names) = record_source(&from.source, &mut offset);
+        left_visible_names.extend(primary_names);
+
+        for join in &from.joins {
+            let (right_start, right_names) = record_source(&join.table, &mut offset);
+            let using_cols: Vec<String> = if join.join_type.natural {
+                right_names
+                    .iter()
+                    .filter(|right_name| {
+                        left_visible_names
+                            .iter()
+                            .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
+                    })
+                    .cloned()
+                    .collect()
+            } else if let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref() {
+                cols.clone()
+            } else {
+                Vec::new()
+            };
+            for (i, right_name) in right_names.iter().enumerate() {
+                if using_cols
+                    .iter()
+                    .any(|using_col| using_col.eq_ignore_ascii_case(right_name))
+                {
+                    skip.insert(right_start + i);
+                } else {
+                    left_visible_names.push(right_name.clone());
+                }
+            }
+        }
+        skip
     }
 
     fn build_join_col_collations(&self, select: &SelectStatement) -> Vec<Option<String>> {
@@ -54148,31 +54466,15 @@ impl Connection {
                     self.reset_statement_change_count();
                     return Ok(Vec::new());
                 }
-                let col_values: Vec<Vec<SqliteValue>> =
-                    source_rows.into_iter().map(|row| row.values).collect();
-                let table_name = &stripped.table.name;
-                for vals in &col_values {
-                    let placeholders = (0..vals.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                    let conflict = match stripped.or_conflict {
-                        Some(fsqlite_ast::ConflictAction::Replace) => "OR REPLACE ",
-                        Some(fsqlite_ast::ConflictAction::Ignore) => "OR IGNORE ",
-                        Some(fsqlite_ast::ConflictAction::Abort) => "OR ABORT ",
-                        Some(fsqlite_ast::ConflictAction::Fail) => "OR FAIL ",
-                        Some(fsqlite_ast::ConflictAction::Rollback) => "OR ROLLBACK ",
-                        None => "",
-                    };
-                    let insert_sql = if stripped.columns.is_empty() {
-                        format!("INSERT {conflict}INTO {table_name} VALUES ({placeholders})")
-                    } else {
-                        let cols = stripped.columns.join(", ");
-                        format!(
-                            "INSERT {conflict}INTO {table_name} ({cols}) VALUES ({placeholders})"
-                        )
-                    };
-                    self.execute_with_params(&insert_sql, vals)?;
-                }
-                self.record_statement_changes(col_values.len());
-                Ok(Vec::new())
+                // Replay the materialized CTE rows through the per-row INSERT
+                // machinery, which correctly threads the ON CONFLICT/UPSERT
+                // clause and RETURNING (the previous bespoke loop here dropped
+                // both, turning an upsert into a plain INSERT that then hit a
+                // spurious UNIQUE violation).
+                let outcome =
+                    self.execute_insert_select_materialized_rows_outcome(&stripped, &source_rows)?;
+                self.set_statement_change_count(outcome.changes);
+                Ok(outcome.returning_rows)
             } else {
                 self.with_compiled_cache_bypass(|| {
                     self.execute_statement(&Statement::Insert(stripped), params)
@@ -80441,6 +80743,42 @@ fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerF
     }
 }
 
+/// If `expr` is a pseudo-column reference (`NEW.col` / `OLD.col`, or a bare
+/// column resolved against the trigger row) that trigger binding will rewrite
+/// to a literal value, return the column identifier so it can be preserved as
+/// the result column's output name. Returns `None` for anything the binder
+/// would leave untouched (real subquery columns, expressions, etc.).
+fn trigger_result_column_implied_name(
+    expr: &Expr,
+    frame: &TriggerFrame,
+    prefix_only: bool,
+    trigger_table_name_shadowed: bool,
+) -> Option<String> {
+    let Expr::Column(col_ref, _) = expr else {
+        return None;
+    };
+    let table_prefix = col_ref.table.as_deref();
+    if prefix_only {
+        // Only explicit OLD/NEW-qualified refs are rewritten in prefix-only
+        // scopes; bare names resolve against the enclosing query's tables.
+        let is_old_or_new = table_prefix
+            .is_some_and(|p| p.eq_ignore_ascii_case("old") || p.eq_ignore_ascii_case("new"));
+        if !is_old_or_new {
+            return None;
+        }
+    }
+    if trigger_table_name_shadowed
+        && table_prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(&frame.table_name))
+    {
+        return None;
+    }
+    if frame.references_pseudo_column(table_prefix, &col_ref.column) {
+        Some(col_ref.column.to_string())
+    } else {
+        None
+    }
+}
+
 fn bind_trigger_columns_in_result_columns(
     columns: &mut Vec<ResultColumn>,
     frame: &TriggerFrame,
@@ -80451,6 +80789,23 @@ fn bind_trigger_columns_in_result_columns(
     for column in std::mem::take(columns) {
         match column {
             ResultColumn::Expr { mut expr, alias } => {
+                // A bare `NEW.col` / `OLD.col` (or unqualified pseudo-column) in
+                // a SELECT result position projects a column whose output name
+                // is the column identifier (`SELECT NEW.x` -> a column named
+                // `x`, matching C SQLite). Binding rewrites that reference to a
+                // literal value, which would otherwise lose the name and leave
+                // the projected column named after the literal. When the user
+                // gave no explicit alias, capture the implied name first so an
+                // enclosing query (e.g. `SELECT x FROM (SELECT NEW.x) ...`) can
+                // still resolve it after the rewrite.
+                let alias = alias.or_else(|| {
+                    trigger_result_column_implied_name(
+                        &expr,
+                        frame,
+                        prefix_only,
+                        trigger_table_name_shadowed,
+                    )
+                });
                 if prefix_only {
                     bind_trigger_prefixed_only_in_expr(&mut expr, frame);
                 } else {
@@ -80606,10 +80961,19 @@ fn bind_trigger_columns_in_select_core(core: &mut SelectCore, frame: &TriggerFra
             let trigger_table_name_shadowed = from.as_ref().is_some_and(|from_clause| {
                 from_clause_has_visible_source_named(from_clause, &frame.table_name)
             });
+            // A nested SELECT with its own FROM clause introduces a new naming
+            // scope: unqualified column references (e.g. `WHERE id = 1` in
+            // `(SELECT threshold FROM gate WHERE id = 1)`) bind to the
+            // subquery's own tables, NOT to the trigger's NEW/OLD pseudo-row.
+            // Only explicit `NEW.`/`OLD.` references are correlated. Without
+            // this, a bare `id` was rewritten to the firing row's value,
+            // corrupting trigger WHEN/body subqueries (matching C SQLite, which
+            // resolves the inner scope first).
+            let prefix_only = from.is_some();
             bind_trigger_columns_in_result_columns(
                 columns,
                 frame,
-                false,
+                prefix_only,
                 trigger_table_name_shadowed,
             );
             if let Some(from_clause) = from {
@@ -80623,18 +80987,23 @@ fn bind_trigger_columns_in_select_core(core: &mut SelectCore, frame: &TriggerFra
                 bind_trigger_columns_in_expr_inner(
                     predicate,
                     frame,
-                    false,
+                    prefix_only,
                     trigger_table_name_shadowed,
                 );
             }
             for expr in group_by {
-                bind_trigger_columns_in_expr_inner(expr, frame, false, trigger_table_name_shadowed);
+                bind_trigger_columns_in_expr_inner(
+                    expr,
+                    frame,
+                    prefix_only,
+                    trigger_table_name_shadowed,
+                );
             }
             if let Some(predicate) = having {
                 bind_trigger_columns_in_expr_inner(
                     predicate,
                     frame,
-                    false,
+                    prefix_only,
                     trigger_table_name_shadowed,
                 );
             }
@@ -83626,6 +83995,100 @@ fn find_col_in_map(
         Err(FrankenError::Internal(format!(
             "column not found: {col_name}"
         )))
+    }
+}
+
+/// Invoke `visit` for every `ColumnRef` reachable from `expr` (recursively),
+/// including those nested inside function arguments, CASE arms, IN lists, etc.
+/// Subqueries are intentionally NOT descended into: their column references
+/// belong to the subquery's own scope, not the enclosing join.
+fn for_each_column_ref_in_expr(expr: &Expr, visit: &mut impl FnMut(&ColumnRef)) {
+    match expr {
+        Expr::Column(col_ref, _) => visit(col_ref),
+        Expr::BinaryOp { left, right, .. } => {
+            for_each_column_ref_in_expr(left, visit);
+            for_each_column_ref_in_expr(right, visit);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => for_each_column_ref_in_expr(expr, visit),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            for_each_column_ref_in_expr(expr, visit);
+            for_each_column_ref_in_expr(low, visit);
+            for_each_column_ref_in_expr(high, visit);
+        }
+        Expr::In { expr, set, .. } => {
+            for_each_column_ref_in_expr(expr, visit);
+            if let InSet::List(items) = set {
+                for item in items {
+                    for_each_column_ref_in_expr(item, visit);
+                }
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            for_each_column_ref_in_expr(expr, visit);
+            for_each_column_ref_in_expr(pattern, visit);
+            if let Some(escape) = escape {
+                for_each_column_ref_in_expr(escape, visit);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                for_each_column_ref_in_expr(operand, visit);
+            }
+            for (when, then) in whens {
+                for_each_column_ref_in_expr(when, visit);
+                for_each_column_ref_in_expr(then, visit);
+            }
+            if let Some(else_expr) = else_expr {
+                for_each_column_ref_in_expr(else_expr, visit);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    for_each_column_ref_in_expr(item, visit);
+                }
+            }
+            for term in order_by {
+                for_each_column_ref_in_expr(&term.expr, visit);
+            }
+            if let Some(filter) = filter {
+                for_each_column_ref_in_expr(filter, visit);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            for_each_column_ref_in_expr(expr, visit);
+            for_each_column_ref_in_expr(path, visit);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                for_each_column_ref_in_expr(item, visit);
+            }
+        }
+        Expr::Literal(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _) => {}
     }
 }
 

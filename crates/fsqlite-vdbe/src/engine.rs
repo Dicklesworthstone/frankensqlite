@@ -11631,6 +11631,19 @@ impl VdbeEngine {
                         func
                     };
 
+                    // Gather per-argument subtypes (cheap when none are set:
+                    // `has_subtypes` short-circuits before any HashMap probes).
+                    // JSON constructors consume these so a `json('[1]')` argument
+                    // is embedded as a JSON value instead of a quoted string.
+                    let arg_subtypes: smallvec::SmallVec<[u32; 4]> = (0..arg_count)
+                        .map(|i| {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                            let reg = first_arg_reg + i as i32;
+                            self.register_subtype(reg).unwrap_or(0)
+                        })
+                        .collect();
+                    let any_arg_subtype = arg_subtypes.iter().any(|&st| st != 0);
+
                     // Use a direct slice into the register file instead of
                     // allocating a SmallVec via collect_reg_range.  Same pattern as
                     // AggStep.  Falls back to collect_reg_range only when the
@@ -11643,13 +11656,25 @@ impl VdbeEngine {
                         let end_idx = start_idx + arg_count;
                         let args = &self.registers[start_idx..end_idx];
                         observe_execution_cancellation(&self.execution_cx)?;
-                        func.invoke(args)?
+                        if any_arg_subtype {
+                            func.invoke_with_arg_subtypes(args, &arg_subtypes)?
+                        } else {
+                            func.invoke(args)?
+                        }
                     } else {
                         let args = self.collect_reg_range(first_arg_reg, arg_count);
                         observe_execution_cancellation(&self.execution_cx)?;
-                        func.invoke(&args)?
+                        if any_arg_subtype {
+                            func.invoke_with_arg_subtypes(&args, &arg_subtypes)?
+                        } else {
+                            func.invoke(&args)?
+                        }
                     };
                     observe_execution_cancellation(&self.execution_cx)?;
+
+                    // Propagate this function's result subtype (e.g. JSON) to the
+                    // destination register so a nested `json(...)` keeps its tag.
+                    let result_subtype = func.result_subtype();
 
                     if self.trace_opcodes {
                         let result_type = match &result {
@@ -11672,6 +11697,11 @@ impl VdbeEngine {
                     fsqlite_func::record_func_call_count_only();
 
                     self.set_reg(output_reg, result);
+                    // set_reg clears any prior subtype on the destination, so
+                    // (re)apply this function's result subtype afterwards.
+                    if let Some(subtype) = result_subtype {
+                        self.set_register_subtype(output_reg, subtype);
+                    }
                     pc += 1;
                 }
 

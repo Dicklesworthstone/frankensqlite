@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
-    ColumnContext, FunctionRegistry, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor,
+    ColumnContext, FunctionRegistry, IndexInfo, JSON_SUBTYPE, ScalarFunction, VirtualTable,
+    VirtualTableCursor,
 };
 use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
 use serde_json::{Map, Number, Value};
@@ -382,6 +383,28 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
     }
 }
 
+/// Convert a SQL value to a JSON value, honouring the JSON subtype.
+///
+/// When `subtype == JSON_SUBTYPE`, a TEXT (or UTF-8 BLOB/JSONB) argument is
+/// the textual rendering of an existing JSON value (e.g. the result of
+/// `json('[2,3]')`), so it is parsed and embedded verbatim instead of being
+/// quoted as a string. This mirrors C SQLite, which keys this off
+/// `sqlite3_value_subtype()`.
+fn sqlite_to_json_with_subtype(value: &SqliteValue, subtype: u32) -> Result<Value> {
+    if subtype == JSON_SUBTYPE {
+        match value {
+            SqliteValue::Text(text) => return parse_json_text(text),
+            SqliteValue::Blob(bytes) => {
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    return parse_json_text(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    sqlite_to_json(value)
+}
+
 /// Build a JSON array from SQL values.
 pub fn json_array(values: &[SqliteValue]) -> Result<String> {
     let mut out = Vec::with_capacity(values.len());
@@ -390,6 +413,49 @@ pub fn json_array(values: &[SqliteValue]) -> Result<String> {
     }
     serde_json::to_string(&Value::Array(out))
         .map_err(|error| FrankenError::function_error(format!("json_array encode failed: {error}")))
+}
+
+/// Build a JSON array from SQL values, embedding JSON-subtyped arguments as
+/// parsed JSON values rather than quoting them as strings.
+pub fn json_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Result<String> {
+    let mut out = Vec::with_capacity(values.len());
+    for (i, value) in values.iter().enumerate() {
+        let subtype = subtypes.get(i).copied().unwrap_or(0);
+        out.push(sqlite_to_json_with_subtype(value, subtype)?);
+    }
+    serde_json::to_string(&Value::Array(out))
+        .map_err(|error| FrankenError::function_error(format!("json_array encode failed: {error}")))
+}
+
+/// Build a JSON object from alternating key/value arguments, embedding
+/// JSON-subtyped values as parsed JSON rather than quoting them as strings.
+pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<String> {
+    if args.len() % 2 != 0 {
+        return Err(FrankenError::function_error(
+            "json_object requires an even number of arguments",
+        ));
+    }
+
+    let mut map = Map::with_capacity(args.len() / 2);
+    let mut idx = 0;
+    while idx < args.len() {
+        let key = match &args[idx] {
+            SqliteValue::Text(text) => text.to_string(),
+            _ => {
+                return Err(FrankenError::function_error(
+                    "json_object keys must be text",
+                ));
+            }
+        };
+        let subtype = subtypes.get(idx + 1).copied().unwrap_or(0);
+        let value = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
+        map.insert(key, value);
+        idx += 2;
+    }
+
+    serde_json::to_string(&Value::Object(map)).map_err(|error| {
+        FrankenError::function_error(format!("json_object encode failed: {error}"))
+    })
 }
 
 /// Build a JSON object from alternating key/value SQL arguments.
@@ -2130,6 +2196,10 @@ impl ScalarFunction for JsonFunc {
     fn name(&self) -> &'static str {
         "json"
     }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
+    }
 }
 
 pub struct JsonbFunc;
@@ -2335,12 +2405,25 @@ impl ScalarFunction for JsonArrayFunc {
         Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        let s = json_array_with_subtypes(args, arg_subtypes)?;
+        Ok(SqliteValue::Text(SmallText::from_string(s)))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
 
     fn name(&self) -> &'static str {
         "json_array"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 
@@ -2369,12 +2452,25 @@ impl ScalarFunction for JsonObjectFunc {
         Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        let s = json_object_with_subtypes(args, arg_subtypes)?;
+        Ok(SqliteValue::Text(SmallText::from_string(s)))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
 
     fn name(&self) -> &'static str {
         "json_object"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 

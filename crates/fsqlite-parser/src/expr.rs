@@ -331,6 +331,23 @@ impl Parser {
             TokenKind::KwReplace if matches!(self.peek_kind(), TokenKind::LeftParen) => {
                 self.parse_function_call("replace".to_owned(), tok.span)
             }
+            // C SQLite exposes the pattern-matching operators as scalar
+            // functions too: `like(P, X [, E])`, `glob(P, X)`,
+            // `regexp(P, X)`, `match(P, X)`. The token doubles as an infix
+            // operator, so only treat it as a function name when directly
+            // followed by `(`.
+            TokenKind::KwLike if matches!(self.peek_kind(), TokenKind::LeftParen) => {
+                self.parse_function_call("like".to_owned(), tok.span)
+            }
+            TokenKind::KwGlob if matches!(self.peek_kind(), TokenKind::LeftParen) => {
+                self.parse_function_call("glob".to_owned(), tok.span)
+            }
+            TokenKind::KwRegexp if matches!(self.peek_kind(), TokenKind::LeftParen) => {
+                self.parse_function_call("regexp".to_owned(), tok.span)
+            }
+            TokenKind::KwMatch if matches!(self.peek_kind(), TokenKind::LeftParen) => {
+                self.parse_function_call("match".to_owned(), tok.span)
+            }
 
             // ── Non-reserved keywords usable as identifiers ─────────────
             // In SQL, non-reserved keywords (like KEY, MATCH, FIRST, etc.)

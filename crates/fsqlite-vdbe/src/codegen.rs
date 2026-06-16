@@ -8143,6 +8143,11 @@ fn codegen_select_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
+    // Resolve SELECT-list aliases referenced from HAVING (e.g.
+    // `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100`).
+    let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
+    let having = rewritten_having.as_ref();
+
     if where_clause.is_none()
         && having.is_none()
         && let Some(plan) = simple_count_star_plus_sum_plan(columns, table, table_alias)
@@ -9570,6 +9575,126 @@ fn parse_group_by_output(
     Ok((output_cols, group_by_keys, agg_columns))
 }
 
+/// Rewrite a HAVING clause so that bare references to SELECT-list output
+/// aliases are replaced by the underlying SELECT expression.
+///
+/// C SQLite resolves a name in HAVING against the FROM tables first, and only
+/// when it is not a real table column does it bind to a SELECT-list alias. For
+/// example `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100` means
+/// `HAVING SUM(qty) > 100`. Without this rewrite the bare `total_qty` reference
+/// resolves to neither a table column nor a group key and silently becomes
+/// NULL, dropping every row. We deliberately keep table columns taking
+/// precedence over aliases to match SQLite's binding order.
+fn rewrite_having_select_aliases(
+    expr: &Expr,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+) -> Expr {
+    match expr {
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+            let name = col_ref.column.as_ref();
+            // A real table column always wins over a SELECT alias.
+            if table.column_index(name).is_some() || table.resolves_to_hidden_rowid(name) {
+                return expr.clone();
+            }
+            // Find a SELECT-list column whose alias matches (case-insensitive,
+            // like SQLite identifier matching).
+            for col in columns {
+                if let ResultColumn::Expr {
+                    expr: select_expr,
+                    alias: Some(alias),
+                } = col
+                {
+                    if alias.eq_ignore_ascii_case(name) {
+                        // Substitute the underlying SELECT expression, then keep
+                        // walking it for further nested aliases.
+                        return rewrite_having_select_aliases(select_expr, columns, table);
+                    }
+                }
+            }
+            expr.clone()
+        }
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(rewrite_having_select_aliases(left, columns, table)),
+            op: *op,
+            right: Box::new(rewrite_having_select_aliases(right, columns, table)),
+            span: *span,
+        },
+        Expr::UnaryOp { op, expr, span } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            span: *span,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            low: Box::new(rewrite_having_select_aliases(low, columns, table)),
+            high: Box::new(rewrite_having_select_aliases(high, columns, table)),
+            not: *not,
+            span: *span,
+        },
+        Expr::IsNull { expr, not, span } => Expr::IsNull {
+            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            not: *not,
+            span: *span,
+        },
+        Expr::Collate {
+            expr,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            collation: collation.clone(),
+            span: *span,
+        },
+        Expr::Cast {
+            expr,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(rewrite_having_select_aliases(o, columns, table))),
+            whens: whens
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_having_select_aliases(w, columns, table),
+                        rewrite_having_select_aliases(t, columns, table),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|e| Box::new(rewrite_having_select_aliases(e, columns, table))),
+            span: *span,
+        },
+        // Leave aggregate calls and everything else untouched: an aggregate's
+        // own arguments reference table columns, never SELECT-list aliases.
+        _ => expr.clone(),
+    }
+}
+
 /// Walk a HAVING expression to find aggregate function calls and add any that
 /// are not already present in `agg_columns` / `output_cols`.  This ensures that
 /// aggregates referenced only in HAVING (not in the SELECT list) still get
@@ -9723,6 +9848,11 @@ fn codegen_select_group_by_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
+    // Resolve SELECT-list aliases referenced from HAVING (e.g.
+    // `SELECT product_id, SUM(qty) AS total_qty ... HAVING total_qty >= 10`).
+    let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
+    let having = rewritten_having.as_ref();
+
     if where_clause.is_none()
         && having.is_none()
         && limit_clause.is_none()
@@ -12091,13 +12221,17 @@ pub fn codegen_update(
         }
     }
 
-    // Index maintenance (bd-2f9t): Delete OLD index entries BEFORE updating values.
-    // col_regs currently contains OLD column values.
-    emit_index_deletes_for_update(b, table, table_cursor, &update_index_mask);
-
     // Evaluate new values from AST expressions and overwrite changed columns.
     // A ScanCtx is required so that column references in SET expressions
     // (e.g., `SET val = val + 5`) resolve to the cursor's current row.
+    //
+    // NOTE: index deletes and the row Delete are deferred until AFTER constraint
+    // validation below. Index key terms and the old indexed values are read
+    // straight from the table cursor (which still points at the unchanged old
+    // row), so deferring them is safe — and it is *required* so that an
+    // `UPDATE OR IGNORE` whose new row fails a CHECK / NOT NULL constraint can
+    // skip the row without having already destroyed it (matching C SQLite,
+    // which validates constraints before applying any mutation).
     let update_ctx = ScanCtx {
         cursor: table_cursor,
         table,
@@ -12109,6 +12243,33 @@ pub fn codegen_update(
     // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
     b.set_next_anon_placeholder(1);
     emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
+
+    // Recompute STORED generated columns and validate constraints on the NEW
+    // row image BEFORE any destructive mutation, so OR IGNORE can bail out
+    // cleanly. (A second `emit_stored_generated_columns` is intentionally NOT
+    // emitted later — the values computed here are reused for MakeRecord.)
+    emit_stored_generated_columns(b, table, col_regs);
+    // For UPDATE OR IGNORE, a failing CHECK or NOT NULL constraint must skip
+    // this row silently rather than aborting the statement (C SQLite
+    // semantics). Route the skip to the next matched row: the full-scan apply
+    // loop re-enters via `apply_seek_miss_label` (which Gotos `apply_loop`),
+    // while a single rowid-target update simply jumps to `apply_done_label`.
+    let constraint_ignore_label = if matches!(
+        stmt.or_conflict.as_ref(),
+        Some(ConflictAction::Ignore)
+    ) {
+        Some(apply_seek_miss_label.unwrap_or(apply_done_label))
+    } else {
+        None
+    };
+    emit_strict_type_check(b, table, col_regs);
+    emit_check_constraints(b, table, col_regs, constraint_ignore_label);
+    emit_not_null_constraints(b, table, col_regs, constraint_ignore_label);
+
+    // Constraints passed: now perform the destructive delete+insert rewrite.
+    // Index maintenance (bd-2f9t): Delete OLD index entries. The indexed key
+    // terms are re-read from the table cursor's still-current old row.
+    emit_index_deletes_for_update(b, table, table_cursor, &update_index_mask);
 
     // UPDATE is delete+insert: remove the current row first, then insert the
     // rewritten record (possibly at a new rowid).
@@ -12154,13 +12315,9 @@ pub fn codegen_update(
         b.resolve_label(rowid_done_label);
     }
 
-    // Recompute STORED generated columns after SET assignments.
-    emit_stored_generated_columns(b, table, col_regs);
-
-    // MakeRecord with ALL columns.
-    emit_strict_type_check(b, table, col_regs);
-    emit_check_constraints(b, table, col_regs, None);
-    emit_not_null_constraints(b, table, col_regs, None);
+    // STORED generated columns and constraint validation already ran above on
+    // the new row image (before the destructive delete), so MakeRecord can use
+    // col_regs directly.
     // Apply column type affinities before packing the record.
     let aff_str = table.affinity_string();
     let rec_reg = b.alloc_reg();

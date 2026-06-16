@@ -35,9 +35,39 @@ use fsqlite_types::SqliteValue;
 ///   for domain errors (e.g. `abs(i64::MIN)`).
 /// - Return [`FrankenError::TooBig`](fsqlite_error::FrankenError::TooBig)
 ///   if the result exceeds `SQLITE_MAX_LENGTH`.
+/// SQLite's JSON subtype tag (`'J'` = 74), attached to TEXT/BLOB values
+/// produced by JSON functions so downstream JSON constructors embed them as
+/// parsed JSON rather than quoting them as ordinary strings.
+pub const JSON_SUBTYPE: u32 = 74;
+
 pub trait ScalarFunction: Send + Sync {
     /// Execute this function on the given arguments.
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue>;
+
+    /// Execute this function with knowledge of each argument's value subtype
+    /// (e.g. [`JSON_SUBTYPE`] for values returned by JSON functions).
+    ///
+    /// The default ignores subtypes and delegates to [`Self::invoke`]. JSON
+    /// constructors (`json_object`, `json_array`, the JSON mutators) override
+    /// this so a JSON-subtyped TEXT argument is embedded as a JSON value
+    /// instead of being quoted as a plain string — matching C SQLite, which
+    /// keys this behaviour off `sqlite3_value_subtype()`.
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        _arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        self.invoke(args)
+    }
+
+    /// The subtype this function tags onto its result value, if any.
+    ///
+    /// Returns [`JSON_SUBTYPE`] for functions whose result is JSON text so the
+    /// engine can propagate the tag to the destination register. Defaults to
+    /// `None` (no subtype).
+    fn result_subtype(&self) -> Option<u32> {
+        None
+    }
 
     /// Whether this function is deterministic (same inputs → same output).
     ///

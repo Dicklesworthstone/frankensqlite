@@ -312,14 +312,23 @@ impl ScalarFunction for ConcatWsFunc {
         let mut result = String::new();
         let mut has_part = false;
         for arg in &args[1..] {
-            // NULL args are skipped entirely
-            if !arg.is_null() {
-                if has_part {
-                    result.push_str(sep.as_ref());
-                }
-                result.push_str(text_arg(arg).as_ref());
-                has_part = true;
+            // C SQLite skips both NULL args and args whose text rendering is
+            // empty: `concat_ws('|','','x')` yields `'x'` (no leading
+            // separator), and `concat_ws('|','a','','b')` yields `'a|b'`.
+            // Only non-empty parts contribute, and the separator is emitted
+            // only between emitted parts.
+            if arg.is_null() {
+                continue;
             }
+            let part = text_arg(arg);
+            if part.as_ref().is_empty() {
+                continue;
+            }
+            if has_part {
+                result.push_str(sep.as_ref());
+            }
+            result.push_str(part.as_ref());
+            has_part = true;
         }
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
@@ -838,9 +847,14 @@ impl ScalarFunction for RoundFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        // C SQLite: a NULL precision argument makes the whole call NULL
+        // (`round(123.4, NULL)` → NULL), not a default of 0.
+        if args.len() > 1 && args[1].is_null() {
+            return Ok(SqliteValue::Null);
+        }
         let x = args[0].to_float();
         // Clamp N to [0, 30] matching SQLite behavior.
-        let n = if args.len() > 1 && !args[1].is_null() {
+        let n = if args.len() > 1 {
             args[1].to_integer().clamp(0, 30)
         } else {
             0
