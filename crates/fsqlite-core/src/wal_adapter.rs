@@ -9,6 +9,7 @@
 //!   WAL executor's [`CheckpointTarget`] trait (WAL -> pager direction).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
@@ -21,13 +22,14 @@ use fsqlite_pager::{
 };
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
-use fsqlite_types::flags::SyncFlags;
-use fsqlite_vfs::VfsFile;
+use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_vfs::{Vfs, VfsFile};
 use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget,
-    TransactionConflictSnapshot, WalFile, WalGenerationIdentity, execute_checkpoint,
+    TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile, WalGenerationIdentity, WalHeader,
+    WalSalts, execute_checkpoint, validate_wal_header_checksum,
 };
 use tracing::debug;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -1343,6 +1345,270 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 }
 
+/// WAL backend that can recover when the path-visible `-wal` sidecar is
+/// removed or replaced while this process still owns an old file descriptor.
+///
+/// Real SQLite can checkpoint and unlink/reset `db-wal` when it does not know
+/// about a live FrankenSQLite handle. `WalFile::refresh` is intentionally
+/// descriptor-local, so it cannot notice that path-level mutation. This wrapper
+/// performs a path probe before mutable WAL operations and swaps in a freshly
+/// opened/created `WalFile` when the path-visible sidecar no longer matches the
+/// open handle.
+pub struct PathRefreshingWalBackend<V: Vfs>
+where
+    V::File: Send + Sync + 'static,
+{
+    vfs: V,
+    wal_path: PathBuf,
+    page_size: u32,
+    create_missing: bool,
+    inner: WalBackendAdapter<V::File>,
+}
+
+impl<V> PathRefreshingWalBackend<V>
+where
+    V: Vfs + 'static,
+    V::File: Send + Sync + 'static,
+{
+    #[must_use]
+    pub fn new(
+        vfs: V,
+        wal_path: impl AsRef<Path>,
+        page_size: u32,
+        wal: WalFile<V::File>,
+        create_missing: bool,
+    ) -> Self {
+        Self {
+            vfs,
+            wal_path: wal_path.as_ref().to_path_buf(),
+            page_size,
+            create_missing,
+            inner: WalBackendAdapter::new(wal),
+        }
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> WalBackendAdapter<V::File> {
+        self.inner
+    }
+
+    fn replace_inner(&mut self, cx: &Cx, wal: WalFile<V::File>) {
+        let old = std::mem::replace(&mut self.inner, WalBackendAdapter::new(wal));
+        let old_wal = old.into_inner();
+        let _ = old_wal.close(cx);
+    }
+
+    fn create_replacement_wal(&self, cx: &Cx) -> Result<WalFile<V::File>> {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = self.vfs.open(cx, Some(&self.wal_path), flags)?;
+        WalFile::create(cx, file, self.page_size, 0, WalSalts::default())
+    }
+
+    fn replace_with_created_wal(&mut self, cx: &Cx) -> Result<()> {
+        let wal = self.create_replacement_wal(cx)?;
+        self.replace_inner(cx, wal);
+        Ok(())
+    }
+
+    fn open_replacement_wal(&self, cx: &Cx, path_file: V::File) -> Result<WalFile<V::File>> {
+        let wal = WalFile::open(cx, path_file)?;
+        if u32::try_from(wal.page_size()).ok() != Some(self.page_size) {
+            let actual_page_size = wal.page_size();
+            let expected_page_size = self.page_size;
+            let _ = wal.close(cx);
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL page size {actual_page_size} does not match database page size {expected_page_size} during path refresh"
+                ),
+            });
+        }
+        Ok(wal)
+    }
+
+    fn path_header_matches_current_handle(&self, cx: &Cx, path_file: &V::File) -> Result<bool> {
+        let mut header_buf = [0_u8; WAL_HEADER_SIZE];
+        let bytes_read = path_file.read(cx, &mut header_buf, 0)?;
+        if bytes_read < WAL_HEADER_SIZE {
+            return Ok(false);
+        }
+
+        let path_header = WalHeader::from_bytes(&header_buf)?;
+        if !validate_wal_header_checksum(&header_buf, path_header.big_endian_checksum())? {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL header checksum mismatch during path refresh".to_owned(),
+            });
+        }
+
+        let current_header = self.inner.inner().header();
+        Ok(path_header.magic == current_header.magic
+            && path_header.format_version == current_header.format_version
+            && path_header.page_size == current_header.page_size
+            && path_header.checkpoint_seq == current_header.checkpoint_seq
+            && path_header.salts == current_header.salts)
+    }
+
+    fn ensure_current_wal_path(&mut self, cx: &Cx) -> Result<()> {
+        if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
+            if self.create_missing {
+                return self.replace_with_created_wal(cx);
+            }
+            return Ok(());
+        }
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (mut path_file, _) = self.vfs.open(cx, Some(&self.wal_path), flags)?;
+        let path_size = path_file.file_size(cx)?;
+        if path_size < u64::try_from(WAL_HEADER_SIZE).unwrap_or(32) {
+            let _ = path_file.close(cx);
+            if self.create_missing {
+                return self.replace_with_created_wal(cx);
+            }
+            return Ok(());
+        }
+
+        let current_size = self.inner.inner().file().file_size(cx).unwrap_or(u64::MAX);
+        let path_matches_current = if path_size == current_size {
+            match self.path_header_matches_current_handle(cx, &path_file) {
+                Ok(matches) => matches,
+                Err(err) => {
+                    let _ = path_file.close(cx);
+                    return Err(err);
+                }
+            }
+        } else {
+            false
+        };
+        if !path_matches_current {
+            let wal = self.open_replacement_wal(cx, path_file)?;
+            self.replace_inner(cx, wal);
+        } else {
+            let _ = path_file.close(cx);
+        }
+        Ok(())
+    }
+}
+
+impl<V> WalBackend for PathRefreshingWalBackend<V>
+where
+    V: Vfs + 'static,
+    V::File: Send + Sync + 'static,
+{
+    fn begin_transaction(&mut self, cx: &Cx) -> Result<()> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.begin_transaction(cx)
+    }
+
+    fn published_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        Some(self.inner.published_snapshot())
+    }
+
+    fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        self.inner.pinned_read_snapshot()
+    }
+
+    fn refresh_published_snapshot(&mut self, cx: &Cx) -> Result<Option<WalPublicationSnapshot>> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.refresh_published_snapshot(cx).map(Some)
+    }
+
+    fn append_frame(
+        &mut self,
+        cx: &Cx,
+        page_number: u32,
+        page_data: &[u8],
+        db_size_if_commit: u32,
+    ) -> Result<()> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner
+            .append_frame(cx, page_number, page_data, db_size_if_commit)
+    }
+
+    fn append_frames(&mut self, cx: &Cx, frames: &[WalFrameRef<'_>]) -> Result<()> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.append_frames(cx, frames)
+    }
+
+    fn prepare_append_frames(
+        &self,
+        frames: &[WalFrameRef<'_>],
+    ) -> Result<Option<PreparedWalFrameBatch>> {
+        self.inner.prepare_append_frames(frames)
+    }
+
+    fn finalize_prepared_frames(
+        &self,
+        cx: &Cx,
+        prepared: &mut PreparedWalFrameBatch,
+    ) -> Result<()> {
+        self.inner.finalize_prepared_frames(cx, prepared)
+    }
+
+    fn append_prepared_frames(
+        &mut self,
+        cx: &Cx,
+        prepared: &mut PreparedWalFrameBatch,
+    ) -> Result<()> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.append_prepared_frames(cx, prepared)
+    }
+
+    fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.read_page(cx, page_number)
+    }
+
+    fn read_page_pinned(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
+        self.inner.read_page_pinned(cx, page_number)
+    }
+
+    fn supports_pinned_reads(&self) -> bool {
+        self.inner.supports_pinned_reads()
+    }
+
+    fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.committed_txns_since_page(cx, page_number)
+    }
+
+    fn conflicting_pages_since_snapshot(
+        &mut self,
+        cx: &Cx,
+        snapshot: TransactionConflictSnapshot,
+        page_numbers: &[u32],
+    ) -> Result<Vec<u32>> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner
+            .conflicting_pages_since_snapshot(cx, snapshot, page_numbers)
+    }
+
+    fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.committed_txn_count(cx)
+    }
+
+    fn sync(&mut self, cx: &Cx) -> Result<()> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner.sync(cx)
+    }
+
+    fn frame_count(&self) -> usize {
+        self.inner.frame_count()
+    }
+
+    fn checkpoint(
+        &mut self,
+        cx: &Cx,
+        mode: CheckpointMode,
+        writer: &mut dyn CheckpointPageWriter,
+        backfilled_frames: u32,
+        oldest_reader_frame: Option<u32>,
+    ) -> Result<CheckpointResult> {
+        self.ensure_current_wal_path(cx)?;
+        self.inner
+            .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+    }
+}
+
 /// Adapter wrapping a `&mut dyn CheckpointPageWriter` to implement `CheckpointTarget`.
 ///
 /// This is used internally by `WalBackendAdapter::checkpoint` to bridge the
@@ -1566,6 +1832,55 @@ mod tests {
             adapter2.frame_count(),
             2,
             "shared WAL should contain both commit frames"
+        );
+    }
+
+    #[test]
+    fn test_path_refresh_rejects_replacement_wal_page_size_mismatch() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let wal_path = std::path::Path::new("test.db-wal");
+
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut backend =
+            PathRefreshingWalBackend::new(vfs.clone(), wal_path, PAGE_SIZE, wal, true);
+
+        backend
+            .append_frame(&cx, 1, &sample_page(0x31), 1)
+            .expect("append through live backend");
+        backend.sync(&cx).expect("sync live backend");
+
+        vfs.delete(&cx, wal_path, false)
+            .expect("remove path-visible WAL");
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (replacement_file, _) = vfs
+            .open(&cx, Some(wal_path), flags)
+            .expect("open replacement WAL path");
+        let replacement_page_size = PAGE_SIZE
+            .checked_mul(2)
+            .expect("test replacement page size fits u32");
+        let replacement_wal = WalFile::create(
+            &cx,
+            replacement_file,
+            replacement_page_size,
+            0,
+            test_salts(),
+        )
+        .expect("create mismatched replacement WAL");
+        replacement_wal.close(&cx).expect("close replacement WAL");
+
+        let err = backend
+            .begin_transaction(&cx)
+            .expect_err("path refresh should reject mismatched WAL page size");
+        assert!(
+            matches!(
+                err,
+                FrankenError::WalCorrupt { ref detail }
+                    if detail.contains("does not match database page size")
+                        && detail.contains("during path refresh")
+            ),
+            "unexpected error: {err:?}"
         );
     }
 

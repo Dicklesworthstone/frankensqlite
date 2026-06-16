@@ -207,7 +207,7 @@ use fsqlite_observability::{
 use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 
 use crate::region::{RegionKind, RegionTree, TaskHandle};
-use crate::wal_adapter::WalBackendAdapter;
+use crate::wal_adapter::{PathRefreshingWalBackend, WalBackendAdapter};
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 const WRITE_COORDINATOR_SERVICE_BEAD_ID: &str = "bd-2jpu6.4";
@@ -2572,22 +2572,22 @@ impl PagerBackend {
         match self {
             Self::Memory(p) => {
                 let vfs = p.vfs_handle();
-                install_wal_backend_with_vfs(p, vfs.as_ref(), cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs.as_ref().clone(), cx, &wal_path)
             }
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs, cx, &wal_path)
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs, cx, &wal_path)
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+                install_wal_backend_with_vfs(p, vfs, cx, &wal_path)
             }
         }
     }
@@ -2604,7 +2604,7 @@ impl PagerBackend {
                 let vfs = p.vfs_handle();
                 install_existing_wal_backend_with_vfs(
                     p,
-                    vfs.as_ref(),
+                    vfs.as_ref().clone(),
                     cx,
                     &wal_path,
                     allow_readonly,
@@ -2613,17 +2613,17 @@ impl PagerBackend {
             #[cfg(all(feature = "native", target_os = "linux"))]
             Self::IoUring(p) => {
                 let vfs = IoUringVfs::new();
-                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
+                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly)
             }
             #[cfg(all(feature = "native", unix))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
-                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
+                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly)
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
-                install_existing_wal_backend_with_vfs(p, &vfs, cx, &wal_path, allow_readonly)
+                install_existing_wal_backend_with_vfs(p, vfs, cx, &wal_path, allow_readonly)
             }
         }
     }
@@ -2802,6 +2802,41 @@ fn wal_path_for_db_path(path: &str) -> PathBuf {
 fn install_opened_wal_backend<V>(
     pager: &Arc<SimplePager<V>>,
     cx: &Cx,
+    vfs: V,
+    wal_path: &Path,
+    wal: WalFile<V::File>,
+    create_missing: bool,
+) -> Result<()>
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    let expected_page_size = pager.page_size().get();
+    if u32::try_from(wal.page_size()).ok() != Some(expected_page_size) {
+        let actual_page_size = wal.page_size();
+        let _ = wal.close(cx);
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "WAL page size {actual_page_size} does not match database page size {expected_page_size}"
+            ),
+        });
+    }
+    let adapter =
+        PathRefreshingWalBackend::new(vfs, wal_path, expected_page_size, wal, create_missing);
+    match pager.set_wal_backend_owned(adapter) {
+        Ok(()) => Ok(()),
+        Err((err, adapter)) => {
+            let adapter = adapter.into_inner();
+            let wal = adapter.into_inner();
+            let _ = wal.close(cx);
+            Err(err)
+        }
+    }
+}
+
+fn install_opened_wal_backend_bare<V>(
+    pager: &Arc<SimplePager<V>>,
+    cx: &Cx,
     wal: WalFile<V::File>,
 ) -> Result<()>
 where
@@ -2831,7 +2866,7 @@ where
 
 fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
-    vfs: &V,
+    vfs: V,
     cx: &Cx,
     wal_path: &Path,
 ) -> Result<()>
@@ -2844,7 +2879,7 @@ where
         let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
             match WalFile::open(cx, file) {
-                Ok(wal) => return install_opened_wal_backend(pager, cx, wal),
+                Ok(wal) => return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true),
                 Err(err) => return Err(err),
             }
         }
@@ -2854,12 +2889,12 @@ where
     let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
     let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::default())?;
-    install_opened_wal_backend(pager, cx, wal)
+    install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true)
 }
 
 fn install_existing_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
-    vfs: &V,
+    vfs: V,
     cx: &Cx,
     wal_path: &Path,
     allow_readonly: bool,
@@ -2898,7 +2933,11 @@ where
     }
 
     let wal = WalFile::open(cx, file)?;
-    install_opened_wal_backend(pager, cx, wal)?;
+    if allow_readonly {
+        install_opened_wal_backend_bare(pager, cx, wal)?;
+    } else {
+        install_opened_wal_backend(pager, cx, vfs, wal_path, wal, false)?;
+    }
     Ok(true)
 }
 
@@ -116609,7 +116648,7 @@ mod tests {
         );
         let wal_path = wal_path_for_db_path("/wal_page_size.db");
 
-        super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+        super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
             .expect("install wal backend");
 
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
@@ -116635,7 +116674,7 @@ mod tests {
         file.write(&cx, &[0_u8; 32], 0).unwrap();
         file.close(&cx).unwrap();
 
-        let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+        let err = super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
             .expect_err("header-sized corrupt WAL should be surfaced");
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
@@ -116665,7 +116704,7 @@ mod tests {
         .unwrap();
         wal.close(&cx).unwrap();
 
-        let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+        let err = super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
             .expect_err("existing WAL with mismatched page size must be rejected");
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
@@ -116691,9 +116730,10 @@ mod tests {
         wal_file.write(&cx, &[0_u8; 32], 0).unwrap();
         wal_file.close(&cx).unwrap();
 
-        let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path).expect_err(
-            "read-write WAL install should fail instead of silently retrying read-only",
-        );
+        let err = super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
+            .expect_err(
+                "read-write WAL install should fail instead of silently retrying read-only",
+            );
         assert!(
             matches!(err, FrankenError::CannotOpen { .. }),
             "unexpected error: {err:?}"

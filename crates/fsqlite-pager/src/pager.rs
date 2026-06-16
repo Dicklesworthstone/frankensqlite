@@ -1640,6 +1640,17 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// generation changes, the main DB header must be read again before the
     /// cached base counter can be trusted.
     committed_wal_generation: Option<WalGenerationIdentity>,
+    /// Visible WAL commit count paired with the cached base counter. External
+    /// checkpoints can move commits from WAL into the main database while the
+    /// summed visible commit sequence stays the same; this keeps that physical
+    /// composition change observable to cache invalidation.
+    committed_wal_visible_commit_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommittedStateRefresh {
+    wal_snapshot_initialized: bool,
+    page_cache_invalidated: bool,
 }
 
 impl<F: VfsFile> PagerInner<F> {
@@ -1767,8 +1778,12 @@ impl<F: VfsFile> PagerInner<F> {
         &mut self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
-    ) -> Result<(CommitSeq, u64, bool)> {
+    ) -> Result<(CommitSeq, u64, bool, bool)> {
         let file_size = self.db_file.file_size(cx)?;
+        let previous_file_size = self.committed_db_file_size_bytes;
+        let previous_db_change_counter = self.committed_db_change_counter;
+        let previous_wal_generation = self.committed_wal_generation;
+        let previous_wal_visible_commit_count = self.committed_wal_visible_commit_count;
         let (wal_visible_commit_count, wal_generation) = if self.journal_mode == JournalMode::Wal {
             with_wal_backend(wal_backend, |wal| {
                 wal.begin_transaction(cx)?;
@@ -1819,25 +1834,40 @@ impl<F: VfsFile> PagerInner<F> {
         };
         let visible_commit_seq =
             CommitSeq::new(base_change_counter.saturating_add(wal_visible_commit_count));
-        Ok((visible_commit_seq, file_size, wal_snapshot_initialized))
+        let durable_identity_changed = file_size != previous_file_size
+            || base_change_counter != previous_db_change_counter
+            || wal_generation != previous_wal_generation
+            || wal_visible_commit_count != previous_wal_visible_commit_count;
+        self.committed_wal_visible_commit_count = wal_visible_commit_count;
+        Ok((
+            visible_commit_seq,
+            file_size,
+            wal_snapshot_initialized,
+            durable_identity_changed,
+        ))
     }
 
     /// Refresh connection-local pager metadata from the latest committed state.
     ///
-    /// Returns `true` when WAL snapshot setup was already performed as part of
-    /// the refresh and does not need to be repeated for the new transaction.
+    /// Reports whether WAL snapshot setup was performed during the refresh and
+    /// whether the durable identity change invalidated cached page/publication
+    /// entries.
     fn refresh_committed_state(
         &mut self,
         cx: &Cx,
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
-    ) -> Result<bool> {
-        let (new_commit_seq, current_file_size, wal_snapshot_initialized) =
+    ) -> Result<CommittedStateRefresh> {
+        let (new_commit_seq, current_file_size, wal_snapshot_initialized, durable_identity_changed) =
             self.probe_visible_commit_seq(cx, wal_backend)?;
         if new_commit_seq == self.commit_seq
             && current_file_size == self.committed_db_file_size_bytes
+            && !durable_identity_changed
         {
-            return Ok(wal_snapshot_initialized);
+            return Ok(CommittedStateRefresh {
+                wal_snapshot_initialized,
+                page_cache_invalidated: false,
+            });
         }
 
         let page1 = self.read_committed_page_copy(cx, wal_backend, PageNumber::ONE)?;
@@ -1901,13 +1931,17 @@ impl<F: VfsFile> PagerInner<F> {
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
         // durable header baseline plus the visible WAL commit horizon.
-        if new_commit_seq != self.commit_seq {
+        let page_cache_invalidated = new_commit_seq != self.commit_seq || durable_identity_changed;
+        if page_cache_invalidated {
             cache.clear();
         }
         self.commit_seq = new_commit_seq;
         self.committed_db_file_size_bytes = current_file_size;
 
-        Ok(wal_snapshot_initialized)
+        Ok(CommittedStateRefresh {
+            wal_snapshot_initialized,
+            page_cache_invalidated,
+        })
     }
 
     /// Flush page data directly to disk.
@@ -4634,10 +4668,12 @@ where
         if self.vfs.is_memory() {
             let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
             let commit_seq_before_refresh = inner.commit_seq;
+            let mut journal_visibility_invalidation = false;
+            let mut refresh_page_cache_invalidated = false;
             if active_transactions_before_begin == 0 {
                 let journal_path = Self::journal_path(&self.db_path);
                 let journal_exists = self.vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
-                let journal_visibility_invalidation = had_recovery_pending || journal_exists;
+                journal_visibility_invalidation = had_recovery_pending || journal_exists;
                 {
                     if inner.rollback_journal_recovery_state.is_pending() || journal_exists {
                         let page_size = inner.page_size;
@@ -4660,9 +4696,15 @@ where
                         self.cache.clear();
                         inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
                     }
-                    inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
+                    let refresh =
+                        inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
+                    refresh_page_cache_invalidated = refresh.page_cache_invalidated;
                 }
+            }
+
+            if active_transactions_before_begin == 0 {
                 let clear_published_pages = journal_visibility_invalidation
+                    || refresh_page_cache_invalidated
                     || inner.commit_seq != commit_seq_before_refresh;
                 // D1-CRITICAL Change 3: Use sharded publish_clear_if.
                 self.published.publish_clear_if(
@@ -4755,7 +4797,7 @@ where
         }
 
         let mut journal_visibility_invalidation = false;
-        let wal_snapshot_initialized = if active_transactions_before_begin == 0 {
+        let committed_refresh = if active_transactions_before_begin == 0 {
             let journal_path = Self::journal_path(&self.db_path);
             let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
                 Ok(exists) => exists,
@@ -4802,12 +4844,16 @@ where
                 }
             }
         } else {
-            false
+            CommittedStateRefresh {
+                wal_snapshot_initialized: false,
+                page_cache_invalidated: false,
+            }
         };
 
         if active_transactions_before_begin == 0 {
-            let clear_published_pages =
-                journal_visibility_invalidation || inner.commit_seq != commit_seq_before_refresh;
+            let clear_published_pages = journal_visibility_invalidation
+                || committed_refresh.page_cache_invalidated
+                || inner.commit_seq != commit_seq_before_refresh;
             // D1-CRITICAL Change 3: Use sharded publish_clear_if.
             self.published.publish_clear_if(
                 cx,
@@ -4874,7 +4920,7 @@ where
             inner.writer_active = true;
         }
 
-        if inner.journal_mode == JournalMode::Wal && !wal_snapshot_initialized {
+        if inner.journal_mode == JournalMode::Wal && !committed_refresh.wal_snapshot_initialized {
             let wal_begin_result =
                 with_wal_backend(&self.wal_backend, |wal| wal.begin_transaction(cx));
             if let Err(err) = wal_begin_result {
@@ -5352,13 +5398,18 @@ where
         if recovered_or_invalidated_journal {
             self.cache.clear();
         }
-        if let Err(err) = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend) {
-            let _ = inner.db_file.unlock(cx, LockLevel::None);
-            return Err(err);
-        }
+        let refresh = match inner.refresh_committed_state(cx, &self.cache, &self.wal_backend) {
+            Ok(refresh) => refresh,
+            Err(err) => {
+                let _ = inner.db_file.unlock(cx, LockLevel::None);
+                return Err(err);
+            }
+        };
 
-        let clear_published_pages =
-            had_recovery_pending || journal_exists || inner.commit_seq != commit_seq_before_refresh;
+        let clear_published_pages = had_recovery_pending
+            || journal_exists
+            || refresh.page_cache_invalidated
+            || inner.commit_seq != commit_seq_before_refresh;
         // D1-CRITICAL Change 3: Use sharded publish_clear_if.
         self.published.publish_clear_if(
             cx,
@@ -5405,7 +5456,7 @@ where
         }
 
         let commit_seq_before_refresh = inner.commit_seq;
-        inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
+        let refresh = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
         self.published.publish_clear_if(
             cx,
             PublishedPagerUpdate {
@@ -5415,7 +5466,7 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             },
-            inner.commit_seq != commit_seq_before_refresh,
+            refresh.page_cache_invalidated || inner.commit_seq != commit_seq_before_refresh,
         );
 
         Ok(self.published.snapshot())
@@ -5815,6 +5866,7 @@ where
                 committed_db_file_size_bytes: file_size,
                 committed_db_change_counter: u64::from(header.change_counter),
                 committed_wal_generation: None,
+                committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
@@ -6006,6 +6058,7 @@ where
                     .as_ref()
                     .map_or(0, |header| u64::from(header.change_counter)),
                 committed_wal_generation: None,
+                committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
             cache: Arc::new(cache),
