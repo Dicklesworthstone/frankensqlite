@@ -359,8 +359,18 @@ mod tests {
     use asupersync::types::CancelReason as AsCancelReason;
     use fsqlite_types::cx::Cx;
 
+    /// Build a `Cx` with an attached native asupersync `Cx`.
+    ///
+    /// The production `AsupersyncCodec` (bd-3sj9w) requires either an attached
+    /// native `Cx` or an ambient asupersync runtime `Cx` to encode/decode — a
+    /// bare `Cx::default()` makes every `encode_pages`/`decode_pages` call fail
+    /// with `Internal("bd-3sj9w: ...requires an attached native Cx...")`.  Tests
+    /// run outside an asupersync runtime, so they must attach one explicitly,
+    /// exactly as `raptorq_codec::tests::test_cx` does.
     fn test_cx() -> Cx {
-        Cx::default()
+        let cx = Cx::new();
+        cx.set_native_cx(AsCx::for_testing());
+        cx
     }
 
     fn sample_page(seed: u8, size: usize) -> Vec<u8> {
@@ -522,6 +532,11 @@ mod tests {
         let mut hook = FecCommitHook::new(default_config()).unwrap();
 
         let aborted_cx = Cx::new();
+        // Attach a native Cx so the codec reaches its cancellation path (the
+        // production codec requires one); `set_native_cx` mirrors the local
+        // cancel onto the native, so the encode aborts rather than failing the
+        // bd-3sj9w "missing native Cx" precondition.
+        aborted_cx.set_native_cx(AsCx::for_testing());
         aborted_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
 
         hook.on_frame(&aborted_cx, 1, &sample_page(0x10, 512), 0)
