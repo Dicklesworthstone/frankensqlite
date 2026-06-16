@@ -14,7 +14,11 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-#[cfg(all(feature = "nightly-simd", target_arch = "x86_64", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "nightly-simd",
+    target_arch = "x86_64",
+    not(target_arch = "wasm32")
+))]
 use std::simd::{
     Simd,
     cmp::{SimdPartialEq, SimdPartialOrd},
@@ -1191,19 +1195,31 @@ fn scalar_integer_encoding(value: i64) -> IntegerEncoding {
     IntegerEncoding::from_serial_type(serial_type)
 }
 
-#[cfg(all(feature = "nightly-simd", target_arch = "x86_64", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "nightly-simd",
+    target_arch = "x86_64",
+    not(target_arch = "wasm32")
+))]
 #[inline]
 fn avx2_available() -> bool {
     std::arch::is_x86_feature_detected!("avx2")
 }
 
-#[cfg(not(all(feature = "nightly-simd", target_arch = "x86_64", not(target_arch = "wasm32"))))]
+#[cfg(not(all(
+    feature = "nightly-simd",
+    target_arch = "x86_64",
+    not(target_arch = "wasm32")
+)))]
 #[inline]
 const fn avx2_available() -> bool {
     false
 }
 
-#[cfg(all(feature = "nightly-simd", target_arch = "x86_64", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "nightly-simd",
+    target_arch = "x86_64",
+    not(target_arch = "wasm32")
+))]
 #[inline]
 fn classify_integer_block_simd(values: [i64; 4]) -> [IntegerEncoding; 4] {
     let values = Simd::<i64, 4>::from_array(values);
@@ -1247,7 +1263,11 @@ fn classify_integer_block_simd(values: [i64; 4]) -> [IntegerEncoding; 4] {
     })
 }
 
-#[cfg(not(all(feature = "nightly-simd", target_arch = "x86_64", not(target_arch = "wasm32"))))]
+#[cfg(not(all(
+    feature = "nightly-simd",
+    target_arch = "x86_64",
+    not(target_arch = "wasm32")
+)))]
 #[inline]
 fn classify_integer_block_simd(values: [i64; 4]) -> [IntegerEncoding; 4] {
     values.map(scalar_integer_encoding)

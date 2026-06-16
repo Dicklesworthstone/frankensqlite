@@ -12254,14 +12254,12 @@ pub fn codegen_update(
     // semantics). Route the skip to the next matched row: the full-scan apply
     // loop re-enters via `apply_seek_miss_label` (which Gotos `apply_loop`),
     // while a single rowid-target update simply jumps to `apply_done_label`.
-    let constraint_ignore_label = if matches!(
-        stmt.or_conflict.as_ref(),
-        Some(ConflictAction::Ignore)
-    ) {
-        Some(apply_seek_miss_label.unwrap_or(apply_done_label))
-    } else {
-        None
-    };
+    let constraint_ignore_label =
+        if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
+            Some(apply_seek_miss_label.unwrap_or(apply_done_label))
+        } else {
+            None
+        };
     emit_strict_type_check(b, table, col_regs);
     emit_check_constraints(b, table, col_regs, constraint_ignore_label);
     emit_not_null_constraints(b, table, col_regs, constraint_ignore_label);
