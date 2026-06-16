@@ -1906,6 +1906,29 @@ impl RuntimeContext {
         }
     }
 
+    /// Create a fully process-global-safe runtime context.
+    ///
+    /// Like [`Self::new`] this mints a cancellation-detached root `Cx`, but it
+    /// also refuses to capture any ambient asupersync runtime handle. The
+    /// process-global runtime (installed via [`init_global_runtime`] or
+    /// lazily by [`Self::global`]) outlives any short-lived `block_on`/request
+    /// scope it happens to be created inside, so binding it to that scope's
+    /// runtime handle would (a) let it spawn the write-coordinator service on a
+    /// runtime that is about to be dropped and (b) leak that ambient capture
+    /// into every later `Connection::open` that resolves the global runtime —
+    /// pollution that is observable as spurious active write-coordinator tasks.
+    /// Both effects are forbidden for the canonical detached process root.
+    #[must_use]
+    fn new_process_global(config: RuntimeConfig) -> Self {
+        Self {
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            config,
+            root_cx: Self::detached_root_cx(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            native_runtime_handle: None,
+        }
+    }
+
     /// Create a runtime context rooted in a caller-supplied parent `Cx`.
     ///
     /// This keeps capability lineage attached to the caller's budget,
@@ -1958,13 +1981,15 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 fn global_runtime_context() -> Arc<RuntimeContext> {
     let slot = GLOBAL_RUNTIME_CONTEXT.get_or_init(|| Mutex::new(None));
     let mut guard = lock_unpoisoned(slot);
-    Arc::clone(guard.get_or_insert_with(|| Arc::new(RuntimeContext::default())))
+    Arc::clone(guard.get_or_insert_with(|| {
+        Arc::new(RuntimeContext::new_process_global(RuntimeConfig::default()))
+    }))
 }
 
 /// Install or replace the process-global runtime context used by `Connection::open`.
 #[must_use]
 pub fn init_global_runtime(config: RuntimeConfig) -> Arc<RuntimeContext> {
-    let runtime = Arc::new(RuntimeContext::new(config));
+    let runtime = Arc::new(RuntimeContext::new_process_global(config));
     let slot = GLOBAL_RUNTIME_CONTEXT.get_or_init(|| Mutex::new(None));
     *lock_unpoisoned(slot) = Some(Arc::clone(&runtime));
     runtime
@@ -63973,13 +63998,27 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
         return false;
     }
     // Correlated EXISTS subqueries (those referencing outer table columns)
-    // must be evaluated per-row by the connection-level fallback path.
-    // The VDBE emit_exists_subquery has a known issue where the AND of a
-    // correlated equality and a correlated inequality (e.g.,
-    // `t2.a = t.a AND t2.id <> t.id`) produces incorrect results for
-    // some outer rows. Route correlated EXISTS through the connection
-    // fallback which correctly substitutes outer refs per row.
-    if is_correlated_subquery(sub) {
+    // generally must be evaluated per-row by the connection-level fallback
+    // path. The VDBE emit_exists_subquery has a known issue where the AND of
+    // a correlated equality and a correlated inequality (e.g.,
+    // `t2.a = t.a AND t2.id <> t.id`) produces incorrect results for some
+    // outer rows: after the single-row SeekRowid probe it still applies a
+    // residual term that references the *outer* row, which the probe path
+    // mishandles. Such multi-correlated-term shapes stay on the connection
+    // fallback, which correctly substitutes outer refs per row.
+    //
+    // The one correlated shape the VDBE *does* handle correctly is the
+    // indexed COUNT(*) EXISTS-semijoin: exactly one correlated equality term
+    // `inner.col = outer.col` (the rowid/index probe key) plus inner-only,
+    // non-correlated residual bounds (e.g. `c.id <= 2`). That is precisely
+    // what the codegen recognizer `extract_count_indexed_exists_target`
+    // (and the `emit_exists_subquery` rowid-probe fallback) accept. Keeping
+    // it on the compiled path lets the `CountIndexEqRun` semijoin fast path
+    // fire instead of the deferred/interpreted fallback. Narrow the blanket
+    // rejection accordingly while still routing every other correlated shape
+    // — multiple correlated terms, correlated inequality, multi-table inner
+    // — to the fallback.
+    if is_correlated_subquery(sub) && !correlated_exists_matches_count_semijoin_shape(sub) {
         return false;
     }
 
@@ -64001,6 +64040,102 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
         }
         SelectCore::Values(_) => false,
     }
+}
+
+/// Returns `true` only for the one correlated EXISTS shape the VDBE compiles
+/// correctly: the indexed COUNT(*) EXISTS-semijoin probe.
+///
+/// This mirrors the structural requirements of the codegen recognizer
+/// `extract_count_indexed_exists_target` / `extract_exists_rowid_probe`
+/// (crates/fsqlite-vdbe/src/codegen.rs) — operating on the subquery AST and
+/// correlation analysis rather than the (here-unavailable) outer table schema:
+///
+/// * a single inner table source (no joins; a plain base table);
+/// * an inner WHERE clause whose AND-terms contain *exactly one* correlated
+///   equality `inner.col = outer.col` — the probe key — where exactly one side
+///   references the outer scan and the other does not; and
+/// * the remaining (residual) terms are *non-correlated* inner-only bounds
+///   (e.g. `c.id <= 2`), of which there is at most one.
+///
+/// The correctness-critical exclusion is the warned-about
+/// `t2.a = t.a AND t2.id <> t.id` family: those carry a *second* correlated
+/// term, so they have either more than one correlated term or a correlated
+/// (non-inner-only) residual, and are rejected here — staying on the
+/// per-row connection fallback.
+fn correlated_exists_matches_count_semijoin_shape(sub: &SelectStatement) -> bool {
+    // No inner WITH/compound/ORDER/LIMIT — the recognizer rejects these too.
+    // (The caller already screens these, but keep the check local + explicit.)
+    if sub.with.is_some()
+        || !sub.body.compounds.is_empty()
+        || !sub.order_by.is_empty()
+        || sub.limit.is_some()
+    {
+        return false;
+    }
+
+    let SelectCore::Select {
+        from: Some(from),
+        where_clause: Some(where_clause),
+        group_by,
+        having,
+        windows,
+        ..
+    } = &sub.body.select
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+        return false;
+    }
+    // Single inner base table only (no joins, no subquery/table-function source).
+    if !from.joins.is_empty() || !matches!(&from.source, TableOrSubquery::Table { .. }) {
+        return false;
+    }
+
+    let inner_tables = collect_inner_subquery_table_aliases(sub);
+
+    let mut terms = Vec::new();
+    flatten_and_terms(where_clause, &mut terms);
+
+    let mut correlated_probe_terms = 0usize;
+    let mut residual_terms = 0usize;
+    for term in terms {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        {
+            let left_external = expr_has_external_column_ref(left, &inner_tables);
+            let right_external = expr_has_external_column_ref(right, &inner_tables);
+            // A valid probe is a correlated equality with exactly one outer
+            // side (`inner.col = outer.col`). Both sides correlated, or an
+            // equality where the "inner" side still references the outer
+            // scan, is not the supported probe shape.
+            if left_external != right_external {
+                correlated_probe_terms += 1;
+                continue;
+            }
+            if left_external || right_external {
+                // Equality with outer refs on both sides — not the probe shape.
+                return false;
+            }
+        }
+
+        // Any non-probe term must be a NON-correlated, inner-only residual
+        // bound. A correlated residual (e.g. `t2.id <> t.id`) is exactly the
+        // shape the VDBE mishandles — reject it.
+        if expr_has_external_column_ref(term, &inner_tables) {
+            return false;
+        }
+        residual_terms += 1;
+    }
+
+    // Exactly one correlated probe key, and at most one inner-only residual,
+    // matching `extract_exists_rowid_probe` + the recognizer's single-residual
+    // ceiling.
+    correlated_probe_terms == 1 && residual_terms <= 1
 }
 
 fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bool {

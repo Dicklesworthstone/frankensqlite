@@ -6860,6 +6860,21 @@ impl<V: Vfs> SimpleTransaction<V> {
             let max_leaf_entries = (inner.page_size.as_usize() / 4).saturating_sub(2).max(1);
             let trunk_count = durable_freelist.len().div_ceil(max_leaf_entries + 1);
             pages.extend(durable_freelist.into_iter().take(trunk_count));
+
+            // The freelist serializer (see the commit-time serialize path) takes
+            // `take(trunk_count)` of the *predicted* freelist as the new trunk
+            // page(s) and rewrites page 1's head to point at the first of them.
+            // Any page that was a trunk in the *committed* freelist but is no
+            // longer a predicted trunk gets repurposed as a leaf, so its
+            // role/contents change on commit. Those previously-committed trunk
+            // pages must therefore enter the predicted conflict surface for MVCC
+            // correctness. Union them in here; the final sort/dedup below removes
+            // any overlap with the predicted trunks.
+            let committed_freelist = self.committed_durable_freelist_pages_with_inner(inner);
+            if !committed_freelist.is_empty() {
+                let committed_trunk_count = committed_freelist.len().div_ceil(max_leaf_entries + 1);
+                pages.extend(committed_freelist.into_iter().take(committed_trunk_count));
+            }
         }
 
         if self.page_one_in_pending_commit_surface_with_inner(inner) {

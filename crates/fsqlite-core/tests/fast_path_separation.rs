@@ -1793,10 +1793,30 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
         non_covering_slow_delta, 0,
         "non-covering indexed equality should not fall back to slow execution"
     );
-    assert!(
-        avg_nanos < non_covering_avg_nanos,
-        "covering index lookup should be faster than non-covering lookup over the same probes: covering={avg_nanos}ns non_covering={non_covering_avg_nanos}ns"
+    // Structural (deterministic) proof that the covering lookup does strictly
+    // less per-probe work than the non-covering lookup. The non-covering shape
+    // must additionally read index rowids and seek the table heap per probe
+    // (IdxRowid + SeekRowid), while the covering shape resolves the result
+    // entirely from the index (SeekRowid == 0). Comparing these opcode totals
+    // is the real seek-bounded invariant the benchmark guards. We deliberately
+    // do NOT compare raw wall-clock here: the per-probe difference is on the
+    // order of a few hundred nanoseconds and is dominated by scheduler/cache
+    // noise, so a `covering_avg_ns < non_covering_avg_ns` assertion flakes
+    // (~3%) without protecting any additional correctness. avg_nanos is still
+    // bounded above by the absolute budget asserted earlier.
+    assert_eq!(
+        seek_rowid_total, 0,
+        "covering index lookup must perform zero table heap seeks: covering_seek_rowid={seek_rowid_total} non_covering_seek_rowid={non_covering_seek_rowid_total}"
     );
+    assert!(
+        non_covering_seek_rowid_total >= expected_probes,
+        "non-covering lookup must perform at least one table heap seek per probe that the covering lookup avoids: covering_seek_rowid={seek_rowid_total} non_covering_seek_rowid={non_covering_seek_rowid_total}"
+    );
+    assert!(
+        non_covering_idx_rowid_total >= expected_probes,
+        "non-covering lookup must additionally read an index rowid per probe that the covering lookup avoids: covering_seek_rowid={seek_rowid_total} non_covering_idx_rowid={non_covering_idx_rowid_total}"
+    );
+    let _ = (avg_nanos, non_covering_avg_nanos);
 }
 
 #[test]
