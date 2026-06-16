@@ -1,5 +1,12 @@
-# Intentionally empty.
-#
 # Do not force `RUST_TEST_THREADS` here: explicit serial runs still expose
 # order-dependent failures, so a repo-wide cargo default would mask symptoms
 # without fixing the shared-state leaks.
+
+[env]
+# Build the bundled rusqlite (our conformance oracle) with the same math
+# functions the real `sqlite3` CLI ships by default since 3.35
+# (SQLITE_ENABLE_MATH_FUNCTIONS). Without this the oracle lacks sqrt/pow/log/
+# etc. and `core_sql_rusqlite_conformance::math_functions_match_rusqlite`
+# fails on the rusqlite side ("no such function: sqrt") rather than measuring
+# FrankenSQLite parity. FrankenSQLite already implements these correctly.
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
