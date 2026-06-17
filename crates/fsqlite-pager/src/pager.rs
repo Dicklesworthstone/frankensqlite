@@ -1858,6 +1858,9 @@ impl<F: VfsFile> PagerInner<F> {
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
     ) -> Result<CommittedStateRefresh> {
+        let previous_committed_db_change_counter = self.committed_db_change_counter;
+        let previous_committed_wal_generation = self.committed_wal_generation;
+        let previous_committed_wal_visible_commit_count = self.committed_wal_visible_commit_count;
         let (new_commit_seq, current_file_size, wal_snapshot_initialized, durable_identity_changed) =
             self.probe_visible_commit_seq(cx, wal_backend)?;
         if new_commit_seq == self.commit_seq
@@ -1870,48 +1873,65 @@ impl<F: VfsFile> PagerInner<F> {
             });
         }
 
-        let page1 = self.read_committed_page_copy(cx, wal_backend, PageNumber::ONE)?;
-        if page1.len() < DATABASE_HEADER_SIZE {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "committed page 1 too small for database header: got {}, need {}",
-                    page1.len(),
-                    DATABASE_HEADER_SIZE
-                ),
-            });
-        }
-
-        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-        header_bytes.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
-        let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-            FrankenError::DatabaseCorrupt {
-                detail: format!("invalid database header during pager refresh: {error}"),
+        // `probe_visible_commit_seq` updates cached WAL/base identity. If the
+        // full materialization below fails, restore that identity so a retry
+        // still observes the same durable composition change and refreshes
+        // instead of treating the failed probe as already accepted.
+        let full_refresh_result = (|| -> Result<(u32, Vec<PageNumber>)> {
+            let page1 = self.read_committed_page_copy(cx, wal_backend, PageNumber::ONE)?;
+            if page1.len() < DATABASE_HEADER_SIZE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "committed page 1 too small for database header: got {}, need {}",
+                        page1.len(),
+                        DATABASE_HEADER_SIZE
+                    ),
+                });
             }
-        })?;
 
-        // Always cross-check header.page_count against the actual file size.
-        // A crash between growing the file and updating the header leaves
-        // page_count stale even when the stale marker is not set.  Using
-        // max(header, file) ensures newly-committed pages are visible and
-        // avoids BusySnapshot errors on startup (see GH issue #49).
-        let file_size = self.db_file.file_size(cx)?;
-        let file_derived = header
-            .page_count_from_file_size(file_size)
-            .unwrap_or(header.page_count);
-        let db_size = header.page_count.max(file_derived).max(1);
-        // Skip freelist scan for read-only pagers — the freelist is only
-        // needed for page allocation during writes.
-        let freelist = if self.access_mode.is_readonly() {
-            Vec::new()
-        } else {
-            load_freelist_from_committed_state(
-                cx,
-                self,
-                wal_backend,
-                db_size,
-                header.freelist_trunk,
-                header.freelist_count,
-            )?
+            let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+            header_bytes.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
+            let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid database header during pager refresh: {error}"),
+                }
+            })?;
+
+            // Always cross-check header.page_count against the actual file size.
+            // A crash between growing the file and updating the header leaves
+            // page_count stale even when the stale marker is not set.  Using
+            // max(header, file) ensures newly-committed pages are visible and
+            // avoids BusySnapshot errors on startup (see GH issue #49).
+            let file_size = self.db_file.file_size(cx)?;
+            let file_derived = header
+                .page_count_from_file_size(file_size)
+                .unwrap_or(header.page_count);
+            let db_size = header.page_count.max(file_derived).max(1);
+            // Skip freelist scan for read-only pagers -- the freelist is only
+            // needed for page allocation during writes.
+            let freelist = if self.access_mode.is_readonly() {
+                Vec::new()
+            } else {
+                load_freelist_from_committed_state(
+                    cx,
+                    self,
+                    wal_backend,
+                    db_size,
+                    header.freelist_trunk,
+                    header.freelist_count,
+                )?
+            };
+            Ok((db_size, freelist))
+        })();
+        let (db_size, freelist) = match full_refresh_result {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                self.committed_db_change_counter = previous_committed_db_change_counter;
+                self.committed_wal_generation = previous_committed_wal_generation;
+                self.committed_wal_visible_commit_count =
+                    previous_committed_wal_visible_commit_count;
+                return Err(err);
+            }
         };
 
         // Cross-process monotonicity (#70): never shrink self.db_size from a
@@ -24962,6 +24982,131 @@ mod tests {
             refreshed_reader.get_page(&cx, p).unwrap().as_ref()[0],
             0x22,
             "bead_id={BEAD_ID} case=publication_refresh_reads_latest_committed_page"
+        );
+    }
+
+    #[test]
+    fn test_refresh_committed_state_restores_probe_identity_on_page1_error() {
+        use crate::traits::{WalBackend, WalPublicationSnapshot};
+
+        struct PageOneReadFailWalBackend {
+            snapshot: WalPublicationSnapshot,
+        }
+
+        impl WalBackend for PageOneReadFailWalBackend {
+            fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
+                Ok(())
+            }
+
+            fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+                Some(self.snapshot)
+            }
+
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
+                Err(FrankenError::internal(
+                    "forced committed page-1 materialization failure",
+                ))
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                1
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                _mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 1,
+                    frames_backfilled: 0,
+                    completed: false,
+                    wal_was_reset: false,
+                    requested_mode: _mode,
+                    effective_mode: _mode,
+                })
+            }
+        }
+
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let old_generation = WalGenerationIdentity {
+            checkpoint_seq: 3,
+            salts: fsqlite_wal::WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            },
+        };
+        let new_generation = WalGenerationIdentity {
+            checkpoint_seq: 4,
+            salts: fsqlite_wal::WalSalts {
+                salt1: 0x5555_6666,
+                salt2: 0x7777_8888,
+            },
+        };
+
+        pager
+            .set_wal_backend(Box::new(PageOneReadFailWalBackend {
+                snapshot: WalPublicationSnapshot {
+                    publication_seq: 1,
+                    generation: new_generation,
+                    last_commit_frame: Some(0),
+                    commit_count: 1,
+                    latest_frame_entries: 1,
+                    index_is_partial: false,
+                },
+            }))
+            .expect("install page-1 failing WAL backend");
+        pager
+            .set_journal_mode(&cx, JournalMode::Wal)
+            .expect("enable WAL mode");
+
+        let mut inner = pager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.committed_db_change_counter = 9_999;
+        inner.committed_wal_generation = Some(old_generation);
+        inner.committed_wal_visible_commit_count = 77;
+        let previous_db_change_counter = inner.committed_db_change_counter;
+        let previous_wal_generation = inner.committed_wal_generation;
+        let previous_wal_visible_commit_count = inner.committed_wal_visible_commit_count;
+
+        let err = inner
+            .refresh_committed_state(&cx, &pager.cache, &pager.wal_backend)
+            .expect_err("forced page-1 materialization failure should surface");
+        assert!(
+            format!("{err}").contains("forced committed page-1 materialization failure"),
+            "bead_id={BEAD_ID} case=refresh_page1_error_surfaces_original_error err={err}"
+        );
+        assert_eq!(
+            inner.committed_db_change_counter, previous_db_change_counter,
+            "bead_id={BEAD_ID} case=refresh_error_restores_base_change_counter"
+        );
+        assert_eq!(
+            inner.committed_wal_generation, previous_wal_generation,
+            "bead_id={BEAD_ID} case=refresh_error_restores_wal_generation"
+        );
+        assert_eq!(
+            inner.committed_wal_visible_commit_count, previous_wal_visible_commit_count,
+            "bead_id={BEAD_ID} case=refresh_error_restores_visible_wal_count"
         );
     }
 
