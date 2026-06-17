@@ -884,13 +884,7 @@ fn emit_upsert_expr(
 
         // ── Scalar function calls ──────────────────────────────────────
         // (includes multi-arg max/min which are scalar, not aggregate)
-        Expr::FunctionCall { name, args, .. }
-            if !is_aggregate_function(name) || {
-                let lower = name.to_ascii_lowercase();
-                (lower == "max" || lower == "min")
-                    && matches!(args, fsqlite_ast::FunctionArgs::List(a) if a.len() >= 2)
-            } =>
-        {
+        Expr::FunctionCall { name, args, .. } if !is_aggregate_function_call(name, args) => {
             let canon = name.to_ascii_uppercase();
             match args {
                 fsqlite_ast::FunctionArgs::Star => {
@@ -8527,7 +8521,7 @@ fn parse_aggregate_columns(
                         ..
                     },
                 ..
-            } if is_aggregate_function(name) => {
+            } if is_aggregate_function_call(name, args) => {
                 let canon_name = name.to_ascii_uppercase();
                 let filt = filter.clone();
                 match args {
@@ -9456,7 +9450,7 @@ fn parse_group_by_output(
                         ..
                     },
                 ..
-            } if is_aggregate_function(name) => {
+            } if is_aggregate_function_call(name, args) => {
                 let agg_index = agg_columns.len();
                 let canon_name = name.to_ascii_uppercase();
                 let filt = filter.clone();
@@ -9590,6 +9584,15 @@ fn rewrite_having_select_aliases(
     columns: &[ResultColumn],
     table: &TableSchema,
 ) -> Expr {
+    rewrite_having_select_aliases_inner(expr, columns, table, &mut Vec::new())
+}
+
+fn rewrite_having_select_aliases_inner(
+    expr: &Expr,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    active_aliases: &mut Vec<String>,
+) -> Expr {
     match expr {
         Expr::Column(col_ref, _) if col_ref.table.is_none() => {
             let name = col_ref.column.as_ref();
@@ -9606,9 +9609,23 @@ fn rewrite_having_select_aliases(
                 } = col
                 {
                     if alias.eq_ignore_ascii_case(name) {
+                        if active_aliases
+                            .iter()
+                            .any(|active| active.eq_ignore_ascii_case(alias))
+                        {
+                            return expr.clone();
+                        }
                         // Substitute the underlying SELECT expression, then keep
                         // walking it for further nested aliases.
-                        return rewrite_having_select_aliases(select_expr, columns, table);
+                        active_aliases.push(alias.clone());
+                        let rewritten = rewrite_having_select_aliases_inner(
+                            select_expr,
+                            columns,
+                            table,
+                            active_aliases,
+                        );
+                        active_aliases.pop();
+                        return rewritten;
                     }
                 }
             }
@@ -9620,14 +9637,29 @@ fn rewrite_having_select_aliases(
             right,
             span,
         } => Expr::BinaryOp {
-            left: Box::new(rewrite_having_select_aliases(left, columns, table)),
+            left: Box::new(rewrite_having_select_aliases_inner(
+                left,
+                columns,
+                table,
+                active_aliases,
+            )),
             op: *op,
-            right: Box::new(rewrite_having_select_aliases(right, columns, table)),
+            right: Box::new(rewrite_having_select_aliases_inner(
+                right,
+                columns,
+                table,
+                active_aliases,
+            )),
             span: *span,
         },
         Expr::UnaryOp { op, expr, span } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
             span: *span,
         },
         Expr::Between {
@@ -9637,14 +9669,82 @@ fn rewrite_having_select_aliases(
             not,
             span,
         } => Expr::Between {
-            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
-            low: Box::new(rewrite_having_select_aliases(low, columns, table)),
-            high: Box::new(rewrite_having_select_aliases(high, columns, table)),
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
+            low: Box::new(rewrite_having_select_aliases_inner(
+                low,
+                columns,
+                table,
+                active_aliases,
+            )),
+            high: Box::new(rewrite_having_select_aliases_inner(
+                high,
+                columns,
+                table,
+                active_aliases,
+            )),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr,
+            set,
+            not,
+            span,
+        } => Expr::In {
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
+            set: rewrite_having_in_set_aliases(set, columns, table, active_aliases),
+            not: *not,
+            span: *span,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
+            pattern: Box::new(rewrite_having_select_aliases_inner(
+                pattern,
+                columns,
+                table,
+                active_aliases,
+            )),
+            escape: escape.as_ref().map(|escape| {
+                Box::new(rewrite_having_select_aliases_inner(
+                    escape,
+                    columns,
+                    table,
+                    active_aliases,
+                ))
+            }),
+            op: *op,
             not: *not,
             span: *span,
         },
         Expr::IsNull { expr, not, span } => Expr::IsNull {
-            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
             not: *not,
             span: *span,
         },
@@ -9653,7 +9753,12 @@ fn rewrite_having_select_aliases(
             collation,
             span,
         } => Expr::Collate {
-            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
             collation: collation.clone(),
             span: *span,
         },
@@ -9662,7 +9767,12 @@ fn rewrite_having_select_aliases(
             type_name,
             span,
         } => Expr::Cast {
-            expr: Box::new(rewrite_having_select_aliases(expr, columns, table)),
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
             type_name: type_name.clone(),
             span: *span,
         },
@@ -9672,27 +9782,143 @@ fn rewrite_having_select_aliases(
             else_expr,
             span,
         } => Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|o| Box::new(rewrite_having_select_aliases(o, columns, table))),
+            operand: operand.as_ref().map(|o| {
+                Box::new(rewrite_having_select_aliases_inner(
+                    o,
+                    columns,
+                    table,
+                    active_aliases,
+                ))
+            }),
             whens: whens
                 .iter()
                 .map(|(w, t)| {
                     (
-                        rewrite_having_select_aliases(w, columns, table),
-                        rewrite_having_select_aliases(t, columns, table),
+                        rewrite_having_select_aliases_inner(w, columns, table, active_aliases),
+                        rewrite_having_select_aliases_inner(t, columns, table, active_aliases),
                     )
                 })
                 .collect(),
-            else_expr: else_expr
-                .as_ref()
-                .map(|e| Box::new(rewrite_having_select_aliases(e, columns, table))),
+            else_expr: else_expr.as_ref().map(|e| {
+                Box::new(rewrite_having_select_aliases_inner(
+                    e,
+                    columns,
+                    table,
+                    active_aliases,
+                ))
+            }),
             span: *span,
         },
-        // Leave aggregate calls and everything else untouched: an aggregate's
-        // own arguments reference table columns, never SELECT-list aliases.
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } if !is_aggregate_function_call(name, args) => Expr::FunctionCall {
+            name: name.clone(),
+            args: rewrite_having_function_args_aliases(args, columns, table, active_aliases),
+            distinct: *distinct,
+            order_by: rewrite_having_ordering_aliases(order_by, columns, table, active_aliases),
+            filter: filter.as_ref().map(|filter| {
+                Box::new(rewrite_having_select_aliases_inner(
+                    filter,
+                    columns,
+                    table,
+                    active_aliases,
+                ))
+            }),
+            over: over.clone(),
+            span: *span,
+        },
+        Expr::JsonAccess {
+            expr,
+            path,
+            arrow,
+            span,
+        } => Expr::JsonAccess {
+            expr: Box::new(rewrite_having_select_aliases_inner(
+                expr,
+                columns,
+                table,
+                active_aliases,
+            )),
+            path: Box::new(rewrite_having_select_aliases_inner(
+                path,
+                columns,
+                table,
+                active_aliases,
+            )),
+            arrow: *arrow,
+            span: *span,
+        },
+        Expr::RowValue(values, span) => Expr::RowValue(
+            values
+                .iter()
+                .map(|value| {
+                    rewrite_having_select_aliases_inner(value, columns, table, active_aliases)
+                })
+                .collect(),
+            *span,
+        ),
+        // Do not rewrite inside aggregate calls or subqueries. Aggregate
+        // arguments and FILTER predicates bind within the aggregate's input-row
+        // scope, and subqueries own their own SELECT-list alias scope.
         _ => expr.clone(),
     }
+}
+
+fn rewrite_having_in_set_aliases(
+    set: &InSet,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    active_aliases: &mut Vec<String>,
+) -> InSet {
+    match set {
+        InSet::List(values) => InSet::List(
+            values
+                .iter()
+                .map(|value| {
+                    rewrite_having_select_aliases_inner(value, columns, table, active_aliases)
+                })
+                .collect(),
+        ),
+        InSet::Subquery(_) | InSet::Table(_) => set.clone(),
+    }
+}
+
+fn rewrite_having_function_args_aliases(
+    args: &FunctionArgs,
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    active_aliases: &mut Vec<String>,
+) -> FunctionArgs {
+    match args {
+        FunctionArgs::Star => FunctionArgs::Star,
+        FunctionArgs::List(args) => FunctionArgs::List(
+            args.iter()
+                .map(|arg| rewrite_having_select_aliases_inner(arg, columns, table, active_aliases))
+                .collect(),
+        ),
+    }
+}
+
+fn rewrite_having_ordering_aliases(
+    terms: &[OrderingTerm],
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    active_aliases: &mut Vec<String>,
+) -> Vec<OrderingTerm> {
+    terms
+        .iter()
+        .map(|term| OrderingTerm {
+            expr: rewrite_having_select_aliases_inner(&term.expr, columns, table, active_aliases),
+            direction: term.direction,
+            nulls: term.nulls,
+        })
+        .collect()
 }
 
 /// Walk a HAVING expression to find aggregate function calls and add any that
@@ -9712,7 +9938,7 @@ fn collect_having_aggregates(
             distinct,
             filter,
             ..
-        } if is_aggregate_function(name) => {
+        } if is_aggregate_function_call(name, args) => {
             let upper = name.to_ascii_uppercase();
             // Check if this aggregate already exists in agg_columns.
             let already_exists = agg_columns.iter().any(|agg| {
@@ -9808,7 +10034,10 @@ fn collect_having_aggregates(
             collect_having_aggregates(left, table, agg_columns, output_cols);
             collect_having_aggregates(right, table, agg_columns, output_cols);
         }
-        Expr::UnaryOp { expr: inner, .. } | Expr::IsNull { expr: inner, .. } => {
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
             collect_having_aggregates(inner, table, agg_columns, output_cols);
         }
         Expr::Between {
@@ -9820,6 +10049,74 @@ fn collect_having_aggregates(
             collect_having_aggregates(inner, table, agg_columns, output_cols);
             collect_having_aggregates(low, table, agg_columns, output_cols);
             collect_having_aggregates(high, table, agg_columns, output_cols);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            collect_having_aggregates(inner, table, agg_columns, output_cols);
+            if let InSet::List(values) = set {
+                for value in values {
+                    collect_having_aggregates(value, table, agg_columns, output_cols);
+                }
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_having_aggregates(inner, table, agg_columns, output_cols);
+            collect_having_aggregates(pattern, table, agg_columns, output_cols);
+            if let Some(escape) = escape {
+                collect_having_aggregates(escape, table, agg_columns, output_cols);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_having_aggregates(operand, table, agg_columns, output_cols);
+            }
+            for (when_expr, then_expr) in whens {
+                collect_having_aggregates(when_expr, table, agg_columns, output_cols);
+                collect_having_aggregates(then_expr, table, agg_columns, output_cols);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_having_aggregates(else_expr, table, agg_columns, output_cols);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            filter,
+            order_by,
+            ..
+        } => {
+            if let FunctionArgs::List(args) = args {
+                for arg in args {
+                    collect_having_aggregates(arg, table, agg_columns, output_cols);
+                }
+            }
+            if let Some(filter) = filter {
+                collect_having_aggregates(filter, table, agg_columns, output_cols);
+            }
+            for term in order_by {
+                collect_having_aggregates(&term.expr, table, agg_columns, output_cols);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            collect_having_aggregates(inner, table, agg_columns, output_cols);
+            collect_having_aggregates(path, table, agg_columns, output_cols);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                collect_having_aggregates(value, table, agg_columns, output_cols);
+            }
         }
         _ => {}
     }
@@ -13861,7 +14158,7 @@ fn emit_having_expr(
 ) {
     match expr {
         // Aggregate function call — resolve to the corresponding output register.
-        Expr::FunctionCall { name, args, .. } if is_aggregate_function(name) => {
+        Expr::FunctionCall { name, args, .. } if is_aggregate_function_call(name, args) => {
             let upper = name.to_ascii_uppercase();
             // Find the matching aggregate by name + argument structure.
             let agg_idx = agg_columns.iter().position(|agg| {
@@ -17165,13 +17462,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 emit_in_probe_expr(b, operand, set, *not, reg, ctx);
             }
         }
-        Expr::FunctionCall { name, args, .. }
-            if !is_aggregate_function(name) || {
-                let lower = name.to_ascii_lowercase();
-                (lower == "max" || lower == "min")
-                    && matches!(args, fsqlite_ast::FunctionArgs::List(a) if a.len() >= 2)
-            } =>
-        {
+        Expr::FunctionCall { name, args, .. } if !is_aggregate_function_call(name, args) => {
             // Scalar function call: emit args, then PureFunc.
             let canon = name.to_ascii_uppercase();
             match args {
