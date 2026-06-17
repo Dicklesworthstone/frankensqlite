@@ -106783,6 +106783,127 @@ mod tests {
     }
 
     #[test]
+    fn test_having_alias_rewrite_descends_through_function_and_in() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (product TEXT, qty INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('apple', 5);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('apple', 7);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('banana', 3);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('cherry', 6);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('cherry', 7);")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT product, SUM(qty) AS total_qty \
+                 FROM sales \
+                 GROUP BY product \
+                 HAVING abs(total_qty) IN (12, 13) \
+                 ORDER BY product;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("apple".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(12));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("cherry".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(13));
+    }
+
+    #[test]
+    fn test_having_alias_rewrite_descends_through_scalar_minmax() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (product TEXT, qty INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('apple', 5);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('apple', 7);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('banana', 3);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('cherry', 6);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('cherry', 7);")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT product, SUM(qty) AS total_qty \
+                 FROM sales \
+                 GROUP BY product \
+                 HAVING max(total_qty, 0) IN (12, 13) \
+                 ORDER BY product;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("apple".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(12));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("cherry".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(13));
+    }
+
+    #[test]
+    fn test_having_collects_nested_aggregate_inside_scalar_function_and_in() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (product TEXT, qty INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('apple', 5);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('apple', 7);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('banana', 3);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('cherry', 6);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('cherry', 7);")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT product \
+                 FROM sales \
+                 GROUP BY product \
+                 HAVING max(SUM(qty), 0) IN (12, 13) \
+                 ORDER BY product;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("apple".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("cherry".into()));
+    }
+
+    #[test]
+    fn test_having_alias_rewrite_descends_through_like() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE teams (dept TEXT, member TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO teams VALUES ('eng', 'ada');")
+            .unwrap();
+        conn.execute("INSERT INTO teams VALUES ('eng', 'grace');")
+            .unwrap();
+        conn.execute("INSERT INTO teams VALUES ('sales', 'lin');")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT dept, 'team-' || dept AS label, COUNT(*) AS cnt \
+                 FROM teams \
+                 GROUP BY dept \
+                 HAVING label LIKE 'team-e%' \
+                 ORDER BY dept;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("team-eng".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(2));
+    }
+
+    #[test]
     fn test_having_like_escape_dangling_escape_does_not_match() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (dept TEXT, salary INTEGER);")
@@ -138357,6 +138478,75 @@ mod pager_routing_tests {
             .unwrap();
         assert!(rows.is_empty());
         conn.rollback_transaction().unwrap();
+    }
+
+    #[test]
+    fn test_prepared_direct_fk_statement_rollback_clears_deferred_memdb_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("prepared_direct_fk_statement_rollback.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_str).unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES parent(id)
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO child (id, parent_id) VALUES (?1, ?2)")
+            .unwrap();
+        assert!(
+            stmt.precompiled_dml()
+                .and_then(|dispatch| dispatch.direct_simple_insert.as_ref())
+                .is_some(),
+            "plain FK INSERT should still use the prepared direct INSERT lane"
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        let err = stmt.execute_with_params(&[SqliteValue::Integer(10), SqliteValue::Integer(404)]);
+        assert!(
+            matches!(err, Err(FrankenError::ForeignKeyViolation)),
+            "missing parent should reject the inserted child row: {err:?}"
+        );
+        assert!(
+            conn.pending_memdb_direct_upserts.borrow().is_empty(),
+            "statement-savepoint rollback must discard deferred MemDatabase upserts from the failed statement"
+        );
+
+        let rows = conn
+            .query("SELECT id, parent_id FROM child ORDER BY id")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "failed FK INSERT must not remain visible through the connection-local MemDatabase mirror"
+        );
+
+        stmt.execute_with_params(&[SqliteValue::Integer(11), SqliteValue::Integer(1)])
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        drop(stmt);
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let rows = sqlite
+            .prepare("SELECT id, parent_id FROM child ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(11, 1)],
+            "only the valid post-rollback child row should reach the database file"
+        );
     }
 
     #[test]
