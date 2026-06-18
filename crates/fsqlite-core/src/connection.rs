@@ -43987,13 +43987,35 @@ impl Connection {
     }
 
     fn compare_index_key_values_for_integrity(
+        &self,
         index: &IndexSchema,
         lhs: &[SqliteValue],
         rhs: &[SqliteValue],
     ) -> Option<std::cmp::Ordering> {
+        // The integrity check must compare index keys exactly the way the
+        // cursor comparator (`compare_index_key_values` in
+        // `fsqlite-btree/src/cursor.rs`) does, otherwise an index built and
+        // queried correctly under a non-binary collation (e.g.
+        // `COLLATE NOCASE`) is false-flagged as "entries out of order". A raw
+        // `partial_cmp` only performs a binary (memcmp) TEXT comparison, which
+        // disagrees with the leaf's actual NOCASE/RTRIM/custom ordering
+        // (frankensqlite#112).
+        let registry = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
-            let mut ord = lhs[idx].partial_cmp(&rhs[idx])?;
+            let mut ord = match (index.key_term_collation(idx), &lhs[idx], &rhs[idx]) {
+                (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) => {
+                    let (left, right) = (left.as_bytes(), right.as_bytes());
+                    match registry.find(coll_name) {
+                        Some(collation) => collation.compare(left, right),
+                        None => left.cmp(right),
+                    }
+                }
+                _ => lhs[idx].partial_cmp(&rhs[idx])?,
+            };
             if index.key_term_descending(idx) {
                 ord = ord.reverse();
             }
@@ -44752,7 +44774,7 @@ impl Connection {
                                         ),
                                     }
                                 })?;
-                                let ordering = Self::compare_index_key_values_for_integrity(
+                                let ordering = self.compare_index_key_values_for_integrity(
                                     index,
                                     &prev_values,
                                     &payload_values,
@@ -44893,7 +44915,7 @@ impl Connection {
                                     ),
                                 }
                             })?;
-                            let ordering = Self::compare_index_key_values_for_integrity(
+                            let ordering = self.compare_index_key_values_for_integrity(
                                 index,
                                 &prev_values,
                                 &payload_values,
@@ -88369,6 +88391,201 @@ mod tests {
         assert_eq!(count, 1, "exact-ID query must work via stock SQLite");
     }
 
+    /// frankensqlite#113: an interleaved table-scan read (`SELECT count(*)` /
+    /// `integrity_check`) in the same live connection as delete/reinsert churn
+    /// must not corrupt secondary index b-trees. The reporter bisected the
+    /// trigger to: ~8000 rows + 3 secondary indexes (high-card, low-card,
+    /// composite) + ≥3 delete/reinsert cycles + an in-loop table-scan read,
+    /// single-writer (`BEGIN IMMEDIATE`, concurrent mode irrelevant). After the
+    /// churn, every row reachable by a table scan must also be reachable via
+    /// each index, and `integrity_check` must stay `ok`.
+    #[test]
+    fn test_interleaved_table_scan_read_does_not_corrupt_indexes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t(
+                id INTEGER PRIMARY KEY,
+                h INTEGER,
+                lo INTEGER,
+                a INTEGER,
+                b INTEGER
+            );",
+        )
+        .unwrap();
+        // High-cardinality, low-cardinality, and composite secondary indexes.
+        conn.execute("CREATE INDEX idx_h ON t(h);").unwrap();
+        conn.execute("CREATE INDEX idx_lo ON t(lo);").unwrap();
+        conn.execute("CREATE INDEX idx_ab ON t(a, b);").unwrap();
+
+        // Bulk-load ~8000 rows.
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        for id in 1..=8_000_i64 {
+            conn.execute(&format!(
+                "INSERT INTO t(id, h, lo, a, b) VALUES ({id}, {h}, {lo}, {a}, {b});",
+                h = id,
+                lo = id % 17,
+                a = id % 53,
+                b = id % 101,
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        // 12 cycles of: delete ~70% of a band, reinsert a fresh batch, with an
+        // interleaved table-scan read each cycle (the load-bearing trigger).
+        let mut next_id: i64 = 8_001;
+        for cycle in 0..12 {
+            conn.execute("BEGIN IMMEDIATE;").unwrap();
+            // Interleaved table-scan read in the SAME connection, mid-churn.
+            let scanned = conn.query("SELECT count(*) FROM t;").unwrap();
+            let _ = scanned[0].get(0);
+
+            let lo = cycle * 600 + 1;
+            let hi = lo + 419; // ~70% of a 600-wide band
+            conn.execute(&format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi};"))
+                .unwrap();
+            for _ in 0..420 {
+                let id = next_id;
+                next_id += 1;
+                conn.execute(&format!(
+                    "INSERT INTO t(id, h, lo, a, b) VALUES ({id}, {h}, {lo}, {a}, {b});",
+                    h = id,
+                    lo = id % 17,
+                    a = id % 53,
+                    b = id % 101,
+                ))
+                .unwrap();
+            }
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        // fsqlite's own integrity_check must stay ok (it flips to "out of
+        // order" / "missing from index" when this bug is live).
+        let ic = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(
+            *ic[0].get(0).unwrap(),
+            SqliteValue::Text("ok".into()),
+            "integrity_check must stay ok after interleaved-read churn"
+        );
+
+        // Smoking-gun cross-check: for several low-cardinality values, the
+        // index path and the table-scan path must agree on the row count.
+        for lo_val in 0..17_i64 {
+            let via_index = conn
+                .query(&format!("SELECT count(*) FROM t WHERE lo = {lo_val};"))
+                .unwrap();
+            let via_scan = conn
+                .query(&format!(
+                    "SELECT count(*) FROM (SELECT id FROM t WHERE +lo = {lo_val});"
+                ))
+                .unwrap();
+            assert_eq!(
+                via_index[0].get(0),
+                via_scan[0].get(0),
+                "index lookup and table scan disagree for lo={lo_val} (lost index entries)"
+            );
+        }
+    }
+
+    /// frankensqlite#113, file-backed + interleaved `PRAGMA integrity_check`
+    /// variant — the reporter's strongest trigger (~100 lost index entries),
+    /// confirmed against canonical SQLite on the produced on-disk file. Uses a
+    /// real unix-backed pager so the cursor/pager state matches the report.
+    #[cfg(unix)]
+    #[test]
+    fn test_interleaved_integrity_read_does_not_corrupt_file_backed_indexes() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let cx = Cx::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("interleaved_churn_repro.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, UnixVfs::new(), &db_path, PageSize::DEFAULT)
+                .expect("open unix pager"),
+        );
+        let conn = Connection::open_with_env_and_pager(
+            db_str,
+            ConnectionEnv::default(),
+            PagerBackend::Unix(pager),
+            false,
+        )
+        .expect("open forced-unix connection");
+
+        // Text payload widens cells so leaves split/merge under churn, matching
+        // the report's index-leaf delete/merge pressure.
+        let pad = "z".repeat(40);
+        conn.execute(
+            "CREATE TABLE t(
+                id INTEGER PRIMARY KEY,
+                h TEXT,
+                lo INTEGER,
+                a INTEGER,
+                b TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_h ON t(h);").unwrap();
+        conn.execute("CREATE INDEX idx_lo ON t(lo);").unwrap();
+        conn.execute("CREATE INDEX idx_ab ON t(a, b);").unwrap();
+
+        let mk_row = |id: i64, pad: &str| {
+            format!(
+                "INSERT INTO t(id, h, lo, a, b) VALUES ({id}, 'h{id:08}_{pad}', {lo}, {a}, 'b{b:04}_{pad}');",
+                lo = id % 17,
+                a = id % 53,
+                b = id % 101,
+            )
+        };
+
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        for id in 1..=8_000_i64 {
+            conn.execute(&mk_row(id, &pad)).unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        let mut next_id: i64 = 8_001;
+        for cycle in 0..12 {
+            conn.execute("BEGIN IMMEDIATE;").unwrap();
+            // Interleaved table-scanning integrity_check in the SAME connection.
+            let ic = conn.query("PRAGMA integrity_check;").unwrap();
+            assert_eq!(
+                *ic[0].get(0).unwrap(),
+                SqliteValue::Text("ok".into()),
+                "in-loop integrity_check flipped on cycle {cycle}"
+            );
+
+            let lo = cycle * 600 + 1;
+            let hi = lo + 419;
+            conn.execute(&format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi};"))
+                .unwrap();
+            for _ in 0..420 {
+                let id = next_id;
+                next_id += 1;
+                conn.execute(&mk_row(id, &pad)).unwrap();
+            }
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        let ic = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(
+            *ic[0].get(0).unwrap(),
+            SqliteValue::Text("ok".into()),
+            "final integrity_check must be ok"
+        );
+        conn.close().unwrap();
+
+        // Canonical ground truth on the on-disk file fsqlite produced.
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "C SQLite must accept the on-disk indexes fsqlite produced under interleaved-read churn"
+        );
+    }
+
     /// Verify REINDEX with full schema produces SQLite-compatible autoindexes.
     #[cfg(unix)]
     #[test]
@@ -114816,6 +115033,51 @@ mod tests {
     fn test_pragma_quick_check_with_schema_prefix_returns_ok_row() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA main.quick_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
+    fn test_integrity_check_nocase_index_is_ok() {
+        // frankensqlite#112: integrity_check must apply the index's declared
+        // collation when verifying key ordering. Under NOCASE, 'a' < 'B'; under
+        // binary, 'B'(0x42) < 'a'(0x61). A binary-only comparator false-flags a
+        // correctly NOCASE-ordered leaf as "entries out of order".
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(name TEXT);").unwrap();
+        conn.execute("CREATE INDEX idx ON t(name COLLATE NOCASE);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('B');").unwrap();
+
+        // Sanity: the index scans in NOCASE order (a, B), matching canonical.
+        let ordered = conn
+            .query("SELECT name FROM t ORDER BY name COLLATE NOCASE;")
+            .unwrap();
+        assert_eq!(*ordered[0].get(0).unwrap(), SqliteValue::Text("a".into()));
+        assert_eq!(*ordered[1].get(0).unwrap(), SqliteValue::Text("B".into()));
+
+        // integrity_check must report "ok", not "out of order".
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1, "expected a single integrity_check result row");
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("ok".into()),
+            "NOCASE index must not be reported as malformed"
+        );
+    }
+
+    #[test]
+    fn test_integrity_check_nocase_index_reverse_insert_is_ok() {
+        // Insert in the binary-sorted order ('B' then 'a') so the leaf is laid
+        // out in NOCASE order from a different physical insertion path; still ok.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(name TEXT);").unwrap();
+        conn.execute("CREATE INDEX idx ON t(name COLLATE NOCASE);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('B');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a');").unwrap();
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".into()));
     }
