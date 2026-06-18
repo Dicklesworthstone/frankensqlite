@@ -392,6 +392,40 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 
 }
+
+/// Test-only hook fired inside `execute_commit_with_cx` for a concurrent commit,
+/// at the precise point AFTER the physical pager write has landed but BEFORE the
+/// commit is published into the shared `CommitIndex`. This is the exact
+/// validate→write→publish window that issue #115 identifies as the
+/// double-allocation TOCTOU. A deterministic test installs a callback here to
+/// force a second connection to validate inside this window; production builds
+/// never compile this hook so it has zero runtime cost off the test path.
+#[cfg(test)]
+static FSQLITE_CONCURRENT_COMMIT_WINDOW_HOOK: Mutex<
+    Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_concurrent_commit_window_hook(hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>) {
+    *FSQLITE_CONCURRENT_COMMIT_WINDOW_HOOK
+        .lock()
+        .expect("commit-window hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+#[inline]
+fn fire_concurrent_commit_window_hook() {
+    let hook = {
+        FSQLITE_CONCURRENT_COMMIT_WINDOW_HOOK
+            .lock()
+            .expect("commit-window hook mutex poisoned")
+            .clone()
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 static FSQLITE_PARSE_SINGLE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PARSE_MULTI_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PARSE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -35913,11 +35947,29 @@ impl Connection {
         };
 
         let mut retained_autocommit_flush_boundary = false;
+        // Issue #115: the autocommit (single-statement / retained-batch flush)
+        // commit path has the SAME validate→write→publish TOCTOU as the explicit
+        // COMMIT path — two connections doing concurrent autocommit writes can
+        // each validate clean, physically write the same freshly-allocated EOF
+        // page, and both publish. Hold the shared `concurrent_registry` guard
+        // across validate → physical write → publish for the concurrent path.
+        // For the `:memory:` retained-batch and `commit_and_retain` fast paths
+        // (which are `!is_concurrent_txn`) the guard is `None`, so they are
+        // unaffected. On a plan failure the `_with_registry` plan already cleans
+        // up the registry and clears `concurrent_session_id`, so the subsequent
+        // `abort_current_concurrent_session` early-returns without re-locking;
+        // we still drop the guard explicitly first to make that unambiguous.
+        let mut commit_registry_guard = if ok && is_concurrent_txn && txn_has_pending_writes {
+            Some(lock_unpoisoned(&self.concurrent_registry))
+        } else {
+            None
+        };
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
-            let concurrent_plan = if is_concurrent_txn && txn_has_pending_writes {
-                match self.plan_concurrent_commit(&pending_conflict_pages) {
+            let concurrent_plan = if let Some(registry) = commit_registry_guard.as_mut() {
+                match self.plan_concurrent_commit_with_registry(registry, &pending_conflict_pages) {
                     Ok(plan) => plan,
                     Err(e) => {
+                        drop(commit_registry_guard.take());
                         self.abort_current_concurrent_session();
                         self.txn_metrics_note_rollback();
                         let rollback_result = txn.rollback(cx);
@@ -36161,6 +36213,13 @@ impl Connection {
                         &FSQLITE_COMMIT_TXN_ROUNDTRIP_TIME_NS,
                         commit_txn_roundtrip_start,
                     );
+                    // Issue #115 regression hook: window AFTER physical write,
+                    // BEFORE publish. With the fix the `concurrent_registry`
+                    // guard is still held here.
+                    #[cfg(test)]
+                    if commit_registry_guard.is_some() {
+                        fire_concurrent_commit_window_hook();
+                    }
                     if txn_has_pending_writes {
                         let commit_finalize_seq_start =
                             hot_path_profile_enabled().then(Instant::now);
@@ -36170,7 +36229,22 @@ impl Connection {
                             self.sync_memory_autocommit_commit_seq(committed_seq);
                         } else if let Some(plan) = concurrent_plan {
                             let committed_seq = self.advance_commit_clock();
-                            self.finalize_concurrent_commit(plan, committed_seq);
+                            // Issue #115: publish through the SAME held guard.
+                            // `concurrent_plan.is_some()` here implies the guard
+                            // was acquired (both gate on
+                            // `ok && is_concurrent_txn && txn_has_pending_writes`).
+                            let registry = commit_registry_guard.as_mut().expect(
+                                "concurrent commit plan present implies the registry guard is held",
+                            );
+                            let commit_card = self.finalize_concurrent_commit_with_registry(
+                                registry,
+                                plan,
+                                committed_seq,
+                            );
+                            drop(commit_registry_guard.take());
+                            if let Some(card) = commit_card {
+                                self.ssi_evidence_ledger.record_async(card);
+                            }
                             self.finish_commit_clock(committed_seq);
                         }
                         record_hot_path_duration(
@@ -36178,12 +36252,17 @@ impl Connection {
                             commit_finalize_seq_start,
                         );
                     } else if is_concurrent_txn {
+                        // Read-only concurrent autocommit: guard is None here
+                        // (acquired only for pending writes), so re-locking is
+                        // safe.
+                        drop(commit_registry_guard.take());
                         if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
                             self.clear_cached_concurrent_handle();
                             lock_unpoisoned(&self.concurrent_registry)
                                 .remove_and_recycle(session_id);
                         }
                     }
+                    drop(commit_registry_guard.take());
                     (Ok(()), txn_has_pending_writes, false)
                 }
                 Err(e) => {
@@ -36193,6 +36272,11 @@ impl Connection {
                     );
                     // Commit failed (e.g. I/O error or BUSY in standard mode).
                     // We must rollback to ensure cleanup and propagate the error.
+                    // Issue #115: drop the held registry guard BEFORE
+                    // `abort_current_concurrent_session`, which re-locks the
+                    // registry, to avoid a self-deadlock on the
+                    // physical-write-failure path.
+                    drop(commit_registry_guard.take());
                     self.txn_metrics_note_rollback();
                     let rollback_result = txn.rollback(cx);
                     let rollback_succeeded = rollback_result.is_ok();
@@ -42755,24 +42839,6 @@ impl Connection {
             .then(|| Self::build_ssi_commit_decision_draft(&plan, committed_seq))
     }
 
-    fn plan_concurrent_commit(
-        &self,
-        pending_commit_pages: &[PageNumber],
-    ) -> Result<Option<PreparedConcurrentCommit>> {
-        let mut registry = lock_unpoisoned(&self.concurrent_registry);
-        self.plan_concurrent_commit_with_registry(&mut registry, pending_commit_pages)
-    }
-
-    fn finalize_concurrent_commit(&self, plan: PreparedConcurrentCommit, committed_seq: CommitSeq) {
-        let commit_card = {
-            let mut registry = lock_unpoisoned(&self.concurrent_registry);
-            self.finalize_concurrent_commit_with_registry(&mut registry, plan, committed_seq)
-        };
-        if let Some(card) = commit_card {
-            self.ssi_evidence_ledger.record_async(card);
-        }
-    }
-
     fn finalize_read_only_concurrent_commit(&self) {
         let Some(session_id) = *self.concurrent_session_id.borrow() else {
             return;
@@ -42928,8 +42994,36 @@ impl Connection {
         // not just at BEGIN time. We mirror that by retrying on Busy with the
         // same spin-loop backoff used in begin_pager_txn_with_busy_timeout().
         let committed_write = {
-            let concurrent_commit_plan = if is_concurrent_txn && txn_has_pending_writes {
-                self.plan_concurrent_commit(&pending_conflict_pages)?
+            // Issue #115: the concurrent-commit publication must be a single
+            // critical section spanning FCW/SSI validate → physical pager write
+            // → publish into the shared `CommitIndex`. Previously the shared
+            // `concurrent_registry` lock was released between validate
+            // (`plan_concurrent_commit`) and publish
+            // (`finalize_concurrent_commit`), leaving a TOCTOU window: a second
+            // connection could validate against a `CommitIndex` snapshot AFTER
+            // this connection physically wrote a freshly-allocated EOF page but
+            // BEFORE it published that page, see `latest(page) == None`, and
+            // claim the SAME EOF page number — yielding one physical page
+            // reachable from two b-trees ("2nd reference to page" /
+            // "database disk image is malformed").
+            //
+            // Holding the guard across the physical write serializes only the
+            // commit-publish step. The page-mutation work already happened
+            // during statement execution (before COMMIT), so this does NOT
+            // reintroduce a writer-blocks-writer bottleneck on the mutation
+            // path — it is consistent with the "mutex held only for the append"
+            // commit model. The pager's physical commit takes its own
+            // `PagerInner` mutex and never reaches back into
+            // `concurrent_registry`, and the commit-clock helpers lock only
+            // `active_commit_seqs`, so holding the registry guard across them is
+            // free of lock-order inversion.
+            let mut commit_registry_guard = if is_concurrent_txn && txn_has_pending_writes {
+                Some(lock_unpoisoned(&self.concurrent_registry))
+            } else {
+                None
+            };
+            let concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
+                self.plan_concurrent_commit_with_registry(registry, &pending_conflict_pages)?
             } else {
                 None
             };
@@ -43002,6 +43096,21 @@ impl Connection {
                     .record_success(latency);
             }
 
+            // Issue #115 regression hook: we are now in the precise window
+            // AFTER the physical pager write has landed but BEFORE the commit
+            // is published into the shared `CommitIndex`. With the #115 fix the
+            // `concurrent_registry` guard is still held here, so any second
+            // committer is blocked at its own `plan_concurrent_commit_with_registry`
+            // and cannot validate against a stale snapshot. The deterministic
+            // repro test installs a callback here to prove that. The gate is on
+            // the commit PLAN (not the guard) so the window is observable
+            // regardless of whether the critical section is held — that lets the
+            // same hook reproduce the pre-fix TOCTOU when the guard is released.
+            #[cfg(test)]
+            if concurrent_commit_plan.is_some() && matches!(commit_res, Ok(())) {
+                fire_concurrent_commit_window_hook();
+            }
+
             if matches!(commit_res, Ok(())) {
                 let commit_finalize_seq_start = hot_path_profile_enabled().then(Instant::now);
                 if let Some(plan) = concurrent_commit_plan {
@@ -43026,7 +43135,23 @@ impl Connection {
                     } else {
                         self.advance_commit_clock_without_memdb_visibility()
                     };
-                    self.finalize_concurrent_commit(plan, committed_seq);
+                    // Issue #115: publish through the SAME held registry guard
+                    // (do not re-acquire / release-and-reacquire the lock). The
+                    // SSI evidence card is recorded after the guard is dropped
+                    // to keep the ledger write off the critical section, matching
+                    // the previous `finalize_concurrent_commit` ordering.
+                    let registry = commit_registry_guard.as_mut().expect(
+                        "concurrent commit plan present implies the registry guard is held",
+                    );
+                    let commit_card = self.finalize_concurrent_commit_with_registry(
+                        registry,
+                        plan,
+                        committed_seq,
+                    );
+                    drop(commit_registry_guard.take());
+                    if let Some(card) = commit_card {
+                        self.ssi_evidence_ledger.record_async(card);
+                    }
                     self.finish_commit_clock(committed_seq);
                 } else if is_concurrent_txn {
                     self.finalize_read_only_concurrent_commit();
@@ -181143,5 +181268,366 @@ mod pager_routing_tests {
             conn.transactional_live_vtab_registry_active(),
             "a mutable active_txn borrow should conservatively report transactional live-vtab state"
         );
+    }
+
+    /// Issue #115 — deterministic regression guard for the concurrent-mode page
+    /// double-allocation TOCTOU.
+    ///
+    /// Two `Connection`s to the same file run concurrent (`BEGIN CONCURRENT`,
+    /// default) write transactions that each force EOF page growth. Before the
+    /// fix the shared `concurrent_registry` lock was released between FCW/SSI
+    /// validate (`plan_concurrent_commit`) and publish
+    /// (`finalize_concurrent_commit`). Connection B, validating in the window
+    /// after A physically wrote a freshly-allocated EOF page N but before A
+    /// published it, saw `commit_index.latest(N) == None`, found no conflict,
+    /// and claimed the same page N — one physical page reachable from two
+    /// b-trees, which canonical SQLite reports as
+    /// `... 2nd reference to page ...` / `database disk image is malformed`.
+    ///
+    /// This test makes that window *deterministic* via a test-only commit
+    /// hook installed at the exact validate→write→publish point. When A reaches
+    /// the window it parks and releases B to attempt its commit:
+    ///
+    /// * Pre-fix — B's `plan_concurrent_commit` is lock-free, so B validates
+    ///   inside A's window, claims the same EOF page, and both publish →
+    ///   corruption (`integrity_check != ok`, and `rusqlite` reports a malformed
+    ///   image). The test would FAIL.
+    /// * Post-fix — A holds the `concurrent_registry` guard across the whole
+    ///   span, so B blocks at its own `plan_concurrent_commit_with_registry`
+    ///   and cannot complete inside the window (the driver observes B's commit
+    ///   does not return). A then publishes and releases the guard; B unblocks,
+    ///   re-validates against the now-current `CommitIndex`, sees the conflict,
+    ///   and retries / aborts. The database is never corrupted. The test PASSES.
+    ///
+    /// Determinism: the interleaving is forced by the in-window hook plus a
+    /// `recv_timeout` that distinguishes "B finished" (microseconds, pre-fix)
+    /// from "B is blocked on the guard A holds" (post-fix). It does not rely on
+    /// probabilistic thread scheduling, so it reproduces every run.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_double_alloc_validate_publish_toctou_issue_115() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _serial = super::fsqlite_core_test_serializer();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("issue_115_double_alloc.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        // Schema with a table AND an index so any cross-tree double-allocation
+        // surfaces as the canonical "2nd reference to page" corruption.
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            setup
+                .execute(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB NOT NULL, tag INTEGER);",
+                )
+                .unwrap();
+            setup.execute("CREATE INDEX idx_tag ON t(tag);").unwrap();
+            // Seed enough rows (with large blobs) to push the database well past
+            // a single page so both committers allocate fresh EOF pages.
+            setup.execute("BEGIN;").unwrap();
+            for i in 0..64 {
+                setup
+                    .execute_with_params(
+                        "INSERT INTO t(id, payload, tag) VALUES (?1, ?2, ?3);",
+                        &[
+                            SqliteValue::Integer(i),
+                            SqliteValue::Blob(vec![0xAB; 900].into()),
+                            SqliteValue::Integer(i % 7),
+                        ],
+                    )
+                    .unwrap();
+            }
+            setup.execute("COMMIT;").unwrap();
+            setup.close().unwrap();
+        }
+
+        // Coordination channels between connection A's in-window hook (fired on
+        // A's thread) and the test driver. The channel endpoints used inside
+        // the hook are wrapped in `Mutex` so the boxed `Fn` is `Send + Sync`
+        // (`mpsc::Sender`/`Receiver` are `Send` but not `Sync`).
+        let (a_in_window_tx, a_in_window_rx) = mpsc::channel::<()>();
+        let (release_a_tx, release_a_rx) = mpsc::channel::<()>();
+        let a_in_window_tx = Mutex::new(a_in_window_tx);
+        let release_a_rx = Mutex::new(release_a_rx);
+        // Only the first connection to enter the commit window arms the
+        // rendezvous; B's own later window firing (if any) is a no-op.
+        let armed = Arc::new(AtomicBool::new(true));
+
+        let hook_armed = Arc::clone(&armed);
+        let hook = Arc::new(move || {
+            if hook_armed.swap(false, Ordering::SeqCst) {
+                // Tell the driver that A is parked post-write / pre-publish.
+                let _ = a_in_window_tx.lock().unwrap().send(());
+                // Block A here until the driver has released B to race.
+                let _ = release_a_rx.lock().unwrap().recv();
+            }
+        });
+        super::set_concurrent_commit_window_hook(Some(
+            hook as Arc<dyn Fn() + Send + Sync + 'static>,
+        ));
+
+        // Connection A on its own thread: open, write, commit, close. Its
+        // commit will pause inside the validate→publish window via the hook.
+        // `Connection` is `!Send`, so it is created, used, and dropped entirely
+        // within the worker thread; only the `Send` commit `Result` crosses
+        // the channel.
+        let path_a = db_path.clone();
+        let (a_done_tx, a_done_rx) = mpsc::channel::<Result<()>>();
+        let a_handle = std::thread::spawn(move || {
+            let conn_a = Connection::open(&path_a).unwrap();
+            conn_a.execute("BEGIN;").unwrap();
+            // Allocate fresh EOF pages: many large rows in a new id range.
+            for i in 1000..1064 {
+                conn_a
+                    .execute_with_params(
+                        "INSERT INTO t(id, payload, tag) VALUES (?1, ?2, ?3);",
+                        &[
+                            SqliteValue::Integer(i),
+                            SqliteValue::Blob(vec![0xCD; 900].into()),
+                            SqliteValue::Integer(i % 7),
+                        ],
+                    )
+                    .unwrap();
+            }
+            let res = conn_a.execute("COMMIT;").map(|_| ());
+            if res.is_ok() {
+                conn_a.close().unwrap();
+            }
+            let _ = a_done_tx.send(res);
+        });
+
+        // Wait until A is parked inside the commit window.
+        a_in_window_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("connection A should reach the commit validate→publish window");
+
+        // Now drive connection B's commit on its own thread. With the fix B
+        // will block on the shared registry guard A holds; without the fix B
+        // races through validate→write→publish inside A's window.
+        let path_b = db_path.clone();
+        let (b_done_tx, b_done_rx) = mpsc::channel::<Result<()>>();
+        let b_handle = std::thread::spawn(move || {
+            let conn_b = Connection::open(&path_b).unwrap();
+            conn_b.execute("BEGIN;").unwrap();
+            // A concurrent-mode conflict against A's just-published pages can
+            // surface either during a statement (snapshot invalidated mid-txn)
+            // or at COMMIT. Capture the FIRST error and report it; never panic —
+            // a transient snapshot/busy conflict here is a CORRECT outcome of
+            // the #115 fix (the engine detected the would-be double allocation).
+            let mut res: Result<()> = Ok(());
+            for i in 2000..2064 {
+                if let Err(err) = conn_b.execute_with_params(
+                    "INSERT INTO t(id, payload, tag) VALUES (?1, ?2, ?3);",
+                    &[
+                        SqliteValue::Integer(i),
+                        SqliteValue::Blob(vec![0xEF; 900].into()),
+                        SqliteValue::Integer(i % 7),
+                    ],
+                ) {
+                    res = Err(err);
+                    break;
+                }
+            }
+            if res.is_ok() {
+                res = conn_b.execute("COMMIT;").map(|_| ());
+            }
+            // Best-effort close on success; on a snapshot/busy conflict the
+            // transaction is already torn down by the engine.
+            if res.is_ok() {
+                conn_b.close().unwrap();
+            } else {
+                // Roll back any partial uncommitted state so the file is clean
+                // for the canonical-SQLite oracle read.
+                let _ = conn_b.execute("ROLLBACK;");
+                conn_b.close().unwrap();
+            }
+            let _ = b_done_tx.send(res);
+        });
+
+        // The bug is "connection B commits SUCCESSFULLY inside connection A's
+        // validate→publish window", double-allocating A's EOF page. Observe
+        // whether B resolves while A is still parked, and if so, with what
+        // result:
+        //
+        //   * Pre-fix — B's commit is lock-free, so it validates clean inside
+        //     A's window and reports `Ok(())` here: that is the regression and
+        //     the assertion below fails.
+        //   * Post-fix — B either blocks on the shared registry guard A holds
+        //     (no result within the window) or is rejected with a transient
+        //     snapshot/busy conflict (the shared lock table / re-validation
+        //     caught the would-be double allocation). Both are correct.
+        let b_in_window = b_done_rx.recv_timeout(Duration::from_secs(3)).ok();
+        if let Some(b_window_res) = &b_in_window {
+            assert!(
+                b_window_res.is_err(),
+                "issue #115 regression: connection B committed SUCCESSFULLY inside \
+                 connection A's validate→publish window — the registry critical \
+                 section was not held, so both connections double-allocated the \
+                 same EOF page"
+            );
+        }
+
+        // Release A; it publishes and drops the guard.
+        release_a_tx.send(()).unwrap();
+
+        let a_res = a_done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("connection A commit should complete after release");
+        a_res.expect("connection A commit should succeed");
+
+        // If B was blocked (did not resolve in the window) it now unblocks and
+        // resolves. B may either succeed (it re-validated and grew at a fresh
+        // page) or be rejected with a transient snapshot/busy conflict — both
+        // are correct. What must NOT happen is a silent on-disk double alloc.
+        let b_res = match b_in_window {
+            Some(res) => res,
+            None => b_done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("connection B commit should resolve after A publishes"),
+        };
+        if let Err(err) = &b_res {
+            assert!(
+                err.is_transient(),
+                "connection B should only fail with a retryable snapshot/busy \
+                 conflict, got: {err:?}"
+            );
+        }
+
+        a_handle.join().expect("connection A thread");
+        b_handle.join().expect("connection B thread");
+
+        // Clear the hook now that both connections have resolved.
+        super::set_concurrent_commit_window_hook(None);
+
+        // Canonical SQLite oracle: the on-disk image must be well-formed. This
+        // is the exact check the issue used to capture "2nd reference to page".
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "issue #115: concurrent double-allocation produced a malformed on-disk \
+             image (canonical SQLite integrity_check failed)"
+        );
+    }
+
+    /// Issue #115 — high-concurrency stress reproduction.
+    ///
+    /// The issue reports the double-allocation corruption reproduces "within
+    /// 1–2 runs" with ≥2 connections doing real concurrent write txns that
+    /// force EOF page growth. This drives many connections through aggressive,
+    /// non-overlapping EOF growth (so every worker allocates fresh pages from
+    /// its own per-connection `next_page`) and verifies the canonical SQLite
+    /// image stays well-formed across several rounds — exactly the
+    /// `PRAGMA integrity_check` check the issue used to capture
+    /// "2nd reference to page" / "database disk image is malformed".
+    ///
+    /// This is the empirical guard: if the validate→publish window (or any
+    /// uncoordinated EOF growth) lets two connections claim the same physical
+    /// page, the canonical-SQLite oracle catches it here.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_eof_growth_stress_stays_sqlite_compatible_issue_115() {
+        const ROUNDS: usize = 2;
+        const WORKERS: u16 = 4;
+        const TXNS_PER_WORKER: usize = 20;
+
+        let _serial = super::fsqlite_core_test_serializer();
+
+        for round in 0..ROUNDS {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("issue_115_stress_{round}.db"));
+            let db_path = db_path.to_string_lossy().into_owned();
+
+            {
+                let setup = Connection::open(&db_path).unwrap();
+                setup.execute("PRAGMA busy_timeout=2000;").unwrap();
+                setup
+                    .execute(
+                        "CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB NOT NULL, tag INTEGER);",
+                    )
+                    .unwrap();
+                setup.execute("CREATE INDEX idx_tag ON t(tag);").unwrap();
+                setup.close().unwrap();
+            }
+
+            let start_barrier = Arc::new(std::sync::Barrier::new(usize::from(WORKERS)));
+            let mut handles = Vec::with_capacity(usize::from(WORKERS));
+            for worker_id in 0..WORKERS {
+                let db = db_path.clone();
+                let barrier = Arc::clone(&start_barrier);
+                handles.push(std::thread::spawn(move || {
+                    let conn = Connection::open(&db).unwrap();
+                    conn.execute("PRAGMA busy_timeout=2000;").unwrap();
+                    barrier.wait();
+                    for txn_idx in 0..TXNS_PER_WORKER {
+                        // Disjoint id ranges per (worker, txn) so every commit is
+                        // pure EOF growth that must allocate fresh pages.
+                        let base = 1_000_000
+                            + i64::from(worker_id) * 100_000
+                            + (txn_idx as i64) * 100;
+                        // Each txn writes several large rows to force multi-page
+                        // growth and B-tree splits under contention.
+                        loop {
+                            if conn.execute("BEGIN;").is_err() {
+                                continue;
+                            }
+                            let mut ok = true;
+                            for k in 0..8 {
+                                if conn
+                                    .execute_with_params(
+                                        "INSERT INTO t(id, payload, tag) VALUES (?1, ?2, ?3);",
+                                        &[
+                                            SqliteValue::Integer(base + k),
+                                            SqliteValue::Blob(vec![0x5A; 1200].into()),
+                                            SqliteValue::Integer((base + k) % 11),
+                                        ],
+                                    )
+                                    .is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if !ok {
+                                let _ = conn.execute("ROLLBACK;");
+                                // Transient conflict on disjoint EOF growth is
+                                // acceptable; retry the whole txn.
+                                continue;
+                            }
+                            match conn.execute("COMMIT;") {
+                                Ok(_) => break,
+                                // Transient conflict — roll back and retry the
+                                // whole txn (the loop re-runs).
+                                Err(err) if err.is_transient() => {
+                                    let _ = conn.execute("ROLLBACK;");
+                                }
+                                Err(other) => panic!("unexpected commit error: {other:?}"),
+                            }
+                        }
+                    }
+                    conn.close().unwrap();
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("stress worker thread");
+            }
+
+            // Canonical SQLite oracle: the on-disk image must be well-formed.
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                integrity_check, "ok",
+                "issue #115 (round {round}): concurrent EOF growth produced a \
+                 malformed on-disk image (canonical SQLite integrity_check failed)"
+            );
+        }
     }
 }
