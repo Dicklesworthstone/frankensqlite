@@ -60,7 +60,6 @@ fn autoincrement_without_primary_key_rejected() {
 }
 
 #[test]
-#[ignore = "bd-z8pzx: frank accepts AUTOINCREMENT on a non-INTEGER PRIMARY KEY; SQLite requires INTEGER PRIMARY KEY"]
 fn autoincrement_on_non_integer_pk_rejected() {
     // PRIMARY KEY present but the column type is not INTEGER -> SQLite errors
     // "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY".

@@ -38128,6 +38128,30 @@ impl Connection {
                         }
                     })
                     .or(table_pk_rowid_col_idx);
+                // AUTOINCREMENT is only legal on a genuine INTEGER PRIMARY KEY
+                // rowid alias. `rowid_col_idx` already encodes that rule (exact
+                // `INTEGER` type, ascending PK), so a column carrying
+                // AUTOINCREMENT that is not that alias (e.g. TEXT PRIMARY KEY
+                // AUTOINCREMENT, or `... DESC AUTOINCREMENT`) is rejected
+                // (bd-z8pzx).
+                let autoincrement_col_idx = columns.iter().position(|col| {
+                    col.constraints.iter().any(|c| {
+                        matches!(
+                            c.kind,
+                            ColumnConstraintKind::PrimaryKey {
+                                autoincrement: true,
+                                ..
+                            }
+                        )
+                    })
+                });
+                if let Some(ai_idx) = autoincrement_col_idx
+                    && rowid_col_idx != Some(ai_idx)
+                {
+                    return Err(FrankenError::FunctionError(
+                        "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY".to_owned(),
+                    ));
+                }
                 let has_primary_key = rowid_col_idx.is_some()
                     || columns.iter().any(|col| {
                         col.constraints
