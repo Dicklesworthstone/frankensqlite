@@ -84,7 +84,6 @@ fn add_not_null_without_default_when_rows_exist() {
 }
 
 #[test]
-#[ignore = "bd-nmt6h: on an EMPTY table SQLite accepts ADD COLUMN ... NOT NULL (no default); frank rejects it unconditionally"]
 fn add_not_null_without_default_empty_table() {
     check(
         &[(&[], "ALTER TABLE t ADD COLUMN b TEXT NOT NULL")],

@@ -39221,11 +39221,32 @@ impl Connection {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                // SQLite rule: cannot add a NOT NULL column without a DEFAULT value.
+                // SQLite only forbids adding a NOT NULL column without a default
+                // when there are existing rows to back-fill with NULL; on an
+                // empty table the column may be added (bd-nmt6h).
                 if notnull && default_value.is_none() {
-                    return Err(FrankenError::Internal(
-                        "Cannot add a NOT NULL column without a default value".to_owned(),
-                    ));
+                    let table_has_rows = {
+                        let schema = self.schema.borrow();
+                        let root_page = schema
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                            .map(|t| t.root_page);
+                        drop(schema);
+                        root_page.is_some_and(|rp| {
+                            self.db
+                                .borrow()
+                                .get_table(rp)
+                                .is_some_and(|t| t.row_count() > 0)
+                        })
+                    };
+                    if table_has_rows {
+                        // FunctionError renders the message verbatim (ErrorCode::Error,
+                        // i.e. SQLITE_ERROR) rather than Internal's "internal error:"
+                        // prefix / SQLITE_INTERNAL code.
+                        return Err(FrankenError::FunctionError(
+                            "Cannot add a NOT NULL column without a default value".to_owned(),
+                        ));
+                    }
                 }
                 let default_for_existing_rows = default_value.as_deref().map_or_else(
                     || Ok(SqliteValue::Null),
