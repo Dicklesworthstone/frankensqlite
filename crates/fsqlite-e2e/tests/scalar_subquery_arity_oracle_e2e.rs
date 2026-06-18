@@ -109,7 +109,6 @@ fn scalar_subquery_single_column_ok() {
 }
 
 #[test]
-#[ignore = "bd-fkwtw: scalar subquery with multiple columns silently uses the first column instead of erroring"]
 fn scalar_subquery_multi_column_rejected() {
     // Multi-column scalar subquery -> SQLite errors. (Multi-row is fine; multi-
     // *column* is not.)

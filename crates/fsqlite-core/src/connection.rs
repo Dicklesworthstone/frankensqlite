@@ -49895,6 +49895,16 @@ impl Connection {
         };
         match expr {
             Expr::Subquery(sub, _) => {
+                // A scalar subquery must project exactly one column; SQLite
+                // rejects a multi-column scalar subquery at prepare time rather
+                // than silently taking the first column (bd-fkwtw). Multiple
+                // *rows* are tolerated (the first is taken).
+                let column_count = self.select_result_column_count(sub, &[], &mut Vec::new());
+                if column_count != 1 {
+                    return Err(FrankenError::FunctionError(format!(
+                        "sub-select returns {column_count} columns - expected 1"
+                    )));
+                }
                 let inner_tables = collect_subquery_inner_tables(sub);
                 let mut sub_clone = sub.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
