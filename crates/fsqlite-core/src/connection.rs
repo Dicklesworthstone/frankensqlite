@@ -25804,9 +25804,21 @@ impl Connection {
         }
 
         for column in insert_columns {
-            if table_schema.column_index(column).is_none() && !is_hidden_rowid_alias_name(column) {
+            let Some(idx) = table_schema.column_index(column) else {
+                if is_hidden_rowid_alias_name(column) {
+                    continue;
+                }
                 return Err(FrankenError::Internal(format!(
                     "column '{column}' not found in table '{table_name}'"
+                )));
+            };
+            // Generated (VIRTUAL/STORED) columns are read-only: SQLite rejects
+            // any attempt to supply a value for one in an INSERT column list
+            // ("cannot INSERT into generated column"). (bd-txni0)
+            let col = &table_schema.columns[idx];
+            if col.generated_expr.is_some() || col.generated_stored.is_some() {
+                return Err(FrankenError::Internal(format!(
+                    "cannot INSERT into generated column \"{column}\""
                 )));
             }
         }

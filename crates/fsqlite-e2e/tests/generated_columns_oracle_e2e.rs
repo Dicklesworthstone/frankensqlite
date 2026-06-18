@@ -194,7 +194,6 @@ fn generated_recomputes_on_update() {
 }
 
 #[test]
-#[ignore = "bd-txni0: explicit value for a generated column must be rejected"]
 fn generated_explicit_value_rejected() {
     // Supplying a value for a generated column must error on both engines.
     let f = Connection::open(":memory:").unwrap();
