@@ -1546,7 +1546,7 @@ mod tests {
         let matrix = BuiltinFunctionParityMatrix::canonical();
         let summary = matrix.summary();
         assert_eq!(
-            summary.total_features, 49,
+            summary.total_features, 50,
             "Unexpected built-in feature count"
         );
         assert!(

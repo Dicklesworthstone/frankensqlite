@@ -1908,6 +1908,13 @@ fn build_builtin_function_features() -> Vec<Feature> {
         ParityStatus::Passing,
         &["func", "math"],
     );
+    b.add(
+        "sqlite_compileoption_used() / sqlite_compileoption_get()",
+        "Compile-time option introspection",
+        0.5,
+        ParityStatus::Passing,
+        &["func", "scalar", "meta"],
+    );
 
     b.build()
 }
