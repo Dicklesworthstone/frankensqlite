@@ -50,6 +50,15 @@ fn create_if_not_exists_on_existing_ok() {
                 &["CREATE TABLE t (a)", "CREATE VIEW v AS SELECT a FROM t"],
                 "CREATE VIEW IF NOT EXISTS v AS SELECT a FROM t",
             ),
+            // IF NOT EXISTS silences a CROSS-kind clash too (SQLite behavior).
+            (
+                &["CREATE TABLE t (a)"],
+                "CREATE VIEW IF NOT EXISTS t AS SELECT 1",
+            ),
+            (
+                &["CREATE VIEW w AS SELECT 1"],
+                "CREATE TABLE IF NOT EXISTS w (a)",
+            ),
         ],
         "create_if_not_exists_on_existing_ok",
     );
@@ -71,7 +80,6 @@ fn create_duplicate_same_kind_rejected() {
 }
 
 #[test]
-#[ignore = "bd-8yhe3: cross-kind name conflict (CREATE VIEW on existing table; CREATE TABLE on existing view) silently accepted"]
 fn create_duplicate_cross_kind_rejected() {
     check(
         &[

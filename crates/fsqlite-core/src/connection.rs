@@ -38050,6 +38050,23 @@ impl Connection {
         }
         drop(schema);
 
+        // Tables and views share one schema namespace: a new table may not take
+        // an existing view's name (bd-8yhe3). IF NOT EXISTS silences the clash
+        // regardless of the existing object's kind, matching SQLite.
+        let views = self.views.borrow();
+        if views
+            .iter()
+            .any(|v| v.name.eq_ignore_ascii_case(&table_name))
+        {
+            if create.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "view {table_name} already exists",
+            )));
+        }
+        drop(views);
+
         match &create.body {
             CreateTableBody::Columns {
                 columns,
@@ -40345,6 +40362,20 @@ impl Connection {
             )));
         }
         drop(views);
+
+        // Tables and views share one schema namespace: a new view may not take
+        // an existing table's name (bd-8yhe3). IF NOT EXISTS silences the clash
+        // regardless of the existing object's kind, matching SQLite.
+        let schema = self.schema.borrow();
+        if schema.iter().any(|t| t.name.eq_ignore_ascii_case(view_name)) {
+            if stmt.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "table {view_name} already exists"
+            )));
+        }
+        drop(schema);
 
         let create_sql = stmt.to_string();
         self.views.borrow_mut().push(ViewDef {
