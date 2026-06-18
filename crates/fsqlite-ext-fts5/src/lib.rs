@@ -4795,6 +4795,21 @@ pub struct Posting {
     pub positions: Positions,
 }
 
+/// Reverse map: for one document, the exact set of index keys it contributed
+/// postings to, so [`InvertedIndex::remove_document`] can prune only that
+/// document's own terms instead of scanning the entire index.
+///
+/// `terms` holds the main-index keys (already normalized through
+/// `index_key`). `prefix_terms` holds, per prefix length, the prefix keys this
+/// document contributed to that prefix index. Both are deduplicated sets
+/// because a single document contributes the same term/prefix once per
+/// (column, position) occurrence but stores it under one map key.
+#[derive(Debug, Clone, Default)]
+struct DocTermRefs {
+    terms: HashSet<SmallText>,
+    prefix_terms: HashMap<usize, HashSet<SmallText>>,
+}
+
 /// In-memory inverted index for FTS5.
 #[derive(Debug, Clone)]
 pub struct InvertedIndex {
@@ -4810,6 +4825,10 @@ pub struct InvertedIndex {
     doc_ids: HashSet<i64>,
     /// Total token count per document (for BM25 avgdl)
     doc_lengths: Option<HashMap<i64, u32>>,
+    /// docid -> the index keys that document contributed to. Maintained on
+    /// every insert so `remove_document` is O(terms-in-doc) rather than
+    /// O(total-index-size).
+    doc_terms: HashMap<i64, DocTermRefs>,
 }
 
 impl Default for InvertedIndex {
@@ -4856,6 +4875,7 @@ impl InvertedIndex {
             tokendata,
             doc_ids: HashSet::new(),
             doc_lengths: track_column_sizes.then(HashMap::new),
+            doc_terms: HashMap::new(),
         }
     }
 
@@ -4887,6 +4907,12 @@ impl InvertedIndex {
         }
     }
 
+    // `SmallText` carries a `OnceLock` for lazy long-string interning, which
+    // trips `mutable_key_type` at the `HashSet<SmallText>` reverse-map sites
+    // even though its `Hash`/`Eq` are content-only and never observe the
+    // single-write interior mutability (same rationale as the
+    // `HashMap<SmallText, _>` sites elsewhere in this crate).
+    #[allow(clippy::mutable_key_type)]
     fn append_position(&mut self, term: &str, docid: i64, column: u32, position: u32) {
         let term = self.index_key(term);
         let stored_column = if self.detail == DetailMode::None {
@@ -4899,12 +4925,19 @@ impl InvertedIndex {
         } else {
             0
         };
+        let doc_refs = self.doc_terms.entry(docid).or_default();
         append_position_to_postings(
             self.index.entry(SmallText::from(term)).or_default(),
             docid,
             stored_column,
             stored_position,
         );
+        // Record the exact main-index key this document touched so removal can
+        // target it directly. `HashSet::insert` collapses the repeated
+        // (column, position) occurrences of the same term to a single key.
+        if !doc_refs.terms.contains(term) {
+            doc_refs.terms.insert(SmallText::from(term));
+        }
 
         for (prefix_length, prefix_index) in &mut self.prefix_indexes {
             if let Some(prefix) = prefix_slice(term, *prefix_length) {
@@ -4914,6 +4947,10 @@ impl InvertedIndex {
                     stored_column,
                     stored_position,
                 );
+                let prefix_refs = doc_refs.prefix_terms.entry(*prefix_length).or_default();
+                if !prefix_refs.contains(prefix) {
+                    prefix_refs.insert(SmallText::from(prefix));
+                }
             }
         }
     }
@@ -4961,16 +4998,42 @@ impl InvertedIndex {
     }
 
     /// Remove a document from the index.
+    ///
+    /// Uses the `doc_terms` reverse map to touch only the index keys this
+    /// document actually contributed to — O(distinct-terms-in-doc) — instead
+    /// of scanning every posting list in the index (the old O(index-size)
+    /// behavior, quadratic across an incremental re-index / upsert workload).
+    ///
+    /// The result is byte-identical to the old full-scan removal: a key the
+    /// document never touched cannot have its posting list emptied by removing
+    /// the document, so restricting the scan to the recorded keys produces the
+    /// same pruning decisions and the same surviving postings.
+    // `SmallText` interior mutability (lazy interning `OnceLock`) is never
+    // observed through `Hash`/`Eq`; the reverse-map `HashSet<SmallText>` keys
+    // are content-addressed and stable. See `append_position`.
+    #[allow(clippy::mutable_key_type)]
     pub fn remove_document(&mut self, docid: i64) {
-        self.index.retain(|_, postings| {
-            postings.retain(|posting| posting.docid != docid);
-            !postings.is_empty()
-        });
-        for prefix_index in self.prefix_indexes.values_mut() {
-            prefix_index.retain(|_, postings| {
-                postings.retain(|posting| posting.docid != docid);
-                !postings.is_empty()
-            });
+        if let Some(doc_refs) = self.doc_terms.remove(&docid) {
+            for term in &doc_refs.terms {
+                if let Some(postings) = self.index.get_mut(term) {
+                    postings.retain(|posting| posting.docid != docid);
+                    if postings.is_empty() {
+                        self.index.remove(term);
+                    }
+                }
+            }
+            for (prefix_length, prefix_keys) in &doc_refs.prefix_terms {
+                if let Some(prefix_index) = self.prefix_indexes.get_mut(prefix_length) {
+                    for prefix in prefix_keys {
+                        if let Some(postings) = prefix_index.get_mut(prefix) {
+                            postings.retain(|posting| posting.docid != docid);
+                            if postings.is_empty() {
+                                prefix_index.remove(prefix);
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.doc_ids.remove(&docid);
         if let Some(doc_lengths) = self.doc_lengths.as_mut() {
@@ -13465,6 +13528,381 @@ mod tests {
         3,
     ],
 }"#
+        );
+    }
+
+    /// Faithful reimplementation of the *old* O(index-size) full-scan removal,
+    /// used only by the equivalence proof test below.
+    // `SmallText` interior mutability is content-only w.r.t. Hash/Eq (see
+    // `append_position`); the `HashMap<SmallText, _>::retain` calls are safe.
+    #[allow(clippy::mutable_key_type)]
+    fn legacy_full_scan_remove(index: &mut InvertedIndex, docid: i64) {
+        index.index.retain(|_, postings| {
+            postings.retain(|posting| posting.docid != docid);
+            !postings.is_empty()
+        });
+        for prefix_index in index.prefix_indexes.values_mut() {
+            prefix_index.retain(|_, postings| {
+                postings.retain(|posting| posting.docid != docid);
+                !postings.is_empty()
+            });
+        }
+        index.doc_ids.remove(&docid);
+        if let Some(doc_lengths) = index.doc_lengths.as_mut() {
+            doc_lengths.remove(&docid);
+        }
+    }
+
+    /// One posting flattened to a sortable, content-only tuple
+    /// `(docid, column, sorted positions)`.
+    type PostingFingerprint = (i64, u32, Vec<u32>);
+
+    /// Canonical, order-independent fingerprint of the observable index state:
+    /// every main and prefix term with its sorted `(docid, column, positions)`
+    /// postings, plus `doc_ids` and `doc_lengths`. Two indexes with the same
+    /// fingerprint are byte-identical in every queryable respect (the
+    /// `doc_terms` reverse map is internal bookkeeping and intentionally
+    /// excluded — only its *effect* on the postings/ids is observable).
+    //
+    // `SmallText` interior mutability is content-only w.r.t. Hash/Eq; the
+    // `HashMap<SmallText, _>` reads here are safe (see `append_position`).
+    #[allow(clippy::mutable_key_type)]
+    fn index_fingerprint(index: &InvertedIndex) -> String {
+        fn postings_fingerprint(postings: &PostingList) -> Vec<PostingFingerprint> {
+            let mut rows: Vec<PostingFingerprint> = postings
+                .iter()
+                .map(|posting| {
+                    let mut positions: Vec<u32> = posting.positions.to_vec();
+                    positions.sort_unstable();
+                    (posting.docid, posting.column, positions)
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+        fn term_map_fingerprint(map: &HashMap<SmallText, PostingList>) -> String {
+            let mut entries: Vec<(String, Vec<PostingFingerprint>)> = map
+                .iter()
+                .map(|(term, postings)| (term.to_string(), postings_fingerprint(postings)))
+                .collect();
+            entries.sort();
+            format!("{entries:?}")
+        }
+
+        let main = term_map_fingerprint(&index.index);
+
+        let mut prefix_lengths: Vec<usize> = index.prefix_indexes.keys().copied().collect();
+        prefix_lengths.sort_unstable();
+        let prefixes: Vec<(usize, String)> = prefix_lengths
+            .iter()
+            .map(|len| {
+                (
+                    *len,
+                    term_map_fingerprint(index.prefix_indexes.get(len).unwrap()),
+                )
+            })
+            .collect();
+
+        let mut doc_ids: Vec<i64> = index.doc_ids.iter().copied().collect();
+        doc_ids.sort_unstable();
+
+        let doc_lengths = index.doc_lengths.as_ref().map(|lengths| {
+            let mut rows: Vec<(i64, u32)> = lengths.iter().map(|(k, v)| (*k, *v)).collect();
+            rows.sort();
+            rows
+        });
+
+        format!("main={main}|prefixes={prefixes:?}|doc_ids={doc_ids:?}|doc_lengths={doc_lengths:?}")
+    }
+
+    /// Proof that the new reverse-map `remove_document` leaves the index in
+    /// EXACTLY the state the old full-scan removal would have, across plain,
+    /// prefixed, shared-term, multi-column, and `DetailMode::None` shapes —
+    /// for every removed-document subset and for repeated/idempotent removals.
+    #[test]
+    fn test_remove_document_reverse_map_matches_legacy_full_scan() {
+        let tok = Unicode61Tokenizer::new();
+        // Documents deliberately share terms ("rust", "engine", "fast"),
+        // exercise prefix overlap, multiple columns, and varying lengths.
+        let docs: &[(i64, &[(u32, &str)])] = &[
+            (1, &[(0, "rust engine is fast and safe"), (1, "rust rocks")]),
+            (2, &[(0, "the engine runs fast"), (1, "engineering rust")]),
+            (3, &[(0, "fast safe systems"), (1, "rust rust rust")]),
+            (4, &[(0, "engine engine engine"), (1, "safety first")]),
+            (5, &[(0, "unique zebra xylophone"), (1, "lonely token")]),
+        ];
+
+        let configs: &[(bool, &[usize], DetailMode)] = &[
+            (true, &[], DetailMode::Full),
+            (true, &[2, 3, 4], DetailMode::Full),
+            (true, &[3], DetailMode::Column),
+            (true, &[2, 4], DetailMode::None),
+            (false, &[3], DetailMode::Full),
+        ];
+
+        // Every interesting removal subset of {1..=5} plus a no-op id (99) and
+        // a duplicate removal to prove idempotency.
+        let removal_sequences: &[&[i64]] = &[
+            &[1],
+            &[3],
+            &[5],
+            &[1, 2],
+            &[2, 4],
+            &[1, 3, 5],
+            &[1, 2, 3, 4, 5],
+            &[3, 3], // idempotent repeat
+            &[99],   // absent doc
+            &[2, 99, 2],
+        ];
+
+        for (track_sizes, prefixes, detail) in configs.iter().copied() {
+            for sequence in removal_sequences {
+                let build = || {
+                    let mut index = InvertedIndex::with_options(track_sizes, prefixes, detail);
+                    for (docid, columns) in docs {
+                        for (column, text) in *columns {
+                            index.add_text(*docid, *column, &tok, text);
+                        }
+                    }
+                    index
+                };
+
+                let mut new_index = build();
+                let mut legacy_index = build();
+
+                // Sanity: identical construction.
+                assert_eq!(
+                    index_fingerprint(&new_index),
+                    index_fingerprint(&legacy_index),
+                    "construction diverged for cfg=({track_sizes},{prefixes:?},{detail:?})"
+                );
+
+                for docid in *sequence {
+                    new_index.remove_document(*docid);
+                    legacy_full_scan_remove(&mut legacy_index, *docid);
+                }
+
+                assert_eq!(
+                    index_fingerprint(&new_index),
+                    index_fingerprint(&legacy_index),
+                    "reverse-map removal diverged from full-scan for \
+                     cfg=({track_sizes},{prefixes:?},{detail:?}) seq={sequence:?}"
+                );
+
+                // Query-result equivalence on a representative term set,
+                // including a prefix probe and per-doc term frequency.
+                for term in ["rust", "engine", "fast", "safe", "zebra", "absent"] {
+                    assert_eq!(
+                        posting_docids(new_index.get_postings(term)),
+                        posting_docids(legacy_index.get_postings(term)),
+                        "postings diverged for term {term:?} seq={sequence:?}"
+                    );
+                    assert_eq!(
+                        new_index.doc_frequency(term),
+                        legacy_index.doc_frequency(term),
+                        "doc_frequency diverged for term {term:?} seq={sequence:?}"
+                    );
+                    for docid in 1..=5 {
+                        assert_eq!(
+                            new_index.term_frequency(term, docid),
+                            legacy_index.term_frequency(term, docid),
+                            "term_frequency diverged for term {term:?} doc {docid} seq={sequence:?}"
+                        );
+                    }
+                }
+                assert_eq!(new_index.total_docs(), legacy_index.total_docs());
+
+                // The new path must keep its reverse map consistent: a removed
+                // document leaves NO reverse entry and NO surviving postings.
+                for docid in 1..=5 {
+                    if !new_index.doc_ids.contains(&docid) {
+                        assert!(
+                            !new_index.doc_terms.contains_key(&docid),
+                            "removed doc {docid} still has a doc_terms entry seq={sequence:?}"
+                        );
+                        assert!(
+                            !any_postings_for_doc(&new_index, docid),
+                            "removed doc {docid} still has postings seq={sequence:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// True if any posting in the main index references `docid`.
+    fn any_postings_for_doc(index: &InvertedIndex, docid: i64) -> bool {
+        index
+            .index
+            .values()
+            .any(|postings| postings.iter().any(|posting| posting.docid == docid))
+    }
+
+    /// Faithful reimplementation of the *old* O(index-size) full-scan
+    /// `remove_document`, used by the scaling microbenchmark to measure the
+    /// before/after speedup head-to-head on the same corpus.
+    fn legacy_full_scan_remove_for_bench(index: &mut InvertedIndex, docid: i64) {
+        legacy_full_scan_remove(index, docid);
+    }
+
+    /// Microbenchmark proving the reverse-map `remove_document` removes the
+    /// O(total-distinct-terms) dictionary-scan factor from the incremental
+    /// upsert / re-index path — the exact shape of cass's FTS5 `--watch`.
+    ///
+    /// The old `remove_document` scanned EVERY posting list in the index on
+    /// each call: a single delete was O(distinct-terms-in-corpus), so doing one
+    /// per document over a corpus of `N` docs was O(N * distinct-terms) — i.e.
+    /// quadratic, because an FTS dictionary grows with the corpus (most tokens
+    /// are document-specific). The reverse map touches only the terms the
+    /// removed document actually contributed, eliminating the dictionary scan.
+    ///
+    /// Two regimes are measured head-to-head against the old full scan on
+    /// identical inputs:
+    ///
+    /// * **`unique`** — every document's terms are document-specific, so the
+    ///   dictionary IS the whole index. The old per-op cost scales linearly
+    ///   with `N` (overall quadratic); the reverse-map per-op cost is FLAT.
+    ///   This is the gated claim: per-op growth `< 1.5x` when `N` doubles.
+    /// * **`mixed`** — a few corpus-spanning common terms plus document
+    ///   specific ones. The reverse map still wins by a large, widening
+    ///   constant factor (it skips the dictionary), but a residual
+    ///   O(shared-posting-list-length) `retain` cost remains for the common
+    ///   terms in BOTH paths, so neither is flat here. Reported, not gated as
+    ///   flat — closing that residual is a separate, larger structural change
+    ///   (a per-term docid index) tracked outside this fix.
+    ///
+    /// Ignored by default (timing-sensitive). Run with:
+    ///   cargo test -p fsqlite-ext-fts5 --release -- --ignored --nocapture \
+    ///       bench_remove_document_upsert_scaling
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_remove_document_upsert_scaling() {
+        use std::time::Instant;
+
+        // Index a pre-tokenized document directly via the same append path
+        // add_text uses, with tokenization already done so it is outside the
+        // timed window.
+        fn index_terms(index: &mut InvertedIndex, docid: i64, terms: &[String]) {
+            index.doc_ids.insert(docid);
+            #[allow(clippy::cast_possible_truncation)]
+            for (pos, term) in terms.iter().enumerate() {
+                index.append_position(term, docid, 0, pos as u32);
+            }
+            if let Some(doc_lengths) = index.doc_lengths.as_mut() {
+                #[allow(clippy::cast_possible_truncation)]
+                let len = terms.len() as u32;
+                *doc_lengths.entry(docid).or_insert(0) += len;
+            }
+        }
+
+        struct Lcg(u64);
+        impl Lcg {
+            fn next_in(&mut self, n: u64) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (self.0 >> 33) % n
+            }
+        }
+
+        // Run one regime: build a corpus with `terms_for(docid)`, then perform
+        // `N` random delete-then-reinsert upserts on each path. Returns the
+        // per-op (new, old) timings at each `N` and asserts state-equivalence.
+        let run_regime = |label: &str, terms_for: &dyn Fn(i64) -> Vec<String>, gate_flat: bool| {
+            println!("\n[{label}] remove_document upsert scaling — reverse-map vs old full scan:");
+            println!(
+                "{:>8}  {:>16}  {:>16}  {:>9}",
+                "corpus_N", "new ns/upsert", "old ns/upsert", "speedup"
+            );
+
+            let build = |n: i64| -> (InvertedIndex, Vec<Vec<String>>) {
+                let mut index = InvertedIndex::with_options(true, &[], DetailMode::Full);
+                let mut all_terms = Vec::with_capacity(n as usize);
+                for docid in 0..n {
+                    let terms = terms_for(docid);
+                    index_terms(&mut index, docid, &terms);
+                    all_terms.push(terms);
+                }
+                (index, all_terms)
+            };
+
+            let mut prev_new_per_op: Option<f64> = None;
+            for &n in &[1000_i64, 2000, 4000, 8000] {
+                let mut rng = Lcg(0x1234_5678_9abc_def0 ^ (n as u64));
+                let targets: Vec<i64> = (0..n).map(|_| rng.next_in(n as u64) as i64).collect();
+
+                // --- New reverse-map path ---
+                let (mut new_index, all_terms) = build(n);
+                let start = Instant::now();
+                for &docid in &targets {
+                    new_index.remove_document(docid);
+                    index_terms(&mut new_index, docid, &all_terms[docid as usize]);
+                }
+                let new_per_op = start.elapsed().as_nanos() as f64 / n as f64;
+
+                // --- Old full-scan path (same inputs) ---
+                let (mut old_index, all_terms) = build(n);
+                let start = Instant::now();
+                for &docid in &targets {
+                    legacy_full_scan_remove_for_bench(&mut old_index, docid);
+                    index_terms(&mut old_index, docid, &all_terms[docid as usize]);
+                }
+                let old_per_op = start.elapsed().as_nanos() as f64 / n as f64;
+
+                // Both paths must end in identical observable state.
+                assert_eq!(
+                    index_fingerprint(&new_index),
+                    index_fingerprint(&old_index),
+                    "[{label}] new and old upsert workloads diverged at N={n}"
+                );
+
+                let speedup = old_per_op / new_per_op;
+                println!("{n:>8}  {new_per_op:>16.1}  {old_per_op:>16.1}  {speedup:>8.1}x");
+
+                // The new path must always beat the old full scan, advantage
+                // widening with corpus size (old scan is O(dictionary) per op).
+                assert!(
+                    speedup > 1.0,
+                    "[{label}] reverse-map path was not faster than old full scan at \
+                     N={n} (new {new_per_op:.1} ns vs old {old_per_op:.1} ns)"
+                );
+
+                // Flatness gate only for the unique-term regime, where the
+                // reverse map removes the ONLY super-constant factor.
+                if gate_flat && let Some(prev) = prev_new_per_op {
+                    let growth = new_per_op / prev;
+                    assert!(
+                        growth < 1.5,
+                        "[{label}] reverse-map per-upsert grew {growth:.2}x when corpus \
+                         doubled to N={n} (prev {prev:.1} ns -> {new_per_op:.1} ns); \
+                         expected ~flat"
+                    );
+                }
+                prev_new_per_op = Some(new_per_op);
+            }
+        };
+
+        // unique: dictionary == whole index; reverse map => flat per-op.
+        run_regime(
+            "unique",
+            &|docid| (0..12).map(|k| format!("d{docid}t{k}")).collect(),
+            true,
+        );
+
+        // mixed: corpus-spanning common terms + doc-specific ones; large,
+        // widening constant-factor win but a residual O(shared-list) retain.
+        run_regime(
+            "mixed",
+            &|docid| {
+                const COMMON: &[&str] = &["the", "and", "data", "system"];
+                let mut terms: Vec<String> = COMMON.iter().map(|s| (*s).to_string()).collect();
+                for k in 0..10 {
+                    terms.push(format!("d{docid}t{k}"));
+                }
+                terms
+            },
+            false,
         );
     }
 
