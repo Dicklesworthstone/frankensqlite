@@ -57,3 +57,19 @@ flow through franken inter-deps and were left untouched per scope.
 ### Franken inter-dependency pins — untouched (per scope)
 
 fsqlite*, asupersync, and other franken-ecosystem pins were not modified.
+
+### Validation
+
+- `cargo check --workspace --all-targets` (native) — **clean** (Finished in 2m23s,
+  no errors/warnings). Confirms the smallvec/bumpalo/jsonschema patch bumps and the
+  re-resolved `Cargo.lock` build natively across the whole workspace.
+- `cargo check -p fsqlite-wasm --target wasm32-unknown-unknown` — the wasm dependency
+  graph (getrandom 0.4.3 `wasm_js`, wasm-bindgen 0.2.125, js-sys 0.3.102) **resolves
+  and compiles up to fsqlite-core**. The build then fails on a **pre-existing,
+  unrelated** signature mismatch in committed `crates/fsqlite-core/src/connection.rs`
+  (E0061 around `preserve_existing_live_vtabs` / `pending_rootpage_zero_virtual_tables`,
+  a vtable/rootpage code path under concurrent development). That file is **not** part
+  of this dependency change (working tree shows only the two wasm `Cargo.toml` files +
+  `Cargo.lock` + this log), so the wasm break exists with or without these bumps and is
+  out of scope for the dependency pass. The dep changes themselves introduce no new
+  wasm errors.
