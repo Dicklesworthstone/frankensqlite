@@ -62,7 +62,6 @@ fn non_constant_default_rejected() {
 }
 
 #[test]
-#[ignore = "bd-bkbe6: frank accepts subqueries in CHECK constraints; SQLite errors 'subqueries prohibited in CHECK constraints'"]
 fn subquery_in_check_rejected() {
     check_ddl(
         &[

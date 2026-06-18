@@ -38222,6 +38222,30 @@ impl Connection {
                         })
                     })
                     .collect::<Result<_>>()?;
+                // CHECK constraints may not contain a subquery — SQLite rejects
+                // them at CREATE time ("subqueries prohibited in CHECK
+                // constraints"). Validate before allocating any pages so a
+                // rejection leaves no side effects (bd-bkbe6).
+                for col in columns {
+                    for c in &col.constraints {
+                        if let ColumnConstraintKind::Check(ref expr) = c.kind
+                            && expr_contains_subquery_match(expr, &mut |_| true)
+                        {
+                            return Err(FrankenError::Internal(
+                                "subqueries prohibited in CHECK constraints".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                for tc in constraints {
+                    if let TableConstraintKind::Check(ref expr) = tc.kind
+                        && expr_contains_subquery_match(expr, &mut |_| true)
+                    {
+                        return Err(FrankenError::Internal(
+                            "subqueries prohibited in CHECK constraints".to_owned(),
+                        ));
+                    }
+                }
                 if !create.without_rowid
                     && let Some(idx) = rowid_col_idx
                 {
