@@ -48123,6 +48123,7 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        self.validate_join_using_columns(select)?;
         // Build a col_map with original table labels before materialization so
         // the internal join scan can project hidden rowid slots in the same
         // order later aggregation uses.
@@ -49080,6 +49081,47 @@ impl Connection {
     /// indices line up with the `col_map` produced by [`Self::build_join_col_map`]
     /// so that an unqualified reference to a USING column resolves to the single
     /// surviving (left) occurrence instead of being reported ambiguous.
+    /// SQLite rejects `JOIN ... USING (c)` when `c` is not present in BOTH of
+    /// the joined relations ("cannot join using column c - column not present
+    /// in both tables"). NATURAL JOIN derives its key set from the common
+    /// columns and needs no such check. Uses the same per-source column-name
+    /// resolution as `build_join_using_skip_indices`, so it never diverges from
+    /// how the join is actually laid out (bd-cx2r6).
+    fn validate_join_using_columns(&self, select: &SelectStatement) -> Result<()> {
+        let visible_ctes = select
+            .with
+            .as_ref()
+            .map_or_else(Vec::new, |with| with.ctes.clone());
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            return Ok(());
+        };
+        let mut left_visible_names =
+            self.source_column_names_for_join_layout(&from.source, &visible_ctes);
+        for join in &from.joins {
+            let right_names = self.source_column_names_for_join_layout(&join.table, &visible_ctes);
+            if !join.join_type.natural
+                && let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref()
+            {
+                for col in cols {
+                    let in_left = left_visible_names
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(col));
+                    let in_right = right_names.iter().any(|n| n.eq_ignore_ascii_case(col));
+                    if !in_left || !in_right {
+                        return Err(FrankenError::FunctionError(format!(
+                            "cannot join using column {col} - column not present in both tables"
+                        )));
+                    }
+                }
+            }
+            left_visible_names.extend(right_names);
+        }
+        Ok(())
+    }
+
     fn build_join_using_skip_indices(&self, select: &SelectStatement) -> HashSet<usize> {
         let mut skip = HashSet::new();
         let mut visible_ctes = Vec::new();
@@ -55646,6 +55688,7 @@ impl Connection {
                 "JOIN on non-SELECT core".to_owned(),
             ));
         };
+        self.validate_join_using_columns(select)?;
         let visible_ctes = select
             .with
             .as_ref()

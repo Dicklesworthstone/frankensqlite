@@ -112,7 +112,6 @@ fn join_using_valid_column_ok() {
 }
 
 #[test]
-#[ignore = "bd-cx2r6: USING(col not in both tables) is accepted (empty result) instead of 'cannot join using column' error"]
 fn join_using_nonexistent_column_rejected() {
     check(
         &[
