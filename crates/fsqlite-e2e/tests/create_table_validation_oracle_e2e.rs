@@ -52,7 +52,6 @@ fn valid_table_definitions_ok() {
 }
 
 #[test]
-#[ignore = "bd-1sgq2: frank accepts duplicate column names; SQLite errors 'duplicate column name'"]
 fn duplicate_column_name_rejected() {
     check_ddl(
         &[
@@ -65,7 +64,6 @@ fn duplicate_column_name_rejected() {
 }
 
 #[test]
-#[ignore = "bd-1sgq2: frank accepts multiple column-level PRIMARY KEYs; SQLite errors 'more than one primary key'"]
 fn multiple_primary_keys_rejected() {
     check_ddl(
         &[

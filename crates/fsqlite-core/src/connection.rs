@@ -38239,6 +38239,41 @@ impl Connection {
                         })
                     })
                     .collect::<Result<_>>()?;
+                // Reject duplicate column names (SQLite folds ASCII case in
+                // identifiers) — "duplicate column name: <name>" (bd-1sgq2).
+                for (i, col) in columns.iter().enumerate() {
+                    if columns[..i]
+                        .iter()
+                        .any(|prev| prev.name.eq_ignore_ascii_case(&col.name))
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "duplicate column name: {}",
+                            col.name
+                        )));
+                    }
+                }
+                // A table may declare at most one PRIMARY KEY: count column-level
+                // PKs plus table-level PKs (a single composite table-level PK is
+                // one). More than one -> "table \"<t>\" has more than one primary
+                // key" (bd-1sgq2).
+                let column_pk_count = columns
+                    .iter()
+                    .filter(|col| {
+                        col.constraints
+                            .iter()
+                            .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }))
+                    })
+                    .count();
+                let table_pk_count = constraints
+                    .iter()
+                    .filter(|tc| matches!(tc.kind, TableConstraintKind::PrimaryKey { .. }))
+                    .count();
+                if column_pk_count + table_pk_count > 1 {
+                    return Err(FrankenError::FunctionError(format!(
+                        "table \"{table_name}\" has more than one primary key"
+                    )));
+                }
+
                 // CHECK constraints may not contain a subquery — SQLite rejects
                 // them at CREATE time ("subqueries prohibited in CHECK
                 // constraints"). Validate before allocating any pages so a
