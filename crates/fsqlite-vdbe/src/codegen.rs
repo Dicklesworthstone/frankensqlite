@@ -14562,6 +14562,27 @@ fn resolved_expr_affinity(expr: &Expr, resolved: Option<&SortKeySource>, scan: &
     }
 }
 
+/// Core comparison-affinity rule (SQLite datatype3 §4.2) shared by every
+/// comparison emit path: given the affinity codes (`A`=BLOB, `B`=TEXT,
+/// `C`=NUMERIC, `D`=INTEGER, `E`=REAL) of the two operands, return the `p5`
+/// affinity to apply — `0` for none, `b'B'` for TEXT, `b'C'` for NUMERIC.
+fn combine_comparison_affinity(l_aff: u8, r_aff: u8) -> u16 {
+    let is_numeric = |a: u8| matches!(a, b'C' | b'D' | b'E');
+
+    // One side numeric (C/D/E), the other TEXT (B) or BLOB (A) → coerce the
+    // text/blob side to a number (NUMERIC affinity).
+    if (is_numeric(l_aff) && matches!(r_aff, b'A' | b'B'))
+        || (is_numeric(r_aff) && matches!(l_aff, b'A' | b'B'))
+    {
+        return u16::from(b'C'); // NUMERIC
+    }
+    // One side TEXT (B), the other BLOB/NONE (A) → coerce the blob side to text.
+    if (l_aff == b'B' && r_aff == b'A') || (l_aff == b'A' && r_aff == b'B') {
+        return u16::from(b'B'); // TEXT
+    }
+    0 // No affinity coercion needed
+}
+
 fn comparison_affinity_p5_resolved(
     left: &Expr,
     left_resolved: Option<&SortKeySource>,
@@ -14569,21 +14590,10 @@ fn comparison_affinity_p5_resolved(
     right_resolved: Option<&SortKeySource>,
     scan: &ScanCtx<'_>,
 ) -> u16 {
-    let l_aff = resolved_expr_affinity(left, left_resolved, scan);
-    let r_aff = resolved_expr_affinity(right, right_resolved, scan);
-
-    let is_numeric = |a: u8| matches!(a, b'C' | b'D' | b'E');
-
-    if is_numeric(l_aff) && matches!(r_aff, b'A' | b'B') {
-        return u16::from(b'C');
-    }
-    if is_numeric(r_aff) && matches!(l_aff, b'A' | b'B') {
-        return u16::from(b'C');
-    }
-    if (l_aff == b'B' && r_aff == b'A') || (l_aff == b'A' && r_aff == b'B') {
-        return u16::from(b'B');
-    }
-    0
+    combine_comparison_affinity(
+        resolved_expr_affinity(left, left_resolved, scan),
+        resolved_expr_affinity(right, right_resolved, scan),
+    )
 }
 
 /// Check whether a column name is a hidden rowid alias (`rowid`, `_rowid_`, or `oid`).
@@ -17119,7 +17129,28 @@ fn emit_in_probe_expr(
         secondary: None,
     };
     emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
-    b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
+    // Apply the comparison affinity between the outer operand and the subquery
+    // probe column, mirroring `=`/value-list IN coercion (bd-56aj2 IN-subquery).
+    let probe_aff = match probe_source.value {
+        InProbeValue::Rowid => b'D',
+        InProbeValue::FirstColumn => probe_source
+            .table
+            .columns
+            .first()
+            .and_then(|c| c.type_name.as_deref())
+            .map_or(b'A', column_type_to_affinity),
+        InProbeValue::Expr(e) => expr_affinity(e, Some(&probe_scan)),
+    };
+    let probe_aff_p5 =
+        combine_comparison_affinity(expr_affinity(operand, Some(scan_ctx)), probe_aff);
+    b.emit_jump_to_label(
+        Opcode::Eq,
+        r_probe,
+        r_operand,
+        matched_label,
+        P4::None,
+        probe_aff_p5,
+    );
     // If probe value was NULL, flag it (Eq never matches NULLs).
     let after_flag = b.emit_label();
     let set_flag = b.emit_label();
@@ -17416,6 +17447,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 // Resolve collation from the operand (e.g. column-level NOCASE).
                 let collation_p4 = effective_collation_ctx(operand, ctx)
                     .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+                // Apply the operand's comparison affinity to each list value, so
+                // `INTEGER_col IN ('1','5')` coerces the text literals to numbers
+                // exactly like a plain `=`/BETWEEN comparison (bd-cfmf6/bd-56aj2).
+                let in_aff = in_operand_affinity_p5(operand, ctx);
                 let null_label = b.emit_label();
                 let true_label = b.emit_label();
                 let done_label = b.emit_label();
@@ -17433,7 +17468,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                         r_operand,
                         true_label,
                         collation_p4.clone(),
-                        0,
+                        in_aff,
                     );
                     // Eq with NULL never jumps.  If this value was NULL, flag it.
                     let next_val = b.emit_label();
@@ -17963,6 +17998,15 @@ fn emit_once_materialized_in_list(
     let r_operand = b.alloc_temp();
     emit_expr(b, operand, r_operand, ctx);
 
+    // SQLite applies the operand's affinity to both the materialized IN-set
+    // values and the probe key (bd-cfmf6/bd-56aj2): an INTEGER operand coerces
+    // text list literals to numbers before they enter / are probed against the
+    // ephemeral autoindex. `None` means BLOB/NONE affinity (no coercion).
+    let in_aff_str: Option<String> = u8::try_from(in_operand_affinity_p5(operand, ctx))
+        .ok()
+        .filter(|&code| code != 0)
+        .map(|code| (code as char).to_string());
+
     let null_label = b.emit_label();
     let found_label = b.emit_label();
     let done_label = b.emit_label();
@@ -17988,6 +18032,16 @@ fn emit_once_materialized_in_list(
     let r_key = b.alloc_temp();
     for value_expr in values {
         emit_expr(b, value_expr, r_value, ctx);
+        if let Some(ref aff) = in_aff_str {
+            b.emit_op(
+                Opcode::Affinity,
+                r_value,
+                1,
+                0,
+                P4::Affinity(aff.clone()),
+                0,
+            );
+        }
         let next_value = b.emit_label();
         let saw_null_label = b.emit_label();
         b.emit_jump_to_label(Opcode::IsNull, r_value, 0, saw_null_label, P4::None, 0);
@@ -18003,6 +18057,16 @@ fn emit_once_materialized_in_list(
     b.resolve_label(build_done);
 
     let r_probe_key = b.alloc_temp();
+    if let Some(ref aff) = in_aff_str {
+        b.emit_op(
+            Opcode::Affinity,
+            r_operand,
+            1,
+            0,
+            P4::Affinity(aff.clone()),
+            0,
+        );
+    }
     b.emit_op(Opcode::MakeRecord, r_operand, 1, r_probe_key, P4::None, 0);
     b.emit_jump_to_label(
         Opcode::Found,
@@ -18103,9 +18167,39 @@ fn emit_once_materialized_in_probe_source(
         register_base: None,
         secondary: None,
     };
+    // Apply the comparison affinity between the outer operand and the subquery
+    // probe column to both the materialized values and the probe key, mirroring
+    // the per-row IN-subquery path (bd-56aj2 IN-subquery).
+    let probe_aff = match probe_source.value {
+        InProbeValue::Rowid => b'D',
+        InProbeValue::FirstColumn => probe_source
+            .table
+            .columns
+            .first()
+            .and_then(|c| c.type_name.as_deref())
+            .map_or(b'A', column_type_to_affinity),
+        InProbeValue::Expr(e) => expr_affinity(e, Some(&probe_scan)),
+    };
+    let in_aff_str: Option<String> = u8::try_from(combine_comparison_affinity(
+        expr_affinity(operand, Some(scan_ctx)),
+        probe_aff,
+    ))
+    .ok()
+    .filter(|&code| code != 0)
+    .map(|code| (code as char).to_string());
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
     emit_in_probe_value(b, source_cursor, probe_source, r_value, &probe_scan);
+    if let Some(ref aff) = in_aff_str {
+        b.emit_op(
+            Opcode::Affinity,
+            r_value,
+            1,
+            0,
+            P4::Affinity(aff.clone()),
+            0,
+        );
+    }
     let next_value = b.emit_label();
     let saw_null_label = b.emit_label();
     b.emit_jump_to_label(Opcode::IsNull, r_value, 0, saw_null_label, P4::None, 0);
@@ -18128,6 +18222,16 @@ fn emit_once_materialized_in_probe_source(
     b.resolve_label(build_done);
 
     let r_probe_key = b.alloc_temp();
+    if let Some(ref aff) = in_aff_str {
+        b.emit_op(
+            Opcode::Affinity,
+            r_operand,
+            1,
+            0,
+            P4::Affinity(aff.clone()),
+            0,
+        );
+    }
     b.emit_op(Opcode::MakeRecord, r_operand, 1, r_probe_key, P4::None, 0);
     b.emit_jump_to_label(
         Opcode::Found,
@@ -19046,11 +19150,18 @@ fn emit_expr_with_fallback(
             if let Some(op_expr) = operand {
                 let r_op = b.alloc_temp();
                 emit_expr_with_fallback(b, op_expr, r_op, inner_ctx, outer_ctx);
+                let op_aff = fallback_expr_affinity(op_expr, inner_ctx, outer_ctx);
                 for (when_expr, then_expr) in whens {
                     let r_when = b.alloc_temp();
                     emit_expr_with_fallback(b, when_expr, r_when, inner_ctx, outer_ctx);
                     let next = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next, P4::None, 0);
+                    // Simple CASE desugars to `operand = when`; apply comparison
+                    // affinity like a plain `=` would (bd-w4r25).
+                    let cmp_aff = combine_comparison_affinity(
+                        op_aff,
+                        fallback_expr_affinity(when_expr, inner_ctx, outer_ctx),
+                    );
+                    b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next, P4::None, cmp_aff);
                     b.free_temp(r_when);
                     emit_expr_with_fallback(b, then_expr, reg, inner_ctx, outer_ctx);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
@@ -19089,6 +19200,11 @@ fn emit_expr_with_fallback(
                 } else {
                     let r_op = b.alloc_temp();
                     emit_expr_with_fallback(b, operand, r_op, inner_ctx, outer_ctx);
+                    // Apply the operand's affinity to each list value (bd-cfmf6/bd-56aj2).
+                    let in_aff = combine_comparison_affinity(
+                        fallback_expr_affinity(operand, inner_ctx, outer_ctx),
+                        b'A',
+                    );
                     let found_label = b.emit_label();
                     let done_label = b.emit_label();
                     let null_label = b.emit_label();
@@ -19097,7 +19213,14 @@ fn emit_expr_with_fallback(
                         let r_val = b.alloc_temp();
                         emit_expr_with_fallback(b, val, r_val, inner_ctx, outer_ctx);
                         b.emit_jump_to_label(Opcode::IsNull, r_val, 0, null_label, P4::None, 0);
-                        b.emit_jump_to_label(Opcode::Eq, r_val, r_op, found_label, P4::None, 0);
+                        b.emit_jump_to_label(
+                            Opcode::Eq,
+                            r_val,
+                            r_op,
+                            found_label,
+                            P4::None,
+                            in_aff,
+                        );
                         b.free_temp(r_val);
                     }
                     b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
@@ -19573,8 +19696,13 @@ fn emit_case_expr(
             // (NULL = x is UNKNOWN in SQL, which is falsy for CASE).
             b.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
             b.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
+            // Simple CASE desugars to `operand = when_value`, so apply the same
+            // comparison affinity a plain `=` would (bd-w4r25): an INTEGER
+            // operand coerces a text WHEN literal to a number before comparing.
+            let cmp_aff =
+                operand.map_or(0, |op_expr| comparison_affinity_p5(op_expr, when_expr, ctx));
             // If operand != when_value, skip to next WHEN.
-            b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, cmp_aff);
             b.free_temp(r_when);
         } else {
             // Searched CASE: each WHEN is a boolean condition.
@@ -19690,24 +19818,29 @@ fn column_type_to_affinity(type_name: &str) -> u8 {
 /// Compute the comparison affinity P5 value for a binary comparison.
 /// Implements SQLite's Section 4.2 type conversion rules.
 fn comparison_affinity_p5(left: &Expr, right: &Expr, ctx: Option<&ScanCtx<'_>>) -> u16 {
-    let l_aff = expr_affinity(left, ctx);
-    let r_aff = expr_affinity(right, ctx);
+    combine_comparison_affinity(expr_affinity(left, ctx), expr_affinity(right, ctx))
+}
 
-    let is_numeric = |a: u8| matches!(a, b'C' | b'D' | b'E');
+/// Affinity that SQLite applies to every element of a value-list / subquery
+/// `IN` comparison: the affinity of the left-hand operand applied uniformly
+/// (datatype3 §4.2 — IN uses `sqlite3ExprAffinity(LHS)` against the RHS set).
+/// Returns a `p5` affinity code (`0`, `b'B'`, or `b'C'`).
+fn in_operand_affinity_p5(operand: &Expr, ctx: Option<&ScanCtx<'_>>) -> u16 {
+    // The RHS set elements contribute NONE/BLOB affinity, so the result is
+    // governed entirely by the operand's own affinity.
+    combine_comparison_affinity(expr_affinity(operand, ctx), b'A')
+}
 
-    // If one has numeric affinity (C/D/E) and the other has TEXT (B) or BLOB (A),
-    // apply NUMERIC affinity to coerce TEXT → number.
-    if is_numeric(l_aff) && matches!(r_aff, b'A' | b'B') {
-        return u16::from(b'C'); // NUMERIC
+/// Resolve an expression's comparison affinity in the correlated-subquery
+/// fallback path: prefer the inner (subquery) context, but fall back to the
+/// outer context when the column doesn't resolve to a typed inner column.
+fn fallback_expr_affinity(expr: &Expr, inner: &ScanCtx<'_>, outer: Option<&ScanCtx<'_>>) -> u8 {
+    let inner_aff = expr_affinity(expr, Some(inner));
+    if inner_aff != b'A' {
+        inner_aff
+    } else {
+        outer.map_or(b'A', |o| expr_affinity(expr, Some(o)))
     }
-    if is_numeric(r_aff) && matches!(l_aff, b'A' | b'B') {
-        return u16::from(b'C'); // NUMERIC
-    }
-    // If one has TEXT (B) and the other BLOB/NONE (A), apply TEXT affinity.
-    if (l_aff == b'B' && r_aff == b'A') || (l_aff == b'A' && r_aff == b'B') {
-        return u16::from(b'B'); // TEXT
-    }
-    0 // No affinity coercion needed
 }
 
 /// Convert a SQL type name to an affinity character code.

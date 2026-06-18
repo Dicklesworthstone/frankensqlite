@@ -118,7 +118,6 @@ fn index_affinity_in_seek() {
 /// INTEGER column tested against a text IN-list matches nothing. Tracked in
 /// bd-cfmf6 (sibling of the BETWEEN-affinity gap bd-36kv6).
 #[test]
-#[ignore = "bd-cfmf6: IN (literal list) does not apply column comparison affinity"]
 fn index_in_list_affinity() {
     scenario(
         &[

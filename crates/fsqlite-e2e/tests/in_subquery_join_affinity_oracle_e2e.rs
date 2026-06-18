@@ -132,7 +132,6 @@ fn join_on_cross_affinity_key() {
 /// (Distinct from bd-zvk68 — this subquery is non-correlated and same-type
 /// IN-subqueries work.)
 #[test]
-#[ignore = "bd-56aj2: IN (subquery) skips LHS affinity (INTEGER col IN text-numeric subquery never matches)"]
 fn in_subquery_applies_lhs_affinity() {
     let (f, r) = data();
     check(

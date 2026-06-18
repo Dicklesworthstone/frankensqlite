@@ -98,7 +98,6 @@ fn data() -> (Connection, rusqlite::Connection) {
 /// bd-w4r25: simple-CASE `CASE n WHEN '5'` (INTEGER col vs text literal) does not
 /// coerce the WHEN value, so it never matches; SQLite applies INTEGER affinity.
 #[test]
-#[ignore = "bd-w4r25: simple-CASE ignores comparison affinity (INTEGER col WHEN text-numeric never matches)"]
 fn case_integer_column_when_text_numeric() {
     let (f, r) = data();
     check(
@@ -115,7 +114,6 @@ fn case_integer_column_when_text_numeric() {
 /// bd-w4r25: simple-CASE `CASE s WHEN 5` (TEXT col vs numeric literal) does not
 /// coerce, so it never matches; SQLite applies TEXT affinity.
 #[test]
-#[ignore = "bd-w4r25: simple-CASE ignores comparison affinity (TEXT col WHEN numeric never matches)"]
 fn case_text_column_when_numeric() {
     let (f, r) = data();
     check(
@@ -164,7 +162,6 @@ fn case_numeric_int_vs_real_in_where() {
 /// bd-w4r25: multi-branch simple-CASE with text-numeric WHEN values on an
 /// INTEGER column — every branch fails to coerce, so all rows fall to ELSE.
 #[test]
-#[ignore = "bd-w4r25: simple-CASE ignores comparison affinity (multi-branch text-numeric WHEN)"]
 fn case_multibranch_affinity() {
     let (f, r) = data();
     check(

@@ -152,7 +152,6 @@ fn in_list_text_column_vs_numeric_list() {
 /// returns no rows. BETWEEN with the same coercion works (see
 /// `between_over_table_and_text`).
 #[test]
-#[ignore = "bd-56aj2: IN value-list does not apply left operand affinity (INTEGER_col IN (text-numerics) returns []); BETWEEN does"]
 fn in_list_applies_affinity() {
     let (f, r) = data();
     check(
