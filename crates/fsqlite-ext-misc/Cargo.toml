@@ -15,7 +15,7 @@ rand = { workspace = true }
 tracing = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
 
 [lints]
 workspace = true

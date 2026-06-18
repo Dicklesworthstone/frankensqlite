@@ -47,8 +47,8 @@ fsqlite-parser = { workspace = true }
 fsqlite-planner = { version = "0.1.10", path = "../fsqlite-planner", default-features = false, features = ["wasm"] }
 fsqlite-func = { workspace = true }
 fsqlite-pager = { version = "0.1.10", path = "../fsqlite-pager", default-features = false, features = ["wasm"] }
-js-sys = "0.3"
-wasm-bindgen = "0.2"
+js-sys = "0.3.102"
+wasm-bindgen = "0.2.125"
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "linux"))'.dependencies]
 fsqlite-core = { version = "0.1.10", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }
@@ -62,8 +62,8 @@ tracing = { workspace = true, optional = true, features = ["release_max_level_er
 tracing-wasm = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-getrandom = { version = "0.4.2", features = ["wasm_js"] }
-wasm-bindgen-test = "0.3"
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+wasm-bindgen-test = "0.3.75"
 
 [lints]
 workspace = true
