@@ -123,7 +123,6 @@ fn pragma_table_info_composite_pk() {
 }
 
 #[test]
-#[ignore = "bd-ewj3w: table_xinfo returns the table_info shape (missing the trailing hidden column)"]
 fn pragma_table_xinfo_hidden_column() {
     let (f, r) = setup(&["CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED)"]);
     // table_xinfo adds the trailing `hidden` column (generated => 2/3).
@@ -178,7 +177,6 @@ fn pragma_index_list() {
 }
 
 #[test]
-#[ignore = "bd-ewj3w: index_xinfo returns the index_info shape (missing desc/coll/key + rowid row)"]
 fn pragma_index_xinfo_with_direction() {
     let (f, r) = setup(&[
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",

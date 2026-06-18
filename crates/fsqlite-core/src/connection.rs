@@ -46515,6 +46515,10 @@ impl Connection {
                     .find(|t| t.name.eq_ignore_ascii_case(&table_name));
                 match table {
                     Some(t) => {
+                        // table_xinfo extends table_info with a trailing `hidden`
+                        // column: 0 normal, 2 VIRTUAL generated, 3 STORED
+                        // generated (bd-ewj3w).
+                        let is_xinfo = full_name == "table_xinfo";
                         let pk_positions = self.compute_pk_positions(t);
                         let rows = t
                             .columns
@@ -46535,16 +46539,25 @@ impl Connection {
                                         SqliteValue::Text(s.clone().into())
                                     });
                                 let pk = pk_positions.get(i).copied().unwrap_or(0);
-                                Row {
-                                    values: vec![
-                                        SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
-                                        SqliteValue::Text(col.name.clone().into()),
-                                        SqliteValue::Text(type_str.into()),
-                                        SqliteValue::Integer(notnull),
-                                        dflt,
-                                        SqliteValue::Integer(pk),
-                                    ],
+                                let mut values = vec![
+                                    SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
+                                    SqliteValue::Text(col.name.clone().into()),
+                                    SqliteValue::Text(type_str.into()),
+                                    SqliteValue::Integer(notnull),
+                                    dflt,
+                                    SqliteValue::Integer(pk),
+                                ];
+                                if is_xinfo {
+                                    let hidden = if col.generated_stored == Some(true) {
+                                        3
+                                    } else if col.generated_expr.is_some() {
+                                        2
+                                    } else {
+                                        0
+                                    };
+                                    values.push(SqliteValue::Integer(hidden));
                                 }
+                                Row { values }
                             })
                             .collect();
                         Ok(rows)
@@ -46622,11 +46635,15 @@ impl Connection {
                     },
                     None => return Ok(Vec::new()),
                 };
+                // index_xinfo extends index_info (seqno, cid, name) with the
+                // desc (sort order), coll (collation), key (1=index key term,
+                // 0=covered) columns plus a trailing rowid entry (bd-ewj3w).
+                let is_xinfo = full_name == "index_xinfo";
                 let schema = self.schema.borrow();
                 for table in schema.iter() {
                     for idx in &table.indexes {
                         if idx.name.eq_ignore_ascii_case(&index_name) {
-                            let rows = idx
+                            let mut rows: Vec<Row> = idx
                                 .columns
                                 .iter()
                                 .enumerate()
@@ -46636,15 +46653,47 @@ impl Connection {
                                         .iter()
                                         .position(|c| c.name.eq_ignore_ascii_case(col_name))
                                         .map_or(-1, |p| i64::try_from(p).unwrap_or(-1));
-                                    Row {
-                                        values: vec![
-                                            SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
-                                            SqliteValue::Integer(cid),
-                                            SqliteValue::Text(col_name.clone().into()),
-                                        ],
+                                    let seqno =
+                                        SqliteValue::Integer(i64::try_from(seq).unwrap_or(0));
+                                    if is_xinfo {
+                                        let desc = i64::from(idx.key_term_descending(seq));
+                                        let coll = idx.key_term_collation(seq).unwrap_or("BINARY");
+                                        Row {
+                                            values: vec![
+                                                seqno,
+                                                SqliteValue::Integer(cid),
+                                                SqliteValue::Text(col_name.clone().into()),
+                                                SqliteValue::Integer(desc),
+                                                SqliteValue::Text(coll.into()),
+                                                SqliteValue::Integer(1),
+                                            ],
+                                        }
+                                    } else {
+                                        Row {
+                                            values: vec![
+                                                seqno,
+                                                SqliteValue::Integer(cid),
+                                                SqliteValue::Text(col_name.clone().into()),
+                                            ],
+                                        }
                                     }
                                 })
                                 .collect();
+                            if is_xinfo {
+                                // Trailing rowid (covered) entry: SQLite appends the
+                                // implicit rowid with cid=-1, NULL name, key=0.
+                                let seqno = i64::try_from(idx.columns.len()).unwrap_or(0);
+                                rows.push(Row {
+                                    values: vec![
+                                        SqliteValue::Integer(seqno),
+                                        SqliteValue::Integer(-1),
+                                        SqliteValue::Null,
+                                        SqliteValue::Integer(0),
+                                        SqliteValue::Text("BINARY".into()),
+                                        SqliteValue::Integer(0),
+                                    ],
+                                });
+                            }
                             return Ok(rows);
                         }
                     }
