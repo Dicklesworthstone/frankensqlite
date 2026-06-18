@@ -2233,6 +2233,14 @@ impl ScalarFunction for FormatFunc {
             return Ok(SqliteValue::Null);
         }
         let fmt_str = args[0].to_text();
+        // SQLite returns NULL (not empty text) when the format string is empty:
+        // an empty format never appends to the StrAccum, so its result buffer
+        // stays NULL. A non-empty format that renders to nothing (e.g.
+        // printf('%s', NULL)) still yields empty TEXT, so only gate on the
+        // format string being empty here.
+        if fmt_str.is_empty() {
+            return Ok(SqliteValue::Null);
+        }
         let params = &args[1..];
         let result = sqlite_format(&fmt_str, params)?;
         Ok(SqliteValue::Text(SmallText::from_string(result)))
@@ -2271,6 +2279,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
         let mut show_sign = false;
         let mut space_sign = false;
         let mut zero_pad = false;
+        let mut alt_form = false;
         loop {
             if i >= chars.len() {
                 break;
@@ -2280,6 +2289,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 '+' => show_sign = true,
                 ' ' => space_sign = true,
                 '0' => zero_pad = true,
+                '#' => alt_form = true,
                 _ => break,
             }
             i += 1;
@@ -2421,16 +2431,23 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
-                let formatted = if spec == 'x' {
+                let digits = if spec == 'x' {
                     format!("{:x}", val as u64)
                 } else {
                     format!("{:X}", val as u64)
                 };
-                let padded = if zero_pad && width > formatted.len() {
-                    let pad = "0".repeat(width - formatted.len());
-                    format!("{pad}{formatted}")
+                // Alternate form (`#`) prefixes a nonzero value with 0x / 0X.
+                let prefix = if alt_form && val != 0 {
+                    if spec == 'x' { "0x" } else { "0X" }
                 } else {
-                    pad_string(&formatted, width, left_align)
+                    ""
+                };
+                let padded = if zero_pad && !left_align && width > digits.len() {
+                    // Zero-pad pads the digits to `width`; the prefix sits outside.
+                    let pad = "0".repeat(width - digits.len());
+                    format!("{prefix}{pad}{digits}")
+                } else {
+                    pad_string(&format!("{prefix}{digits}"), width, left_align)
                 };
                 result.push_str(&padded);
             }
@@ -2438,12 +2455,14 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
                 #[allow(clippy::cast_sign_loss)]
-                let formatted = format!("{:o}", val as u64);
-                let padded = if zero_pad && width > formatted.len() {
-                    let pad = "0".repeat(width - formatted.len());
-                    format!("{pad}{formatted}")
+                let digits = format!("{:o}", val as u64);
+                // Alternate form (`#`) prefixes a nonzero value with a leading 0.
+                let prefix = if alt_form && val != 0 { "0" } else { "" };
+                let padded = if zero_pad && !left_align && width > digits.len() {
+                    let pad = "0".repeat(width - digits.len());
+                    format!("{prefix}{pad}{digits}")
                 } else {
-                    pad_string(&formatted, width, left_align)
+                    pad_string(&format!("{prefix}{digits}"), width, left_align)
                 };
                 result.push_str(&padded);
             }
@@ -4465,6 +4484,60 @@ mod tests {
         assert_eq!(
             result,
             SqliteValue::Text(SmallText::from_string("beforeafter"))
+        );
+    }
+
+    #[test]
+    fn test_format_alternate_form_hex_octal() {
+        // bd-w54bm: `#` flag prefixes 0x/0X (hex) or 0 (octal) for nonzero values.
+        let cases: &[(&str, i64, &str)] = &[
+            ("%#x", 255, "0xff"),
+            ("%#X", 255, "0XFF"),
+            ("%#o", 64, "0100"),
+            ("%#x", 0, "0"),   // zero gets no prefix
+            ("%#o", 0, "0"),   // zero gets no prefix
+            ("%#5x", 255, " 0xff"),       // prefix counts toward space pad
+            ("%#8x", 255, "    0xff"),
+            ("%#08x", 255, "0x000000ff"), // zero pad pads digits, prefix outside
+            ("%-#8x", 255, "0xff    "),    // left align overrides zero pad
+            ("%#08o", 64, "000000100"),
+            ("%#x", -1, "0xffffffffffffffff"),
+        ];
+        for (fmt, arg, want) in cases {
+            let f = FormatFunc;
+            let result = f
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(*fmt)),
+                    SqliteValue::Integer(*arg),
+                ])
+                .unwrap();
+            assert_eq!(
+                result,
+                SqliteValue::Text(SmallText::from_string((*want).to_owned())),
+                "format({fmt:?}, {arg})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_empty_string_is_null() {
+        // bd-13ivh: an empty format string yields NULL (the StrAccum is never
+        // touched), while a non-empty format that renders to nothing still
+        // yields empty TEXT.
+        let f = FormatFunc;
+        assert_eq!(
+            f.invoke(&[SqliteValue::Text(SmallText::from_string(""))])
+                .unwrap(),
+            SqliteValue::Null
+        );
+        // Non-empty format rendering to empty output is still TEXT, not NULL.
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Text(SmallText::from_string("%s")),
+                SqliteValue::Null,
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string(String::new()))
         );
     }
 

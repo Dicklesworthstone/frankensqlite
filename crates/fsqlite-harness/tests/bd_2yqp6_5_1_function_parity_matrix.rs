@@ -501,6 +501,31 @@ fn test_format_printf_functions() {
             name: "printf_octal",
             sql: "SELECT printf('%o', 255)",
         },
+        // bd-w54bm: `#` alternate-form flag (0x/0X/0 prefix).
+        CompatTest {
+            name: "printf_hash_hex_lower",
+            sql: "SELECT printf('%#x', 255)",
+        },
+        CompatTest {
+            name: "printf_hash_hex_upper",
+            sql: "SELECT printf('%#X', 255)",
+        },
+        CompatTest {
+            name: "printf_hash_octal",
+            sql: "SELECT printf('%#o', 64)",
+        },
+        CompatTest {
+            name: "printf_hash_hex_zero",
+            sql: "SELECT printf('%#x', 0)",
+        },
+        CompatTest {
+            name: "printf_hash_hex_zeropad",
+            sql: "SELECT printf('%#08x', 255)",
+        },
+        CompatTest {
+            name: "printf_hash_hex_widthpad",
+            sql: "SELECT printf('[%#8x]', 255)",
+        },
         CompatTest {
             name: "printf_char",
             sql: "SELECT printf('%c', 65)",
@@ -521,6 +546,15 @@ fn test_format_printf_functions() {
         CompatTest {
             name: "printf_null_q",
             sql: "SELECT printf('%q', NULL)",
+        },
+        // bd-13ivh: an empty format string yields NULL (not empty text).
+        CompatTest {
+            name: "printf_empty_format",
+            sql: "SELECT printf('')",
+        },
+        CompatTest {
+            name: "format_empty_format",
+            sql: "SELECT format('')",
         },
     ];
 
