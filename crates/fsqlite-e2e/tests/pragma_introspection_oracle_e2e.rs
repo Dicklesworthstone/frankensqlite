@@ -136,7 +136,6 @@ fn pragma_table_xinfo_hidden_column() {
 }
 
 #[test]
-#[ignore = "bd-uylfy: foreign_key_list uses forward declaration order; SQLite numbers FKs in reverse"]
 fn pragma_foreign_key_list() {
     let (f, r) = setup(&[
         "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
@@ -169,7 +168,6 @@ fn pragma_index_info() {
 }
 
 #[test]
-#[ignore = "bd-uylfy: index_list uses forward creation order; SQLite numbers indexes in reverse"]
 fn pragma_index_list() {
     let (f, r) = setup(&[
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER)",
@@ -196,7 +194,6 @@ fn pragma_index_xinfo_with_direction() {
 }
 
 #[test]
-#[ignore = "bd-uylfy: index_list uses forward creation order; SQLite numbers indexes in reverse"]
 fn pragma_index_list_unique_origin() {
     // A UNIQUE constraint creates an auto-index with origin 'u'; an explicit
     // CREATE INDEX has origin 'c'; the PK auto-index has origin 'pk'.

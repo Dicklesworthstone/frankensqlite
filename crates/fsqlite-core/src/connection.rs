@@ -44774,12 +44774,15 @@ impl Connection {
                                         ),
                                     }
                                 })?;
-                                let ordering = self.compare_index_key_values_for_integrity(
-                                    index,
-                                    &prev_values,
-                                    &payload_values,
-                                )
-                                .unwrap_or_else(|| prev_payload.as_slice().cmp(payload.as_slice()));
+                                let ordering = self
+                                    .compare_index_key_values_for_integrity(
+                                        index,
+                                        &prev_values,
+                                        &payload_values,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        prev_payload.as_slice().cmp(payload.as_slice())
+                                    });
                                 if ordering != std::cmp::Ordering::Less {
                                     return Err(FrankenError::DatabaseCorrupt {
                                         detail: format!(
@@ -44915,12 +44918,13 @@ impl Connection {
                                     ),
                                 }
                             })?;
-                            let ordering = self.compare_index_key_values_for_integrity(
-                                index,
-                                &prev_values,
-                                &payload_values,
-                            )
-                            .unwrap_or_else(|| prev_payload.as_slice().cmp(payload.as_slice()));
+                            let ordering = self
+                                .compare_index_key_values_for_integrity(
+                                    index,
+                                    &prev_values,
+                                    &payload_values,
+                                )
+                                .unwrap_or_else(|| prev_payload.as_slice().cmp(payload.as_slice()));
                             if ordering != std::cmp::Ordering::Less {
                                 return Err(FrankenError::DatabaseCorrupt {
                                     detail: format!(
@@ -46442,23 +46446,37 @@ impl Connection {
                     .find(|t| t.name.eq_ignore_ascii_case(&table_name));
                 match table {
                     Some(t) => {
-                        let mut indexes = t.indexes.iter().collect::<Vec<_>>();
-                        indexes.sort_by(|left, right| {
-                            left.name
-                                .to_ascii_lowercase()
-                                .cmp(&right.name.to_ascii_lowercase())
-                        });
-                        let rows = indexes
-                            .into_iter()
+                        // SQLite lists indexes in reverse creation order (the
+                        // most recently created index gets seq 0) and reports
+                        // origin 'c' for CREATE INDEX, or 'u'/'pk' for the
+                        // UNIQUE/PRIMARY KEY auto-index (sqlite_autoindex_*).
+                        let rows = t
+                            .indexes
+                            .iter()
+                            .rev()
                             .enumerate()
-                            .map(|(seq, idx)| Row {
-                                values: vec![
-                                    SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
-                                    SqliteValue::Text(idx.name.clone().into()),
-                                    SqliteValue::Integer(i64::from(idx.is_unique)),
-                                    SqliteValue::Text("c".into()),
-                                    SqliteValue::Integer(0),
-                                ],
+                            .map(|(seq, idx)| {
+                                let origin = if idx.name.starts_with("sqlite_autoindex_") {
+                                    let is_pk = t.primary_key_constraints.iter().any(|pk_cols| {
+                                        pk_cols.len() == idx.columns.len()
+                                            && pk_cols
+                                                .iter()
+                                                .zip(&idx.columns)
+                                                .all(|(pk, ic)| pk.eq_ignore_ascii_case(ic))
+                                    });
+                                    if is_pk { "pk" } else { "u" }
+                                } else {
+                                    "c"
+                                };
+                                Row {
+                                    values: vec![
+                                        SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
+                                        SqliteValue::Text(idx.name.clone().into()),
+                                        SqliteValue::Integer(i64::from(idx.is_unique)),
+                                        SqliteValue::Text(origin.into()),
+                                        SqliteValue::Integer(0),
+                                    ],
+                                }
                             })
                             .collect();
                         Ok(rows)
@@ -46527,9 +46545,13 @@ impl Connection {
                     .find(|t| t.name.eq_ignore_ascii_case(&table_name));
                 match table {
                     Some(t) => {
+                        // SQLite numbers foreign keys in reverse declaration
+                        // order: the last-declared FK gets id 0, and rows are
+                        // emitted in ascending-id order (bd-uylfy).
                         let rows = t
                             .foreign_keys
                             .iter()
+                            .rev()
                             .enumerate()
                             .flat_map(|(fk_id, fk)| {
                                 fk.child_columns.iter().enumerate().map(move |(seq, &cid)| {
@@ -115059,7 +115081,11 @@ mod tests {
 
         // integrity_check must report "ok", not "out of order".
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
-        assert_eq!(rows.len(), 1, "expected a single integrity_check result row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected a single integrity_check result row"
+        );
         assert_eq!(
             *rows[0].get(0).unwrap(),
             SqliteValue::Text("ok".into()),
@@ -151871,6 +151897,94 @@ mod pager_routing_tests {
                 || message.contains("stale rowid")
                 || message.contains("does not match"),
             "unexpected integrity_check diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_reports_out_of_order_nocase_index_entry() {
+        // frankensqlite#112 adversarial guard: applying the index collation in
+        // the key-ordering check must NOT weaken genuine-corruption detection.
+        // Build a valid NOCASE index (`'a'` rowid 1, `'B'` rowid 2 — NOCASE
+        // order is a < B), then physically swap the two leaf cell pointers so
+        // the stored traversal order becomes `'B','a'`, which violates NOCASE
+        // ordering (NOCASE 'B' > 'a'). integrity_check must still flag this as
+        // "out of order". Canonical sqlite3 3.46.1 confirms the unswapped index
+        // is genuinely valid (scans a, B; integrity_check = ok), so the only
+        // thing under test here is that the collation-aware comparator detects
+        // a real physical misordering.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_name ON t(name COLLATE NOCASE);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'B');").unwrap();
+
+        // Sanity: as built, the NOCASE index is reported `ok`.
+        let ok = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(
+            *ok[0].get(0).unwrap(),
+            SqliteValue::Text("ok".into()),
+            "freshly built NOCASE index must pass integrity_check"
+        );
+
+        let index_root = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .and_then(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .find(|index| index.name.eq_ignore_ascii_case("idx_t_name"))
+                    .map(|index| index.root_page)
+            })
+            .expect("test index root page");
+
+        let cx = Cx::new();
+        if conn.retained_autocommit_txn.borrow().is_some() {
+            conn.flush_retained_autocommit_txn(&cx).unwrap();
+        }
+        conn.invalidate_cached_write_txn(&cx);
+        conn.invalidate_cached_read_snapshot(&cx);
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = PageNumber::new(u32::try_from(index_root).unwrap()).unwrap();
+        let mut page = txn.get_page(&cx, page_no).unwrap().into_vec();
+        let header_offset = fsqlite_btree::header_offset_for_page(page_no);
+        let header = fsqlite_btree::BtreePageHeader::parse(&page, header_offset).unwrap();
+        assert!(
+            header.page_type.is_leaf(),
+            "two-entry index root must be a single leaf page"
+        );
+        let mut cell_pointers =
+            fsqlite_btree::read_cell_pointers(&page, &header, header_offset).unwrap();
+        assert_eq!(
+            cell_pointers.len(),
+            2,
+            "expected exactly two index leaf entries"
+        );
+        // Swap the two leaf cell pointers: traversal order flips to `'B','a'`,
+        // which is out of NOCASE order. Payload bytes are untouched, so the
+        // ONLY invariant violated is key ordering — isolating the collation
+        // comparator rather than the payload-match check.
+        cell_pointers.swap(0, 1);
+        fsqlite_btree::write_cell_pointers(&mut page, header_offset, &header, &cell_pointers);
+        txn.write_page(&cx, page_no, &page).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        let SqliteValue::Text(message) = &rows[0].values()[0] else {
+            panic!("integrity_check should return a text diagnostic row");
+        };
+        assert_ne!(
+            &**message, "ok",
+            "a physically misordered NOCASE leaf must not be reported ok"
+        );
+        assert!(
+            message.contains("out of order") && message.contains("idx_t_name"),
+            "expected an out-of-order diagnostic for idx_t_name, got: {message}"
         );
     }
 
