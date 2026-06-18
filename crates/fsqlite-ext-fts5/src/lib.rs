@@ -5088,6 +5088,60 @@ impl InvertedIndex {
         Fts5DocsizeRow::new(docid, counts)
     }
 
+    /// Compute the per-column docsize row for *every* document in a single
+    /// O(postings) sweep, instead of re-scanning the whole index once per
+    /// document.
+    ///
+    /// [`Self::docsize_row`] answers one document by filtering every posting,
+    /// which is O(postings). Calling it once per document — as
+    /// `Fts5Table::encode_docsize_rows` did — is O(documents × postings),
+    /// i.e. quadratic in corpus size, and was the dominant cost in a full FTS
+    /// rebuild: it wedged `cass index --full` on a single CPU core above
+    /// ~15-30 MB of indexed content (cass#301). This sweeps the postings once,
+    /// accumulating per-`(docid, column)` token counts into a map.
+    ///
+    /// `extra_docids` seeds documents that exist outside the inverted index
+    /// (e.g. the table's content rowids); together with every indexed
+    /// `doc_id` this guarantees documents with no postings still emit a
+    /// zero-count row. Output is sorted by rowid to preserve the previous
+    /// deterministic ordering and is row-for-row identical to mapping
+    /// [`Self::docsize_row`] over the same docid set.
+    #[must_use]
+    pub fn accumulate_docsize_rows<I>(
+        &self,
+        column_count: usize,
+        extra_docids: I,
+    ) -> Vec<Fts5DocsizeRow>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let mut counts_by_doc: HashMap<i64, Vec<u32>> = HashMap::new();
+        for docid in self.doc_ids.iter().copied().chain(extra_docids) {
+            counts_by_doc
+                .entry(docid)
+                .or_insert_with(|| vec![0_u32; column_count]);
+        }
+        for postings in self.index.values() {
+            for posting in postings {
+                let Ok(column) = usize::try_from(posting.column) else {
+                    continue;
+                };
+                if let Some(counts) = counts_by_doc.get_mut(&posting.docid)
+                    && let Some(count) = counts.get_mut(column)
+                {
+                    *count = count
+                        .saturating_add(u32::try_from(posting.positions.len()).unwrap_or(u32::MAX));
+                }
+            }
+        }
+        let mut rows: Vec<Fts5DocsizeRow> = counts_by_doc
+            .into_iter()
+            .map(|(rowid, counts)| Fts5DocsizeRow::new(rowid, counts))
+            .collect();
+        rows.sort_unstable_by_key(|row| row.rowid);
+        rows
+    }
+
     pub fn apply_docsize_row(&mut self, row: &Fts5DocsizeRow) {
         self.doc_ids.insert(row.rowid);
         if let Some(doc_lengths) = self.doc_lengths.as_mut() {
@@ -7675,18 +7729,16 @@ impl Fts5Table {
             return rows;
         }
 
-        let mut docids: Vec<i64> = self
-            .documents
-            .keys()
-            .copied()
-            .chain(self.index.doc_ids.iter().copied())
-            .collect();
-        docids.sort_unstable();
-        docids.dedup();
-        docids
-            .into_iter()
-            .map(|rowid| self.index.docsize_row(rowid, self.columns.len()))
-            .collect()
+        // Single O(postings) sweep across every document rather than an
+        // O(documents × postings) per-document rescan. The previous
+        // `docids.map(|id| self.index.docsize_row(id, ..))` re-filtered the
+        // entire posting set once per document, which is quadratic in corpus
+        // size and wedged full FTS rebuilds above ~15-30 MB of content
+        // (cass#301). `accumulate_docsize_rows` seeds the content rowids
+        // (`self.documents.keys()`) plus every indexed `doc_id` and returns
+        // rows sorted by rowid, so the output is identical to the old path.
+        self.index
+            .accumulate_docsize_rows(self.columns.len(), self.documents.keys().copied())
     }
 
     #[must_use]
@@ -9719,6 +9771,114 @@ mod tests {
                 Fts5ConfigRecord::integer("secure-delete", 1),
                 Fts5ConfigRecord::integer("version", 4),
             ]
+        );
+    }
+
+    /// The pre-cass#301 reference: one full posting rescan per document via
+    /// [`InvertedIndex::docsize_row`] (O(documents × postings)). The
+    /// single-pass [`Fts5Table::encode_docsize_rows`] must produce identical
+    /// rows.
+    fn reference_docsize_rows(table: &Fts5Table) -> Vec<Fts5DocsizeRow> {
+        let mut docids: Vec<i64> = table
+            .documents
+            .keys()
+            .copied()
+            .chain(table.index.doc_ids.iter().copied())
+            .collect();
+        docids.sort_unstable();
+        docids.dedup();
+        docids
+            .into_iter()
+            .map(|id| table.index.docsize_row(id, table.columns.len()))
+            .collect()
+    }
+
+    fn fill_docsize_corpus(table: &mut Fts5Table, docs: i64) {
+        const VOCAB: &[&str] = &[
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for rowid in 1..=docs {
+            // Title: 0-3 tokens — sometimes empty, exercising a zero-count column.
+            let title_len = (next() % 4) as usize;
+            let title = (0..title_len)
+                .map(|_| VOCAB[(next() as usize) % VOCAB.len()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Body: 1-12 tokens with repeats so positions accumulate per term.
+            let body_len = 1 + (next() % 12) as usize;
+            let body = (0..body_len)
+                .map(|_| VOCAB[(next() as usize) % VOCAB.len()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            table.insert_document(rowid, &[title, body]);
+        }
+    }
+
+    #[test]
+    fn encode_docsize_rows_matches_per_document_reference() {
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        assert!(
+            table.config().columnsize_enabled(),
+            "columnsize must default on for this equivalence test"
+        );
+
+        fill_docsize_corpus(&mut table, 400);
+
+        let expected = reference_docsize_rows(&table);
+        let actual = table.encode_docsize_rows();
+
+        assert_eq!(
+            actual, expected,
+            "single-pass encode_docsize_rows must equal the per-document reference"
+        );
+        assert_eq!(
+            actual.len(),
+            400,
+            "every document must emit exactly one row"
+        );
+        for row in &actual {
+            assert_eq!(
+                row.column_token_counts.len(),
+                2,
+                "each docsize row carries one token count per column"
+            );
+        }
+    }
+
+    /// Scaling guard for cass#301: the previous per-document rescan was
+    /// O(documents × postings), so a full FTS rebuild wedged a CPU core above
+    /// ~15-30 MB of content. The single-pass encoder is O(postings); 20k docs
+    /// must encode near-instantly. Ignored by default (build a larger corpus);
+    /// run with `cargo test ... encode_docsize_rows_scales_linearly -- --ignored`.
+    #[test]
+    #[ignore = "perf scaling guard for cass#301; run explicitly with --ignored"]
+    fn encode_docsize_rows_scales_linearly() {
+        use std::time::Instant;
+        let cx = Cx::new();
+        let mut table =
+            Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "body"]).unwrap();
+        fill_docsize_corpus(&mut table, 20_000);
+
+        let start = Instant::now();
+        let rows = table.encode_docsize_rows();
+        let elapsed = start.elapsed();
+
+        assert_eq!(rows.len(), 20_000);
+        assert_eq!(rows, reference_docsize_rows(&table));
+        // The O(N²) path took many seconds/minutes at this size; O(N) is well
+        // under a second. A generous 5 s bound still catches a regression.
+        assert!(
+            elapsed.as_secs() < 5,
+            "encode_docsize_rows for 20k docs took {elapsed:?}; expected O(postings), not O(docs × postings)"
         );
     }
 
