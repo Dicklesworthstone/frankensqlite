@@ -6417,6 +6417,14 @@ enum FkDeleteAction {
         child_columns: Vec<String>,
         parent_values: Vec<SqliteValue>,
     },
+    /// Child rows exist and ON DELETE SET DEFAULT is specified.
+    SetDefault {
+        child_table: String,
+        child_columns: Vec<String>,
+        /// SQL DEFAULT expression text per child column (`NULL` if none).
+        child_defaults: Vec<String>,
+        parent_values: Vec<SqliteValue>,
+    },
 }
 
 /// Describes the action to take when a FK-referenced parent row is updated.
@@ -6432,6 +6440,13 @@ enum FkUpdateAction {
     SetNull {
         child_table: String,
         child_columns: Vec<String>,
+        old_parent_values: Vec<SqliteValue>,
+    },
+    SetDefault {
+        child_table: String,
+        child_columns: Vec<String>,
+        /// SQL DEFAULT expression text per child column (`NULL` if none).
+        child_defaults: Vec<String>,
         old_parent_values: Vec<SqliteValue>,
     },
 }
@@ -40760,13 +40775,46 @@ impl Connection {
                             parent_values: parent_values.clone(),
                         });
                     }
-                    FkActionType::NoAction | FkActionType::Restrict | FkActionType::SetDefault => {
+                    FkActionType::SetDefault => {
+                        let child_defaults =
+                            self.fk_child_column_defaults(child_table, child_col_names);
+                        result_actions.push(FkDeleteAction::SetDefault {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            child_defaults,
+                            parent_values: parent_values.clone(),
+                        });
+                    }
+                    FkActionType::NoAction | FkActionType::Restrict => {
                         return Err(FrankenError::ForeignKeyViolation);
                     }
                 }
             }
         }
         Ok(result_actions)
+    }
+
+    /// Resolve the SQL DEFAULT expression text for each child FK column, used by
+    /// ON DELETE/UPDATE SET DEFAULT. Columns with no declared default fall back
+    /// to `NULL`, matching SQLite's SET DEFAULT semantics.
+    fn fk_child_column_defaults(&self, child_table: &str, child_columns: &[String]) -> Vec<String> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(child_table));
+        child_columns
+            .iter()
+            .map(|col| {
+                table
+                    .and_then(|t| {
+                        t.columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col))
+                            .and_then(|c| c.default_value.clone())
+                    })
+                    .unwrap_or_else(|| "NULL".to_owned())
+            })
+            .collect()
     }
 
     /// Execute FK cascade/set-null actions for a DELETE operation.
@@ -40802,6 +40850,34 @@ impl Connection {
                 let set_parts: Vec<String> = child_columns
                     .iter()
                     .map(|col| format!("{} = NULL", quote_identifier(col)))
+                    .collect();
+                let where_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
+                    .collect();
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    quote_identifier(child_table),
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
+                let result = self.execute_with_params(&sql, parent_values);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                result?;
+                Ok(())
+            }
+            FkDeleteAction::SetDefault {
+                child_table,
+                child_columns,
+                child_defaults,
+                parent_values,
+            } => {
+                let set_parts: Vec<String> = child_columns
+                    .iter()
+                    .zip(child_defaults)
+                    .map(|(col, def)| format!("{} = {}", quote_identifier(col), def))
                     .collect();
                 let where_parts: Vec<String> = child_columns
                     .iter()
@@ -40949,9 +41025,18 @@ impl Connection {
                             old_parent_values: old_parent_vals,
                         });
                     }
+                    fsqlite_vdbe::codegen::FkActionType::SetDefault => {
+                        let child_defaults =
+                            self.fk_child_column_defaults(child_table, child_col_names);
+                        result_actions.push(FkUpdateAction::SetDefault {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            child_defaults,
+                            old_parent_values: old_parent_vals,
+                        });
+                    }
                     fsqlite_vdbe::codegen::FkActionType::NoAction
-                    | fsqlite_vdbe::codegen::FkActionType::Restrict
-                    | fsqlite_vdbe::codegen::FkActionType::SetDefault => {
+                    | fsqlite_vdbe::codegen::FkActionType::Restrict => {
                         return Err(FrankenError::ForeignKeyViolation);
                     }
                 }
@@ -41008,6 +41093,34 @@ impl Connection {
                 let set_parts: Vec<String> = child_columns
                     .iter()
                     .map(|col| format!("{} = NULL", quote_identifier(col)))
+                    .collect();
+                let where_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
+                    .collect();
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    quote_identifier(child_table),
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
+                let result = self.execute_with_params(&sql, old_parent_values);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                result?;
+                Ok(())
+            }
+            FkUpdateAction::SetDefault {
+                child_table,
+                child_columns,
+                child_defaults,
+                old_parent_values,
+            } => {
+                let set_parts: Vec<String> = child_columns
+                    .iter()
+                    .zip(child_defaults)
+                    .map(|(col, def)| format!("{} = {}", quote_identifier(col), def))
                     .collect();
                 let where_parts: Vec<String> = child_columns
                     .iter()

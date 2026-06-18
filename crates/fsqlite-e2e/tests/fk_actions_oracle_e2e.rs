@@ -98,7 +98,6 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 /// is rejected with "FOREIGN KEY constraint failed" instead of setting the
 /// child's FK column to its DEFAULT.
 #[test]
-#[ignore = "bd-a4ki6: ON DELETE SET DEFAULT not applied (treated as constraint failure)"]
 fn fk_on_delete_set_default() {
     scenario(
         &[
@@ -190,7 +189,6 @@ fn fk_three_level_cascade_chain() {
 
 /// bd-a4ki6: ON UPDATE SET DEFAULT fails identically to the ON DELETE variant.
 #[test]
-#[ignore = "bd-a4ki6: ON UPDATE SET DEFAULT not applied (treated as constraint failure)"]
 fn fk_on_update_set_default() {
     scenario(
         &[
