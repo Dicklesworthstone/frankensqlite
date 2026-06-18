@@ -38307,7 +38307,7 @@ impl Connection {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind
                             && expr_contains_subquery_match(expr, &mut |_| true)
                         {
-                            return Err(FrankenError::Internal(
+                            return Err(FrankenError::FunctionError(
                                 "subqueries prohibited in CHECK constraints".to_owned(),
                             ));
                         }
@@ -38317,7 +38317,7 @@ impl Connection {
                     if let TableConstraintKind::Check(ref expr) = tc.kind
                         && expr_contains_subquery_match(expr, &mut |_| true)
                     {
-                        return Err(FrankenError::Internal(
+                        return Err(FrankenError::FunctionError(
                             "subqueries prohibited in CHECK constraints".to_owned(),
                         ));
                     }

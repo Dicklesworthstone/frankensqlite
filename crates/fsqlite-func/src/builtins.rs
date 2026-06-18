@@ -2442,8 +2442,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 } else {
                     ""
                 };
-                let padded = if zero_pad && !left_align && width > digits.len() {
-                    // Zero-pad pads the digits to `width`; the prefix sits outside.
+                // SQLite's printf zero-pads whenever the `0` flag is present,
+                // even alongside `-` (it does NOT let `-` override `0` the way C
+                // does). The digits are zero-padded to `width`; the prefix sits
+                // outside that pad.
+                let padded = if zero_pad && width > digits.len() {
                     let pad = "0".repeat(width - digits.len());
                     format!("{prefix}{pad}{digits}")
                 } else {
@@ -2458,7 +2461,9 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let digits = format!("{:o}", val as u64);
                 // Alternate form (`#`) prefixes a nonzero value with a leading 0.
                 let prefix = if alt_form && val != 0 { "0" } else { "" };
-                let padded = if zero_pad && !left_align && width > digits.len() {
+                // As with %x, SQLite zero-pads whenever the `0` flag is present
+                // (even with `-`).
+                let padded = if zero_pad && width > digits.len() {
                     let pad = "0".repeat(width - digits.len());
                     format!("{prefix}{pad}{digits}")
                 } else {
@@ -4499,7 +4504,8 @@ mod tests {
             ("%#5x", 255, " 0xff"),       // prefix counts toward space pad
             ("%#8x", 255, "    0xff"),
             ("%#08x", 255, "0x000000ff"), // zero pad pads digits, prefix outside
-            ("%-#8x", 255, "0xff    "),    // left align overrides zero pad
+            ("%-#8x", 255, "0xff    "),    // '-' (no '0') -> space pad, left aligned
+            ("%-08x", 255, "000000ff"),    // '-' does NOT override '0' in SQLite
             ("%#08o", 64, "000000100"),
             ("%#x", -1, "0xffffffffffffffff"),
         ];

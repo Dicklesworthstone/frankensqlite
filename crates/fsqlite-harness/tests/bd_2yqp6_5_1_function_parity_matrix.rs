@@ -527,6 +527,11 @@ fn test_format_printf_functions() {
             sql: "SELECT printf('[%#8x]', 255)",
         },
         CompatTest {
+            // SQLite zero-pads with the '0' flag even alongside '-'.
+            name: "printf_dash_zero_hex",
+            sql: "SELECT printf('[%-08x]', 255)",
+        },
+        CompatTest {
             name: "printf_char",
             sql: "SELECT printf('%c', 65)",
         },
