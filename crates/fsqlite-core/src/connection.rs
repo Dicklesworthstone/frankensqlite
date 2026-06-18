@@ -401,9 +401,8 @@ thread_local! {
 /// force a second connection to validate inside this window; production builds
 /// never compile this hook so it has zero runtime cost off the test path.
 #[cfg(test)]
-static FSQLITE_CONCURRENT_COMMIT_WINDOW_HOOK: Mutex<
-    Option<Arc<dyn Fn() + Send + Sync + 'static>>,
-> = Mutex::new(None);
+static FSQLITE_CONCURRENT_COMMIT_WINDOW_HOOK: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 fn set_concurrent_commit_window_hook(hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>) {
@@ -181568,9 +181567,8 @@ mod pager_routing_tests {
                     for txn_idx in 0..TXNS_PER_WORKER {
                         // Disjoint id ranges per (worker, txn) so every commit is
                         // pure EOF growth that must allocate fresh pages.
-                        let base = 1_000_000
-                            + i64::from(worker_id) * 100_000
-                            + (txn_idx as i64) * 100;
+                        let base =
+                            1_000_000 + i64::from(worker_id) * 100_000 + (txn_idx as i64) * 100;
                         // Each txn writes several large rows to force multi-page
                         // growth and B-tree splits under contention.
                         loop {
