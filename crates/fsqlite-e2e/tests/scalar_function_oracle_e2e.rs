@@ -216,7 +216,6 @@ fn scalar_printf_specifiers() {
 /// (C-printf `%c`, 65 -> 'A') while SQLite emits the first character of the
 /// argument's text form ('65' -> '6'). Tracked in bd-47mu0.
 #[test]
-#[ignore = "bd-47mu0: printf('%c', N) emits codepoint char instead of first char of arg text"]
 fn scalar_printf_c_specifier_divergence() {
     assert_parity(
         &["SELECT printf('%c', 65)", "SELECT printf('%c', 9731)"],

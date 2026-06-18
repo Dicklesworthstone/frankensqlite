@@ -2448,10 +2448,17 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push_str(&padded);
             }
             'c' => {
-                let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+                let param = params.get(param_idx);
                 param_idx += 1;
-                #[allow(clippy::cast_sign_loss)]
-                if let Some(c) = char::from_u32(val as u32) {
+                // SQLite's printf %c renders the argument to its text form and
+                // emits the first character — it does NOT interpret an integer
+                // as a Unicode codepoint like C printf does (bd-47mu0). So
+                // printf('%c', 65) yields '6' (first char of "65"), not 'A'.
+                let text = match param {
+                    Some(SqliteValue::Null) | None => String::new(),
+                    Some(v) => v.to_text(),
+                };
+                if let Some(c) = text.chars().next() {
                     result.push(c);
                 }
             }

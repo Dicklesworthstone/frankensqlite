@@ -207,9 +207,8 @@ struct CompatTest {
 /// parity gaps against C SQLite.  The rusqlite Rust bindings sometimes
 /// coerce NULL/integer parameters differently than the C API.
 const KNOWN_RUSQLITE_BINDING_DIFFS: &[&str] = &[
-    // rusqlite binds integer 65 as text "65", taking first char '6'.
-    // C SQLite correctly returns 'A' for printf('%c', 65).
-    "printf_char",
+    // (printf_char removed — bd-47mu0: frank now matches SQLite's first-char-of-
+    // text semantics for `printf('%c', 65)` -> '6', so it compares equal.)
     // rusqlite converts NULL to empty string before passing to printf.
     // C SQLite returns "(null)" for printf('%s', NULL).
     "printf_null_s",
