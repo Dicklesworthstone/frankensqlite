@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-session"
-version = "0.1.10"
+version = "0.1.11"
 description = "Session, changeset, and patchset extension"
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-json"
-version = "0.1.10"
+version = "0.1.11"
 description = "JSON1 functions and virtual tables"
 edition.workspace = true
 license.workspace = true
