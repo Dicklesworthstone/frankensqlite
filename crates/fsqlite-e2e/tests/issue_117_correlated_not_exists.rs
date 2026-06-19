@@ -49,7 +49,8 @@ fn not_exists_anti_join_correct() {
         conn.execute(&format!("INSERT INTO ledger (fk) VALUES ({fk})"))
             .unwrap();
     }
-    conn.execute("INSERT INTO ledger (fk) VALUES (NULL)").unwrap();
+    conn.execute("INSERT INTO ledger (fk) VALUES (NULL)")
+        .unwrap();
 
     let ref_set: std::collections::HashSet<i64> = referenced.into_iter().collect();
 
@@ -70,9 +71,11 @@ fn not_exists_anti_join_correct() {
          WHERE EXISTS (SELECT 1 FROM ledger WHERE ledger.fk = parent.id) \
          ORDER BY id",
     );
-    let expected_exists: Vec<i64> =
-        (1..=20).filter(|id| ref_set.contains(id)).collect();
-    assert_eq!(got_exists, expected_exists, "EXISTS semi-join produced wrong rows");
+    let expected_exists: Vec<i64> = (1..=20).filter(|id| ref_set.contains(id)).collect();
+    assert_eq!(
+        got_exists, expected_exists,
+        "EXISTS semi-join produced wrong rows"
+    );
 
     // Combined with extra outer predicates (the GH#117 shape): the memo must
     // not change which rows survive the additional filters.
@@ -87,7 +90,10 @@ fn not_exists_anti_join_correct() {
     let expected_combo: Vec<i64> = (1..=20)
         .filter(|id| id % 3 == 1 && !ref_set.contains(id) && 1000 + id > 1010)
         .collect();
-    assert_eq!(got_combo, expected_combo, "NOT EXISTS + outer filters wrong");
+    assert_eq!(
+        got_combo, expected_combo,
+        "NOT EXISTS + outer filters wrong"
+    );
 }
 
 #[test]
@@ -105,8 +111,10 @@ fn not_exists_cross_type_numeric_equality() {
             .unwrap();
     }
     // REAL fk values equal (as numbers) to parent ids 2 and 4.
-    conn.execute("INSERT INTO ledger (fk) VALUES (2.0)").unwrap();
-    conn.execute("INSERT INTO ledger (fk) VALUES (4.0)").unwrap();
+    conn.execute("INSERT INTO ledger (fk) VALUES (2.0)")
+        .unwrap();
+    conn.execute("INSERT INTO ledger (fk) VALUES (4.0)")
+        .unwrap();
 
     let got = ids(
         &conn,
@@ -134,7 +142,8 @@ fn not_exists_text_key_equality() {
         ))
         .unwrap();
     }
-    conn.execute("INSERT INTO ban (name) VALUES ('bob')").unwrap();
+    conn.execute("INSERT INTO ban (name) VALUES ('bob')")
+        .unwrap();
     conn.execute("INSERT INTO ban (name) VALUES ('dave')")
         .unwrap();
     // Case mismatch must NOT match (binary equality).
@@ -190,9 +199,7 @@ fn not_exists_perf_is_subquadratic() {
     let elapsed = start.elapsed();
 
     // Correctness: odd ids with k==1 and not referenced.
-    let expected: Vec<i64> = (1..=n)
-        .filter(|id| id % 7 == 1 && id % 2 == 1)
-        .collect();
+    let expected: Vec<i64> = (1..=n).filter(|id| id % 7 == 1 && id % 2 == 1).collect();
     let got: Vec<i64> = rows
         .iter()
         .map(|r| match &r.values()[0] {

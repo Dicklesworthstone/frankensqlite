@@ -71,9 +71,9 @@ fn run_shape(n: i64, fk_on: bool, composite_unique: bool) -> f64 {
     let start = Instant::now();
     for i in 0..n {
         let params = [
-            SqliteValue::Integer(i + 1),            // id (explicit rowid)
-            SqliteValue::Text("p1".into()),         // parent_id
-            SqliteValue::Integer(i),                // seq (unique per row)
+            SqliteValue::Integer(i + 1),    // id (explicit rowid)
+            SqliteValue::Text("p1".into()), // parent_id
+            SqliteValue::Integer(i),        // seq (unique per row)
             SqliteValue::Float(1.0),
             SqliteValue::Float(2.0),
             SqliteValue::Float(3.0),
@@ -82,8 +82,8 @@ fn run_shape(n: i64, fk_on: bool, composite_unique: bool) -> f64 {
             SqliteValue::Float(6.0),
             SqliteValue::Float(7.0),
             SqliteValue::Float(8.0),
-            SqliteValue::Text("x".into()),          // extra
-            SqliteValue::Integer(i),                // orig_seq
+            SqliteValue::Text("x".into()), // extra
+            SqliteValue::Integer(i),       // orig_seq
         ];
         conn.execute_prepared_with_params(&stmt, &params).unwrap();
     }
