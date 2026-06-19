@@ -8269,6 +8269,15 @@ pub struct Connection {
     /// Keyed by Vec<Expr> pointer identity (the list's heap address).
     /// Built once during first probe, reused on subsequent rows.
     precomputed_in_sets: RefCell<std::collections::HashMap<usize, PrecomputedInSetCache>>,
+    /// GH#117: query-scoped memo of a child table column's value-set for the
+    /// correlated `EXISTS`/`NOT EXISTS` direct probe. Armed (depth > 0) only for
+    /// the duration of an `execute_join_select` WHERE loop, where the child
+    /// tables are read-only, so the memo is safe; the RAII guard returned by
+    /// `arm_exists_probe_memo` clears it when the outermost loop exits, so it is
+    /// never consulted across statements (no staleness). Keyed by
+    /// (root_page, correlated column index). This converts the per-outer-row
+    /// O(child) linear scan into an O(child) build + O(1)/row membership test.
+    exists_probe_memo: RefCell<ExistsProbeMemo>,
     /// Deferred MemDatabase upserts for prepared direct-simple INSERTs when the
     /// connection cannot keep the MemDatabase image exact inline.
     ///
@@ -8924,6 +8933,7 @@ impl Connection {
             quotient_filters_may_have_entries: Cell::new(false),
             quotient_filter_short_circuits: Cell::new(0),
             precomputed_in_sets: RefCell::new(std::collections::HashMap::new()),
+            exists_probe_memo: RefCell::new(ExistsProbeMemo::default()),
             pending_memdb_direct_upserts: RefCell::new(Vec::new()),
             pending_direct_insert_page_run: RefCell::new(None),
             pending_direct_insert_page_run_active: Cell::new(false),
@@ -9224,6 +9234,7 @@ impl Connection {
             quotient_filters_may_have_entries: Cell::new(false),
             quotient_filter_short_circuits: Cell::new(0),
             precomputed_in_sets: RefCell::new(std::collections::HashMap::new()),
+            exists_probe_memo: RefCell::new(ExistsProbeMemo::default()),
             pending_memdb_direct_upserts: RefCell::new(Vec::new()),
             pending_direct_insert_page_run: RefCell::new(None),
             pending_direct_insert_page_run_active: Cell::new(false),
@@ -49809,6 +49820,14 @@ impl Connection {
     /// Eligible shape: `EXISTS (SELECT ... FROM single_table WHERE col = outer_ref [AND static_filter])`
     /// Returns `Some(Ok(value))` if the probe was handled, `None` to fall through.
     #[allow(clippy::too_many_lines)]
+    /// GH#117: arm the correlated-EXISTS value-set memo for the duration of an
+    /// `execute_join_select` WHERE loop. Returns a guard that disarms (and, at
+    /// the outermost level, clears) the memo on every exit path.
+    fn arm_exists_probe_memo(&self) -> ExistsProbeMemoGuard<'_> {
+        self.exists_probe_memo.borrow_mut().depth += 1;
+        ExistsProbeMemoGuard { conn: self }
+    }
+
     fn try_direct_exists_probe(
         &self,
         subquery: &SelectStatement,
@@ -49911,6 +49930,41 @@ impl Connection {
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&correlated_col))?;
         let rowid_alias_col_idx = table_entry.columns.iter().position(|column| column.is_ipk);
+
+        // GH#117 fast path: with no inner-only residual filters, EXISTS reduces
+        // to "does the correlated column contain `outer_value`?". During an
+        // armed `execute_join_select` WHERE loop (memo depth > 0), build the
+        // column's value-set once (O(child)) and answer each subsequent outer
+        // row in O(1), instead of re-scanning the whole child table per outer
+        // row — the GH#117 ~480x anti-join cliff. The value-set mirrors
+        // `values_equal_sqlite` exactly, so results are unchanged.
+        if static_filters.is_empty() {
+            let memo = self.exists_probe_memo.borrow();
+            if memo.depth > 0 {
+                let key = (table_entry.root_page, col_idx);
+                if let Some(set) = memo.sets.get(&key) {
+                    let found = set.contains(&outer_value);
+                    let truth = if not { !found } else { found };
+                    return Some(Ok(SqliteValue::Integer(i64::from(truth))));
+                }
+                drop(memo);
+                let mut set = ExistsValueSet::default();
+                for (rowid, values) in table.iter_rows() {
+                    let cell_val = memdb_row_value_with_rowid_alias(
+                        rowid,
+                        values,
+                        col_idx,
+                        rowid_alias_col_idx,
+                    );
+                    set.add(&cell_val);
+                }
+                let found = set.contains(&outer_value);
+                self.exists_probe_memo.borrow_mut().sets.insert(key, set);
+                let truth = if not { !found } else { found };
+                return Some(Ok(SqliteValue::Integer(i64::from(truth))));
+            }
+        }
+
         // Linear scan with early exit on first match.
         let mut found = false;
         for (rowid, values) in table.iter_rows() {
@@ -56238,6 +56292,12 @@ impl Connection {
 
         // ── 5. Apply WHERE filter ──
         if let Some(where_expr) = effective_where_clause_for_eval {
+            // GH#117: arm the correlated-EXISTS value-set memo for this loop.
+            // The child tables are read-only here, so the per-outer-row probe
+            // can reuse a value-set built once instead of re-scanning the child
+            // table for every outer row. The guard disarms+clears on exit so the
+            // memo is never consulted across statements.
+            let _exists_memo_guard = self.arm_exists_probe_memo();
             let mut filtered = Vec::with_capacity(combined.len());
             for row in combined {
                 let predicate =
@@ -76000,6 +76060,213 @@ fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 struct PrecomputedInSetCache {
     set: std::collections::HashSet<SqliteValueHashable>,
     has_null: bool,
+}
+
+/// GH#117: query-scoped memo for the correlated `EXISTS`/`NOT EXISTS` direct
+/// probe (`try_direct_exists_probe`). `depth` counts the nesting of armed
+/// `execute_join_select` WHERE loops; the memo is consulted only when
+/// `depth > 0`, and `sets` is cleared when the outermost loop exits (depth
+/// returns to 0). Because the child tables are read-only for the whole dynamic
+/// extent of a SELECT, all cached value-sets stay valid across nested
+/// subquery evaluation, and the memo is empty between statements (no
+/// cross-statement staleness).
+#[derive(Default)]
+struct ExistsProbeMemo {
+    depth: u32,
+    sets: std::collections::HashMap<(i32, usize), ExistsValueSet>,
+}
+
+/// The set of distinct values present in one child-table column, indexed so
+/// that membership can be answered in O(1) with semantics **identical** to
+/// `values_equal_sqlite` (the comparison the per-row scan uses): binary
+/// equality for TEXT/BLOB and lossy `(i as f64)` cross-type numeric equality
+/// for INTEGER/REAL. NULL cells never match (they are skipped on insert and
+/// the caller never probes with a NULL outer value).
+#[derive(Default)]
+struct ExistsValueSet {
+    /// TEXT and BLOB cells. `SqliteValueHashable` agrees with
+    /// `values_equal_sqlite` on binary equality for these classes (the
+    /// `cmp_values` text↔numeric coercion never applies because only TEXT/BLOB
+    /// are stored and only TEXT/BLOB outer values are probed against this set).
+    exact: std::collections::HashSet<SqliteValueHashable>,
+    /// Exact INTEGER cell values (the `Integer == Integer` case).
+    ints: std::collections::HashSet<i64>,
+    /// `canon_match_f64(x as f64)` for every INTEGER cell `x` — the key probed
+    /// by a REAL outer value against INTEGER children.
+    int_as_f64: std::collections::HashSet<u64>,
+    /// `canon_match_f64(y)` for every finite, non-NaN REAL cell `y` — the key
+    /// probed by both REAL and INTEGER outer values against REAL children.
+    float_f64: std::collections::HashSet<u64>,
+}
+
+/// Canonicalize a non-NaN `f64` to a `u64` hash key such that two values share
+/// a key iff they are `==` (IEEE): `-0.0` and `+0.0` collapse to the same key,
+/// every other finite/infinite value maps to its bit pattern. Callers must
+/// guarantee `f` is not NaN (NaN never compares equal, so NaN cells/probes are
+/// excluded before reaching here).
+fn canon_match_f64(f: f64) -> u64 {
+    // `f + 0.0` rewrites `-0.0` to `+0.0` while leaving every other value
+    // unchanged, so the bit pattern is a faithful equality key without a
+    // float comparison.
+    (f + 0.0).to_bits()
+}
+
+impl ExistsValueSet {
+    fn add(&mut self, v: &SqliteValue) {
+        match v {
+            SqliteValue::Null => {}
+            SqliteValue::Integer(x) => {
+                self.ints.insert(*x);
+                #[allow(clippy::cast_precision_loss)]
+                let as_f64 = *x as f64;
+                self.int_as_f64.insert(canon_match_f64(as_f64));
+            }
+            SqliteValue::Float(y) => {
+                if !y.is_nan() {
+                    self.float_f64.insert(canon_match_f64(*y));
+                }
+            }
+            SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+                self.exact.insert(SqliteValueHashable(v.clone()));
+            }
+        }
+    }
+
+    /// Membership test matching `values_equal_sqlite(cell, outer)` for some
+    /// cell in the column. `outer` is guaranteed non-NULL by the caller.
+    fn contains(&self, outer: &SqliteValue) -> bool {
+        match outer {
+            SqliteValue::Null => false,
+            SqliteValue::Integer(x) => {
+                #[allow(clippy::cast_precision_loss)]
+                let as_f64 = *x as f64;
+                self.ints.contains(x) || self.float_f64.contains(&canon_match_f64(as_f64))
+            }
+            SqliteValue::Float(x) => {
+                if x.is_nan() {
+                    false
+                } else {
+                    let key = canon_match_f64(*x);
+                    self.float_f64.contains(&key) || self.int_as_f64.contains(&key)
+                }
+            }
+            SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+                self.exact.contains(&SqliteValueHashable(outer.clone()))
+            }
+        }
+    }
+}
+
+/// RAII guard that disarms the `exists_probe_memo` when an `execute_join_select`
+/// WHERE loop exits (on any path, including `?`/panic). Decrements the nesting
+/// depth and clears the cached value-sets once the outermost loop finishes.
+struct ExistsProbeMemoGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for ExistsProbeMemoGuard<'_> {
+    fn drop(&mut self) {
+        let mut memo = self.conn.exists_probe_memo.borrow_mut();
+        memo.depth = memo.depth.saturating_sub(1);
+        if memo.depth == 0 {
+            memo.sets.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod exists_value_set_tests {
+    use super::{ExistsValueSet, values_equal_sqlite};
+    use fsqlite_types::SqliteValue;
+    use std::sync::Arc;
+
+    /// A spread of values covering every storage class plus the tricky numeric
+    /// boundaries (cross-type INTEGER/REAL, large ints beyond f64 precision,
+    /// signed zero, infinities, fractional reals) and binary text/blob.
+    fn sample_values() -> Vec<SqliteValue> {
+        vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-1),
+            SqliteValue::Integer(42),
+            SqliteValue::Integer(9_007_199_254_740_993), // 2^53 + 1 (not exact in f64)
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Float(0.0),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Float(1.0),
+            SqliteValue::Float(42.0),
+            SqliteValue::Float(2.5),
+            SqliteValue::Float(f64::INFINITY),
+            SqliteValue::Float(9_007_199_254_740_992.0), // 2^53 exactly
+            SqliteValue::Text("alice".into()),
+            SqliteValue::Text("ALICE".into()),
+            SqliteValue::Text("42".into()),
+            SqliteValue::Text(String::new().into()),
+            SqliteValue::Blob(Arc::from(&b"alice"[..])),
+            SqliteValue::Blob(Arc::from(&[42u8][..])),
+        ]
+    }
+
+    /// The memo's `contains` must agree with the per-row scan's
+    /// `values_equal_sqlite` for every (cell, outer) pair where the outer value
+    /// is non-NULL (NULL outers are short-circuited before the memo is used).
+    #[test]
+    fn single_cell_matches_values_equal_sqlite() {
+        let values = sample_values();
+        for cell in &values {
+            let mut set = ExistsValueSet::default();
+            set.add(cell);
+            for outer in &values {
+                if matches!(outer, SqliteValue::Null) {
+                    continue;
+                }
+                let expected = values_equal_sqlite(cell, outer);
+                let got = set.contains(outer);
+                assert_eq!(
+                    got, expected,
+                    "contains mismatch: cell={cell:?} outer={outer:?} (memo={got}, scan={expected})",
+                );
+            }
+        }
+    }
+
+    /// A multi-cell set must answer "does ANY cell equal the outer value?",
+    /// matching a linear scan with `values_equal_sqlite`.
+    #[test]
+    fn multi_cell_matches_any_scan() {
+        let values = sample_values();
+        // Build a set from a subset of cells.
+        let cells: Vec<SqliteValue> = values.iter().step_by(2).cloned().collect();
+        let mut set = ExistsValueSet::default();
+        for c in &cells {
+            set.add(c);
+        }
+        for outer in &values {
+            if matches!(outer, SqliteValue::Null) {
+                continue;
+            }
+            let expected = cells.iter().any(|c| values_equal_sqlite(c, outer));
+            assert_eq!(
+                set.contains(outer),
+                expected,
+                "multi-cell contains mismatch for outer={outer:?}",
+            );
+        }
+    }
+
+    /// NULL cells never satisfy a correlated equality and must never be matched.
+    #[test]
+    fn null_cells_never_match() {
+        let mut set = ExistsValueSet::default();
+        set.add(&SqliteValue::Null);
+        for outer in sample_values() {
+            if matches!(outer, SqliteValue::Null) {
+                continue;
+            }
+            assert!(!set.contains(&outer), "NULL cell wrongly matched {outer:?}");
+        }
+    }
 }
 
 struct FkParentValidationCache {
