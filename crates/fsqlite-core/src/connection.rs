@@ -152802,7 +152802,18 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_pragma_integrity_check_reports_freelist_count_mismatch() {
+    fn test_in_txn_integrity_check_ignores_stale_freelist_count_header() {
+        // GH#113: inside a write transaction the page-1 freelist_count (offset
+        // 36) and the on-disk freelist trunk are a deferred commit-time
+        // projection — they stay at the last-committed value until COMMIT runs
+        // serialize_freelist_to_write_set. The in-transaction integrity walk
+        // must therefore NOT validate the live btree against this stale header
+        // (it uses the pager's live freelist set instead); doing so produced
+        // false "freelist header claims N" / "malformed" reports for a database
+        // whose committed state is consistent. A deliberately wrong committed
+        // count poked here must be ignored mid-transaction. The committed-state
+        // integrity_check (no active txn) still walks the on-disk trunk and
+        // validates this header — see validate_page_ownership_in_txn.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
             .unwrap();
@@ -152816,7 +152827,8 @@ mod pager_routing_tests {
                 .as_mut()
                 .expect("explicit BEGIN should create an active pager transaction");
             let mut page1 = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
-            page1[36..40].copy_from_slice(&1_u32.to_be_bytes());
+            // A bogus committed freelist_count that does not match the live state.
+            page1[36..40].copy_from_slice(&12345_u32.to_be_bytes());
             txn.write_page(&cx, PageNumber::ONE, &page1).unwrap();
         }
 
@@ -152826,10 +152838,10 @@ mod pager_routing_tests {
         let SqliteValue::Text(message) = &rows[0].values()[0] else {
             panic!("integrity_check should return a text diagnostic row");
         };
-        assert_ne!(&**message, "ok");
-        assert!(
-            message.contains("freelist header claims"),
-            "unexpected integrity_check diagnostic: {message}"
+        assert_eq!(
+            &**message, "ok",
+            "in-transaction integrity_check must ignore the deferred/stale freelist_count \
+             header (GH#113); got: {message}"
         );
     }
 
