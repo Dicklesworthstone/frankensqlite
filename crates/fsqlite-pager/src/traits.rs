@@ -1219,6 +1219,45 @@ impl std::fmt::Debug for TransactionKind {
 }
 
 impl TransactionKind {
+    /// The pager's live free-page set for this transaction (see
+    /// [`SimpleTransaction::live_freelist_pages`]). Used by `PRAGMA
+    /// integrity_check` (GH#113) to validate page ownership against the
+    /// authoritative in-transaction freelist rather than the deferred,
+    /// commit-time on-disk trunk. Mock and drained variants have no freelist
+    /// projection and return an empty set.
+    #[must_use]
+    pub fn live_freelist_pages(&self) -> Vec<PageNumber> {
+        match self {
+            Self::Memory(txn) => txn.live_freelist_pages(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.live_freelist_pages(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.live_freelist_pages(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.live_freelist_pages(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Vec::new(),
+        }
+    }
+
+    /// The in-transaction database size in pages (see
+    /// [`SimpleTransaction::live_db_size`]). Used as the page-extent bound by
+    /// `PRAGMA integrity_check` (GH#113) so the walk does not flag pages
+    /// allocated this transaction as past the end of the database. Mock and
+    /// drained variants return 0 (the caller falls back to the published size).
+    #[must_use]
+    pub fn live_db_size(&self) -> u32 {
+        match self {
+            Self::Memory(txn) => txn.live_db_size(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(txn) => txn.live_db_size(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(txn) => txn.live_db_size(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(txn) => txn.live_db_size(),
+            Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
+        }
+    }
+
     fn with_handle<R>(&self, f: impl FnOnce(&dyn TransactionHandle) -> R) -> R {
         match self {
             Self::Memory(txn) => f(txn),

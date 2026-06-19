@@ -6691,6 +6691,53 @@ impl<V: Vfs> SimpleTransaction<V> {
         Self::durable_freelist_pages_with_inner(inner, committed_db_size, &self.freed_pages)
     }
 
+    /// The set of pages that are free in this transaction's *live* view:
+    /// `inner.freelist` (the committed freelist with pages allocated this
+    /// transaction already popped) plus the pages freed this transaction.
+    ///
+    /// During an open write transaction the on-disk freelist trunk pages and
+    /// the page-1 header (offsets 32/36) are a deferred, commit-time
+    /// projection of this set — `serialize_freelist_to_write_set` rewrites
+    /// them only at COMMIT (so concurrent readers never observe uncommitted
+    /// freelist changes; see beads_rust#138). This method therefore returns
+    /// the authoritative freelist mid-transaction, where the on-disk trunk is
+    /// intentionally stale. For a read-only transaction the deltas are empty,
+    /// so it returns the committed freelist. Used by `PRAGMA integrity_check`
+    /// (GH#113) to cross-reference page ownership against the live freelist
+    /// instead of the stale on-disk trunk.
+    #[must_use]
+    pub fn live_freelist_pages(&self) -> Vec<PageNumber> {
+        self.inner.lock().map_or_else(
+            |_| Vec::new(),
+            |inner| {
+                let committed_db_size = self.committed_db_size_with_inner(&inner);
+                self.predicted_durable_freelist_pages_with_inner(&inner, committed_db_size)
+            },
+        )
+    }
+
+    /// The page high-water mark visible to this transaction: the largest page
+    /// number that has been allocated, including uncommitted growth. This is
+    /// `next_page - 1` (the same in-transaction upper bound
+    /// `durable_freelist_pages_with_inner` uses), floored at the committed
+    /// `db_size`.
+    ///
+    /// The pager's *published* snapshot db_size and the committed `db_size`
+    /// only reflect the last committed state, but a write transaction can
+    /// allocate new btree pages beyond it (e.g. leaf/interior pages created by
+    /// inserts/splits). `PRAGMA integrity_check` running inside this write
+    /// transaction must use this high-water mark as its page-extent bound —
+    /// otherwise the btree walk reaches legitimately in-transaction-allocated
+    /// pages and falsely reports them as lying "past the end of the database"
+    /// (GH#113). Returns 0 only if the inner lock is poisoned, in which case
+    /// the caller falls back to the published size.
+    #[must_use]
+    pub fn live_db_size(&self) -> u32 {
+        self.inner.lock().map_or(0, |inner| {
+            inner.next_page.saturating_sub(1).max(inner.db_size)
+        })
+    }
+
     #[must_use]
     fn freelist_metadata_dirty_with_inner(
         &self,

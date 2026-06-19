@@ -43903,6 +43903,24 @@ impl Connection {
     }
 
     fn validate_database_integrity(&self, quick: bool) -> Result<()> {
+        // GH#113: when a write transaction is active, `with_integrity_txn`
+        // reuses it, so the integrity walk reads uncommitted btree pages. But
+        // frank's on-disk freelist trunk pages and the page-1 header (offsets
+        // 32/36) are a deferred, commit-time projection — they stay at the
+        // last-committed state until COMMIT runs `serialize_freelist_to_write_set`.
+        // Cross-referencing fresh btree pages against the stale on-disk trunk
+        // produced false "page referenced multiple times" / "freed earlier"
+        // reports for pages legitimately allocated-from-freelist this txn.
+        // The published db size likewise lags in-transaction growth, so capture
+        // both the live freelist set and the live db size here (before
+        // with_integrity_txn borrows active_txn). `None` (no active txn) keeps
+        // the committed-state walk, which validates the on-disk trunk structure
+        // and uses the published size.
+        let active_state: Option<(Vec<PageNumber>, u32)> = self
+            .active_txn
+            .borrow()
+            .as_ref()
+            .map(|txn| (txn.live_freelist_pages(), txn.live_db_size()));
         self.with_integrity_txn(|cx, txn| {
             let page1 = txn.get_page(cx, PageNumber::ONE)?;
             let page1_bytes = page1.as_ref();
@@ -43911,7 +43929,15 @@ impl Connection {
             }
 
             let header = parse_database_header_checked(page1_bytes)?;
-            let total_pages = self.pager.refresh_published_snapshot(cx)?.db_size;
+            // Inside a write transaction, use the in-transaction db size (which
+            // includes uncommitted growth) as the page-extent bound; the
+            // published snapshot only counts committed pages, so it would flag
+            // legitimately in-txn-allocated btree pages as "past the end of the
+            // database" (GH#113).
+            let published_db_size = self.pager.refresh_published_snapshot(cx)?.db_size;
+            let total_pages = active_state
+                .as_ref()
+                .map_or(published_db_size, |(_, sz)| (*sz).max(published_db_size));
             let master_rows = Self::read_sqlite_master_rows_in_txn(
                 cx,
                 txn,
@@ -43930,6 +43956,7 @@ impl Connection {
                 header.freelist_trunk,
                 header.freelist_count,
                 header.largest_root_page != 0,
+                active_state.as_ref().map(|(fl, _)| fl.as_slice()),
             )?;
             Ok(())
         })
@@ -44691,6 +44718,7 @@ impl Connection {
         freelist_count: u32,
         auto_vacuum_enabled: bool,
         schema: &[TableSchema],
+        live_freelist: Option<&[PageNumber]>,
     ) -> Result<()> {
         if total_pages == 0 {
             return Ok(());
@@ -44708,51 +44736,81 @@ impl Connection {
             Some(&mut owners),
         )?;
 
-        let mut counted_freelist_pages = 0_u32;
-        let mut next_trunk = PageNumber::new(freelist_trunk);
-        let mut trunk_index = 0_usize;
-        while let Some(trunk_page) = next_trunk {
-            Self::record_integrity_page_owner(
-                Some(&mut owners),
-                page_size,
-                trunk_page,
-                total_pages,
-                format!("freelist trunk[{trunk_index}]"),
-            )?;
+        if let Some(live) = live_freelist {
+            // GH#113: a write transaction is active. The on-disk freelist trunk
+            // pages and page-1 header (offsets 32/36) are a deferred commit-time
+            // projection and are intentionally stale mid-transaction, so walking
+            // them here cross-references fresh btree pages against an out-of-date
+            // freelist and falsely flags pages legitimately allocated-from-
+            // freelist this txn as "referenced multiple times". Record ownership
+            // from the pager's authoritative live freelist set instead. The btree
+            // walks above and below are unchanged, so a genuine inconsistency —
+            // a page that is both live-free and reachable as a live btree child —
+            // still trips the double-owner check in record_integrity_page_owner.
+            for &free_page in live {
+                // The live freelist can transiently name a page beyond the
+                // currently-walked db extent: the txn may have grown the file,
+                // allocated a high page, then freed it (it stays in the live set
+                // until COMMIT filters it by committed_db_size). Such a page is
+                // past every btree page, so it cannot alias one — skip it rather
+                // than falsely flag "page N lies past the end of the database".
+                if free_page.get() > total_pages {
+                    continue;
+                }
+                Self::record_integrity_page_owner(
+                    Some(&mut owners),
+                    page_size,
+                    free_page,
+                    total_pages,
+                    "freelist (in-transaction live set)".to_string(),
+                )?;
+            }
+        } else {
+            let mut counted_freelist_pages = 0_u32;
+            let mut next_trunk = PageNumber::new(freelist_trunk);
+            let mut trunk_index = 0_usize;
+            while let Some(trunk_page) = next_trunk {
+                Self::record_integrity_page_owner(
+                    Some(&mut owners),
+                    page_size,
+                    trunk_page,
+                    total_pages,
+                    format!("freelist trunk[{trunk_index}]"),
+                )?;
 
-            let page = txn.get_page(cx, trunk_page)?;
-            let trunk =
-                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|err| {
-                    FrankenError::DatabaseCorrupt {
+                let page = txn.get_page(cx, trunk_page)?;
+                let trunk = fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(
+                    |err| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "freelist trunk page {} is malformed: {err}",
                             trunk_page.get()
                         ),
-                    }
-                })?;
-            counted_freelist_pages = counted_freelist_pages.saturating_add(1);
-
-            for (leaf_idx, leaf_page) in trunk.leaf_pages.iter().copied().enumerate() {
-                Self::record_integrity_page_owner(
-                    Some(&mut owners),
-                    page_size,
-                    leaf_page,
-                    total_pages,
-                    format!("freelist trunk[{trunk_index}] leaf[{leaf_idx}]"),
+                    },
                 )?;
                 counted_freelist_pages = counted_freelist_pages.saturating_add(1);
+
+                for (leaf_idx, leaf_page) in trunk.leaf_pages.iter().copied().enumerate() {
+                    Self::record_integrity_page_owner(
+                        Some(&mut owners),
+                        page_size,
+                        leaf_page,
+                        total_pages,
+                        format!("freelist trunk[{trunk_index}] leaf[{leaf_idx}]"),
+                    )?;
+                    counted_freelist_pages = counted_freelist_pages.saturating_add(1);
+                }
+
+                next_trunk = trunk.next_trunk;
+                trunk_index = trunk_index.saturating_add(1);
             }
 
-            next_trunk = trunk.next_trunk;
-            trunk_index = trunk_index.saturating_add(1);
-        }
-
-        if counted_freelist_pages != freelist_count {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "freelist header claims {freelist_count} pages but the freelist walk found {counted_freelist_pages}",
-                ),
-            });
+            if counted_freelist_pages != freelist_count {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freelist header claims {freelist_count} pages but the freelist walk found {counted_freelist_pages}",
+                    ),
+                });
+            }
         }
 
         for table in schema {
@@ -44818,6 +44876,7 @@ impl Connection {
         freelist_trunk: u32,
         freelist_count: u32,
         auto_vacuum_enabled: bool,
+        live_freelist: Option<&[PageNumber]>,
     ) -> Result<()> {
         let schema = self.schema.borrow().clone();
         let rowid_alias_col_by_root_page = (!quick).then(|| self.rowid_alias_column_by_root_page());
@@ -44834,6 +44893,7 @@ impl Connection {
                 freelist_count,
                 auto_vacuum_enabled,
                 &schema,
+                live_freelist,
             )?;
         } else {
             // quick_check: walk every B-tree page to validate headers, cell
