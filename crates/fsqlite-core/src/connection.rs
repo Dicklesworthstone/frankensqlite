@@ -30990,21 +30990,23 @@ impl Connection {
         row_exprs: &[Expr],
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<SqliteValue>> {
-        let projection = row_exprs
+        // GH#116: evaluate the VALUES row expressions directly rather than
+        // materializing them through a nested `SELECT <projection>` prepared
+        // read. The prepared-read boundary unconditionally runs
+        // `refresh_memdb_from_active_txn_if_dirty` (a full O(rows-so-far) memdb
+        // reload + unique-index rebuild). On an FK-enforced INSERT loop this
+        // function is called once per inserted row, so the reload turned the
+        // whole loop into O(N^2) for tables with a secondary (e.g. composite
+        // UNIQUE) index. VALUES rows reference no columns, so an empty
+        // row/col_map is sufficient; `eval_expr_with_subqueries` evaluates
+        // literals, bound parameters, scalar functions, and subqueries
+        // identically to the projection SELECT, but without the reload.
+        let empty_row: &[SqliteValue] = &[];
+        let empty_col_map: &[(String, String, bool)] = &[];
+        row_exprs
             .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT {projection}");
-        let rows = if let Some(params) = params {
-            self.query_with_params(&sql, params)?
-        } else {
-            self.query(&sql)?
-        };
-        Ok(rows
-            .first()
-            .map(|row| row.values().to_vec())
-            .unwrap_or_default())
+            .map(|expr| self.eval_expr_with_subqueries(expr, empty_row, empty_col_map, params))
+            .collect()
     }
 
     fn resolve_live_vtab_insert_layout(
