@@ -75,6 +75,8 @@ const RECORD_PROFILE_SCOPE_COUNT: usize = RecordProfileScope::BtreeCursor as usi
 thread_local! {
     static CURRENT_RECORD_PROFILE_SCOPE: Cell<RecordProfileScope> =
         const { Cell::new(RecordProfileScope::Unattributed) };
+    static FSQLITE_RECORD_PROFILE_THREAD_OVERRIDE: Cell<Option<bool>> =
+        const { Cell::new(None) };
 }
 
 #[derive(Debug)]
@@ -170,8 +172,20 @@ pub fn set_record_profile_enabled(enabled: bool) {
     FSQLITE_RECORD_PROFILE_ENABLED.store(enabled, AtomicOrdering::Relaxed);
 }
 
+pub fn set_record_profile_thread_override(enabled: Option<bool>) {
+    FSQLITE_RECORD_PROFILE_THREAD_OVERRIDE.with(|c| c.set(enabled));
+}
+
+#[must_use]
+pub fn record_profile_thread_override() -> Option<bool> {
+    FSQLITE_RECORD_PROFILE_THREAD_OVERRIDE.with(|c| c.get())
+}
+
 #[must_use]
 pub fn record_profile_enabled() -> bool {
+    if let Some(enabled) = record_profile_thread_override() {
+        return enabled;
+    }
     FSQLITE_RECORD_PROFILE_ENABLED.load(AtomicOrdering::Relaxed)
 }
 
@@ -2680,6 +2694,24 @@ mod tests {
     use super::*;
     use crate::value::SmallText;
 
+    struct RecordProfileThreadOverrideGuard {
+        previous: Option<bool>,
+    }
+
+    impl RecordProfileThreadOverrideGuard {
+        fn enabled() -> Self {
+            let previous = record_profile_thread_override();
+            set_record_profile_thread_override(Some(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for RecordProfileThreadOverrideGuard {
+        fn drop(&mut self) {
+            set_record_profile_thread_override(self.previous);
+        }
+    }
+
     #[test]
     fn empty_record() {
         let data = serialize_record(&[]);
@@ -3899,8 +3931,8 @@ mod tests {
 
     #[test]
     fn record_profile_scope_breakdown_tracks_and_restores_nested_scopes() {
+        let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
         reset_record_profile();
-        set_record_profile_enabled(true);
 
         let encoded = serialize_record(&[
             SqliteValue::Integer(7),
@@ -3944,8 +3976,6 @@ mod tests {
                 .parse_record_column_calls,
             1
         );
-
-        set_record_profile_enabled(false);
     }
 
     proptest::proptest! {

@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-06-18
+**Date:** 2026-06-19
 **Project:** FrankenSQLite
 **Language:** Rust, TypeScript
 **Manifest:** Cargo.toml, crate Cargo.toml files, package.json files
@@ -11,8 +11,8 @@
 
 | Metric | Count |
 |--------|-------|
-| **Total direct dependency entries audited** | 80 |
-| **Updated** | 22 |
+| **Total direct dependency entries audited** | 81 |
+| **Updated** | 23 |
 | **Skipped** | 0 |
 | **Failed (rolled back)** | 0 |
 | **Requires attention** | 0 |
@@ -236,6 +236,40 @@ npm outdated --workspaces --all
 
 ---
 
+### asupersync: 0.3.4 -> 0.3.5
+
+**Changelog:** local source audit of `/dp/asupersync`; FrankenSQLite build and
+test output against the local workspace checkout.
+
+**Breaking changes:** The RaptorQ `SystematicEncoder::repair_symbol` API now
+expects public repair ESIs in the same namespace as emitted repair symbols
+(`K..`), not zero-based repair indexes.
+
+**Notable changes:**
+- Updated the workspace dependency to the latest local `/dp/asupersync`
+  checkout and kept `default-features = false`.
+- Refreshed `Cargo.lock` to local `asupersync 0.3.5` and matching
+  `franken-* 0.3.5` companion crates.
+- Updated `ReplicationSender` repair-symbol emission to pass the public ISI/ESI
+  through to `SystematicEncoder::repair_symbol`.
+- Fixed an `asupersync` local clippy warning in `src/runtime/builder.rs` so
+  FrankenSQLite's path-dependency clippy gate remains warning-clean.
+
+**Deprecations fixed:** None.
+
+**Tests:** In progress as part of the final release gate. Targeted RaptorQ
+streaming tests and the full `fsqlite-core` library suite passed after the
+migration; the final whole-workspace gates are tracked below.
+
+```bash
+cargo update -p asupersync
+cargo test -p fsqlite-core --lib replication_sender::tests::test_streaming -- --nocapture
+cargo test -p fsqlite-core --lib replication_receiver::tests::test -- --nocapture
+cargo test -p fsqlite-core --lib
+```
+
+---
+
 ## Skipped
 
 _None._
@@ -256,7 +290,9 @@ _None so far._
 
 ## Security Notes
 
-`npm ci --ignore-scripts --legacy-peer-deps` reported 0 vulnerabilities. Final Rust duplicate and release-prep gates are still pending.
+`npm ci --ignore-scripts --legacy-peer-deps` reported 0 vulnerabilities. Final
+Rust duplicate and release-prep gates are still pending for the restarted
+release candidate.
 
 ---
 
@@ -273,7 +309,10 @@ npm outdated --workspaces --all
 ## Notes
 
 - Repo docs require concurrent-writer mode to stay default-on and forbid Tokio-family dependencies.
-- Local `/dp` maps to `/data/projects`; `asupersync` latest local active checkout is `/data/projects/asupersync` at `0.3.4`, matching the current manifest. The older `/data/projects/dp/asupersync` mirror is stale at `0.3.1` and was not used as the latest local source.
+- Local `/dp` is the authoritative local-library root for this release pass;
+  `asupersync` latest local active checkout is `/dp/asupersync` at `0.3.5`, and
+  the FrankenSQLite workspace now depends on that local path while release
+  validation runs.
 - `ftui` latest local checkout is `/data/projects/frankentui` at `0.4.1`; the workspace manifest started at `0.2.1`.
 
 ---

@@ -33,6 +33,7 @@ struct CliOptions {
     verify_slack: u32,
     force_batch: bool,
     show_help: bool,
+    show_version: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +224,13 @@ where
         return 0;
     }
 
+    if options.show_version {
+        if writeln!(out, "fsqlite {}", env!("CARGO_PKG_VERSION")).is_err() {
+            return 1;
+        }
+        return 0;
+    }
+
     if let Some(path) = options.verify_proof_path.as_deref() {
         return run_verify_proof(
             path,
@@ -309,6 +317,7 @@ where
     let mut verify_slack_set = false;
     let mut force_batch = false;
     let mut show_help = false;
+    let mut show_version = false;
 
     while let Some(argument) = iter.next() {
         let arg = argument.to_string_lossy();
@@ -317,6 +326,9 @@ where
         match arg_str {
             "-h" | "--help" => {
                 show_help = true;
+            }
+            "-V" | "--version" => {
+                show_version = true;
             }
             "-c" | "--command" => {
                 if verify_proof_path.is_some() {
@@ -505,6 +517,7 @@ where
         verify_slack,
         force_batch,
         show_help,
+        show_version,
     })
 }
 
@@ -2093,6 +2106,7 @@ where
          Piped input runs in batch mode automatically (no prompts).\n\
          `-batch` forces batch mode even on a TTY.\n\
          `-init FILE` executes a startup script before command mode or the REPL.\n\
+         `-V` / `--version` prints the binary version and exits.\n\
          Dot commands in command mode are also supported: `fsqlite -c \".schema\"`.\n\
          \n\
          Verify decode proof JSON:\n\
@@ -2218,6 +2232,13 @@ mod tests {
         assert_eq!(options.db_path, ":memory:");
         assert_eq!(options.command, None);
         assert!(!options.show_help);
+        assert!(!options.show_version);
+    }
+
+    #[test]
+    fn test_parse_version_flag() {
+        let options = parse_from(&["fsqlite", "--version"]).expect("version args should parse");
+        assert!(options.show_version);
     }
 
     #[test]
@@ -2384,6 +2405,25 @@ mod tests {
         assert!(
             stdout.contains("1 | 'x'"),
             "expected rendered row in output, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_version_flag_prints_binary_version_without_opening_database() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite"), OsString::from("--version")];
+
+        let exit_code =
+            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch());
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        assert_eq!(
+            stdout.trim(),
+            format!("fsqlite {}", env!("CARGO_PKG_VERSION"))
         );
     }
 

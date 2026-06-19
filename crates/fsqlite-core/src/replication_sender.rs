@@ -1390,10 +1390,7 @@ impl ReplicationSender {
                     .collect();
 
                 match SystematicEncoder::new(&source_symbols, t, shard.seed) {
-                    Some(encoder) => {
-                        let repair_esi = isi - shard.k_source;
-                        encoder.repair_symbol(repair_esi)
-                    }
+                    Some(encoder) => encoder.repair_symbol(isi),
                     None => {
                         warn!(
                             bead_id = BEAD_ID,

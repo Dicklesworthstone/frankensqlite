@@ -6717,10 +6717,8 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     /// The page high-water mark visible to this transaction: the largest page
-    /// number that has been allocated, including uncommitted growth. This is
-    /// `next_page - 1` (the same in-transaction upper bound
-    /// `durable_freelist_pages_with_inner` uses), floored at the committed
-    /// `db_size`.
+    /// number that has actually been handed to the transaction, including
+    /// uncommitted growth, floored at the committed `db_size`.
     ///
     /// The pager's *published* snapshot db_size and the committed `db_size`
     /// only reflect the last committed state, but a write transaction can
@@ -6729,12 +6727,22 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// transaction must use this high-water mark as its page-extent bound —
     /// otherwise the btree walk reaches legitimately in-transaction-allocated
     /// pages and falsely reports them as lying "past the end of the database"
-    /// (GH#113). Returns 0 only if the inner lock is poisoned, in which case
-    /// the caller falls back to the published size.
+    /// (GH#113). Pages still sitting in `page_lease` are deliberately excluded:
+    /// they are only reservations, not reachable database pages, and counting
+    /// them makes `integrity_check` scan for orphan ownership that cannot exist
+    /// yet. Returns 0 only if the inner lock is poisoned, in which case the
+    /// caller falls back to the published size.
     #[must_use]
     pub fn live_db_size(&self) -> u32 {
         self.inner.lock().map_or(0, |inner| {
-            inner.next_page.saturating_sub(1).max(inner.db_size)
+            self.allocated_from_eof
+                .iter()
+                .chain(self.allocated_from_freelist.iter())
+                .chain(self.write_set.keys())
+                .map(|page| page.get())
+                .max()
+                .unwrap_or(inner.db_size)
+                .max(inner.db_size)
         })
     }
 
@@ -20761,6 +20769,23 @@ mod tests {
             "bead_id={BEAD_ID} case=memory_db_allocator_keeps_bump_sequence allocated={} expected={}",
             allocated.get(),
             expected.get()
+        );
+    }
+
+    #[test]
+    fn test_live_db_size_excludes_unissued_page_lease_reservations() {
+        let vfs = MemoryVfs::new();
+        let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let _page_one = txn.allocate_page(&cx).unwrap();
+        let page_two = txn.allocate_page(&cx).unwrap();
+
+        assert_eq!(
+            txn.live_db_size(),
+            page_two.get(),
+            "bead_id={BEAD_ID} case=live_db_size_counts_issued_pages_not_unissued_lease"
         );
     }
 

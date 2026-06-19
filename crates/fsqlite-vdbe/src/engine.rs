@@ -17705,6 +17705,24 @@ mod tests {
     use rusqlite::params_from_iter;
     use rusqlite::types::Value as RusqliteValue;
 
+    struct RecordProfileThreadOverrideGuard {
+        previous: Option<bool>,
+    }
+
+    impl RecordProfileThreadOverrideGuard {
+        fn enabled() -> Self {
+            let previous = fsqlite_types::record::record_profile_thread_override();
+            fsqlite_types::record::set_record_profile_thread_override(Some(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for RecordProfileThreadOverrideGuard {
+        fn drop(&mut self) {
+            fsqlite_types::record::set_record_profile_thread_override(self.previous);
+        }
+    }
+
     struct CancelExecutionFunc {
         cx: Cx,
     }
@@ -28087,11 +28105,10 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let (mut engine, conflict_key, _) = build_storage_index_engine_with_duplicate_prefixes();
         let iterations = 256;
-        let prev_record_profile_enabled = fsqlite_types::record::record_profile_enabled();
+        let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
 
         let run_legacy = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
-            fsqlite_types::record::set_record_profile_enabled(true);
             fsqlite_btree::reset_btree_copy_profile();
             fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
@@ -28112,7 +28129,6 @@ mod tests {
 
         let run_scratch = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
-            fsqlite_types::record::set_record_profile_enabled(true);
             fsqlite_btree::reset_btree_copy_profile();
             fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
@@ -28256,7 +28272,6 @@ mod tests {
         );
 
         fsqlite_btree::set_btree_copy_profile_enabled(false);
-        fsqlite_types::record::set_record_profile_enabled(prev_record_profile_enabled);
     }
 
     #[test]
@@ -28271,11 +28286,10 @@ mod tests {
         let conflict_target = [SqliteValue::Integer(7)];
         let miss_target = [SqliteValue::Integer(9)];
         let iterations = 128usize;
-        let prev_record_profile_enabled = fsqlite_types::record::record_profile_enabled();
+        let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
 
         let run_legacy = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
-            fsqlite_types::record::set_record_profile_enabled(true);
             fsqlite_btree::reset_btree_copy_profile();
             fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
@@ -28304,7 +28318,6 @@ mod tests {
 
         let run_scratch = |cursor: &mut StorageCursor| {
             fsqlite_types::record::reset_record_profile();
-            fsqlite_types::record::set_record_profile_enabled(true);
             fsqlite_btree::reset_btree_copy_profile();
             fsqlite_btree::set_btree_copy_profile_enabled(true);
             let _scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
@@ -28504,7 +28517,6 @@ mod tests {
         );
 
         fsqlite_btree::set_btree_copy_profile_enabled(false);
-        fsqlite_types::record::set_record_profile_enabled(prev_record_profile_enabled);
     }
 
     #[test]
@@ -30365,11 +30377,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev_metrics_enabled = vdbe_metrics_enabled();
-        let prev_record_profile_enabled = fsqlite_types::record::record_profile_enabled();
+        let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
         reset_vdbe_metrics();
         set_vdbe_metrics_enabled(true);
         fsqlite_types::record::reset_record_profile();
-        fsqlite_types::record::set_record_profile_enabled(true);
 
         let mut db = MemDatabase::new();
         let root = db.create_table(65);
@@ -30420,7 +30431,6 @@ mod tests {
             1
         );
 
-        fsqlite_types::record::set_record_profile_enabled(prev_record_profile_enabled);
         set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 

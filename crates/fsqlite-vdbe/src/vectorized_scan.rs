@@ -508,8 +508,8 @@ mod tests {
     use fsqlite_btree::{MemPageStore, PageReader};
     use fsqlite_types::WitnessKey;
     use fsqlite_types::record::{
-        parse_record, record_profile_enabled, record_profile_snapshot, reset_record_profile,
-        serialize_record, set_record_profile_enabled,
+        parse_record, record_profile_snapshot, record_profile_thread_override,
+        reset_record_profile, serialize_record, set_record_profile_thread_override,
     };
 
     use super::*;
@@ -518,6 +518,24 @@ mod tests {
     const PAGE_SIZE: u32 = 512;
     const ROOT_PAGE: u32 = 2;
     const BEAD_ID: &str = "bd-14vp7.2";
+
+    struct RecordProfileThreadOverrideGuard {
+        previous: Option<bool>,
+    }
+
+    impl RecordProfileThreadOverrideGuard {
+        fn enabled() -> Self {
+            let previous = record_profile_thread_override();
+            set_record_profile_thread_override(Some(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for RecordProfileThreadOverrideGuard {
+        fn drop(&mut self) {
+            set_record_profile_thread_override(self.previous);
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct SharedTrackingPageIo {
@@ -864,9 +882,8 @@ mod tests {
     #[test]
     fn scan_reuses_decode_scratch_and_avoids_full_record_parse_calls() {
         let (io, root_page) = build_fixture(257);
-        let prev_record_profile_enabled = record_profile_enabled();
+        let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();
         reset_record_profile();
-        set_record_profile_enabled(true);
 
         let cx = Cx::new();
         let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
@@ -923,7 +940,5 @@ mod tests {
             257,
             "bead_id={BEAD_ID} vectorized scan should decode through reusable parse_record_into scratch"
         );
-
-        set_record_profile_enabled(prev_record_profile_enabled);
     }
 }

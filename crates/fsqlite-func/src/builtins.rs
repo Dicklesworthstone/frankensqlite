@@ -312,18 +312,12 @@ impl ScalarFunction for ConcatWsFunc {
         let mut result = String::new();
         let mut has_part = false;
         for arg in &args[1..] {
-            // C SQLite skips both NULL args and args whose text rendering is
-            // empty: `concat_ws('|','','x')` yields `'x'` (no leading
-            // separator), and `concat_ws('|','a','','b')` yields `'a|b'`.
-            // Only non-empty parts contribute, and the separator is emitted
-            // only between emitted parts.
+            // C SQLite skips only NULL value arguments. Empty text is still a
+            // value: `concat_ws('|','','x')` yields `'|x'`.
             if arg.is_null() {
                 continue;
             }
             let part = text_arg(arg);
-            if part.as_ref().is_empty() {
-                continue;
-            }
             if has_part {
                 result.push_str(sep.as_ref());
             }
@@ -2889,6 +2883,19 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Text(SmallText::from_string("a,b")));
+    }
+
+    #[test]
+    fn test_concat_ws_empty_string_is_not_skipped() {
+        let f = ConcatWsFunc;
+        let result = f
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("|")),
+                SqliteValue::Text(SmallText::new("")),
+                SqliteValue::Text(SmallText::from_string("x")),
+            ])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("|x")));
     }
 
     #[test]

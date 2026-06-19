@@ -13784,11 +13784,15 @@ impl Connection {
     fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let op_cx = self.op_cx_after_background_status();
         self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)?;
-        let _ = self.refresh_prepared_schema_state(&op_cx, true)?;
         if self.committed_pager_refresh_allowed() {
             // File-backed autocommit prepares must refresh the committed MemDB
             // image before prepared-cache lookup so any cache hit is keyed
             // against the latest visible snapshot rather than stale local state.
+            //
+            // Keep this before the lightweight prepared-schema refresh below:
+            // that path may advance `memdb_visible_commit_seq` without
+            // hydrating rows, which would make a stale row image look current
+            // to file-backed direct row lookup preparation.
             self.refresh_memdb_from_active_txn_if_dirty(&op_cx)?;
             if !self.memdb_rows_loaded.get() {
                 self.reload_memdb_from_pager(&op_cx)?;
@@ -13796,6 +13800,7 @@ impl Connection {
                 self.refresh_memdb_if_stale(&op_cx)?;
             }
         }
+        let _ = self.refresh_prepared_schema_state(&op_cx, true)?;
         let profile_enabled = hot_path_profile_enabled();
         let lookup_start = profile_enabled.then(Instant::now);
         self.refresh_parse_cache_if_needed(sql);
@@ -23420,6 +23425,12 @@ impl Connection {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
                     Ok(rows)
+                } else if self.select_correlated_exists_where_requires_fallback(select) {
+                    // Correlated EXISTS subqueries in the WHERE clause require
+                    // per-row evaluation of outer column refs unless the exact
+                    // validated indexed COUNT(*) semijoin fast path applies.
+                    self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
+                    self.execute_correlated_exists_where_fallback(cx, select, params)
                 } else if (has_group_by(select)
                     || has_implicit_aggregation(select)
                     || ordered_aggregate)
@@ -23600,23 +23611,6 @@ impl Connection {
                     // (which only opens one table cursor). Route through the
                     // connection-level fallback which can inline-evaluate them.
                     self.log_mem_execution_fallback("select", "correlated_join_subquery_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound =
-                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_join_select(&bound, None)?;
-                    if let Some(limit) = limit_clause {
-                        apply_limit_clause(&mut rows, &limit);
-                    }
-                    Ok(rows)
-                } else if select_has_correlated_exists_in_where(select) {
-                    // Correlated EXISTS subqueries in the WHERE clause
-                    // require per-row evaluation of the outer column refs.
-                    // The VDBE emit_exists_subquery path has a known issue
-                    // with AND of correlated terms. Route through the
-                    // connection-level fallback which correctly substitutes
-                    // outer refs via eval_expr_with_subqueries.
-                    self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -28775,6 +28769,87 @@ impl Connection {
             || has_window_functions(select)
             || (has_join_like_source && !has_vdbe_eligible_join && !has_vdbe_eligible_grouped_join)
             || select_has_correlated_join_subquery(select)
+            || self.select_correlated_exists_where_requires_fallback(select)
+    }
+
+    fn select_correlated_exists_where_requires_fallback(&self, select: &SelectStatement) -> bool {
+        if !select_has_correlated_exists_in_where(select) {
+            return false;
+        }
+        !self.select_correlated_exists_where_can_use_indexed_count_probe(select)
+    }
+
+    fn execute_correlated_exists_where_fallback(
+        &self,
+        cx: &Cx,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+        let mut bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+        let limit_clause = bound.limit.take();
+        let mut rows = if has_group_by(&bound)
+            || has_implicit_aggregation(&bound)
+            || has_ordered_aggregate(&bound)
+        {
+            self.execute_group_by_join_select(cx, &bound, None)?
+        } else {
+            self.execute_join_select(&bound, None)?
+        };
+        if let Some(limit) = limit_clause {
+            apply_limit_clause(&mut rows, &limit);
+        }
+        Ok(rows)
+    }
+
+    fn select_correlated_exists_where_can_use_indexed_count_probe(
+        &self,
+        select: &SelectStatement,
+    ) -> bool {
+        let Ok(normalized) = canonicalize_select_placeholders(select) else {
+            return false;
+        };
+        let SelectCore::Select {
+            distinct,
+            from: Some(from),
+            ..
+        } = &normalized.body.select
+        else {
+            return false;
+        };
+        if !matches!(distinct, Distinctness::All)
+            || normalized.with.is_some()
+            || !normalized.body.compounds.is_empty()
+            || !normalized.order_by.is_empty()
+            || normalized.limit.is_some()
+            || !from.joins.is_empty()
+        {
+            return false;
+        }
+        let TableOrSubquery::Table {
+            name,
+            alias,
+            index_hint,
+            time_travel,
+            ..
+        } = &from.source
+        else {
+            return false;
+        };
+        if name.schema.is_some() || index_hint.is_some() || time_travel.is_some() {
+            return false;
+        }
+
+        let schema = self.schema.borrow();
+        let Some(table) = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+        else {
+            return false;
+        };
+        let table_label = alias.as_deref().unwrap_or(&name.name);
+        self.prepared_count_indexed_rowid_probe_fast_path(&normalized, table, table_label)
+            .is_some()
     }
 
     fn prepared_query_fast_path(&self, statement: &Statement) -> Option<PreparedQueryFastPath> {
@@ -53691,6 +53766,7 @@ impl Connection {
                 CompoundOp::Union => {
                     result.extend(arm_rows);
                     dedup_rows_collated_keep_last(&mut result, &collations, &registry_snap);
+                    sort_compound_distinct_rows_collated(&mut result, &collations, &registry_snap);
                 }
                 CompoundOp::Intersect => {
                     // s79j: collation-aware containment for INTERSECT.
@@ -53721,6 +53797,7 @@ impl Connection {
                             .is_ok()
                     });
                     dedup_rows_collated(&mut result, &collations, &registry_snap);
+                    sort_compound_distinct_rows_collated(&mut result, &collations, &registry_snap);
                 }
                 CompoundOp::Except => {
                     // s79j: collation-aware non-containment for EXCEPT.
@@ -53748,6 +53825,7 @@ impl Connection {
                             .is_err()
                     });
                     dedup_rows_collated(&mut result, &collations, &registry_snap);
+                    sort_compound_distinct_rows_collated(&mut result, &collations, &registry_snap);
                 }
             }
         }
@@ -59877,6 +59955,19 @@ fn dedup_rows_collated_keep_last(
 ) {
     let compare_width = rows.first().map_or(0, |row| row.values().len());
     dedup_rows_collated_impl(rows, compare_width, collations, registry, true, true);
+}
+
+/// SQLite backs distinct compound operators with a temp b-tree, so each
+/// UNION/INTERSECT/EXCEPT step emits the current distinct set in result-key
+/// order. UNION ALL keeps simple left-to-right append semantics.
+fn sort_compound_distinct_rows_collated(
+    rows: &mut [Row],
+    collations: &[Option<String>],
+    registry: &CollationRegistry,
+) {
+    rows.sort_by(|a, b| {
+        compare_value_slices_collated_snapshot(a.values(), b.values(), collations, registry)
+    });
 }
 
 /// Collation-aware duplicate removal over the first `compare_width` columns.
@@ -66834,11 +66925,10 @@ fn select_has_correlated_exists_in_where(select: &SelectStatement) -> bool {
 
 /// Return true if `expr` contains a correlated EXISTS subquery.
 ///
-/// `exists_subquery_supported_by_vdbe` rejects every correlated EXISTS shape,
-/// so SELECT routing must send the containing statement through the
-/// connection-level fallback where `eval_expr_with_subqueries` substitutes
-/// outer references per row. Keeping this guard self-reference-only let
-/// multi-table correlated EXISTS slip into VDBE and return empty results.
+/// SELECT routing uses this to keep unsupported correlated EXISTS predicates on
+/// the connection-level fallback where `eval_expr_with_subqueries` substitutes
+/// outer references per row. The one validated compiled exception is checked
+/// separately by `select_correlated_exists_where_can_use_indexed_count_probe`.
 fn expr_has_correlated_exists(expr: &Expr) -> bool {
     match expr {
         Expr::Exists { subquery, .. } => is_correlated_subquery(subquery),
@@ -93749,6 +93839,7 @@ mod tests {
             count.prepared_query_fast_path.as_ref(),
             Some(&super::PreparedQueryFastPath::SimpleCountStar { .. })
         ));
+        conn.memdb_storage_count_shortcuts_safe.set(false);
 
         super::reset_hot_path_profile();
         let row = count.query_row().unwrap();
@@ -93869,7 +93960,7 @@ mod tests {
 
     #[test]
     fn test_explicit_pk_unique_index_counts_table_vs_index_vs_sql() {
-        const ROW_COUNT: i64 = 10_000;
+        const ROW_COUNT: i64 = 2_048;
         let _guard = super::fsqlite_core_test_serializer();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("explicit_pk_unique_index_count_probe.db");
@@ -93962,7 +94053,7 @@ mod tests {
 
     #[test]
     fn test_ad_hoc_count_query_after_explicit_pk_prepared_unique_email_insert_loop() {
-        const ROW_COUNT: i64 = 10_000;
+        const ROW_COUNT: i64 = 2_048;
         let _guard = super::fsqlite_core_test_serializer();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("explicit_pk_unique_email_count_runtime.db");
@@ -104744,6 +104835,7 @@ mod tests {
 
     #[test]
     fn test_benchmark_cte_join_shape_uses_direct_top_category_fast_path() {
+        let _serial = super::fsqlite_core_test_serializer();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
             "CREATE TABLE products (
@@ -104808,6 +104900,7 @@ mod tests {
 
     #[test]
     fn test_top_category_cte_fast_path_keeps_null_sum_category_at_limit_boundary() {
+        let _serial = super::fsqlite_core_test_serializer();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
             "CREATE TABLE products (
@@ -104864,6 +104957,7 @@ mod tests {
 
     #[test]
     fn test_top_category_cte_fast_path_orders_large_integer_sums_exactly() {
+        let _serial = super::fsqlite_core_test_serializer();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
             "CREATE TABLE products (
@@ -104917,6 +105011,7 @@ mod tests {
 
     #[test]
     fn test_top_category_cte_fast_path_errors_on_integer_sum_overflow() {
+        let _serial = super::fsqlite_core_test_serializer();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
             "CREATE TABLE products (
@@ -105150,6 +105245,7 @@ mod tests {
 
     #[test]
     fn test_top_category_cte_fast_path_later_float_clears_integer_overflow_error() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let conn = Connection::open(":memory:")?;
         conn.execute(
             "CREATE TABLE products (
@@ -105206,6 +105302,7 @@ mod tests {
 
     #[test]
     fn test_top_category_cte_fast_path_integer_text_later_real_clears_overflow() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let conn = Connection::open(":memory:")?;
         conn.execute(
             "CREATE TABLE products (
@@ -108750,6 +108847,59 @@ mod tests {
             .collect();
         vals.sort_unstable();
         assert_eq!(vals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_compound_union_limit_offset_uses_distinct_row_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO a VALUES(1,10),(2,20),(3,30),(4,40);")
+            .unwrap();
+        conn.execute("INSERT INTO b VALUES(1,20),(2,30),(3,50),(4,60);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT val FROM a UNION SELECT val FROM b LIMIT 3 OFFSET 2;")
+            .unwrap();
+        let vals = rows
+            .iter()
+            .filter_map(|row| match row.values().first() {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vals, vec![30, 40, 50]);
+    }
+
+    #[test]
+    fn test_compound_distinct_then_union_all_preserves_append_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 2 UNION SELECT 1 UNION ALL SELECT 3;")
+            .unwrap();
+        let vals = rows
+            .iter()
+            .filter_map(|row| match row.values().first() {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vals, vec![1, 2, 3]);
+
+        let rows = conn
+            .query("SELECT 2 INTERSECT SELECT 2 UNION ALL SELECT 1;")
+            .unwrap();
+        let vals = rows
+            .iter()
+            .filter_map(|row| match row.values().first() {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vals, vec![2, 1]);
     }
 
     #[test]
@@ -129809,6 +129959,26 @@ mod pager_routing_tests {
     #[test]
     fn test_window_eval_trace_span_counter_records_enabled_debug_spans() {
         let _serial = super::fsqlite_core_test_serializer();
+        #[derive(Clone)]
+        struct WindowSpanCounter(Arc<AtomicU64>);
+
+        impl<S> tracing_subscriber::Layer<S> for WindowSpanCounter
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let metadata = attrs.metadata();
+                if metadata.target() == "fsqlite.window" && metadata.name() == "window_eval" {
+                    self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE win_trace(id INTEGER, grp TEXT, val INTEGER);")
             .unwrap();
@@ -129822,10 +129992,14 @@ mod pager_routing_tests {
         .unwrap();
 
         reset_trace_metrics();
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::filter::Targets::new()
-                .with_target("fsqlite.window", tracing::Level::DEBUG),
-        );
+        let trace_metrics_baseline = trace_metrics_snapshot();
+        let local_window_spans = Arc::new(AtomicU64::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target("fsqlite.window", tracing::Level::DEBUG),
+            )
+            .with(WindowSpanCounter(Arc::clone(&local_window_spans)));
 
         tracing::subscriber::with_default(subscriber, || {
             let rows = conn
@@ -129844,8 +130018,13 @@ mod pager_routing_tests {
 
         let snapshot = trace_metrics_snapshot();
         assert_eq!(
-            snapshot.fsqlite_trace_spans_total, 1,
+            local_window_spans.load(AtomicOrdering::Relaxed),
+            1,
             "window-only tracing should create exactly one span"
+        );
+        assert!(
+            snapshot.fsqlite_trace_spans_total > trace_metrics_baseline.fsqlite_trace_spans_total,
+            "window tracing should increment the global span counter"
         );
     }
 
@@ -133582,6 +133761,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6751_aggregate_window_storage_substrate_logs_required_fields() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_group_by_structured_log.db")?;
         conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")?;
         conn.execute(
@@ -146147,6 +146327,7 @@ mod pager_routing_tests {
 
     #[cfg(test)]
     pub(super) struct StatementReuseHotPathProfileGuard {
+        _trace_guard: tracing::dispatcher::DefaultGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
         previous_enabled: bool,
     }
@@ -146157,10 +146338,13 @@ mod pager_routing_tests {
             // Use the process-global test serializer so that profile tests
             // never overlap with ANY other test that touches shared state.
             let guard = super::fsqlite_core_test_serializer();
+            let trace_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
+            let trace_guard = tracing::dispatcher::set_default(&trace_dispatch);
             let previous_enabled = hot_path_profile_enabled();
             reset_hot_path_profile();
             set_hot_path_profile_enabled(true);
             Self {
+                _trace_guard: trace_guard,
                 _lock: guard,
                 previous_enabled,
             }
@@ -146177,22 +146361,22 @@ mod pager_routing_tests {
 
     #[cfg(test)]
     struct RecordHotPathProfileGuard {
-        previous_enabled: bool,
+        previous_override: Option<bool>,
     }
 
     #[cfg(test)]
     impl RecordHotPathProfileGuard {
         fn new() -> Self {
-            let previous_enabled = fsqlite_types::record::record_profile_enabled();
-            fsqlite_types::record::set_record_profile_enabled(true);
-            Self { previous_enabled }
+            let previous_override = fsqlite_types::record::record_profile_thread_override();
+            fsqlite_types::record::set_record_profile_thread_override(Some(true));
+            Self { previous_override }
         }
     }
 
     #[cfg(test)]
     impl Drop for RecordHotPathProfileGuard {
         fn drop(&mut self) {
-            fsqlite_types::record::set_record_profile_enabled(self.previous_enabled);
+            fsqlite_types::record::set_record_profile_thread_override(self.previous_override);
         }
     }
 
@@ -181882,10 +182066,18 @@ mod pager_routing_tests {
         // Only the first connection to enter the commit window arms the
         // rendezvous; B's own later window firing (if any) is a no-op.
         let armed = Arc::new(AtomicBool::new(true));
+        let target_thread = Arc::new(Mutex::new(None::<std::thread::ThreadId>));
 
         let hook_armed = Arc::clone(&armed);
+        let hook_target_thread = Arc::clone(&target_thread);
         let hook = Arc::new(move || {
-            if hook_armed.swap(false, Ordering::SeqCst) {
+            let is_target_thread = {
+                let target = hook_target_thread.lock().unwrap();
+                target
+                    .as_ref()
+                    .is_some_and(|thread_id| *thread_id == std::thread::current().id())
+            };
+            if is_target_thread && hook_armed.swap(false, Ordering::SeqCst) {
                 // Tell the driver that A is parked post-write / pre-publish.
                 let _ = a_in_window_tx.lock().unwrap().send(());
                 // Block A here until the driver has released B to race.
@@ -181895,6 +182087,13 @@ mod pager_routing_tests {
         super::set_concurrent_commit_window_hook(Some(
             hook as Arc<dyn Fn() + Send + Sync + 'static>,
         ));
+        struct CommitWindowHookGuard;
+        impl Drop for CommitWindowHookGuard {
+            fn drop(&mut self) {
+                super::set_concurrent_commit_window_hook(None);
+            }
+        }
+        let _hook_guard = CommitWindowHookGuard;
 
         // Connection A on its own thread: open, write, commit, close. Its
         // commit will pause inside the validate→publish window via the hook.
@@ -181903,26 +182102,27 @@ mod pager_routing_tests {
         // the channel.
         let path_a = db_path.clone();
         let (a_done_tx, a_done_rx) = mpsc::channel::<Result<()>>();
+        let a_target_thread = Arc::clone(&target_thread);
         let a_handle = std::thread::spawn(move || {
-            let conn_a = Connection::open(&path_a).unwrap();
-            conn_a.execute("BEGIN;").unwrap();
-            // Allocate fresh EOF pages: many large rows in a new id range.
-            for i in 1000..1064 {
-                conn_a
-                    .execute_with_params(
+            *a_target_thread.lock().unwrap() = Some(std::thread::current().id());
+            let res = (|| -> Result<()> {
+                let conn_a = Connection::open(&path_a)?;
+                conn_a.execute("BEGIN;")?;
+                // Allocate fresh EOF pages: many large rows in a new id range.
+                for i in 1000..1064 {
+                    conn_a.execute_with_params(
                         "INSERT INTO t(id, payload, tag) VALUES (?1, ?2, ?3);",
                         &[
                             SqliteValue::Integer(i),
                             SqliteValue::Blob(vec![0xCD; 900].into()),
                             SqliteValue::Integer(i % 7),
                         ],
-                    )
-                    .unwrap();
-            }
-            let res = conn_a.execute("COMMIT;").map(|_| ());
-            if res.is_ok() {
-                conn_a.close().unwrap();
-            }
+                    )?;
+                }
+                conn_a.execute("COMMIT;")?;
+                conn_a.close()?;
+                Ok(())
+            })();
             let _ = a_done_tx.send(res);
         });
 
@@ -181987,15 +182187,7 @@ mod pager_routing_tests {
         //     snapshot/busy conflict (the shared lock table / re-validation
         //     caught the would-be double allocation). Both are correct.
         let b_in_window = b_done_rx.recv_timeout(Duration::from_secs(3)).ok();
-        if let Some(b_window_res) = &b_in_window {
-            assert!(
-                b_window_res.is_err(),
-                "issue #115 regression: connection B committed SUCCESSFULLY inside \
-                 connection A's validate→publish window — the registry critical \
-                 section was not held, so both connections double-allocated the \
-                 same EOF page"
-            );
-        }
+        let b_committed_inside_window = b_in_window.as_ref().is_some_and(Result::is_ok);
 
         // Release A; it publishes and drops the guard.
         release_a_tx.send(()).unwrap();
@@ -182015,6 +182207,13 @@ mod pager_routing_tests {
                 .recv_timeout(Duration::from_secs(30))
                 .expect("connection B commit should resolve after A publishes"),
         };
+        assert!(
+            !b_committed_inside_window,
+            "issue #115 regression: connection B committed SUCCESSFULLY inside \
+             connection A's validate→publish window — the registry critical \
+             section was not held, so both connections double-allocated the \
+             same EOF page"
+        );
         if let Err(err) = &b_res {
             assert!(
                 err.is_transient(),

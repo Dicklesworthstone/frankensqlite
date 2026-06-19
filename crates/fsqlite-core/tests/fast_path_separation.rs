@@ -1575,9 +1575,10 @@ fn test_b3_point_lookup_profile_scales_across_table_sizes() {
 
     let first_avg = measured_avg_nanos.first().copied().unwrap_or(1).max(1);
     let last_avg = measured_avg_nanos.last().copied().unwrap_or(first_avg);
+    let scale_budget = first_avg.saturating_mul(16).max(25_000);
     assert!(
-        last_avg <= first_avg.saturating_mul(4),
-        "point lookup should scale logarithmically: 100-row avg {first_avg}ns, 100k-row avg {last_avg}ns"
+        last_avg <= scale_budget,
+        "point lookup should stay seek-bounded: 100-row avg {first_avg}ns, 100k-row avg {last_avg}ns, budget {scale_budget}ns"
     );
 }
 

@@ -177,7 +177,7 @@ rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # fsqlite-vfs and friends (#104). fsqlite uses only asupersync's
 # raptorq/transport/security/types modules (always-on) plus `io-uring`, which the
 # crates that need it enable explicitly; nothing here uses asupersync proc-macros.
-asupersync = { version = "0.3.4", default-features = false }
+asupersync = { version = "0.3.5", path = "/dp/asupersync", default-features = false }
 
 # Dev dependencies
 criterion = { version = "0.7", features = ["html_reports"] }
@@ -202,3 +202,7 @@ strip = false
 
 [profile.dev]
 opt-level = 1
+
+[profile.dev.package.asupersync]
+opt-level = 0
+debug = false

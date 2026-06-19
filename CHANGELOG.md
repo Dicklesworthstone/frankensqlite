@@ -4,7 +4,7 @@ All notable changes to FrankenSQLite are documented in this file.
 
 FrankenSQLite is an independent ground-up Rust reimplementation of SQLite with
 page-level MVCC concurrent writers, Serializable Snapshot Isolation (SSI), and
-RaptorQ-pervasive durability. The project is organized as a 26-member Cargo
+RaptorQ-pervasive durability. The project is organized as a 27-member Cargo
 workspace under `crates/`.
 
 > The project is pre-release. Crates are published to crates.io as `fsqlite`
@@ -14,6 +14,40 @@ workspace under `crates/`.
 > 2026-03-21; the 0.1.3 and 0.1.4 entries are point releases.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
+
+---
+
+## [0.1.11] -- 2026-06-19 (dependency refresh, conformance fixes, release hardening)
+
+Full-workspace lockstep release candidate (`0.1.10 -> 0.1.11`).
+
+### Fixed
+
+- Corrected in-transaction `PRAGMA integrity_check` false positives around
+  transaction-local page growth and reserved-but-unissued pager leases
+  ([#113](https://github.com/Dicklesworthstone/frankensqlite/issues/113)).
+- Hardened the concurrent commit validate/write/publish regression test for
+  [#115](https://github.com/Dicklesworthstone/frankensqlite/issues/115) so the
+  process-global hook cannot be stolen by unrelated parallel tests.
+- Updated RaptorQ repair symbol emission for `asupersync 0.3.5`.
+- Isolated record/hot-path profiling tests with thread-local guards and local
+  serializers so full-workspace parallel test runs do not cross-contaminate
+  global counters.
+- Added a CLI `-V` / `--version` path for release/package-manager verification.
+
+### Changed
+
+- Refreshed direct Rust and TypeScript dependencies to current stable versions,
+  including the latest local `/dp/asupersync` checkout.
+- Updated browser SDK/worker tooling to TypeScript 6, Vitest 4, and Playwright
+  1.61.
+
+### Release Notes
+
+- `asupersync 0.3.5` must be available on crates.io before this workspace can be
+  published to crates.io without path dependencies.
+- The publishable crates remain the `fsqlite` / `fsqlite-*` crates; harness and
+  e2e crates stay `publish = false`.
 
 ---
 

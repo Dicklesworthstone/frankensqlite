@@ -17,9 +17,39 @@
 //!     cargo test -p fsqlite-core --test boundary_duplication_census \
 //!     -- --test-threads=1 --nocapture
 
+use std::sync::{Mutex, MutexGuard};
+
 use fsqlite_core::connection::{
-    Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
 };
+
+static CENSUS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct CensusProfileGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous_enabled: bool,
+}
+
+impl CensusProfileGuard {
+    fn new() -> Self {
+        let lock = CENSUS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_enabled = hot_path_profile_enabled();
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+        Self {
+            _lock: lock,
+            previous_enabled,
+        }
+    }
+}
+
+impl Drop for CensusProfileGuard {
+    fn drop(&mut self) {
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(self.previous_enabled);
+    }
+}
 
 /// Snapshot the census-relevant counters.
 fn census_snapshot() -> CensusCounters {
@@ -104,8 +134,7 @@ impl CensusCounters {
 /// C1: Single prepared INSERT in autocommit mode — census per statement.
 #[test]
 fn test_census_single_prepared_insert_autocommit() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = CensusProfileGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -150,8 +179,7 @@ fn test_census_single_prepared_insert_autocommit() {
 /// C2: File-backed prepared INSERT — exposes duplication.
 #[test]
 fn test_census_file_backed_prepared_insert() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = CensusProfileGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
@@ -216,8 +244,7 @@ fn test_census_file_backed_prepared_insert() {
 /// C3: Explicit transaction — begin/commit work should happen once, not per statement.
 #[test]
 fn test_census_explicit_transaction_prepared_insert() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = CensusProfileGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
@@ -274,8 +301,7 @@ fn test_census_explicit_transaction_prepared_insert() {
 /// C4: Schema invalidation during census — one DDL, verify counters spike then recover.
 #[test]
 fn test_census_schema_invalidation_spike() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = CensusProfileGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -320,8 +346,7 @@ fn test_census_schema_invalidation_spike() {
 /// C5: Full census scorecard — the authoritative artifact for bd-db300.5.2.2.1.
 #[test]
 fn test_census_full_scorecard() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = CensusProfileGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
