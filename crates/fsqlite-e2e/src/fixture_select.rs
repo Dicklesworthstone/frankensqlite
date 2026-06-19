@@ -1722,7 +1722,7 @@ fn unique_ids<'a>(
 fn sha256_hex_file(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let digest = Sha256::digest(bytes);
-    Ok(format!("{digest:x}"))
+    Ok(crate::bytes_to_lower_hex(digest))
 }
 
 fn is_sha256_hex_64(value: &str) -> bool {

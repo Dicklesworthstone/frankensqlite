@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tempfile::tempdir;
 
 const BEAD_ID: &str = "bd-yfdb6";
@@ -216,7 +216,7 @@ fn run_one_iteration(seed: u64, iteration: u32) {
     let commit_log: PathBuf = dir.path().join(format!("yfdb6_iter_{iteration}.commits"));
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let stop_after: u32 = rng.gen_range(KILL_AFTER_MIN_COMMITS..=KILL_AFTER_MAX_COMMITS);
+    let stop_after: u32 = rng.random_range(KILL_AFTER_MIN_COMMITS..=KILL_AFTER_MAX_COMMITS);
 
     let mut child = spawn_producer(&db_path, &commit_log, stop_after);
 
@@ -235,7 +235,7 @@ fn run_one_iteration(seed: u64, iteration: u32) {
 
     // Randomize a tiny extra delay after the minimum commit count so the
     // kill lands at a different point in the commit path each iteration.
-    let extra_ms: u64 = rng.gen_range(0..50);
+    let extra_ms: u64 = rng.random_range(0..50);
     std::thread::sleep(Duration::from_millis(extra_ms));
 
     // Child::kill on unix is SIGKILL (see docs); on non-unix this is also

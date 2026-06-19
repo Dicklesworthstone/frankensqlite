@@ -25,7 +25,7 @@ use fsqlite_core::repair_engine::{
     detect_and_repair_pages,
 };
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -129,10 +129,10 @@ fn build_all_groups(original_pages: &[Vec<u8>]) -> Vec<RepairGroup> {
 fn apply_corruption(data: &mut [u8], variant: CorruptionVariant, rng: &mut StdRng) {
     match variant {
         CorruptionVariant::BitFlip => {
-            let flips = rng.gen_range(1..=8u32);
+            let flips = rng.random_range(1..=8u32);
             for _ in 0..flips {
-                let byte_idx = rng.gen_range(0..data.len());
-                let bit_idx = rng.gen_range(0..8u8);
+                let byte_idx = rng.random_range(0..data.len());
+                let bit_idx = rng.random_range(0..8u8);
                 data[byte_idx] ^= 1 << bit_idx;
             }
         }
@@ -145,7 +145,7 @@ fn apply_corruption(data: &mut [u8], variant: CorruptionVariant, rng: &mut StdRn
         CorruptionVariant::HeaderCorrupt => {
             let header_len = 16.min(data.len());
             for b in &mut data[..header_len] {
-                *b = rng.r#gen();
+                *b = rng.random();
             }
         }
     }
@@ -159,7 +159,7 @@ fn select_corruption_targets(percent: f64, rng: &mut StdRng) -> Vec<(u32, Corrup
 
     let mut selected = BTreeSet::new();
     while selected.len() < count {
-        let pgno = rng.gen_range(1..=TOTAL_PAGES);
+        let pgno = rng.random_range(1..=TOTAL_PAGES);
         selected.insert(pgno);
     }
 

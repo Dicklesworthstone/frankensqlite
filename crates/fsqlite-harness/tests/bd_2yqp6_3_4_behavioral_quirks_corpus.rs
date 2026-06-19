@@ -93,7 +93,7 @@ fn envelope_for_fixture(fixture: &TestFixture, index: usize) -> ExecutionEnvelop
 
 fn sha256_hex(payload: &[u8]) -> String {
     let digest = Sha256::digest(payload);
-    format!("{digest:x}")
+    fsqlite_harness::bytes_to_lower_hex(digest)
 }
 
 fn write_minimal_repro_artifact(

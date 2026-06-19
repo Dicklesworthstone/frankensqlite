@@ -2,7 +2,7 @@ import type { ErrorResponse, WorkerRequest, WorkerResponse } from "./protocol";
 import { serializeFrankenError, WorkerConnectionHost } from "./connection";
 
 const host = new WorkerConnectionHost();
-const workerScope = globalThis as DedicatedWorkerGlobalScope;
+const workerScope = globalThis as unknown as DedicatedWorkerGlobalScope;
 
 workerScope.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
   void dispatch(event.data);

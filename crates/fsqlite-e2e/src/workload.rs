@@ -4,7 +4,7 @@
 //! be used in both unit tests and higher-level harness orchestration.
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::oplog::{ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec};
 
@@ -70,7 +70,7 @@ enum TemplateOp {
 
 fn choose_template_op(rng: &mut StdRng, mix: OperationMix) -> TemplateOp {
     let total = mix.total_weight().max(1);
-    let mut x = rng.gen_range(0..total);
+    let mut x = rng.random_range(0..total);
     if x < mix.insert_weight {
         return TemplateOp::Insert;
     }
@@ -201,14 +201,14 @@ impl WorkerState {
     }
 
     fn gen_text(&mut self) -> String {
-        let len = self.rng.gen_range(1..=24);
+        let len = self.rng.random_range(1..=24);
         (0..len)
-            .map(|_| (b'a' + self.rng.gen_range(0..26)) as char)
+            .map(|_| (b'a' + self.rng.random_range(0..26)) as char)
             .collect()
     }
 
     fn gen_real(&mut self) -> f64 {
-        self.rng.gen_range(-1000.0..=1000.0)
+        self.rng.random_range(-1000.0..=1000.0)
     }
 
     fn insert_op(&mut self, table: &str, table_idx: usize) -> OpKind {
@@ -230,7 +230,7 @@ impl WorkerState {
         if keys.is_empty() {
             return None;
         }
-        let idx = self.rng.gen_range(0..keys.len());
+        let idx = self.rng.random_range(0..keys.len());
         Some(keys[idx])
     }
 
@@ -408,7 +408,7 @@ impl WorkloadGenerator {
         }
 
         while remaining > 0 {
-            let table_idx = ws.rng.gen_range(0..table_count);
+            let table_idx = ws.rng.random_range(0..table_count);
             let table = &tables[table_idx].name;
             let tmpl = choose_template_op(&mut ws.rng, self.cfg.operation_mix);
 

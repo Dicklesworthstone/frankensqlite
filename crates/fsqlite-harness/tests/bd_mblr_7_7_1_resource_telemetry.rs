@@ -45,7 +45,7 @@ fn runtime_dir(label: &str) -> Result<PathBuf, String> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    fsqlite_harness::bytes_to_lower_hex(digest)
 }
 
 #[derive(Debug)]

@@ -4272,12 +4272,12 @@ mod tests {
 
                     while commits < OPS_PER_WRITER {
                         // Pick random accounts for transfer.
-                        let from_id = rng.gen_range(0..NUM_ACCOUNTS);
-                        let to_id = rng.gen_range(0..NUM_ACCOUNTS);
+                        let from_id = rng.random_range(0..NUM_ACCOUNTS);
+                        let to_id = rng.random_range(0..NUM_ACCOUNTS);
                         if from_id == to_id {
                             continue; // Skip self-transfer.
                         }
-                        let amount = rng.gen_range(1..=10_i64);
+                        let amount = rng.random_range(1..=10_i64);
 
                         // Start transaction (will be CONCURRENT by default).
                         if conn.execute("BEGIN;").is_err() {

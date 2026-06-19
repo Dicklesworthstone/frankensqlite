@@ -143,34 +143,34 @@ fsqlite-c-api = { version = "0.1.10", path = "crates/fsqlite-c-api" }
 fsqlite-wasm = { version = "0.1.10", path = "crates/fsqlite-wasm" }
 
 # External dependencies
-ftui = { version = "0.2.1", default-features = false }
+ftui = { version = "0.4.1", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 itoa = "1.0"
 tracing = "0.1"
 simdutf8 = "0.1"
-tracing-subscriber = "0.3.22"
-bitflags = { version = "2.9", features = ["serde"] }
-smallvec = "1.13"
-memchr = "2.7"
+tracing-subscriber = "0.3.23"
+bitflags = { version = "2.13", features = ["serde"] }
+smallvec = "1.15"
+memchr = "2.8"
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32c = "0.6"
-blake3 = "1.5"
+blake3 = "1.8"
 crossbeam-epoch = "0.9"
 crossbeam-deque = "0.8"
-sha2 = "0.10"
-nix = { version = "0.29", default-features = false, features = ["fs", "process", "signal", "socket", "uio", "user"] }
+sha2 = "0.11"
+nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "socket", "uio", "user"] }
 libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
-rand = "0.8"
-hashbrown = { version = "0.14", features = ["serde"] }
-dashmap = "6.1"
-lru = "0.16"
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rand = "0.10"
+hashbrown = { version = "0.17", features = ["serde"] }
+dashmap = "6.2"
+lru = "0.18"
+rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 # `default-features = false` drops asupersync's default `test-internals` feature
 # (which pulls tracing/tracing-subscriber/visibility) from every fsqlite crate.
 # Otherwise those test-only deps leak into downstream production builds via
@@ -180,11 +180,11 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 asupersync = { version = "0.3.4", default-features = false }
 
 # Dev dependencies
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.6"
-insta = { version = "1.42", features = ["json", "yaml"] }
-tempfile = "3.17"
-toml = "0.8"
+criterion = { version = "0.7", features = ["html_reports"] }
+proptest = "1.11"
+insta = { version = "1.48", features = ["json", "yaml"] }
+tempfile = "3.27"
+toml = "1.1"
 
 [profile.release]
 opt-level = "z"

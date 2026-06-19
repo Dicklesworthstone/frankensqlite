@@ -1,6 +1,6 @@
 import { FrankenPreparedStatement } from "./statement";
 import { FrankenTransaction } from "./transaction";
-import type { FrankenDbOpenOptions, QueryResult } from "./types";
+import type { FrankenDbOpenOptions, QueryResult, SqlScalar } from "./types";
 import { normalizeOpenOptions, resolveWorker } from "./utils";
 import { FrankenWorkerClient } from "./worker-client";
 
@@ -16,12 +16,20 @@ export class FrankenDB {
   static async open(options?: FrankenDbOpenOptions | string): Promise<FrankenDB> {
     const normalized = normalizeOpenOptions(options);
     const client = new FrankenWorkerClient(resolveWorker(normalized.worker));
-    const ready = await client.init({
-      dbName: normalized.dbName,
-      persistence: normalized.persistence,
-      wasmUrl: normalized.wasmUrl,
-      snapshot: normalized.snapshot,
-    });
+    const config: FrankenDbOpenOptions = {};
+    if (normalized.dbName !== undefined) {
+      config.dbName = normalized.dbName;
+    }
+    if (normalized.persistence !== undefined) {
+      config.persistence = normalized.persistence;
+    }
+    if (normalized.wasmUrl !== undefined) {
+      config.wasmUrl = normalized.wasmUrl;
+    }
+    if (normalized.snapshot !== undefined) {
+      config.snapshot = normalized.snapshot;
+    }
+    const ready = await client.init(config);
     return new FrankenDB(client, ready.path);
   }
 
@@ -39,7 +47,7 @@ export class FrankenDB {
     return this.#path;
   }
 
-  execute(sql: string, params: readonly unknown[] = []): Promise<number> {
+  execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
     return this.#client.execute(sql, params);
   }
 
@@ -49,9 +57,9 @@ export class FrankenDB {
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
-    params: readonly unknown[] = [],
+    params: readonly SqlScalar[] = [],
   ): Promise<QueryResult<Row>> {
-    return this.#client.query(sql, params);
+    return this.#client.query<Row>(sql, params);
   }
 
   async prepare<Row extends Record<string, unknown> = Record<string, unknown>>(

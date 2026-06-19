@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use sha2::{Digest, Sha256};
 
 use crate::{E2eError, E2eResult};
@@ -389,8 +389,8 @@ impl CorruptionInjector {
                     ))
                 })?;
                 while flips.len() < target {
-                    let byte_idx = off + rng.gen_range(0..len);
-                    let bit_idx = rng.gen_range(0..8u8);
+                    let byte_idx = off + rng.random_range(0..len);
+                    let bit_idx = rng.random_range(0..8u8);
                     flips.insert((byte_idx, bit_idx));
                 }
 
@@ -517,7 +517,7 @@ impl CorruptionInjector {
                 let original = data[off..end].to_vec();
                 let mut rng = StdRng::seed_from_u64(*seed);
                 for b in &mut data[off..end] {
-                    *b = rng.r#gen();
+                    *b = rng.random();
                 }
                 let is_sidecar = matches!(pattern, CorruptionPattern::SidecarCorrupt { .. });
                 let pages = if is_sidecar {
@@ -600,7 +600,7 @@ impl CorruptionInjector {
                 let original = data[start..end].to_vec();
                 let mut rng = StdRng::seed_from_u64(*seed);
                 for b in &mut data[start..end] {
-                    *b = rng.r#gen();
+                    *b = rng.random();
                 }
                 let modification = CorruptionModification {
                     offset: u64::try_from(start).unwrap_or(u64::MAX),
@@ -736,7 +736,7 @@ impl CorruptionInjector {
                     let original = data[data_start..data_end].to_vec();
                     all_original.extend_from_slice(&original);
                     for b in &mut data[data_start..data_end] {
-                        *b = rng.r#gen();
+                        *b = rng.random();
                     }
                     modifications.push(CorruptionModification {
                         offset: u64::try_from(data_start).unwrap_or(u64::MAX),
@@ -1008,9 +1008,9 @@ impl CorruptionInjector {
                     ))
                 })?;
                 while flip_map.values().map(BTreeSet::len).sum::<usize>() < target {
-                    let frame_idx = rng.gen_range(*frame_start..=*frame_end);
-                    let byte_off = rng.gen_range(0..(self.page_size as usize));
-                    let bit_idx = rng.gen_range(0..8u8);
+                    let frame_idx = rng.random_range(*frame_start..=*frame_end);
+                    let byte_off = rng.random_range(0..(self.page_size as usize));
+                    let bit_idx = rng.random_range(0..8u8);
                     flip_map
                         .entry(frame_idx)
                         .or_default()
@@ -1709,8 +1709,8 @@ pub fn inject_corruption(path: &Path, strategy: CorruptionStrategy, seed: u64) -
     match strategy {
         CorruptionStrategy::RandomBitFlip { count } => {
             for _ in 0..count {
-                let byte_idx = rng.gen_range(0..data.len());
-                let bit_idx = rng.gen_range(0..8u8);
+                let byte_idx = rng.random_range(0..data.len());
+                let bit_idx = rng.random_range(0..8u8);
                 data[byte_idx] ^= 1 << bit_idx;
             }
         }
@@ -1751,7 +1751,7 @@ pub fn inject_corruption(path: &Path, strategy: CorruptionStrategy, seed: u64) -
             }
 
             for byte in &mut data[start..end] {
-                *byte = rng.r#gen();
+                *byte = rng.random();
             }
         }
     }

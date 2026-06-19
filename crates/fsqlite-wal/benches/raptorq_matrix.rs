@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
 use asupersync::raptorq::systematic::SystematicEncoder;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::{
     ObjectId, Oti, SymbolRecord, SymbolRecordFlags, reconstruct_systematic_happy_path,
 };
@@ -27,9 +28,7 @@ enum BenchMode {
 
 impl BenchMode {
     fn detect() -> Self {
-        let smoke_env = std::env::var("FSQLITE_BENCH_SMOKE")
-            .ok()
-            .is_some_and(|value| value != "0");
+        let smoke_env = std::env::var("FSQLITE_BENCH_SMOKE").is_ok_and(|value| value != "0");
         if smoke_env || std::env::var("CI").is_ok() {
             Self::Smoke
         } else {

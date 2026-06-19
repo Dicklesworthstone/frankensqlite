@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use rusqlite::{Connection, DatabaseName, OpenFlags};
+use rusqlite::{Connection, MAIN_DB, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
@@ -2358,7 +2358,7 @@ fn resolve_hot_path_beads_data_hash(workspace_root: &Path) -> Option<String> {
     let campaign = load_beads_benchmark_campaign(workspace_root).ok()?;
     let beads_path = workspace_root.join(campaign.beads_data_relpath);
     let bytes = fs::read(beads_path).ok()?;
-    Some(format!("{:x}", Sha256::digest(bytes)))
+    Some(fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(bytes)))
 }
 
 fn resolve_hot_path_artifact_provenance_inputs(
@@ -2453,7 +2453,7 @@ fn build_hot_path_artifact_provenance(
 }
 
 fn hot_path_artifact_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(bytes))
 }
 
 fn refresh_hot_path_artifact_metadata(
@@ -4608,11 +4608,11 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         hasher.update(&buf[..n]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(fsqlite_e2e::bytes_to_lower_hex(hasher.finalize()))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(bytes))
 }
 
 fn sqlite_page_size_or_default(db_bytes: &[u8]) -> u32 {
@@ -7361,8 +7361,10 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnPro
 
 fn count_rows(conn: &Connection, table: &str) -> Result<u64, String> {
     let sql = format!("SELECT count(*) FROM {}", quote_ident(table));
-    conn.query_row(&sql, [], |r| r.get::<_, u64>(0))
-        .map_err(|e| format!("count_rows({table}): {e}"))
+    let count = conn
+        .query_row(&sql, [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("count_rows({table}): {e}"))?;
+    u64::try_from(count).map_err(|e| format!("count_rows({table}): {e}"))
 }
 
 fn quote_ident(name: &str) -> String {
@@ -7506,7 +7508,7 @@ fn backup_sqlite_file(src: &Path, dst: &Path) -> Result<(), String> {
 
     // Uses SQLite backup API (same semantics as `sqlite3 "$SRC" ".backup '$DST'"`).
     src_conn
-        .backup(DatabaseName::Main, dst, None)
+        .backup(MAIN_DB, dst, None)
         .map_err(|e| format!("sqlite backup API failed: {e}"))
 }
 
@@ -10578,7 +10580,7 @@ mod tests {
         fs::write(golden.join("test.db"), content).unwrap();
 
         // Compute expected sha256.
-        let expected = format!("{:x}", Sha256::digest(content));
+        let expected = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
 
         // Write checksums file.
         let checksums = dir.path().join("checksums.sha256");
@@ -10658,8 +10660,8 @@ mod tests {
         fs::write(golden.join("a.db"), a_content).unwrap();
         fs::write(golden.join("b.db"), b_content).unwrap();
 
-        let a_hash = format!("{:x}", Sha256::digest(a_content));
-        let b_hash = format!("{:x}", Sha256::digest(b_content));
+        let a_hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(a_content));
+        let b_hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(b_content));
 
         let checksums = dir.path().join("checksums.sha256");
         fs::write(&checksums, format!("{a_hash}  a.db\n{b_hash}  b.db\n")).unwrap();
@@ -10681,7 +10683,7 @@ mod tests {
         let content = b"cli test data";
         fs::write(golden.join("x.db"), content).unwrap();
 
-        let hash = format!("{:x}", Sha256::digest(content));
+        let hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
         let checksums = dir.path().join("checksums.sha256");
         fs::write(&checksums, format!("{hash}  x.db\n")).unwrap();
 
@@ -10735,7 +10737,7 @@ mod tests {
         // Expected file.
         let content = b"expected";
         fs::write(golden.join("a.db"), content).unwrap();
-        let hash = format!("{:x}", Sha256::digest(content));
+        let hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
 
         // Extra file on disk, not in checksums.
         fs::write(golden.join("extra.db"), b"extra").unwrap();
@@ -10764,7 +10766,7 @@ mod tests {
         // Expected file.
         let content = b"expected";
         fs::write(golden.join("a.db"), content).unwrap();
-        let hash = format!("{:x}", Sha256::digest(content));
+        let hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
 
         // Dotfiles and sidecars are expected to exist locally and should not break verification.
         fs::write(golden.join(".gitignore"), b"*").unwrap();
@@ -10794,7 +10796,7 @@ mod tests {
         fs::write(golden.join("a.db"), content).unwrap();
         fs::write(golden.join("extra.db"), b"extra").unwrap();
 
-        let hash = format!("{:x}", Sha256::digest(content));
+        let hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
         let checksums = dir.path().join("checksums.sha256");
         fs::write(&checksums, format!("{hash}  a.db\n")).unwrap();
 
@@ -10842,7 +10844,7 @@ mod tests {
         let content = b"cli json test data";
         fs::write(golden.join("x.db"), content).unwrap();
 
-        let hash = format!("{:x}", Sha256::digest(content));
+        let hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
         let checksums = dir.path().join("checksums.sha256");
         fs::write(&checksums, format!("{hash}  x.db\n")).unwrap();
 
@@ -10870,7 +10872,7 @@ mod tests {
         let content = b"json serialize";
         fs::write(golden.join("x.db"), content).unwrap();
 
-        let hash = format!("{:x}", Sha256::digest(content));
+        let hash = fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(content));
         let checksums = dir.path().join("checksums.sha256");
         fs::write(&checksums, format!("{hash}  x.db\n")).unwrap();
 

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::hint::black_box;
 use std::rc::Rc;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -140,7 +141,7 @@ fn bench_vectorized_scan_throughput(c: &mut Criterion) {
                         scanned_rows = scanned_rows.saturating_add(batch.stats.rows_scanned);
                     }
 
-                    criterion::black_box(scanned_rows);
+                    black_box(scanned_rows);
                 });
             },
         );

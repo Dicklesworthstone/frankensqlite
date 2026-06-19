@@ -528,7 +528,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("cannot read {} for sha256: {error}", path.display()))?;
     let digest = Sha256::digest(bytes);
-    Ok(format!("{digest:x}"))
+    Ok(crate::bytes_to_lower_hex(digest))
 }
 
 fn render_template(template: &str, replacements: &[(&str, String)]) -> String {

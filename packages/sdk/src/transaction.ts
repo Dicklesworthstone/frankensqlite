@@ -1,4 +1,4 @@
-import type { QueryResult } from "./types";
+import type { QueryResult, SqlScalar } from "./types";
 import type { FrankenDB } from "./database";
 import { FrankenPreparedStatement } from "./statement";
 
@@ -14,13 +14,13 @@ export class FrankenTransaction {
     this.#db = db;
   }
 
-  execute(sql: string, params: readonly unknown[] = []): Promise<number> {
+  execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
     return this.#db.execute(sql, params);
   }
 
   query<Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
-    params: readonly unknown[] = [],
+    params: readonly SqlScalar[] = [],
   ): Promise<QueryResult<Row>> {
     return this.#db.query<Row>(sql, params);
   }

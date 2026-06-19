@@ -127,8 +127,7 @@ fn throughput_iters() -> usize {
 #[cfg(all(feature = "native", target_os = "linux"))]
 fn require_io_uring_ratio_gate() -> bool {
     std::env::var("BD_3U7_4_REQUIRE_IO_URING")
-        .ok()
-        .is_some_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .is_ok_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 #[cfg(all(feature = "native", target_os = "linux"))]

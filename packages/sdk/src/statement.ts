@@ -1,4 +1,4 @@
-import type { QueryResult } from "./types";
+import type { QueryResult, SqlScalar } from "./types";
 import { FrankenWorkerClient } from "./worker-client";
 
 export class FrankenPreparedStatement<
@@ -24,12 +24,12 @@ export class FrankenPreparedStatement<
     this.columnNames = [...columnNames];
   }
 
-  execute(params: readonly unknown[] = []): Promise<number> {
+  execute(params: readonly SqlScalar[] = []): Promise<number> {
     return this.#client.executePrepared(this.#statementId, params);
   }
 
-  query(params: readonly unknown[] = []): Promise<QueryResult<Row>> {
-    return this.#client.queryPrepared(this.#statementId, params);
+  query(params: readonly SqlScalar[] = []): Promise<QueryResult<Row>> {
+    return this.#client.queryPrepared<Row>(this.#statementId, params);
   }
 
   finalize(): Promise<void> {

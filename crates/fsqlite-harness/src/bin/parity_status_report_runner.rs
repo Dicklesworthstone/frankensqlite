@@ -207,7 +207,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     hasher.update(payload);
     let digest = hasher.finalize();
-    Ok(format!("{digest:x}"))
+    Ok(fsqlite_harness::bytes_to_lower_hex(digest))
 }
 
 fn write_text(path: &Path, payload: &str) -> Result<(), String> {

@@ -135,7 +135,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("artifact_read_failed path={} error={error}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(payload);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(fsqlite_harness::bytes_to_lower_hex(hasher.finalize()))
 }
 
 fn enrich_artifact_hashes(config: &Config, input: &mut WorkflowInput) -> Result<(), String> {

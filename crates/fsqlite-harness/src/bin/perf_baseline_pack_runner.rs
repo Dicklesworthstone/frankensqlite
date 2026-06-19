@@ -303,7 +303,10 @@ fn compute_config_hash<T: Serialize>(value: &T) -> Result<String, String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("config_hash_serialize_failed: {error}"))?;
     let digest = Sha256::digest(bytes);
-    Ok(format!("sha256:{digest:x}"))
+    Ok(format!(
+        "sha256:{}",
+        fsqlite_harness::bytes_to_lower_hex(digest)
+    ))
 }
 
 fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {

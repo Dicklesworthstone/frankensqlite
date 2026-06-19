@@ -764,7 +764,7 @@ fn workspace_relative_path(workspace_root: &Path, path: &Path) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    crate::bytes_to_lower_hex(digest)
 }
 
 #[cfg(test)]

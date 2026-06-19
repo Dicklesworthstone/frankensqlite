@@ -1319,7 +1319,7 @@ fn fixture_fingerprint(report: &Fts5BaselineReport) -> String {
         hasher.update(scenario.fixture_id.as_bytes());
         hasher.update(scenario.db_shape.as_bytes());
     }
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", crate::bytes_to_lower_hex(hasher.finalize()))
 }
 
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -1468,7 +1468,10 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     })?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!(
+        "sha256:{}",
+        crate::bytes_to_lower_hex(hasher.finalize())
+    ))
 }
 
 fn query_rusqlite(

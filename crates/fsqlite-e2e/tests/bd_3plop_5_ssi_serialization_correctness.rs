@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use fsqlite_e2e::derive_worker_seed;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde_json::json;
 
 use fsqlite_error::FrankenError;
@@ -552,7 +552,7 @@ fn run_worker(
                             let jitter = if jitter_ceiling == 0 {
                                 0
                             } else {
-                                rng.gen_range(0_u64..=jitter_ceiling)
+                                rng.random_range(0_u64..=jitter_ceiling)
                             };
                             last_wait_ms = Some(wait_ms);
                             wait_ms.saturating_add(jitter)
@@ -623,7 +623,7 @@ fn execute_single_txn(
             if to == from {
                 to = if to == account_count { 1 } else { to + 1 };
             }
-            let amount = i64::from(rng.gen_range(1_u8..=5_u8));
+            let amount = i64::from(rng.random_range(1_u8..=5_u8));
 
             let from_balance = read_balance(conn, from)?;
             read_set.insert(from);
@@ -644,7 +644,7 @@ fn execute_single_txn(
         }
         TxnKind::Deposit => {
             let account = random_account(rng, account_count);
-            let amount = i64::from(rng.gen_range(1_u8..=3_u8));
+            let amount = i64::from(rng.random_range(1_u8..=3_u8));
 
             conn.execute(&format!(
                 "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"
@@ -665,7 +665,7 @@ fn execute_single_txn(
 }
 
 fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
-    let bucket = rng.gen_range(0_u8..100_u8);
+    let bucket = rng.random_range(0_u8..100_u8);
     if bucket < MIX_TRANSFER_PCT {
         TxnKind::Transfer
     } else if bucket < MIX_TRANSFER_PCT + MIX_DEPOSIT_PCT {
@@ -680,7 +680,7 @@ fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
 }
 
 fn random_account(rng: &mut StdRng, account_count: i64) -> i64 {
-    rng.gen_range(1_i64..=account_count)
+    rng.random_range(1_i64..=account_count)
 }
 
 fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, FrankenError> {

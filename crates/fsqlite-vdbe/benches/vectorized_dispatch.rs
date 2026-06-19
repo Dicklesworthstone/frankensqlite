@@ -1,3 +1,5 @@
+use std::hint::black_box;
+
 use asupersync::runtime::RuntimeBuilder;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::PageNumber;
@@ -61,7 +63,7 @@ fn bench_dispatcher_scaling(c: &mut Criterion) {
                         .completed
                         .iter()
                         .fold(0_u64, |acc, done| acc ^ done.result);
-                    criterion::black_box(checksum);
+                    black_box(checksum);
                 });
             },
         );

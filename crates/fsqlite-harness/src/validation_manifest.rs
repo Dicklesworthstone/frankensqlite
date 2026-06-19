@@ -1204,7 +1204,7 @@ fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
-    format!("{digest:x}")
+    crate::bytes_to_lower_hex(digest)
 }
 
 fn is_sha256_hex_64(value: &str) -> bool {

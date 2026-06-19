@@ -759,8 +759,10 @@ fn query_columns(conn: &Connection, table_name: &str) -> Result<Vec<ColumnProfil
 fn query_row_count(conn: &Connection, table_name: &str) -> Result<u64, String> {
     // Use a quoted identifier to handle table names with special characters.
     let sql = format!("SELECT count(*) FROM \"{table_name}\"");
-    conn.query_row(&sql, [], |row| row.get::<_, u64>(0))
-        .map_err(|e| format!("count(*) from {table_name}: {e}"))
+    let count = conn
+        .query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("count(*) from {table_name}: {e}"))?;
+    u64::try_from(count).map_err(|e| format!("count(*) from {table_name}: {e}"))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

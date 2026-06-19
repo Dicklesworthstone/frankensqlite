@@ -260,7 +260,7 @@ fn git_head_revision(repo_root: &Path) -> Result<String, Box<dyn Error>> {
 
 fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
     let bytes = fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(fsqlite_e2e::bytes_to_lower_hex(Sha256::digest(bytes)))
 }
 
 fn resolve_repo_relative_env_path(repo_root: &Path, key: &str) -> Option<PathBuf> {

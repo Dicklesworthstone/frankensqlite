@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { FrankenDB } from "../src/database";
+import type { WorkerResponse } from "@frankensqlite/worker";
 import type { WorkerLike, WorkerMessageEvent } from "../src/worker-client";
 
 class TransactionWorker implements WorkerLike {
@@ -27,7 +28,7 @@ class TransactionWorker implements WorkerLike {
 
   postMessage(message: any): void {
     this.requests.push({ kind: message.kind, sql: message.sql });
-    const response =
+    const response: WorkerResponse =
       message.kind === "init"
         ? {
             kind: "ready",

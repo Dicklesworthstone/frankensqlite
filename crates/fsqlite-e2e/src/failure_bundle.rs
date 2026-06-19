@@ -402,7 +402,7 @@ impl FailureBundleBuilder {
             let mut file = fs::File::create(&full_path)?;
             file.write_all(content)?;
 
-            let hash = format!("{:x}", Sha256::digest(content));
+            let hash = crate::bytes_to_lower_hex(Sha256::digest(content));
             bundle_files.push(BundleFile {
                 path: path.clone(),
                 size_bytes: content.len() as u64,

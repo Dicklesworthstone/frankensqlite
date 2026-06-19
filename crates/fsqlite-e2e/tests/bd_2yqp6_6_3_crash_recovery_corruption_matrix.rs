@@ -204,9 +204,7 @@ fn bd_2yqp6_6_3_crash_recovery_corruption_differential_matrix() {
         records.push(record);
     }
 
-    let filtered = env::var(STRATEGY_ENV_FILTER)
-        .ok()
-        .is_some_and(|raw| !raw.trim().is_empty());
+    let filtered = env::var(STRATEGY_ENV_FILTER).is_ok_and(|raw| !raw.trim().is_empty());
     if !filtered {
         assert!(
             saw_db_strategy,
@@ -581,7 +579,7 @@ fn maybe_write_artifact(records: &[Value], first_failure: Option<&str>) {
 
     let payload = serde_json::to_vec_pretty(&artifact).expect("serialize artifact payload");
     let digest = Sha256::digest(&payload);
-    let hash = format!("{digest:x}");
+    let hash = fsqlite_e2e::bytes_to_lower_hex(digest);
 
     fs::write(&artifact_path, payload).expect("write crash matrix artifact");
     eprintln!(

@@ -102,8 +102,7 @@ fn bench_iters() -> usize {
 
 fn require_io_uring() -> bool {
     std::env::var("BD_3U7_4_REQUIRE_IO_URING")
-        .ok()
-        .is_some_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .is_ok_and(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 fn workspace_root() -> Result<PathBuf, String> {

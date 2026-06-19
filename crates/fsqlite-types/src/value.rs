@@ -1781,69 +1781,65 @@ pub fn format_sqlite_float(f: f64) -> String {
             "-Inf".to_owned()
         };
     }
-    // Emulate C's `printf("%!.15g", f)`:
-    // - 15 significant digits
-    // - Use scientific notation if exponent < -4 or >= 15
-    // - Strip trailing zeros (but keep at least one digit after decimal point)
+    // SQLite's alternate REAL-to-TEXT formatter keeps a decimal point for REAL
+    // values and, in current bundled SQLite, preserves enough digits to
+    // distinguish values such as 0.1 + 0.2 from the shorter decimal 0.3.
     let abs = f.abs();
     let s = if abs == 0.0 {
-        // Zero: preserve sign for -0.0 (C SQLite: printf("%!.15g", -0.0) → "-0.0")
-        if f.is_sign_negative() {
-            "-0.0".to_owned()
-        } else {
-            "0.0".to_owned()
-        }
+        "0.0".to_owned()
     } else {
-        // Determine which format is shorter: fixed vs scientific.
-        // C's %g uses scientific if exponent < -4 or >= precision.
         let exp = abs.log10().floor() as i32;
-        if exp >= 15 || exp < -4 {
-            // Scientific notation with 14 decimal places (15 sig digits total).
-            let mut s = format!("{f:.14e}");
-            // Strip trailing zeros in the mantissa before 'e'.
-            if let Some(e_pos) = s.find('e') {
-                let mantissa = &s[..e_pos];
-                let exp_str = &s[e_pos + 1..]; // after 'e'
-                let trimmed = mantissa.trim_end_matches('0');
-                // Ensure decimal point is kept (the `!` flag).
-                let trimmed = if trimmed.ends_with('.') {
-                    format!("{trimmed}0")
-                } else {
-                    trimmed.to_owned()
-                };
-                // Normalize exponent to match C printf: explicit +/- sign
-                // and at least 2 digits (e.g. "e-05" not "e-5", "e+15" not "e15").
-                let (exp_sign, exp_digits) = if let Some(rest) = exp_str.strip_prefix('-') {
-                    ("-", rest)
-                } else if let Some(rest) = exp_str.strip_prefix('+') {
-                    ("+", rest)
-                } else {
-                    ("+", exp_str)
-                };
-                let exp_num: u32 = exp_digits.parse().unwrap_or(0);
-                s = format!("{trimmed}e{exp_sign}{exp_num:02}");
+        if (-4..16).contains(&exp) {
+            let mut s = format!("{f:?}");
+            if !s.contains('.') && !s.contains('e') {
+                s.push_str(".0");
             }
             s
         } else {
-            // Fixed notation: number of decimal places = 15 - (exp + 1).
-            #[allow(clippy::cast_sign_loss)]
-            let decimal_places = (14 - exp).max(0) as usize;
-            let mut s = format!("{f:.decimal_places$}");
-            // Strip trailing zeros but keep at least one digit after decimal.
-            if s.contains('.') {
-                let trimmed = s.trim_end_matches('0');
-                s = if trimmed.ends_with('.') {
-                    format!("{trimmed}0")
+            let debug = format!("{f:?}");
+            let mut s = if let Some((mantissa, _)) = debug.split_once('e') {
+                if !mantissa.contains('.') {
+                    debug
                 } else {
-                    trimmed.to_owned()
-                };
+                    format!("{f:.16e}")
+                }
             } else {
-                s.push_str(".0");
-            }
+                debug
+            };
+            normalize_sqlite_float_exponent(&mut s);
             s
         }
     };
     s
+}
+
+fn normalize_sqlite_float_exponent(s: &mut String) {
+    let Some(e_pos) = s.find('e') else {
+        if !s.contains('.') {
+            s.push_str(".0");
+        }
+        return;
+    };
+
+    let mantissa = &s[..e_pos];
+    let exp_str = &s[e_pos + 1..];
+    let trimmed = mantissa.trim_end_matches('0');
+    let mantissa = if trimmed.ends_with('.') {
+        format!("{trimmed}0")
+    } else if trimmed.contains('.') {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}.0")
+    };
+    let (exp_sign, exp_digits) = if let Some(rest) = exp_str.strip_prefix('-') {
+        ("-", rest)
+    } else if let Some(rest) = exp_str.strip_prefix('+') {
+        ("+", rest)
+    } else {
+        ("+", exp_str)
+    };
+    let exp_num: u32 = exp_digits.parse().unwrap_or(0);
+    *s = format!("{mantissa}e{exp_sign}{exp_num}");
 }
 
 #[cfg(test)]
@@ -3287,9 +3283,20 @@ mod tests {
 
     #[test]
     fn test_format_sqlite_float_negative_zero() {
-        // C SQLite: printf("%!.15g", -0.0) → "-0.0"
-        assert_eq!(format_sqlite_float(-0.0), "-0.0");
+        // SQLite CAST(... AS TEXT) normalizes both zero signs to "0.0".
+        assert_eq!(format_sqlite_float(-0.0), "0.0");
         assert_eq!(format_sqlite_float(0.0), "0.0");
+    }
+
+    #[test]
+    fn test_format_sqlite_float_preserves_shortest_distinguishing_digits() {
+        assert_eq!(format_sqlite_float(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(format_sqlite_float(1.0e308), "1.0e+308");
+        assert_eq!(format_sqlite_float(1.0e-308), "1.0e-308");
+        assert_eq!(
+            format_sqlite_float(9.223_372_036_854_776e18),
+            "9.2233720368547758e+18"
+        );
     }
 
     #[test]

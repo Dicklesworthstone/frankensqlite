@@ -40460,7 +40460,10 @@ impl Connection {
         // an existing table's name (bd-8yhe3). IF NOT EXISTS silences the clash
         // regardless of the existing object's kind, matching SQLite.
         let schema = self.schema.borrow();
-        if schema.iter().any(|t| t.name.eq_ignore_ascii_case(view_name)) {
+        if schema
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(view_name))
+        {
             if stmt.if_not_exists {
                 return Ok(());
             }
@@ -81042,11 +81045,7 @@ impl Default for BindParamState {
 impl BindParamState {
     fn claim_anonymous(&mut self) -> Result<i32> {
         let index = self.next_index;
-        if index <= 0
-            || u32::try_from(index)
-                .ok()
-                .is_none_or(|n| n > MAX_VARIABLE_NUMBER)
-        {
+        if index <= 0 || u32::try_from(index).map_or(true, |n| n > MAX_VARIABLE_NUMBER) {
             return Err(FrankenError::OutOfRange {
                 what: "placeholder index".to_owned(),
                 value: index.to_string(),
@@ -81063,11 +81062,7 @@ impl BindParamState {
     }
 
     fn register_numbered(&mut self, index: i32) -> Result<i32> {
-        if index <= 0
-            || u32::try_from(index)
-                .ok()
-                .is_none_or(|n| n > MAX_VARIABLE_NUMBER)
-        {
+        if index <= 0 || u32::try_from(index).map_or(true, |n| n > MAX_VARIABLE_NUMBER) {
             return Err(FrankenError::OutOfRange {
                 what: "placeholder index".to_owned(),
                 value: index.to_string(),
@@ -115079,6 +115074,10 @@ mod tests {
                 let mut retries = 0_u64;
                 for _ in 0..TXNS_PER_WORKER {
                     loop {
+                        let pre_begin_latest_root_commit = conn
+                            .concurrent_commit_index
+                            .latest(table_root_pgno)
+                            .map_or(0, CommitSeq::get);
                         match conn.execute("BEGIN CONCURRENT;") {
                             Ok(_) => {}
                             Err(err) if err.is_transient() => {
@@ -115095,8 +115094,8 @@ mod tests {
                             .latest(table_root_pgno)
                             .map_or(0, CommitSeq::get);
                         assert!(
-                            snapshot_high >= latest_root_commit,
-                            "BEGIN CONCURRENT bound stale snapshot in hot-row probe: snapshot_high={snapshot_high} latest_root_commit={latest_root_commit} retries={retries}"
+                            snapshot_high >= pre_begin_latest_root_commit,
+                            "BEGIN CONCURRENT bound stale snapshot in hot-row probe: snapshot_high={snapshot_high} pre_begin_latest_root_commit={pre_begin_latest_root_commit} latest_root_commit={latest_root_commit} retries={retries}"
                         );
                         match conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
                             Ok(changes) => {
@@ -118958,23 +118957,6 @@ mod transaction_lifecycle_tests {
             &SqliteValue::Text("alpha".into())
         );
 
-        let oracle = rusqlite::Connection::open(&db_path).unwrap();
-        let oracle_rows = oracle
-            .prepare("SELECT id, v FROM t ORDER BY id;")
-            .unwrap()
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(
-            oracle_rows,
-            vec![(1, "alpha".to_owned())],
-            "rusqlite should observe the same recovered row set"
-        );
-        drop(oracle);
-
         let checkpoint_rows = conn
             .query("PRAGMA wal_checkpoint(FULL);")
             .expect("checkpoint after crash recovery should succeed");
@@ -119009,6 +118991,22 @@ mod transaction_lifecycle_tests {
             std::fs::metadata(&db_path).unwrap().len(),
             u64::from(PageSize::DEFAULT.get()) * 2,
             "checkpoint should grow the main database file to include the table root page"
+        );
+
+        let oracle = rusqlite::Connection::open(&db_path).unwrap();
+        let oracle_rows = oracle
+            .prepare("SELECT id, v FROM t ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            oracle_rows,
+            vec![(1, "alpha".to_owned())],
+            "rusqlite should observe the same checkpointed row set"
         );
     }
 

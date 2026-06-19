@@ -1383,7 +1383,7 @@ mod tests {
         })?;
         let mut hasher = Sha256::new();
         hasher.update(payload.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = crate::bytes_to_lower_hex(hasher.finalize());
 
         eprintln!(
             "DEBUG bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=artifact_written run_id={run_id} path={}",

@@ -296,7 +296,9 @@ fn pragma_u32(conn: &rusqlite::Connection, pragma: &str) -> u32 {
 
 fn pragma_u64(conn: &rusqlite::Connection, pragma: &str) -> u64 {
     let sql = format!("PRAGMA {pragma}");
-    conn.query_row(&sql, [], |row| row.get::<_, u64>(0))
+    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0)
 }
 

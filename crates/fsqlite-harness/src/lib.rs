@@ -93,6 +93,18 @@ pub mod verification_contract_enforcement;
 pub mod verification_gates;
 pub mod wal_journal_parity;
 
+pub fn bytes_to_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 #[cfg(test)]
 mod sql_pipeline_suites;
 #[cfg(test)]

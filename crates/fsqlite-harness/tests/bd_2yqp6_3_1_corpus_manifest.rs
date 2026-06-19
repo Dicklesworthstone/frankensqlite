@@ -145,7 +145,7 @@ fn feature_id_is_valid(feature_id: &str) -> bool {
 
 fn sha256_hex(payload: &[u8]) -> String {
     let digest = Sha256::digest(payload);
-    format!("{digest:x}")
+    fsqlite_harness::bytes_to_lower_hex(digest)
 }
 
 fn canonical_shard_hash(manifest: &CorpusManifestContract, shard: &Shard) -> String {

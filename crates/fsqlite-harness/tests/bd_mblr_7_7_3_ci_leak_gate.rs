@@ -78,7 +78,7 @@ fn make_record(
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    fsqlite_harness::bytes_to_lower_hex(digest)
 }
 
 fn actionable_diagnostic(finding: &LeakDetectorFinding) -> String {

@@ -24,7 +24,7 @@
 //! cargo test -p fsqlite-e2e --test seed_reproducibility -- --nocapture
 //! ```
 
-use rand::RngCore;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -318,7 +318,7 @@ fn execute_oplog_and_hash(oplog: &fsqlite_e2e::oplog::OpLog) -> String {
         }
     }
 
-    format!("{:x}", hasher.finalize())
+    fsqlite_e2e::bytes_to_lower_hex(hasher.finalize())
 }
 
 fn format_val(v: &str) -> String {

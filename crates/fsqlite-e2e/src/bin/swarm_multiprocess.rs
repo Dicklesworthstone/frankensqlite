@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fsqlite::{Connection, FrankenError, SqliteValue};
 use fsqlite_e2e::verify_csqlite::{verify_concurrency_artifact, write_artifact_bundle};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 const REPORT_SCHEMA_V1: &str = "fsqlite-e2e.swarm-multiprocess-report.v1";
@@ -528,10 +528,10 @@ fn commit_mixed_transaction(
     let seq = state.next_seq;
     let id = row_id_for(child.worker_id, seq)?;
     let payload = random_payload(rng, child.worker_id, seq);
-    let hot_id = HOT_ROW_BASE - rng.gen_range(0..DEFAULT_HOT_ROWS);
+    let hot_id = HOT_ROW_BASE - rng.random_range(0..DEFAULT_HOT_ROWS);
     let update_id = state
         .live_ids
-        .get(rng.gen_range(0..state.live_ids.len().max(1)))
+        .get(rng.random_range(0..state.live_ids.len().max(1)))
         .copied()
         .unwrap_or(hot_id);
     let deleted_id = choose_delete_id(&state.live_ids, rng);
@@ -539,7 +539,7 @@ fn commit_mixed_transaction(
         "update:w{}:s{}:{}",
         child.worker_id,
         seq,
-        rng.r#gen::<u32>()
+        rng.random::<u32>()
     );
 
     retry_fsqlite(config, counters, "mixed write transaction", || {
@@ -677,10 +677,10 @@ fn verify_random_pk_lookup(
     counters: &mut WorkerCounters,
     rng: &mut StdRng,
 ) -> HarnessResult<()> {
-    let lookup_id = if !state.live_ids.is_empty() && rng.gen_ratio(3, 4) {
-        state.live_ids[rng.gen_range(0..state.live_ids.len())]
+    let lookup_id = if !state.live_ids.is_empty() && rng.random_ratio(3, 4) {
+        state.live_ids[rng.random_range(0..state.live_ids.len())]
     } else {
-        HOT_ROW_BASE - rng.gen_range(0..DEFAULT_HOT_ROWS)
+        HOT_ROW_BASE - rng.random_range(0..DEFAULT_HOT_ROWS)
     };
     let _ = query_pk(conn, config, counters, lookup_id)?;
     Ok(())
@@ -696,7 +696,7 @@ fn verify_other_worker_visible(
     if config.workers <= 1 {
         return Ok(());
     }
-    let start = rng.gen_range(0..config.workers);
+    let start = rng.random_range(0..config.workers);
     for offset in 0..config.workers {
         let other = (start + offset) % config.workers;
         if other == worker_id {
@@ -2104,18 +2104,18 @@ fn row_id_for(worker_id: usize, seq: i64) -> HarnessResult<i64> {
 }
 
 fn choose_delete_id(live_ids: &[i64], rng: &mut StdRng) -> Option<i64> {
-    if live_ids.len() < 8 || !rng.gen_ratio(1, 10) {
+    if live_ids.len() < 8 || !rng.random_ratio(1, 10) {
         return None;
     }
     let max_index = live_ids.len().saturating_sub(2);
-    Some(live_ids[rng.gen_range(0..max_index)])
+    Some(live_ids[rng.random_range(0..max_index)])
 }
 
 fn random_payload(rng: &mut StdRng, worker_id: usize, seq: i64) -> String {
     format!(
         "payload:w{worker_id}:s{seq}:a{:016x}:b{:016x}",
-        rng.r#gen::<u64>(),
-        rng.r#gen::<u64>()
+        rng.random::<u64>(),
+        rng.random::<u64>()
     )
 }
 

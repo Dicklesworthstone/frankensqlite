@@ -55,7 +55,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite::{Connection, FrankenError, SqliteValue};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Marker env var: when set on a child process, the test binary runs
 /// as a swarm worker instead of running the test framework.
@@ -1132,8 +1132,8 @@ fn child_main(backend: Backend) -> Result<(), String> {
         ^ now_ns;
     let mut rng = StdRng::seed_from_u64(rng_seed);
 
-    let lifetime_ms = rng.gen_range(PROC_LIFETIME_MIN_MS..=PROC_LIFETIME_MAX_MS);
-    let ops_count = rng.gen_range(PROC_OPS_MIN..=PROC_OPS_MAX);
+    let lifetime_ms = rng.random_range(PROC_LIFETIME_MIN_MS..=PROC_LIFETIME_MAX_MS);
+    let ops_count = rng.random_range(PROC_OPS_MIN..=PROC_OPS_MAX);
     let deadline = Instant::now() + Duration::from_millis(lifetime_ms);
 
     // Open audit log (append).
@@ -1172,7 +1172,7 @@ fn child_main(backend: Backend) -> Result<(), String> {
 }
 
 fn pick_op(rng: &mut StdRng) -> Op {
-    match rng.gen_range(0..4) {
+    match rng.random_range(0..4) {
         0 => Op::Insert,
         1 => Op::Update,
         2 => Op::SelectByPk,
@@ -1224,7 +1224,7 @@ fn child_run_fsqlite(
     let mut completed = 0_u32;
     while completed < ops_count && Instant::now() < deadline {
         let op = pick_op(rng);
-        let key = rng.gen_range(0..keyspace);
+        let key = rng.random_range(0..keyspace);
         let value = format!("w{worker_id}-pid{pid}-rev{completed}");
         let started = Instant::now();
         let res: Result<String, FrankenError> = match op {
@@ -1333,8 +1333,8 @@ fn child_run_fsqlite(
                 r
             }
             Op::SelectRange => retry_busy_fsqlite(busy_budget, || {
-                let lo = rng.gen_range(0..keyspace);
-                let hi = (lo + rng.gen_range(1..32)).min(keyspace);
+                let lo = rng.random_range(0..keyspace);
+                let hi = (lo + rng.random_range(1..32)).min(keyspace);
                 let _rows = conn.query_with_params(
                     "SELECT k, v FROM swarm_kv WHERE k BETWEEN ?1 AND ?2",
                     &[SqliteValue::Integer(lo), SqliteValue::Integer(hi)],
@@ -1444,7 +1444,7 @@ fn child_run_stock(
     let mut completed = 0_u32;
     while completed < ops_count && Instant::now() < deadline {
         let op = pick_op(rng);
-        let key = rng.gen_range(0..keyspace);
+        let key = rng.random_range(0..keyspace);
         let value = format!("w{worker_id}-pid{pid}-rev{completed}");
         let started = Instant::now();
         let res: Result<String, rusqlite::Error> = match op {
@@ -1493,8 +1493,8 @@ fn child_run_stock(
                 Ok("select_pk".to_owned())
             })(),
             Op::SelectRange => (|| -> Result<String, rusqlite::Error> {
-                let lo = rng.gen_range(0..keyspace);
-                let hi = (lo + rng.gen_range(1..32)).min(keyspace);
+                let lo = rng.random_range(0..keyspace);
+                let hi = (lo + rng.random_range(1..32)).min(keyspace);
                 let mut stmt =
                     conn.prepare("SELECT k, v FROM swarm_kv WHERE k BETWEEN ?1 AND ?2")?;
                 let mut rows = stmt.query(rusqlite::params![lo, hi])?;

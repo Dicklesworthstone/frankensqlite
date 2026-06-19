@@ -2795,7 +2795,7 @@ fn format_basis_points_ratio(value: u32) -> String {
 }
 
 fn hot_path_artifact_sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::bytes_to_lower_hex(Sha256::digest(bytes))
 }
 
 fn actionable_entry(

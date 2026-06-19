@@ -19,7 +19,7 @@
     "@frankensqlite/core": "^0.1.0"
   },
   "dependencies": {
-    "@frankensqlite/worker": "workspace:*"
+    "@frankensqlite/worker": "0.1.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

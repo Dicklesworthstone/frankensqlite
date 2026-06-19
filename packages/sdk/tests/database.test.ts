@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { FrankenDB } from "../src/database";
+import type { WorkerResponse } from "@frankensqlite/worker";
 import type { WorkerLike, WorkerMessageEvent } from "../src/worker-client";
 
 class MockWorker implements WorkerLike {
@@ -28,7 +29,7 @@ class MockWorker implements WorkerLike {
   postMessage(message: any): void {
     this.requests.push(message);
     queueMicrotask(() => {
-      const response =
+      const response: WorkerResponse =
         message.kind === "init"
           ? {
               kind: "ready",

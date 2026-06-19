@@ -491,7 +491,7 @@ fn sha256_hex(data: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
+    fsqlite_harness::bytes_to_lower_hex(hasher.finalize())
 }
 
 // ─── Multi-Run Ingestion Regression ────────────────────────────────────

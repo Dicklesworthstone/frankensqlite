@@ -925,7 +925,7 @@ fn maybe_write_artifact(records: &[Value], first_failure: Option<&str>) {
 
     let payload = serde_json::to_vec_pretty(&artifact).expect("serialize busy matrix artifact");
     let digest = Sha256::digest(&payload);
-    let hash = format!("{digest:x}");
+    let hash = fsqlite_e2e::bytes_to_lower_hex(digest);
     fs::write(&artifact_path, payload).expect("write busy matrix artifact");
 
     eprintln!(

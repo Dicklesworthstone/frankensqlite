@@ -452,7 +452,7 @@ fn envelope_for_scenario(scenario: &QuirkScenario, index: usize) -> ExecutionEnv
 
 fn sha256_hex(payload: &[u8]) -> String {
     let digest = Sha256::digest(payload);
-    format!("{digest:x}")
+    fsqlite_harness::bytes_to_lower_hex(digest)
 }
 
 fn scenario_source_bytes(scenario: &QuirkScenario) -> Result<Vec<u8>, String> {

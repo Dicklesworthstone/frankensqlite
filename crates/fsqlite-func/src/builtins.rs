@@ -4499,13 +4499,13 @@ mod tests {
             ("%#x", 255, "0xff"),
             ("%#X", 255, "0XFF"),
             ("%#o", 64, "0100"),
-            ("%#x", 0, "0"),   // zero gets no prefix
-            ("%#o", 0, "0"),   // zero gets no prefix
-            ("%#5x", 255, " 0xff"),       // prefix counts toward space pad
+            ("%#x", 0, "0"),        // zero gets no prefix
+            ("%#o", 0, "0"),        // zero gets no prefix
+            ("%#5x", 255, " 0xff"), // prefix counts toward space pad
             ("%#8x", 255, "    0xff"),
             ("%#08x", 255, "0x000000ff"), // zero pad pads digits, prefix outside
-            ("%-#8x", 255, "0xff    "),    // '-' (no '0') -> space pad, left aligned
-            ("%-08x", 255, "000000ff"),    // '-' does NOT override '0' in SQLite
+            ("%-#8x", 255, "0xff    "),   // '-' (no '0') -> space pad, left aligned
+            ("%-08x", 255, "000000ff"),   // '-' does NOT override '0' in SQLite
             ("%#08o", 64, "000000100"),
             ("%#x", -1, "0xffffffffffffffff"),
         ];

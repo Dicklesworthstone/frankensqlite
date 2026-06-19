@@ -4,7 +4,9 @@ import type {
   ExportResponse,
   InitConfig,
   PrepareResponse,
+  QueryResult,
   QueryResponse,
+  SqlScalar,
   WorkerRequest,
   WorkerResponse,
 } from "@frankensqlite/worker";
@@ -88,7 +90,7 @@ export class FrankenWorkerClient {
     return ensureKind(response, "ready").data;
   }
 
-  async execute(sql: string, params: readonly unknown[] = []): Promise<number> {
+  async execute(sql: string, params: readonly SqlScalar[] = []): Promise<number> {
     const response = await this.#send({
       kind: "execute",
       requestId: this.#nextId(),
@@ -107,14 +109,17 @@ export class FrankenWorkerClient {
     ensureKind(response, "execute-batch-result");
   }
 
-  async query(sql: string, params: readonly unknown[] = []) {
+  async query<Row extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params: readonly SqlScalar[] = [],
+  ): Promise<QueryResult<Row>> {
     const response = await this.#send({
       kind: "query",
       requestId: this.#nextId(),
       sql,
       params: [...params],
     });
-    return ensureKind(response, "query-result").data;
+    return ensureKind(response, "query-result").data as QueryResult<Row>;
   }
 
   async prepare(sql: string) {
@@ -128,7 +133,7 @@ export class FrankenWorkerClient {
 
   async executePrepared(
     statementId: string,
-    params: readonly unknown[] = [],
+    params: readonly SqlScalar[] = [],
   ): Promise<number> {
     const response = await this.#send({
       kind: "statement-execute",
@@ -139,17 +144,17 @@ export class FrankenWorkerClient {
     return ensureKind(response, "execute-result").changes;
   }
 
-  async queryPrepared(
+  async queryPrepared<Row extends Record<string, unknown> = Record<string, unknown>>(
     statementId: string,
-    params: readonly unknown[] = [],
-  ) {
+    params: readonly SqlScalar[] = [],
+  ): Promise<QueryResult<Row>> {
     const response = await this.#send({
       kind: "statement-query",
       requestId: this.#nextId(),
       statementId,
       params: [...params],
     });
-    return ensureKind(response, "query-result").data;
+    return ensureKind(response, "query-result").data as QueryResult<Row>;
   }
 
   async finalizePrepared(statementId: string): Promise<void> {

@@ -71,6 +71,10 @@ const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
 
+fn sqlite_i64(value: u64) -> i64 {
+    i64::try_from(value).expect("test workload values fit SQLite INTEGER")
+}
+
 static E2E_LOCK: Mutex<()> = Mutex::new(());
 
 // ─── Structured logging ──────────────────────────────────────────────
@@ -691,7 +695,7 @@ fn w7_concurrent_append_checkpoint() {
                     if conn
                         .execute(
                             "INSERT INTO data (id, payload) VALUES (?1, ?2)",
-                            rusqlite::params![base + i, format!("t{tid}-r{i}")],
+                            rusqlite::params![sqlite_i64(base + i), format!("t{tid}-r{i}")],
                         )
                         .is_ok()
                     {

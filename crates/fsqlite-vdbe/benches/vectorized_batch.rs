@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use fsqlite_types::value::SqliteValue;
@@ -72,7 +73,7 @@ fn bench_batch_construction(c: &mut Criterion) {
             b.iter(|| {
                 let batch = Batch::from_rows(rows, &specs, DEFAULT_BATCH_ROW_CAPACITY)
                     .expect("batch construction should succeed");
-                criterion::black_box(batch);
+                black_box(batch);
             });
         });
     }
@@ -92,7 +93,7 @@ fn bench_trie_vs_hash_build(c: &mut Criterion) {
                 b.iter(|| {
                     let trie = TrieRelation::from_sorted_rows(rows.clone())
                         .expect("trie build should succeed");
-                    criterion::black_box(trie.node_count());
+                    black_box(trie.node_count());
                 });
             },
         );
@@ -102,7 +103,7 @@ fn bench_trie_vs_hash_build(c: &mut Criterion) {
             |b, rows| {
                 b.iter(|| {
                     let index = build_hash_index(rows);
-                    criterion::black_box(index.len());
+                    black_box(index.len());
                 });
             },
         );

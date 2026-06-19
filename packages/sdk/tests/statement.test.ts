@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { FrankenDB } from "../src/database";
+import type { WorkerResponse } from "@frankensqlite/worker";
 import type { WorkerLike, WorkerMessageEvent } from "../src/worker-client";
 
 class PreparedWorker implements WorkerLike {
@@ -25,7 +26,7 @@ class PreparedWorker implements WorkerLike {
   }
 
   postMessage(message: any): void {
-    const response =
+    const response: WorkerResponse =
       message.kind === "init"
         ? {
             kind: "ready",
@@ -61,11 +62,16 @@ class PreparedWorker implements WorkerLike {
                   kind: "statement-finalize-result",
                   requestId: message.requestId,
                 }
-              : {
-                  kind: "execute-result",
-                  requestId: message.requestId,
-                  changes: 1,
-                };
+              : message.kind === "close"
+                ? {
+                    kind: "close-result",
+                    requestId: message.requestId,
+                  }
+                : {
+                    kind: "execute-result",
+                    requestId: message.requestId,
+                    changes: 1,
+                  };
 
     queueMicrotask(() => {
       for (const listener of this.#listeners) {

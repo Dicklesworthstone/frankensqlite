@@ -57,6 +57,10 @@ const HISTORICAL_PLACEHOLDER_8T_SPEEDUP: f64 = 1.5;
 /// Historical 16-thread placeholder gate from the pre-overlay contention file.
 const HISTORICAL_PLACEHOLDER_16T_SPEEDUP: f64 = 1.0;
 
+fn sqlite_i64(value: u64) -> i64 {
+    i64::try_from(value).expect("test workload values fit SQLite INTEGER")
+}
+
 // ---------------------------------------------------------------------------
 // Test result types
 // ---------------------------------------------------------------------------
@@ -113,7 +117,7 @@ fn measure_csqlite_throughput(thread_count: usize, rows_per_thread: u64) -> Thro
                     if conn
                         .execute(
                             "INSERT INTO bench VALUES (?1, ?2)",
-                            rusqlite::params![base + i, i * 7],
+                            rusqlite::params![sqlite_i64(base + i), sqlite_i64(i * 7)],
                         )
                         .is_ok()
                     {

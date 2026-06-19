@@ -1,6 +1,8 @@
+use std::hint::black_box;
+
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
 use asupersync::raptorq::systematic::SystematicEncoder;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_core::replication_receiver::{PacketResult, ReplicationReceiver};
 use fsqlite_core::replication_sender::{
     PageEntry, ReplicationPacket, ReplicationSender, SenderConfig,

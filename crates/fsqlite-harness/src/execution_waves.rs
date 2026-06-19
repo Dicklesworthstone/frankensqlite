@@ -649,7 +649,7 @@ pub fn write_execution_wave_plan_artifact(
 
     let mut hasher = Sha256::new();
     hasher.update(json.as_bytes());
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::bytes_to_lower_hex(hasher.finalize()))
 }
 
 /// Build a deterministic runtime output directory for execution-wave artifacts.

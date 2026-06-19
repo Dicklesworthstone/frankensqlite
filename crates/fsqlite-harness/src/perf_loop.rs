@@ -29,6 +29,18 @@ pub const PROFILING_COOKBOOK_BEAD_ID: &str = "bd-3cl3.5";
 /// Baseline layout bead identifier.
 pub const BASELINE_LAYOUT_BEAD_ID: &str = "bd-3cl3.4";
 
+fn bytes_to_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
 /// Required baseline artifact directory names (§17.8.4).
 pub const REQUIRED_BASELINE_DIRS: [&str; 5] = [
     "criterion",
@@ -670,7 +682,7 @@ pub fn compute_trace_fingerprint(schedule: &[ScheduleEvent]) -> Result<String, P
         message: error.to_string(),
     })?;
     let digest = Sha256::digest(encoded);
-    Ok(format!("sha256:{digest:x}"))
+    Ok(format!("sha256:{}", bytes_to_lower_hex(digest)))
 }
 
 /// Validate `sha256:<hex>` fingerprint shape.
@@ -759,7 +771,7 @@ pub fn compute_env_fingerprint(env: &BTreeMap<String, String>) -> Result<String,
         message: error.to_string(),
     })?;
     let digest = Sha256::digest(encoded);
-    Ok(format!("sha256:{digest:x}"))
+    Ok(format!("sha256:{}", bytes_to_lower_hex(digest)))
 }
 
 /// Build deterministic artifact bundle metadata for reproducible benchmark runs.

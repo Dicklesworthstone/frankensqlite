@@ -288,7 +288,7 @@ export function serializeFrankenError(
       ? error.code
       : extractStringProperty(error, "code") ?? "ERR_FSQLITE_WORKER";
 
-  return {
+  const serialized: SerializedFrankenError = {
     code,
     message:
       error instanceof Error
@@ -296,13 +296,33 @@ export function serializeFrankenError(
         : typeof error === "string"
           ? error
           : "Unknown FrankenSQLite worker error",
-    sqliteCode: extractNumberProperty(error, "sqliteCode"),
-    extendedCode: extractNumberProperty(error, "extendedCode"),
-    transient: extractBooleanProperty(error, "transient"),
-    userRecoverable: extractBooleanProperty(error, "userRecoverable"),
-    suggestion: extractStringProperty(error, "suggestion"),
-    stack: error instanceof Error ? error.stack : undefined,
   };
+
+  const sqliteCode = extractNumberProperty(error, "sqliteCode");
+  if (sqliteCode !== undefined) {
+    serialized.sqliteCode = sqliteCode;
+  }
+  const extendedCode = extractNumberProperty(error, "extendedCode");
+  if (extendedCode !== undefined) {
+    serialized.extendedCode = extendedCode;
+  }
+  const transient = extractBooleanProperty(error, "transient");
+  if (transient !== undefined) {
+    serialized.transient = transient;
+  }
+  const userRecoverable = extractBooleanProperty(error, "userRecoverable");
+  if (userRecoverable !== undefined) {
+    serialized.userRecoverable = userRecoverable;
+  }
+  const suggestion = extractStringProperty(error, "suggestion");
+  if (suggestion !== undefined) {
+    serialized.suggestion = suggestion;
+  }
+  if (error instanceof Error && error.stack !== undefined) {
+    serialized.stack = error.stack;
+  }
+
+  return serialized;
 }
 
 function extractStringProperty(

@@ -956,7 +956,7 @@ fn maybe_write_artifact(run_records: &[Value]) {
 
     let payload = serde_json::to_vec_pretty(&artifact).expect("serialize artifact payload");
     let digest = Sha256::digest(&payload);
-    let hash = format!("{digest:x}");
+    let hash = fsqlite_e2e::bytes_to_lower_hex(digest);
 
     fs::write(&artifact_path, payload).expect("write differential artifact");
 

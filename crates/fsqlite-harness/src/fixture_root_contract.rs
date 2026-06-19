@@ -615,7 +615,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
-    format!("{digest:x}")
+    crate::bytes_to_lower_hex(digest)
 }
 
 #[cfg(test)]

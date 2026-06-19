@@ -80,7 +80,7 @@ fn apply_outcome_json(outcome: &ApplyOutcome) -> serde_json::Value {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    fsqlite_e2e::bytes_to_lower_hex(hasher.finalize())
 }
 
 fn command_succeeded(program: &str, version_flag: &str) -> bool {

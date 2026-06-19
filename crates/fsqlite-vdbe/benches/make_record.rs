@@ -1,3 +1,4 @@
+use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -87,7 +88,7 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("generic MakeRecord benchmark should execute");
-                    criterion::black_box(outcome);
+                    black_box(outcome);
                 });
             },
         );
@@ -106,7 +107,7 @@ fn bench_make_record_fixed_schema(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("precomputed MakeRecord benchmark should execute");
-                    criterion::black_box(outcome);
+                    black_box(outcome);
                 });
             },
         );
@@ -166,10 +167,10 @@ fn bench_record_batch_encoding(c: &mut Criterion) {
                 b.iter(|| {
                     out.clear();
                     for row in rows {
-                        let record = serialize_record(criterion::black_box(row));
+                        let record = serialize_record(black_box(row));
                         out.extend_from_slice(&record);
                     }
-                    criterion::black_box(&out);
+                    black_box(&out);
                 });
             },
         );
@@ -188,9 +189,9 @@ fn bench_record_batch_encoding(c: &mut Criterion) {
                     "batch benchmark setup must stay byte-identical to scalar encoding"
                 );
                 b.iter(|| {
-                    encode_batch(criterion::black_box(&row_refs), &mut out, &mut offsets)
+                    encode_batch(black_box(&row_refs), &mut out, &mut offsets)
                         .expect("batch encoder should encode benchmark rows");
-                    criterion::black_box((&out, &offsets));
+                    black_box((&out, &offsets));
                 });
             },
         );

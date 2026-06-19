@@ -371,7 +371,7 @@ fn build_trace_id(run_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(run_id.as_bytes());
     let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    let hex = crate::bytes_to_lower_hex(digest);
     format!("trace-{}", &hex[..16])
 }
 

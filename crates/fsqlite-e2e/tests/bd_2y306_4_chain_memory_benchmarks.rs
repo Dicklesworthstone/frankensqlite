@@ -4,7 +4,7 @@ use std::{collections::HashSet, env, fs, path::PathBuf, time::Instant};
 
 use fsqlite_mvcc::{BeginKind, GLOBAL_EBR_METRICS, MvccError, TransactionManager};
 use fsqlite_types::{PageData, PageNumber, PageSize};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde_json::json;
 
 const BEAD_ID: &str = "bd-2y306.4";
@@ -149,7 +149,7 @@ fn build_zipf_cdf(page_pool: u32, s: f64) -> Vec<f64> {
 }
 
 fn sample_zipf_index(cdf: &[f64], rng: &mut StdRng) -> usize {
-    let draw = rng.gen_range(0.0_f64..1.0_f64);
+    let draw = rng.random_range(0.0_f64..1.0_f64);
     match cdf.binary_search_by(|probe| probe.total_cmp(&draw)) {
         Ok(idx) => idx,
         Err(idx) => idx.min(cdf.len().saturating_sub(1)),
@@ -203,7 +203,7 @@ fn run_workload(kind: WorkloadKind, bounded: bool, seed: u64) -> WorkloadMetrics
         let page_idx = match kind {
             WorkloadKind::HotPage => HOT_PAGE,
             WorkloadKind::Uniform => {
-                let offset = rng.gen_range(0..DEFAULT_PAGE_POOL);
+                let offset = rng.random_range(0..DEFAULT_PAGE_POOL);
                 PAGE_BASE.saturating_add(offset)
             }
             WorkloadKind::Zipfian => {
@@ -321,7 +321,7 @@ fn run_long_reader_scenario(seed: u64) -> LongReaderMetrics {
         let mut writer = mgr
             .begin(BeginKind::Concurrent)
             .expect("writer begin phase1");
-        let byte = u8::try_from((step + rng.gen_range(1..17)) % 251).expect("u8 bounded");
+        let byte = u8::try_from((step + rng.random_range(1..17)) % 251).expect("u8 bounded");
         mgr.write_page(&mut writer, hot_pgno, test_data(byte))
             .expect("writer write phase1");
         if mgr.commit(&mut writer) == Err(MvccError::Busy) {
@@ -337,7 +337,7 @@ fn run_long_reader_scenario(seed: u64) -> LongReaderMetrics {
         let mut writer = mgr
             .begin(BeginKind::Concurrent)
             .expect("writer begin phase2");
-        let byte = u8::try_from((step + rng.gen_range(5..29)) % 251).expect("u8 bounded");
+        let byte = u8::try_from((step + rng.random_range(5..29)) % 251).expect("u8 bounded");
         mgr.write_page(&mut writer, hot_pgno, test_data(byte))
             .expect("writer write phase2");
         if mgr.commit(&mut writer) == Err(MvccError::Busy) {

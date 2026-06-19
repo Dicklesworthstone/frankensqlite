@@ -2040,8 +2040,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_scm_rights_fd_passing() {
-        use std::io::Write;
         use std::io::pipe;
+        use std::io::{Read, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
 
@@ -2065,8 +2065,10 @@ mod tests {
         let payload = b"pipe-data";
         pipe_w.write_all(payload).expect("write into pipe");
 
+        let mut recv_file = std::fs::File::open(format!("/proc/self/fd/{}", recv_fd.raw_fd()))
+            .expect("open received fd via procfs");
         let mut out = [0u8; 64];
-        let nr = nix::unistd::read(recv_fd.raw_fd(), &mut out).expect("read from received fd");
+        let nr = recv_file.read(&mut out).expect("read from received fd");
         assert_eq!(&out[..nr], payload);
     }
 

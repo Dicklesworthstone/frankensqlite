@@ -21,7 +21,7 @@ use fsqlite_func::scalar::ScalarFunction;
 use fsqlite_func::vtab::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::{SmallText, SqliteValue};
-use rand::RngCore;
+use rand::Rng;
 use tracing::{debug, info};
 
 #[must_use]
@@ -674,7 +674,7 @@ impl ScalarFunction for DecimalCmpFunc {
 /// Generate a random UUID v4 string.
 fn generate_uuid_v4() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
 
     // Set version (4) and variant (10xx)
     bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
