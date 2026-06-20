@@ -5908,7 +5908,7 @@ impl PreparedStatement<'_> {
                 collect_rows,
                 max_collected_result_rows,
                 row_handler,
-                false,
+                invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
             );
@@ -5959,7 +5959,7 @@ impl PreparedStatement<'_> {
                 collect_rows,
                 max_collected_result_rows,
                 row_handler,
-                false,
+                invalidate_memdb_count_shortcuts_on_success,
                 true,
                 cached,
             );
@@ -8451,6 +8451,22 @@ pub struct Connection {
     /// Connection-local prepared-statement invalidation marker. This bumps on
     /// both local DDL and cross-connection schema reloads.
     schema_generation: Cell<u64>,
+    /// One-shot guard forcing the next memdb reload to take the FULL
+    /// sqlite_master rebuild path instead of the schema-only fast path
+    /// (bd-xvv8f). Autocommit DDL applies its connection-local schema mutation
+    /// (e.g. `self.schema.push`) and bumps `schema_cookie` eagerly, *before* the
+    /// implicit commit. When that commit then fails — e.g. a concurrent writer
+    /// wins the first-committer race on the shared sqlite_master page — the
+    /// statement is rolled back, but the eager in-memory mutation survives. The
+    /// rollback-recovery `reload_memdb_from_pager` is supposed to repair this,
+    /// yet its schema-only fast path keys on `header_cookie == schema_cookie`
+    /// and (because the local cookie was bumped by the failed DDL) can
+    /// intermittently match the committed header and skip rebuilding the schema
+    /// Vec, leaving the rolled-back table visible. A retry of the same `CREATE`
+    /// then reports "table already exists" non-transiently. This flag, set
+    /// before the rollback-recovery reload, forces the full sqlite_master scan
+    /// so the connection-local schema is reconstructed from committed state.
+    force_full_schema_reload_once: Cell<bool>,
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
@@ -8981,6 +8997,7 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
+            force_full_schema_reload_once: Cell::new(false),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             fk_parent_validation_cache: RefCell::new(None),
@@ -9282,6 +9299,7 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             schema_generation: Cell::new(0),
+            force_full_schema_reload_once: Cell::new(false),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             fk_parent_validation_cache: RefCell::new(None),
@@ -19424,6 +19442,7 @@ impl Connection {
             result
         };
         if matches!(result.as_ref(), Ok(Some(_))) {
+            self.discard_cached_vdbe_engine();
             self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
         }
         // #111: POST-insert FK enforcement. Only fires when a row actually
@@ -19565,6 +19584,7 @@ impl Connection {
             self.abandon_exact_memdb_row_mirror();
         }
         if affected > 0 {
+            self.discard_cached_vdbe_engine();
             self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
         }
         Ok(affected)
@@ -19974,6 +19994,7 @@ impl Connection {
             );
         }
         if affected > 0 {
+            self.discard_cached_vdbe_engine();
             if profile_direct_delete {
                 FSQLITE_PREPARED_DIRECT_DELETE_MEMORY_SYNC_CALLS
                     .fetch_add(1, AtomicOrdering::Relaxed);
@@ -23200,13 +23221,33 @@ impl Connection {
         } else {
             None
         };
-        self.resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
+        // bd-xvv8f: an autocommit DDL statement applies its connection-local
+        // schema mutation (and bumps `schema_cookie`) eagerly, before the
+        // implicit commit below. If that commit fails — e.g. a concurrent writer
+        // wins the first-committer race on the shared sqlite_master page — the
+        // statement rolls back, but the eager in-memory mutation survives and the
+        // rollback-recovery reload's schema-only fast path can skip repairing it
+        // (its `header_cookie == schema_cookie` guard intermittently matches the
+        // bumped local cookie). Arm a one-shot full-rebuild so the recovery reload
+        // reconstructs the schema from committed state. Scoped to schema-change
+        // boundaries so conflicted INSERT/UPDATE/DELETE rollbacks keep the cheap
+        // fast-path reload. Cleared on the success path (no recovery reload ran,
+        // so nothing consumed it) to avoid forcing an unrelated later reload.
+        let armed_full_schema_reload = was_auto && schema_change_boundary;
+        if armed_full_schema_reload {
+            self.force_full_schema_reload_once.set(true);
+        }
+        let resolve_result = self.resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
             was_auto,
             ok,
             dirty_table_name,
             capture_time_travel_snapshot,
             &op_cx,
-        )?;
+        );
+        if armed_full_schema_reload && resolve_result.is_ok() {
+            self.force_full_schema_reload_once.set(false);
+        }
+        resolve_result?;
         if ok && writable_schema_dml {
             let flush_retained = self.retained_autocommit_txn.borrow().is_some();
             if flush_retained {
@@ -35851,7 +35892,7 @@ impl Connection {
             return;
         };
 
-        let retain_leaf_page_data = self.in_transaction.get() || retain_for_memory_autocommit;
+        let retain_leaf_page_data = self.in_transaction.get();
         if !retain_leaf_page_data && let Some(cached_leaf) = hint.cached_leaf.as_mut() {
             // In-place page-data strip. The previous shape was
             // `take() → without_page_data(self) → Some(..)` which
@@ -35873,7 +35914,7 @@ impl Connection {
         &self,
         cached_leaf: TableAppendHint,
     ) -> TableAppendHint {
-        if self.in_transaction.get() || (self.pager.is_memory() && !self.in_transaction.get()) {
+        if self.in_transaction.get() {
             cached_leaf
         } else {
             cached_leaf.without_page_data()
@@ -57832,11 +57873,12 @@ impl Connection {
 
         // Take cached engine if available (avoids 21+ collection re-allocations).
         let cached_engine = self.cached_vdbe_engine.borrow_mut().take();
-        // Keep engine allocation reuse, but do not retain storage cursors here.
-        // This connection-level cache is not keyed by VDBE program identity; a
-        // mixed INSERT/UPDATE/DELETE workload can otherwise carry cursors from
-        // one program/table shape into the next and corrupt pager-backed data.
-        let allow_retained_cursor_reuse = false;
+        // DML callers pass `invalidate_memdb_count_shortcuts_on_success = true`.
+        // For those table programs, retaining storage cursors preserves the
+        // proven right-edge insert hint across repeated ad-hoc statements.
+        // `OP_OpenWrite` still gates reuse by cursor id, root page, and backend
+        // kind, so mixed DML shapes replace incompatible retained cursors.
+        let allow_retained_cursor_reuse = invalidate_memdb_count_shortcuts_on_success;
         let ((result, txn_back), engine_back) = execute_table_program_with_db(
             program,
             params,
@@ -58935,6 +58977,12 @@ impl Connection {
         hydrate_rows: bool,
         allow_dirty_schema_only_fast_path: bool,
     ) -> Result<()> {
+        // bd-xvv8f: one-shot request (consumed here regardless of path) to take
+        // the full sqlite_master rebuild below instead of the schema-only fast
+        // path. Set on autocommit DDL rollback recovery, where the
+        // connection-local schema Vec holds a rolled-back object whose eager
+        // `schema_cookie` bump can coincidentally match the committed header.
+        let force_full_schema_reload = self.force_full_schema_reload_once.replace(false);
         if bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
             self.discard_cached_vdbe_engine();
         }
@@ -59028,7 +59076,8 @@ impl Connection {
         // fire only on the first ever reload (after which the flag is set
         // unconditionally at the bottom of this function), which defeats
         // the purpose on long-lived connections.
-        if !hydrate_rows
+        if !force_full_schema_reload
+            && !hydrate_rows
             && schema_cookie != 0
             && schema_cookie == *self.schema_cookie.borrow()
             && (!self.memdb_requires_active_txn_reload.get() || allow_dirty_schema_only_fast_path)
@@ -78510,6 +78559,7 @@ fn execute_table_program_with_db(
     } else {
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
     };
+    engine.set_retain_storage_cursors_on_close(allow_retained_cursor_reuse);
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
             return (
@@ -139912,6 +139962,64 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_prepared_direct_simple_insert_invalidates_stale_vdbe_cursor() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE prep_direct_mixed_vdbe (
+                id INTEGER PRIMARY KEY,
+                name TEXT DEFAULT 'unnamed',
+                active INTEGER DEFAULT 1,
+                score REAL DEFAULT 0.0
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO prep_direct_mixed_vdbe(id) VALUES(1);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_direct_mixed_vdbe(id, name) VALUES(2, 'custom');")
+            .unwrap();
+        conn.execute("INSERT INTO prep_direct_mixed_vdbe VALUES(3, 'full', 0, 99.9);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_direct_mixed_vdbe DEFAULT VALUES;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, name, active, score FROM prep_direct_mixed_vdbe ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("unnamed".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Float(0.0),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("custom".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Float(0.0),
+                ],
+                vec![
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text("full".into()),
+                    SqliteValue::Integer(0),
+                    SqliteValue::Float(99.9),
+                ],
+                vec![
+                    SqliteValue::Integer(4),
+                    SqliteValue::Text("unnamed".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Float(0.0),
+                ],
+            ],
+        );
     }
 
     #[test]
