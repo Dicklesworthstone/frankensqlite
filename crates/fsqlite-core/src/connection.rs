@@ -31019,22 +31019,39 @@ impl Connection {
             )));
         }
         match &insert.source {
-            fsqlite_ast::InsertSource::Values(rows) => rows
-                .iter()
-                .enumerate()
-                .map(|(row_idx, row_exprs)| {
-                    let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
-                    let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
-                    self.map_insert_source_row_to_table_row(
-                        &default_row,
-                        &layout.targets,
-                        layout.rowid_alias_col_idx,
-                        layout.explicit_rowid_source,
-                        &source_values,
-                        &format!("INSERT VALUES row {}", row_idx + 1),
-                    )
-                })
-                .collect(),
+            fsqlite_ast::InsertSource::Values(rows) => {
+                // The FK/trigger enforcement path can reach here with a freshly
+                // re-parsed, NON-canonicalized insert: the cold FK path re-parses
+                // stmt.sql (the original text), which may carry anonymous `?` or
+                // named `:x`/`@x`/`$x` placeholders. evaluate_insert_source_row
+                // evaluates these directly and requires canonical Numbered
+                // placeholders, so a non-canonical placeholder tripped the
+                // internal invariant "expected canonicalized numbered placeholder".
+                // Canonicalize the VALUES placeholders once across all rows with a
+                // shared bind_state (statement-level positions matching the bound
+                // params); idempotent for already-Numbered placeholders.
+                let mut bind_state = BindParamState::default();
+                rows.iter()
+                    .enumerate()
+                    .map(|(row_idx, row_exprs)| {
+                        let mut canonical_exprs = row_exprs.clone();
+                        for expr in &mut canonical_exprs {
+                            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+                        }
+                        let source_values =
+                            self.evaluate_insert_source_row(&canonical_exprs, params)?;
+                        let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
+                        self.map_insert_source_row_to_table_row(
+                            &default_row,
+                            &layout.targets,
+                            layout.rowid_alias_col_idx,
+                            layout.explicit_rowid_source,
+                            &source_values,
+                            &format!("INSERT VALUES row {}", row_idx + 1),
+                        )
+                    })
+                    .collect()
+            }
             fsqlite_ast::InsertSource::Select(select) => {
                 let source_rows =
                     self.execute_statement(&Statement::Select(*select.clone()), params)?;
