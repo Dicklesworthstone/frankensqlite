@@ -716,6 +716,22 @@ impl Parser {
             vec![]
         };
         let limit = self.parse_limit()?;
+        // bd-tp6ia: SQLite's grammar attaches ORDER BY / LIMIT to the final term
+        // of a compound SELECT, but a VALUES term has no such slot — so a
+        // trailing ORDER BY / LIMIT after a compound whose last term is VALUES is
+        // a syntax error (e.g. `SELECT 1 UNION VALUES (2),(3) ORDER BY 1`). A
+        // standalone VALUES (no compound) is unaffected.
+        if !body.compounds.is_empty()
+            && matches!(
+                body.compounds.last().map(|(_, core)| core),
+                Some(SelectCore::Values(_))
+            )
+            && (!order_by.is_empty() || limit.is_some())
+        {
+            return Err(self.err_msg(
+                "ORDER BY / LIMIT clause is not allowed after a VALUES term in a compound SELECT",
+            ));
+        }
         Ok(SelectStatement {
             with,
             body,

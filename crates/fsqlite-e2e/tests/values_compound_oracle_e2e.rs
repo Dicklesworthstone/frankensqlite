@@ -146,7 +146,6 @@ fn values_compound_multicolumn_and_derived() {
 }
 
 #[test]
-#[ignore = "bd-tp6ia: frank accepts trailing ORDER BY after a VALUES-terminated compound; SQLite rejects it as a syntax error"]
 fn order_by_after_values_terminated_compound() {
     // These are SYNTAX ERRORS in SQLite (the compound's last term is VALUES).
     // frank accepts them and applies the ORDER BY, so the engines disagree.
