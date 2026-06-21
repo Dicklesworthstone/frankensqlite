@@ -88,7 +88,6 @@ fn assert_scalar(queries: &[&str], label: &str) {
 }
 
 #[test]
-#[ignore = "bd-5m3x3: like() function-call form does not parse (KwLike not accepted as a function name)"]
 fn like_function_two_arg() {
     assert_scalar(
         &[
@@ -105,7 +104,6 @@ fn like_function_two_arg() {
 }
 
 #[test]
-#[ignore = "bd-5m3x3: like() function-call form does not parse"]
 fn like_function_three_arg_escape() {
     assert_scalar(
         &[
@@ -119,7 +117,6 @@ fn like_function_three_arg_escape() {
 }
 
 #[test]
-#[ignore = "bd-5m3x3: glob() function-call form does not parse (KwGlob not accepted as a function name)"]
 fn glob_function_two_arg() {
     assert_scalar(
         &[
@@ -135,7 +132,6 @@ fn glob_function_two_arg() {
 }
 
 #[test]
-#[ignore = "bd-5m3x3: like()/glob() function-call forms do not parse"]
 fn like_glob_functions_in_where() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
