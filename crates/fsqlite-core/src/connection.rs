@@ -40390,6 +40390,25 @@ impl Connection {
                 return Ok(Vec::new());
             }
 
+            // bd-n3ukk: REINDEX <collation-name> rebuilds every index that uses
+            // that collation. We rebuild all (non-internal) indexes — a harmless
+            // superset — when the name resolves to a registered collation.
+            if lock_unpoisoned(self.collation_registry.as_ref()).contains(&target.name) {
+                let mut targets = Vec::new();
+                for table in schema.iter() {
+                    if is_internal_sqlite_table(&table.name) {
+                        continue;
+                    }
+                    for index in &table.indexes {
+                        targets.push(ReindexTarget {
+                            table: table.clone(),
+                            index: index.clone(),
+                        });
+                    }
+                }
+                return Ok(targets);
+            }
+
             return Err(FrankenError::internal(
                 "unable to identify the object to be reindexed",
             ));
@@ -47685,24 +47704,40 @@ impl Connection {
             // PRAGMA database_list — return attached databases.
             // Output: seq, name, file
             "database_list" => {
-                let mut rows = vec![
-                    Row {
-                        values: vec![
-                            SqliteValue::Integer(0),
-                            SqliteValue::Text("main".into()),
-                            SqliteValue::Text(self.path.clone().into()),
-                        ],
-                    },
-                    Row {
+                // bd-c2387: SQLite renders an in-memory / temp database's file as
+                // "" (empty), not ":memory:".
+                let render_path = |p: &str| -> SqliteValue {
+                    let s = if p.is_empty() || p.eq_ignore_ascii_case(":memory:") {
+                        String::new()
+                    } else {
+                        p.to_owned()
+                    };
+                    SqliteValue::Text(s.into())
+                };
+                let mut rows = vec![Row {
+                    values: vec![
+                        SqliteValue::Integer(0),
+                        SqliteValue::Text("main".into()),
+                        render_path(&self.path),
+                    ],
+                }];
+                // bd-c2387: SQLite lists the `temp` database only once it has
+                // objects (temp tables/triggers), not unconditionally.
+                let temp_active = !self.temp_table_names.borrow().is_empty()
+                    || self.triggers.borrow().iter().any(|t| t.temporary);
+                if temp_active {
+                    rows.push(Row {
                         values: vec![
                             SqliteValue::Integer(1),
                             SqliteValue::Text("temp".into()),
                             SqliteValue::Text(String::new().into()),
                         ],
-                    },
-                ];
+                    });
+                }
                 let registry = self.attached_schemas.borrow();
-                for (i, schema_name) in registry.all_schemas().into_iter().enumerate() {
+                // main = 0, temp reserves seq 1, attached databases start at 2.
+                let mut seq = 2_i64;
+                for schema_name in registry.all_schemas() {
                     if schema_name == "main" || schema_name == "temp" {
                         continue;
                     }
@@ -47711,11 +47746,12 @@ impl Connection {
                         .map_or_else(String::new, |db| db.path.clone());
                     rows.push(Row {
                         values: vec![
-                            SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
+                            SqliteValue::Integer(seq),
                             SqliteValue::Text(schema_name.into()),
-                            SqliteValue::Text(path.into()),
+                            render_path(&path),
                         ],
                     });
+                    seq += 1;
                 }
                 Ok(rows)
             }
@@ -153180,6 +153216,9 @@ mod pager_routing_tests {
     #[test]
     fn test_pragma_database_list_with_attach() {
         let conn = Connection::open(":memory:").unwrap();
+        // bd-c2387: the `temp` database is only listed once it has objects, so
+        // create a TEMP table to make it appear.
+        conn.execute("CREATE TEMP TABLE tmp (x INTEGER);").unwrap();
         let rows = conn.query("PRAGMA database_list;").unwrap();
         // At minimum, main and temp should be listed.
         assert!(rows.len() >= 2);

@@ -82,7 +82,6 @@ fn check(f: &Connection, r: &rusqlite::Connection, queries: &[&str], label: &str
 }
 
 #[test]
-#[ignore = "bd-c2387: database_list shows ':memory:' file (not '') and always lists a temp row SQLite omits"]
 fn database_list_main_only() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -103,7 +102,6 @@ fn database_list_main_only() {
 }
 
 #[test]
-#[ignore = "bd-c2387: database_list shows ':memory:' file (not '') and always lists a temp row SQLite omits"]
 fn database_list_after_attach() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();

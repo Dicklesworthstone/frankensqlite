@@ -191,7 +191,6 @@ fn reindex_specific_table() {
 /// bd-n3ukk: REINDEX <collation-name> (rebuild all indexes using that collation)
 /// is not supported — frank only resolves table/index targets.
 #[test]
-#[ignore = "bd-n3ukk: REINDEX <collation-name> errors 'unable to identify the object to be reindexed'"]
 fn reindex_collation_name() {
     scenario(
         &[
