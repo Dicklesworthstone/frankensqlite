@@ -3365,6 +3365,11 @@ fn rows_into_value_vectors(rows: Vec<Row>) -> Vec<Vec<SqliteValue>> {
 
 type QueryRowHandler<'a> = dyn FnMut(&Row) -> Result<()> + 'a;
 
+/// bd-wjrs0: a captured connection-local `TEMP` table — its schema plus all
+/// `(rowid, row)` pairs — used to carry `TEMP` tables (and their data) across a
+/// destructive memdb reload that rebuilds state from the main `sqlite_master`.
+type CapturedTempTable = (TableSchema, Vec<(i64, Vec<SqliteValue>)>);
+
 #[derive(Clone)]
 struct RecursiveCteDirectEvalPlan {
     col_map: Vec<(String, String, bool)>,
@@ -4744,6 +4749,23 @@ enum QueryRowCollectionOutcome {
     MultipleRows,
 }
 
+fn record_direct_result_row_metrics(row: &Row) {
+    fsqlite_vdbe::engine::record_external_result_row_metrics(row.values());
+}
+
+fn direct_query_row_result(row: Row) -> Row {
+    record_direct_result_row_metrics(&row);
+    row
+}
+
+fn direct_query_row_outcome_result(row_outcome: QueryRowCollectionOutcome) -> Result<Row> {
+    match row_outcome {
+        QueryRowCollectionOutcome::Row(row) => Ok(direct_query_row_result(row)),
+        QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
+        QueryRowCollectionOutcome::MultipleRows => Err(FrankenError::QueryReturnedMultipleRows),
+    }
+}
+
 impl std::ops::BitOr for TraceMask {
     type Output = Self;
 
@@ -6086,23 +6108,17 @@ impl PreparedStatement<'_> {
         if let Some(params) = params
             && let Some(row_outcome) = self.try_query_row_clean_memory_rowid_lookup_fast(params)?
         {
-            return match row_outcome {
-                QueryRowCollectionOutcome::Row(row) => Ok(row),
-                QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
-                QueryRowCollectionOutcome::MultipleRows => {
-                    Err(FrankenError::QueryReturnedMultipleRows)
-                }
-            };
+            return direct_query_row_outcome_result(row_outcome);
         }
         if params.is_none()
             && let Some(row) = self.try_query_row_clean_memory_count_star_fast()?
         {
-            return Ok(row);
+            return Ok(direct_query_row_result(row));
         }
         if params.is_none()
             && let Some(row) = self.try_query_row_clean_memory_count_indexed_rowid_probe_fast()?
         {
-            return Ok(row);
+            return Ok(direct_query_row_result(row));
         }
         self.conn
             .query_prepared_row_after_background_status(self, params)
@@ -8339,6 +8355,18 @@ pub struct Connection {
     /// implies `schema[i].name.eq_ignore_ascii_case(&k)`. Rebuilt atomically with `schema`
     /// on every mutation (CREATE/DROP/ALTER/reload/restore).
     schema_by_name: RefCell<HashMap<String, usize>>,
+    /// bd-wjrs0: lowercased names of connection-local `TEMP` tables currently
+    /// registered in `schema`. A `TEMP` table shadows a same-named `main` table
+    /// for unqualified references, so the entry in `schema` is the `TEMP` one;
+    /// the shadowed `main` table (if any) is parked in `shadowed_main_tables`.
+    /// `TEMP` tables are never written to the main `sqlite_master`, mirroring
+    /// the `TriggerDef::temporary` precedent.
+    temp_table_names: RefCell<HashSet<String>>,
+    /// bd-wjrs0: `main` tables currently shadowed by a same-named `TEMP` table,
+    /// keyed by lowercased name. Kept out of `schema` so unqualified references
+    /// resolve to the `TEMP` table; restored into `schema` when the `TEMP`
+    /// table is dropped, and consulted to resolve `main.<name>` references.
+    shadowed_main_tables: RefCell<HashMap<String, TableSchema>>,
     /// View definitions stored in-memory.
     views: RefCell<Vec<ViewDef>>,
     /// HashMap side-index for O(1) view name lookup. See `schema_by_name` for semantics.
@@ -8539,6 +8567,12 @@ pub struct Connection {
     next_commit_seq: Arc<AtomicU64>,
     /// Highest fully finalized commit sequence visible to new snapshots.
     stable_commit_seq: Arc<AtomicU64>,
+    /// Latest committed schema cookie observed by this per-database shared state.
+    ///
+    /// Concurrent writers capture this value in their begin snapshot. If another
+    /// connection publishes DDL before they commit, they must retry so DML is
+    /// recompiled against the new index/trigger/schema layout.
+    committed_schema_cookie: Arc<AtomicU32>,
     /// Highest commit sequence reflected in this connection's in-memory
     /// `MemDatabase` image. Used to reload from pager before BEGIN when stale.
     memdb_visible_commit_seq: RefCell<CommitSeq>,
@@ -8961,6 +8995,8 @@ impl Connection {
             prepared_direct_insert_append_hint: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
+            temp_table_names: RefCell::new(HashSet::new()),
+            shadowed_main_tables: RefCell::new(HashMap::new()),
             views: RefCell::new(Vec::new()),
             views_by_name: RefCell::new(HashMap::new()),
             triggers: RefCell::new(Vec::new()),
@@ -9015,6 +9051,7 @@ impl Connection {
             active_commit_seqs: Arc::clone(&shared_mvcc_state.active_commit_seqs),
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             stable_commit_seq: Arc::clone(&shared_mvcc_state.stable_commit_seq),
+            committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             // Never hydrate rows — this is the whole point of schema-only.
             memdb_rows_loaded: Cell::new(false),
@@ -9263,6 +9300,8 @@ impl Connection {
             prepared_direct_insert_append_hint: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
             schema_by_name: RefCell::new(HashMap::new()),
+            temp_table_names: RefCell::new(HashSet::new()),
+            shadowed_main_tables: RefCell::new(HashMap::new()),
             views: RefCell::new(Vec::new()),
             views_by_name: RefCell::new(HashMap::new()),
             triggers: RefCell::new(Vec::new()),
@@ -9320,6 +9359,7 @@ impl Connection {
             active_commit_seqs: Arc::clone(&shared_mvcc_state.active_commit_seqs),
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             stable_commit_seq: Arc::clone(&shared_mvcc_state.stable_commit_seq),
+            committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
             memdb_requires_active_txn_reload: Cell::new(false),
@@ -12722,6 +12762,17 @@ impl Connection {
         );
     }
 
+    #[inline]
+    fn committed_schema_cookie(&self) -> u32 {
+        self.committed_schema_cookie.load(AtomicOrdering::Acquire)
+    }
+
+    #[inline]
+    fn publish_committed_schema_cookie(&self, schema_cookie: u32) {
+        self.committed_schema_cookie
+            .store(schema_cookie, AtomicOrdering::Release);
+    }
+
     /// bd-#70 memdb-refresh / plan-cache epoch wedge extension.
     ///
     /// Set `memdb_visible_commit_seq` to the publication-bound commit seq AND
@@ -14924,13 +14975,7 @@ impl Connection {
                     );
                 }
                 self.note_connection_statement_execution_count(1);
-                return match row_outcome {
-                    QueryRowCollectionOutcome::Row(row) => Ok(row),
-                    QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
-                    QueryRowCollectionOutcome::MultipleRows => {
-                        Err(FrankenError::QueryReturnedMultipleRows)
-                    }
-                };
+                return direct_query_row_outcome_result(row_outcome);
             }
         }
         if self.prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)?
@@ -14952,13 +14997,7 @@ impl Connection {
                 );
             }
             self.note_connection_statement_execution_count(1);
-            return match row_outcome {
-                QueryRowCollectionOutcome::Row(row) => Ok(row),
-                QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
-                QueryRowCollectionOutcome::MultipleRows => {
-                    Err(FrankenError::QueryReturnedMultipleRows)
-                }
-            };
+            return direct_query_row_outcome_result(row_outcome);
         }
         if self.prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)?
             && let Some(row_outcome) =
@@ -14979,13 +15018,7 @@ impl Connection {
                 );
             }
             self.note_connection_statement_execution_count(1);
-            return match row_outcome {
-                QueryRowCollectionOutcome::Row(row) => Ok(row),
-                QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
-                QueryRowCollectionOutcome::MultipleRows => {
-                    Err(FrankenError::QueryReturnedMultipleRows)
-                }
-            };
+            return direct_query_row_outcome_result(row_outcome);
         }
         let prepared_auto_read = self.prepare_connection_for_prepared_read(stmt, &op_cx)?;
         let entry_proof = stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx)?;
@@ -15011,13 +15044,7 @@ impl Connection {
                 );
             }
             self.note_connection_statement_execution_count(1);
-            let row_result = match row_outcome {
-                QueryRowCollectionOutcome::Row(row) => Ok(row),
-                QueryRowCollectionOutcome::NoRows => Err(FrankenError::QueryReturnedNoRows),
-                QueryRowCollectionOutcome::MultipleRows => {
-                    Err(FrankenError::QueryReturnedMultipleRows)
-                }
-            };
+            let row_result = direct_query_row_outcome_result(row_outcome);
             self.finish_prepared_read_autocommit(
                 prepared_auto_read,
                 query_row_completed_without_engine_failure(&row_result),
@@ -18051,6 +18078,7 @@ impl Connection {
             execution_ok,
             dirty_table_name,
             capture_time_travel_snapshot,
+            false,
             execution_cx,
         );
         if direct_insert_autocommit_candidate && was_auto {
@@ -18368,6 +18396,7 @@ impl Connection {
             ok,
             Some(table_name),
             capture_time_travel_snapshot,
+            false,
             execution_cx,
         );
         record_hot_path_duration(
@@ -18798,6 +18827,7 @@ impl Connection {
             }
             self.flush_taken_pending_direct_insert_page_run_with_cursor(execution_cx, cursor, run)?;
         }
+        fsqlite_vdbe::engine::record_external_insert_path_metric(append_fast_path_candidate);
         let buffered_page_run = can_buffer_current_page_run
             && self.try_buffer_prepared_direct_insert_page_run_with_cursor(
                 execution_cx,
@@ -18883,11 +18913,15 @@ impl Connection {
                 }
                 Err(FrankenError::PrimaryKeyViolation) => match conflict_action {
                     fsqlite_ast::ConflictAction::Ignore => {
-                        self.clear_prepared_direct_insert_append_hint();
+                        self.clear_prepared_direct_insert_append_hint_after_path_miss(
+                            prepared_append_hint.as_ref(),
+                        );
                         return Ok(None);
                     }
                     fsqlite_ast::ConflictAction::Replace => {
-                        self.clear_prepared_direct_insert_append_hint();
+                        self.clear_prepared_direct_insert_append_hint_after_path_miss(
+                            prepared_append_hint.as_ref(),
+                        );
                         if !cursor.table_move_to(execution_cx, rowid)?.is_found() {
                             return Err(FrankenError::PrimaryKeyViolation);
                         }
@@ -18897,12 +18931,16 @@ impl Connection {
                     fsqlite_ast::ConflictAction::Rollback
                     | fsqlite_ast::ConflictAction::Abort
                     | fsqlite_ast::ConflictAction::Fail => {
-                        self.clear_prepared_direct_insert_append_hint();
+                        self.clear_prepared_direct_insert_append_hint_after_path_miss(
+                            prepared_append_hint.as_ref(),
+                        );
                         return Err(FrankenError::PrimaryKeyViolation);
                     }
                 },
                 Err(error) => {
-                    self.clear_prepared_direct_insert_append_hint();
+                    self.clear_prepared_direct_insert_append_hint_after_path_miss(
+                        prepared_append_hint.as_ref(),
+                    );
                     return Err(error);
                 }
             }
@@ -18931,7 +18969,9 @@ impl Connection {
                     ));
                 }
             } else {
-                self.clear_prepared_direct_insert_append_hint();
+                self.clear_prepared_direct_insert_append_hint_after_path_miss(
+                    prepared_append_hint.as_ref(),
+                );
             }
         }
         record_hot_path_duration(
@@ -21113,6 +21153,7 @@ impl Connection {
             ok,
             Some(table_name),
             false,
+            false,
             execution_cx,
         );
         Some(match resolve_result {
@@ -23242,6 +23283,7 @@ impl Connection {
             ok,
             dirty_table_name,
             capture_time_travel_snapshot,
+            schema_change_boundary,
             &op_cx,
         );
         if armed_full_schema_reload && resolve_result.is_ok() {
@@ -35857,6 +35899,16 @@ impl Connection {
         self.prepared_direct_insert_append_hint.borrow_mut().take();
     }
 
+    fn clear_prepared_direct_insert_append_hint_after_path_miss(
+        &self,
+        prepared_append_hint: Option<&PreparedDirectInsertAppendHint>,
+    ) {
+        if prepared_append_hint.is_some() {
+            fsqlite_vdbe::engine::record_external_insert_append_hint_clear_metric();
+        }
+        self.clear_prepared_direct_insert_append_hint();
+    }
+
     fn take_prepared_direct_insert_append_hint_for_root(
         &self,
         root_page: i32,
@@ -35959,16 +36011,21 @@ impl Connection {
             ok,
             None,
             capture_time_travel_snapshot,
+            false,
             cx,
         )
     }
 
+    // Distinct lifecycle flags; refactoring into an enum would obscure the
+    // independent autocommit/ok/capture/schema-boundary axes.
+    #[allow(clippy::fn_params_excessive_bools)]
     fn resolve_autocommit_txn_with_dirty_table_and_capture_and_cx(
         &self,
         was_auto: bool,
         ok: bool,
         dirty_table_name: Option<&str>,
         capture_time_travel_snapshot: bool,
+        schema_change_boundary: bool,
         cx: &Cx,
     ) -> Result<()> {
         if !was_auto {
@@ -36111,7 +36168,11 @@ impl Connection {
         };
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
             let concurrent_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                match self.plan_concurrent_commit_with_registry(registry, &pending_conflict_pages) {
+                match self.plan_concurrent_commit_with_registry(
+                    registry,
+                    &pending_conflict_pages,
+                    schema_change_boundary,
+                ) {
                     Ok(plan) => plan,
                     Err(e) => {
                         drop(commit_registry_guard.take());
@@ -36386,6 +36447,9 @@ impl Connection {
                                 plan,
                                 committed_seq,
                             );
+                            if schema_change_boundary {
+                                self.publish_committed_schema_cookie(self.schema_cookie());
+                            }
                             drop(commit_registry_guard.take());
                             if let Some(card) = commit_card {
                                 self.ssi_evidence_ledger.record_async(card);
@@ -36489,6 +36553,9 @@ impl Connection {
         }
 
         txn_result?;
+        if committed_write && schema_change_boundary {
+            self.publish_committed_schema_cookie(self.schema_cookie());
+        }
         let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         let commit_handle_finalize_start = hot_path_profile_enabled().then(Instant::now);
         self.live_vtab_commit_all_best_effort(cx);
@@ -38181,37 +38248,66 @@ impl Connection {
     fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
         let table_name = create.name.name.clone();
 
-        // Check for duplicate table names.
-        let schema = self.schema.borrow();
-        if schema
-            .iter()
-            .any(|t| t.name.eq_ignore_ascii_case(&table_name))
+        // bd-wjrs0: a `TEMP`/`TEMPORARY` table (or a `temp.<name>` qualifier)
+        // lives in the connection-local temp namespace and may shadow a
+        // same-named `main` table; it is never persisted to the main
+        // `sqlite_master`. An unqualified non-TEMP create, or a `main.<name>`
+        // qualifier, targets the main namespace.
+        let target_is_temp = create.temporary
+            || create
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"));
+        let name_lc = table_name.to_ascii_lowercase();
+
+        // Check for duplicate table names within the *target* namespace only.
+        // A TEMP table may coexist with a same-named main table (and vice
+        // versa); the "already exists" clash only fires inside one namespace.
         {
-            if create.if_not_exists {
-                return Ok(());
+            let schema = self.schema.borrow();
+            let temp_names = self.temp_table_names.borrow();
+            let visible_same_name = schema
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(&table_name));
+            let temp_exists = temp_names.contains(&name_lc);
+            // A main table named X exists when a visible non-temp entry holds
+            // the name, or when a temp table currently shadows it.
+            let main_exists = (visible_same_name && !temp_exists)
+                || self.shadowed_main_tables.borrow().contains_key(&name_lc);
+            let conflict = if target_is_temp {
+                temp_exists
+            } else {
+                main_exists
+            };
+            if conflict {
+                if create.if_not_exists {
+                    return Ok(());
+                }
+                return Err(FrankenError::Internal(format!(
+                    "table {table_name} already exists",
+                )));
             }
-            return Err(FrankenError::Internal(format!(
-                "table {table_name} already exists",
-            )));
         }
-        drop(schema);
 
         // Tables and views share one schema namespace: a new table may not take
         // an existing view's name (bd-8yhe3). IF NOT EXISTS silences the clash
-        // regardless of the existing object's kind, matching SQLite.
-        let views = self.views.borrow();
-        if views
-            .iter()
-            .any(|v| v.name.eq_ignore_ascii_case(&table_name))
-        {
-            if create.if_not_exists {
-                return Ok(());
+        // regardless of the existing object's kind, matching SQLite. A TEMP
+        // table lives in a separate namespace and may shadow a main view.
+        if !target_is_temp {
+            let views = self.views.borrow();
+            if views
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(&table_name))
+            {
+                if create.if_not_exists {
+                    return Ok(());
+                }
+                return Err(FrankenError::Internal(format!(
+                    "view {table_name} already exists",
+                )));
             }
-            return Err(FrankenError::Internal(format!(
-                "view {table_name} already exists",
-            )));
         }
-        drop(views);
 
         match &create.body {
             CreateTableBody::Columns {
@@ -38696,20 +38792,54 @@ impl Connection {
                 let create_sql = create.to_string();
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
-                self.schema.borrow_mut().push(table_schema);
-                self.rebuild_schema_indices();
-                self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
-                // Persist implicit autoindex entries (sqlite_autoindex_*) to
-                // sqlite_master with NULL sql, matching real SQLite behavior.
-                // Without these rows SQLite reports the database as malformed.
-                for index in &implicit_indexes_for_master {
-                    self.insert_sqlite_master_row_with_sql(
-                        "index",
-                        &index.name,
-                        &tbl_name,
-                        index.root_page,
-                        None,
-                    )?;
+                if target_is_temp {
+                    // bd-wjrs0: park a same-named main table so `main.<name>`
+                    // can still reach it, then register the TEMP table as the
+                    // visible entry so unqualified references resolve to it.
+                    {
+                        let mut schema = self.schema.borrow_mut();
+                        if let Some(pos) = schema
+                            .iter()
+                            .position(|t| t.name.eq_ignore_ascii_case(&tbl_name))
+                        {
+                            let shadowed = schema.remove(pos);
+                            self.shadowed_main_tables
+                                .borrow_mut()
+                                .insert(name_lc.clone(), shadowed);
+                        }
+                        schema.push(table_schema);
+                    }
+                    self.temp_table_names.borrow_mut().insert(name_lc.clone());
+                    self.rebuild_schema_indices();
+                    // TEMP tables are connection-local: never written to the
+                    // main sqlite_master (mirrors the TEMP trigger precedent).
+                } else {
+                    // bd-wjrs0: if a TEMP table currently shadows this name, the
+                    // new main table is parked out of `self.schema` so the TEMP
+                    // shadow stays visible to unqualified references; it is still
+                    // persisted to the main sqlite_master and reachable via
+                    // `main.<name>`. Otherwise it becomes the visible entry.
+                    if self.temp_table_names.borrow().contains(&name_lc) {
+                        self.shadowed_main_tables
+                            .borrow_mut()
+                            .insert(name_lc.clone(), table_schema);
+                    } else {
+                        self.schema.borrow_mut().push(table_schema);
+                    }
+                    self.rebuild_schema_indices();
+                    self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
+                    // Persist implicit autoindex entries (sqlite_autoindex_*) to
+                    // sqlite_master with NULL sql, matching real SQLite behavior.
+                    // Without these rows SQLite reports the database as malformed.
+                    for index in &implicit_indexes_for_master {
+                        self.insert_sqlite_master_row_with_sql(
+                            "index",
+                            &index.name,
+                            &tbl_name,
+                            index.root_page,
+                            None,
+                        )?;
+                    }
                 }
                 if is_autoincrement {
                     self.ensure_sqlite_sequence_table_exists()?;
@@ -38958,6 +39088,45 @@ impl Connection {
             } else {
                 Vec::new()
             };
+        // bd-wjrs0: a `DROP TABLE` that targets a connection-local TEMP table
+        // (unqualified when a TEMP shadow exists, or `temp.<name>`) is handled
+        // here: the TEMP table is never in the main sqlite_master, so the
+        // normal path's master-row delete would spuriously fail. Restore any
+        // main table the TEMP one shadowed so unqualified references resolve to
+        // it again.
+        if matches!(drop_stmt.object_type, DropObjectType::Table) {
+            let drop_name_lc = obj_name.to_ascii_lowercase();
+            let qual = drop_stmt.name.schema.as_deref();
+            let targets_main_explicit = qual.is_some_and(|s| s.eq_ignore_ascii_case("main"));
+            let targets_temp_explicit = qual.is_some_and(|s| s.eq_ignore_ascii_case("temp"));
+            let is_temp = self.temp_table_names.borrow().contains(&drop_name_lc);
+            if is_temp && (targets_temp_explicit || !targets_main_explicit) {
+                let removed = {
+                    let mut schema = self.schema.borrow_mut();
+                    schema
+                        .iter()
+                        .position(|t| t.name.eq_ignore_ascii_case(obj_name) && t.root_page > 0)
+                        .map(|idx| schema.remove(idx))
+                };
+                if let Some(table) = removed {
+                    // TEMP table pages live in the same MemDatabase; release the
+                    // backing memtable. (Indexes on TEMP tables are not yet
+                    // separately tracked here.)
+                    self.db.borrow_mut().destroy_table(table.root_page);
+                }
+                self.temp_table_names.borrow_mut().remove(&drop_name_lc);
+                self.rowid_alias_columns.borrow_mut().remove(&drop_name_lc);
+                // Restore the shadowed main table (if any) as the visible entry.
+                if let Some(main_table) =
+                    self.shadowed_main_tables.borrow_mut().remove(&drop_name_lc)
+                {
+                    self.schema.borrow_mut().push(main_table);
+                }
+                self.rebuild_schema_indices();
+                self.increment_schema_cookie()?;
+                return Ok(());
+            }
+        }
         let dropped = match drop_stmt.object_type {
             DropObjectType::Table => {
                 let mut schema = self.schema.borrow_mut();
@@ -42623,6 +42792,43 @@ impl Connection {
         }
     }
 
+    fn concurrent_commit_schema_snapshot_is_stale(
+        &self,
+        registry: &ConcurrentRegistry,
+        session_id: u64,
+    ) -> Result<bool> {
+        let committed_schema_cookie = self.committed_schema_cookie();
+        let handle = registry.get(session_id).ok_or_else(|| {
+            FrankenError::Internal(
+                "concurrent transaction missing session during schema snapshot validation"
+                    .to_owned(),
+            )
+        })?;
+        let begin_schema_epoch = handle.snapshot().schema_epoch.get();
+        drop(handle);
+        let Ok(begin_schema_cookie) = u32::try_from(begin_schema_epoch) else {
+            return Ok(true);
+        };
+
+        Ok(committed_schema_cookie != begin_schema_cookie)
+    }
+
+    fn concurrent_schema_change_snapshot_is_stale(
+        &self,
+        registry: &ConcurrentRegistry,
+        session_id: u64,
+    ) -> Result<bool> {
+        let handle = registry.get(session_id).ok_or_else(|| {
+            FrankenError::Internal(
+                "concurrent transaction missing session during schema-change snapshot validation"
+                    .to_owned(),
+            )
+        })?;
+        let begin_seq = handle.snapshot().high;
+        drop(handle);
+        Ok(self.current_global_commit_seq() > begin_seq)
+    }
+
     fn capture_ssi_snapshot(handle: &ConcurrentHandle) -> SsiTxnEvidenceSnapshot {
         let mut read_pages = handle.read_set().iter().copied().collect::<Vec<_>>();
         read_pages.sort_by_key(|page| page.get());
@@ -42840,6 +43046,7 @@ impl Connection {
         &self,
         registry: &mut ConcurrentRegistry,
         pending_conflict_pages: &[PageNumber],
+        schema_change_boundary: bool,
     ) -> Result<Option<PreparedConcurrentCommit>> {
         // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
         // Validate FCW/SSI preconditions first, but delay commit-side
@@ -42865,6 +43072,57 @@ impl Connection {
         ) {
             record_concurrent_commit_plan_error(&error);
             return Err(error);
+        }
+
+        match self.concurrent_commit_schema_snapshot_is_stale(registry, session_id) {
+            Ok(false) => {}
+            Ok(true) => {
+                let committed_schema_cookie = self.committed_schema_cookie();
+                let begin_schema_cookie = registry
+                    .get(session_id)
+                    .and_then(|handle| u32::try_from(handle.snapshot().schema_epoch.get()).ok())
+                    .unwrap_or(0);
+                tracing::debug!(
+                    begin_schema_cookie,
+                    committed_schema_cookie,
+                    "aborting concurrent commit with stale schema snapshot"
+                );
+                let error = FrankenError::BusySnapshot {
+                    conflicting_pages: String::new(),
+                };
+                record_concurrent_commit_plan_error(&error);
+                return Err(error);
+            }
+            Err(error) => {
+                record_concurrent_commit_plan_error(&error);
+                return Err(error);
+            }
+        }
+        if schema_change_boundary {
+            match self.concurrent_schema_change_snapshot_is_stale(registry, session_id) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let begin_seq = registry
+                        .get(session_id)
+                        .map(|handle| handle.snapshot().high.get())
+                        .unwrap_or(0);
+                    let current_seq = self.current_global_commit_seq().get();
+                    tracing::debug!(
+                        begin_seq,
+                        current_seq,
+                        "aborting concurrent schema change with stale data snapshot"
+                    );
+                    let error = FrankenError::BusySnapshot {
+                        conflicting_pages: String::new(),
+                    };
+                    record_concurrent_commit_plan_error(&error);
+                    return Err(error);
+                }
+                Err(error) => {
+                    record_concurrent_commit_plan_error(&error);
+                    return Err(error);
+                }
+            }
         }
 
         // Consult the anytime-valid e-process gate (LAB_UNSAFE mode only).
@@ -43144,6 +43402,11 @@ impl Connection {
             registry.recycle_handle(shared_handle);
             *self.concurrent_session_id.borrow_mut() = None;
             self.clear_memory_concurrent_synced_write_roots();
+            let committed_seq = self.current_global_commit_seq();
+            {
+                let mut last = self.last_local_commit_seq.borrow_mut();
+                *last = Some(last.map_or(committed_seq, |existing| existing.max(committed_seq)));
+            }
             Some(
                 Self::build_ssi_decision_draft(
                     &snapshot,
@@ -43155,7 +43418,7 @@ impl Connection {
                         snapshot.snapshot_seq.get()
                     ),
                 )
-                .with_commit_seq(self.current_global_commit_seq()),
+                .with_commit_seq(committed_seq),
             )
         };
         if let Some(card) = commit_card {
@@ -43243,6 +43506,14 @@ impl Connection {
         }
 
         let is_concurrent_txn = self.concurrent_txn.get();
+        let schema_cookie_to_publish = {
+            let current_schema_cookie = self.schema_cookie();
+            self.txn_snapshot
+                .borrow()
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.schema_cookie != current_schema_cookie)
+                .then_some(current_schema_cookie)
+        };
         let (txn_has_pending_writes, pending_conflict_pages) = {
             let txn_guard = self.active_txn.borrow();
             let txn_has_pending_writes = txn_guard
@@ -43306,7 +43577,11 @@ impl Connection {
                 None
             };
             let concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                self.plan_concurrent_commit_with_registry(registry, &pending_conflict_pages)?
+                self.plan_concurrent_commit_with_registry(
+                    registry,
+                    &pending_conflict_pages,
+                    schema_cookie_to_publish.is_some(),
+                )?
             } else {
                 None
             };
@@ -43431,6 +43706,9 @@ impl Connection {
                         plan,
                         committed_seq,
                     );
+                    if let Some(schema_cookie) = schema_cookie_to_publish {
+                        self.publish_committed_schema_cookie(schema_cookie);
+                    }
                     drop(commit_registry_guard.take());
                     if let Some(card) = commit_card {
                         self.ssi_evidence_ledger.record_async(card);
@@ -43467,6 +43745,9 @@ impl Connection {
         }
         if committed_write && !self.pager.is_memory() {
             self.sync_filebacked_post_commit_visibility_floor();
+        }
+        if committed_write && let Some(schema_cookie) = schema_cookie_to_publish {
+            self.publish_committed_schema_cookie(schema_cookie);
         }
 
         // Discard rollback snapshot and savepoints — changes are committed.
@@ -48184,6 +48465,101 @@ impl Connection {
         directive
     }
 
+    /// bd-wjrs0: snapshot connection-local `TEMP` tables (schema + rows) before
+    /// a destructive memdb reload. `TEMP` tables never appear in the main
+    /// `sqlite_master`, so a reload that rebuilds `self.schema`/`self.db` from
+    /// page 1 would silently drop them; this captures them for re-insertion via
+    /// `restore_temp_tables_into`. Returns an empty Vec (taking no further
+    /// borrows) when no `TEMP` tables exist, so non-temp connections pay nothing.
+    fn snapshot_temp_tables(&self) -> Vec<CapturedTempTable> {
+        if self.temp_table_names.borrow().is_empty() {
+            return Vec::new();
+        }
+        let temp_names = self.temp_table_names.borrow();
+        let schema = self.schema.borrow();
+        let db = self.db.borrow();
+        temp_names
+            .iter()
+            .filter_map(|name_lc| {
+                let table = schema
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(name_lc))?;
+                let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
+                    mt.iter_rows()
+                        .map(|(rowid, vals)| (rowid, vals.to_vec()))
+                        .collect()
+                });
+                Some((table.clone(), rows))
+            })
+            .collect()
+    }
+
+    /// bd-wjrs0: re-insert `TEMP` tables captured by `snapshot_temp_tables` into
+    /// a freshly rebuilt schema/memdb, re-parking any same-named `main` table the
+    /// reload re-materialized from `sqlite_master` so the `TEMP` table shadows it
+    /// again. Mirrors the TEMP-trigger preservation done in the same reload.
+    fn restore_temp_tables_into(
+        &self,
+        new_schema: &mut Vec<TableSchema>,
+        new_db: &mut MemDatabase,
+        captured: Vec<CapturedTempTable>,
+    ) {
+        for (temp_schema, rows) in captured {
+            let name_lc = temp_schema.name.to_ascii_lowercase();
+            // If the rebuild re-materialized a same-named main table, park it so
+            // the TEMP table remains the visible (unqualified) entry.
+            if let Some(pos) = new_schema
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(&name_lc))
+            {
+                let main_table = new_schema.remove(pos);
+                self.shadowed_main_tables
+                    .borrow_mut()
+                    .insert(name_lc.clone(), main_table);
+            }
+            // Recreate the TEMP table and its rows in the rebuilt memdb.
+            new_db.create_table_at(temp_schema.root_page, temp_schema.columns.len());
+            for (rowid, vals) in rows {
+                new_db.upsert_row(temp_schema.root_page, rowid, vals);
+            }
+            new_schema.push(temp_schema);
+            self.temp_table_names.borrow_mut().insert(name_lc);
+        }
+    }
+
+    /// bd-wjrs0: substitute shadowed `main` tables into a per-statement schema
+    /// snapshot. When a `TEMP` table shadows a same-named `main` table, the
+    /// entry in `self.schema` is the `TEMP` one (so unqualified references
+    /// resolve to it). A `main.<name>` reference must still reach the parked
+    /// main table, so this replaces the snapshot's entry for any `main.`
+    /// qualified table that is currently shadowed. No-op (and effectively free)
+    /// when nothing is shadowed.
+    fn apply_shadowed_main_substitution(
+        &self,
+        schema: &mut [TableSchema],
+        select: &SelectStatement,
+    ) {
+        if self.shadowed_main_tables.borrow().is_empty() {
+            return;
+        }
+        let mut main_refs = HashSet::new();
+        collect_main_qualified_table_names(select, &mut main_refs);
+        if main_refs.is_empty() {
+            return;
+        }
+        let shadowed = self.shadowed_main_tables.borrow();
+        for name_lc in &main_refs {
+            if let Some(main_table) = shadowed.get(name_lc) {
+                if let Some(slot) = schema
+                    .iter_mut()
+                    .find(|t| t.name.eq_ignore_ascii_case(name_lc))
+                {
+                    *slot = main_table.clone();
+                }
+            }
+        }
+    }
+
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
         let canonical_select = canonicalize_select_placeholders(select)?;
@@ -48192,7 +48568,12 @@ impl Connection {
         // The planner may consult sqlite_stat1 through `self.query()`, which can
         // refresh the active transaction image and mutate `self.schema`. Do not
         // hold a RefCell borrow across that reentrant path.
-        let schema = self.schema.borrow().clone();
+        let mut schema = self.schema.borrow().clone();
+        // bd-wjrs0: when a TEMP table shadows a same-named main table, the
+        // visible `schema` entry is the TEMP one. An explicit `main.<name>`
+        // reference must still reach the shadowed main table, so swap it back
+        // into this per-statement snapshot.
+        self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
         let planner_select_directive = self.planner_select_directive_with_cache(
             &canonical_select,
             &canonical_sql,
@@ -58282,7 +58663,9 @@ impl Connection {
             bound_visible_commit_seq,
             hydrate_rows,
             true,
-        )
+        )?;
+        self.publish_committed_schema_cookie(self.schema_cookie());
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -58299,7 +58682,9 @@ impl Connection {
             bound_visible_commit_seq,
             hydrate_rows,
             true,
-        )
+        )?;
+        self.publish_committed_schema_cookie(self.schema_cookie());
+        Ok(())
     }
 
     fn reload_memdb_rows_from_txn_preserving_schema(
@@ -58993,12 +59378,22 @@ impl Connection {
         // If page 1 is all zeros or doesn't have a valid B-tree header, the
         // database is empty. Reset to a fresh state.
         if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < 100 {
+            // bd-wjrs0: capture connection-local TEMP tables before the reset so
+            // they (and their rows) survive — they are never in sqlite_master.
+            let captured_temp_tables = self.snapshot_temp_tables();
             *self.db.borrow_mut() = MemDatabase::new();
             self.schema.borrow_mut().clear();
             self.views.borrow_mut().clear();
             // Preserve TEMP triggers even when the database is empty — they are
             // connection-local and must survive memdb reloads.
             self.triggers.borrow_mut().retain(|t| t.temporary);
+            // bd-wjrs0: re-insert TEMP tables (the empty main DB has no main
+            // tables to shadow, so this only restores the TEMP entries + rows).
+            {
+                let mut new_schema = self.schema.borrow_mut();
+                let mut new_db = self.db.borrow_mut();
+                self.restore_temp_tables_into(&mut new_schema, &mut new_db, captured_temp_tables);
+            }
             self.rebuild_schema_indices();
             self.rowid_alias_columns.borrow_mut().clear();
             self.autoincrement_tables.borrow_mut().clear();
@@ -59744,6 +60139,15 @@ impl Connection {
         // has proven insufficient here: reentrant drops of the old MemDatabase during
         // `*self.db.borrow_mut() = new_db` on a blocking worker can observe the still-
         // live borrow and panic "RefCell already borrowed" at the subsequent borrow_mut.
+        // bd-wjrs0: TEMP tables are connection-local and never persisted to the
+        // main sqlite_master, so the rebuilt new_schema/new_db (derived from
+        // page 1) would drop them and their rows. Re-insert them and re-park any
+        // same-named main table the reload re-materialized, before the schema
+        // fingerprint + atomic publish below. Mirrors the TEMP-trigger
+        // preservation a few lines down.
+        let captured_temp_tables = self.snapshot_temp_tables();
+        self.restore_temp_tables_into(&mut new_schema, &mut new_db, captured_temp_tables);
+
         let old_schema_fingerprint = {
             let schema = self.schema.borrow();
             schema_fingerprint(&schema)
@@ -65773,6 +66177,7 @@ struct SharedMvccState {
     active_commit_seqs: Arc<Mutex<smallvec::SmallVec<[u64; 16]>>>,
     next_commit_seq: Arc<AtomicU64>,
     stable_commit_seq: Arc<AtomicU64>,
+    committed_schema_cookie: Arc<AtomicU32>,
     open_connection_count: Arc<AtomicUsize>,
     _runtime: Arc<RuntimeContext>,
     runtime_state: Mutex<SharedRuntimeState>,
@@ -65830,6 +66235,7 @@ impl SharedMvccState {
             active_commit_seqs: Arc::new(Mutex::new(smallvec::SmallVec::new())),
             next_commit_seq: Arc::new(AtomicU64::new(1)),
             stable_commit_seq: Arc::new(AtomicU64::new(0)),
+            committed_schema_cookie: Arc::new(AtomicU32::new(0)),
             open_connection_count: Arc::new(AtomicUsize::new(0)),
             _runtime: runtime,
             runtime_state: Mutex::new(SharedRuntimeState {
@@ -66507,6 +66913,225 @@ fn collect_table_or_subquery_inner_alias(source: &TableOrSubquery, out: &mut Vec
                 collect_table_or_subquery_inner_alias(&join.table, out);
             }
         }
+    }
+}
+
+fn collect_main_qualified_table_names(select: &SelectStatement, out: &mut HashSet<String>) {
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            collect_main_qualified_table_names(&cte.query, out);
+        }
+    }
+    collect_main_qualified_select_core(&select.body.select, out);
+    for (_, core) in &select.body.compounds {
+        collect_main_qualified_select_core(core, out);
+    }
+    for term in &select.order_by {
+        collect_main_qualified_expr(&term.expr, out);
+    }
+    if let Some(limit) = &select.limit {
+        collect_main_qualified_expr(&limit.limit, out);
+        if let Some(offset) = &limit.offset {
+            collect_main_qualified_expr(offset, out);
+        }
+    }
+}
+
+fn collect_main_qualified_select_core(core: &SelectCore, out: &mut HashSet<String>) {
+    match core {
+        SelectCore::Values(rows) => {
+            for expr in rows.iter().flatten() {
+                collect_main_qualified_expr(expr, out);
+            }
+        }
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                match column {
+                    ResultColumn::Expr { expr, .. } => collect_main_qualified_expr(expr, out),
+                    ResultColumn::TableStar(name) => collect_main_qualified_name(name, out),
+                    ResultColumn::Star => {}
+                }
+            }
+            if let Some(from) = from {
+                collect_main_qualified_from_clause(from, out);
+            }
+            if let Some(expr) = where_clause {
+                collect_main_qualified_expr(expr, out);
+            }
+            for expr in group_by {
+                collect_main_qualified_expr(expr, out);
+            }
+            if let Some(expr) = having {
+                collect_main_qualified_expr(expr, out);
+            }
+            for window in windows {
+                collect_main_qualified_window_spec(&window.spec, out);
+            }
+        }
+    }
+}
+
+fn collect_main_qualified_from_clause(from: &FromClause, out: &mut HashSet<String>) {
+    collect_main_qualified_table_or_subquery(&from.source, out);
+    for join in &from.joins {
+        collect_main_qualified_table_or_subquery(&join.table, out);
+        if let Some(JoinConstraint::On(expr)) = &join.constraint {
+            collect_main_qualified_expr(expr, out);
+        }
+    }
+}
+
+fn collect_main_qualified_table_or_subquery(source: &TableOrSubquery, out: &mut HashSet<String>) {
+    match source {
+        TableOrSubquery::Table { name, .. } => collect_main_qualified_name(name, out),
+        TableOrSubquery::Subquery { query, .. } => collect_main_qualified_table_names(query, out),
+        TableOrSubquery::TableFunction { args, .. } => {
+            for expr in args {
+                collect_main_qualified_expr(expr, out);
+            }
+        }
+        TableOrSubquery::ParenJoin(from) => collect_main_qualified_from_clause(from, out),
+    }
+}
+
+fn collect_main_qualified_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_main_qualified_expr(left, out);
+            collect_main_qualified_expr(right, out);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => collect_main_qualified_expr(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_main_qualified_expr(expr, out);
+            collect_main_qualified_expr(low, out);
+            collect_main_qualified_expr(high, out);
+        }
+        Expr::In { expr, set, .. } => {
+            collect_main_qualified_expr(expr, out);
+            match set {
+                InSet::List(items) => {
+                    for item in items {
+                        collect_main_qualified_expr(item, out);
+                    }
+                }
+                InSet::Subquery(query) => collect_main_qualified_table_names(query, out),
+                InSet::Table(name) => collect_main_qualified_name(name, out),
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_main_qualified_expr(expr, out);
+            collect_main_qualified_expr(pattern, out);
+            if let Some(escape) = escape {
+                collect_main_qualified_expr(escape, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_main_qualified_expr(operand, out);
+            }
+            for (when, then) in whens {
+                collect_main_qualified_expr(when, out);
+                collect_main_qualified_expr(then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_main_qualified_expr(else_expr, out);
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            collect_main_qualified_table_names(subquery, out);
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    collect_main_qualified_expr(item, out);
+                }
+            }
+            for term in order_by {
+                collect_main_qualified_expr(&term.expr, out);
+            }
+            if let Some(filter) = filter {
+                collect_main_qualified_expr(filter, out);
+            }
+            if let Some(over) = over {
+                collect_main_qualified_window_spec(over, out);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            collect_main_qualified_expr(expr, out);
+            collect_main_qualified_expr(path, out);
+        }
+        Expr::RowValue(items, _) => {
+            for item in items {
+                collect_main_qualified_expr(item, out);
+            }
+        }
+    }
+}
+
+fn collect_main_qualified_window_spec(window: &WindowSpec, out: &mut HashSet<String>) {
+    for expr in &window.partition_by {
+        collect_main_qualified_expr(expr, out);
+    }
+    for term in &window.order_by {
+        collect_main_qualified_expr(&term.expr, out);
+    }
+    if let Some(frame) = &window.frame {
+        collect_main_qualified_frame_bound(&frame.start, out);
+        if let Some(end) = &frame.end {
+            collect_main_qualified_frame_bound(end, out);
+        }
+    }
+}
+
+fn collect_main_qualified_frame_bound(bound: &FrameBound, out: &mut HashSet<String>) {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            collect_main_qualified_expr(expr, out);
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => {}
+    }
+}
+
+fn collect_main_qualified_name(name: &QualifiedName, out: &mut HashSet<String>) {
+    if name
+        .schema
+        .as_deref()
+        .is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+    {
+        out.insert(name.name.to_ascii_lowercase());
     }
 }
 
@@ -113794,6 +114419,11 @@ mod tests {
 
         conn.execute("COMMIT;").unwrap();
 
+        assert_eq!(
+            conn.last_local_commit_seq(),
+            Some(0),
+            "read-only concurrent COMMIT should publish its serialization point without advancing the writer clock"
+        );
         assert!(
             conn.concurrent_session_id.borrow().is_none(),
             "successful COMMIT without pending writes must clear the connection session id"

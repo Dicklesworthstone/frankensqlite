@@ -111,7 +111,6 @@ fn temp_table_basic() {
 }
 
 #[test]
-#[ignore = "bd-wjrs0: CREATE TEMP TABLE cannot shadow a same-named main table"]
 fn temp_table_shadows_main() {
     // A TEMP table shadows a same-named table in main within the connection.
     scenario(
