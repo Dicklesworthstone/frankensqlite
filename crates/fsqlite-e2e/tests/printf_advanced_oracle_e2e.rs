@@ -127,7 +127,6 @@ fn printf_numeric_specifiers() {
 /// bd-jvnwt: %u is unimplemented (emitted literally) and %c uses codepoint
 /// semantics (65 -> 'A') instead of SQLite's first-char-of-text (65 -> '6').
 #[test]
-#[ignore = "bd-jvnwt: printf %u unimplemented (emits '%u'); %c codepoint vs SQLite first-char-of-text"]
 fn printf_u_and_c() {
     assert_scalar(
         &[
@@ -154,7 +153,6 @@ fn printf_width_precision_flags() {
 /// bd-jvnwt: the `*` dynamic-width form is unimplemented; the whole conversion
 /// is emitted literally instead of consuming the next arg as the width.
 #[test]
-#[ignore = "bd-jvnwt: printf %*d (dynamic width) unimplemented (emits '[%*d]')"]
 fn printf_dynamic_width() {
     assert_scalar(
         &["SELECT printf('[%*d]', 5, 42)"], // expect '[   42]'

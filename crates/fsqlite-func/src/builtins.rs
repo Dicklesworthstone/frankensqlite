@@ -2289,14 +2289,28 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             i += 1;
         }
 
-        // Parse width
+        // Parse width: a literal number, or `*` to take the width from the next
+        // argument (bd-jvnwt). A negative dynamic width means left-justify with
+        // its absolute value, matching C printf.
         let mut width = 0usize;
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            width = width
-                .saturating_mul(10)
-                .saturating_add(chars[i] as usize - '0' as usize)
-                .min(100_000_000); // Prevent OOM from malicious formats
+        if i < chars.len() && chars[i] == '*' {
             i += 1;
+            let w = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+            param_idx += 1;
+            if w < 0 {
+                left_align = true;
+                width = usize::try_from(w.unsigned_abs()).unwrap_or(0).min(100_000_000);
+            } else {
+                width = usize::try_from(w).unwrap_or(0).min(100_000_000);
+            }
+        } else {
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                width = width
+                    .saturating_mul(10)
+                    .saturating_add(chars[i] as usize - '0' as usize)
+                    .min(100_000_000); // Prevent OOM from malicious formats
+                i += 1;
+            }
         }
 
         // Parse precision
@@ -2330,6 +2344,20 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let formatted =
                     format_integer(val, width, left_align, show_sign, space_sign, zero_pad);
                 result.push_str(&formatted);
+            }
+            'u' => {
+                // Unsigned decimal (bd-jvnwt): reinterpret the i64 bit pattern as
+                // u64, matching C/SQLite %u.
+                let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+                param_idx += 1;
+                #[allow(clippy::cast_sign_loss)]
+                let digits = (val as u64).to_string();
+                let padded = if zero_pad && width > digits.len() {
+                    format!("{}{}", "0".repeat(width - digits.len()), digits)
+                } else {
+                    pad_string(&digits, width, left_align)
+                };
+                result.push_str(&padded);
             }
             'f' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
