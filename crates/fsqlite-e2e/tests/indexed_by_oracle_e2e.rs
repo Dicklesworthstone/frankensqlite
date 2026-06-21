@@ -129,7 +129,6 @@ fn not_indexed_forces_scan_same_results() {
 /// but frank silently ignores the hint and runs the query (returns [2,3]). The
 /// forced-index name is not validated against the schema.
 #[test]
-#[ignore = "bd-pw68x: INDEXED BY <nonexistent index> silently accepted instead of erroring 'no such index'"]
 fn indexed_by_nonexistent_index_errors() {
     scenario(
         &T,

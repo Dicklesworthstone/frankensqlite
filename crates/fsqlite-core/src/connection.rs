@@ -23455,6 +23455,9 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(select) => {
+                // bd-c9v0f + bd-pw68x: reject out-of-range ORDER BY/GROUP BY
+                // ordinals and unknown INDEXED BY hints, matching SQLite.
+                self.validate_select_ordinals_and_hints(select)?;
                 // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
@@ -30544,6 +30547,91 @@ impl Connection {
         }
 
         resolved
+    }
+
+    /// bd-c9v0f + bd-pw68x: reject a top-level SELECT that SQLite would reject:
+    /// an ORDER BY / GROUP BY integer ordinal outside `1..=ncol`, or an
+    /// `INDEXED BY <name>` naming an index the table does not have. FrankenSQLite
+    /// otherwise silently treats an out-of-range ordinal as a constant and
+    /// ignores an unknown index hint.
+    fn validate_select_ordinals_and_hints(&self, select: &SelectStatement) -> Result<()> {
+        let ncol = self.select_result_column_count(select, &[], &mut Vec::new());
+        let ncol_i = i64::try_from(ncol).unwrap_or(i64::MAX);
+        // Only validate ordinals when the output column count is determinable;
+        // ncol == 0 means it could not be resolved, so don't risk a false error.
+        if ncol_i >= 1 {
+            let check_ordinal = |kind: &str, expr: &Expr| -> Result<()> {
+                // SQLite treats a (possibly signed) bare integer literal as a
+                // column ordinal; `-1`/`0` are out of range. `1+1` etc. are
+                // expressions, not ordinals, so are intentionally not matched.
+                let ordinal = match expr {
+                    Expr::Literal(Literal::Integer(n), _) => Some(*n),
+                    Expr::UnaryOp {
+                        op: fsqlite_ast::UnaryOp::Negate,
+                        expr,
+                        ..
+                    } => match expr.as_ref() {
+                        Expr::Literal(Literal::Integer(n), _) => Some(-*n),
+                        _ => None,
+                    },
+                    Expr::UnaryOp {
+                        op: fsqlite_ast::UnaryOp::Plus,
+                        expr,
+                        ..
+                    } => match expr.as_ref() {
+                        Expr::Literal(Literal::Integer(n), _) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(n) = ordinal {
+                    if n < 1 || n > ncol_i {
+                        return Err(FrankenError::FunctionError(format!(
+                            "{kind} term out of range - should be between 1 and {ncol_i}"
+                        )));
+                    }
+                }
+                Ok(())
+            };
+            for term in &select.order_by {
+                check_ordinal("ORDER BY", &term.expr)?;
+            }
+            if let SelectCore::Select { group_by, .. } = &select.body.select {
+                for expr in group_by {
+                    check_ordinal("GROUP BY", expr)?;
+                }
+            }
+        }
+        // INDEXED BY <name> must reference an existing index on the named table.
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        {
+            let mut sources: Vec<&TableOrSubquery> = vec![&from.source];
+            sources.extend(from.joins.iter().map(|j| &j.table));
+            for tos in sources {
+                if let TableOrSubquery::Table {
+                    name,
+                    index_hint: Some(fsqlite_ast::IndexHint::IndexedBy(idx)),
+                    ..
+                } = tos
+                {
+                    // Only validate against a known local table; an unknown table
+                    // is reported by the normal execution path.
+                    if let Some(ti) = self.schema_index_of(&name.name) {
+                        let known = self.schema.borrow().get(ti).is_some_and(|t| {
+                            t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(idx))
+                        });
+                        if !known {
+                            return Err(FrankenError::FunctionError(format!(
+                                "no such index: {idx}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn select_result_column_count(

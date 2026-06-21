@@ -112,7 +112,6 @@ fn ordinal_in_range_sorts_and_groups() {
 }
 
 #[test]
-#[ignore = "bd-c9v0f: out-of-range integer ordinal treated as a constant (no-op/one group) instead of raising 'term out of range'"]
 fn ordinal_out_of_range_rejected() {
     // A bare integer ordinal must be in [1, ncol]; otherwise SQLite errors.
     // The test confirms frank rejects too (not treating the literal as a constant).
