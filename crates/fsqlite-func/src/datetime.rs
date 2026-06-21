@@ -772,6 +772,14 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
         match spec {
             'd' => push_zero_padded_2(&mut result, d),
             'e' => push_space_padded_2(&mut result, d),
+            'F' => {
+                // ISO 8601 date: %Y-%m-%d (bd-luvv8).
+                push_zero_padded_4(&mut result, y);
+                result.push('-');
+                push_zero_padded_2(&mut result, mo);
+                result.push('-');
+                push_zero_padded_2(&mut result, d);
+            }
             'f' => {
                 // Seconds with fractional part.
                 let total = s as f64 + frac;
@@ -1083,7 +1091,14 @@ pub struct UnixepochFunc;
 impl ScalarFunction for UnixepochFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, _)) => Ok(SqliteValue::Integer(jdn_to_unix(jdn))),
+            // bd-855l7: the 'subsec'/'subsecond' modifier makes unixepoch return
+            // a floating-point value carrying the fractional seconds.
+            Some((jdn, true)) => {
+                let secs = (jdn - UNIX_EPOCH_JDN) * 86400.0;
+                let rounded = (secs * 1000.0).round() / 1000.0;
+                Ok(SqliteValue::Float(rounded))
+            }
+            Some((jdn, false)) => Ok(SqliteValue::Integer(jdn_to_unix(jdn))),
             None => Ok(SqliteValue::Null),
         }
     }

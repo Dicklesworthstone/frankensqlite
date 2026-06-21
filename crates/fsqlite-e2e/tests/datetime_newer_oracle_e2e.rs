@@ -122,7 +122,6 @@ fn subsec_modifier_datetime_and_time() {
 }
 
 #[test]
-#[ignore = "bd-855l7: unixepoch(X,'subsec') drops the fractional part (returns truncated integer, not real)"]
 fn unixepoch_subsec_fractional() {
     assert_scalar(
         &[

@@ -138,7 +138,6 @@ fn datetime_iso_convenience_specifiers() {
 /// bd-luvv8: %F (== %Y-%m-%d) is not implemented; frank emits the literal '%F'.
 /// Its siblings %R and %T (above) work.
 #[test]
-#[ignore = "bd-luvv8: strftime %F emits literal '%F' instead of the ISO date (no F arm in the strftime match)"]
 fn datetime_iso_date_specifier_f() {
     assert_scalar(
         &["SELECT strftime('%F', '2023-06-15 13:45:30')"], // expect '2023-06-15'
