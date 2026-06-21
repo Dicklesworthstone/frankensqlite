@@ -77,9 +77,9 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DocsizeRow, Fts5Expr,
-    Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows, Fts5StructureRecord,
-    Fts5Table, Fts5Tokenizer, build_expr, decode_docsize_blob, highlight as fts5_highlight,
-    parse_fts5_query, snippet as fts5_snippet,
+    Fts5HighlightFunc, Fts5IdxRow, Fts5OnDiskReader, Fts5ScoreSnapshot, Fts5ShadowRows,
+    Fts5SnippetFunc, Fts5StructureRecord, Fts5Table, Fts5Tokenizer, build_expr,
+    decode_docsize_blob, highlight as fts5_highlight, parse_fts5_query, snippet as fts5_snippet,
 };
 #[cfg(feature = "ext-json")]
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
@@ -13824,6 +13824,56 @@ impl Connection {
         self.func_registry.borrow().aggregate_names_lowercase()
     }
 
+    fn function_call_is_current_aggregate(&self, name: &str, args: &FunctionArgs) -> bool {
+        if is_scalar_max_min(name, args) {
+            return false;
+        }
+        if is_agg_fn(name) {
+            return true;
+        }
+        self.func_registry
+            .borrow()
+            .find_aggregate(name, function_args_len(args))
+            .is_some()
+    }
+
+    fn has_implicit_aggregation_with_registry(&self, select: &SelectStatement) -> bool {
+        if has_implicit_aggregation(select) {
+            return true;
+        }
+        if has_group_by(select) {
+            return false;
+        }
+        let SelectCore::Select { columns, .. } = &select.body.select else {
+            return false;
+        };
+        let registry = self.func_registry.borrow();
+        columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr { expr, .. }
+                    if expr_contains_registered_agg(expr, registry.as_ref())
+            )
+        })
+    }
+
+    fn has_custom_implicit_aggregation_with_registry(&self, select: &SelectStatement) -> bool {
+        if has_group_by(select) {
+            return false;
+        }
+        let SelectCore::Select { columns, .. } = &select.body.select else {
+            return false;
+        };
+        let registry = self.func_registry.borrow();
+        columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr { expr, .. }
+                    if expr_contains_custom_registered_agg(expr, registry.as_ref())
+            )
+        })
+    }
+
     fn validate_default_value_is_constant(
         &self,
         column_name: &str,
@@ -23437,7 +23487,18 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_join_select(&bound, None)?;
+                    // bd-xvtao: a mixed main+attached JOIN with GROUP BY or
+                    // aggregates must run through the aggregation-aware join path;
+                    // execute_join_select alone returns raw un-grouped rows and
+                    // evaluates aggregates (e.g. sum()) as scalars -> NULL.
+                    let needs_aggregation = has_group_by(select)
+                        || self.has_implicit_aggregation_with_registry(select)
+                        || has_ordered_aggregate(select);
+                    let mut rows = if needs_aggregation && has_joins(select) {
+                        self.execute_group_by_join_select(cx, &bound, None)?
+                    } else {
+                        self.execute_join_select(&bound, None)?
+                    };
                     if let Some(limit) = limit_clause {
                         apply_limit_clause(&mut rows, &limit);
                     }
@@ -23464,10 +23525,13 @@ impl Connection {
                     CollationRegistry::default()
                 };
                 let ordered_aggregate = has_ordered_aggregate(select);
+                let implicit_aggregate = self.has_implicit_aggregation_with_registry(select);
+                let custom_implicit_aggregate =
+                    self.has_custom_implicit_aggregation_with_registry(select);
                 // FROM-less aggregate SELECT (e.g. SELECT COUNT(*), SUM(NULL)).
                 // Must be checked before the expression-only path because the
                 // expression-only VDBE codegen cannot handle aggregate functions.
-                if is_expression_only_select(select) && has_implicit_aggregation(select) {
+                if is_expression_only_select(select) && implicit_aggregate {
                     return self.execute_fromless_aggregate(select, params);
                 }
                 // Expression-only SELECT with scalar subqueries in result
@@ -23514,9 +23578,7 @@ impl Connection {
                     // validated indexed COUNT(*) semijoin fast path applies.
                     self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
                     self.execute_correlated_exists_where_fallback(cx, select, params)
-                } else if (has_group_by(select)
-                    || has_implicit_aggregation(select)
-                    || ordered_aggregate)
+                } else if (has_group_by(select) || implicit_aggregate || ordered_aggregate)
                     && (has_joins(select)
                         || has_fallback_from_source(select)
                         || self.has_primary_live_vtab_source(select))
@@ -23531,6 +23593,20 @@ impl Connection {
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_join_select(cx, &bound, None)?;
+                    if distinct {
+                        dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
+                } else if custom_implicit_aggregate {
+                    self.log_mem_execution_fallback("select", "custom_aggregate_fallback")?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows = self.execute_group_by_select(&bound, None)?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -44009,7 +44085,7 @@ impl Connection {
             // Full ROLLBACK: restore to transaction start.
             // 5D.2 (bd-1ene): Use pager rollback and reload from committed state.
             // bd-2yqp6.4.3: SQLite errors on ROLLBACK outside a transaction,
-            // matching COMMIT behavior (vdbe.c:4056).
+            // matching upstream COMMIT behavior.
             if !self.in_transaction.get() {
                 return Err(FrankenError::Internal(
                     "cannot rollback - no transaction is active".to_owned(),
@@ -48913,7 +48989,7 @@ impl Connection {
                             ..
                         },
                     ..
-                } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
+                } if self.function_call_is_current_aggregate(name, args) => {
                     let func = name.to_ascii_lowercase();
                     let mut arg_expr = None;
                     let mut separator = None;
@@ -49351,13 +49427,19 @@ impl Connection {
                                     })
                                 })
                             });
-                            values.push(compute_aggregate_ext_collated(
-                                name,
-                                &agg_values,
-                                evaluated_separator.as_deref(),
-                                collation.as_deref(),
-                                &self.collation_registry,
-                            )?);
+                            if let Some(result) =
+                                self.compute_custom_aggregate_with_registry(name, &owned_values)?
+                            {
+                                values.push(result);
+                            } else {
+                                values.push(compute_aggregate_ext_collated(
+                                    name,
+                                    &agg_values,
+                                    evaluated_separator.as_deref(),
+                                    collation.as_deref(),
+                                    &self.collation_registry,
+                                )?);
+                            }
                         }
                     }
                 }
@@ -50729,7 +50811,7 @@ impl Connection {
                 if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                     return result;
                 }
-                if is_fts5_aux_function_name(name) {
+                if fts5_aux_function_requires_context(name, args, row, col_map) {
                     return Err(FrankenError::function_error(format!(
                         "unable to use function {name} in the requested context",
                     )));
@@ -51267,7 +51349,7 @@ impl Connection {
                             ..
                         },
                     ..
-                } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
+                } if self.function_call_is_current_aggregate(name, args) => {
                     let func = name.to_ascii_lowercase();
                     let mut arg_expr = None;
                     let mut separator = None;
@@ -51819,13 +51901,19 @@ impl Connection {
                                     })
                                 })
                             });
-                            values.push(compute_aggregate_ext_collated(
-                                name,
-                                &agg_values,
-                                evaluated_separator.as_deref(),
-                                collation.as_deref(),
-                                &self.collation_registry,
-                            )?);
+                            if let Some(result) =
+                                self.compute_custom_aggregate_with_registry(name, &owned_values)?
+                            {
+                                values.push(result);
+                            } else {
+                                values.push(compute_aggregate_ext_collated(
+                                    name,
+                                    &agg_values,
+                                    evaluated_separator.as_deref(),
+                                    collation.as_deref(),
+                                    &self.collation_registry,
+                                )?);
+                            }
                         }
                     }
                 }
@@ -55485,6 +55573,25 @@ impl Connection {
             func.step(&mut state, std::slice::from_ref(*value))?;
         }
         func.finalize(state)
+    }
+
+    fn compute_custom_aggregate_with_registry(
+        &self,
+        name: &str,
+        values: &[SqliteValue],
+    ) -> Result<Option<SqliteValue>> {
+        if is_agg_fn(name) {
+            return Ok(None);
+        }
+        let registry = self.func_registry.borrow();
+        let Some(func) = registry.find_aggregate(name, 1) else {
+            return Ok(None);
+        };
+        let mut state = func.initial_state();
+        for value in values {
+            func.step(&mut state, std::slice::from_ref(value))?;
+        }
+        func.finalize(state).map(Some)
     }
 
     fn should_route_cte_join_through_memdb_fallback(&self, select: &SelectStatement) -> bool {
@@ -61725,6 +61832,16 @@ fn select_has_single_left_join(select: &SelectStatement) -> bool {
 /// Returns true if a JOIN query is eligible for the currently validated VDBE
 /// path: one simple INNER or LEFT JOIN over named tables with a plain ON
 /// predicate and no grouping/window/subquery/fallback-only features.
+/// bd-xvtao: true when `tos` names a table in an ATTACHed (non-builtin) schema
+/// (`aux.t`), which VDBE codegen cannot resolve against the local schema.
+fn table_or_subquery_in_attached_schema(tos: &TableOrSubquery) -> bool {
+    matches!(
+        tos,
+        TableOrSubquery::Table { name, .. }
+            if name.schema.as_deref().is_some_and(|s| !is_builtin_schema(s))
+    )
+}
+
 fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
     let SelectCore::Select {
         columns,
@@ -61755,6 +61872,11 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
     if !matches!(&from.source, TableOrSubquery::Table { .. }) {
         return false;
     }
+    // bd-xvtao: cross-database (ATTACHed) tables must use the connection-level
+    // join executor, not VDBE codegen (which only knows the local schema).
+    if table_or_subquery_in_attached_schema(&from.source) {
+        return false;
+    }
 
     if columns.iter().any(|column| match column {
         ResultColumn::Expr { expr, .. } => {
@@ -61783,6 +61905,9 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
         return false;
     }
     if !matches!(&join.table, TableOrSubquery::Table { .. }) {
+        return false;
+    }
+    if table_or_subquery_in_attached_schema(&join.table) {
         return false;
     }
 
@@ -68897,6 +69022,98 @@ fn expr_contains_registered_agg(expr: &Expr, registry: &fsqlite_func::FunctionRe
     }
 }
 
+fn expr_contains_custom_registered_agg(
+    expr: &Expr,
+    registry: &fsqlite_func::FunctionRegistry,
+) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            if !is_agg_fn(name)
+                && !is_scalar_max_min(name, args)
+                && registry
+                    .find_aggregate(name, function_args_len(args))
+                    .is_some()
+            {
+                return true;
+            }
+            match args {
+                FunctionArgs::List(exprs) => exprs
+                    .iter()
+                    .any(|expr| expr_contains_custom_registered_agg(expr, registry)),
+                FunctionArgs::Star => false,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_custom_registered_agg(left, registry)
+                || expr_contains_custom_registered_agg(right, registry)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_contains_custom_registered_agg(inner, registry),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expr_contains_custom_registered_agg(inner, registry)
+                || expr_contains_custom_registered_agg(low, registry)
+                || expr_contains_custom_registered_agg(high, registry)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            expr_contains_custom_registered_agg(inner, registry)
+                || match set {
+                    InSet::List(exprs) => exprs
+                        .iter()
+                        .any(|expr| expr_contains_custom_registered_agg(expr, registry)),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_custom_registered_agg(inner, registry)
+                || expr_contains_custom_registered_agg(pattern, registry)
+                || escape
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_custom_registered_agg(expr, registry))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_contains_custom_registered_agg(expr, registry))
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_custom_registered_agg(when_expr, registry)
+                        || expr_contains_custom_registered_agg(then_expr, registry)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_custom_registered_agg(expr, registry))
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            expr_contains_custom_registered_agg(inner, registry)
+                || expr_contains_custom_registered_agg(path, registry)
+        }
+        Expr::RowValue(values, _) => values
+            .iter()
+            .any(|expr| expr_contains_custom_registered_agg(expr, registry)),
+        _ => false,
+    }
+}
+
 fn insert_may_observe_change_tracking(insert: &InsertStatement) -> bool {
     insert.with.as_ref().is_some_and(|with| {
         with.ctes
@@ -69263,8 +69480,8 @@ fn eval_group_agg_join_expr(
         }
         Expr::FunctionCall { name, args, .. } => {
             // Scalar function — evaluate args which may themselves contain aggs.
-            if is_fts5_aux_function_name(name) {
-                let row = group_rows.first().map_or(&[][..], |row| row.as_slice());
+            let row = group_rows.first().map_or(&[][..], |row| row.as_slice());
+            if fts5_aux_function_requires_context(name, args, row, col_map) {
                 if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                     return result;
                 }
@@ -69279,6 +69496,10 @@ fn eval_group_agg_join_expr(
                     .collect::<Result<Vec<_>>>()?,
                 FunctionArgs::Star => vec![],
             };
+            #[cfg(feature = "ext-fts5")]
+            if let Some(value) = eval_fts5_scalar_fallback(name, &arg_vals)? {
+                return Ok(value);
+            }
             Ok(eval_scalar_fn(name, &arg_vals))
         }
         Expr::BinaryOp {
@@ -76120,7 +76341,7 @@ fn build_raw_scan_select(select: &SelectStatement) -> SelectStatement {
 /// Test whether a `SqliteValue` is truthy (non-zero, non-NULL).
 /// C SQLite-compatible shift: negative shift reverses direction, large shift
 /// produces 0 (or -1 for arithmetic right-shift of negative values).
-/// See vdbe.c lines 2046-2066.
+/// Mirrors upstream VDBE shift opcode behavior.
 fn sqlite_shift(val: i64, shift: i64, is_left: bool) -> i64 {
     let v = val;
     let mut s = shift;
@@ -76725,6 +76946,10 @@ fn evaluate_having_value(
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
+            #[cfg(feature = "ext-fts5")]
+            if let Some(value) = eval_fts5_scalar_fallback(name, &arg_values)? {
+                return Ok(value);
+            }
             Ok(eval_scalar_fn(name, &arg_values))
         }
 
@@ -76839,8 +77064,8 @@ fn numeric_div(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
         } else {
             match ai.checked_div(*bi) {
                 Some(result) => SqliteValue::Integer(result),
-                // i64::MIN / -1 overflows; C SQLite promotes to float
-                // via `goto fp_math` (vdbe.c:1916).
+                // i64::MIN / -1 overflows; C SQLite promotes to the floating
+                // point arithmetic path.
                 #[allow(clippy::cast_precision_loss)]
                 None => {
                     let result = *ai as f64 / *bi as f64;
@@ -76870,14 +77095,14 @@ fn numeric_div(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 /// SQL remainder with NULL propagation and division-by-zero → NULL.
 ///
 /// C SQLite: both-integer → Integer result; otherwise converts both to integer
-/// and computes `iB % iA`, storing as Float (vdbe.c:1949-1953).
+/// and computes `iB % iA`, storing as Float.
 #[allow(clippy::cast_precision_loss)]
 fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     if a.is_null() || b.is_null() {
         return SqliteValue::Null;
     }
     // C SQLite converts both operands to integer for OP_Remainder in ALL
-    // paths (vdbe.c:1949-1953): iA = intValue(pIn1), iB = intValue(pIn2).
+    // paths: iA = intValue(pIn1), iB = intValue(pIn2).
     // Both-integer → Integer result; mixed/float → Float result.
     let both_int = matches!((a, b), (SqliteValue::Integer(_), SqliteValue::Integer(_)));
     let ai = a.to_integer();
@@ -77541,7 +77766,8 @@ fn eval_empty_set_agg_expr(expr: &Expr) -> SqliteValue {
     }
 }
 
-/// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
+/// Kahan-Babuska-Neumaier compensated summation step matching upstream
+/// aggregate precision behavior.
 #[inline]
 fn kbn_step(sum: &mut f64, err: &mut f64, value: f64) {
     let s = *sum;
@@ -84913,6 +85139,23 @@ fn fts5_table_label_from_args(args: &FunctionArgs) -> Option<&str> {
 }
 
 #[cfg(feature = "ext-fts5")]
+fn fts5_aux_function_targets_current_source(
+    args: &FunctionArgs,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> bool {
+    let Some(table_label) = fts5_table_label_from_args(args) else {
+        return false;
+    };
+    if current_fts5_rowid(table_label, row, col_map).is_some() {
+        return true;
+    }
+    with_current_fts5_aux_context(|ctx_opt| {
+        ctx_opt.is_some_and(|ctx| ctx.table(table_label).is_some())
+    })
+}
+
+#[cfg(feature = "ext-fts5")]
 fn current_fts5_rowid(
     table_label: &str,
     row: &[SqliteValue],
@@ -85221,7 +85464,8 @@ fn try_eval_fts5_aux_function(
 ) -> Option<Result<SqliteValue>> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
-        "bm25" | "highlight" | "snippet" => {
+        "bm25" => Some(eval_fts5_aux_function(lower.as_str(), args, row, col_map)),
+        "highlight" | "snippet" if fts5_aux_function_targets_current_source(args, row, col_map) => {
             Some(eval_fts5_aux_function(lower.as_str(), args, row, col_map))
         }
         _ => None,
@@ -85248,6 +85492,43 @@ fn is_fts5_aux_function_name(name: &str) -> bool {
 #[cfg(not(feature = "ext-fts5"))]
 fn is_fts5_aux_function_name(_name: &str) -> bool {
     false
+}
+
+#[cfg(feature = "ext-fts5")]
+fn fts5_aux_function_requires_context(
+    name: &str,
+    args: &FunctionArgs,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> bool {
+    if name.eq_ignore_ascii_case("bm25") {
+        return true;
+    }
+    (name.eq_ignore_ascii_case("highlight") || name.eq_ignore_ascii_case("snippet"))
+        && fts5_aux_function_targets_current_source(args, row, col_map)
+}
+
+#[cfg(not(feature = "ext-fts5"))]
+fn fts5_aux_function_requires_context(
+    _name: &str,
+    _args: &FunctionArgs,
+    _row: &[SqliteValue],
+    _col_map: &[(String, String, bool)],
+) -> bool {
+    false
+}
+
+#[cfg(feature = "ext-fts5")]
+fn eval_fts5_scalar_fallback(name: &str, args: &[SqliteValue]) -> Result<Option<SqliteValue>> {
+    use fsqlite_func::ScalarFunction;
+
+    if name.eq_ignore_ascii_case("highlight") && args.len() == 4 {
+        return Fts5HighlightFunc.invoke(args).map(Some);
+    }
+    if name.eq_ignore_ascii_case("snippet") && args.len() == 6 {
+        return Fts5SnippetFunc.invoke(args).map(Some);
+    }
+    Ok(None)
 }
 
 fn join_expr_affinity(
@@ -85628,7 +85909,7 @@ pub(crate) fn eval_join_expr(
             if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                 return result;
             }
-            if is_fts5_aux_function_name(name) {
+            if fts5_aux_function_requires_context(name, args, row, col_map) {
                 return Err(FrankenError::function_error(format!(
                     "unable to use function {name} in the requested context",
                 )));
@@ -85640,6 +85921,10 @@ pub(crate) fn eval_join_expr(
                     .collect::<Result<Vec<_>>>()?,
                 FunctionArgs::Star => vec![],
             };
+            #[cfg(feature = "ext-fts5")]
+            if let Some(value) = eval_fts5_scalar_fallback(name, &arg_vals)? {
+                return Ok(value);
+            }
             Ok(eval_scalar_fn(name, &arg_vals))
         }
         Expr::Like {

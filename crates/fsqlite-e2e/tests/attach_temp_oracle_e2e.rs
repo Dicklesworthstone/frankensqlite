@@ -153,7 +153,6 @@ fn attach_memory_db_and_query() {
 }
 
 #[test]
-#[ignore = "bd-xvtao: cross-database JOIN over an ATTACHed db returns wrong results"]
 fn attach_cross_db_join() {
     scenario(
         &[
