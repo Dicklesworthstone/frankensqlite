@@ -57220,9 +57220,22 @@ impl Connection {
                 Fts5AuxContext::default()
             }
         };
-        let primary_where_pushdown = effective_where_clause.and_then(|expr| {
-            expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
-        });
+        // bd-41syy(A): the primary (left) table is null-extendable when any join
+        // is RIGHT/FULL, so a WHERE predicate over its columns (e.g.
+        // `l.id IS NULL`) must NOT be pushed into its scan — doing so drops the
+        // real left rows and makes the predicate spuriously true for every
+        // right-side row instead of only the orphan rows.
+        let primary_null_extendable = from
+            .joins
+            .iter()
+            .any(|j| matches!(j.join_type.kind, JoinKind::Right | JoinKind::Full));
+        let primary_where_pushdown = if primary_null_extendable {
+            None
+        } else {
+            effective_where_clause.and_then(|expr| {
+                expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
+            })
+        };
 
         // ── 3. Load each table's raw rows ──
         // Cache scanned rows by resolved scan identity so that repeated
@@ -88065,7 +88078,26 @@ fn eval_join_expr_with_using(
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
             if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, Some(skip)) {
-                return Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null));
+                let val = row.get(idx).cloned().unwrap_or(SqliteValue::Null);
+                // bd-41syy(B): a JOIN ... USING / NATURAL coalesced column takes
+                // the value from whichever side is present. When the kept (left)
+                // value is NULL — a right-only row in a RIGHT/FULL join — fall
+                // back to the skipped duplicate (right) column of the same name.
+                if matches!(val, SqliteValue::Null) && table_prefix.is_none() {
+                    for &skip_idx in skip {
+                        if col_map
+                            .get(skip_idx)
+                            .is_some_and(|(_, c, _)| c.eq_ignore_ascii_case(col_name))
+                        {
+                            if let Some(rv) = row.get(skip_idx) {
+                                if !matches!(rv, SqliteValue::Null) {
+                                    return Ok(rv.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(val);
             }
         }
         let rewritten = rewrite_join_expr_using_columns(expr, col_map, skip)?;

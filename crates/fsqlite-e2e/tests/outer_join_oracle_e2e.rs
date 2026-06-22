@@ -167,7 +167,6 @@ fn full_outer_join_no_overlap() {
 }
 
 #[test]
-#[ignore = "bd-41syy(B): FULL OUTER JOIN USING(col) leaves the coalesced join column NULL for right-only rows"]
 fn full_outer_join_using_coalesces_column() {
     scenario(
         &[
@@ -203,7 +202,6 @@ fn aggregate_over_right_join() {
 /// and that `IS NOT NULL` works — so the `IS NULL` predicate is independently
 /// mis-compiled to constant-true for the null-extendable side.
 #[test]
-#[ignore = "bd-41syy(A): WHERE <outer_col> IS NULL matches all rows in a RIGHT/FULL join"]
 fn outer_join_where_outer_col_is_null() {
     scenario(
         &LR,
