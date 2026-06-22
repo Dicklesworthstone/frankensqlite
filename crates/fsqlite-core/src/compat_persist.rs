@@ -1458,12 +1458,20 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
             fsqlite_ast::ForeignKeyTrigger::OnUpdate => on_update = action_type,
         }
     }
+    let deferred = clause.deferrable.as_ref().is_some_and(|d| {
+        !d.not
+            && matches!(
+                d.initially,
+                Some(fsqlite_ast::DeferrableInitially::Deferred)
+            )
+    });
     FkDef {
         child_columns: child_indices.to_vec(),
         parent_table: clause.table.clone(),
         parent_columns: clause.columns.clone(),
         on_delete,
         on_update,
+        deferred,
     }
 }
 
@@ -4169,6 +4177,7 @@ PRAGMA integrity_check;
                 parent_columns: vec!["id\"x".to_owned()],
                 on_delete: FkActionType::Cascade,
                 on_update: FkActionType::NoAction,
+                deferred: false,
             }],
             check_constraints: Vec::new(),
         };
@@ -4317,6 +4326,7 @@ PRAGMA integrity_check;
                 parent_columns: vec!["id".to_owned()],
                 on_delete: FkActionType::Cascade,
                 on_update: FkActionType::Restrict,
+                deferred: false,
             }],
             check_constraints: vec!["length(slug) > 0".to_owned()],
         };

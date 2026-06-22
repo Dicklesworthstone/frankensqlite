@@ -162,7 +162,6 @@ fn output_alias_resolves_in_order_by_and_group_by() {
 /// rejects it with "no such column". The ORDER BY/GROUP BY alias cases above
 /// work, so frank is stricter than SQLite only in the WHERE clause.
 #[test]
-#[ignore = "bd-ujuzr: output-column alias not resolvable in WHERE (frank errors 'no such column'; SQLite accepts)"]
 fn output_alias_in_where() {
     let (f, r) = ab();
     check(

@@ -325,6 +325,10 @@ pub struct FkDef {
     pub on_delete: FkActionType,
     /// Action on parent row update.
     pub on_update: FkActionType,
+    /// `true` for `DEFERRABLE INITIALLY DEFERRED` constraints, whose
+    /// parent-existence check is deferred to COMMIT rather than checked at the
+    /// statement (bd-do0d6).
+    pub deferred: bool,
 }
 
 /// Foreign key action type (mirrors `fsqlite_ast::ForeignKeyActionType`).
@@ -1750,6 +1754,16 @@ pub fn codegen_select(
     }
 
     let table = find_table(schema, table_name)?;
+    // bd-ujuzr: SQLite resolves a result-column alias referenced in the WHERE
+    // clause when no real table column matches.  Substitute aliases up front (a
+    // real column always wins), reusing the HAVING alias-rewrite, so both
+    // validation and the scan filter see the underlying expression.
+    let where_clause_rewritten: Option<Box<Expr>> = where_clause
+        .as_deref()
+        .map(|w| Box::new(rewrite_having_select_aliases(w, columns, table)));
+    // Re-bind with the original `&Option<Box<Expr>>` shape so the downstream
+    // `.as_deref()` call sites keep their meaning (and avoid no-op derefs).
+    let where_clause = &where_clause_rewritten;
     validate_single_table_result_columns(columns, table, table_alias)?;
     if let Some(where_expr) = where_clause.as_deref() {
         validate_single_table_expr_columns(where_expr, table, table_alias)?;

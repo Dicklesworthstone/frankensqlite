@@ -3125,6 +3125,60 @@ const CACHE_PAGES_TABLE_COLUMN_NAME_STRINGS: [&str; 6] = [
     "access_count",
 ];
 
+// Column names for the `pragma_*` table-valued function forms (bd-1hn48).
+// These mirror the column order produced by the corresponding PRAGMA statement
+// (e.g. `PRAGMA table_info(t)`), which `execute_pragma` builds.
+const PRAGMA_TABLE_INFO_TVF_COLUMNS: [&str; 6] =
+    ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+const PRAGMA_TABLE_XINFO_TVF_COLUMNS: [&str; 7] = [
+    "cid",
+    "name",
+    "type",
+    "notnull",
+    "dflt_value",
+    "pk",
+    "hidden",
+];
+const PRAGMA_INDEX_LIST_TVF_COLUMNS: [&str; 5] = ["seq", "name", "unique", "origin", "partial"];
+const PRAGMA_INDEX_INFO_TVF_COLUMNS: [&str; 3] = ["seqno", "cid", "name"];
+const PRAGMA_INDEX_XINFO_TVF_COLUMNS: [&str; 6] = ["seqno", "cid", "name", "desc", "coll", "key"];
+const PRAGMA_FOREIGN_KEY_LIST_TVF_COLUMNS: [&str; 8] = [
+    "id",
+    "seq",
+    "table",
+    "from",
+    "to",
+    "on_update",
+    "on_delete",
+    "match",
+];
+
+/// Map a `pragma_<name>` table-valued function to its static column-name slice.
+/// Returns `None` for any name that is not a supported pragma TVF, which keeps
+/// the TVF surface bounded to the row-returning introspection pragmas.
+fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> {
+    let prefix = name.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("pragma_") {
+        return None;
+    }
+    let pragma = &name[7..];
+    if pragma.eq_ignore_ascii_case("table_info") {
+        Some(&PRAGMA_TABLE_INFO_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("table_xinfo") {
+        Some(&PRAGMA_TABLE_XINFO_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("index_list") {
+        Some(&PRAGMA_INDEX_LIST_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("index_info") {
+        Some(&PRAGMA_INDEX_INFO_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("index_xinfo") {
+        Some(&PRAGMA_INDEX_XINFO_TVF_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("foreign_key_list") {
+        Some(&PRAGMA_FOREIGN_KEY_LIST_TVF_COLUMNS)
+    } else {
+        None
+    }
+}
+
 struct HtmMetricsVtab;
 
 #[derive(Clone)]
@@ -8503,6 +8557,13 @@ pub struct Connection {
     /// actions (matches C SQLite behavior where FK actions do not re-trigger
     /// FK checking).
     fk_cascade_depth: Cell<usize>,
+    /// Pending `DEFERRABLE INITIALLY DEFERRED` parent-existence checks recorded
+    /// during an explicit transaction, rechecked at COMMIT (bd-do0d6). Each
+    /// entry is `(child_table_name, row_values_in_storage_order)`.
+    deferred_fk_checks: RefCell<Vec<(String, Vec<SqliteValue>)>>,
+    /// When `true`, deferred FK checks are forced to run immediately (used while
+    /// rechecking the deferred set at COMMIT so the recheck actually errors).
+    fk_force_immediate_check: Cell<bool>,
     /// Cache for successful FK parent-existence probes.
     ///
     /// Two activation modes share this slot:
@@ -9036,6 +9097,8 @@ impl Connection {
             force_full_schema_reload_once: Cell::new(false),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
+            deferred_fk_checks: RefCell::new(Vec::new()),
+            fk_force_immediate_check: Cell::new(false),
             fk_parent_validation_cache: RefCell::new(None),
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
             trace_registration: RefCell::new(None),
@@ -9341,6 +9404,8 @@ impl Connection {
             force_full_schema_reload_once: Cell::new(false),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
+            deferred_fk_checks: RefCell::new(Vec::new()),
+            fk_force_immediate_check: Cell::new(false),
             fk_parent_validation_cache: RefCell::new(None),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
@@ -39868,6 +39933,7 @@ impl Connection {
                         parent_columns: clause.columns.clone(),
                         on_delete,
                         on_update,
+                        deferred: fk_clause_initially_deferred(clause),
                     });
                 }
                 // FIX: Pad existing MemDB rows with the default value for the
@@ -41081,6 +41147,34 @@ impl Connection {
             && self.fk_cascade_depth.get() < MAX_FK_CASCADE_DEPTH
     }
 
+    /// Returns `true` when a parent-existence violation for `fk` should be
+    /// deferred to COMMIT instead of raised now: the FK is `DEFERRABLE INITIALLY
+    /// DEFERRED`, we are inside an explicit transaction, and we are not in the
+    /// middle of the commit-time recheck (bd-do0d6).  In autocommit mode the
+    /// implicit per-statement commit makes deferral equivalent to an immediate
+    /// check, so we keep it immediate.
+    fn fk_should_defer(&self, fk: &FkDef) -> bool {
+        fk.deferred && self.in_transaction.get() && !self.fk_force_immediate_check.get()
+    }
+
+    /// Recheck every deferred FK parent-existence constraint accumulated during
+    /// the transaction.  Returns the first violation (if any).  Called at COMMIT.
+    fn recheck_deferred_fk_at_commit(&self) -> Result<()> {
+        let pending = std::mem::take(&mut *self.deferred_fk_checks.borrow_mut());
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.fk_force_immediate_check.set(true);
+        let result = (|| {
+            for (table_name, row_values) in &pending {
+                self.check_fk_parent_exists(table_name, row_values)?;
+            }
+            Ok(())
+        })();
+        self.fk_force_immediate_check.set(false);
+        result
+    }
+
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
     ///
     /// This resolves inserted row values in table-column order (including
@@ -41123,6 +41217,10 @@ impl Connection {
         // skip the FK existence SELECT and its O(rows-so-far) memdb reload.
         self.ensure_fk_parent_validation_cache();
 
+        // bd-do0d6: record a deferred row at most once even if several of its
+        // FKs are violated.
+        let mut deferred_recorded = false;
+
         for fk in &fk_defs {
             // Collect child column values for this FK.
             let fk_values: Vec<&SqliteValue> = fk
@@ -41143,6 +41241,15 @@ impl Connection {
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(&fk.parent_table));
             let Some(parent) = parent else {
+                if self.fk_should_defer(fk) {
+                    if !deferred_recorded {
+                        self.deferred_fk_checks
+                            .borrow_mut()
+                            .push((table_name.to_owned(), row_values.to_vec()));
+                        deferred_recorded = true;
+                    }
+                    continue;
+                }
                 return Err(FrankenError::ForeignKeyViolation);
             };
 
@@ -41197,6 +41304,15 @@ impl Connection {
             // explicitly refreshing stale memdb state before execution).
             let rows = self.fk_validation_query(&sql, &params)?;
             if rows.is_empty() {
+                if self.fk_should_defer(fk) {
+                    if !deferred_recorded {
+                        self.deferred_fk_checks
+                            .borrow_mut()
+                            .push((table_name.to_owned(), row_values.to_vec()));
+                        deferred_recorded = true;
+                    }
+                    continue;
+                }
                 return Err(FrankenError::ForeignKeyViolation);
             }
             if let Some(cache_key) = cache_key {
@@ -42801,6 +42917,8 @@ impl Connection {
                 "cannot start a transaction within a transaction".to_owned(),
             ));
         }
+        // bd-do0d6: a new transaction starts with no pending deferred FK checks.
+        self.deferred_fk_checks.borrow_mut().clear();
         // AAC-P6: txn boundary — renew any prepared-DML micro-batch.
         self.stmt_microbatch_flush();
         let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
@@ -43641,6 +43759,11 @@ impl Connection {
         self.discard_cached_vdbe_engine();
         self.clear_prepared_direct_insert_append_hint();
         self.flush_pending_direct_write_runs(cx)?;
+        // bd-do0d6: validate DEFERRABLE INITIALLY DEFERRED foreign keys that
+        // were postponed during the transaction.  A surviving violation fails
+        // the COMMIT but, matching SQLite, leaves the transaction ACTIVE (the
+        // application must ROLLBACK or resolve the violation and COMMIT again).
+        self.recheck_deferred_fk_at_commit()?;
         let commit_pre_txn_start = hot_path_profile_enabled().then(Instant::now);
         let had_live_vtab_txn = !self.live_vtab_transactions.borrow().is_empty();
         if !self.live_vtab_transactions.borrow().is_empty() {
@@ -44105,6 +44228,10 @@ impl Connection {
     }
 
     fn execute_rollback_with_cx(&self, cx: &Cx, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
+        // bd-do0d6: a full rollback discards any postponed deferred FK checks.
+        if rb.to_savepoint.is_none() {
+            self.deferred_fk_checks.borrow_mut().clear();
+        }
         // AAC-P6: any rollback invalidates the prepared-DML micro-batch.
         self.stmt_microbatch_flush();
         self.discard_cached_vdbe_engine();
@@ -51351,6 +51478,18 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         include_hidden_rowid: bool,
     ) -> Result<Vec<Vec<SqliteValue>>> {
+        // bd-1hn48: `pragma_<name>(arg)` table-valued functions reuse the
+        // existing PRAGMA row generators by synthesizing a PRAGMA statement.
+        if let Some(columns) = pragma_table_function_columns(name) {
+            return self.execute_pragma_table_function_rows(
+                name,
+                columns.len(),
+                args,
+                params,
+                include_hidden_rowid,
+            );
+        }
+
         let empty_row: Vec<SqliteValue> = Vec::new();
         let empty_col_map: Vec<(String, String, bool)> = Vec::new();
         let arg_values = args
@@ -51386,6 +51525,62 @@ impl Connection {
             column_count,
             include_hidden_rowid,
         )
+    }
+
+    /// bd-1hn48: execute a `pragma_<name>(arg)` table-valued function by
+    /// synthesizing the equivalent PRAGMA statement and reusing the existing
+    /// `execute_pragma` row generators. The single optional argument becomes the
+    /// pragma's call value (e.g. `pragma_table_info('t')` -> `PRAGMA table_info(t)`).
+    fn execute_pragma_table_function_rows(
+        &self,
+        name: &str,
+        column_count: usize,
+        args: &[Expr],
+        params: Option<&[SqliteValue]>,
+        include_hidden_rowid: bool,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let pragma_name = name[7..].to_ascii_lowercase();
+        let value = if let Some(arg) = args.first() {
+            let empty_row: Vec<SqliteValue> = Vec::new();
+            let empty_col_map: Vec<(String, String, bool)> = Vec::new();
+            let arg_value =
+                self.eval_expr_with_subqueries(arg, &empty_row, &empty_col_map, params)?;
+            let arg_text =
+                arg_value
+                    .as_text_str()
+                    .map(str::to_owned)
+                    .or_else(|| match &arg_value {
+                        SqliteValue::Integer(n) => Some(n.to_string()),
+                        SqliteValue::Float(f) => Some(format!("{f}")),
+                        _ => None,
+                    });
+            arg_text.map(|s| {
+                fsqlite_ast::PragmaValue::Call(Expr::Literal(
+                    Literal::String(s),
+                    fsqlite_ast::Span::ZERO,
+                ))
+            })
+        } else {
+            None
+        };
+        let stmt = fsqlite_ast::PragmaStatement {
+            name: fsqlite_ast::QualifiedName {
+                schema: None,
+                name: pragma_name,
+            },
+            value,
+        };
+        let rows = self.execute_pragma(&stmt)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, row) in rows.into_iter().enumerate() {
+            let mut values = row.values;
+            values.resize(column_count, SqliteValue::Null);
+            if include_hidden_rowid {
+                values.push(SqliteValue::Integer(i64::try_from(i + 1).unwrap_or(0)));
+            }
+            out.push(values);
+        }
+        Ok(out)
     }
 
     fn scan_erased_table_function_vtab(
@@ -61731,9 +61926,9 @@ fn select_core_is_aggregate(core: &SelectCore) -> bool {
     if !group_by.is_empty() || having.is_some() {
         return true;
     }
-    columns.iter().any(|col| {
-        matches!(col, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr))
-    })
+    columns
+        .iter()
+        .any(|col| matches!(col, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr)))
 }
 
 /// bd-fuxgg: reject the aggregate/window misuse patterns SQLite rejects but
@@ -61820,7 +62015,9 @@ fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
     // or window nested inside a subquery is its own scope and not flagged).
     if let Some(w) = where_clause {
         if expr_has_aggregate(w) {
-            return Err(FrankenError::FunctionError("misuse of aggregate: ".to_owned()));
+            return Err(FrankenError::FunctionError(
+                "misuse of aggregate: ".to_owned(),
+            ));
         }
         if expr_has_window_function(w) {
             return Err(FrankenError::FunctionError(
@@ -63632,6 +63829,9 @@ fn join_order_label(select: &SelectStatement) -> String {
 }
 
 fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
+    if let Some(columns) = pragma_table_function_columns(name) {
+        return Some(columns);
+    }
     #[cfg(feature = "ext-json")]
     if name.eq_ignore_ascii_case("json_each") || name.eq_ignore_ascii_case("json_tree") {
         return Some(&JSON_TABLE_COLUMN_NAMES);
@@ -78851,7 +79051,20 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
         parent_columns: clause.columns.clone(),
         on_delete,
         on_update,
+        deferred: fk_clause_initially_deferred(clause),
     }
+}
+
+/// `true` when a foreign-key clause is declared `DEFERRABLE INITIALLY DEFERRED`,
+/// whose parent-existence check is postponed to COMMIT (bd-do0d6).
+fn fk_clause_initially_deferred(clause: &fsqlite_ast::ForeignKeyClause) -> bool {
+    clause.deferrable.as_ref().is_some_and(|d| {
+        !d.not
+            && matches!(
+                d.initially,
+                Some(fsqlite_ast::DeferrableInitially::Deferred)
+            )
+    })
 }
 
 /// Map an AST type name to a codegen affinity character.
@@ -82242,8 +82455,7 @@ fn emit_expr(
                 JsonArrow::Arrow => "JSON_ARROW",
                 JsonArrow::DoubleArrow => "JSON_DOUBLE_ARROW",
             };
-            let args =
-                FunctionArgs::List(vec![inner.as_ref().clone(), path.as_ref().clone()]);
+            let args = FunctionArgs::List(vec![inner.as_ref().clone(), path.as_ref().clone()]);
             emit_function_call(
                 builder, func, &args, false, false, false, target_reg, bind_state,
             )

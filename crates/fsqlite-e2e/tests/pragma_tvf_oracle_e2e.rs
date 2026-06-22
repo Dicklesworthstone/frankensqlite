@@ -102,7 +102,6 @@ const TBL: &[&str] =
     &["CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b TEXT DEFAULT 'x', c REAL)"];
 
 #[test]
-#[ignore = "bd-1hn48: pragma table-valued functions unimplemented (NotImplemented)"]
 fn pragma_table_info_tvf_projection() {
     let (f, r) = setup(TBL);
     check(
@@ -119,7 +118,6 @@ fn pragma_table_info_tvf_projection() {
 }
 
 #[test]
-#[ignore = "bd-1hn48: pragma table-valued functions unimplemented (NotImplemented)"]
 fn pragma_table_info_tvf_filter_and_count() {
     let (f, r) = setup(TBL);
     check(
@@ -138,7 +136,6 @@ fn pragma_table_info_tvf_filter_and_count() {
 }
 
 #[test]
-#[ignore = "bd-1hn48: pragma table-valued functions unimplemented (NotImplemented)"]
 fn pragma_table_info_tvf_self_subquery() {
     let (f, r) = setup(TBL);
     check(
@@ -156,7 +153,6 @@ fn pragma_table_info_tvf_self_subquery() {
 }
 
 #[test]
-#[ignore = "bd-1hn48: pragma table-valued functions unimplemented (NotImplemented)"]
 fn pragma_foreign_key_list_tvf() {
     let (f, r) = setup(&[
         "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",

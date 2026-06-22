@@ -95,7 +95,6 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 /// bd-do0d6: frank checks the deferred FK at the INSERT (errors) instead of at
 /// COMMIT, so this valid children-first transaction fails.
 #[test]
-#[ignore = "bd-do0d6: DEFERRABLE INITIALLY DEFERRED not deferred (FK checked at statement, not COMMIT)"]
 fn deferred_fk_temporary_violation_resolved_by_commit() {
     scenario(
         &[
@@ -119,7 +118,6 @@ fn deferred_fk_temporary_violation_resolved_by_commit() {
 /// bd-do0d6: the violation should surface at COMMIT, but frank raises it at the
 /// INSERT (deferral unimplemented).
 #[test]
-#[ignore = "bd-do0d6: DEFERRABLE INITIALLY DEFERRED not deferred (violation raised at statement, not COMMIT)"]
 fn deferred_fk_unresolved_violation_fails_at_commit() {
     scenario(
         &[
@@ -160,7 +158,6 @@ fn immediate_fk_fails_at_statement() {
 /// bd-do0d6: building a self-referential tree children-first within a txn relies
 /// on deferral; frank checks immediately and fails on the first insert.
 #[test]
-#[ignore = "bd-do0d6: DEFERRABLE INITIALLY DEFERRED not deferred (self-ref children-first txn fails at statement)"]
 fn deferred_fk_self_reference_within_txn() {
     scenario(
         &[
