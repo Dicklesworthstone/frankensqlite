@@ -161,7 +161,6 @@ fn recursive_limit_cuts_infinite() {
 /// term ("recursive aggregate queries not supported"); frank runs the recursion
 /// instead. Same missing-aggregate-validation class as the other misuse cases.
 #[test]
-#[ignore = "bd-fuxgg: aggregate in a recursive-CTE term accepted by frank (SQLite rejects 'recursive aggregate queries not supported')"]
 fn recursive_aggregate_in_recursive_term_errors() {
     let (f, r) = setup(&[]);
     check(

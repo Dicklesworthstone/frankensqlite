@@ -98,7 +98,6 @@ fn data() -> (Connection, rusqlite::Connection) {
 
 /// bd-fuxgg: frank runs an aggregate placed in WHERE instead of rejecting it.
 #[test]
-#[ignore = "bd-fuxgg: aggregate in WHERE accepted by frank (SQLite rejects 'misuse of aggregate')"]
 fn aggregate_in_where_is_rejected() {
     let (f, r) = data();
     check(
@@ -115,7 +114,6 @@ fn aggregate_in_where_is_rejected() {
 
 /// bd-fuxgg: frank runs a nested aggregate (returns NULL) instead of rejecting.
 #[test]
-#[ignore = "bd-fuxgg: nested aggregate accepted by frank (SQLite rejects 'misuse of aggregate function')"]
 fn nested_aggregate_is_rejected() {
     let (f, r) = data();
     check(
@@ -144,7 +142,6 @@ fn window_function_in_where_is_rejected() {
 /// bd-fuxgg: frank accepts a window function in HAVING / GROUP BY (SQLite rejects
 /// it; window functions are only allowed in SELECT and ORDER BY).
 #[test]
-#[ignore = "bd-fuxgg: window fn in HAVING/GROUP BY accepted by frank (SQLite rejects 'misuse of window function')"]
 fn window_function_in_having_or_group_by_is_rejected() {
     let (f, r) = data();
     check(

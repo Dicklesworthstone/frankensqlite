@@ -23458,6 +23458,11 @@ impl Connection {
                 // bd-c9v0f + bd-pw68x: reject out-of-range ORDER BY/GROUP BY
                 // ordinals and unknown INDEXED BY hints, matching SQLite.
                 self.validate_select_ordinals_and_hints(select)?;
+                // bd-fuxgg: reject aggregate-in-WHERE, nested aggregates,
+                // aggregate/window in GROUP BY, window in HAVING, and aggregates
+                // in a recursive-CTE recursive term, matching SQLite's "misuse"
+                // errors (frank was too permissive).
+                validate_aggregate_window_misuse(select)?;
                 // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
@@ -42213,8 +42218,14 @@ impl Connection {
                         })?;
                     let view_rows =
                         self.execute_statement(&Statement::Select(view.query.clone()), params)?;
-                    let col_names =
-                        self.select_result_column_names(&view.query, &[], &mut Vec::new());
+                    // bd-ws183: an explicit `CREATE VIEW v(c1, c2, ...)` column
+                    // list renames the view's output columns; only fall back to
+                    // the SELECT's own result names when no list was declared.
+                    let col_names = if view.columns.is_empty() {
+                        self.select_result_column_names(&view.query, &[], &mut Vec::new())
+                    } else {
+                        view.columns.clone()
+                    };
                     let width = if col_names.is_empty() {
                         view_rows.first().map_or(1, |r| r.values().len())
                     } else {
@@ -61555,6 +61566,161 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
     }
 }
 
+/// Detect an aggregate function whose own arguments contain another aggregate
+/// (e.g. `sum(count(*))`, `max(avg(x))`), which SQLite rejects as "misuse of
+/// aggregate function". Does not descend into subqueries.
+fn expr_has_nested_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            over: None,
+            ..
+        } => {
+            if is_agg_fn(name) && !is_scalar_max_min(name, args) {
+                if let FunctionArgs::List(exprs) = args {
+                    if exprs.iter().any(expr_has_aggregate) {
+                        return true;
+                    }
+                }
+            }
+            match args {
+                FunctionArgs::List(exprs) => exprs.iter().any(expr_has_nested_aggregate),
+                FunctionArgs::Star => false,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_nested_aggregate(left) || expr_has_nested_aggregate(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_has_nested_aggregate(inner),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_has_nested_aggregate)
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_has_nested_aggregate(w) || expr_has_nested_aggregate(t))
+                || else_expr.as_deref().is_some_and(expr_has_nested_aggregate)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a SELECT core is an aggregate query: explicit GROUP BY/HAVING, or an
+/// aggregate function in a result column. Used to detect recursive-CTE terms
+/// that SQLite rejects ("recursive aggregate queries not supported").
+fn select_core_is_aggregate(core: &SelectCore) -> bool {
+    let SelectCore::Select {
+        columns,
+        group_by,
+        having,
+        ..
+    } = core
+    else {
+        return false;
+    };
+    if !group_by.is_empty() || having.is_some() {
+        return true;
+    }
+    columns.iter().any(|col| {
+        matches!(col, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr))
+    })
+}
+
+/// bd-fuxgg: reject the aggregate/window misuse patterns SQLite rejects but
+/// frank previously accepted. The oracle passes as long as frank errors (it
+/// compares frank-vs-rusqlite and treats both-error as agreement).
+fn validate_aggregate_window_misuse(select: &SelectStatement) -> Result<()> {
+    // Recursive-CTE: an aggregate in the recursive term is unsupported.
+    if let Some(with) = &select.with {
+        if with.recursive {
+            for cte in &with.ctes {
+                for (_, core) in &cte.query.body.compounds {
+                    if select_core_references_table(core, &cte.name)
+                        && select_core_is_aggregate(core)
+                    {
+                        return Err(FrankenError::FunctionError(
+                            "recursive aggregate queries not supported".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    check_core_aggregate_window_misuse(&select.body.select)?;
+    for (_, core) in &select.body.compounds {
+        check_core_aggregate_window_misuse(core)?;
+    }
+    Ok(())
+}
+
+fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {
+    let SelectCore::Select {
+        columns,
+        where_clause,
+        group_by,
+        having,
+        ..
+    } = core
+    else {
+        return Ok(());
+    };
+    // Aggregate or window function directly in WHERE is a misuse (an aggregate
+    // or window nested inside a subquery is its own scope and not flagged).
+    if let Some(w) = where_clause {
+        if expr_has_aggregate(w) {
+            return Err(FrankenError::FunctionError("misuse of aggregate: ".to_owned()));
+        }
+        if expr_has_window_function(w) {
+            return Err(FrankenError::FunctionError(
+                "misuse of window function".to_owned(),
+            ));
+        }
+    }
+    // Aggregate or window function in GROUP BY is rejected.
+    for g in group_by {
+        if expr_has_aggregate(g) {
+            return Err(FrankenError::FunctionError(
+                "aggregate functions are not allowed in the GROUP BY clause".to_owned(),
+            ));
+        }
+        if expr_has_window_function(g) {
+            return Err(FrankenError::FunctionError(
+                "misuse of window function".to_owned(),
+            ));
+        }
+    }
+    // Window function in HAVING is rejected (an aggregate in HAVING is allowed).
+    if let Some(h) = having {
+        if expr_has_window_function(h) {
+            return Err(FrankenError::FunctionError(
+                "misuse of window function".to_owned(),
+            ));
+        }
+        if expr_has_nested_aggregate(h) {
+            return Err(FrankenError::FunctionError(
+                "misuse of aggregate function".to_owned(),
+            ));
+        }
+    }
+    // A nested aggregate anywhere in a result column is a misuse.
+    for col in columns {
+        if let ResultColumn::Expr { expr, .. } = col {
+            if expr_has_nested_aggregate(expr) {
+                return Err(FrankenError::FunctionError(
+                    "misuse of aggregate function".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn collect_aggregate_kind_names(expr: &Expr, out: &mut BTreeSet<String>) {
     match expr {
         Expr::FunctionCall {
@@ -69060,10 +69226,13 @@ fn aggregate_args_len_for_lookup(args: &FunctionArgs) -> i32 {
 
 fn expr_contains_registered_agg(expr: &Expr, registry: &fsqlite_func::FunctionRegistry) -> bool {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
-            if registry
-                .find_aggregate(name, function_args_len(args))
-                .is_some()
+        Expr::FunctionCall {
+            name, args, over, ..
+        } => {
+            if over.is_none()
+                && registry
+                    .find_aggregate(name, function_args_len(args))
+                    .is_some()
                 && !is_scalar_max_min(name, args)
             {
                 return true;
@@ -69151,8 +69320,11 @@ fn expr_contains_custom_registered_agg(
     registry: &fsqlite_func::FunctionRegistry,
 ) -> bool {
     match expr {
-        Expr::FunctionCall { name, args, .. } => {
+        Expr::FunctionCall {
+            name, args, over, ..
+        } => {
             if !is_agg_fn(name)
+                && over.is_none()
                 && !is_scalar_max_min(name, args)
                 && registry
                     .find_aggregate(name, function_args_len(args))
@@ -81911,6 +82083,25 @@ fn emit_expr(
 
         // ── COLLATE: transparent wrapper – evaluate inner expression ─
         Expr::Collate { expr: inner, .. } => emit_expr(builder, inner, target_reg, bind_state),
+
+        // ── JSON ->/->> : lower to the JSON_ARROW / JSON_DOUBLE_ARROW scalar
+        // functions so they work in table-less constant SELECTs (bd-m87j8).
+        Expr::JsonAccess {
+            expr: inner,
+            path,
+            arrow,
+            ..
+        } => {
+            let func = match arrow {
+                JsonArrow::Arrow => "JSON_ARROW",
+                JsonArrow::DoubleArrow => "JSON_DOUBLE_ARROW",
+            };
+            let args =
+                FunctionArgs::List(vec![inner.as_ref().clone(), path.as_ref().clone()]);
+            emit_function_call(
+                builder, func, &args, false, false, false, target_reg, bind_state,
+            )
+        }
 
         _ => Err(FrankenError::NotImplemented(format!(
             "expression form is not supported in this connection path: {expr:?}",

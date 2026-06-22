@@ -149,7 +149,6 @@ fn view_select_expression_aliases() {
 /// Explicit view column-name list `CREATE VIEW v(a,b) AS ...` is ignored
 /// (columns keep their underlying names); tracked in bd-ws183.
 #[test]
-#[ignore = "bd-ws183: CREATE VIEW v(col-list) ignores declared column names"]
 fn view_explicit_column_list() {
     let (f, r) = setup(&[
         base_tables()[0],

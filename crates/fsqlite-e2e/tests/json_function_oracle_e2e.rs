@@ -198,7 +198,6 @@ fn json_quote_function() {
 /// path used for table-less constant SELECTs has no `JsonAccess` arm and errors.
 /// Tracked in bd-m87j8.
 #[test]
-#[ignore = "bd-m87j8: JSON ->/->> unsupported in connection.rs emit_expr table-less constant SELECT path"]
 fn json_arrow_operators() {
     scenario(
         &[],

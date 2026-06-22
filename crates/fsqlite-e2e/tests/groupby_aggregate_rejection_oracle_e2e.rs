@@ -95,7 +95,6 @@ fn check(queries: &[&str], label: &str) {
 }
 
 #[test]
-#[ignore = "bd-fuxgg: aggregate function inside GROUP BY not rejected (sibling of WHERE/nested/window-in-GROUP BY cases on the same bead)"]
 fn group_by_aggregate_rejected() {
     // Aggregate inside GROUP BY itself -> SQLite error on both engines.
     check(
