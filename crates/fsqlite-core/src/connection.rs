@@ -23463,6 +23463,10 @@ impl Connection {
                 // in a recursive-CTE recursive term, matching SQLite's "misuse"
                 // errors (frank was too permissive).
                 validate_aggregate_window_misuse(select)?;
+                // bd-1zc9p: a constant LIMIT/OFFSET that is not losslessly
+                // convertible to an integer (a fractional real, non-numeric
+                // text, NULL, or a blob) is a "datatype mismatch" in SQLite.
+                validate_limit_offset_lossless(select)?;
                 // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
@@ -61757,6 +61761,48 @@ fn validate_aggregate_window_misuse(select: &SelectStatement) -> Result<()> {
         check_core_aggregate_window_misuse(core)?;
     }
     Ok(())
+}
+
+/// bd-1zc9p: reject a constant LIMIT/OFFSET value that SQLite's `OP_MustBeInt`
+/// would reject — a real with a fractional part, non-numeric text, NULL, or a
+/// blob. Integer-valued text (`'3'`), arithmetic expressions, and scalar
+/// subqueries are accepted (the latter two are evaluated by the normal path).
+fn validate_limit_offset_lossless(select: &SelectStatement) -> Result<()> {
+    if let Some(limit) = &select.limit {
+        check_limit_value_lossless(&limit.limit)?;
+        if let Some(offset) = &limit.offset {
+            check_limit_value_lossless(offset)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_limit_value_lossless(expr: &Expr) -> Result<()> {
+    let rejected = match expr {
+        Expr::Literal(Literal::Float(f), _) => f.fract() != 0.0,
+        Expr::Literal(Literal::Null | Literal::Blob(_), _) => true,
+        Expr::Literal(Literal::String(s), _) => !text_is_lossless_integer(s),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate | fsqlite_ast::UnaryOp::Plus,
+            expr: inner,
+            ..
+        } => return check_limit_value_lossless(inner),
+        _ => false,
+    };
+    if rejected {
+        return Err(FrankenError::FunctionError("datatype mismatch".to_owned()));
+    }
+    Ok(())
+}
+
+/// Whether `s` (after trimming) converts losslessly to an integer under
+/// SQLite's numeric affinity rules: an integer-valued decimal string.
+fn text_is_lossless_integer(s: &str) -> bool {
+    let t = s.trim();
+    if t.parse::<i64>().is_ok() {
+        return true;
+    }
+    matches!(t.parse::<f64>(), Ok(f) if f.is_finite() && f.fract() == 0.0)
 }
 
 fn check_core_aggregate_window_misuse(core: &SelectCore) -> Result<()> {

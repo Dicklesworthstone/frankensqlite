@@ -116,7 +116,6 @@ fn limit_offset_lossless_integer_values() {
 }
 
 #[test]
-#[ignore = "bd-1zc9p: frank coerces non-integer LIMIT/OFFSET (real/non-numeric text/NULL); SQLite raises datatype mismatch"]
 fn limit_offset_noninteger_rejected() {
     // SQLite requires a LOSSLESS integer conversion; these all raise
     // "datatype mismatch". frank coerces them (truncate / parse-to-0 / NULL->0).
