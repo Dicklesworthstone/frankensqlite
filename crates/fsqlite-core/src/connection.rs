@@ -47643,6 +47643,106 @@ impl Connection {
                 }
                 Ok(Vec::new())
             }
+            // PRAGMA foreign_key_check [(table)] — report every row whose
+            // foreign key has no matching parent (bd-avlou). Output columns:
+            // table, rowid, referred_table, fkid. Runs regardless of whether
+            // FK enforcement is currently enabled.
+            "foreign_key_check" => {
+                let only_table: Option<String> = match pragma.value.as_ref() {
+                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => match expr {
+                        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                            Some(col_ref.column.to_string())
+                        }
+                        Expr::Literal(Literal::String(s), _) => Some(s.clone()),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                // Snapshot (table, fk defs) for tables with FKs so we don't hold
+                // the schema borrow across the row-scanning queries below.
+                let targets: Vec<(String, Vec<_>)> = {
+                    let schema = self.schema.borrow();
+                    schema
+                        .iter()
+                        .filter(|t| !t.foreign_keys.is_empty())
+                        .filter(|t| {
+                            only_table
+                                .as_ref()
+                                .is_none_or(|n| t.name.eq_ignore_ascii_case(n))
+                        })
+                        .map(|t| (t.name.clone(), t.foreign_keys.clone()))
+                        .collect()
+                };
+                let mut out: Vec<Row> = Vec::new();
+                for (tname, fks) in &targets {
+                    let n_fks = fks.len();
+                    // rowid first, then columns in schema order.
+                    let scan_sql = format!("SELECT rowid, * FROM {}", quote_identifier(tname));
+                    let child_rows = self.query_with_params(&scan_sql, &[])?;
+                    for (decl_idx, fk) in fks.iter().enumerate() {
+                        // FK numbering mirrors foreign_key_list: the last-declared
+                        // FK is id 0 (reverse declaration order).
+                        let fkid = i64::try_from(n_fks - 1 - decl_idx).unwrap_or(0);
+                        // Resolve parent match columns (empty => parent's IPK).
+                        let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                            let schema = self.schema.borrow();
+                            schema
+                                .iter()
+                                .find(|t| t.name.eq_ignore_ascii_case(&fk.parent_table))
+                                .and_then(|p| {
+                                    p.columns
+                                        .iter()
+                                        .find(|c| c.is_ipk)
+                                        .map(|c| vec![c.name.clone()])
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            fk.parent_columns.clone()
+                        };
+                        if parent_cols.is_empty() {
+                            continue;
+                        }
+                        let where_parts: Vec<String> = parent_cols
+                            .iter()
+                            .enumerate()
+                            .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
+                            .collect();
+                        let parent_sql = format!(
+                            "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                            quote_identifier(&fk.parent_table),
+                            where_parts.join(" AND ")
+                        );
+                        for row in &child_rows {
+                            let vals = row.values();
+                            let Some(rowid_val) = vals.first().cloned() else {
+                                continue;
+                            };
+                            // Child column indices are offset by 1 (rowid is col 0).
+                            let child_vals: Vec<SqliteValue> = fk
+                                .child_columns
+                                .iter()
+                                .map(|&ci| vals.get(ci + 1).cloned().unwrap_or(SqliteValue::Null))
+                                .collect();
+                            // A partially/fully NULL child FK is satisfied.
+                            if child_vals.iter().any(SqliteValue::is_null) {
+                                continue;
+                            }
+                            let parent_hit = self.query_with_params(&parent_sql, &child_vals)?;
+                            if parent_hit.is_empty() {
+                                out.push(Row {
+                                    values: vec![
+                                        SqliteValue::Text(tname.clone().into()),
+                                        rowid_val,
+                                        SqliteValue::Text(fk.parent_table.clone().into()),
+                                        SqliteValue::Integer(fkid),
+                                    ],
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
             // PRAGMA foreign_key_list(table_name) — FK constraints.
             // Output: id, seq, table, from, to, on_update, on_delete, match
             "foreign_key_list" => {

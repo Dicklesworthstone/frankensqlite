@@ -149,7 +149,6 @@ fn pragma_foreign_key_check_clean() {
 /// result even when an orphaned child row exists, so it silently reports a clean
 /// database. (The clean-database case passes only because it is also empty.)
 #[test]
-#[ignore = "bd-avlou: PRAGMA foreign_key_check unimplemented (always empty; never reports orphans)"]
 fn pragma_foreign_key_check_reports_violation() {
     // With FK enforcement OFF we can insert an orphan, then foreign_key_check
     // reports it. The reported columns: (table, rowid, referred_table, fkid).
