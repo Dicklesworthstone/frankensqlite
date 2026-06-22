@@ -132,7 +132,6 @@ fn unixepoch_subsec_fractional() {
 }
 
 #[test]
-#[ignore = "bd-uh34b: 'ceiling'/'floor' datetime modifiers unimplemented (return NULL)"]
 fn ceiling_floor_month_overflow() {
     assert_scalar(
         &[
@@ -159,7 +158,6 @@ fn auto_modifier_detects_julian_vs_unix() {
 }
 
 #[test]
-#[ignore = "bd-orw5m: JDN->calendar conversion diverges at extreme Julian day 0 (-4712-01-01 vs SQLite -4713-11-24)"]
 fn julian_day_zero_extreme_date() {
     assert_scalar(
         &[

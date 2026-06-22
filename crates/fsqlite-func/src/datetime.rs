@@ -133,23 +133,25 @@ fn ymd_to_jdn(y: i64, m: i64, d: i64) -> f64 {
 /// than panicking.  Callers that care about validity should bounds-check
 /// the JDN before calling.
 fn jdn_to_ymd(jdn: f64) -> (i64, i64, i64) {
+    // Mirror SQLite's computeYMD (date.c): a proleptic-Gregorian conversion that
+    // ALWAYS applies the centurial leap correction, using C-style truncation
+    // toward zero (Rust `as i64` casts, not `floor`) so that extreme pre-historic
+    // JDN values near 0 agree with SQLite (JDN 0 → -4713-11-24 12:00) instead of
+    // diverging via a mixed Julian/Gregorian calendar split.
     let z = (jdn + 0.5).floor() as i64;
-    let a = if z < 2_299_161 {
-        z
-    } else {
-        let alpha = ((z as f64 - 1_867_216.25) / 36524.25).floor() as i64;
-        z.saturating_add(1)
-            .saturating_add(alpha)
-            .saturating_sub(alpha / 4)
-    };
+    let alpha = ((z as f64 - 1_867_216.25) / 36524.25) as i64;
+    let a = z
+        .saturating_add(1)
+        .saturating_add(alpha)
+        .saturating_sub(alpha / 4);
     let b = a.saturating_add(1524);
-    let c = ((b as f64 - 122.1) / 365.25).floor() as i64;
-    let d = (365.25 * c as f64).floor() as i64;
-    let e = ((b.saturating_sub(d)) as f64 / 30.6001).floor() as i64;
+    let c = ((b as f64 - 122.1) / 365.25) as i64;
+    let d = (365.25 * c as f64) as i64;
+    let e = ((b.saturating_sub(d)) as f64 / 30.6001) as i64;
 
     let day = b
         .saturating_sub(d)
-        .saturating_sub((30.6001 * e as f64).floor() as i64);
+        .saturating_sub((30.6001 * e as f64) as i64);
     let month = if e < 14 {
         e.saturating_sub(1)
     } else {
@@ -560,14 +562,50 @@ fn apply_month_delta(months: f64) -> f64 {
     months * 30.436875
 }
 
+/// SQLite's `computeFloor` (date.c): given a (possibly day-of-month-overflowing)
+/// Y-M-D, return how many days must be subtracted to bring the date back to the
+/// last valid day of month `m`.  Consumed by the `'floor'` datetime modifier.
+fn compute_floor(y: i64, m: i64, d: i64) -> i64 {
+    if d <= 28 {
+        0
+    } else if ((1_i64 << m) & 0x15aa) != 0 {
+        // 31-day month (Jan, Mar, May, Jul, Aug, Oct, Dec): days 29-31 all valid.
+        0
+    } else if m != 2 {
+        // 30-day month (Apr, Jun, Sep, Nov): only day 31 overflows, by 1.
+        i64::from(d == 31)
+    } else if y % 4 != 0 || (y % 100 == 0 && y % 400 != 0) {
+        d - 28 // non-leap February
+    } else {
+        d - 29 // leap February
+    }
+}
+
 /// Apply a sequence of modifiers, also tracking the 'subsec' flag.
 fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
     let mut j = jdn;
     let mut subsec = false;
+    // Pending day-of-month overflow from the most recent +N month/year shift,
+    // consumed by a later 'floor' modifier (mirrors SQLite's DateTime.nFloor).
+    let mut n_floor: i64 = 0;
     for m in modifiers {
         let m_lower = m.trim().to_ascii_lowercase();
         if m_lower == "subsec" || m_lower == "subsecond" {
             subsec = true;
+            continue;
+        }
+        // 'ceiling' is the default day-of-month-overflow behavior (roll forward
+        // into the next month); it merely clears any pending floor adjustment.
+        // 'floor' rolls the date back to the last day of the prior month by
+        // subtracting the overflow days that the preceding month/year shift left.
+        if m_lower == "ceiling" {
+            n_floor = 0;
+            continue;
+        }
+        if m_lower == "floor" {
+            j -= n_floor as f64;
+            n_floor = 0;
+            continue;
         }
         // Month/year modifiers need special handling for exact date math.
         // If exact arithmetic overflows (returns None), the modifier is
@@ -576,15 +614,19 @@ fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
         // panics in jdn_to_ymd.
         if is_month_year_modifier(&m_lower) {
             match apply_month_year_exact(j, &m_lower) {
-                Ok(new_jdn) => {
-                    j = new_jdn?;
+                Ok(Some((new_jdn, nf))) => {
+                    j = new_jdn;
+                    n_floor = nf;
                     continue;
                 }
+                Ok(None) => return None,
                 Err(()) => {
                     // Fall through to `apply_modifier` for fractional values
                 }
             }
         }
+        // Any other date-changing modifier clears the pending floor.
+        n_floor = 0;
         j = apply_modifier(j, m)?;
     }
     Some((j, subsec))
@@ -595,10 +637,11 @@ fn is_month_year_modifier(m: &str) -> bool {
 }
 
 /// Exact month/year arithmetic by decomposing to YMD.
-/// Returns Ok(Some(jdn)) for exact application.
+/// Returns Ok(Some((jdn, n_floor))) for exact application, where `n_floor` is
+/// the day-of-month overflow (days to subtract for a later `'floor'` modifier).
 /// Returns Ok(None) for overflow.
 /// Returns Err(()) if the modifier is not an integer, so it should fall back.
-fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<f64>, ()> {
+fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64, i64)>, ()> {
     let (sign, rest) = if let Some(r) = m.strip_prefix('+') {
         (1_i64, r.trim())
     } else if let Some(r) = m.strip_prefix('-') {
@@ -660,8 +703,11 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<f64>,
     let new_y = new_total.div_euclid(12);
     let new_mo = new_total.rem_euclid(12) + 1;
     // Do NOT clamp `d` to the target month's day count.  C SQLite lets
-    // out-of-range days overflow via JDN arithmetic (e.g. Feb 31 → Mar 3).
-    Ok(Some(ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac)))
+    // out-of-range days overflow via JDN arithmetic (e.g. Feb 31 → Mar 3) for
+    // the default/`'ceiling'` behavior; the `'floor'` modifier later subtracts
+    // the reported `n_floor` overflow days to clamp back to end-of-month.
+    let n_floor = compute_floor(new_y, new_mo, d);
+    Ok(Some((ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac), n_floor)))
 }
 
 // ── Output Formatters ─────────────────────────────────────────────────────
