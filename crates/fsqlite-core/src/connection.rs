@@ -69274,11 +69274,25 @@ fn rewrite_in_expr(
                     // IN subqueries intact so recursive rewrite-time dispatch
                     // does not lose those ephemeral relations.
                     let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
-                    let literals: Vec<Expr> = rows
-                        .into_iter()
-                        .filter_map(|row| row.values.into_iter().next())
-                        .map(value_to_literal_expr)
-                        .collect();
+                    // bd-7ccda: for a row-value LHS — `(a, b) IN (SELECT x, y …)`
+                    // — build a tuple literal per row from ALL projected columns
+                    // so the multi-column IN → OR expansion below can match. A
+                    // scalar LHS keeps the first column only.
+                    let literals: Vec<Expr> = if matches!(inner.as_ref(), Expr::RowValue(..)) {
+                        rows.into_iter()
+                            .map(|row| {
+                                Expr::RowValue(
+                                    row.values.into_iter().map(value_to_literal_expr).collect(),
+                                    fsqlite_ast::Span::new(0, 0),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        rows.into_iter()
+                            .filter_map(|row| row.values.into_iter().next())
+                            .map(value_to_literal_expr)
+                            .collect()
+                    };
                     *set = InSet::List(literals);
                 }
             }

@@ -240,7 +240,6 @@ fn nested_subqueries() {
 /// Row-value IN against a subquery RHS is broken (matches nothing); tracked in
 /// bd-7ccda. Row-value IN against a literal list works.
 #[test]
-#[ignore = "bd-7ccda: (a,b) IN (SELECT ...) row-value IN with subquery RHS matches nothing"]
 fn multi_column_in_subquery() {
     let (f, r) = setup(&two_tables());
     check(
