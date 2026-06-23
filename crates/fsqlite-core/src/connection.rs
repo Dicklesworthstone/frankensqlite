@@ -12160,6 +12160,9 @@ impl Connection {
             || select_contains_match_operator(select)
             || select_contains_rewritable_subquery(select)
             || select_has_correlated_join_subquery(select)
+            // bd-xplxa: single min/max + bare columns must source bare columns
+            // from the extremum row, which the storage substrate does not track.
+            || select_minmax_bare_tracking(select).is_some()
         {
             return false;
         }
@@ -23679,6 +23682,25 @@ impl Connection {
                     Ok(rows)
                 } else if custom_implicit_aggregate {
                     self.log_mem_execution_fallback("select", "custom_aggregate_fallback")?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows = self.execute_group_by_select(&bound, None)?;
+                    if distinct {
+                        dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
+                } else if implicit_aggregate && select_minmax_bare_tracking(select).is_some() {
+                    // bd-xplxa: a whole-table query whose only aggregate is a
+                    // single min()/max() with bare columns must take the bare
+                    // columns from the extremum row. The plain VDBE max/min fast
+                    // path returns an arbitrary row, so route to the grouped
+                    // interpreter which sources bare columns from that row.
+                    self.log_mem_execution_fallback("select", "minmax_bare_tracking_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -49004,7 +49026,10 @@ impl Connection {
 
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
-        let canonical_select = canonicalize_select_placeholders(select)?;
+        let mut canonical_select = canonicalize_select_placeholders(select)?;
+        // bd-l2si0: expand row-value (tuple) comparisons into scalar boolean
+        // expressions before codegen, which otherwise collapses them to false.
+        rewrite_row_value_comparisons_in_select(&mut canonical_select);
         let canonical_sql = canonical_select.to_string();
         let feature_flags = PlannerFeatureFlags::default();
         // The planner may consult sqlite_stat1 through `self.query()`, which can
@@ -52022,13 +52047,22 @@ impl Connection {
             .map(|expr| expr_effective_collation_for_table(expr, &table_schema))
             .collect();
 
-        let simple_streaming_outputs = build_simple_streaming_group_by_outputs(
-            &result_descriptors,
-            having_expr,
-            &select.order_by,
-            &expanded_columns,
-            &group_collations,
-        );
+        // bd-xplxa: when a single min()/max() with bare columns must track the
+        // extremum row, the streaming fast paths (which take an arbitrary row for
+        // bare columns) cannot express it. Disqualify them so the row-grouping
+        // loop below applies the extremum-row sourcing.
+        let minmax_bare_tracking = select_minmax_bare_tracking(select);
+        let simple_streaming_outputs = if minmax_bare_tracking.is_some() {
+            None
+        } else {
+            build_simple_streaming_group_by_outputs(
+                &result_descriptors,
+                having_expr,
+                &select.order_by,
+                &expanded_columns,
+                &group_collations,
+            )
+        };
         // FIX: Only use the mem-scan fast path when there is NO WHERE clause.
         // The streaming mem-scan reads all rows from MemDB without filtering.
         // Queries with WHERE must fall through to the VDBE path which compiles
@@ -52142,6 +52176,13 @@ impl Connection {
         let mut result = Vec::with_capacity(groups.len());
         for (_key, group_rows) in &groups {
             let mut values = Vec::with_capacity(result_descriptors.len());
+            // bd-xplxa: representative row for bare (non-aggregate) columns — the
+            // min/max extremum row when that tracking pattern applies, otherwise
+            // the first row of the group (an arbitrary but stable choice).
+            let repr_row: Option<&Vec<SqliteValue>> = match &minmax_bare_tracking {
+                Some((is_max, arg)) => group_extremum_row(group_rows, arg, *is_max, &col_map),
+                None => group_rows.first(),
+            };
             for desc in &result_descriptors {
                 match desc {
                     GroupByColumn::Plain(expr) => {
@@ -52167,14 +52208,14 @@ impl Connection {
                         } else if expr_has_any_subquery(expr) {
                             // Correlated scalar subqueries need to be inlined
                             // with the representative row's column values.
-                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
+                            repr_row.map_or(Ok(SqliteValue::Null), |r| {
                                 let inlined = self
                                     .inline_subqueries_in_expr(expr, r, &col_map)
                                     .unwrap_or_else(|_| (**expr).clone());
                                 eval_join_expr(&inlined, r, &col_map)
                             })?
                         } else {
-                            group_rows.first().map_or(Ok(SqliteValue::Null), |r| {
+                            repr_row.map_or(Ok(SqliteValue::Null), |r| {
                                 eval_join_expr(expr, r, &col_map)
                             })?
                         };
@@ -61878,6 +61919,111 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
     }
 }
 
+/// bd-xplxa: Detect SQLite's "bare column tracks the min()/max() row" special
+/// case. It applies when a query's ONLY aggregate is a single `min(x)` or
+/// `max(x)` (one argument, no window spec) and at least one result column is a
+/// bare (un-grouped, non-aggregate) value. SQLite then sources every bare column
+/// from the row that produced the extremum rather than an arbitrary row.
+/// Returns `(is_max, arg_expr)` of that aggregate, or `None` otherwise.
+fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr)> {
+    if !select.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select {
+        columns,
+        from: Some(_),
+        group_by,
+        having,
+        ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    // Leave HAVING queries on the existing path; the optimization interacts with
+    // post-aggregate filtering in ways not exercised here.
+    if having.is_some() {
+        return None;
+    }
+    let mut minmax: Option<(bool, Expr)> = None;
+    let mut agg_count = 0usize;
+    let mut has_bare = false;
+    for col in columns {
+        let ResultColumn::Expr { expr, .. } = col else {
+            return None;
+        };
+        match expr {
+            Expr::FunctionCall {
+                name,
+                args,
+                over: None,
+                ..
+            } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
+                agg_count += 1;
+                let arg = match args {
+                    FunctionArgs::List(a) if a.len() == 1 => &a[0],
+                    _ => return None,
+                };
+                let lname = name.to_ascii_lowercase();
+                if lname != "min" && lname != "max" {
+                    return None;
+                }
+                if minmax.is_some() {
+                    return None;
+                }
+                minmax = Some((lname == "max", arg.clone()));
+            }
+            _ => {
+                if expr_has_aggregate(expr) {
+                    return None;
+                }
+                if !group_by.iter().any(|g| g == expr) {
+                    has_bare = true;
+                }
+            }
+        }
+    }
+    if agg_count == 1 && has_bare {
+        minmax
+    } else {
+        None
+    }
+}
+
+/// bd-xplxa: Return the row in `group_rows` that yields the min/max value of
+/// `arg` (NULLs ignored, matching SQLite's min/max). Ties resolve to the first
+/// such row. Falls back to the first row when no non-NULL extremum exists.
+fn group_extremum_row<'a>(
+    group_rows: &'a [Vec<SqliteValue>],
+    arg: &Expr,
+    is_max: bool,
+    col_map: &[(String, String, bool)],
+) -> Option<&'a Vec<SqliteValue>> {
+    let mut best: Option<(&'a Vec<SqliteValue>, SqliteValue)> = None;
+    for row in group_rows {
+        let Ok(value) = eval_join_expr(arg, row.as_slice(), col_map) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let replace = match &best {
+            None => true,
+            Some((_, current)) => {
+                let ord = cmp_sqlite_values(&value, current);
+                if is_max {
+                    ord == std::cmp::Ordering::Greater
+                } else {
+                    ord == std::cmp::Ordering::Less
+                }
+            }
+        };
+        if replace {
+            best = Some((row, value));
+        }
+    }
+    best.map(|(row, _)| row).or_else(|| group_rows.first())
+}
+
 /// Detect an aggregate function whose own arguments contain another aggregate
 /// (e.g. `sum(count(*))`, `max(avg(x))`), which SQLite rejects as "misuse of
 /// aggregate function". Does not descend into subqueries.
@@ -69234,6 +69380,310 @@ fn rewrite_in_limit_clause(
         rewrite_dml_in_expr(offset, conn, rewrite_in_subqueries, params)?;
     }
     Ok(())
+}
+
+/// bd-l2si0: Expand a row-value (tuple) comparison `(a0,..) OP (b0,..)` into the
+/// equivalent scalar boolean expression. SQLite defines row-value comparisons
+/// element-wise (`=`/`<>`) and lexicographically (`<`/`<=`/`>`/`>=`) with the
+/// usual three-valued logic; the VDBE codegen otherwise silently collapses such
+/// comparisons to false, and the table-less expression path errors on a bare
+/// `RowValue`. Both operands must be the same non-empty length; returns `None`
+/// for unsupported operators (e.g. `IS`) so the caller leaves the node intact.
+fn expand_row_value_comparison(a: &[Expr], b: &[Expr], op: BinaryOp, span: Span) -> Option<Expr> {
+    let cmp = |l: &Expr, r: &Expr, o: BinaryOp| Expr::BinaryOp {
+        left: Box::new(l.clone()),
+        op: o,
+        right: Box::new(r.clone()),
+        span,
+    };
+    let join = |op: BinaryOp| {
+        move |acc: Expr, e: Expr| Expr::BinaryOp {
+            left: Box::new(acc),
+            op,
+            right: Box::new(e),
+            span,
+        }
+    };
+    match op {
+        // (a,b) = (c,d)  ->  a = c AND b = d
+        BinaryOp::Eq => a
+            .iter()
+            .zip(b)
+            .map(|(l, r)| cmp(l, r, BinaryOp::Eq))
+            .reduce(join(BinaryOp::And)),
+        // (a,b) <> (c,d)  ->  a <> c OR b <> d
+        BinaryOp::Ne => a
+            .iter()
+            .zip(b)
+            .map(|(l, r)| cmp(l, r, BinaryOp::Ne))
+            .reduce(join(BinaryOp::Or)),
+        // Lexicographic: a0 STRICT b0 OR (a0 = b0 AND <rest>), last element uses
+        // the original (possibly non-strict) operator.
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            let strict = match op {
+                BinaryOp::Lt | BinaryOp::Le => BinaryOp::Lt,
+                _ => BinaryOp::Gt,
+            };
+            Some(expand_row_value_order(a, b, strict, op, span))
+        }
+        _ => None,
+    }
+}
+
+/// Recursive lexicographic expansion helper for [`expand_row_value_comparison`].
+fn expand_row_value_order(
+    a: &[Expr],
+    b: &[Expr],
+    strict: BinaryOp,
+    last: BinaryOp,
+    span: Span,
+) -> Expr {
+    let cmp = |l: &Expr, r: &Expr, o: BinaryOp| Expr::BinaryOp {
+        left: Box::new(l.clone()),
+        op: o,
+        right: Box::new(r.clone()),
+        span,
+    };
+    if a.len() == 1 {
+        return cmp(&a[0], &b[0], last);
+    }
+    let head_strict = cmp(&a[0], &b[0], strict);
+    let head_eq = cmp(&a[0], &b[0], BinaryOp::Eq);
+    let rest = expand_row_value_order(&a[1..], &b[1..], strict, last, span);
+    let and_part = Expr::BinaryOp {
+        left: Box::new(head_eq),
+        op: BinaryOp::And,
+        right: Box::new(rest),
+        span,
+    };
+    Expr::BinaryOp {
+        left: Box::new(head_strict),
+        op: BinaryOp::Or,
+        right: Box::new(and_part),
+        span,
+    }
+}
+
+/// bd-l2si0: Recursively expand every `RowValue OP RowValue` comparison in an
+/// expression tree. `IN (list)` / `IN (SELECT ...)` row values are handled by
+/// `rewrite_in_expr` and are only descended into here, not transformed.
+fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => {
+            let l = rewrite_row_value_comparisons(left);
+            let r = rewrite_row_value_comparisons(right);
+            if let (Expr::RowValue(la, _), Expr::RowValue(ra, _)) = (&l, &r) {
+                if !la.is_empty() && la.len() == ra.len() {
+                    if let Some(expanded) = expand_row_value_comparison(la, ra, *op, *span) {
+                        return expanded;
+                    }
+                }
+            }
+            Expr::BinaryOp {
+                left: Box::new(l),
+                op: *op,
+                right: Box::new(r),
+                span: *span,
+            }
+        }
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_row_value_comparisons(inner)),
+            span: *span,
+        },
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            low: Box::new(rewrite_row_value_comparisons(low)),
+            high: Box::new(rewrite_row_value_comparisons(high)),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr: e,
+            set,
+            not,
+            span,
+        } => Expr::In {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            set: match set {
+                InSet::List(items) => {
+                    InSet::List(items.iter().map(rewrite_row_value_comparisons).collect())
+                }
+                other => other.clone(),
+            },
+            not: *not,
+            span: *span,
+        },
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            pattern: Box::new(rewrite_row_value_comparisons(pattern)),
+            escape: escape
+                .as_ref()
+                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
+            op: *op,
+            not: *not,
+            span: *span,
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
+            whens: whens
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_row_value_comparisons(w),
+                        rewrite_row_value_comparisons(t),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
+            span: *span,
+        },
+        Expr::Cast {
+            expr: e,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => Expr::FunctionCall {
+            name: name.clone(),
+            args: match args {
+                FunctionArgs::List(exprs) => {
+                    FunctionArgs::List(exprs.iter().map(rewrite_row_value_comparisons).collect())
+                }
+                FunctionArgs::Star => FunctionArgs::Star,
+            },
+            distinct: *distinct,
+            order_by: order_by.clone(),
+            filter: filter
+                .as_ref()
+                .map(|x| Box::new(rewrite_row_value_comparisons(x))),
+            over: over.clone(),
+            span: *span,
+        },
+        Expr::Collate {
+            expr: e,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            collation: collation.clone(),
+            span: *span,
+        },
+        Expr::IsNull { expr: e, not, span } => Expr::IsNull {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            not: *not,
+            span: *span,
+        },
+        Expr::JsonAccess {
+            expr: e,
+            path,
+            arrow,
+            span,
+        } => Expr::JsonAccess {
+            expr: Box::new(rewrite_row_value_comparisons(e)),
+            path: Box::new(rewrite_row_value_comparisons(path)),
+            arrow: *arrow,
+            span: *span,
+        },
+        Expr::RowValue(items, span) => Expr::RowValue(
+            items.iter().map(rewrite_row_value_comparisons).collect(),
+            *span,
+        ),
+        Expr::Literal(..)
+        | Expr::Column(..)
+        | Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(..) => expr.clone(),
+    }
+}
+
+/// bd-l2si0: Apply [`rewrite_row_value_comparisons`] across every expression in
+/// a SELECT (result columns, WHERE/HAVING, GROUP BY, ORDER BY, and compounds).
+fn rewrite_row_value_comparisons_in_select(select: &mut SelectStatement) {
+    rewrite_row_value_comparisons_in_select_core(&mut select.body.select);
+    for (_, core) in &mut select.body.compounds {
+        rewrite_row_value_comparisons_in_select_core(core);
+    }
+    for term in &mut select.order_by {
+        term.expr = rewrite_row_value_comparisons(&term.expr);
+    }
+}
+
+fn rewrite_row_value_comparisons_in_select_core(core: &mut SelectCore) {
+    match core {
+        SelectCore::Select {
+            columns,
+            where_clause,
+            group_by,
+            having,
+            ..
+        } => {
+            for col in columns.iter_mut() {
+                if let ResultColumn::Expr { expr, .. } = col {
+                    *expr = rewrite_row_value_comparisons(expr);
+                }
+            }
+            if let Some(w) = where_clause.as_mut() {
+                **w = rewrite_row_value_comparisons(w.as_ref());
+            }
+            for g in group_by.iter_mut() {
+                *g = rewrite_row_value_comparisons(g);
+            }
+            if let Some(h) = having.as_mut() {
+                **h = rewrite_row_value_comparisons(h.as_ref());
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows.iter_mut() {
+                for e in row.iter_mut() {
+                    *e = rewrite_row_value_comparisons(e);
+                }
+            }
+        }
+    }
 }
 
 ///
@@ -82145,6 +82595,16 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
             "compound SELECT is not supported in this connection path".to_owned(),
         ));
     }
+
+    // bd-l2si0: expand row-value (tuple) comparisons (e.g. `SELECT (1,2) < (1,3)`
+    // or `SELECT 1 WHERE (1,NULL) = (1,2)`) into scalar boolean expressions; the
+    // table-less expression codegen otherwise cannot lower a bare `RowValue`.
+    let rewritten_select = {
+        let mut owned = select.clone();
+        rewrite_row_value_comparisons_in_select(&mut owned);
+        owned
+    };
+    let select = &rewritten_select;
 
     let mut builder = ProgramBuilder::new();
     let mut bind_state = BindParamState::default();

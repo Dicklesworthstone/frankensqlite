@@ -99,7 +99,6 @@ const DATA: [&str; 2] = [
 ];
 
 #[test]
-#[ignore = "bd-l2si0: row-value `=`/`<>` in WHERE silently returns no rows (collapses to false in VDBE codegen)"]
 fn rowvalue_equality() {
     scenario(
         &DATA,
@@ -129,7 +128,6 @@ fn rowvalue_in_list() {
 }
 
 #[test]
-#[ignore = "bd-l2si0: row-value `<`/`<=`/`>=` in WHERE silently returns no rows; constant tuple comparison errors in connection.rs emit_expr"]
 fn rowvalue_lexicographic_order() {
     scenario(
         &DATA,
@@ -148,7 +146,6 @@ fn rowvalue_lexicographic_order() {
 }
 
 #[test]
-#[ignore = "bd-l2si0: row-value `IN (SELECT ...)` silently returns no rows (IN-list form works; subquery form does not)"]
 fn rowvalue_in_subquery() {
     scenario(
         &[
@@ -167,7 +164,6 @@ fn rowvalue_in_subquery() {
 }
 
 #[test]
-#[ignore = "bd-l2si0: constant-path row-value equality errors in connection.rs emit_expr (RowValue arm missing)"]
 fn rowvalue_null_in_in_list() {
     scenario(
         &DATA,

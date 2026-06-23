@@ -185,7 +185,6 @@ fn having_references_and_distinct() {
 }
 
 #[test]
-#[ignore = "bd-xplxa: bare columns don't track the min()/max() row (frank returns an arbitrary row)"]
 fn bare_column_tracks_min_max_row() {
     // SQLite special case: when a query has a single min()/max() and bare
     // (un-aggregated) columns, those columns are taken from the row that
