@@ -987,6 +987,7 @@ fn parse_create_index_sql_to_schema(
         where_clause,
         is_unique,
         key_collations: collations,
+        conflict_action: None,
     })
 }
 
@@ -1047,6 +1048,7 @@ fn create_index_statement_to_index_schema(
         where_clause: create.where_clause.as_ref().map(ToString::to_string),
         is_unique: create.unique,
         key_collations,
+        conflict_action: None,
     }
 }
 
@@ -1336,6 +1338,13 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                         None
                     }
                 })],
+                conflict_action: column.constraints.iter().find_map(|constraint| {
+                    match &constraint.kind {
+                        ColumnConstraintKind::Unique { conflict }
+                        | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                        _ => None,
+                    }
+                }),
             });
             autoindex_ordinal += 1;
         }
@@ -1392,6 +1401,11 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 .into_iter()
                 .map(|(_, collation)| collation)
                 .collect(),
+            conflict_action: match &constraint.kind {
+                TableConstraintKind::Unique { conflict, .. }
+                | TableConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                _ => None,
+            },
         });
         autoindex_ordinal += 1;
     }
@@ -1657,6 +1671,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 generated_expr: None,
                 generated_stored: None,
                 collation,
+                conflict_action: None,
             })
         })
         .collect()
@@ -1760,6 +1775,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         });
     }
 
@@ -1776,6 +1792,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         });
     }
 
@@ -2488,6 +2505,20 @@ pub(crate) fn columns_from_create_table_statement(
                         None
                     }
                 });
+                // Per-constraint ON CONFLICT: PRIMARY KEY clause for the rowid
+                // alias, NOT NULL clause otherwise (UNIQUE conflicts live on the
+                // backing index).
+                let conflict_action = if is_ipk {
+                    col.constraints.iter().find_map(|constraint| match &constraint.kind {
+                        ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                        _ => None,
+                    })
+                } else {
+                    col.constraints.iter().find_map(|constraint| match &constraint.kind {
+                        ColumnConstraintKind::NotNull { conflict } => *conflict,
+                        _ => None,
+                    })
+                };
 
                 ColumnInfo {
                     name: col.name.clone(),
@@ -2501,6 +2532,7 @@ pub(crate) fn columns_from_create_table_statement(
                     generated_expr,
                     generated_stored,
                     collation,
+                    conflict_action,
                 }
             })
             .collect(),
@@ -3169,6 +3201,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -3182,6 +3215,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: Vec::new(),
@@ -3476,6 +3510,7 @@ mod tests {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         };
         let mut required = column("required", 'B', false);
         required.notnull = true;
@@ -3635,6 +3670,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 }],
                 indexes: Vec::new(),
                 strict: false,
@@ -3658,6 +3694,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 }],
                 indexes: Vec::new(),
                 strict: false,
@@ -4042,6 +4079,7 @@ PRAGMA integrity_check;
                 generated_expr: None,
                 generated_stored: None,
                 collation: None,
+                conflict_action: None,
             }],
             indexes: Vec::new(),
             strict: true,
@@ -4076,6 +4114,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -4089,6 +4128,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: Vec::new(),
@@ -4121,6 +4161,7 @@ PRAGMA integrity_check;
                 generated_expr: None,
                 generated_stored: None,
                 collation: None,
+                conflict_action: None,
             }],
             indexes: Vec::new(),
             strict: false,
@@ -4152,6 +4193,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: Some("noca\"se".to_owned()),
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "parent\"id".to_owned(),
@@ -4165,6 +4207,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: Vec::new(),
@@ -4212,6 +4255,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "body".to_owned(),
@@ -4225,6 +4269,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: Vec::new(),
@@ -4261,6 +4306,7 @@ PRAGMA integrity_check;
                 generated_expr: None,
                 generated_stored: None,
                 collation: None,
+                conflict_action: None,
             }],
             indexes: Vec::new(),
             strict: true,
@@ -4292,6 +4338,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "slug".to_owned(),
@@ -4305,6 +4352,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![IndexSchema {
@@ -4316,6 +4364,7 @@ PRAGMA integrity_check;
                 where_clause: None,
                 is_unique: true,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -4613,6 +4662,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -4626,6 +4676,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "is_active".to_owned(),
@@ -4639,6 +4690,7 @@ PRAGMA integrity_check;
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![IndexSchema {
@@ -4650,6 +4702,7 @@ PRAGMA integrity_check;
                 where_clause: Some("is_active = 1".to_owned()),
                 is_unique: true,
                 key_collations: vec![None],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,

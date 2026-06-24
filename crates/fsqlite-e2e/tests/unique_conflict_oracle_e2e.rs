@@ -198,7 +198,6 @@ fn insert_or_fail_errors() {
 }
 
 #[test]
-#[ignore = "bd-24hno: column/table-level ON CONFLICT clause ignored for plain INSERT"]
 fn column_level_on_conflict_ignore() {
     scenario(
         &[

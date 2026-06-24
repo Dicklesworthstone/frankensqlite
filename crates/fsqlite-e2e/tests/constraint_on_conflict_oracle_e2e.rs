@@ -97,7 +97,6 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 /// bd-587fx: a plain INSERT violating UNIQUE ON CONFLICT REPLACE should replace
 /// the conflicting row; frank errors instead (only UNIQUE+IGNORE is honored).
 #[test]
-#[ignore = "bd-587fx: UNIQUE ON CONFLICT REPLACE not applied (frank errors instead of replacing)"]
 fn unique_on_conflict_replace() {
     scenario(
         &[
@@ -113,7 +112,6 @@ fn unique_on_conflict_replace() {
 /// bd-587fx: PRIMARY KEY ON CONFLICT IGNORE should skip a duplicate-PK insert;
 /// frank errors instead.
 #[test]
-#[ignore = "bd-587fx: PRIMARY KEY ON CONFLICT IGNORE not applied (frank errors on duplicate PK)"]
 fn primary_key_on_conflict_ignore() {
     scenario(
         &[
@@ -130,7 +128,6 @@ fn primary_key_on_conflict_ignore() {
 /// bd-587fx: NOT NULL ON CONFLICT IGNORE should skip a row with a NULL in that
 /// column; frank errors instead.
 #[test]
-#[ignore = "bd-587fx: NOT NULL ON CONFLICT IGNORE not applied (frank errors on NULL)"]
 fn not_null_on_conflict_ignore() {
     scenario(
         &[

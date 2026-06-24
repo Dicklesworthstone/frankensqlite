@@ -82,6 +82,18 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
     }
 }
 
+/// Resolve the effective conflict algorithm for a single constraint.
+///
+/// A statement-level `INSERT OR <algo>` (`stmt_level`) overrides a constraint's
+/// declared `ON CONFLICT <algo>` (`constraint_level`); absent both, the default
+/// is ABORT.
+fn effective_oe(
+    stmt_level: Option<ConflictAction>,
+    constraint_level: Option<ConflictAction>,
+) -> u16 {
+    conflict_action_to_oe(stmt_level.or(constraint_level).as_ref())
+}
+
 fn json_access_func_name(arrow: JsonArrow) -> &'static str {
     match arrow {
         JsonArrow::Arrow => "JSON_ARROW",
@@ -123,6 +135,11 @@ pub struct ColumnInfo {
     /// Column collation sequence name (e.g. "NOCASE", "BINARY", "RTRIM").
     /// `None` means the default (BINARY).
     pub collation: Option<String>,
+    /// Conflict-resolution algorithm declared on this column's NOT NULL or
+    /// (INTEGER PRIMARY KEY) constraint via `ON CONFLICT <algo>`. `None` means
+    /// the default (ABORT). UNIQUE-constraint conflict actions live on the
+    /// corresponding `IndexSchema::conflict_action` instead.
+    pub conflict_action: Option<ConflictAction>,
 }
 
 impl ColumnInfo {
@@ -141,6 +158,7 @@ impl ColumnInfo {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         }
     }
 }
@@ -175,6 +193,10 @@ pub struct IndexSchema {
     /// `None` means "use the default (BINARY) collation" for that position.
     /// Empty vec means "all BINARY" for legacy callers/tests.
     pub key_collations: Vec<Option<String>>,
+    /// Conflict-resolution algorithm declared on the UNIQUE / PRIMARY KEY
+    /// constraint backing this index via `ON CONFLICT <algo>`. `None` means the
+    /// default (ABORT) unless overridden by a statement-level `INSERT OR <algo>`.
+    pub conflict_action: Option<ConflictAction>,
 }
 
 impl IndexSchema {
@@ -8714,6 +8736,7 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         }],
         indexes: vec![],
         strict: false,
@@ -8760,6 +8783,7 @@ fn emit_simple_agg_wrapper(
         generated_expr: None,
         generated_stored: None,
         collation: None,
+        conflict_action: None,
     }];
     let fake_table = TableSchema {
         name: String::new(),
@@ -8810,6 +8834,7 @@ fn emit_multi_agg_wrapper(
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         })
         .collect();
     let fake_table = TableSchema {
@@ -10895,6 +10920,15 @@ pub fn codegen_insert(
     } else {
         (conflict_action_to_oe(stmt.or_conflict.as_ref()), None)
     };
+    // Statement-level conflict algorithm: an explicit `INSERT OR <algo>`
+    // overrides per-constraint `ON CONFLICT` clauses. For an upsert we keep the
+    // upsert's IGNORE semantics on the non-conflict path (so per-constraint
+    // actions are not re-applied on top of it).
+    let stmt_level: Option<ConflictAction> = if stmt.upsert.is_empty() {
+        stmt.or_conflict
+    } else {
+        Some(ConflictAction::Ignore)
+    };
     if let Some(UpsertClause {
         action: UpsertAction::Update {
             assignments,
@@ -10931,6 +10965,7 @@ pub fn codegen_insert(
                     target_alias,
                     ctx,
                     oe_flag,
+                    stmt_level,
                     upsert_clause,
                 )?;
             } else {
@@ -10946,6 +10981,7 @@ pub fn codegen_insert(
                     target_alias,
                     ctx,
                     oe_flag,
+                    stmt_level,
                     upsert_clause,
                 )?;
             }
@@ -10969,6 +11005,7 @@ pub fn codegen_insert(
                 target_alias,
                 ctx,
                 oe_flag,
+                stmt_level,
                 expected_cols,
                 target_mapping
                     .as_ref()
@@ -11031,7 +11068,15 @@ pub fn codegen_insert(
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
             emit_check_constraints(b, table, col_regs, None);
-            emit_not_null_constraints(b, table, col_regs, None);
+            emit_not_null_constraints(b, table, col_regs, stmt_level, None);
+            let pk_oe = effective_oe(
+                stmt_level,
+                table
+                    .columns
+                    .iter()
+                    .find(|c| c.is_ipk)
+                    .and_then(|c| c.conflict_action),
+            );
             // Apply column type affinities before packing the record.
             let aff_str = table.affinity_string();
             b.emit_op(
@@ -11056,11 +11101,11 @@ pub fn codegen_insert(
                 rec_reg,
                 rowid_reg,
                 P4::Table(table.name.clone()),
-                oe_flag,
+                pk_oe,
             );
 
             // Index maintenance: insert into each index (bd-so1h).
-            emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, oe_flag);
+            emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, stmt_level);
 
             if !stmt.returning.is_empty() {
                 emit_returning(
@@ -11167,8 +11212,18 @@ fn codegen_insert_values(
     table_alias: Option<&str>,
     ctx: &CodegenContext,
     oe_flag: u16,
+    stmt_level: Option<ConflictAction>,
     upsert: Option<&UpsertClause>,
 ) -> Result<(), CodegenError> {
+    // Conflict action for the table (rowid/INTEGER PRIMARY KEY) row: a
+    // statement-level `INSERT OR <algo>` overrides the IPK column's declared
+    // `PRIMARY KEY ON CONFLICT <algo>`.
+    let ipk_conflict = table
+        .columns
+        .iter()
+        .find(|c| c.is_ipk)
+        .and_then(|c| c.conflict_action);
+    let pk_oe = effective_oe(stmt_level, ipk_conflict);
     let n_source_cols = rows
         .first()
         .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
@@ -11314,14 +11369,23 @@ fn codegen_insert_values(
         // classes, then applies affinity for the on-disk format).
         emit_strict_type_check(b, table, val_regs);
 
-        // CHECK constraint validation.
-        let ignore_skip = if oe_flag == OE_IGNORE {
+        // CHECK / NOT NULL validation. A row is skipped (IGNORE) when the
+        // statement is `INSERT OR IGNORE`, or when a violated NOT NULL column
+        // declares its own `ON CONFLICT IGNORE`. We allocate the shared skip
+        // label whenever any of those is possible.
+        let nn_ignore = table.columns.iter().any(|c| {
+            c.notnull && !c.is_ipk && effective_oe(stmt_level, c.conflict_action) == OE_IGNORE
+        });
+        let ignore_skip = if oe_flag == OE_IGNORE || nn_ignore {
             Some(b.emit_label())
         } else {
             None
         };
-        emit_check_constraints(b, table, val_regs, ignore_skip);
-        emit_not_null_constraints(b, table, val_regs, ignore_skip);
+        // CHECK constraints have no per-column conflict clause here, so they
+        // only skip under a statement-level IGNORE.
+        let check_ignore = if oe_flag == OE_IGNORE { ignore_skip } else { None };
+        emit_check_constraints(b, table, val_regs, check_ignore);
+        emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip);
 
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
@@ -11524,7 +11588,7 @@ fn codegen_insert_values(
                     // could write data violating STRICT, CHECK, or NOT NULL.
                     emit_strict_type_check(b, table, existing_regs);
                     emit_check_constraints(b, table, existing_regs, None);
-                    emit_not_null_constraints(b, table, existing_regs, None);
+                    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -11552,7 +11616,7 @@ fn codegen_insert_values(
                         cursor,
                         existing_regs,
                         update_rowid_reg,
-                        OE_REPLACE,
+                        Some(ConflictAction::Replace),
                     );
                     if !returning.is_empty() {
                         emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
@@ -11573,7 +11637,7 @@ fn codegen_insert_values(
                     // Constraint checks (same as WHERE branch above).
                     emit_strict_type_check(b, table, existing_regs);
                     emit_check_constraints(b, table, existing_regs, None);
-                    emit_not_null_constraints(b, table, existing_regs, None);
+                    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -11600,7 +11664,7 @@ fn codegen_insert_values(
                         cursor,
                         existing_regs,
                         update_rowid_reg,
-                        OE_REPLACE,
+                        Some(ConflictAction::Replace),
                     );
                     if !returning.is_empty() {
                         emit_returning(b, cursor, table, returning, table_alias, update_rowid_reg)?;
@@ -11626,9 +11690,9 @@ fn codegen_insert_values(
                     rec_reg,
                     rowid_reg,
                     insert_p4,
-                    oe_flag,
+                    pk_oe,
                 );
-                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
 
                 if !returning.is_empty() {
                     emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
@@ -11652,9 +11716,9 @@ fn codegen_insert_values(
                     rec_reg,
                     rowid_reg,
                     insert_p4,
-                    oe_flag,
+                    pk_oe,
                 );
-                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
                 if !returning.is_empty() {
                     emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
                 }
@@ -11676,9 +11740,9 @@ fn codegen_insert_values(
                 rec_reg,
                 rowid_reg,
                 insert_p4,
-                oe_flag,
+                pk_oe,
             );
-            emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+            emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
             if !returning.is_empty() {
                 emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
             }
@@ -11839,6 +11903,7 @@ fn codegen_insert_select(
     target_alias: Option<&str>,
     ctx: &CodegenContext,
     oe_flag: u16,
+    stmt_level: Option<ConflictAction>,
     expected_cols: Option<usize>,
     explicit_rowid_source_pos: Option<usize>,
     col_mapping: Option<&[Option<usize>]>,
@@ -11869,6 +11934,7 @@ fn codegen_insert_select(
             target_alias,
             ctx,
             oe_flag,
+            stmt_level,
             expected_cols,
             explicit_rowid_source_pos,
             col_mapping,
@@ -12051,13 +12117,25 @@ fn codegen_insert_select(
     // Apply column type affinities before packing the record.
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
-    let ignore_target = if oe_flag == OE_IGNORE {
+    let nn_ignore = target_table.columns.iter().any(|c| {
+        c.notnull && !c.is_ipk && effective_oe(stmt_level, c.conflict_action) == OE_IGNORE
+    });
+    let ignore_target = if oe_flag == OE_IGNORE || nn_ignore {
         Some(skip_label)
     } else {
         None
     };
-    emit_check_constraints(b, target_table, final_regs, ignore_target);
-    emit_not_null_constraints(b, target_table, final_regs, ignore_target);
+    let check_ignore = if oe_flag == OE_IGNORE { ignore_target } else { None };
+    emit_check_constraints(b, target_table, final_regs, check_ignore);
+    emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
+    let pk_oe = effective_oe(
+        stmt_level,
+        target_table
+            .columns
+            .iter()
+            .find(|c| c.is_ipk)
+            .and_then(|c| c.conflict_action),
+    );
 
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -12086,7 +12164,7 @@ fn codegen_insert_select(
         rec_reg,
         rowid_reg,
         P4::Table(target_table.name.clone()),
-        oe_flag,
+        pk_oe,
     );
 
     // Index maintenance: insert into each index (bd-so1h).
@@ -12096,7 +12174,7 @@ fn codegen_insert_select(
         write_cursor,
         final_regs,
         rowid_reg,
-        oe_flag,
+        stmt_level,
     );
 
     // RETURNING clause: position cursor on inserted row and read columns.
@@ -12140,6 +12218,7 @@ fn codegen_insert_select_without_from(
     target_alias: Option<&str>,
     ctx: &CodegenContext,
     oe_flag: u16,
+    stmt_level: Option<ConflictAction>,
     expected_cols: Option<usize>,
     explicit_rowid_source_pos: Option<usize>,
     col_mapping: Option<&[Option<usize>]>,
@@ -12262,16 +12341,28 @@ fn codegen_insert_select_without_from(
     // Evaluate STORED generated columns before packing the record.
     emit_stored_generated_columns(b, target_table, final_regs);
 
-    let ignore_target = if oe_flag == OE_IGNORE {
+    let nn_ignore = target_table.columns.iter().any(|c| {
+        c.notnull && !c.is_ipk && effective_oe(stmt_level, c.conflict_action) == OE_IGNORE
+    });
+    let ignore_target = if oe_flag == OE_IGNORE || nn_ignore {
         Some(done_label)
     } else {
         None
     };
+    let check_ignore = if oe_flag == OE_IGNORE { ignore_target } else { None };
+    let pk_oe = effective_oe(
+        stmt_level,
+        target_table
+            .columns
+            .iter()
+            .find(|c| c.is_ipk)
+            .and_then(|c| c.conflict_action),
+    );
 
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
-    emit_check_constraints(b, target_table, final_regs, ignore_target);
-    emit_not_null_constraints(b, target_table, final_regs, ignore_target);
+    emit_check_constraints(b, target_table, final_regs, check_ignore);
+    emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
 
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
@@ -12299,7 +12390,7 @@ fn codegen_insert_select_without_from(
         rec_reg,
         rowid_reg,
         P4::Table(target_table.name.clone()),
-        oe_flag,
+        pk_oe,
     );
 
     emit_index_inserts(
@@ -12308,7 +12399,7 @@ fn codegen_insert_select_without_from(
         write_cursor,
         final_regs,
         rowid_reg,
-        oe_flag,
+        stmt_level,
     );
 
     if !returning.is_empty() {
@@ -12573,7 +12664,7 @@ pub fn codegen_update(
         };
     emit_strict_type_check(b, table, col_regs);
     emit_check_constraints(b, table, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(b, table, col_regs, constraint_ignore_label);
+    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, constraint_ignore_label);
 
     // Constraints passed: now perform the destructive delete+insert rewrite.
     // Index maintenance (bd-2f9t): Delete OLD index entries. The indexed key
@@ -12670,7 +12761,7 @@ pub fn codegen_update(
         table_cursor,
         col_regs,
         rowid_reg,
-        oe_flag,
+        stmt.or_conflict,
         &update_index_mask,
     );
 
@@ -13109,7 +13200,7 @@ fn codegen_update_from(
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, target, col_regs);
     emit_check_constraints(b, target, col_regs, None);
-    emit_not_null_constraints(b, target, col_regs, None);
+    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, None);
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -13143,7 +13234,7 @@ fn codegen_update_from(
     );
 
     // Insert new index entries.
-    emit_index_inserts(b, target, target_cursor, col_regs, rowid_reg, oe_flag);
+    emit_index_inserts(b, target, target_cursor, col_regs, rowid_reg, stmt.or_conflict);
 
     // RETURNING clause.
     if !stmt.returning.is_empty() {
@@ -13685,6 +13776,7 @@ fn emit_not_null_constraints(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     val_regs: i32,
+    stmt_level: Option<ConflictAction>,
     ignore_label: Option<Label>,
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
@@ -13694,20 +13786,27 @@ fn emit_not_null_constraints(
             let reg = val_regs + col_idx as i32;
             let ok_label = b.emit_label();
             b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
-            if let Some(skip) = ignore_label {
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
-            } else {
-                b.emit_op(
-                    Opcode::Halt,
-                    SQLITE_CONSTRAINT,
-                    0,
-                    0,
-                    P4::Str(format!(
-                        "NOT NULL constraint failed: {}.{}",
-                        table.name, col.name
-                    )),
-                    0,
-                );
+            // A statement-level `INSERT OR <algo>` overrides the column's
+            // declared `NOT NULL ON CONFLICT <algo>`. Only IGNORE skips the
+            // row; every other action (incl. the default ABORT) errors.
+            let oe = effective_oe(stmt_level, col.conflict_action);
+            match (oe == OE_IGNORE, ignore_label) {
+                (true, Some(skip)) => {
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
+                }
+                _ => {
+                    b.emit_op(
+                        Opcode::Halt,
+                        SQLITE_CONSTRAINT,
+                        0,
+                        0,
+                        P4::Str(format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            table.name, col.name
+                        )),
+                        0,
+                    );
+                }
             }
             b.resolve_label(ok_label);
         }
@@ -13732,9 +13831,9 @@ fn emit_index_inserts(
     table_cursor: i32,
     col_regs: i32,
     rowid_reg: i32,
-    oe_flag: u16,
+    stmt_conflict: Option<ConflictAction>,
 ) {
-    emit_index_inserts_filtered(b, table, table_cursor, col_regs, rowid_reg, oe_flag, None);
+    emit_index_inserts_filtered(b, table, table_cursor, col_regs, rowid_reg, stmt_conflict, None);
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -13744,7 +13843,7 @@ fn emit_index_inserts_for_update(
     table_cursor: i32,
     col_regs: i32,
     rowid_reg: i32,
-    oe_flag: u16,
+    stmt_conflict: Option<ConflictAction>,
     update_index_mask: &[bool],
 ) {
     emit_index_inserts_filtered(
@@ -13753,7 +13852,7 @@ fn emit_index_inserts_for_update(
         table_cursor,
         col_regs,
         rowid_reg,
-        oe_flag,
+        stmt_conflict,
         Some(update_index_mask),
     );
 }
@@ -13765,10 +13864,13 @@ fn emit_index_inserts_filtered(
     table_cursor: i32,
     col_regs: i32,
     rowid_reg: i32,
-    oe_flag: u16,
+    stmt_conflict: Option<ConflictAction>,
     update_index_mask: Option<&[bool]>,
 ) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
+        // A statement-level `INSERT OR <algo>` overrides the index's declared
+        // `ON CONFLICT <algo>`; absent both, the default is ABORT.
+        let oe_flag = effective_oe(stmt_conflict, index.conflict_action);
         if update_index_mask.is_some_and(|mask| !mask.get(idx_offset).copied().unwrap_or(true)) {
             continue;
         }
@@ -20000,6 +20102,7 @@ mod tests {
                 where_clause: None,
                 is_unique: false,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -20026,6 +20129,7 @@ mod tests {
                 where_clause: None,
                 is_unique: false,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -20114,6 +20218,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: Some("NOCASE".to_owned()),
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -20141,6 +20246,7 @@ mod tests {
                 generated_expr: None,
                 generated_stored: None,
                 collation: Some("NOCASE".to_owned()),
+                conflict_action: None,
             }],
             indexes: vec![IndexSchema {
                 name: "idx_t_name".to_owned(),
@@ -20151,6 +20257,7 @@ mod tests {
                 where_clause: None,
                 is_unique: false,
                 key_collations: vec![Some("NOCASE".to_owned())],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -20176,6 +20283,7 @@ mod tests {
                 generated_expr: None,
                 generated_stored: None,
                 collation: None,
+                conflict_action: None,
             }],
             indexes: vec![IndexSchema {
                 name: "idx_t_n".to_owned(),
@@ -20186,6 +20294,7 @@ mod tests {
                 where_clause: None,
                 is_unique: false,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -20213,6 +20322,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -20226,6 +20336,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                 ],
                 indexes: vec![],
@@ -20267,6 +20378,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 }],
                 strict: false,
                 without_rowid: false,
@@ -20323,6 +20435,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 }],
                 strict: false,
                 without_rowid: false,
@@ -20987,6 +21100,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "score".to_owned(),
@@ -21000,6 +21114,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -21028,6 +21143,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "payload".to_owned(),
@@ -21041,6 +21157,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -21104,6 +21221,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 },
                 IndexSchema {
                     name: "idx_t_rowid".to_owned(),
@@ -21114,6 +21232,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 },
             ],
             strict: false,
@@ -21913,6 +22032,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -21950,6 +22070,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -22139,6 +22260,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -22152,6 +22274,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                 ],
                 indexes: vec![],
@@ -22177,6 +22300,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -22190,6 +22314,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                 ],
                 indexes: vec![],
@@ -22521,6 +22646,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 }],
                 strict: false,
                 without_rowid: false,
@@ -22620,6 +22746,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -22633,6 +22760,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                 ],
                 indexes: vec![],
@@ -22658,6 +22786,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -22671,6 +22800,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo::basic("z", 'e', false),
                 ],
@@ -24203,6 +24333,7 @@ mod tests {
                 where_clause: None,
                 is_unique: true,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -27322,6 +27453,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 }],
                 strict: false,
                 without_rowid: false,
@@ -28309,6 +28441,7 @@ mod tests {
                     where_clause: None,
                     is_unique: true,
                     key_collations: vec![],
+                    conflict_action: None,
                 }],
                 strict: false,
                 without_rowid: false,
@@ -28474,6 +28607,7 @@ mod tests {
                         where_clause: None,
                         is_unique: false,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                     IndexSchema {
                         name: "agents_tenant_unique".to_owned(),
@@ -28484,6 +28618,7 @@ mod tests {
                         where_clause: None,
                         is_unique: true,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                 ],
                 strict: false,
@@ -28543,6 +28678,7 @@ mod tests {
                         where_clause: None,
                         is_unique: true,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                     IndexSchema {
                         name: "agents_tenant_unique_asc".to_owned(),
@@ -28553,6 +28689,7 @@ mod tests {
                         where_clause: None,
                         is_unique: true,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                 ],
                 strict: false,
@@ -28754,6 +28891,7 @@ mod tests {
                         where_clause: None,
                         is_unique: true,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                     IndexSchema {
                         name: "agents_tenant_unique_nocase".to_owned(),
@@ -28764,6 +28902,7 @@ mod tests {
                         where_clause: None,
                         is_unique: true,
                         key_collations: vec![Some("NOCASE".to_owned())],
+                        conflict_action: None,
                     },
                 ],
                 strict: false,
@@ -28813,6 +28952,7 @@ mod tests {
                         where_clause: None,
                         is_unique: false,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                     IndexSchema {
                         name: "idx_orders_region_nocase".to_owned(),
@@ -28823,6 +28963,7 @@ mod tests {
                         where_clause: None,
                         is_unique: false,
                         key_collations: vec![Some("NOCASE".to_owned())],
+                        conflict_action: None,
                     },
                 ],
                 strict: false,
@@ -28868,6 +29009,7 @@ mod tests {
                     where_clause: None,
                     is_unique: false,
                     key_collations: vec![],
+                    conflict_action: None,
                 }],
                 strict: false,
                 without_rowid: false,
@@ -28913,6 +29055,7 @@ mod tests {
                         where_clause: None,
                         is_unique: false,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                     IndexSchema {
                         name: "idx_orders_region_asc".to_owned(),
@@ -28923,6 +29066,7 @@ mod tests {
                         where_clause: None,
                         is_unique: false,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                 ],
                 strict: false,
@@ -29240,6 +29384,7 @@ mod tests {
                         where_clause: None,
                         is_unique: false,
                         key_collations: vec![],
+                        conflict_action: None,
                     },
                     IndexSchema {
                         name: "agents_tenant_unique_nocase".to_owned(),
@@ -29250,6 +29395,7 @@ mod tests {
                         where_clause: None,
                         is_unique: true,
                         key_collations: vec![Some("NOCASE".to_owned())],
+                        conflict_action: None,
                     },
                 ],
                 strict: false,
@@ -33057,6 +33203,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -33104,6 +33251,7 @@ mod tests {
                 generated_expr: None,
                 generated_stored: None,
                 collation: None,
+                conflict_action: None,
             }],
             indexes: vec![],
             strict: false,
@@ -33150,6 +33298,7 @@ mod tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -33188,6 +33337,7 @@ mod tests {
                     generated_expr: Some("a + b".to_owned()),
                     generated_stored: Some(true),
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],
@@ -33219,6 +33369,7 @@ mod tests {
                     generated_expr: Some("a * 2".to_owned()),
                     generated_stored: Some(false),
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: vec![],

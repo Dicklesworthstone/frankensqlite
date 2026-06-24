@@ -25265,6 +25265,7 @@ impl Connection {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 }
             })
             .collect()
@@ -26981,8 +26982,18 @@ impl Connection {
         };
         let schema = self.schema.borrow();
         schema.get(idx).is_some_and(|table| {
-            table.foreign_keys.is_empty()
-                || insert.or_conflict != Some(fsqlite_ast::ConflictAction::Replace)
+            let fk_ok = table.foreign_keys.is_empty()
+                || insert.or_conflict != Some(fsqlite_ast::ConflictAction::Replace);
+            // A column or index that declares its own `ON CONFLICT <algo>`
+            // requires the full codegen INSERT path, which honors per-constraint
+            // conflict resolution; the direct-simple lane does not (bd-587fx,
+            // bd-24hno). Decline so such tables fall back to codegen.
+            let no_per_constraint_conflict = table
+                .columns
+                .iter()
+                .all(|c| c.conflict_action.is_none())
+                && table.indexes.iter().all(|i| i.conflict_action.is_none());
+            fk_ok && no_per_constraint_conflict
         })
     }
 
@@ -37688,6 +37699,7 @@ impl Connection {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "seq".to_owned(),
@@ -37701,6 +37713,7 @@ impl Connection {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: Vec::new(),
@@ -38750,6 +38763,22 @@ impl Connection {
                                 None
                             }
                         });
+                        // Per-constraint ON CONFLICT for the column. For the
+                        // INTEGER PRIMARY KEY (rowid) the PRIMARY KEY clause
+                        // governs the table-row insert; for other columns the
+                        // NOT NULL clause governs the null check. UNIQUE-column
+                        // conflicts live on the backing index instead.
+                        let conflict_action = if is_ipk {
+                            col.constraints.iter().find_map(|c| match &c.kind {
+                                ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                                _ => None,
+                            })
+                        } else {
+                            col.constraints.iter().find_map(|c| match &c.kind {
+                                ColumnConstraintKind::NotNull { conflict } => *conflict,
+                                _ => None,
+                            })
+                        };
                         Ok(ColumnInfo {
                             name: col.name.clone(),
                             affinity,
@@ -38762,6 +38791,7 @@ impl Connection {
                             generated_expr,
                             generated_stored,
                             collation,
+                            conflict_action,
                         })
                     })
                     .collect::<Result<_>>()?;
@@ -38841,6 +38871,13 @@ impl Connection {
                     if col.unique && !col.is_ipk && !(create.without_rowid && column_primary_key) {
                         let idx_root = self.allocate_index_root_page()?;
                         self.db.borrow_mut().create_table_at(idx_root, 0);
+                        // Per-constraint ON CONFLICT declared on the column's
+                        // UNIQUE / (non-IPK) PRIMARY KEY clause.
+                        let conflict_action = decl_col.constraints.iter().find_map(|c| match &c.kind {
+                            ColumnConstraintKind::Unique { conflict }
+                            | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                            _ => None,
+                        });
                         implicit_indexes.push(IndexSchema {
                             name: format!(
                                 "sqlite_autoindex_{}_{}",
@@ -38854,6 +38891,7 @@ impl Connection {
                             where_clause: None,
                             is_unique: true,
                             key_collations: vec![col.collation.clone()],
+                            conflict_action,
                         });
                     }
                 }
@@ -38891,6 +38929,13 @@ impl Connection {
                             }
                             let idx_root = self.allocate_index_root_page()?;
                             self.db.borrow_mut().create_table_at(idx_root, 0);
+                            // Per-constraint ON CONFLICT declared on the
+                            // table-level UNIQUE / PRIMARY KEY constraint.
+                            let conflict_action = match &tc.kind {
+                                TableConstraintKind::Unique { conflict, .. }
+                                | TableConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                                _ => None,
+                            };
                             implicit_indexes.push(IndexSchema {
                                 name: format!(
                                     "sqlite_autoindex_{}_{}",
@@ -38910,6 +38955,7 @@ impl Connection {
                                     .iter()
                                     .map(|term| term.collation.clone())
                                     .collect(),
+                                conflict_action,
                             });
                         }
                     }
@@ -39926,6 +39972,7 @@ impl Connection {
                     generated_expr,
                     generated_stored,
                     collation,
+                    conflict_action: None,
                 });
                 table.check_constraints.extend(column_check_constraints);
                 for constraint in &col_def.constraints {
@@ -40867,6 +40914,7 @@ impl Connection {
                 root_page,
                 is_unique: stmt.unique,
                 key_collations,
+                conflict_action: None,
             });
         }
 
@@ -42387,6 +42435,7 @@ impl Connection {
                                 generated_expr: None,
                                 generated_stored: None,
                                 collation: None,
+                                conflict_action: None,
                             })
                             .collect()
                     } else {
@@ -42404,6 +42453,7 @@ impl Connection {
                                 generated_expr: None,
                                 generated_stored: None,
                                 collation: None,
+                                conflict_action: None,
                             })
                             .collect()
                     };
@@ -56350,6 +56400,7 @@ impl Connection {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     })
                     .collect();
                 let num_columns = col_infos.len();
@@ -56571,6 +56622,7 @@ impl Connection {
                 generated_expr: None,
                 generated_stored: None,
                 collation: None,
+                conflict_action: None,
             })
             .collect();
         let num_columns = col_infos.len();
@@ -60652,6 +60704,7 @@ impl Connection {
                     key_collations: index_definition.key_collations,
                     where_clause: index_definition.where_clause,
                     is_unique: index_definition.is_unique,
+                    conflict_action: None,
                 });
                 if !new_db.tables.contains_key(&root_page) {
                     new_db.create_table_at(root_page, 0);
@@ -64369,6 +64422,7 @@ fn parse_declared_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo>
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         });
     }
 
@@ -64388,6 +64442,7 @@ fn default_virtual_table_column_info() -> ColumnInfo {
         generated_expr: None,
         generated_stored: None,
         collation: None,
+        conflict_action: None,
     }
 }
 
@@ -64416,6 +64471,7 @@ fn resolve_virtual_table_column_infos(
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         })
         .collect::<Vec<_>>();
     if !from_factory.is_empty() {
@@ -64570,6 +64626,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
         ColumnInfo {
             name: "name".to_owned(),
@@ -64583,6 +64640,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
         ColumnInfo {
             name: "tbl_name".to_owned(),
@@ -64596,6 +64654,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
         ColumnInfo {
             name: "rootpage".to_owned(),
@@ -64609,6 +64668,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
         ColumnInfo {
             name: "sql".to_owned(),
@@ -64622,6 +64682,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
     ]
 }
@@ -64640,6 +64701,7 @@ fn sqlite_stat1_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
         ColumnInfo {
             name: "idx".to_owned(),
@@ -64653,6 +64715,7 @@ fn sqlite_stat1_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
         ColumnInfo {
             name: "stat".to_owned(),
@@ -64666,6 +64729,7 @@ fn sqlite_stat1_column_infos() -> Vec<ColumnInfo> {
             generated_expr: None,
             generated_stored: None,
             collation: None,
+            conflict_action: None,
         },
     ]
 }
@@ -137322,8 +137386,9 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT max(val), id FROM ep10b;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(30));
-        // Bare column `id` takes its value from the last row scanned.
-        assert_eq!(rows[0].values()[1], SqliteValue::Integer(3));
+        // Bare column `id` takes its value from the extremum (max) row, which is
+        // the row val=30 / id=2 (SQLite min/max bare-column semantics, bd-xplxa).
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
     }
 
     #[test]
@@ -143383,6 +143448,7 @@ mod pager_routing_tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -143396,6 +143462,7 @@ mod pager_routing_tests {
                     generated_expr: None,
                     generated_stored: None,
                     collation: None,
+                    conflict_action: None,
                 },
             ],
             indexes: Vec::new(),
@@ -149810,6 +149877,7 @@ mod pager_routing_tests {
                 where_clause: None,
                 is_unique: false,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,
@@ -149854,6 +149922,7 @@ mod pager_routing_tests {
                 where_clause: None,
                 is_unique: false,
                 key_collations: vec![],
+                conflict_action: None,
             }],
             strict: false,
             without_rowid: false,

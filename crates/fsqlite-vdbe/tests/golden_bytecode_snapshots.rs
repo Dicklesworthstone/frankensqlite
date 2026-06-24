@@ -57,6 +57,7 @@ fn index(name: &str, root_page: i32, columns: &[&str], is_unique: bool) -> Index
         where_clause: None,
         is_unique,
         key_collations: Vec::new(),
+        conflict_action: None,
     }
 }
 

@@ -126,6 +126,10 @@ impl<V> CursorSlots<V> {
         self.slots.iter().filter_map(Option::as_ref)
     }
 
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.slots.iter_mut().filter_map(Option::as_mut)
+    }
+
     /// Iterate over occupied (key, &value) pairs. Keys are derived from slot indices.
     /// Used by diagnostic/parity-cert paths, not on the hot path.
     #[allow(clippy::cast_possible_wrap)]
@@ -5041,6 +5045,49 @@ fn record_result_row_metrics(row: &[SqliteValue]) {
     }
 }
 
+/// Record VDBE-style metrics for a result row emitted by a direct fast path
+/// outside the opcode loop.
+pub fn record_external_result_row_metrics(row: &[SqliteValue]) {
+    if !vdbe_metrics_enabled() {
+        return;
+    }
+
+    let materialize_start = Instant::now();
+    for value in row {
+        record_decoded_value_metrics(value);
+    }
+    record_result_row_metrics(row);
+    FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+        u64::try_from(materialize_start.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1),
+        AtomicOrdering::Relaxed,
+    );
+}
+
+/// Record VDBE-style INSERT fast-path decision metrics for direct execution
+/// paths outside the opcode loop.
+pub fn record_external_insert_path_metric(append_fast_path: bool) {
+    if !vdbe_metrics_enabled() {
+        return;
+    }
+
+    if append_fast_path {
+        FSQLITE_VDBE_INSERT_APPEND_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    } else {
+        FSQLITE_VDBE_INSERT_SEEK_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Record that a direct execution path had to clear a cached INSERT append hint.
+pub fn record_external_insert_append_hint_clear_metric() {
+    if !vdbe_metrics_enabled() {
+        return;
+    }
+
+    FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
 fn record_type_coercion(before: &SqliteValue, after: &SqliteValue) {
     FSQLITE_VDBE_TYPE_COERCIONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
     if before.storage_class() != after.storage_class() {
@@ -5500,6 +5547,13 @@ pub struct VdbeEngine {
     pending_next_after_delete: HashSet<i32>,
     /// Whether `OpenRead`/`OpenWrite` should route through storage-backed cursors.
     storage_cursors_enabled: bool,
+    /// Whether `OP_Close` should keep storage cursors alive for reusable DML.
+    ///
+    /// Normal VDBE execution closes storage cursors immediately. The reusable
+    /// DML lanes enable this so retained engines carry right-edge append hints
+    /// across statement executions while `OpenWrite` still revalidates cursor
+    /// id, root page, and backend kind before reuse.
+    retain_storage_cursors_on_close: bool,
     /// Shared pager transaction for storage cursors (Phase 5, bd-2a3y).
     /// When set, `open_storage_cursor` routes through the real pager/WAL
     /// stack instead of building transient `MemPageStore` snapshots.
@@ -6063,6 +6117,7 @@ impl VdbeEngine {
             storage_cursors: CursorSlots::new(),
             pending_next_after_delete: HashSet::new(),
             storage_cursors_enabled: true,
+            retain_storage_cursors_on_close: false,
             txn_page_io: None,
             // bd-zjisk.1: Default to parity-cert mode — reject MemPageStore fallback.
             reject_mem_fallback: true,
@@ -6270,6 +6325,7 @@ impl VdbeEngine {
             // OP_OpenWrite will detect an existing cursor on the same root
             // page and reuse it instead of creating a new one.
             // Clear only transient per-statement cursor state.
+            self.clear_retained_storage_cursor_statement_state();
             self.sorters.clear();
             self.pending_next_after_delete.clear();
         } else {
@@ -6280,6 +6336,7 @@ impl VdbeEngine {
             self.storage_cursors_enabled = true;
             self.txn_page_io = None;
         }
+        self.retain_storage_cursors_on_close = retain_cursors;
         if !retain_cursors {
             self.db = None;
             self.cursor_root_pages.clear();
@@ -6385,6 +6442,25 @@ impl VdbeEngine {
     /// Convenience wrapper: reset without retaining cursors (legacy behavior).
     pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
         self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
+    }
+
+    /// Control whether `OP_Close` preserves storage cursors for reusable DML.
+    pub fn set_retain_storage_cursors_on_close(&mut self, retain: bool) {
+        self.retain_storage_cursors_on_close = retain;
+    }
+
+    fn clear_storage_cursor_statement_state(sc: &mut StorageCursor) {
+        // `last_alloc_rowid` exists only to keep multiple OP_NewRowid calls in a
+        // single statement unique before any corresponding insert lands. If a
+        // retained cursor carries it across statements, conflict-only INSERT /
+        // UPSERT statements incorrectly burn normal rowids.
+        sc.last_alloc_rowid = 0;
+    }
+
+    fn clear_retained_storage_cursor_statement_state(&mut self) {
+        for sc in self.storage_cursors.values_mut() {
+            Self::clear_storage_cursor_statement_state(sc);
+        }
     }
 
     pub fn apply_reusable_table_execution_state(
@@ -8771,7 +8847,13 @@ impl VdbeEngine {
 
                 Opcode::Close => {
                     self.cursors.remove(&op.p1);
-                    self.storage_cursors.remove(&op.p1);
+                    if self.retain_storage_cursors_on_close {
+                        if let Some(sc) = self.storage_cursors.get_mut(&op.p1) {
+                            Self::clear_storage_cursor_statement_state(sc);
+                        }
+                    } else {
+                        self.storage_cursors.remove(&op.p1);
+                    }
                     self.sorters.remove(&op.p1);
                     if let Some(cold_state) = self.cold_state_mut() {
                         cold_state.vtab_cursors.remove(&op.p1);
@@ -21917,6 +21999,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -21930,6 +22013,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                 ],
                 indexes: vec![],
@@ -22321,6 +22405,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -22334,6 +22419,7 @@ mod tests {
                         generated_expr: None,
                         generated_stored: None,
                         collation: None,
+                        conflict_action: None,
                     },
                 ],
                 indexes: vec![],
