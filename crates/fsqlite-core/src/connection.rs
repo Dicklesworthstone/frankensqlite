@@ -69965,6 +69965,23 @@ fn is_agg_fn(name: &str) -> bool {
     AGG_NAMES.iter().any(|&n| n == lower)
 }
 
+/// bd-cnwdm: the JSON1 aggregate functions `json_group_array(v)` and
+/// `json_group_object(k, v)`. They are intentionally NOT in [`AGG_NAMES`] — that
+/// would route them to the registry-unaware GROUP BY storage substrate. Instead
+/// they are recognized here so the connection-level grouped-aggregate
+/// interpreter (`eval_group_agg_join_expr`) computes them directly, preserving
+/// the NULL-keeping / two-argument semantics the generic aggregate path lacks.
+#[cfg(feature = "ext-json")]
+fn is_builtin_json_aggregate(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(lower.as_str(), "json_group_array" | "json_group_object")
+}
+
+#[cfg(not(feature = "ext-json"))]
+fn is_builtin_json_aggregate(_name: &str) -> bool {
+    false
+}
+
 /// Returns true if this is a scalar max/min call (2+ arguments), not aggregate.
 fn is_scalar_max_min(name: &str, args: &FunctionArgs) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -69975,7 +69992,9 @@ fn is_scalar_max_min(name: &str, args: &FunctionArgs) -> bool {
 fn expr_contains_agg(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            if is_agg_fn(name) && !is_scalar_max_min(name, args) {
+            if (is_agg_fn(name) || is_builtin_json_aggregate(name))
+                && !is_scalar_max_min(name, args)
+            {
                 return true;
             }
             match args {
@@ -70149,9 +70168,10 @@ fn expr_contains_custom_registered_agg(
             if !is_agg_fn(name)
                 && over.is_none()
                 && !is_scalar_max_min(name, args)
-                && registry
-                    .find_aggregate(name, function_args_len(args))
-                    .is_some()
+                && (is_builtin_json_aggregate(name)
+                    || registry
+                        .find_aggregate(name, function_args_len(args))
+                        .is_some())
             {
                 return true;
             }
@@ -70529,6 +70549,57 @@ fn eval_group_agg_join_expr(
     col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     match expr {
+        // bd-cnwdm: JSON1 aggregates computed directly (NULL-preserving for
+        // json_group_array; two-argument key/value pairs for json_group_object).
+        #[cfg(feature = "ext-json")]
+        Expr::FunctionCall {
+            name, args, filter, ..
+        } if is_builtin_json_aggregate(name) => {
+            let exprs = match args {
+                FunctionArgs::List(e) => e.as_slice(),
+                FunctionArgs::Star => &[][..],
+            };
+            let passes_filter = |row: &&Vec<SqliteValue>| -> bool {
+                filter.as_ref().is_none_or(|f| {
+                    eval_join_expr(f, row, col_map)
+                        .map(|v| is_sqlite_truthy(&v))
+                        .unwrap_or(false)
+                })
+            };
+            if name.eq_ignore_ascii_case("json_group_array") {
+                let arg = exprs.first().ok_or_else(|| {
+                    FrankenError::function_error("json_group_array() requires 1 argument")
+                })?;
+                let mut vals = Vec::new();
+                for row in group_rows {
+                    if passes_filter(row) {
+                        // NULLs are preserved (rendered as JSON null).
+                        vals.push(eval_join_expr(arg, row, col_map)?);
+                    }
+                }
+                Ok(SqliteValue::Text(
+                    fsqlite_ext_json::json_group_array(&vals)?.into(),
+                ))
+            } else {
+                // json_group_object(key, value)
+                if exprs.len() != 2 {
+                    return Err(FrankenError::function_error(
+                        "json_group_object() requires 2 arguments",
+                    ));
+                }
+                let mut pairs = Vec::new();
+                for row in group_rows {
+                    if passes_filter(row) {
+                        let key = eval_join_expr(&exprs[0], row, col_map)?;
+                        let value = eval_join_expr(&exprs[1], row, col_map)?;
+                        pairs.push((key, value));
+                    }
+                }
+                Ok(SqliteValue::Text(
+                    fsqlite_ext_json::json_group_object(&pairs)?.into(),
+                ))
+            }
+        }
         Expr::FunctionCall {
             name,
             args,
@@ -88029,6 +88100,28 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
     }
 
     match lower {
+        // bd-cnwdm: JSON1 scalars needed when a JSON aggregate is nested inside a
+        // scalar in a grouped/aggregate result column, e.g.
+        // `json_valid(json_group_array(v))`. NULL args are handled by the guard
+        // above (matching SQLite's NULL-in/NULL-out for these functions).
+        #[cfg(feature = "ext-json")]
+        "json_valid" => match args.first() {
+            Some(SqliteValue::Text(s)) => {
+                SqliteValue::Integer(fsqlite_ext_json::json_valid(s, None))
+            }
+            Some(SqliteValue::Blob(b)) => {
+                SqliteValue::Integer(fsqlite_ext_json::json_valid_blob(b, None))
+            }
+            _ => SqliteValue::Integer(0),
+        },
+        #[cfg(feature = "ext-json")]
+        "json_array_length" => match args.first() {
+            Some(SqliteValue::Text(s)) => match fsqlite_ext_json::json_array_length(s, None) {
+                Ok(Some(n)) => SqliteValue::Integer(i64::try_from(n).unwrap_or(i64::MAX)),
+                _ => SqliteValue::Null,
+            },
+            _ => SqliteValue::Null,
+        },
         "length" | "len" => match args.first() {
             Some(SqliteValue::Text(s)) => {
                 // C SQLite: length() returns character count, not byte count.

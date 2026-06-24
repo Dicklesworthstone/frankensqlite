@@ -94,7 +94,6 @@ fn data() -> (Connection, rusqlite::Connection) {
 }
 
 #[test]
-#[ignore = "bd-cnwdm: json_group_array not registered as an aggregate ('no such function')"]
 fn json_group_array_basic_and_grouped() {
     let (f, r) = data();
     check(
@@ -110,7 +109,6 @@ fn json_group_array_basic_and_grouped() {
 }
 
 #[test]
-#[ignore = "bd-cnwdm: json_group_object not registered ('no such function'; GROUP BY form silently NULL)"]
 fn json_group_object_basic_and_grouped() {
     let (f, r) = data();
     check(
@@ -125,7 +123,6 @@ fn json_group_object_basic_and_grouped() {
 }
 
 #[test]
-#[ignore = "bd-cnwdm: json_group_array not registered as an aggregate"]
 fn json_group_array_mixed_and_null() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -150,7 +147,6 @@ fn json_group_array_mixed_and_null() {
 }
 
 #[test]
-#[ignore = "bd-cnwdm: json_group_array not registered as an aggregate"]
 fn json_group_array_empty_group() {
     let (f, r) = data();
     check(
