@@ -39960,6 +39960,12 @@ impl Connection {
                     None
                 };
                 let new_column_index = table.columns.len();
+                // ALTER ADD COLUMN cannot add an IPK/UNIQUE; only a column-level
+                // NOT NULL ON CONFLICT clause is meaningful here.
+                let conflict_action = col_def.constraints.iter().find_map(|c| match &c.kind {
+                    ColumnConstraintKind::NotNull { conflict } => *conflict,
+                    _ => None,
+                });
                 table.columns.push(ColumnInfo {
                     name: col_def.name.clone(),
                     affinity,
@@ -39972,7 +39978,7 @@ impl Connection {
                     generated_expr,
                     generated_stored,
                     collation,
-                    conflict_action: None,
+                    conflict_action,
                 });
                 table.check_constraints.extend(column_check_constraints);
                 for constraint in &col_def.constraints {
@@ -60704,7 +60710,7 @@ impl Connection {
                     key_collations: index_definition.key_collations,
                     where_clause: index_definition.where_clause,
                     is_unique: index_definition.is_unique,
-                    conflict_action: None,
+                    conflict_action: index_definition.conflict_action,
                 });
                 if !new_db.tables.contains_key(&root_page) {
                     new_db.create_table_at(root_page, 0);
@@ -71711,6 +71717,10 @@ struct ReconstructedIndexDefinition {
     key_collations: Vec<Option<String>>,
     where_clause: Option<String>,
     is_unique: bool,
+    /// Per-constraint `ON CONFLICT <algo>` for an implicit UNIQUE/PK autoindex
+    /// (reconstructed from the CREATE TABLE SQL on reload). `None` for explicit
+    /// CREATE INDEX (which cannot declare a conflict clause).
+    conflict_action: Option<fsqlite_ast::ConflictAction>,
 }
 
 impl ReconstructedIndexDefinition {
@@ -71817,6 +71827,11 @@ fn implicit_index_definitions_from_create_table_sql(
                 })
         });
         if has_unique_constraint && !is_ipk {
+            let conflict_action = column.constraints.iter().find_map(|c| match &c.kind {
+                ColumnConstraintKind::Unique { conflict }
+                | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                _ => None,
+            });
             definitions.push(ReconstructedIndexDefinition {
                 columns: vec![column.name.clone()],
                 key_expressions: Vec::new(),
@@ -71824,16 +71839,21 @@ fn implicit_index_definitions_from_create_table_sql(
                 key_collations: vec![column_def_declared_collation(column)],
                 where_clause: None,
                 is_unique: true,
+                conflict_action,
             });
         }
     }
 
     for constraint in constraints {
         if let TableConstraintKind::Unique {
-            columns: idx_cols, ..
+            columns: idx_cols,
+            conflict,
+            ..
         }
         | TableConstraintKind::PrimaryKey {
-            columns: idx_cols, ..
+            columns: idx_cols,
+            conflict,
+            ..
         } = constraint.kind
         {
             if let Some(normalized) =
@@ -71856,6 +71876,7 @@ fn implicit_index_definitions_from_create_table_sql(
                         .collect(),
                     where_clause: None,
                     is_unique: true,
+                    conflict_action: conflict,
                 });
             }
         }
@@ -71889,6 +71910,8 @@ fn index_definition_from_create_index_statement(
                 .collect()
         });
     Some(ReconstructedIndexDefinition {
+        // Explicit CREATE INDEX cannot declare an ON CONFLICT clause.
+        conflict_action: None,
         columns: simple_columns,
         key_expressions,
         key_sort_directions: stmt

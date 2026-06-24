@@ -167,3 +167,51 @@ fn unique_on_conflict_fail_errors() {
         "unique_on_conflict_fail_errors",
     );
 }
+
+/// A declared per-constraint `ON CONFLICT` must survive a file-backed
+/// close/reopen: the implicit UNIQUE autoindex's conflict algorithm is
+/// reconstructed from the CREATE TABLE SQL on schema reload. This pins the
+/// reload path (`ReconstructedIndexDefinition::conflict_action`) that the
+/// `:memory:` scenarios never exercise.
+#[test]
+fn unique_on_conflict_replace_survives_reopen() {
+    let dir = tempfile::tempdir_in(std::env::temp_dir())
+        .or_else(|_| tempfile::tempdir_in("."))
+        .expect("tempdir");
+    let db_path = dir.path().join("on_conflict_reopen.db");
+    let db_str = db_path.to_string_lossy().into_owned();
+
+    // Reference: run the whole sequence against rusqlite in memory.
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    let ddl_dml = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE ON CONFLICT REPLACE, label TEXT)",
+        "INSERT INTO t VALUES (1,10,'a'),(2,20,'b')",
+    ];
+    for s in ddl_dml {
+        r.execute_batch(s)
+            .unwrap_or_else(|e| panic!("rusqlite `{s}`: {e}"));
+    }
+
+    // frank: create + seed, then DROP the connection to flush to disk.
+    {
+        let f = Connection::open(&db_str).expect("open frank");
+        for s in ddl_dml {
+            f.execute(s).unwrap_or_else(|e| panic!("frank `{s}`: {e}"));
+        }
+    }
+
+    // The conflicting INSERT runs AFTER reopen, so the REPLACE must come from the
+    // reloaded autoindex's conflict_action (not the in-memory writer state).
+    let conflicting = "INSERT INTO t VALUES (3,10,'c')"; // u=10 conflicts -> REPLACE id1
+    r.execute_batch(conflicting).expect("rusqlite conflict insert");
+    let f = Connection::open(&db_str).expect("reopen frank");
+    f.execute(conflicting)
+        .unwrap_or_else(|e| panic!("frank reopened `{conflicting}`: {e}"));
+
+    let q = "SELECT id, u, label FROM t ORDER BY id";
+    assert_eq!(
+        frank_rows(&f, q).expect("frank query"),
+        sqlite_rows(&r, q).expect("rusqlite query"),
+        "unique_on_conflict_replace_survives_reopen: rows differ after reopen"
+    );
+}
