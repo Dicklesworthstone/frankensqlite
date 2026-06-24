@@ -99,7 +99,6 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 }
 
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated columns return NULL (not computed on read)"]
 fn generated_virtual_basic() {
     scenario(
         &[
@@ -131,7 +130,6 @@ fn generated_stored_basic() {
 }
 
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated columns return NULL (not computed on read)"]
 fn generated_always_long_form() {
     scenario(
         &[
@@ -146,7 +144,6 @@ fn generated_always_long_form() {
 }
 
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated columns return NULL (not computed on read)"]
 fn generated_expression_with_functions_and_text() {
     scenario(
         &[
@@ -164,7 +161,6 @@ fn generated_expression_with_functions_and_text() {
 }
 
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated columns return NULL (not computed on read)"]
 fn generated_type_affinity_coercion() {
     // The generated value is coerced to the column's declared affinity.
     scenario(
@@ -180,7 +176,6 @@ fn generated_type_affinity_coercion() {
 }
 
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated columns return NULL (not computed on read)"]
 fn generated_recomputes_on_update() {
     scenario(
         &[
@@ -223,7 +218,6 @@ fn generated_explicit_value_rejected() {
 }
 
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated columns return NULL (not computed on read)"]
 fn generated_indexed_lookup() {
     scenario(
         &[

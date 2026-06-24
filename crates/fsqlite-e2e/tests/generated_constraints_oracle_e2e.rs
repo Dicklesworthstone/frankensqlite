@@ -144,7 +144,6 @@ fn unique_generated_revalidated_on_update() {
 /// filter on it matches nothing. (STORED generated columns work — see the UNIQUE
 /// tests above.)
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated column returns NULL, so WHERE on it matches nothing"]
 fn virtual_generated_in_where() {
     scenario(
         &[
@@ -164,7 +163,6 @@ fn virtual_generated_in_where() {
 /// NULL — so this is the root of the WHERE/CHECK manifestations above, not a
 /// constraint-specific issue. (STORED works, per the UNIQUE / STORED-CHECK tests.)
 #[test]
-#[ignore = "bd-r3303: VIRTUAL generated column projects as NULL (not computed on read)"]
 fn virtual_generated_projection_returns_null() {
     scenario(
         &[

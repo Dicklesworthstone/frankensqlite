@@ -13698,8 +13698,77 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
             }
         } else {
             // VIRTUAL: not stored in the record; set NULL as placeholder.
+            // The real value is computed on read (bd-r3303,
+            // virtual_generated_column_expr).
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
         }
+    }
+}
+
+/// bd-r3303: if `col` is a VIRTUAL generated column, parse and return its
+/// generating expression so callers can compute it on read.
+///
+/// Returns `None` for non-generated columns and for STORED generated columns
+/// (which are computed and persisted at write time, then read back directly).
+fn virtual_generated_column_expr(col: &ColumnInfo) -> Option<Expr> {
+    if col.generated_stored != Some(false) {
+        return None;
+    }
+    parse_default_expr(col.generated_expr.as_ref()?)
+}
+
+/// bd-r3303: emit `Opcode::Affinity` to coerce a single register to a column's
+/// declared type affinity. Used after computing a VIRTUAL generated column on
+/// read, mirroring the per-column affinity that record packing applies to
+/// STORED columns at write time.
+fn emit_single_column_affinity(b: &mut ProgramBuilder, reg: i32, affinity: char) {
+    b.emit_op(
+        Opcode::Affinity,
+        reg,
+        1,
+        0,
+        P4::Affinity(affinity.to_string()),
+        0,
+    );
+}
+
+/// Emit the read of table column `col_idx` from `cursor` into `reg`.
+///
+/// Centralizes the three column-read shapes so every table-scan read site
+/// (projection, WHERE, ORDER BY) handles them uniformly:
+/// - INTEGER PRIMARY KEY columns read the rowid (`Opcode::Rowid`);
+/// - VIRTUAL generated columns (bd-r3303) are not materialized in the record,
+///   so compute the generating expression against the current row (the
+///   referenced base columns resolve through this same path) and coerce to the
+///   column's declared affinity, matching what record packing applies to STORED
+///   columns at write time;
+/// - all other columns read directly from the record (`Opcode::Column`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_table_column_read(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: Option<&[TableSchema]>,
+    col_idx: usize,
+    reg: i32,
+) {
+    let col = &table.columns[col_idx];
+    if col.is_ipk {
+        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+    } else if let Some(gen_expr) = virtual_generated_column_expr(col) {
+        let scan = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema,
+            register_base: None,
+            secondary: None,
+        };
+        emit_expr(b, &gen_expr, reg, Some(&scan));
+        emit_single_column_affinity(b, reg, col.affinity);
+    } else {
+        b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
     }
 }
 
@@ -14094,12 +14163,8 @@ fn emit_column_reads(
     for col in columns {
         match col {
             ResultColumn::Star => {
-                for (i, ci) in table.columns.iter().enumerate() {
-                    if ci.is_ipk {
-                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-                    } else {
-                        b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
-                    }
+                for i in 0..table.columns.len() {
+                    emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
                     reg += 1;
                 }
             }
@@ -14107,12 +14172,8 @@ fn emit_column_reads(
                 if !matches_table_or_alias(&qualifier.name, table, table_alias) {
                     return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
-                for (i, ci) in table.columns.iter().enumerate() {
-                    if ci.is_ipk {
-                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-                    } else {
-                        b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
-                    }
+                for i in 0..table.columns.len() {
+                    emit_table_column_read(b, cursor, table, table_alias, Some(schema), i, reg);
                     reg += 1;
                 }
             }
@@ -14124,11 +14185,15 @@ fn emit_column_reads(
                         }
                     }
                     if let Some(col_idx) = table.column_index(&col_ref.column) {
-                        if table.columns[col_idx].is_ipk {
-                            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-                        } else {
-                            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
-                        }
+                        emit_table_column_read(
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            Some(schema),
+                            col_idx,
+                            reg,
+                        );
                     } else if table.resolves_to_hidden_rowid(&col_ref.column) {
                         b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
                     } else if let Some(qualifier) = &col_ref.table {
@@ -14755,7 +14820,23 @@ fn emit_resolved_column(
 ) {
     match resolved {
         SortKeySource::Column(idx) => {
-            b.emit_op(Opcode::Column, cursor, *idx as i32, reg, P4::None, 0);
+            // bd-r3303: when reading from the scanned table's own cursor, route
+            // through emit_table_column_read so a VIRTUAL generated column is
+            // computed on read. For other cursors (e.g. a sorter/join feed where
+            // base columns are already materialized) keep the direct read.
+            if cursor == scan.cursor && *idx < scan.table.columns.len() {
+                emit_table_column_read(
+                    b,
+                    cursor,
+                    scan.table,
+                    scan.table_alias,
+                    scan.schema,
+                    *idx,
+                    reg,
+                );
+            } else {
+                b.emit_op(Opcode::Column, cursor, *idx as i32, reg, P4::None, 0);
+            }
         }
         SortKeySource::Rowid => {
             b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
@@ -17670,7 +17751,20 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             if let Some(reg_base) = sc.register_base {
                 if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    b.emit_op(Opcode::Copy, reg_base + col_idx as i32, reg, 0, P4::None, 0);
+                    if let Some(gen_expr) =
+                        virtual_generated_column_expr(&sc.table.columns[col_idx])
+                    {
+                        // bd-r3303: a VIRTUAL generated column has only a NULL
+                        // placeholder register (it is never materialized), so when
+                        // it is referenced in a write-time context — building an
+                        // index key over it, or a STORED column / CHECK constraint
+                        // that reads it — recompute it from the sibling column
+                        // registers and coerce to its declared affinity.
+                        emit_expr(b, &gen_expr, reg, Some(sc));
+                        emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
+                    } else {
+                        b.emit_op(Opcode::Copy, reg_base + col_idx as i32, reg, 0, P4::None, 0);
+                    }
                 } else {
                     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 }
@@ -17678,6 +17772,17 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 if sc.table.columns[col_idx].is_ipk {
                     b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
+                } else if let Some(gen_expr) =
+                    virtual_generated_column_expr(&sc.table.columns[col_idx])
+                {
+                    // bd-r3303: a VIRTUAL generated column is not materialized in
+                    // the stored record, so compute it on read by emitting its
+                    // generating expression against the current cursor row (the
+                    // referenced base columns resolve through this same path),
+                    // then coerce to the column's declared affinity — matching
+                    // what record packing applies to STORED columns at write.
+                    emit_expr(b, &gen_expr, reg, Some(sc));
+                    emit_single_column_affinity(b, reg, sc.table.columns[col_idx].affinity);
                 } else {
                     b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
                 }
