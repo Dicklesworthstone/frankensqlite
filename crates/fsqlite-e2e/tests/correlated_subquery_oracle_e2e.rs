@@ -142,7 +142,6 @@ fn correlated_exists_and_not_exists() {
 /// correlated+aggregate subquery via scalar `=` works and a non-correlated IN
 /// works. Correlation is not threaded into the `x IN (SELECT ...)` path.
 #[test]
-#[ignore = "bd-zvk68: correlated IN-subquery returns []; scalar = form of the same subquery works"]
 fn correlated_in_top_per_group() {
     let (f, r) = setup(&emp());
     check(
@@ -174,7 +173,6 @@ fn self_correlated_above_group_average() {
 /// it evaluates true regardless and the outer query over-matches. Single-level
 /// correlated EXISTS works (correlated_exists_and_not_exists).
 #[test]
-#[ignore = "bd-zvk68: doubly-nested correlation over-matches (inner EXISTS not bound to the middle level)"]
 fn doubly_nested_correlation() {
     let (f, r) = setup(&[
         "CREATE TABLE a (id INTEGER PRIMARY KEY)",

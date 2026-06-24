@@ -23657,7 +23657,18 @@ impl Connection {
                     // per-row evaluation of outer column refs unless the exact
                     // validated indexed COUNT(*) semijoin fast path applies.
                     self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
-                    self.execute_correlated_exists_where_fallback(cx, select, params)
+                    self.execute_correlated_subquery_where_fallback(cx, select, params)
+                } else if select_has_correlated_in_subquery_in_where(select) {
+                    // bd-zvk68: a correlated `x IN (SELECT ...)` predicate in the
+                    // WHERE clause references outer columns and must be evaluated
+                    // per outer row. The VDBE codegen IN-subquery path builds the
+                    // candidate set once with no outer binding (yielding an empty
+                    // set), so route to the connection-level fallback where
+                    // eval_expr_with_subqueries substitutes outer refs per row
+                    // (the InSet::Subquery arm). The correlated scalar `=` form is
+                    // already handled in VDBE via emit_scalar_subquery.
+                    self.log_mem_execution_fallback("select", "correlated_in_subquery_fallback")?;
+                    self.execute_correlated_subquery_where_fallback(cx, select, params)
                 } else if (has_group_by(select) || implicit_aggregate || ordered_aggregate)
                     && (has_joins(select)
                         || has_fallback_from_source(select)
@@ -29048,7 +29059,7 @@ impl Connection {
         !self.select_correlated_exists_where_can_use_indexed_count_probe(select)
     }
 
-    fn execute_correlated_exists_where_fallback(
+    fn execute_correlated_subquery_where_fallback(
         &self,
         cx: &Cx,
         select: &SelectStatement,
@@ -51014,6 +51025,15 @@ impl Connection {
             } else if expr_references_outer_column(term, &inner_table_lower, col_map) {
                 // Non-equality outer reference — too complex, fall through.
                 return None;
+            } else if expr_contains_subquery_match(term, &mut |_| true) {
+                // bd-zvk68: a residual term containing a subquery (e.g. a nested
+                // correlated EXISTS that references THIS subquery's own row, as
+                // in a doubly-nested correlation) cannot be evaluated by
+                // static_filters_match, which has no Connection access and would
+                // conservatively treat it as always-true — over-matching. Fall
+                // through to the full clone+substitute+execute path, which runs
+                // the nested subquery per inner row with correct correlation.
+                return None;
             } else {
                 static_filters.push(term);
             }
@@ -68602,6 +68622,27 @@ fn select_has_correlated_exists_in_where(select: &SelectStatement) -> bool {
     where_clause
         .as_deref()
         .is_some_and(expr_has_correlated_exists)
+}
+
+/// Return true if the WHERE clause contains a correlated `x IN (SELECT ...)`
+/// predicate — a subquery on the RHS of `IN` that references an outer column.
+///
+/// bd-zvk68: such predicates must be evaluated per outer row. SELECT routing
+/// uses this to keep them on the connection-level fallback, where
+/// `eval_expr_with_subqueries` substitutes outer references per row (the
+/// `InSet::Subquery` arm). The eager IN-rewrite already leaves correlated IN
+/// subqueries intact (`is_correlated_subquery`), but the VDBE codegen IN path
+/// then materializes the candidate set once with no outer binding, so without
+/// this gate the predicate matches nothing.
+fn select_has_correlated_in_subquery_in_where(select: &SelectStatement) -> bool {
+    let SelectCore::Select { where_clause, .. } = &select.body.select else {
+        return false;
+    };
+    where_clause.as_deref().is_some_and(|expr| {
+        expr_contains_subquery_match(expr, &mut |sub| {
+            matches!(sub, SubqueryExprRef::In(inner) if is_correlated_subquery(inner))
+        })
+    })
 }
 
 /// Return true if `expr` contains a correlated EXISTS subquery.
