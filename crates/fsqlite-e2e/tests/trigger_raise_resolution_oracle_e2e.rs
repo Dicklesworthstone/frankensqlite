@@ -120,7 +120,6 @@ fn raise_abort_rolls_back_statement() {
 }
 
 #[test]
-#[ignore = "bd-dkp13: RAISE(FAIL) behaves like RAISE(ABORT) — rolls back prior rows instead of keeping them"]
 fn raise_fail_keeps_prior_rows() {
     // FAIL on row 3 -> rows inserted before it (1,2) are KEPT; 3,4 are not.
     scenario(

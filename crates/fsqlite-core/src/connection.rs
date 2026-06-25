@@ -22516,6 +22516,17 @@ impl Connection {
                 Ok(value)
             }
             Err(statement_error) => {
+                // RAISE(FAIL): the statement fails but its already-applied rows
+                // are KEPT. Release the savepoint exactly as on success (instead
+                // of rolling back to it), then propagate the error.
+                if matches!(statement_error, FrankenError::RaiseFail(_)) {
+                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                        txn.release_savepoint(cx, &savepoint_name)?;
+                    }
+                    self.live_vtab_release_all(cx, live_vtab_level)?;
+                    return Err(statement_error);
+                }
+
                 // Full ROLLBACK can clear the transaction underneath us
                 // (for example via trigger RAISE(ROLLBACK)). In that case,
                 // the outer rollback has already restored connection state.
@@ -23375,11 +23386,14 @@ impl Connection {
             }
         };
         let commit_autocommit_on_error = was_auto
-            && statement_preserves_prior_changes_on_constraint(statement.as_ref())
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+            && ((statement_preserves_prior_changes_on_constraint(statement.as_ref())
+                && matches!(
+                    result.as_ref(),
+                    Err(error) if error_is_constraint_violation(error)
+                ))
+                // RAISE(FAIL) keeps the statement's already-applied rows, so an
+                // autocommit statement must commit them rather than roll back.
+                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
         let ok = result.is_ok() || commit_autocommit_on_error;
         let dirty_table_name = if is_write {
             Self::extract_written_table_name(statement.as_ref())
@@ -25211,11 +25225,14 @@ impl Connection {
             self.execute_insert_select_materialized_rows(insert, source_rows)
         };
         let commit_autocommit_on_error = was_auto
-            && preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+            && ((preserve_prior_changes_on_constraint_violation
+                && matches!(
+                    result.as_ref(),
+                    Err(error) if error_is_constraint_violation(error)
+                ))
+                // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
+                // by this statement; commit them instead of rolling back.
+                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
         let ok = result.is_ok() || commit_autocommit_on_error;
         self.resolve_autocommit_txn_with_capture(was_auto, ok, false)?;
         result
@@ -42296,11 +42313,23 @@ impl Connection {
     ) -> Result<TriggerStatementOutcome> {
         match directive.action {
             fsqlite_ast::RaiseAction::Ignore => Ok(TriggerStatementOutcome::SkipDml),
-            fsqlite_ast::RaiseAction::Abort | fsqlite_ast::RaiseAction::Fail => {
+            fsqlite_ast::RaiseAction::Abort => {
+                // ABORT: fail the statement AND undo its already-applied rows
+                // (the statement savepoint rolls back / the autocommit txn does).
                 let message = directive
                     .message
                     .unwrap_or_else(|| "trigger RAISE()".to_owned());
                 Err(FrankenError::FunctionError(message))
+            }
+            fsqlite_ast::RaiseAction::Fail => {
+                // FAIL: fail the statement but KEEP its already-applied rows.
+                // The distinct error type makes the statement savepoint release
+                // (rather than roll back) and the autocommit boundary commit
+                // (rather than roll back) as the error unwinds.
+                let message = directive
+                    .message
+                    .unwrap_or_else(|| "trigger RAISE()".to_owned());
+                Err(FrankenError::RaiseFail(message))
             }
             fsqlite_ast::RaiseAction::Rollback => {
                 let reason = directive
@@ -106491,21 +106520,37 @@ mod tests {
     }
 
     #[test]
-    fn test_trigger_raise_fail_returns_function_error() {
+    fn test_trigger_raise_fail_keeps_prior_rows() {
+        // RAISE(FAIL) fails the statement but KEEPS rows already inserted before
+        // the failing one (unlike RAISE(ABORT), which undoes them). bd-dkp13.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
         conn.execute(
-            "CREATE TRIGGER trg_raise_fail BEFORE INSERT ON t BEGIN SELECT RAISE(FAIL, 'fail insert'); END;",
+            "CREATE TRIGGER trg_raise_fail BEFORE INSERT ON t WHEN NEW.id = 3 \
+             BEGIN SELECT RAISE(FAIL, 'fail insert'); END;",
         )
         .unwrap();
 
         let err = conn
-            .execute("INSERT INTO t VALUES (1);")
+            .execute("INSERT INTO t VALUES (1),(2),(3),(4);")
             .expect_err("INSERT should fail via RAISE(FAIL)");
+        // FAIL surfaces as RaiseFail (a distinct signal from ABORT's
+        // FunctionError) carrying the same verbatim message.
         assert!(matches!(
             err,
-            FrankenError::FunctionError(ref msg) if msg == "fail insert"
+            FrankenError::RaiseFail(ref msg) if msg == "fail insert"
         ));
+
+        // Rows 1 and 2 (inserted before the failing row 3) must survive.
+        let rows = conn.query("SELECT id FROM t ORDER BY id;").unwrap();
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.values()[0] {
+                SqliteValue::Integer(n) => n,
+                ref other => panic!("unexpected value {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2], "RAISE(FAIL) must keep prior rows");
     }
 
     #[test]
