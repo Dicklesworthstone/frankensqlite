@@ -32598,6 +32598,71 @@ impl Connection {
         })
     }
 
+    /// Physically rewrite every row of `table_name`, deleting the record slot at
+    /// `removed_slot` (the dropped column's position in the pre-drop schema).
+    ///
+    /// ALTER TABLE DROP COLUMN must realign trailing columns: the read path
+    /// (cursor_column) decodes a row by physical slot index, so updating only the
+    /// schema metadata leaves the old record layout and every column after the
+    /// dropped position misreads the wrong physical slot (and mixed-width records
+    /// can trip the payload-width consistency check). bd-nb2j9 / bd-w50nr.
+    ///
+    /// Records narrower than `removed_slot` (columns added via ALTER ADD COLUMN
+    /// that were never physically materialized) are left untouched — the slot
+    /// they would occupy does not exist on disk.
+    fn rewrite_table_records_remove_slot(
+        &self,
+        table_name: &str,
+        removed_slot: usize,
+    ) -> Result<()> {
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        if root_page <= 0 {
+            return Ok(());
+        }
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            // Collect (rowid, rewritten record) first, then delete+reinsert so we
+            // never mutate the tree while iterating it.
+            let mut rewritten: Vec<(i64, Vec<u8>)> = Vec::new();
+            if cursor.first(cx)? {
+                loop {
+                    let rowid = cursor.rowid(cx)?;
+                    let payload = cursor.payload(cx)?;
+                    let mut values =
+                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table `{table_name}` rowid {rowid} payload is not a valid SQLite record"
+                            ),
+                        })?;
+                    if removed_slot < values.len() {
+                        values.remove(removed_slot);
+                    }
+                    rewritten.push((rowid, serialize_record(&values)));
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+            }
+            for (rowid, _) in &rewritten {
+                if cursor.table_move_to(cx, *rowid)?.is_found() {
+                    cursor.delete(cx)?;
+                }
+            }
+            for (rowid, record) in &rewritten {
+                cursor.table_insert(cx, *rowid, record)?;
+            }
+            Ok(())
+        })
+    }
+
     #[cfg(feature = "ext-fts5")]
     fn upsert_storage_table_rows<I>(&self, table_name: &str, rows: I) -> Result<()>
     where
@@ -40187,6 +40252,12 @@ impl Connection {
                 for idx_name in &dropped_indexes {
                     let _ = self.delete_sqlite_master_typed_row("index", idx_name);
                 }
+                // Physically rewrite stored rows to drop the column's record slot
+                // so trailing columns realign on read (the read path decodes by
+                // physical slot index). `col_idx` is the dropped column's position
+                // in the pre-drop schema, which equals its physical record slot.
+                // bd-nb2j9 / bd-w50nr.
+                self.rewrite_table_records_remove_slot(table_name, col_idx)?;
                 table_clone
             }
         };

@@ -143,7 +143,6 @@ fn add_column_not_null_default() {
 /// (here `c` returns b's old values). Dropping the last column works
 /// (add_then_drop_column_roundtrip), so this is specific to mid-table drops.
 #[test]
-#[ignore = "bd-w50nr: DROP COLUMN (non-last) doesn't rewrite row data; following columns read stale slots"]
 fn drop_column_removes_data() {
     scenario(
         &[
@@ -165,7 +164,6 @@ fn drop_column_removes_data() {
 /// COLUMN only works for columns added via ALTER ADD COLUMN (lazy slots), as in
 /// add_then_drop_column_roundtrip.
 #[test]
-#[ignore = "bd-w50nr: DROP COLUMN of a CREATE-time column doesn't rewrite rows -> 'database disk image is malformed' on later read"]
 fn drop_create_time_last_column_corrupts() {
     scenario(
         &[

@@ -257,7 +257,6 @@ fn alter_rename_column() {
 }
 
 #[test]
-#[ignore = "bd-nb2j9: ALTER DROP COLUMN does not repack the row image (trailing columns misalign)"]
 fn alter_drop_column() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
