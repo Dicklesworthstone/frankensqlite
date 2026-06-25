@@ -212,7 +212,6 @@ fn trigger_raise_abort_rolls_back() {
 }
 
 #[test]
-#[ignore = "bd-ffkpv: CREATE TRIGGER INSTEAD OF ON <view> rejected with 'no such table'"]
 fn trigger_instead_of_view_insert() {
     let (f, r) = setup(&[
         "CREATE TABLE base (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",

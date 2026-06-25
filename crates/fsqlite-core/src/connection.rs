@@ -14435,6 +14435,12 @@ impl Connection {
     }
 
     fn ad_hoc_execute_supports_prepared_reuse(&self, statement: &Statement) -> Result<bool> {
+        // DML on a view with a matching INSTEAD OF trigger must go through the
+        // normal dispatcher, which routes to the trigger body. The prepared fast
+        // lane would compile it as table DML and fail "no such table". bd-ffkpv.
+        if self.statement_targets_instead_of_view(statement) {
+            return Ok(false);
+        }
         match statement {
             Statement::Select(_) => Ok(!self.prepared_select_requires_dispatch(statement)),
             Statement::Insert(insert) => {
@@ -23511,6 +23517,13 @@ impl Connection {
         if !matches!(statement, Statement::Select(_) | Statement::Pragma(_)) {
             self.clear_prepared_direct_insert_append_hint();
         }
+        // INSTEAD OF triggers make a view writable: route INSERT/UPDATE/DELETE on
+        // a view with a matching INSTEAD OF trigger to the trigger body instead of
+        // normal table DML (which would fail "no such table" — a view has no
+        // B-tree). bd-ffkpv.
+        if let Some(rows) = self.maybe_execute_instead_of_view_dml(statement, params)? {
+            return Ok(rows);
+        }
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(create)?;
@@ -28158,6 +28171,16 @@ impl Connection {
             schema_idx.get(&name.to_ascii_lowercase()).copied()
         } else {
             schema_idx.get(name).copied()
+        }
+    }
+
+    /// Index of a view by name (case-insensitive), or `None` if no such view.
+    fn view_index_of(&self, name: &str) -> Option<usize> {
+        let views_idx = self.views_by_name.borrow();
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            views_idx.get(&name.to_ascii_lowercase()).copied()
+        } else {
+            views_idx.get(name).copied()
         }
     }
 
@@ -41287,10 +41310,31 @@ impl Connection {
         let table_name = &stmt.table;
 
         let table_exists = self.schema_index_of(table_name).is_some();
-        if !table_exists {
-            return Err(FrankenError::NoSuchTable {
-                name: table_name.clone(),
-            });
+        let view_exists = self.view_index_of(table_name).is_some();
+        // INSTEAD OF triggers attach to a VIEW (making it writable); BEFORE/AFTER
+        // triggers attach to a base table. bd-ffkpv.
+        if stmt.timing == fsqlite_ast::TriggerTiming::InsteadOf {
+            if table_exists {
+                return Err(FrankenError::FunctionError(format!(
+                    "cannot create INSTEAD OF trigger on table: {table_name}"
+                )));
+            }
+            if !view_exists {
+                return Err(FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                });
+            }
+        } else {
+            if view_exists && !table_exists {
+                return Err(FrankenError::FunctionError(format!(
+                    "cannot create BEFORE/AFTER trigger on view: {table_name}"
+                )));
+            }
+            if !table_exists {
+                return Err(FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                });
+            }
         }
 
         let triggers = self.triggers.borrow();
@@ -42450,6 +42494,367 @@ impl Connection {
             }
         }
 
+        Ok(())
+    }
+
+    /// If `statement` is an INSERT/UPDATE/DELETE targeting a VIEW that has a
+    /// matching INSTEAD OF trigger, run the trigger body (binding NEW/OLD) and
+    /// return `Some(rows)`. Otherwise return `None` so the caller falls through
+    /// to normal DML handling. bd-ffkpv.
+    fn maybe_execute_instead_of_view_dml(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Vec<Row>>> {
+        if !self.statement_targets_instead_of_view(statement) {
+            return Ok(None);
+        }
+        let rows = match statement {
+            Statement::Insert(insert) => self.execute_instead_of_view_insert(insert, params)?,
+            Statement::Update(update) => self.execute_instead_of_view_update(update, params)?,
+            Statement::Delete(delete) => self.execute_instead_of_view_delete(delete, params)?,
+            _ => return Ok(None),
+        };
+        Ok(Some(rows))
+    }
+
+    /// Whether `statement` is INSERT/UPDATE/DELETE targeting a VIEW that has a
+    /// matching INSTEAD OF trigger. Such DML must be routed through the normal
+    /// dispatcher (`maybe_execute_instead_of_view_dml`) rather than the prepared
+    /// fast lane, which would compile it as table DML and fail "no such table".
+    fn statement_targets_instead_of_view(&self, statement: &Statement) -> bool {
+        let (view_name, event): (&str, fsqlite_ast::TriggerEvent) = match statement {
+            Statement::Insert(insert) => {
+                (insert.table.name.as_str(), fsqlite_ast::TriggerEvent::Insert)
+            }
+            Statement::Update(update) => (
+                update.table.name.name.as_str(),
+                fsqlite_ast::TriggerEvent::Update(Self::assignment_target_column_names(
+                    &update.assignments,
+                )),
+            ),
+            Statement::Delete(delete) => (
+                delete.table.name.name.as_str(),
+                fsqlite_ast::TriggerEvent::Delete,
+            ),
+            _ => return false,
+        };
+        self.view_index_of(view_name).is_some()
+            && self.has_matching_triggers(
+                view_name,
+                fsqlite_ast::TriggerTiming::InsteadOf,
+                &event,
+            )
+    }
+
+    /// Effective output column names of a view, for binding NEW/OLD in an
+    /// INSTEAD OF trigger frame: the explicit `CREATE VIEW v(cols)` list when
+    /// present, otherwise the column names inferred from the view's SELECT.
+    fn view_trigger_column_names(&self, view_name: &str) -> Result<Vec<String>> {
+        let query = {
+            let views = self.views.borrow();
+            let view = views
+                .iter()
+                .find(|v| v.name.eq_ignore_ascii_case(view_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: view_name.to_owned(),
+                })?;
+            if !view.columns.is_empty() {
+                return Ok(view.columns.clone());
+            }
+            view.query.clone()
+        };
+        Ok(self.select_result_column_names(&query, &[], &mut Vec::new()))
+    }
+
+    /// Columns assigned by an UPDATE's SET list (for INSTEAD OF UPDATE event
+    /// matching against `UPDATE OF <cols>` triggers).
+    fn assignment_target_column_names(assignments: &[fsqlite_ast::Assignment]) -> Vec<String> {
+        let mut columns = Vec::new();
+        for assignment in assignments {
+            match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => columns.push(column.clone()),
+                fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
+                    columns.extend(cols.iter().cloned());
+                }
+            }
+        }
+        columns
+    }
+
+    /// INSERT INTO <view> with an INSTEAD OF INSERT trigger: build a NEW
+    /// pseudo-row per source row (aligned to the view's columns) and fire.
+    fn execute_instead_of_view_insert(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let view_name = insert.table.name.clone();
+        let column_names = self.view_trigger_column_names(&view_name)?;
+        let new_rows = self.collect_view_insert_new_rows(insert, &column_names, params)?;
+        let event = fsqlite_ast::TriggerEvent::Insert;
+        for new_values in &new_rows {
+            self.fire_instead_of_triggers(
+                &view_name,
+                &column_names,
+                &event,
+                None,
+                Some(new_values),
+            )?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// UPDATE <view> with an INSTEAD OF UPDATE trigger: materialize the matched
+    /// view rows (OLD), apply the SET assignments to compute NEW, and fire the
+    /// trigger once per matched row.
+    fn execute_instead_of_view_update(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let view_name = update.table.name.name.clone();
+        let column_names = self.view_trigger_column_names(&view_name)?;
+        let matched_rows = self.select_matching_rows(
+            &update.table,
+            update.where_clause.as_ref(),
+            &[],
+            None,
+            params,
+        )?;
+        if matched_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Bind placeholders in assignment values so eval_join_expr can evaluate
+        // them (mirrors collect_update_trigger_rows).
+        let bound_assignments = if let Some(p) = params {
+            let mut cloned = update.assignments.clone();
+            let mut bind_state = BindParamState::default();
+            for assignment in &mut cloned {
+                bind_placeholders_in_expr(&mut assignment.value, &mut bind_state, p)?;
+            }
+            cloned
+        } else {
+            update.assignments.clone()
+        };
+        let col_map: Vec<(String, String, bool)> = column_names
+            .iter()
+            .map(|name| (view_name.clone(), name.clone(), false))
+            .collect();
+        let event = fsqlite_ast::TriggerEvent::Update(Self::assignment_target_column_names(
+            &update.assignments,
+        ));
+        for row in matched_rows {
+            let old_values = row.values().to_vec();
+            let mut new_values = old_values.clone();
+            for assignment in &bound_assignments {
+                Self::apply_view_update_assignment(
+                    assignment,
+                    &column_names,
+                    &old_values,
+                    &col_map,
+                    &mut new_values,
+                )?;
+            }
+            self.fire_instead_of_triggers(
+                &view_name,
+                &column_names,
+                &event,
+                Some(&old_values),
+                Some(&new_values),
+            )?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// DELETE FROM <view> with an INSTEAD OF DELETE trigger: materialize the
+    /// matched view rows (OLD) and fire the trigger once per matched row.
+    fn execute_instead_of_view_delete(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let view_name = delete.table.name.name.clone();
+        let column_names = self.view_trigger_column_names(&view_name)?;
+        let old_rows = self.collect_delete_trigger_rows(delete, params)?;
+        let event = fsqlite_ast::TriggerEvent::Delete;
+        for old_values in &old_rows {
+            self.fire_instead_of_triggers(
+                &view_name,
+                &column_names,
+                &event,
+                Some(old_values),
+                None,
+            )?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// Apply one UPDATE assignment to `new_values` (indexed by the view's
+    /// columns), evaluating the assignment expression against `old_values`.
+    fn apply_view_update_assignment(
+        assignment: &fsqlite_ast::Assignment,
+        column_names: &[String],
+        old_values: &[SqliteValue],
+        col_map: &[(String, String, bool)],
+        new_values: &mut [SqliteValue],
+    ) -> Result<()> {
+        let assign_one = |new_values: &mut [SqliteValue], column: &str, value: &Expr| -> Result<()> {
+            let index = find_column_index_case_insensitive(column_names, column).ok_or_else(|| {
+                FrankenError::Internal(format!("UPDATE on view: unknown column `{column}`"))
+            })?;
+            new_values[index] = eval_join_expr(value, old_values, col_map)?;
+            Ok(())
+        };
+        match &assignment.target {
+            fsqlite_ast::AssignmentTarget::Column(column) => {
+                assign_one(new_values, column, &assignment.value)?;
+            }
+            fsqlite_ast::AssignmentTarget::ColumnList(columns) => match &assignment.value {
+                Expr::RowValue(values, _) if values.len() == columns.len() => {
+                    for (column, value) in columns.iter().zip(values) {
+                        assign_one(new_values, column, value)?;
+                    }
+                }
+                other if columns.len() == 1 => {
+                    let value = match other {
+                        Expr::RowValue(values, _) if values.len() == 1 => &values[0],
+                        value => value,
+                    };
+                    assign_one(new_values, &columns[0], value)?;
+                }
+                _ => {
+                    return Err(FrankenError::Internal(
+                        "UPDATE on view: column-list assignment requires a matching row-value"
+                            .to_owned(),
+                    ));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Build NEW pseudo-rows (aligned to the view's columns) for an INSTEAD OF
+    /// INSERT, taking values from the INSERT's column list / VALUES / SELECT.
+    /// View columns not supplied by the INSERT are NULL (views have no defaults).
+    fn collect_view_insert_new_rows(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        view_columns: &[String],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        // For each view column, the source-row position that supplies it.
+        let source_index_for_view_col: Vec<Option<usize>> = if insert.columns.is_empty() {
+            (0..view_columns.len()).map(Some).collect()
+        } else {
+            view_columns
+                .iter()
+                .map(|view_col| {
+                    insert
+                        .columns
+                        .iter()
+                        .position(|insert_col| insert_col.eq_ignore_ascii_case(view_col))
+                })
+                .collect()
+        };
+        let align = |source: &[SqliteValue]| -> Vec<SqliteValue> {
+            source_index_for_view_col
+                .iter()
+                .map(|maybe_idx| {
+                    maybe_idx
+                        .and_then(|idx| source.get(idx).cloned())
+                        .unwrap_or(SqliteValue::Null)
+                })
+                .collect()
+        };
+        match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => {
+                let mut bind_state = BindParamState::default();
+                let mut new_rows = Vec::with_capacity(rows.len());
+                for row_exprs in rows {
+                    let mut canonical = row_exprs.clone();
+                    for expr in &mut canonical {
+                        canonicalize_expr_placeholders(expr, &mut bind_state)?;
+                    }
+                    let source = self.evaluate_insert_source_row(&canonical, params)?;
+                    new_rows.push(align(&source));
+                }
+                Ok(new_rows)
+            }
+            fsqlite_ast::InsertSource::Select(select) => {
+                let source_rows =
+                    self.execute_statement(&Statement::Select(*select.clone()), params)?;
+                Ok(source_rows.iter().map(|row| align(row.values())).collect())
+            }
+            fsqlite_ast::InsertSource::DefaultValues => {
+                Ok(vec![vec![SqliteValue::Null; view_columns.len()]])
+            }
+        }
+    }
+
+    /// Fire all INSTEAD OF triggers on `view_name` matching `event`, binding a
+    /// frame with the supplied OLD/NEW rows (indexed by `column_names`).
+    /// Mirrors `fire_after_triggers` but uses a view-derived frame (no rowid).
+    fn fire_instead_of_triggers(
+        &self,
+        view_name: &str,
+        column_names: &[String],
+        event: &fsqlite_ast::TriggerEvent,
+        old_values: Option<&[SqliteValue]>,
+        new_values: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
+            return Err(FrankenError::Internal(
+                "too many levels of trigger recursion".to_owned(),
+            ));
+        }
+        let triggers = self.triggers.borrow();
+        let matching: Vec<_> = triggers
+            .iter()
+            .filter(|trigger| {
+                trigger.table_name.eq_ignore_ascii_case(view_name)
+                    && trigger.timing == fsqlite_ast::TriggerTiming::InsteadOf
+                    && trigger_event_matches(&trigger.event, event)
+            })
+            .cloned()
+            .collect();
+        drop(triggers);
+        if matching.is_empty() {
+            return Ok(());
+        }
+        let base_frame = TriggerFrame {
+            table_name: view_name.to_owned(),
+            trigger_name: String::new(),
+            column_names: column_names.to_vec(),
+            rowid_alias_col_idx: None,
+            old_row: old_values.map(<[SqliteValue]>::to_vec),
+            new_row: new_values.map(<[SqliteValue]>::to_vec),
+        };
+        for trigger in matching {
+            if !self.pragma_state.borrow().recursive_triggers
+                && self
+                    .trigger_frame_stack
+                    .borrow()
+                    .iter()
+                    .any(|f| f.trigger_name.eq_ignore_ascii_case(&trigger.name))
+            {
+                continue;
+            }
+            let mut frame = base_frame.clone();
+            frame.trigger_name.clone_from(&trigger.name);
+            let _frame_guard = self.push_trigger_frame(frame.clone());
+            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame))? {
+                continue;
+            }
+            for stmt in &trigger.body {
+                let mut bound_stmt = stmt.clone();
+                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                match self.execute_bound_trigger_statement(bound_stmt)? {
+                    TriggerStatementOutcome::Continue => {}
+                    TriggerStatementOutcome::SkipDml => return Ok(()),
+                }
+            }
+        }
         Ok(())
     }
 

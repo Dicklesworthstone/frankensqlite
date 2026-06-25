@@ -166,7 +166,6 @@ fn trigger_old_new_across_all_events() {
 /// unsupported. Confirmed here for UPDATE and DELETE (the bead's existing
 /// INSTEAD-OF-insert test covers INSERT).
 #[test]
-#[ignore = "bd-ffkpv: CREATE TRIGGER INSTEAD OF UPDATE/DELETE ON <view> rejected with 'no such table'"]
 fn trigger_instead_of_view_update_and_delete() {
     scenario(
         &[
