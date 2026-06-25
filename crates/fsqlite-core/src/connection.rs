@@ -38355,16 +38355,51 @@ impl Connection {
             if hot_path_profile_enabled() {
                 FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            // Coerce each synthesized ADD COLUMN default through its column's
+            // declared affinity so the read storage class matches a normal INSERT
+            // default (e.g. INTEGER col DEFAULT '42' -> int 42, TEXT col
+            // DEFAULT 100 -> text '100'). bd-v7y8q. This is the hot-path builder
+            // feeding the VDBE storage-cursor default synthesis (cursor_column).
+            let affinity_by_root_page: HbHashMap<i32, Vec<TypeAffinity>> = {
+                let schema = self.schema.borrow();
+                schema
+                    .iter()
+                    .filter(|table| {
+                        metadata
+                            .column_default_sql_by_root_page
+                            .contains_key(&table.root_page)
+                    })
+                    .map(|table| {
+                        (
+                            table.root_page,
+                            table
+                                .columns
+                                .iter()
+                                .map(|column| affinity_char_to_type(column.affinity))
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            };
             Arc::new(
                 metadata
                     .column_default_sql_by_root_page
                     .iter()
                     .filter_map(|(root_page, default_sqls)| {
+                        let affinities = affinity_by_root_page.get(root_page);
                         let defaults: Vec<Option<SqliteValue>> = default_sqls
                             .iter()
-                            .map(|default_sql| {
+                            .enumerate()
+                            .map(|(col_idx, default_sql)| {
                                 default_sql.as_deref().and_then(|sql| {
-                                    self.evaluate_column_default_value(Some(sql)).ok()
+                                    self.evaluate_column_default_value(Some(sql)).ok().map(
+                                        |value| match affinities
+                                            .and_then(|affs| affs.get(col_idx).copied())
+                                        {
+                                            Some(aff) => value.apply_affinity(aff),
+                                            None => value,
+                                        },
+                                    )
                                 })
                             })
                             .collect();
@@ -38506,16 +38541,50 @@ impl Connection {
         if hot_path_profile_enabled() {
             FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
+        // Per-column affinities so each synthesized ADD COLUMN default is coerced
+        // through its column's declared affinity, matching how a normal INSERT
+        // stores a column default (e.g. INTEGER col DEFAULT '42' -> int 42,
+        // TEXT col DEFAULT 100 -> text '100'). bd-v7y8q.
+        let affinity_by_root_page: HashMap<i32, Vec<TypeAffinity>> = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .filter(|table| {
+                    metadata
+                        .column_default_sql_by_root_page
+                        .contains_key(&table.root_page)
+                })
+                .map(|table| {
+                    (
+                        table.root_page,
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| affinity_char_to_type(column.affinity))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
         metadata
             .column_default_sql_by_root_page
             .iter()
             .filter_map(|(root_page, default_sqls)| {
+                let affinities = affinity_by_root_page.get(root_page);
                 let defaults: Vec<Option<SqliteValue>> = default_sqls
                     .iter()
-                    .map(|default_sql| {
-                        default_sql
-                            .as_deref()
-                            .and_then(|sql| self.evaluate_column_default_value(Some(sql)).ok())
+                    .enumerate()
+                    .map(|(col_idx, default_sql)| {
+                        default_sql.as_deref().and_then(|sql| {
+                            self.evaluate_column_default_value(Some(sql)).ok().map(
+                                |value| match affinities
+                                    .and_then(|affs| affs.get(col_idx).copied())
+                                {
+                                    Some(aff) => value.apply_affinity(aff),
+                                    None => value,
+                                },
+                            )
+                        })
                     })
                     .collect();
                 defaults
@@ -39939,10 +40008,17 @@ impl Connection {
                         ));
                     }
                 }
-                let default_for_existing_rows = default_value.as_deref().map_or_else(
-                    || Ok(SqliteValue::Null),
-                    |default_sql| self.evaluate_column_default_value(Some(default_sql)),
-                )?;
+                // Coerce the back-fill default through the new column's affinity so
+                // the stored storage class matches a normal INSERT default (the
+                // read path applies the same coercion). bd-v7y8q. apply_affinity
+                // preserves NULL, so the no-default case stays NULL.
+                let default_for_existing_rows = default_value
+                    .as_deref()
+                    .map_or_else(
+                        || Ok(SqliteValue::Null),
+                        |default_sql| self.evaluate_column_default_value(Some(default_sql)),
+                    )?
+                    .apply_affinity(affinity_char_to_type(affinity));
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
                     .iter_mut()

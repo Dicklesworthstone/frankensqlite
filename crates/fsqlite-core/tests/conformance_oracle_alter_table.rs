@@ -182,7 +182,6 @@ fn alter_add_column_null_default_when_unspecified() {
 }
 
 #[test]
-#[ignore = "bd-v7y8q: ALTER ADD COLUMN does not apply column affinity to the DEFAULT value"]
 fn alter_add_column_default_affinity_coercion() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
