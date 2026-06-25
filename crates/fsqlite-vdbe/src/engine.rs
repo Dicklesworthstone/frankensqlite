@@ -178,7 +178,8 @@ use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
 };
 use fsqlite_types::value::{
-    SmallText, SqlLikeFastPathKind, SqliteValue, pool_return_reusable, sql_like_fast_path_matches,
+    SmallText, SqlLikeFastPathKind, SqliteValue, pool_return_reusable,
+    sql_like_fast_path_matches_cased,
 };
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
@@ -11802,20 +11803,36 @@ impl VdbeEngine {
                         }
                     };
                     let input = self.get_reg(op.p1);
+                    // Honor `PRAGMA case_sensitive_like` (set per-statement into a
+                    // thread-local by the Connection before execution).
+                    let case_sensitive = fsqlite_func::case_sensitive_like_active();
                     let result = if input.is_null() {
                         SqliteValue::Null
                     } else {
                         let matched = match input {
-                            SqliteValue::Text(text) => {
-                                sql_like_fast_path_matches(kind, literal, text)
-                            }
+                            SqliteValue::Text(text) => sql_like_fast_path_matches_cased(
+                                kind,
+                                literal,
+                                text,
+                                case_sensitive,
+                            ),
                             SqliteValue::Blob(bytes) => {
                                 let text = String::from_utf8_lossy(bytes);
-                                sql_like_fast_path_matches(kind, literal, &text)
+                                sql_like_fast_path_matches_cased(
+                                    kind,
+                                    literal,
+                                    &text,
+                                    case_sensitive,
+                                )
                             }
                             _ => {
                                 let text = input.to_text();
-                                sql_like_fast_path_matches(kind, literal, &text)
+                                sql_like_fast_path_matches_cased(
+                                    kind,
+                                    literal,
+                                    &text,
+                                    case_sensitive,
+                                )
                             }
                         };
                         let final_match = if op.p5 != 0 { !matched } else { matched };

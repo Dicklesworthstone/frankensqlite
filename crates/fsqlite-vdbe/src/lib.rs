@@ -1436,6 +1436,9 @@ pub mod pragma {
         pub mvcc_writer_lease_secs: u64,
         /// `PRAGMA writable_schema` toggle — allows direct DML on sqlite_master.
         pub writable_schema: bool,
+        /// `PRAGMA case_sensitive_like` toggle. When `false` (the default) LIKE
+        /// folds ASCII case; when `true` LIKE is byte-exact (case-sensitive).
+        pub case_sensitive_like: bool,
     }
 
     impl Default for ConnectionPragmaState {
@@ -1461,6 +1464,7 @@ pub mod pragma {
                 mvcc_max_chain_length: 64,
                 mvcc_writer_lease_secs: 30,
                 writable_schema: false,
+                case_sensitive_like: false,
             }
         }
     }
@@ -1557,6 +1561,9 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("writable_schema") {
             return apply_writable_schema(state, stmt);
         }
+        if name.eq_ignore_ascii_case("case_sensitive_like") {
+            return apply_case_sensitive_like(state, stmt);
+        }
         if is_fsqlite_mvcc_max_chain_length(&stmt.name) {
             return apply_mvcc_max_chain_length(state, stmt);
         }
@@ -1575,6 +1582,25 @@ pub mod pragma {
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
                 let enabled = parse_bool(expr)?;
                 state.serializable = enabled;
+                Ok(PragmaOutput::Bool(enabled))
+            }
+        }
+    }
+
+    /// `PRAGMA case_sensitive_like = ON|OFF`. SQLite treats this as write-only,
+    /// but mirroring the other boolean toggles we also echo the current value on
+    /// the no-argument query form. When ON, LIKE becomes byte-exact; the actual
+    /// matching behavior is honored by the LIKE evaluation paths that read this
+    /// flag (via the connection's pragma state).
+    fn apply_case_sensitive_like(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Bool(state.case_sensitive_like)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.case_sensitive_like = enabled;
                 Ok(PragmaOutput::Bool(enabled))
             }
         }

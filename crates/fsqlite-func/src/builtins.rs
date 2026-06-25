@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::value::{format_sqlite_float, sql_like};
+use fsqlite_types::value::{format_sqlite_float, sql_like_cased};
 use fsqlite_types::{SmallText, SqliteValue};
 
 use crate::agg_builtins::register_aggregate_builtins;
@@ -43,6 +43,25 @@ thread_local! {
     static LAST_INSERT_ROWID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static LAST_CHANGES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static TOTAL_CHANGES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// `PRAGMA case_sensitive_like` for the connection whose statement is
+    /// currently executing on this thread. `false` (the default) folds ASCII
+    /// case in LIKE; `true` makes LIKE byte-exact. Set by the Connection before
+    /// each statement (see `sync_change_tracking_context`); read by `LikeFunc`
+    /// and other LIKE evaluation paths so the pragma never has to be threaded
+    /// through every call site.
+    static CASE_SENSITIVE_LIKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set the active `case_sensitive_like` flag for LIKE evaluation on this thread
+/// (called by the Connection before executing a statement).
+pub fn set_case_sensitive_like(case_sensitive: bool) {
+    CASE_SENSITIVE_LIKE.set(case_sensitive);
+}
+
+/// Read the active `case_sensitive_like` flag for LIKE evaluation on this thread.
+#[must_use]
+pub fn case_sensitive_like_active() -> bool {
+    CASE_SENSITIVE_LIKE.get()
 }
 
 /// Connection-scoped change-tracking state projected into builtin execution context.
@@ -1816,6 +1835,42 @@ impl ScalarFunction for LikeFunc {
     }
 }
 
+#[cfg(test)]
+mod like_func_pragma_tests {
+    use super::{LikeFunc, case_sensitive_like_active, set_case_sensitive_like};
+    use crate::ScalarFunction;
+    use fsqlite_types::SqliteValue;
+
+    fn like(pattern: &str, text: &str) -> i64 {
+        match LikeFunc
+            .invoke(&[
+                SqliteValue::Text(pattern.into()),
+                SqliteValue::Text(text.into()),
+            ])
+            .unwrap()
+        {
+            SqliteValue::Integer(n) => n,
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn like_honors_case_sensitive_like_thread_local() {
+        // Default: ASCII-case-insensitive.
+        set_case_sensitive_like(false);
+        assert_eq!(like("a", "A"), 1);
+        assert_eq!(like("A%", "apple"), 1);
+        // ON: byte-exact.
+        set_case_sensitive_like(true);
+        assert!(case_sensitive_like_active());
+        assert_eq!(like("a", "A"), 0);
+        assert_eq!(like("A%", "apple"), 0);
+        assert_eq!(like("A%", "Apple"), 1);
+        // Restore so other tests on this thread see the default.
+        set_case_sensitive_like(false);
+    }
+}
+
 fn single_char_escape(escape: &str) -> Result<char> {
     let mut chars = escape.chars();
     match (chars.next(), chars.next()) {
@@ -1826,9 +1881,11 @@ fn single_char_escape(escape: &str) -> Result<char> {
     }
 }
 
-/// LIKE pattern matching (case-insensitive for ASCII).
+/// LIKE pattern matching. ASCII-case-insensitive by default; byte-exact when
+/// the connection has `PRAGMA case_sensitive_like = ON` (read from the
+/// thread-local set by the Connection before statement execution).
 fn like_match(pattern: &str, string: &str, escape: Option<char>) -> bool {
-    sql_like(pattern, string, escape)
+    sql_like_cased(pattern, string, escape, case_sensitive_like_active())
 }
 
 // ── glob(PATTERN, STRING) ───────────────────────────────────────────────

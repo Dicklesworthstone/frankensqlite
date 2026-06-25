@@ -1169,8 +1169,25 @@ pub fn unique_key_duplicates(a: &[SqliteValue], b: &[SqliteValue]) -> bool {
 /// - Case-insensitive for ASCII A-Z only (no Unicode case folding without ICU).
 /// - `escape` optionally specifies the escape character for literal `%`/`_`.
 pub fn sql_like(pattern: &str, text: &str, escape: Option<char>) -> bool {
+    sql_like_cased(pattern, text, escape, false)
+}
+
+/// Match a string against a SQL LIKE pattern, honoring the connection's
+/// `PRAGMA case_sensitive_like` setting.
+///
+/// When `case_sensitive` is `false` (the default) this is identical to
+/// [`sql_like`]: ASCII case is folded. When `case_sensitive` is `true`
+/// (`PRAGMA case_sensitive_like = ON`) the literal portions of the pattern are
+/// matched byte-exact — wildcards (`%`, `_`) still behave the same.
+#[must_use]
+pub fn sql_like_cased(
+    pattern: &str,
+    text: &str,
+    escape: Option<char>,
+    case_sensitive: bool,
+) -> bool {
     if let Some((kind, literal)) = classify_sql_like_fast_path(pattern, escape) {
-        return sql_like_fast_path_matches(kind, literal, text);
+        return sql_like_fast_path_matches_cased(kind, literal, text, case_sensitive);
     }
 
     sql_like_inner(
@@ -1179,6 +1196,7 @@ pub fn sql_like(pattern: &str, text: &str, escape: Option<char>) -> bool {
         escape,
         0,
         0,
+        case_sensitive,
     )
 }
 
@@ -1218,12 +1236,50 @@ impl SqlLikeFastPathKind {
 
 #[must_use]
 pub fn sql_like_fast_path_matches(kind: SqlLikeFastPathKind, literal: &str, text: &str) -> bool {
+    sql_like_fast_path_matches_cased(kind, literal, text, false)
+}
+
+/// Like [`sql_like_fast_path_matches`] but honoring `case_sensitive`.
+///
+/// When `case_sensitive` is `true` the literal is compared byte-exact
+/// (`PRAGMA case_sensitive_like = ON`); otherwise ASCII case is folded.
+#[must_use]
+pub fn sql_like_fast_path_matches_cased(
+    kind: SqlLikeFastPathKind,
+    literal: &str,
+    text: &str,
+    case_sensitive: bool,
+) -> bool {
     match kind {
         SqlLikeFastPathKind::MatchAll => true,
-        SqlLikeFastPathKind::Exact => ascii_ci_eq_bytes(literal.as_bytes(), text.as_bytes()),
-        SqlLikeFastPathKind::Prefix => ascii_ci_starts_with(text, literal),
-        SqlLikeFastPathKind::Suffix => ascii_ci_ends_with(text, literal),
-        SqlLikeFastPathKind::Contains => ascii_ci_contains(text, literal),
+        SqlLikeFastPathKind::Exact => {
+            if case_sensitive {
+                literal.as_bytes() == text.as_bytes()
+            } else {
+                ascii_ci_eq_bytes(literal.as_bytes(), text.as_bytes())
+            }
+        }
+        SqlLikeFastPathKind::Prefix => {
+            if case_sensitive {
+                text.as_bytes().starts_with(literal.as_bytes())
+            } else {
+                ascii_ci_starts_with(text, literal)
+            }
+        }
+        SqlLikeFastPathKind::Suffix => {
+            if case_sensitive {
+                text.as_bytes().ends_with(literal.as_bytes())
+            } else {
+                ascii_ci_ends_with(text, literal)
+            }
+        }
+        SqlLikeFastPathKind::Contains => {
+            if case_sensitive {
+                literal.is_empty() || memmem::find(text.as_bytes(), literal.as_bytes()).is_some()
+            } else {
+                ascii_ci_contains(text, literal)
+            }
+        }
     }
 }
 
@@ -1232,17 +1288,25 @@ pub struct SqlLikeFastPathMatcher<'a> {
     kind: SqlLikeFastPathKind,
     literal: &'a str,
     contains_finder: Option<memmem::Finder<'a>>,
+    case_sensitive: bool,
 }
 
 impl<'a> SqlLikeFastPathMatcher<'a> {
     #[must_use]
     pub fn new(kind: SqlLikeFastPathKind, literal: &'a str) -> Self {
+        Self::new_cased(kind, literal, false)
+    }
+
+    /// Build a matcher honoring `case_sensitive` (`PRAGMA case_sensitive_like`).
+    #[must_use]
+    pub fn new_cased(kind: SqlLikeFastPathKind, literal: &'a str, case_sensitive: bool) -> Self {
         let contains_finder = (kind == SqlLikeFastPathKind::Contains && !literal.is_empty())
             .then(|| memmem::Finder::new(literal.as_bytes()));
         Self {
             kind,
             literal,
             contains_finder,
+            case_sensitive,
         }
     }
 
@@ -1257,9 +1321,15 @@ impl<'a> SqlLikeFastPathMatcher<'a> {
             if finder.find(text_bytes).is_some() {
                 return true;
             }
+            // A byte-exact substring (the finder above) is the *only* match when
+            // the connection's LIKE is case-sensitive; otherwise fall back to the
+            // ASCII-case-folded scan.
+            if self.case_sensitive {
+                return false;
+            }
             return ascii_ci_contains_folded_scan(text_bytes, needle_bytes);
         }
-        sql_like_fast_path_matches(self.kind, self.literal, text)
+        sql_like_fast_path_matches_cased(self.kind, self.literal, text, self.case_sensitive)
     }
 }
 
@@ -1308,6 +1378,7 @@ fn sql_like_inner(
     escape: Option<char>,
     pi: usize,
     ti: usize,
+    case_sensitive: bool,
 ) -> bool {
     let mut pi = pi;
     let mut ti = ti;
@@ -1322,7 +1393,7 @@ fn sql_like_inner(
                 return false; // Trailing escape is malformed.
             }
             // Match the escaped character literally.
-            if ti >= text.len() || !ascii_ci_eq(pattern[pi], text[ti]) {
+            if ti >= text.len() || !chars_eq(pattern[pi], text[ti], case_sensitive) {
                 return false;
             }
             pi += 1;
@@ -1342,7 +1413,7 @@ fn sql_like_inner(
                 }
                 // Try matching rest of pattern at each position.
                 for start in ti..=text.len() {
-                    if sql_like_inner(pattern, text, escape, pi, start) {
+                    if sql_like_inner(pattern, text, escape, pi, start, case_sensitive) {
                         return true;
                     }
                 }
@@ -1356,7 +1427,7 @@ fn sql_like_inner(
                 ti += 1;
             }
             _ => {
-                if ti >= text.len() || !ascii_ci_eq(pc, text[ti]) {
+                if ti >= text.len() || !chars_eq(pc, text[ti], case_sensitive) {
                     return false;
                 }
                 pi += 1;
@@ -1365,6 +1436,17 @@ fn sql_like_inner(
         }
     }
     ti >= text.len()
+}
+
+/// LIKE literal-character comparison: byte-exact when `case_sensitive`
+/// (`PRAGMA case_sensitive_like = ON`), otherwise ASCII case-folded (default).
+#[inline]
+fn chars_eq(a: char, b: char, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        a == b
+    } else {
+        ascii_ci_eq(a, b)
+    }
 }
 
 /// ASCII-only case-insensitive character comparison (SQLite LIKE semantics).
@@ -1491,7 +1573,8 @@ impl Default for SumAccumulator {
     }
 }
 
-/// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
+/// Kahan-Babuska-Neumaier compensated summation step matching upstream
+/// aggregate precision behavior.
 #[inline]
 fn kbn_step(sum: &mut f64, err: &mut f64, value: f64) {
     let s = *sum;
@@ -1764,11 +1847,12 @@ pub fn int_float_cmp(i: i64, r: f64) -> Ordering {
     }
 }
 
-/// Format a floating-point value as text matching SQLite's `%!.15g` behavior.
+/// Format a floating-point value as text matching SQLite's `%!.*g` behavior.
 ///
-/// SQLite uses `printf("%!.15g", value)` to convert REAL to TEXT. The `!` flag
-/// ensures the result always contains a decimal point, distinguishing REAL from
-/// INTEGER in text output (e.g., `120.0` not `120`).
+/// SQLite 3.52 and newer default REAL-to-TEXT conversion to 17 significant
+/// digits through `sqlite3VdbeMemStringify()`. The `!` flag keeps a decimal
+/// point so REAL text stays distinct from INTEGER text, for example `120.0`
+/// rather than `120`.
 #[must_use]
 pub fn format_sqlite_float(f: f64) -> String {
     if f.is_nan() {
@@ -1781,65 +1865,459 @@ pub fn format_sqlite_float(f: f64) -> String {
             "-Inf".to_owned()
         };
     }
-    // SQLite's alternate REAL-to-TEXT formatter keeps a decimal point for REAL
-    // values and, in current bundled SQLite, preserves enough digits to
-    // distinguish values such as 0.1 + 0.2 from the shorter decimal 0.3.
-    let abs = f.abs();
-    let s = if abs == 0.0 {
-        "0.0".to_owned()
-    } else {
-        let exp = abs.log10().floor() as i32;
-        if (-4..16).contains(&exp) {
-            let mut s = format!("{f:?}");
-            if !s.contains('.') && !s.contains('e') {
-                s.push_str(".0");
-            }
-            s
-        } else {
-            let debug = format!("{f:?}");
-            let mut s = if let Some((mantissa, _)) = debug.split_once('e') {
-                if !mantissa.contains('.') {
-                    debug
-                } else {
-                    format!("{f:.16e}")
-                }
-            } else {
-                debug
-            };
-            normalize_sqlite_float_exponent(&mut s);
-            s
-        }
-    };
-    s
+    render_sqlite_float_decode(&sqlite_float_decode(f))
 }
 
-fn normalize_sqlite_float_exponent(s: &mut String) {
-    let Some(e_pos) = s.find('e') else {
-        if !s.contains('.') {
-            s.push_str(".0");
+const SQLITE_FLOAT_SIGNIFICANT_DIGITS: usize = 17;
+const SQLITE_FLOAT_MAX_ROUND_DIGITS: usize = 20;
+const SQLITE_FLOAT_GENERIC_PRECISION: i32 = 16;
+const SQLITE_POWERS_OF_TEN_FIRST: i32 = -348;
+const SQLITE_POWERS_OF_TEN_LAST: i32 = 347;
+
+#[derive(Debug)]
+struct SqliteFloatDecode {
+    digits: Vec<u8>,
+    decimal_point: i32,
+    negative: bool,
+}
+
+fn render_sqlite_float_decode(decoded: &SqliteFloatDecode) -> String {
+    let exponent = decoded.decimal_point - 1;
+    if !(-4..=SQLITE_FLOAT_GENERIC_PRECISION).contains(&exponent) {
+        return render_sqlite_float_exponential(decoded, exponent);
+    }
+    render_sqlite_float_fixed(decoded, exponent)
+}
+
+fn render_sqlite_float_fixed(decoded: &SqliteFloatDecode, exponent: i32) -> String {
+    let mut out = String::with_capacity(decoded.digits.len() + 8);
+    if decoded.negative {
+        out.push('-');
+    }
+
+    let mut precision = SQLITE_FLOAT_GENERIC_PRECISION - exponent;
+    let mut digit_idx = 0usize;
+    let mut e2 = decoded.decimal_point - 1;
+
+    if e2 < 0 {
+        out.push('0');
+    } else {
+        while e2 >= 0 {
+            if let Some(&digit) = decoded.digits.get(digit_idx) {
+                out.push(char::from(digit));
+                digit_idx += 1;
+            } else {
+                out.push('0');
+            }
+            e2 -= 1;
         }
-        return;
+    }
+
+    out.push('.');
+
+    if e2 < -1 && precision > 0 {
+        let zero_count = (-1 - e2).min(precision);
+        for _ in 0..zero_count {
+            out.push('0');
+        }
+        precision -= zero_count;
+    }
+
+    if precision > 0 {
+        let digits_after_decimal =
+            (decoded.digits.len().saturating_sub(digit_idx)).min(precision as usize);
+        for &digit in &decoded.digits[digit_idx..digit_idx + digits_after_decimal] {
+            out.push(char::from(digit));
+        }
+    }
+
+    trim_sqlite_float_tail(&mut out);
+    out
+}
+
+fn render_sqlite_float_exponential(decoded: &SqliteFloatDecode, exponent: i32) -> String {
+    let mut out = String::with_capacity(decoded.digits.len() + 8);
+    if decoded.negative {
+        out.push('-');
+    }
+
+    let first = decoded.digits.first().copied().unwrap_or(b'0');
+    out.push(char::from(first));
+    out.push('.');
+    let digits_after_decimal =
+        (decoded.digits.len().saturating_sub(1)).min(SQLITE_FLOAT_GENERIC_PRECISION as usize);
+    for &digit in decoded.digits.iter().skip(1).take(digits_after_decimal) {
+        out.push(char::from(digit));
+    }
+    trim_sqlite_float_tail(&mut out);
+
+    out.push('e');
+    let mut abs_exp = exponent;
+    if abs_exp < 0 {
+        out.push('-');
+        abs_exp = -abs_exp;
+    } else {
+        out.push('+');
+    }
+    if abs_exp >= 100 {
+        out.push(char::from(b'0' + (abs_exp / 100) as u8));
+        abs_exp %= 100;
+    }
+    out.push(char::from(b'0' + (abs_exp / 10) as u8));
+    out.push(char::from(b'0' + (abs_exp % 10) as u8));
+    out
+}
+
+fn trim_sqlite_float_tail(out: &mut String) {
+    while out.ends_with('0') {
+        out.pop();
+    }
+    if out.ends_with('.') {
+        out.push('0');
+    }
+}
+
+fn sqlite_float_decode(f: f64) -> SqliteFloatDecode {
+    let negative = f < 0.0;
+    let r = if negative { -f } else { f };
+    if r == 0.0 {
+        return SqliteFloatDecode {
+            digits: vec![b'0'],
+            decimal_point: 1,
+            negative: false,
+        };
+    }
+
+    let bits = r.to_bits();
+    let raw_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let mut mantissa = bits & 0x000f_ffff_ffff_ffff;
+    let binary_exponent = if raw_exponent == 0 {
+        let leading = mantissa.leading_zeros();
+        mantissa <<= leading;
+        -1074 - leading as i32
+    } else {
+        mantissa = (mantissa << 11) | (1_u64 << 63);
+        raw_exponent - 1086
     };
 
-    let mantissa = &s[..e_pos];
-    let exp_str = &s[e_pos + 1..];
-    let trimmed = mantissa.trim_end_matches('0');
-    let mantissa = if trimmed.ends_with('.') {
-        format!("{trimmed}0")
-    } else if trimmed.contains('.') {
-        trimmed.to_owned()
+    let (decimal, decimal_exponent) = sqlite_fp2_convert10(mantissa, binary_exponent, 18);
+    let mut digits = decimal.to_string().into_bytes();
+    let mut digit_count = digits.len();
+    let mut decimal_point = digit_count as i32 + decimal_exponent;
+    let mut round_at = SQLITE_FLOAT_SIGNIFICANT_DIGITS;
+
+    if round_at < digit_count || digit_count > SQLITE_FLOAT_MAX_ROUND_DIGITS {
+        if round_at == SQLITE_FLOAT_SIGNIFICANT_DIGITS {
+            round_at = sqlite_adjust_17_digit_rounding(
+                r,
+                &digits,
+                decimal_exponent,
+                digit_count,
+                decimal_point,
+                round_at,
+            );
+        }
+        if digits.get(round_at).copied().unwrap_or(b'0') >= b'5' {
+            let mut idx = round_at - 1;
+            loop {
+                digits[idx] += 1;
+                if digits[idx] <= b'9' {
+                    break;
+                }
+                digits[idx] = b'0';
+                if idx == 0 {
+                    digits.insert(0, b'1');
+                    round_at += 1;
+                    decimal_point += 1;
+                    break;
+                }
+                idx -= 1;
+            }
+        }
+        digit_count = round_at;
+        digits.truncate(digit_count);
+    }
+
+    while digit_count > 1 && digits[digit_count - 1] == b'0' {
+        digit_count -= 1;
+    }
+    digits.truncate(digit_count);
+
+    SqliteFloatDecode {
+        digits,
+        decimal_point,
+        negative,
+    }
+}
+
+fn sqlite_adjust_17_digit_rounding(
+    r: f64,
+    digits: &[u8],
+    decimal_exponent: i32,
+    digit_count: usize,
+    decimal_point: i32,
+    round_at: usize,
+) -> usize {
+    if digits.len() <= SQLITE_FLOAT_SIGNIFICANT_DIGITS {
+        return round_at;
+    }
+
+    if digits[15] == b'9' && digits[14] == b'9' {
+        let mut keep = 14usize;
+        while keep > 0 && digits[keep - 1] == b'9' {
+            keep -= 1;
+        }
+        let candidate = if keep == 0 {
+            1
+        } else {
+            decimal_digits_to_u64(&digits[..keep]) + 1
+        };
+        if r == sqlite_fp10_convert2(
+            candidate,
+            decimal_exponent + digit_count as i32 - keep as i32,
+        ) {
+            return keep + 1;
+        }
+    } else if decimal_point >= digit_count as i32
+        || (digits[15] == b'0' && digits[14] == b'0' && digits[13] == b'0')
+    {
+        let mut keep = 13usize;
+        while keep > 0 && digits[keep - 1] == b'0' {
+            keep -= 1;
+        }
+        if keep > 0 {
+            let candidate = decimal_digits_to_u64(&digits[..keep]);
+            if r == sqlite_fp10_convert2(
+                candidate,
+                decimal_exponent + digit_count as i32 - keep as i32,
+            ) {
+                return keep + 1;
+            }
+        }
+    }
+
+    round_at
+}
+
+fn decimal_digits_to_u64(digits: &[u8]) -> u64 {
+    digits
+        .iter()
+        .fold(0_u64, |acc, digit| acc * 10 + u64::from(*digit - b'0'))
+}
+
+fn sqlite_fp2_convert10(mantissa: u64, binary_exponent: i32, digits: i32) -> (u64, i32) {
+    let power = digits - 1 - pwr2_to_10(binary_exponent + 63);
+    let (power_hi, power_lo) = power_of_ten(power);
+    let (mut high, _) = sqlite_multiply_128(mantissa, power_hi);
+    let _ = power_lo;
+    if digits == 18 {
+        high >>= -(binary_exponent + pwr10_to_2(power) + 2) as u32;
+        (high.wrapping_add((high << 1) & 2) >> 1, -power)
     } else {
-        format!("{trimmed}.0")
-    };
-    let (exp_sign, exp_digits) = if let Some(rest) = exp_str.strip_prefix('-') {
-        ("-", rest)
-    } else if let Some(rest) = exp_str.strip_prefix('+') {
-        ("+", rest)
+        high >>= -(binary_exponent + pwr10_to_2(power) + 1) as u32;
+        (high, -power)
+    }
+}
+
+fn sqlite_fp10_convert2(decimal: u64, power: i32) -> f64 {
+    if power < SQLITE_POWERS_OF_TEN_FIRST {
+        return 0.0;
+    }
+    if power > SQLITE_POWERS_OF_TEN_LAST {
+        return f64::INFINITY;
+    }
+
+    let bit_width = 64 - decimal.leading_zeros() as i32;
+    let binary_power = pwr10_to_2(power);
+    let mut exponent = 53 - bit_width - binary_power;
+    if exponent > 1074 {
+        if exponent >= 1130 {
+            return 0.0;
+        }
+        exponent = 1074;
+    }
+
+    let shift = -(exponent - (64 - bit_width) + binary_power + 3);
+    let shift = shift.clamp(0, 63) as u32;
+    let (mut power_hi, mut power_lo) = power_of_ten(power);
+    if power_lo != 0 {
+        power_hi = power_hi.wrapping_add(1);
+        power_lo = !power_lo;
+    }
+
+    let shifted_decimal = decimal << (64 - bit_width);
+    let (mut high, low) = sqlite_multiply_128(shifted_decimal, power_hi);
+    let mid1 = (low >> 32) as u32;
+    let mut sticky = 1_u64;
+    if (high & low_mask(shift)) == 0 {
+        let (mid2_high, _) = sqlite_multiply_128(shifted_decimal, u64::from(power_lo) << 32);
+        let mid2 = (mid2_high >> 32) as u32;
+        sticky = u64::from(mid1.wrapping_sub(mid2) > 1);
+        high = high.wrapping_sub(u64::from(mid1 < mid2));
+    }
+
+    let mut rounded = (high >> shift) | sticky;
+    let adjust = u32::from(rounded >= (1_u64 << 55) - 2);
+    if adjust != 0 {
+        rounded = (rounded >> adjust) | (rounded & 1);
+        exponent -= adjust as i32;
+    }
+
+    let mut bits = (rounded + 1 + ((rounded >> 2) & 1)) >> 2;
+    if exponent <= -972 {
+        return f64::INFINITY;
+    }
+    if (bits & (1_u64 << 52)) != 0 {
+        bits = (bits & !(1_u64 << 52)) | ((1075 - exponent) as u64) << 52;
+    }
+    f64::from_bits(bits)
+}
+
+fn low_mask(bits: u32) -> u64 {
+    if bits == 0 { 0 } else { (1_u64 << bits) - 1 }
+}
+
+fn sqlite_multiply_128(left: u64, right: u64) -> (u64, u64) {
+    let product = u128::from(left) * u128::from(right);
+    ((product >> 64) as u64, product as u64)
+}
+
+fn sqlite_multiply_160(high: u64, low: u32, right: u64) -> (u64, u32) {
+    let product =
+        u128::from(high) * u128::from(right) + ((u128::from(low) * u128::from(right)) >> 32);
+    (
+        (product >> 64) as u64,
+        ((product >> 32) & u128::from(u32::MAX)) as u32,
+    )
+}
+
+fn pwr10_to_2(power: i32) -> i32 {
+    (power * 108_853) >> 15
+}
+
+fn pwr2_to_10(power: i32) -> i32 {
+    (power * 78_913) >> 18
+}
+
+fn power_of_ten(power: i32) -> (u64, u32) {
+    const BASE: [u64; 27] = [
+        0x8000_0000_0000_0000,
+        0xa000_0000_0000_0000,
+        0xc800_0000_0000_0000,
+        0xfa00_0000_0000_0000,
+        0x9c40_0000_0000_0000,
+        0xc350_0000_0000_0000,
+        0xf424_0000_0000_0000,
+        0x9896_8000_0000_0000,
+        0xbebc_2000_0000_0000,
+        0xee6b_2800_0000_0000,
+        0x9502_f900_0000_0000,
+        0xba43_b740_0000_0000,
+        0xe8d4_a510_0000_0000,
+        0x9184_e72a_0000_0000,
+        0xb5e6_20f4_8000_0000,
+        0xe35f_a931_a000_0000,
+        0x8e1b_c9bf_0400_0000,
+        0xb1a2_bc2e_c500_0000,
+        0xde0b_6b3a_7640_0000,
+        0x8ac7_2304_89e8_0000,
+        0xad78_ebc5_ac62_0000,
+        0xd8d7_26b7_177a_8000,
+        0x8786_7832_6eac_9000,
+        0xa968_163f_0a57_b400,
+        0xd3c2_1bce_cced_a100,
+        0x8459_5161_4014_84a0,
+        0xa56f_a5b9_9019_a5c8,
+    ];
+    const SCALE: [u64; 26] = [
+        0x8049_a4ac_0c58_11ae,
+        0xcf42_894a_5dce_35ea,
+        0xa76c_5823_38ed_2621,
+        0x873e_4f75_e222_4e68,
+        0xda7f_5bf5_9096_6848,
+        0xb080_392c_c434_9dec,
+        0x8e93_8662_882a_f53e,
+        0xe658_29b3_046b_0afa,
+        0xba12_1a46_50e4_ddeb,
+        0x964e_858c_91ba_2655,
+        0xf2d5_6790_ab41_c2a2,
+        0xc428_d05a_a475_1e4c,
+        0x9e74_d1b7_91e0_7e48,
+        0xcccc_cccc_cccc_cccc,
+        0xcecb_8f27_f420_0f3a,
+        0xa70c_3c40_a64e_6c51,
+        0x86f0_ac99_b4e8_dafd,
+        0xda01_ee64_1a70_8de9,
+        0xb01a_e745_b101_e9e4,
+        0x8e41_ade9_fbeb_c27d,
+        0xe5d3_ef28_2a24_2e81,
+        0xb9a7_4a06_37ce_2ee1,
+        0x95f8_3d0a_1fb6_9cd9,
+        0xf24a_01a7_3cf2_dccf,
+        0xc3b8_3581_09e8_4f07,
+        0x9e19_db92_b4e3_1ba9,
+    ];
+    const SCALE_LO: [u32; 26] = [
+        0x205b_896d,
+        0x5206_4cad,
+        0xaf2a_f2b8,
+        0x5a77_44a7,
+        0xaf39_a475,
+        0xbd8d_794e,
+        0x547e_b47b,
+        0x0cb4_a5a3,
+        0x92f3_4d62,
+        0x3a6a_07f9,
+        0xfae2_7299,
+        0xaa97_e14c,
+        0x775e_a265,
+        0xcccc_cccc,
+        0x0000_0000,
+        0x9990_90b6,
+        0x69a0_28bb,
+        0xe80e_6f48,
+        0x5ec0_5dd0,
+        0x1458_8f14,
+        0x8f16_68c9,
+        0x6d95_3e2c,
+        0x4abd_af10,
+        0xbc63_3b39,
+        0x0a86_2f81,
+        0x6c07_a2c2,
+    ];
+
+    debug_assert!((SQLITE_POWERS_OF_TEN_FIRST..=SQLITE_POWERS_OF_TEN_LAST).contains(&power));
+
+    let (group, offset) = if power < 0 {
+        if power == -1 {
+            return (SCALE[13], SCALE_LO[13]);
+        }
+        let mut group = power / 27;
+        let mut offset = power % 27;
+        if offset != 0 {
+            group -= 1;
+            offset += 27;
+        }
+        (group, offset)
+    } else if power < 27 {
+        return (BASE[power as usize], 0);
     } else {
-        ("+", exp_str)
+        (power / 27, power % 27)
     };
-    let exp_num: u32 = exp_digits.parse().unwrap_or(0);
-    *s = format!("{mantissa}e{exp_sign}{exp_num}");
+
+    let scale_idx = (group + 13) as usize;
+    let mut high = SCALE[scale_idx];
+    if offset == 0 {
+        return (high, SCALE_LO[scale_idx]);
+    }
+
+    let (scaled, mut low) = sqlite_multiply_160(high, SCALE_LO[scale_idx], BASE[offset as usize]);
+    high = scaled;
+    if (high & (1_u64 << 63)) == 0 {
+        high = (high << 1) | u64::from(low >> 31);
+        low = (low << 1) | 1;
+    }
+    (high, low)
 }
 
 #[cfg(test)]
@@ -3289,8 +3767,15 @@ mod tests {
     }
 
     #[test]
-    fn test_format_sqlite_float_preserves_shortest_distinguishing_digits() {
+    fn test_format_sqlite_float_matches_sqlite_17_digit_text_contract() {
         assert_eq!(format_sqlite_float(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(format_sqlite_float(1.0 / 3.0), "0.33333333333333332");
+        assert_eq!(format_sqlite_float(2.0 / 3.0), "0.66666666666666663");
+        assert_eq!(format_sqlite_float(1.5e16), "15000000000000000.0");
+        assert_eq!(
+            format_sqlite_float(123_456_789_012_345.6),
+            "123456789012345.59"
+        );
         assert_eq!(format_sqlite_float(1.0e308), "1.0e+308");
         assert_eq!(format_sqlite_float(1.0e-308), "1.0e-308");
         assert_eq!(

@@ -99,9 +99,10 @@ pub use agg_builtins::register_aggregate_builtins;
 pub use aggregate::{AggregateAdapter, AggregateFunction};
 pub use authorizer::{AuthAction, AuthResult, Authorizer, AuthorizerAction, AuthorizerDecision};
 pub use builtins::{
-    ChangeTrackingState, get_last_changes, get_last_insert_rowid, get_total_changes,
-    register_builtins, reset_total_changes, set_change_tracking_state, set_last_changes,
-    set_last_insert_rowid, sqlite_compile_options, sqlite_compileoption_used,
+    ChangeTrackingState, case_sensitive_like_active, get_last_changes, get_last_insert_rowid,
+    get_total_changes, register_builtins, reset_total_changes, set_case_sensitive_like,
+    set_change_tracking_state, set_last_changes, set_last_insert_rowid, sqlite_compile_options,
+    sqlite_compileoption_used,
 };
 pub use collation::{
     BinaryCollation, CollationAnnotation, CollationFunction, CollationRegistry, CollationSource,

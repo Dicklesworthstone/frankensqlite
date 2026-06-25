@@ -117,7 +117,6 @@ fn like_default_is_ascii_case_insensitive() {
 }
 
 #[test]
-#[ignore = "bd-2ye8m: PRAGMA case_sensitive_like is silently ignored; LIKE stays ASCII-case-insensitive"]
 fn like_case_sensitive_pragma_on() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -144,7 +143,6 @@ fn like_case_sensitive_pragma_on() {
 }
 
 #[test]
-#[ignore = "bd-2ye8m: PRAGMA case_sensitive_like is silently ignored; toggle has no effect"]
 fn like_pragma_toggles_back_off() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
@@ -199,7 +197,6 @@ fn glob_unaffected_by_case_sensitive_like() {
 }
 
 #[test]
-#[ignore = "bd-2ye8m: PRAGMA case_sensitive_like is silently ignored; WHERE LIKE filter stays case-insensitive"]
 fn like_pragma_in_where_filter() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();

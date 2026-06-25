@@ -88,7 +88,8 @@ use fsqlite_ext_misc::GenerateSeriesTable;
 #[cfg(feature = "ext-rtree")]
 use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
 use fsqlite_func::builtins::{
-    ChangeTrackingState, get_change_tracking_state, set_change_tracking_state,
+    ChangeTrackingState, case_sensitive_like_active, get_change_tracking_state,
+    set_case_sensitive_like, set_change_tracking_state,
 };
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{
@@ -135,7 +136,7 @@ use fsqlite_types::serial_type::{
 };
 use fsqlite_types::value::{
     SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue, classify_sql_like_fast_path,
-    format_sqlite_float, sql_like,
+    format_sqlite_float, sql_like_cased,
 };
 use fsqlite_types::{
     BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize, Region,
@@ -9709,6 +9710,10 @@ impl Connection {
         )
     }
 
+    /// Project this connection's per-statement state into the `fsqlite-func`
+    /// thread-locals that scalar functions and LIKE evaluation read. Called
+    /// before every statement executes (all ad-hoc and prepared paths), so the
+    /// thread-locals always reflect the connection currently running.
     fn sync_change_tracking_context(&self) {
         let state = ChangeTrackingState {
             last_insert_rowid: self.last_insert_rowid.get(),
@@ -9717,6 +9722,13 @@ impl Connection {
         };
         if get_change_tracking_state() != state {
             set_change_tracking_state(state);
+        }
+        // Project `PRAGMA case_sensitive_like` so all LIKE evaluation paths
+        // (VDBE `LikeConstFast`, the `like()` scalar, and interpreted fallbacks)
+        // honor it without threading the flag through every call site.
+        let case_sensitive_like = self.pragma_state.borrow().case_sensitive_like;
+        if case_sensitive_like_active() != case_sensitive_like {
+            set_case_sensitive_like(case_sensitive_like);
         }
     }
 
@@ -17965,7 +17977,11 @@ impl Connection {
                     let Some(table) = db.get_table(root_page) else {
                         return Ok(None);
                     };
-                    let matcher = SqlLikeFastPathMatcher::new(kind, literal.as_ref());
+                    let matcher = SqlLikeFastPathMatcher::new_cased(
+                        kind,
+                        literal.as_ref(),
+                        case_sensitive_like_active(),
+                    );
                     i64::try_from(
                         table
                             .iter_rows()
@@ -88417,13 +88433,15 @@ fn eval_join_binary_op(
     }
 }
 
-/// Simple case-insensitive LIKE pattern match (`%` = any sequence, `_` = any char).
+/// Simple LIKE pattern match (`%` = any sequence, `_` = any char). ASCII
+/// case-insensitive by default; byte-exact when the connection has
+/// `PRAGMA case_sensitive_like = ON` (read from the per-statement thread-local).
 ///
 /// `escape_char`: when `Some(ch)`, the character `ch` escapes the next
 /// pattern character (e.g., `LIKE '%!%%' ESCAPE '!'` treats `%` after `!`
 /// as a literal percent). A dangling trailing escape never matches.
 fn simple_like_match(pattern: &str, string: &str, escape_char: Option<char>) -> bool {
-    sql_like(pattern, string, escape_char)
+    sql_like_cased(pattern, string, escape_char, case_sensitive_like_active())
 }
 
 /// Lightweight MATCH predicate for fallback paths.
@@ -89331,7 +89349,12 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             } else {
                 None
             };
-            SqliteValue::Integer(i64::from(sql_like(&pattern, &string, escape)))
+            SqliteValue::Integer(i64::from(sql_like_cased(
+                &pattern,
+                &string,
+                escape,
+                case_sensitive_like_active(),
+            )))
         }
         // glob would go here when sql_glob is implemented
         _ => SqliteValue::Null,
