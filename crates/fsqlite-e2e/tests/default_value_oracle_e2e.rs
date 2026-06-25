@@ -3,9 +3,11 @@
 //! Covers literal defaults (int/real/text/NULL/negative), parenthesised
 //! expression defaults `DEFAULT (expr)`, the affinity coercion of a default to
 //! its column type, `INSERT DEFAULT VALUES`, defaults filling omitted columns
-//! (single + multi-row), the explicit `DEFAULT` keyword in a VALUES list, and
-//! CURRENT_TIMESTAMP / CURRENT_DATE defaults (checked by storage class + length,
-//! which are deterministic regardless of the wall clock). DML is autocommit.
+//! (single + multi-row), the rejection of the bare `DEFAULT` keyword inside a
+//! VALUES tuple (a syntax error in SQLite — only `INSERT ... DEFAULT VALUES` is
+//! valid), and CURRENT_TIMESTAMP / CURRENT_DATE defaults (checked by storage
+//! class + length, which are deterministic regardless of the wall clock). DML
+//! is autocommit.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -168,19 +170,27 @@ fn default_omitted_columns_multi_row() {
 }
 
 #[test]
-#[ignore = "bd-yw5kx: parser rejects the DEFAULT keyword in an INSERT VALUES list"]
 fn default_explicit_keyword() {
-    let (f, r) = setup(&[
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 11, b INTEGER DEFAULT 22)",
-        // Explicit DEFAULT keyword in the VALUES list.
-        "INSERT INTO t(id, a, b) VALUES (1, DEFAULT, 200)",
-        "INSERT INTO t(id, a, b) VALUES (2, 100, DEFAULT)",
-    ]);
-    check(
-        &f,
-        &r,
-        &["SELECT id, a, b FROM t ORDER BY id"],
-        "default_explicit_keyword",
+    // SQLite does NOT accept the bare `DEFAULT` keyword as a value inside a
+    // `VALUES (...)` tuple — only the whole-row `INSERT ... DEFAULT VALUES`
+    // form (exercised by `default_values_insert` above). `VALUES (1, DEFAULT,
+    // 200)` is a syntax error in real SQLite, so for parity FrankenSQLite must
+    // reject it too. (Verified vs sqlite3 CLI 3.46.1 and the bundled rusqlite;
+    // bd-yw5kx was filed on a mistaken premise that SQLite accepts it.)
+    let f = Connection::open(":memory:").expect("open frank");
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER DEFAULT 11, b INTEGER DEFAULT 22)";
+    f.execute(ddl).expect("frank create");
+    r.execute_batch(ddl).expect("rusqlite create");
+
+    let bad = "INSERT INTO t(id, a, b) VALUES (1, DEFAULT, 200)";
+    assert!(
+        f.execute(bad).is_err(),
+        "frank must reject the DEFAULT keyword inside a VALUES tuple (parity with SQLite)"
+    );
+    assert!(
+        r.execute_batch(bad).is_err(),
+        "oracle (rusqlite/SQLite) rejects the DEFAULT keyword inside a VALUES tuple"
     );
 }
 
