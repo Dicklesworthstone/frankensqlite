@@ -348,16 +348,7 @@ observability = [
   "test_conformance_time_travel_delete_update_visibility_s76k",
   "test_conformance_time_travel_timestamp_and_live_state_preservation_s76l",
 ]
-notes = """Externally verified for :memory: / compatibility-runtime snapshot-ring \
-execution. COMMITSEQ-based time travel captures snapshots at each COMMIT and public \
-conformance tests compare those historical reads against shadow rusqlite databases \
-replayed to the same commit boundary. Timestamp-based resolution is verified on the \
-retained-snapshot path (latest-snapshot lookup plus explicit missing-snapshot error). \
-Historical SELECT execution also restores the live source state after the snapshot \
-read completes. Internal engine tests additionally cover empty-table snapshots. Max \
-256 snapshots retained (ring buffer \
-eviction). Parser/AST/VDBE SetSnapshot path remains the future Native-mode \
-VersionStore-backed route for file-backed historical reads."""
+notes = "Externally verified for :memory: / compatibility-runtime snapshot-ring execution. COMMITSEQ-based time travel captures snapshots at each COMMIT and public conformance tests compare those historical reads against shadow rusqlite databases replayed to the same commit boundary. Timestamp-based resolution is verified on the retained-snapshot path (latest-snapshot lookup plus explicit missing-snapshot error). Historical SELECT execution also restores the live source state after the snapshot read completes. Internal engine tests additionally cover empty-table snapshots. Max 256 snapshots retained (ring buffer eviction). Parser/AST/VDBE SetSnapshot path remains the future Native-mode VersionStore-backed route for file-backed historical reads."
 
 # ============================================================================
 # FAMILY: TXN — Transaction and Storage Behavior (weight pool: 150)

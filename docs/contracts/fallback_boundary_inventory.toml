@@ -225,6 +225,24 @@ covered_by_test = "test_t6751_strict_mode_allows_file_backed_group_by_window_sto
 notes = "This adjacent real-backend decision prevents treating every group-by/window route as a MemDatabase fallback."
 
 [[boundary]]
+boundary_id = "conn.select.custom_aggregate_fallback"
+boundary_family = "connection_dispatch"
+statement_kind = "select"
+trigger_condition = "Implicit custom aggregate SELECT cannot use the validated VDBE aggregate path."
+decision_reason = "custom_aggregate_fallback"
+source_file = "crates/fsqlite-core/src/connection.rs"
+source_touchpoint = "execute_statement SELECT custom aggregate fallback branch"
+source_anchor = "custom_aggregate_fallback"
+certifying_policy = "strict_deny"
+non_cert_policy = "allow_with_event"
+expected_backend_identity = "strict parity-cert rejects before MemDatabase; non-cert evaluates the custom aggregate through connection-level fallback"
+decision_outcome = "denied"
+first_failure_diag = "in-memory fallback disabled in strict parity-cert mode: statement_kind=select, decision_reason=custom_aggregate_fallback"
+owner_bead = "bd-2yqp6.7.9.1"
+covered_by_test = "fallback_boundary_inventory_covers_runtime_reason_strings"
+notes = "Custom aggregate dispatch remains a compatibility fallback until the VDBE aggregate path certifies user-defined aggregate state."
+
+[[boundary]]
 boundary_id = "conn.select.group_by_window_fallback"
 boundary_family = "connection_dispatch"
 statement_kind = "select"

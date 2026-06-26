@@ -360,3 +360,8 @@ heaptrack.*.zst
 # Ephemeral run artifacts / stray temp dumps
 /tmp_total.txt
 tests/artifacts/parity-status/
+
+# Library-updater progress file (machine-local, transient)
+claude-upgrade-progress.json
+# Agent scratch test files (machine-local, never tracked)
+**/zz_scratch_*.rs

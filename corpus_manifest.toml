@@ -44,7 +44,7 @@ path = "crates/fsqlite-harness/conformance"
 kind = "fixture_json"
 hash_algorithm = "sha256-tree-v1"
 include_extensions = ["json"]
-content_hash = "27206d784700e7135e4e4195ba937258f9b837c9df35e2124b284141dc5fa1d6"
+content_hash = "efd6c8061dacb5dff3716c3e48675d51dc82ee3b97bc2b8a5b83509865e4b2ef"
 min_files = 8
 
 [coverage_accounting]
