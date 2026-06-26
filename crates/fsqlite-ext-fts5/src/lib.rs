@@ -1487,6 +1487,26 @@ impl Fts5PendingFlush {
     }
 }
 
+/// The persist payload for one contentless INSERT statement.
+///
+/// Encoded as an incremental segment append rather than a full re-encode of the
+/// inverted index. See [`Fts5Table::encode_incremental_insert_flush`] (bd-sf8dx).
+#[derive(Debug, Clone)]
+pub struct Fts5IncrementalInsertFlush {
+    /// The new segment's leaf `_data` row, to be appended. `None` when the
+    /// inserted rows produced no indexable tokens (e.g. empty/all-unindexed
+    /// content): no segment is created, but averages/docsize still advance.
+    pub leaf_data_row: Option<Fts5DataRow>,
+    /// The updated structure `_data` row (rowid [`FTS5_STRUCTURE_ROWID`]),
+    /// replacing the prior structure (now with the appended segment).
+    pub structure_data_row: Fts5DataRow,
+    /// The updated averages `_data` row (rowid [`FTS5_AVERAGES_ROWID`]).
+    pub averages_data_row: Fts5DataRow,
+    /// Per-column docsize rows for the newly inserted documents, to append to
+    /// the `_docsize` shadow table.
+    pub docsize_rows: Vec<Fts5DocsizeRow>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fts5ShadowWriteMitigation {
     NoWrites,
@@ -8044,6 +8064,117 @@ impl Fts5Table {
     ) -> Result<Fts5PendingFlush> {
         self.build_pending_hash()?
             .flush_to_segment(segid, structure)
+    }
+
+    /// Encode the persist payload for a contentless INSERT as an incremental
+    /// segment append.
+    ///
+    /// Appends one segment onto `existing_structure` instead of re-encoding the
+    /// whole inverted index ([`Self::encode_data_rows`]).
+    ///
+    /// `new_docs` are the `(rowid, post-rowid column args)` pairs for the rows
+    /// the current INSERT added — the same `args[2..]` the vtable `update` saw,
+    /// decoded identically via [`Self::decode_column_values`]. Only those rows
+    /// are tokenized, so the work is O(new rows) instead of the full
+    /// re-encode's O(table); a batch rebuild is then O(table) overall instead
+    /// of O(table^2), which is the root cause of the cass#301 `index --full`
+    /// wedge (bd-sf8dx).
+    ///
+    /// The caller passes a fresh `next_segid` (one past the current max) and,
+    /// on success, appends `leaf_data_row`, replaces `structure_data_row` and
+    /// `averages_data_row`, and appends `docsize_rows` to `_docsize`. Live
+    /// MATCH keeps reading the in-memory `self.index`; reopen rehydrates from
+    /// the multi-segment structure via `collect_live_term_groups`, so the extra
+    /// segments are transparent to readers.
+    ///
+    /// Returns `None` when `new_docs` is empty (nothing to persist).
+    pub fn encode_incremental_insert_flush(
+        &self,
+        new_docs: &[(i64, &[SqliteValue])],
+        existing_structure: &Fts5StructureRecord,
+        existing_averages: &Fts5AveragesRecord,
+        next_segid: u32,
+    ) -> Result<Option<Fts5IncrementalInsertFlush>> {
+        if new_docs.is_empty() {
+            return Ok(None);
+        }
+        let tokenizer = self.create_tokenizer_instance();
+        // A delta index holding ONLY this statement's rows, tokenized exactly as
+        // the live insert (`index_document_with_tokenizer` -> `add_text`), so
+        // its postings and docsizes match the in-memory index for these rows.
+        let mut delta = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+        let mut new_rowids = Vec::with_capacity(new_docs.len());
+        for (rowid, column_args) in new_docs.iter().copied() {
+            new_rowids.push(rowid);
+            let DecodedColumnValues { values, .. } = self.decode_column_values(column_args)?;
+            #[allow(clippy::cast_possible_truncation)]
+            for (col_idx, text) in values.iter().enumerate() {
+                if matches!(self.indexed_columns.get(col_idx), Some(false)) {
+                    continue;
+                }
+                delta.add_text(rowid, col_idx as u32, tokenizer.as_ref(), text);
+            }
+        }
+
+        // Per-column docsize rows for the new docs. `delta` holds only the new
+        // docs, so this canonical accumulation is O(new) yet row-for-row
+        // identical to the full-encode path for these rowids.
+        let docsize_rows =
+            delta.accumulate_docsize_rows(self.columns.len(), new_rowids.iter().copied());
+
+        // Updated averages = old running totals + the new docs' contributions.
+        let mut column_token_totals = existing_averages.column_token_totals.clone();
+        if column_token_totals.len() < self.columns.len() {
+            column_token_totals.resize(self.columns.len(), 0);
+        }
+        for row in &docsize_rows {
+            for (col, count) in row.column_token_counts.iter().copied().enumerate() {
+                if let Some(total) = column_token_totals.get_mut(col) {
+                    *total = total.saturating_add(u64::from(count));
+                }
+            }
+        }
+        let total_rows = existing_averages
+            .total_rows
+            .saturating_add(u64::try_from(new_docs.len()).unwrap_or(u64::MAX));
+        let averages_data_row = Fts5DataRow::new(
+            FTS5_AVERAGES_ROWID,
+            Fts5AveragesRecord::new(total_rows, column_token_totals).encode(),
+        );
+
+        // Build and append the new segment. When the new rows produced no
+        // indexable tokens, leave the structure unchanged but still advance the
+        // averages/docsize (matching the full path's row accounting).
+        let pending = delta.build_pending_hash(&self.prefix_lengths)?;
+        if pending.is_empty() {
+            return Ok(Some(Fts5IncrementalInsertFlush {
+                leaf_data_row: None,
+                structure_data_row: Fts5DataRow::new(
+                    FTS5_STRUCTURE_ROWID,
+                    existing_structure.encode(),
+                ),
+                averages_data_row,
+                docsize_rows,
+            }));
+        }
+        let flush = pending.flush_to_segment(next_segid, existing_structure.clone())?;
+        let structure_data_row =
+            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, flush.structure.encode());
+        let leaf_data_row = flush
+            .data_rows
+            .into_iter()
+            .find(|row| row.id != FTS5_STRUCTURE_ROWID);
+        Ok(Some(Fts5IncrementalInsertFlush {
+            leaf_data_row,
+            structure_data_row,
+            averages_data_row,
+            docsize_rows,
+        }))
     }
 
     #[must_use]

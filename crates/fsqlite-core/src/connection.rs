@@ -32428,7 +32428,12 @@ impl Connection {
             return Ok(false);
         };
         if !layout.has_internal_content_shadow {
-            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+            return self.persist_rootpage_zero_fts5_contentless_incremental_insert(
+                table_name,
+                rows,
+                inserted_rowids,
+                layout.column_count,
+            );
         }
 
         self.reset_rootpage_zero_fts5_segment_metadata(table_name, layout.column_count)?;
@@ -32497,6 +32502,136 @@ impl Connection {
             )?;
         }
 
+        Ok(true)
+    }
+
+    /// Persist a contentless rootpage-zero FTS5 INSERT as an incremental
+    /// segment append.
+    ///
+    /// Avoids re-encoding the whole inverted index on every insert. The legacy
+    /// contentless path delegated to
+    /// [`Self::persist_rootpage_zero_fts5_shadow_rows`], which rebuilds the
+    /// single `_data` segment from the entire in-memory index on every INSERT —
+    /// O(table) per insert, O(table^2) over a batch rebuild. That wedged
+    /// `cass index --full` above ~15-30 MB of content (bd-sf8dx / cass#301).
+    ///
+    /// This appends one fresh segment (containing only the current statement's
+    /// rows) onto the persisted structure: point-read the current structure +
+    /// averages, encode the delta in O(new rows), then upsert the new leaf and
+    /// the two changed metadata rows. Until a real segment exists (the first
+    /// insert, or runs of empty/all-unindexed rows), it falls back to the full
+    /// encode, which also lays down the `_config`/`_idx`/`_docsize` shadows.
+    #[cfg(feature = "ext-fts5")]
+    fn persist_rootpage_zero_fts5_contentless_incremental_insert(
+        &self,
+        table_name: &str,
+        rows: &[LiveVtabInsertRow],
+        inserted_rowids: &[i64],
+        column_count: usize,
+    ) -> Result<bool> {
+        // The incremental append needs an existing `_data` shadow to read the
+        // current structure from; without one, fall back to the full encode.
+        if !self.schema_table_exists(&format!("{table_name}_data")) {
+            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+        }
+
+        // Point-read the current on-disk structure + averages. `with_lazy_fts5_reader`
+        // reuses the active write txn when one is open, so these reflect this
+        // connection's own prior appends within the same transaction
+        // (read-your-writes), keeping `next_segid` collision-free.
+        let (structure, averages) = self.with_lazy_fts5_reader(table_name, |reader| {
+            let structure = match reader.read_data_block(FTS5_STRUCTURE_ROWID)? {
+                Some(block) => Some(Fts5StructureRecord::decode(&block)?),
+                None => None,
+            };
+            let averages = match reader.read_data_block(FTS5_AVERAGES_ROWID)? {
+                Some(block) => Some(Fts5AveragesRecord::decode(&block, column_count)?),
+                None => None,
+            };
+            Ok((structure, averages))
+        })?;
+
+        // No persisted segment yet (fresh table, or only empty rows so far):
+        // the full encode lays down the first segment plus the config/idx/docsize
+        // shadows. Once a segment exists, every later INSERT appends incrementally.
+        let Some(structure) = structure.filter(|s| s.segment_count() > 0) else {
+            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+        };
+        let averages =
+            averages.unwrap_or_else(|| Fts5AveragesRecord::new(0, vec![0; column_count]));
+        let next_segid = structure
+            .levels
+            .iter()
+            .flat_map(|level| level.segments.iter())
+            .map(|segment| segment.segid)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        let flush = {
+            let instances = self.vtab_instances.borrow();
+            let key = table_name.to_ascii_uppercase();
+            let fts5 = instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "rootpage=0 virtual table {table_name} is not an FTS5 instance"
+                    ))
+                })?;
+            let new_docs: Vec<(i64, &[SqliteValue])> = inserted_rowids
+                .iter()
+                .copied()
+                .zip(rows.iter().map(|row| row.values.as_slice()))
+                .collect();
+            fts5.encode_incremental_insert_flush(&new_docs, &structure, &averages, next_segid)?
+        };
+        let Some(flush) = flush else {
+            return Ok(true);
+        };
+
+        // Append the new segment leaf and replace the structure + averages rows
+        // (point upserts — O(new), never touching the existing leaves).
+        let mut data_rows: Vec<(i64, Vec<SqliteValue>)> = Vec::with_capacity(3);
+        for row in flush
+            .leaf_data_row
+            .into_iter()
+            .chain([flush.structure_data_row, flush.averages_data_row])
+        {
+            data_rows.push((
+                row.id,
+                vec![
+                    SqliteValue::Integer(row.id),
+                    SqliteValue::Blob(Arc::from(row.block.into_boxed_slice())),
+                ],
+            ));
+        }
+        self.upsert_storage_table_rows(&format!("{table_name}_data"), data_rows)?;
+
+        // Append the new documents' docsize rows (read back on reopen for BM25).
+        let docsize_name = format!("{table_name}_docsize");
+        if self.schema_table_exists(&docsize_name) {
+            self.upsert_storage_table_rows(
+                &docsize_name,
+                flush.docsize_rows.into_iter().map(|row| {
+                    let sz = encode_fts5_docsize_blob(&row.column_token_counts);
+                    (
+                        row.rowid,
+                        vec![
+                            SqliteValue::Integer(row.rowid),
+                            SqliteValue::Blob(Arc::from(sz.into_boxed_slice())),
+                        ],
+                    )
+                }),
+            )?;
+        }
+
+        tracing::debug!(
+            table = table_name,
+            segid = next_segid,
+            new_rows = inserted_rowids.len(),
+            "fts5: appended incremental contentless segment (bd-sf8dx)"
+        );
         Ok(true)
     }
 
