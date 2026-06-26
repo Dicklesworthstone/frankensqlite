@@ -207,7 +207,6 @@ fn explicit_rowid_insert() {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported"]
 fn without_rowid_table() {
     let (f, r) = setup(&[
         "CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
@@ -237,7 +236,6 @@ fn without_rowid_table() {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported"]
 fn without_rowid_composite_pk() {
     let (f, r) = setup(&[
         "CREATE TABLE wr (a INTEGER, b INTEGER, label TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID",

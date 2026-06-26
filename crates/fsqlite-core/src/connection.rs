@@ -24085,7 +24085,6 @@ impl Connection {
                 }
 
                 let table_name = &insert.table.name;
-                self.reject_without_rowid_dml(table_name, "INSERT")?;
                 let insert_event = fsqlite_ast::TriggerEvent::Insert;
                 let is_live_vtab = self.has_live_vtab_instance(table_name);
                 let has_before_insert = self.has_matching_triggers(
@@ -24381,7 +24380,6 @@ impl Connection {
                 let (effective_update, _limited_row_count_hint) =
                     self.materialize_update_limit_scope(update, params)?;
                 let table_name = &effective_update.table.name.name;
-                self.reject_without_rowid_dml(table_name, "UPDATE")?;
                 // Collect columns being updated for UPDATE OF trigger matching.
                 let update_cols: Vec<String> = effective_update
                     .assignments
@@ -24592,7 +24590,6 @@ impl Connection {
                     });
                 }
                 let table_name = &effective_delete.table.name.name;
-                self.reject_without_rowid_dml(table_name, "DELETE")?;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
                 let has_before_delete = self.has_matching_triggers(
                     table_name,
@@ -38750,6 +38747,28 @@ impl Connection {
                         .collect(),
                 );
             }
+            // WITHOUT ROWID tables are stored as an index b-tree keyed by the
+            // PRIMARY KEY. Register the table's own root page with the PK
+            // ordering/collation metadata (one entry per PK column, in PK
+            // order) so the table cursor compares on the primary-key prefix
+            // rather than degrading to whole-record BINARY-ascending order.
+            if table.without_rowid {
+                if let Some(pk_cols) = table.primary_key_constraints.first() {
+                    let desc_flags: Vec<bool> = pk_cols.iter().map(|_| false).collect();
+                    let collations: Vec<Option<String>> = pk_cols
+                        .iter()
+                        .map(|name| {
+                            table
+                                .columns
+                                .iter()
+                                .find(|column| column.name.eq_ignore_ascii_case(name))
+                                .and_then(|column| column.collation.clone())
+                        })
+                        .collect();
+                    index_desc_flags_by_root_page.insert(table.root_page, desc_flags);
+                    index_collations_by_root_page.insert(table.root_page, collations);
+                }
+            }
         }
 
         let rowid_alias_col_by_root_page = Arc::new(rowid_alias_col_by_root_page);
@@ -50025,14 +50044,6 @@ impl Connection {
             .is_some_and(|sql| is_without_rowid_table_sql(sql))
     }
 
-    fn reject_without_rowid_dml(&self, table_name: &str, verb: &str) -> Result<()> {
-        if self.table_declares_without_rowid(table_name) {
-            return Err(FrankenError::NotImplemented(format!(
-                "{verb} on WITHOUT ROWID tables is not yet supported"
-            )));
-        }
-        Ok(())
-    }
 
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
     /// GROUP BY aggregation directly on the joined rows.
@@ -59281,7 +59292,6 @@ impl Connection {
 
     /// Compile an INSERT through the VDBE codegen.
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
-        self.reject_without_rowid_dml(&insert.table.name, "INSERT")?;
         // Resolve any subqueries inside VALUES expressions before VDBE codegen,
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
@@ -59367,7 +59377,6 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
-        self.reject_without_rowid_dml(&update.table.name.name, "UPDATE")?;
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
@@ -59386,7 +59395,6 @@ impl Connection {
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
-        self.reject_without_rowid_dml(&delete.table.name.name, "DELETE")?;
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
@@ -124656,93 +124664,88 @@ mod without_rowid_runtime_tests {
     }
 
     #[test]
-    fn test_without_rowid_dml_reports_not_implemented() {
+    fn test_without_rowid_dml_round_trips() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
             .unwrap();
 
-        for (sql, verb) in [
-            ("INSERT INTO wr VALUES (1, 'x');", "INSERT"),
-            ("UPDATE wr SET payload = 'y' WHERE id = 1;", "UPDATE"),
-            ("DELETE FROM wr WHERE id = 1;", "DELETE"),
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            match err {
-                FrankenError::NotImplemented(message) => {
-                    assert!(
-                        message.contains(&format!("{verb} on WITHOUT ROWID tables")),
-                        "unexpected {verb} diagnostic: {message}"
-                    );
-                }
-                other => panic!("unexpected {verb} error: {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_without_rowid_insert_error_does_not_fire_before_trigger_side_effects() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
+        // INSERT out of primary-key order; SELECT returns rows in PK order.
+        conn.execute("INSERT INTO wr VALUES (3, 'c'), (1, 'a'), (2, 'b');")
             .unwrap();
-        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
-        conn.execute(
-            "CREATE TRIGGER wr_bi BEFORE INSERT ON wr BEGIN INSERT INTO log VALUES ('fired'); END;",
-        )
-        .unwrap();
+        let rows = conn
+            .query("SELECT id, payload FROM wr ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())],
+                vec![SqliteValue::Integer(3), SqliteValue::Text("c".into())],
+            ]
+        );
 
-        let err = conn.execute("INSERT INTO wr VALUES (1, 'x');").unwrap_err();
-        match err {
-            FrankenError::NotImplemented(message) => {
-                assert!(message.contains("INSERT on WITHOUT ROWID tables"));
-            }
-            other => panic!("unexpected INSERT error: {other:?}"),
-        }
-
-        let rows = conn.query("SELECT msg FROM log;").unwrap();
-        assert!(
-            rows.is_empty(),
-            "rejected WITHOUT ROWID INSERT must not fire BEFORE trigger side effects"
+        // UPDATE a non-key column and DELETE a row, both keyed by primary key.
+        conn.execute("UPDATE wr SET payload = 'B' WHERE id = 2;")
+            .unwrap();
+        conn.execute("DELETE FROM wr WHERE id = 1;").unwrap();
+        let rows = conn
+            .query("SELECT id, payload FROM wr ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(2), SqliteValue::Text("B".into())],
+                vec![SqliteValue::Integer(3), SqliteValue::Text("c".into())],
+            ]
         );
     }
 
     #[test]
-    fn test_without_rowid_update_delete_errors_do_not_fire_before_trigger_side_effects() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("without_rowid_trigger_side_effects.db");
-
-        {
-            let rconn = rusqlite::Connection::open(&db_path).unwrap();
-            rconn.execute_batch(
-                "CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;
-                 CREATE TABLE log (msg TEXT);
-                 CREATE TRIGGER wr_bu BEFORE UPDATE ON wr BEGIN INSERT INTO log VALUES ('update'); END;
-                 CREATE TRIGGER wr_bd BEFORE DELETE ON wr BEGIN INSERT INTO log VALUES ('delete'); END;
-                 INSERT INTO wr VALUES (1, 'x');",
-            )
+    fn test_without_rowid_dup_primary_key_conflicts_and_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;")
             .unwrap();
-        }
+        conn.execute("INSERT INTO wr VALUES ('a', 1), ('b', 2);")
+            .unwrap();
 
-        let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
-        for (sql, verb) in [
-            ("UPDATE wr SET payload = 'y' WHERE id = 1;", "UPDATE"),
-            ("DELETE FROM wr WHERE id = 1;", "DELETE"),
-        ] {
-            let err = conn.execute(sql).unwrap_err();
-            match err {
-                FrankenError::NotImplemented(message) => {
-                    assert!(
-                        message.contains(&format!("{verb} on WITHOUT ROWID tables")),
-                        "unexpected {verb} diagnostic: {message}"
-                    );
-                }
-                other => panic!("unexpected {verb} error: {other:?}"),
-            }
-        }
-
-        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        // A duplicate primary key is a constraint violation.
+        let err = conn.execute("INSERT INTO wr VALUES ('a', 99);").unwrap_err();
         assert!(
-            rows.is_empty(),
-            "rejected WITHOUT ROWID UPDATE/DELETE must not fire BEFORE trigger side effects"
+            matches!(err, FrankenError::UniqueViolation { .. }),
+            "duplicate WITHOUT ROWID primary key must conflict: {err:?}"
+        );
+
+        // INSERT OR REPLACE overwrites the conflicting row.
+        conn.execute("INSERT OR REPLACE INTO wr VALUES ('a', 99);")
+            .unwrap();
+        let rows = conn.query("SELECT k, v FROM wr ORDER BY k;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Text("a".into()), SqliteValue::Integer(99)],
+                vec![SqliteValue::Text("b".into()), SqliteValue::Integer(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_update_primary_key_rekeys() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;")
+            .unwrap();
+        conn.execute("INSERT INTO wr VALUES ('apple', 1), ('banana', 2);")
+            .unwrap();
+
+        // Updating the primary key re-keys and re-orders the row.
+        conn.execute("UPDATE wr SET k = 'zebra' WHERE k = 'apple';")
+            .unwrap();
+        let rows = conn.query("SELECT k, v FROM wr ORDER BY k;").unwrap();
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Text("banana".into()), SqliteValue::Integer(2)],
+                vec![SqliteValue::Text("zebra".into()), SqliteValue::Integer(1)],
+            ]
         );
     }
 

@@ -94,7 +94,6 @@ fn scenario(stmts: &[&str], queries: &[&str], label: &str) {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported (blocks all DML below)"]
 fn without_rowid_update_and_delete() {
     scenario(
         &[
@@ -109,7 +108,6 @@ fn without_rowid_update_and_delete() {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported"]
 fn without_rowid_update_primary_key() {
     scenario(
         &[
@@ -123,7 +121,6 @@ fn without_rowid_update_primary_key() {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported"]
 fn without_rowid_secondary_index() {
     scenario(
         &[
@@ -141,7 +138,6 @@ fn without_rowid_secondary_index() {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported"]
 fn without_rowid_pk_conflict_and_replace() {
     scenario(
         &[
@@ -156,7 +152,6 @@ fn without_rowid_pk_conflict_and_replace() {
 }
 
 #[test]
-#[ignore = "bd-mqhuw: INSERT on WITHOUT ROWID tables is not yet supported"]
 fn without_rowid_integer_pk_ordering() {
     scenario(
         &[
