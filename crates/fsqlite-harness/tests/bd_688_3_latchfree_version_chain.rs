@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use fsqlite_mvcc::observability::set_mvcc_cas_metrics_enabled;
 use fsqlite_mvcc::{
     CHAIN_HEAD_EMPTY, CHAIN_HEAD_SHARDS, VersionStore, cas_metrics_snapshot, idx_to_version_pointer,
 };
@@ -270,6 +271,7 @@ fn stress_concurrent_resolve_while_publishing() {
 fn cas_success_rate_under_moderate_contention() {
     // 8 threads, 100 pages, measure first-attempt CAS success rate.
     // Use snapshot-delta pattern to avoid interference from parallel tests.
+    set_mvcc_cas_metrics_enabled(true);
     let before = cas_metrics_snapshot();
 
     let store = Arc::new(VersionStore::new(PageSize::DEFAULT));
@@ -367,6 +369,7 @@ fn aba_protection_interleave_gc_and_publish() {
 fn cas_metrics_reset_and_increment() {
     // Use snapshot-delta pattern to avoid interference from parallel tests.
     let store = VersionStore::new(PageSize::DEFAULT);
+    set_mvcc_cas_metrics_enabled(true);
     let before = cas_metrics_snapshot();
 
     for i in 1..=10_u32 {
@@ -439,6 +442,7 @@ mod proptests {
             count in 1_usize..50,
         ) {
             // Use snapshot-delta pattern to avoid interference from parallel tests.
+            set_mvcc_cas_metrics_enabled(true);
             let before = cas_metrics_snapshot();
             let store = VersionStore::new(PageSize::DEFAULT);
 

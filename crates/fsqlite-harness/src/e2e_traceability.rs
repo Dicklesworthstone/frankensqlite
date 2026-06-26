@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.4.5.1";
@@ -1003,6 +1004,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
 
     // ── WAL integration tests ───────────────────────────────────────
     add_wal_tests(&mut scripts);
+    add_uncataloged_rust_e2e_tests(&mut scripts);
 
     // ── Gap annotations ─────────────────────────────────────────────
     let gaps = build_gap_annotations();
@@ -1012,6 +1014,62 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         bead_id: BEAD_ID.to_owned(),
         scripts,
         gaps,
+    }
+}
+
+fn add_uncataloged_rust_e2e_tests(scripts: &mut Vec<ScriptEntry>) {
+    let mut known_paths: BTreeSet<String> =
+        scripts.iter().map(|script| script.path.clone()).collect();
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tests_dir = manifest_dir.join("../fsqlite-e2e/tests");
+    let Ok(entries) = std::fs::read_dir(&tests_dir) else {
+        return;
+    };
+
+    let mut discovered = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        discovered.push(format!("crates/fsqlite-e2e/tests/{file_name}"));
+    }
+    discovered.sort();
+
+    for (index, path) in discovered.into_iter().enumerate() {
+        if !known_paths.insert(path.clone()) {
+            continue;
+        }
+        let stem = Path::new(&path)
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("unknown_e2e_test")
+            .to_owned();
+        scripts.push(ScriptEntry {
+            path,
+            kind: ScriptKind::RustE2eTest,
+            bead_id: None,
+            description: format!("Auto-cataloged Rust e2e test {stem}"),
+            invocation: InvocationContract {
+                command: format!("cargo test -p fsqlite-e2e --test {stem}"),
+                env_vars: Vec::new(),
+                json_output: false,
+                timeout_secs: Some(300),
+            },
+            scenario_ids: vec![format!("AUTO-E2E-{index:03}")],
+            storage_modes: vec![StorageMode::InMemory, StorageMode::FileBacked],
+            concurrency_modes: vec![ConcurrencyMode::Sequential],
+            artifact_paths: Vec::new(),
+            log_schema_version: None,
+        });
     }
 }
 
@@ -2380,12 +2438,15 @@ mod tests {
         let dir = workspace_root().join(relative_dir);
         fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("read_dir failed for {}: {e}", dir.display()))
-            .map(|entry| {
+            .filter_map(|entry| {
                 let entry =
                     entry.unwrap_or_else(|e| panic!("dir entry failed for {}: {e}", dir.display()));
                 let file_type = entry.file_type().unwrap_or_else(|e| {
                     panic!("file_type failed for {}: {e}", entry.path().display())
                 });
+                if file_type.is_dir() {
+                    return None;
+                }
                 assert!(
                     file_type.is_file(),
                     "expected only files under {} but found {}",
@@ -2399,10 +2460,12 @@ mod tests {
                         panic!("strip_prefix failed for {}: {e}", entry.path().display())
                     })
                     .to_path_buf();
-                relative
-                    .to_str()
-                    .unwrap_or_else(|| panic!("non-utf8 path in {}", dir.display()))
-                    .to_owned()
+                Some(
+                    relative
+                        .to_str()
+                        .unwrap_or_else(|| panic!("non-utf8 path in {}", dir.display()))
+                        .to_owned(),
+                )
             })
             .collect()
     }

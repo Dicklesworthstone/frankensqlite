@@ -26,12 +26,10 @@ use crate::commit_combiner::CommitSequenceCombiner;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::{EbrRetireQueue, VersionGuardRegistry};
 use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
-// `record_cas_attempt` is intentionally no longer called from `publish`
-// after 2f2aecb0 switched the chain-head install to strong `compare_exchange`
-// — the attempt count is provably 1, so the histogram sample is a
-// meaningless constant. The recorder itself stays in `observability` for the
-// existing test harness and for any future lock-free installer path that
-// legitimately retries.
+// `record_cas_attempt` is gated by a relaxed bool in observability, so the
+// production default is still one cheap load while diagnostic runs can assert
+// the chain-head installer remains on the first-attempt path.
+use crate::observability::record_cas_attempt;
 use crate::reclamation::{advance_epoch_and_reclaim, reclaim_at_epoch, retire_and_reclaim};
 
 // ---------------------------------------------------------------------------
@@ -684,9 +682,9 @@ impl VersionStore {
         // succeed on the first attempt — the prior `compare_exchange_weak`
         // loop existed only to recover from spurious weak-CAS failures
         // that this path never needed to tolerate. Consequently the CAS
-        // attempt histogram sample is always 1 and we no longer call
-        // `record_cas_attempt` here (see module-level comment above the
-        // removed import).
+        // attempt histogram sample is always 1; record it through the
+        // observability gate so production keeps the hot path cheap while
+        // diagnostics can still verify the invariant.
         let previous_head = {
             let slots = shard.slots.read();
             let current_raw = slots[slot_idx].load(Ordering::Acquire);
@@ -702,6 +700,7 @@ impl VersionStore {
                     "chain-head CAS must succeed under arena.write() exclusive hold: \
                      no other writer can mutate this slot in the window",
                 );
+            record_cas_attempt(1);
             prev
         };
         drop(arena);

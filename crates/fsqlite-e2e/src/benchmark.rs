@@ -1331,7 +1331,7 @@ where
                 }
                 IterationRecord {
                     iteration: measurement_idx,
-                    wall_time_ms: duration_to_u64_ms(iter_elapsed),
+                    wall_time_ms: report.wall_time_ms,
                     ops_per_sec: report.ops_per_sec,
                     ops_total: report.ops_total,
                     retries: report.retries,

@@ -12,8 +12,23 @@
 //!   9. Index operator and edge cases
 //!  10. Machine-readable conformance output
 
-use fsqlite_btree::btree_metrics_snapshot;
 use fsqlite_btree::swiss_index::SwissIndex;
+use fsqlite_btree::{btree_metrics_snapshot, reset_btree_metrics, set_btree_metrics_enabled};
+
+struct MetricsGuard;
+
+impl Drop for MetricsGuard {
+    fn drop(&mut self) {
+        set_btree_metrics_enabled(false);
+        reset_btree_metrics();
+    }
+}
+
+fn enable_metrics_for_test() -> MetricsGuard {
+    reset_btree_metrics();
+    set_btree_metrics_enabled(true);
+    MetricsGuard
+}
 
 // ---------------------------------------------------------------------------
 // Test 1: Basic CRUD operations
@@ -65,6 +80,7 @@ fn test_basic_crud() {
 
 #[test]
 fn test_load_factor_tracking() {
+    let _metrics = enable_metrics_for_test();
     let m_before = btree_metrics_snapshot();
 
     let mut map = SwissIndex::with_capacity(128);
@@ -261,6 +277,7 @@ fn test_entry_or_insert_with() {
 
 #[test]
 fn test_probe_metrics_fidelity() {
+    let _metrics = enable_metrics_for_test();
     let m_before = btree_metrics_snapshot();
 
     let mut map = SwissIndex::new();
@@ -358,6 +375,8 @@ fn test_index_operator_and_edges() {
 
 #[test]
 fn test_conformance_summary() {
+    let _metrics = enable_metrics_for_test();
+
     // Property 1: Insert/get round-trip.
     let mut m: SwissIndex<u64, u64> = SwissIndex::new();
     m.insert(1, 100);

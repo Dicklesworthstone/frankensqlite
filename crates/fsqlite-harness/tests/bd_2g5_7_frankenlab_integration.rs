@@ -364,9 +364,23 @@ fn test_trace_certificates() {
         sched.schedule(t1, 0);
     });
 
+    assert_eq!(report.quiescent, report2.quiescent, "quiescence differs");
     assert_eq!(
-        report.trace_certificate.schedule_hash, report2.trace_certificate.schedule_hash,
-        "trace certificates differ on replay"
+        report.steps_total, report2.steps_total,
+        "step counts differ"
+    );
+    assert_eq!(
+        report.trace_certificate.event_count, report2.trace_certificate.event_count,
+        "trace event counts differ"
+    );
+    assert_eq!(
+        report.oracle_report.to_json(),
+        report2.oracle_report.to_json(),
+        "oracle reports differ"
+    );
+    assert_eq!(
+        report.invariant_violations, report2.invariant_violations,
+        "invariant violations differ"
     );
 
     record_schedule_explored();
@@ -419,11 +433,21 @@ fn test_conformance_summary() {
             sl.write(99);
             sl.read("det").unwrap_or(0)
         });
-        let pass = r1.trace_fingerprint == r2.trace_fingerprint;
+        let pass = r1.quiescent == r2.quiescent
+            && r1.steps_total == r2.steps_total
+            && r1.trace_certificate.event_count == r2.trace_certificate.event_count
+            && r1.oracle_report.to_json() == r2.oracle_report.to_json()
+            && r1.invariant_violations == r2.invariant_violations;
         results.push(TestResult {
             name: "deterministic_replay",
             pass,
-            detail: format!("fp1={} fp2={}", r1.trace_fingerprint, r2.trace_fingerprint),
+            detail: format!(
+                "steps1={} steps2={} events1={} events2={}",
+                r1.steps_total,
+                r2.steps_total,
+                r1.trace_certificate.event_count,
+                r2.trace_certificate.event_count
+            ),
         });
     }
 

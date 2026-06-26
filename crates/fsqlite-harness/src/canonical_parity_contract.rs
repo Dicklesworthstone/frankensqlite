@@ -302,7 +302,9 @@ impl CanonicalParityContractBundle {
                 ),
             });
         }
-        if self.version_contract.references.surface_matrix != SUPPORTED_SURFACE_MATRIX_PATH {
+        let version_surface_matrix_path =
+            normalize_contract_reference(&self.version_contract.references.surface_matrix);
+        if version_surface_matrix_path != SUPPORTED_SURFACE_MATRIX_PATH {
             diagnostics.push(ContractDiagnostic {
                 code: "surface_matrix_path_mismatch",
                 message: format!(
@@ -311,7 +313,9 @@ impl CanonicalParityContractBundle {
                 ),
             });
         }
-        if self.version_contract.references.feature_ledger != FEATURE_UNIVERSE_LEDGER_PATH {
+        let version_feature_ledger_path =
+            normalize_contract_reference(&self.version_contract.references.feature_ledger);
+        if version_feature_ledger_path != FEATURE_UNIVERSE_LEDGER_PATH {
             diagnostics.push(ContractDiagnostic {
                 code: "feature_ledger_path_mismatch",
                 message: format!(
@@ -518,6 +522,17 @@ fn reference_target_path(reference: &str) -> Option<&str> {
         return None;
     }
     Some(path)
+}
+
+fn normalize_contract_reference(reference: &str) -> String {
+    let Some(path) = reference_target_path(reference) else {
+        return reference.trim().to_owned();
+    };
+    if Path::new(path).components().count() == 1 {
+        format!("docs/contracts/{path}")
+    } else {
+        path.to_owned()
+    }
 }
 
 #[cfg(test)]

@@ -204,6 +204,16 @@ impl OpLog {
 /// workers do not hold a shared leaf across multi-insert batches while the
 /// measured phase is running.
 #[must_use]
+pub fn commutative_inserts_disjoint_keys_expected_rows(
+    worker_count: u16,
+    rows_per_worker: u32,
+) -> u64 {
+    let seed_rows_per_worker = rows_per_worker.max(64);
+    u64::from(worker_count)
+        .saturating_mul(u64::from(seed_rows_per_worker).saturating_add(u64::from(rows_per_worker)))
+}
+
+#[must_use]
 pub fn preset_commutative_inserts_disjoint_keys(
     fixture_id: &str,
     seed: u64,
@@ -307,8 +317,9 @@ pub fn preset_commutative_inserts_disjoint_keys(
         }
     }
 
-    // Final verification query.
-    let expected_total = u64::from(worker_count) * u64::from(rows_per_worker);
+    // Final verification query. The result value itself is checked by tests
+    // and downstream harnesses that know this preset's deterministic seed row
+    // contract.
     records.push(OpRecord {
         op_id,
         worker: 0,
@@ -317,7 +328,6 @@ pub fn preset_commutative_inserts_disjoint_keys(
         },
         expected: Some(ExpectedResult::RowCount(1)),
     });
-    let _ = expected_total; // used by executor, not stored here
 
     OpLog { header, records }
 }

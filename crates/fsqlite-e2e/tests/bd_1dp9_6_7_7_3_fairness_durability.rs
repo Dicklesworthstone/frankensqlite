@@ -76,6 +76,42 @@ fn sqlite_i64(value: u64) -> i64 {
     i64::try_from(value).expect("test workload values fit SQLite INTEGER")
 }
 
+fn is_transient_csqlite_write_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn insert_csqlite_fairness_row(
+    conn: &rusqlite::Connection,
+    row_id: u64,
+    thread_id: usize,
+    value: u64,
+) {
+    const MAX_ATTEMPTS: usize = 8;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match conn.execute(
+            "INSERT INTO fairness_bench (id, thread_id, val) VALUES (?1, ?2, ?3)",
+            rusqlite::params![sqlite_i64(row_id), thread_id as i64, sqlite_i64(value)],
+        ) {
+            Ok(1) => return,
+            Ok(count) => panic!("C SQLite insert affected {count} rows, expected 1"),
+            Err(error) if is_transient_csqlite_write_error(&error) && attempt < MAX_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                panic!("C SQLite insert failed after {attempt} attempt(s): {error}");
+            }
+        }
+    }
+}
+
 // Jain's fairness index floor: below this, the workload is unfair.
 // Perfect fairness = 1.0, worst case for N threads = 1/N.
 // 0.90 is a reasonable gate for 2-8 threads.
@@ -226,13 +262,8 @@ fn run_csqlite_disjoint(
                 let base = (tid as u64) * RANGE_SIZE;
                 let mut completed = 0u64;
                 for i in 0..ops_per_thread {
-                    let r = conn.execute(
-                        "INSERT INTO fairness_bench (id, thread_id, val) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![sqlite_i64(base + i), tid as i64, sqlite_i64(i * 7 + 13)],
-                    );
-                    if r.is_ok() {
-                        completed += 1;
-                    }
+                    insert_csqlite_fairness_row(&conn, base + i, tid, i * 7 + 13);
+                    completed += 1;
                 }
                 ThreadResult {
                     _thread_id: tid,
@@ -291,13 +322,8 @@ fn run_csqlite_hot_page(
                 let mut completed = 0u64;
                 for _ in 0..ops_per_thread {
                     let id = nid.fetch_add(1, Ordering::Relaxed);
-                    let r = conn.execute(
-                        "INSERT INTO fairness_bench (id, thread_id, val) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![sqlite_i64(id), tid as i64, sqlite_i64(id * 3)],
-                    );
-                    if r.is_ok() {
-                        completed += 1;
-                    }
+                    insert_csqlite_fairness_row(&conn, id, tid, id * 3);
+                    completed += 1;
                 }
                 ThreadResult {
                     _thread_id: tid,
@@ -575,15 +601,8 @@ fn d1_file_backed_durability() {
                 let base = (tid as u64) * RANGE_SIZE;
                 let mut ok = 0u64;
                 for i in 0..ops_per_thread {
-                    if conn
-                        .execute(
-                            "INSERT INTO fairness_bench (id, thread_id, val) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![sqlite_i64(base + i), tid as i64, sqlite_i64(i)],
-                        )
-                        .is_ok()
-                    {
-                        ok += 1;
-                    }
+                    insert_csqlite_fairness_row(&conn, base + i, tid, i);
+                    ok += 1;
                 }
                 ok
             })
@@ -651,15 +670,8 @@ fn d2_checkpoint_under_concurrent_writes() {
                 let base = (tid as u64) * RANGE_SIZE;
                 let mut ok = 0u64;
                 for i in 0..ops_per_writer {
-                    if conn
-                        .execute(
-                            "INSERT INTO fairness_bench (id, thread_id, val) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![sqlite_i64(base + i), tid as i64, sqlite_i64(i)],
-                        )
-                        .is_ok()
-                    {
-                        ok += 1;
-                    }
+                    insert_csqlite_fairness_row(&conn, base + i, tid, i);
+                    ok += 1;
                     // Mid-stream yield to increase checkpoint overlap
                     if i == ops_per_writer / 2 && !ckpt.load(Ordering::Relaxed) {
                         thread::yield_now();
@@ -858,15 +870,8 @@ fn s1_scaling_curve() {
                     let base = (tid as u64) * RANGE_SIZE;
                     let mut ok = 0u64;
                     for i in 0..ops {
-                        if conn
-                            .execute(
-                                "INSERT INTO fairness_bench (id, thread_id, val) VALUES (?1, ?2, ?3)",
-                                rusqlite::params![sqlite_i64(base + i), tid as i64, sqlite_i64(i)],
-                            )
-                            .is_ok()
-                        {
-                            ok += 1;
-                        }
+                        insert_csqlite_fairness_row(&conn, base + i, tid, i);
+                        ok += 1;
                     }
                     ok
                 })

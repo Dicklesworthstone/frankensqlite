@@ -23,7 +23,7 @@ fn setup_join_fixture(conn: &Connection) {
 }
 
 #[test]
-fn certifying_mode_strict_rejects_fallback_query() {
+fn certifying_mode_strict_allows_file_backed_join_path() {
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join("zjisk1-certifying-strict.db");
     let db_path = db_path.to_string_lossy().to_string();
@@ -37,9 +37,34 @@ fn certifying_mode_strict_rejects_fallback_query() {
 
     let sql = "SELECT items.name, tags.tag \
                FROM items JOIN tags ON items.id = tags.item_id;";
-    let err = conn
+    let rows = conn
         .query(sql)
-        .expect_err("strict certifying mode must reject interpreted fallback");
+        .expect("strict certifying mode should allow pager-backed file join path");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+    assert_eq!(rows[0].values()[1], SqliteValue::Text("fruit".into()));
+}
+
+#[test]
+fn certifying_mode_strict_rejects_in_memory_fallback_query() {
+    let conn = Connection::open(":memory:").expect("open connection");
+
+    conn.execute("CREATE TABLE items (id INTEGER, name TEXT);")
+        .expect("create items");
+    conn.execute("CREATE TABLE tags (id INTEGER, tag TEXT);")
+        .expect("create tags");
+    conn.execute("INSERT INTO items VALUES (1, 'alpha');")
+        .expect("insert item");
+    conn.execute("INSERT INTO tags VALUES (1, 'fruit');")
+        .expect("insert tag");
+    conn.execute("PRAGMA fsqlite.parity_cert=ON;")
+        .expect("enable parity cert");
+    conn.execute("PRAGMA fsqlite.parity_cert_strict=ON;")
+        .expect("enable strict cert mode");
+
+    let err = conn
+        .query("SELECT items.name, tags.tag FROM items JOIN tags USING (id);")
+        .expect_err("strict certifying mode must reject interpreted memory fallback");
     assert!(
         err.to_string()
             .contains("in-memory fallback disabled in strict parity-cert mode"),

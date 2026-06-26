@@ -771,14 +771,14 @@ mod mvcc_tests {
         let txn = TxnId::new(1).unwrap();
 
         for i in 1..=128_u32 {
-            let page = PageNumber::new(i).unwrap();
+            let page = PageNumber::new(65_536 + i).unwrap();
             table.try_acquire(page, txn).unwrap();
         }
 
         let dist = table.shard_distribution();
         let ctx = DiagContext::new(BEAD_ID)
             .case("shard_distribution")
-            .invariant("128 pages across 64 shards → 2 each");
+            .invariant("128 sharded pages across 64 shards -> 2 each");
         diag_assert_eq!(ctx.clone(), dist.len(), LOCK_TABLE_SHARDS);
         for &count in &dist {
             diag_assert_eq!(ctx.clone(), count, 2);

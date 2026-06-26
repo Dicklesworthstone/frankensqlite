@@ -235,8 +235,8 @@ fn test_fifo_ordering_under_contention() {
 }
 
 #[test]
-#[should_panic(expected = "OBLIGATION TOKEN LEAKED")]
-fn test_tracked_sender_detects_leaked_permit() {
+#[should_panic(expected = "[ASUP-E103] Cannot create obligation token in root region")]
+fn test_tracked_sender_rejects_root_region_permit() {
     let cx = test_cx();
     let (tracked_sender, _receiver) = session::tracked_channel::<CommitRequest>(4);
     let permit = block_on(tracked_sender.reserve(&cx)).expect("tracked reserve should succeed");

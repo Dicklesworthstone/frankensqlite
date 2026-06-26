@@ -20,7 +20,7 @@ const UNIT_TEST_IDS: [&str; 5] = [
 const E2E_TEST_IDS: [&str; 2] = ["test_e2e_bd_3kp_1", "test_e2e_bd_3kp_1_compliance"];
 const LOG_LEVEL_MARKERS: [&str; 4] = ["DEBUG", "INFO", "WARN", "ERROR"];
 const LOG_STANDARD_REF: &str = "bd-1fpm";
-const EXPECTED_QUESTIONS: [&str; 7] = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"];
+const EXPECTED_QUESTIONS: [&str; 8] = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8"];
 const REQUIRED_TOKENS: [&str; 12] = [
     "test_bd_3kp_1_unit_compliance_gate",
     "prop_bd_3kp_1_structure_compliance",

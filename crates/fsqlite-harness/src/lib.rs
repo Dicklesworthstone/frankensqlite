@@ -116,7 +116,7 @@ mod gf256_verification {
 
     use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
     use asupersync::raptorq::gf256::{Gf256, gf256_addmul_slice, gf256_mul_slice};
-    use asupersync::raptorq::systematic::{ConstraintMatrix, SystematicEncoder};
+    use asupersync::raptorq::systematic::SystematicEncoder;
     use proptest::prelude::*;
 
     const BEAD_ID: &str = "bd-1hi.1";
@@ -643,31 +643,16 @@ mod gf256_verification {
         let l = params.l;
         let k_u32 = u32::try_from(k).expect("k is small and fits u32");
         let l_u32 = u32::try_from(l).expect("L is small in this test and fits u32");
-        let base_rows = params.s + params.h;
-        let constraints = ConstraintMatrix::build(params, seed);
 
         // Start with the LDPC/HDPC constraint symbols (zero RHS).
         let mut received: Vec<ReceivedSymbol> = decoder.constraint_symbols();
 
-        // Add source symbols with their LT equations from the constraint matrix.
+        // Add source symbols using the decoder's canonical systematic identity equation.
         for (i, data) in source.iter().enumerate() {
-            let row = base_rows + i;
-            let mut columns = Vec::new();
-            let mut coefficients = Vec::new();
-            for col in 0..constraints.cols {
-                let coeff = constraints.get(row, col);
-                if !coeff.is_zero() {
-                    columns.push(col);
-                    coefficients.push(coeff);
-                }
-            }
-            received.push(ReceivedSymbol {
-                esi: u32::try_from(i).expect("esi fits u32 for this test"),
-                is_source: true,
-                columns,
-                coefficients,
-                data: data.clone(),
-            });
+            received.push(ReceivedSymbol::source(
+                u32::try_from(i).expect("esi fits u32 for this test"),
+                data.clone(),
+            ));
         }
 
         // Add enough repair symbols to reach L total.

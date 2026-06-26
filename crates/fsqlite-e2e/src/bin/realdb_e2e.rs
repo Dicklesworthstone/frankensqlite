@@ -480,9 +480,7 @@ fn find_bench_workspace_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_hot_path_workspace_root_candidate(candidate: &Path) -> Option<PathBuf> {
-    let normalized = candidate
-        .canonicalize()
-        .unwrap_or_else(|_| candidate.to_path_buf());
+    let normalized = candidate.canonicalize().ok()?;
     if normalized
         .join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE)
         .is_file()
@@ -7888,14 +7886,14 @@ mod tests {
         BenchmarkArtifactCommand, BenchmarkArtifactContract, BenchmarkArtifactProvenanceCapture,
         BenchmarkArtifactRetentionClass, BenchmarkArtifactRetentionPolicy,
         BenchmarkArtifactToolVersion, BenchmarkMode, BuildProfile, ExpandedBenchmarkCell,
-        HARDWARE_CLASS_LINUX_X86_64_ANY, HardwareClass, HardwareClassIdFields,
-        HardwareCpuArchitecture, HardwareOsFamily, HardwareTopologyClass, PlacementAvailability,
-        PlacementClaimContract, PlacementCpuAffinityPolicy, PlacementExecutionContract,
-        PlacementFocusedRerunContract, PlacementFocusedRerunSelectorKind,
-        PlacementHelperLanePolicy, PlacementMemoryPolicy, PlacementProfile, PlacementProfileKind,
-        PlacementSmtPolicy, PlacementSuiteSelectionContract, PlacementSuiteSelectorKind,
-        PlacementVariant, PlacementViolationDisposition, RetryPolicy, SeedPolicy,
-        build_benchmark_artifact_manifest,
+        HARDWARE_CLASS_LINUX_X86_64_ANY, HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA, HardwareClass,
+        HardwareClassIdFields, HardwareCpuArchitecture, HardwareOsFamily, HardwareTopologyClass,
+        PlacementAvailability, PlacementClaimContract, PlacementCpuAffinityPolicy,
+        PlacementExecutionContract, PlacementFocusedRerunContract,
+        PlacementFocusedRerunSelectorKind, PlacementHelperLanePolicy, PlacementMemoryPolicy,
+        PlacementProfile, PlacementProfileKind, PlacementSmtPolicy,
+        PlacementSuiteSelectionContract, PlacementSuiteSelectorKind, PlacementVariant,
+        PlacementViolationDisposition, RetryPolicy, SeedPolicy, build_benchmark_artifact_manifest,
     };
     use fsqlite_e2e::methodology::{
         AUTHORITATIVE_PERF_CARGO_PROFILE, BuildHygieneMeta, EnvironmentCaptureMode,
@@ -8365,17 +8363,30 @@ mod tests {
                     violation_disposition: PlacementViolationDisposition::NotComparable,
                 },
             }],
-            hardware_classes: vec![HardwareClass {
-                id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
-                id_fields: HardwareClassIdFields {
-                    os_family: HardwareOsFamily::Linux,
-                    cpu_arch: HardwareCpuArchitecture::X86_64,
-                    topology_class: HardwareTopologyClass::Any,
+            hardware_classes: vec![
+                HardwareClass {
+                    id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
+                    id_fields: HardwareClassIdFields {
+                        os_family: HardwareOsFamily::Linux,
+                        cpu_arch: HardwareCpuArchitecture::X86_64,
+                        topology_class: HardwareTopologyClass::Any,
+                    },
+                    min_logical_cores: 4,
+                    min_numa_nodes: None,
+                    description: "generic".to_owned(),
                 },
-                min_logical_cores: 4,
-                min_numa_nodes: None,
-                description: "generic".to_owned(),
-            }],
+                HardwareClass {
+                    id: HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA.to_owned(),
+                    id_fields: HardwareClassIdFields {
+                        os_family: HardwareOsFamily::Linux,
+                        cpu_arch: HardwareCpuArchitecture::X86_64,
+                        topology_class: HardwareTopologyClass::ManyCoreNuma,
+                    },
+                    min_logical_cores: 32,
+                    min_numa_nodes: Some(2),
+                    description: "many-core".to_owned(),
+                },
+            ],
             retry_policies: vec![RetryPolicy {
                 id: "instrumented_busy_retry_v1".to_owned(),
                 max_busy_retries: 10_000,
@@ -8405,11 +8416,23 @@ mod tests {
                     BenchmarkMode::FsqliteSingleWriter,
                     BenchmarkMode::FsqliteMvcc,
                 ],
-                placement_variants: vec![PlacementVariant {
-                    placement_profile_id: "baseline_unpinned".to_owned(),
-                    hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
-                    required: true,
-                }],
+                placement_variants: vec![
+                    PlacementVariant {
+                        placement_profile_id: PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned(),
+                        hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
+                        required: true,
+                    },
+                    PlacementVariant {
+                        placement_profile_id: PLACEMENT_PROFILE_RECOMMENDED_PINNED.to_owned(),
+                        hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA.to_owned(),
+                        required: true,
+                    },
+                    PlacementVariant {
+                        placement_profile_id: PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE.to_owned(),
+                        hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA.to_owned(),
+                        required: true,
+                    },
+                ],
                 retry_policy_id: "instrumented_busy_retry_v1".to_owned(),
                 build_profile_id: "release_perf".to_owned(),
                 seed_policy_id: "fixed_seed_42".to_owned(),

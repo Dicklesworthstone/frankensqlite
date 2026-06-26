@@ -137,6 +137,34 @@ fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<SqlVal
         .collect()
 }
 
+fn fsqlite_count_probe(conn: &fsqlite::Connection, sql: &str) -> String {
+    match conn.query(sql) {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row.values().first())
+            .map_or_else(|| "no-row".to_owned(), ToString::to_string),
+        Err(err) => format!("error:{err}"),
+    }
+}
+
+fn mode_mix_post_rollback_probe(path: &str, conn: &fsqlite::Connection, id: i64) -> String {
+    let sql = format!("SELECT COUNT(*) FROM mode_mix WHERE id = {id};");
+    let same_connection = fsqlite_count_probe(conn, &sql);
+    let fresh_connection = match fsqlite::Connection::open(path) {
+        Ok(fresh) => {
+            let count = fsqlite_count_probe(&fresh, &sql);
+            let close_result = fresh.close();
+            if let Err(err) = close_result {
+                format!("{count};close_error:{err}")
+            } else {
+                count
+            }
+        }
+        Err(err) => format!("open_error:{err}"),
+    };
+    format!("post-rollback id={id} same_conn={same_connection} fresh_conn={fresh_connection}")
+}
+
 struct HotPathProfileGuard {
     was_enabled: bool,
 }
@@ -1490,6 +1518,7 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
         mvcc_barrier.wait();
 
         let mut last_error = String::new();
+        let mut error_history = Vec::new();
         for attempt in 1..=64 {
             match conn.execute("BEGIN;") {
                 Ok(_) => {
@@ -1502,21 +1531,36 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
                         );
                         if let Err(err) = conn.execute(&sql) {
                             last_error = err.to_string();
+                            error_history.push(format!("attempt {attempt} insert id={id}: {err}"));
                             failed = true;
                             break;
                         }
                     }
                     if failed {
-                        let _ = conn.execute("ROLLBACK;");
+                        if let Err(err) = conn.execute("ROLLBACK;") {
+                            error_history.push(format!(
+                                "attempt {attempt} rollback after insert error: {err}"
+                            ));
+                        }
                     } else {
                         match conn.execute("COMMIT;") {
                             Ok(_) => return (mode_default, concurrent_txn, attempt),
                             Err(err) => {
                                 last_error = err.to_string();
-                                if let Err(rollback_err) = conn.execute("ROLLBACK;") {
-                                    last_error = format!(
-                                        "{last_error}; rollback after failed commit also failed: {rollback_err}"
-                                    );
+                                error_history.push(format!("attempt {attempt} commit: {err}"));
+                                match conn.execute("ROLLBACK;") {
+                                    Ok(_) => error_history.push(format!(
+                                        "attempt {attempt} {}",
+                                        mode_mix_post_rollback_probe(&mvcc_path, &conn, 0)
+                                    )),
+                                    Err(rollback_err) => {
+                                        error_history.push(format!(
+                                            "attempt {attempt} rollback after commit error: {rollback_err}"
+                                        ));
+                                        last_error = format!(
+                                            "{last_error}; rollback after failed commit also failed: {rollback_err}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1524,17 +1568,18 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
                 }
                 Err(err) => {
                     last_error = err.to_string();
+                    error_history.push(format!("attempt {attempt} begin: {err}"));
                 }
             }
 
             assert!(
                 is_retryable_txn_error(&last_error),
-                "mixed-mode MVCC worker hit non-retryable error: {last_error}"
+                "mixed-mode MVCC worker hit non-retryable error: {last_error}; history={error_history:?}"
             );
             thread::sleep(Duration::from_millis(2));
         }
 
-        panic!("mixed-mode MVCC worker exhausted retries: {last_error}");
+        panic!("mixed-mode MVCC worker exhausted retries: {last_error}; history={error_history:?}");
     });
 
     let serialized_path = candidate_path_string.clone();
@@ -1546,6 +1591,7 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
         serialized_barrier.wait();
 
         let mut last_error = String::new();
+        let mut error_history = Vec::new();
         for attempt in 1..=64 {
             match conn.execute("BEGIN;") {
                 Ok(_) => {
@@ -1558,21 +1604,36 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
                         );
                         if let Err(err) = conn.execute(&sql) {
                             last_error = err.to_string();
+                            error_history.push(format!("attempt {attempt} insert id={id}: {err}"));
                             failed = true;
                             break;
                         }
                     }
                     if failed {
-                        let _ = conn.execute("ROLLBACK;");
+                        if let Err(err) = conn.execute("ROLLBACK;") {
+                            error_history.push(format!(
+                                "attempt {attempt} rollback after insert error: {err}"
+                            ));
+                        }
                     } else {
                         match conn.execute("COMMIT;") {
                             Ok(_) => return (mode_default, concurrent_txn, attempt),
                             Err(err) => {
                                 last_error = err.to_string();
-                                if let Err(rollback_err) = conn.execute("ROLLBACK;") {
-                                    last_error = format!(
-                                        "{last_error}; rollback after failed commit also failed: {rollback_err}"
-                                    );
+                                error_history.push(format!("attempt {attempt} commit: {err}"));
+                                match conn.execute("ROLLBACK;") {
+                                    Ok(_) => error_history.push(format!(
+                                        "attempt {attempt} {}",
+                                        mode_mix_post_rollback_probe(&serialized_path, &conn, 100)
+                                    )),
+                                    Err(rollback_err) => {
+                                        error_history.push(format!(
+                                            "attempt {attempt} rollback after commit error: {rollback_err}"
+                                        ));
+                                        last_error = format!(
+                                            "{last_error}; rollback after failed commit also failed: {rollback_err}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1580,17 +1641,20 @@ fn txn_mixed_connection_modes_remain_local_and_preserve_rows() {
                 }
                 Err(err) => {
                     last_error = err.to_string();
+                    error_history.push(format!("attempt {attempt} begin: {err}"));
                 }
             }
 
             assert!(
                 is_retryable_txn_error(&last_error),
-                "mixed-mode serialized worker hit non-retryable error: {last_error}"
+                "mixed-mode serialized worker hit non-retryable error: {last_error}; history={error_history:?}"
             );
             thread::sleep(Duration::from_millis(2));
         }
 
-        panic!("mixed-mode serialized worker exhausted retries: {last_error}");
+        panic!(
+            "mixed-mode serialized worker exhausted retries: {last_error}; history={error_history:?}"
+        );
     });
 
     let (mvcc_default, mvcc_txn, mvcc_attempts) = mvcc.join().expect("join mvcc worker");

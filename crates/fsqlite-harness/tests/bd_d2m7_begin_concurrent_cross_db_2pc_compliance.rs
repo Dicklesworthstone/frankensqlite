@@ -521,10 +521,10 @@ fn test_e2e_bd_d2m7_compliance() -> Result<(), String> {
     run_cross_db_prepare_crash_atomicity_scenario()?;
 
     eprintln!(
-        "WARN bead_id={BEAD_ID} case=e2e_degraded_mode degraded_mode=0 reference={LOG_STANDARD_REF}"
+        "INFO bead_id={BEAD_ID} case=e2e_degraded_mode degraded_mode=0 reference={LOG_STANDARD_REF}"
     );
     eprintln!(
-        "ERROR bead_id={BEAD_ID} case=e2e_terminal_failure_count terminal_failure_count=0 reference={LOG_STANDARD_REF}"
+        "INFO bead_id={BEAD_ID} case=e2e_terminal_failure_count terminal_failure_count=0 reference={LOG_STANDARD_REF}"
     );
     eprintln!("INFO bead_id={BEAD_ID} case=e2e_complete status=pass reference={LOG_STANDARD_REF}");
 

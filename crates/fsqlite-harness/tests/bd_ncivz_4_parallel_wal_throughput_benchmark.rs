@@ -77,15 +77,17 @@ fn consolidator_lifecycle_filling_flushing_complete() {
 
     // Submit first batch → Flusher.
     let batch = make_batch(2);
-    let outcome = consolidator.submit_batch(batch).unwrap();
-    assert_eq!(outcome, SubmitOutcome::Flusher);
+    let receipt = consolidator.submit_batch(batch).unwrap();
+    assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+    assert_eq!(receipt.target_epoch, 1);
     assert_eq!(consolidator.pending_frame_count(), 2);
     assert_eq!(consolidator.pending_batch_count(), 1);
 
     // Submit second batch → Waiter.
     let batch2 = make_batch(1);
-    let outcome2 = consolidator.submit_batch(batch2).unwrap();
-    assert_eq!(outcome2, SubmitOutcome::Waiter);
+    let receipt2 = consolidator.submit_batch(batch2).unwrap();
+    assert_eq!(receipt2.outcome, SubmitOutcome::Waiter);
+    assert_eq!(receipt2.target_epoch, 1);
     assert_eq!(consolidator.pending_frame_count(), 3);
 
     // Begin flush → transitions to Flushing, advances epoch.
@@ -115,8 +117,9 @@ fn consolidator_complete_to_filling_on_submit() {
     assert_eq!(consolidator.phase(), ConsolidationPhase::Complete);
 
     // New submit transitions back to Filling.
-    let outcome = consolidator.submit_batch(make_batch(1)).unwrap();
-    assert_eq!(outcome, SubmitOutcome::Flusher);
+    let receipt = consolidator.submit_batch(make_batch(1)).unwrap();
+    assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+    assert_eq!(receipt.target_epoch, 2);
     assert_eq!(consolidator.phase(), ConsolidationPhase::Filling);
 }
 
@@ -144,16 +147,25 @@ fn consolidator_should_flush_when_full() {
     assert_eq!(consolidator.time_until_flush(), Duration::ZERO);
 }
 
-// ── 6. Submit during Flushing phase fails ───────────────────────────────────
+// ── 6. Submit during Flushing phase pipelines to next epoch ─────────────────
 
 #[test]
-fn submit_during_flushing_is_error() {
+fn submit_during_flushing_pipelines_to_next_epoch() {
     let mut consolidator = GroupCommitConsolidator::new(GroupCommitConfig::default());
     consolidator.submit_batch(make_batch(1)).unwrap();
     consolidator.begin_flush().unwrap();
 
-    let result = consolidator.submit_batch(make_batch(1));
-    assert!(result.is_err(), "submit during FLUSHING should error");
+    let receipt = consolidator.submit_batch(make_batch(1)).unwrap();
+    assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+    assert_eq!(receipt.target_epoch, 2);
+    assert!(consolidator.has_pipelined_batches());
+
+    let promoted = consolidator.complete_flush().unwrap();
+    assert!(promoted, "pipelined batch should promote the next epoch");
+    assert_eq!(consolidator.phase(), ConsolidationPhase::Filling);
+    assert_eq!(consolidator.completed_epoch(), 1);
+    assert_eq!(consolidator.pending_batch_count(), 1);
+    assert_eq!(consolidator.pending_frame_count(), 1);
 }
 
 // ── 7. Frame batch semantics ────────────────────────────────────────────────

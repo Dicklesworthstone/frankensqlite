@@ -177,6 +177,6 @@ if [[ "${#missing_risk_ids[@]}" -gt 0 || "${#duplicate_risk_ids[@]}" -gt 0 || "$
     exit 1
 fi
 
-printf 'bead_id=%s level=WARN case=degraded_mode_count=0 reference=%s\n' "${BEAD_ID}" "${LOG_STANDARD_REF}"
-printf 'bead_id=%s level=ERROR case=terminal_failure_count=0 reference=%s\n' "${BEAD_ID}" "${LOG_STANDARD_REF}"
+printf 'bead_id=%s level=INFO case=degraded_mode_count=0 reference=%s\n' "${BEAD_ID}" "${LOG_STANDARD_REF}"
+printf 'bead_id=%s level=INFO case=terminal_failure_count=0 reference=%s\n' "${BEAD_ID}" "${LOG_STANDARD_REF}"
 printf 'bead_id=%s level=INFO case=pass report=%s\n' "${BEAD_ID}" "${REPORT_JSONL}"

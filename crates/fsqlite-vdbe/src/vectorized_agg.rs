@@ -48,7 +48,8 @@ pub struct AggregateSpec {
 
 // ── Aggregate Accumulator ──────────────────────────────────────────────────
 
-/// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
+/// Kahan-Babuska-Neumaier compensated summation step matching upstream
+/// aggregate precision behavior.
 #[inline]
 fn kbn_step(sum: &mut f64, err: &mut f64, value: f64) {
     let s = *sum;

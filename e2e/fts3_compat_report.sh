@@ -139,9 +139,9 @@ if [[ "${#missing_markers[@]}" -gt 0 ]]; then
     exit 1
 fi
 
-printf 'bead_id=%s level=WARN case=degraded_mode_count=0 trace_id=%s reference=%s\n' \
+printf 'bead_id=%s level=INFO case=degraded_mode_count=0 trace_id=%s reference=%s\n' \
     "${BEAD_ID}" "${trace_id}" "${LOG_STANDARD_REF}"
-printf 'bead_id=%s level=ERROR case=terminal_failure_count=0 trace_id=%s reference=%s\n' \
+printf 'bead_id=%s level=INFO case=terminal_failure_count=0 trace_id=%s reference=%s\n' \
     "${BEAD_ID}" "${trace_id}" "${LOG_STANDARD_REF}"
 printf 'bead_id=%s level=INFO case=pass trace_id=%s report=%s\n' \
     "${BEAD_ID}" "${trace_id}" "${REPORT_JSONL}"

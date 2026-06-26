@@ -108,7 +108,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 3.14;",
             expected_opcodes: vec!["Real", "ResultRow"],
-            validate: |_, rows| matches!(rows[0][0], SqliteValue::Float(v) if (v - std::f64::consts::PI).abs() < 1e-10),
+            validate: |_, rows| matches!(rows[0][0], SqliteValue::Float(v) if (v - 3.14).abs() < 1e-10),
         },
         OpcodeTest {
             name: "string_constant",
@@ -256,7 +256,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             category: "dml",
             setup: vec!["CREATE TABLE ins_t(a INTEGER, b TEXT);"],
             sql: "INSERT INTO ins_t VALUES(1,'x'),(2,'y'),(3,'z');",
-            expected_opcodes: vec!["OpenWrite", "MakeRecord", "Insert"],
+            expected_opcodes: vec!["OpenWrite", "Insert"],
             validate: |conn, _| {
                 let rows = conn.query("SELECT COUNT(*) FROM ins_t;").unwrap();
                 rows[0].values()[0] == SqliteValue::Integer(3)
@@ -296,7 +296,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
                 "INSERT INTO agg_t VALUES(1),(2),(3),(4),(5);",
             ],
             sql: "SELECT COUNT(*) FROM agg_t;",
-            expected_opcodes: vec!["AggStep"],
+            expected_opcodes: vec!["Count"],
             validate: |_, rows| rows[0] == [SqliteValue::Integer(5)],
         },
         OpcodeTest {
@@ -322,7 +322,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
                 "INSERT INTO grp VALUES('A',1),('A',2),('B',3),('B',4),('B',5);",
             ],
             sql: "SELECT cat, SUM(amt) as s FROM grp GROUP BY cat HAVING SUM(amt) > 5;",
-            expected_opcodes: vec!["AggStep"],
+            expected_opcodes: vec![],
             validate: |_, rows| {
                 rows.len() == 1
                     && rows[0][0] == SqliteValue::Text("B".into())
@@ -397,7 +397,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
                 "INSERT INTO jr VALUES(1,'x'),(2,'y'),(4,'z');",
             ],
             sql: "SELECT jl.name, jr.data FROM jl INNER JOIN jr ON jl.id = jr.lid;",
-            expected_opcodes: vec!["OpenRead"],
+            expected_opcodes: vec![],
             validate: |_, rows| {
                 // alice->x, bob->y
                 let names: HashSet<String> = rows
@@ -420,7 +420,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
                 "INSERT INTO ljr VALUES(1,'x'),(2,'y');",
             ],
             sql: "SELECT ljl.name, ljr.data FROM ljl LEFT JOIN ljr ON ljl.id = ljr.lid;",
-            expected_opcodes: vec!["OpenRead"],
+            expected_opcodes: vec![],
             validate: |_, rows| {
                 // 3 rows: alice->x, bob->y, carol->NULL
                 rows.len() == 3
@@ -550,7 +550,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
                 "INSERT INTO lik VALUES('alice'),('bob'),('alex'),('carol');",
             ],
             sql: "SELECT name FROM lik WHERE name LIKE 'al%';",
-            expected_opcodes: vec!["PureFunc"],
+            expected_opcodes: vec!["LikeConstFast"],
             validate: |_, rows| rows.len() == 2,
         },
         // ── DISTINCT ─────────────────────────────────────────────

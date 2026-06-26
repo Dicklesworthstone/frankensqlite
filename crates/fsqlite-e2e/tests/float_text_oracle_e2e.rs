@@ -2,11 +2,11 @@
 //!
 //! This compares the ENGINE's float->text rendering (via CAST(... AS TEXT) and
 //! `float || ''`), not the test harness's, so it exercises FrankenSQLite's
-//! float formatter against SQLite's. SQLite 3.43+ uses the shortest
-//! round-trippable representation (as Rust does), so simple and repeating
-//! decimals should agree; the riskier cases are integer-valued floats (`3.0`),
-//! and large/small magnitudes where scientific-notation thresholds and exponent
-//! formatting (`1.0e+20` vs `1e20`) commonly differ. Those are isolated.
+//! float formatter against SQLite's. SQLite 3.52+ defaults REAL-to-TEXT
+//! conversion to 17 significant digits, with SQLite-specific rounding and
+//! scientific-notation thresholds. The riskier cases are repeating decimals,
+//! integer-valued floats (`3.0`), and large/small magnitudes where exponent
+//! formatting (`1.0e+20` vs `1e20`) commonly differs. Those are isolated.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -102,9 +102,8 @@ fn float_text_simple_decimals() {
 fn float_text_repeating_and_precision() {
     assert_scalar(
         &[
-            // Shortest round-trip on SQLite 3.43+ and Rust should agree.
-            "SELECT CAST(1.0/3.0 AS TEXT)",   // 0.3333333333333333
-            "SELECT CAST(2.0/3.0 AS TEXT)",   // 0.6666666666666666
+            "SELECT CAST(1.0/3.0 AS TEXT)",   // 0.33333333333333332
+            "SELECT CAST(2.0/3.0 AS TEXT)",   // 0.66666666666666663
             "SELECT CAST(0.1 + 0.2 AS TEXT)", // 0.30000000000000004
             "SELECT (10.0/3.0) || ''",
         ],

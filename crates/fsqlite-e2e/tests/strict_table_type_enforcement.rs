@@ -8,12 +8,27 @@
 
 use fsqlite::Connection;
 use fsqlite_error::ErrorCode;
-use tempfile::tempdir;
+use std::ops::Deref;
+use tempfile::{TempDir, tempdir};
 
-fn open_db(name: &str) -> Connection {
+struct TestConnection {
+    _temp: TempDir,
+    conn: Connection,
+}
+
+impl Deref for TestConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+fn open_db(name: &str) -> TestConnection {
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join(name);
-    Connection::open(db_path.to_string_lossy().to_string()).expect("open connection")
+    let conn = Connection::open(db_path.to_string_lossy().to_string()).expect("open connection");
+    TestConnection { _temp: temp, conn }
 }
 
 // ─── CREATE TABLE ... STRICT ────────────────────────────────────────────

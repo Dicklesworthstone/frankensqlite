@@ -6,11 +6,11 @@
 //! Uses SSE2/AVX2 control byte probing for cache-line parallel lookup (via hashbrown).
 //!
 //! **Performance note:** Observability (atomic probe counters and tracing spans) is
-//! deferred to a cold path gated on `tracing::enabled!(Level::TRACE)`. On the hot
-//! path — cursor lookups inside the VDBE opcode dispatch — only the underlying
-//! hashbrown operation runs, with zero overhead from instrumentation.
+//! deferred to a cold path gated on the B-tree metrics flag or TRACE tracing. On
+//! the hot path — cursor lookups inside the VDBE opcode dispatch — only the
+//! underlying hashbrown operation runs, with zero overhead from instrumentation.
 
-use crate::instrumentation::{record_swiss_probe, set_swiss_load_factor};
+use crate::instrumentation::{btree_metrics_enabled, record_swiss_probe, set_swiss_load_factor};
 use foldhash::fast::FixedState;
 use hashbrown::HashMap;
 use std::borrow::Borrow;
@@ -22,7 +22,8 @@ use tracing::Level;
 /// This structure is a thin wrapper around `hashbrown::HashMap` that automatically
 /// emits `hash_probe` spans and updates `fsqlite_swiss_table_probes_total` and
 /// `fsqlite_swiss_table_load_factor` metrics on operations — but only when
-/// TRACE-level tracing is enabled, keeping the hot path zero-cost.
+/// tracing or B-tree metrics are explicitly enabled, keeping the hot path
+/// zero-cost.
 #[derive(Debug, Clone, Default)]
 pub struct SwissIndex<K, V> {
     inner: HashMap<K, V, FixedState>,
@@ -134,8 +135,8 @@ where
     #[inline]
     pub fn clear(&mut self) {
         self.inner.clear();
-        if tracing::enabled!(Level::TRACE) {
-            self.update_load_factor();
+        if btree_metrics_enabled() {
+            set_swiss_load_factor(self.load_factor_milli());
         }
     }
 
@@ -153,37 +154,47 @@ where
 
     // --- Observability Helpers (cold path only) ---
 
-    /// Record a probe event only when TRACE-level tracing is active.
-    /// On the hot path this compiles to a single branch on the tracing
-    /// subscriber's interest flag — no atomic increment, no span creation.
+    /// Record a probe event only when metrics or TRACE-level tracing is active.
+    /// On the hot path this compiles to two cheap branch checks — no atomic
+    /// increment, no span creation.
     #[inline]
     fn maybe_record_probe(&self) {
-        if tracing::enabled!(Level::TRACE) {
-            self.record_probe_cold();
+        let metrics_enabled = btree_metrics_enabled();
+        let trace_enabled = tracing::enabled!(Level::TRACE);
+        if metrics_enabled || trace_enabled {
+            self.record_probe_cold(metrics_enabled, trace_enabled);
         }
     }
 
-    /// Combined probe + load-factor update, gated on TRACE.
+    /// Combined probe + load-factor update, gated on metrics or TRACE.
     #[inline]
     fn maybe_record_probe_and_load_factor(&self) {
-        if tracing::enabled!(Level::TRACE) {
-            self.record_probe_cold();
-            self.update_load_factor();
+        let metrics_enabled = btree_metrics_enabled();
+        let trace_enabled = tracing::enabled!(Level::TRACE);
+        if metrics_enabled || trace_enabled {
+            self.record_probe_cold(metrics_enabled, trace_enabled);
+            if metrics_enabled {
+                self.update_load_factor();
+            }
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn record_probe_cold(&self) {
-        record_swiss_probe();
-        let span = tracing::span!(
-            Level::TRACE,
-            "hash_probe",
-            probes = 1,
-            items = self.len(),
-            load_factor = self.load_factor_milli() as f64 / 1000.0
-        );
-        span.in_scope(|| {});
+    fn record_probe_cold(&self, metrics_enabled: bool, trace_enabled: bool) {
+        if metrics_enabled {
+            record_swiss_probe();
+        }
+        if trace_enabled {
+            let span = tracing::span!(
+                Level::TRACE,
+                "hash_probe",
+                probes = 1,
+                items = self.len(),
+                load_factor = self.load_factor_milli() as f64 / 1000.0
+            );
+            span.in_scope(|| {});
+        }
     }
 
     #[cold]

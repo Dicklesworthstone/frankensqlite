@@ -187,6 +187,13 @@ fn run_workload(kind: WorkloadKind, bounded: bool, seed: u64) -> WorkloadMetrics
     mgr.set_max_chain_length(max_chain);
     mgr.set_chain_length_warning(warn_chain);
 
+    // Keep the GC horizon pinned while this workload runs. Without a pinned
+    // reader, eager cleanup correctly flattens both bounded and unbounded modes
+    // to one live version per page, which does not exercise chain pressure.
+    let mut pinning_reader = mgr
+        .begin(BeginKind::Concurrent)
+        .expect("pinning reader begin");
+
     let zipf_cdf = build_zipf_cdf(DEFAULT_PAGE_POOL, 1.15);
     let mut rng = StdRng::seed_from_u64(seed);
     let mut touched_pages = HashSet::new();
@@ -256,7 +263,7 @@ fn run_workload(kind: WorkloadKind, bounded: bool, seed: u64) -> WorkloadMetrics
         final_active_versions as f64 / distinct_pages as f64
     };
 
-    WorkloadMetrics {
+    let metrics = WorkloadMetrics {
         workload: workload_name(kind),
         mode,
         seed,
@@ -279,7 +286,11 @@ fn run_workload(kind: WorkloadKind, bounded: bool, seed: u64) -> WorkloadMetrics
         max_chain_length_observed: after.max_chain_length_observed,
         avg_chain_length_observed: after.avg_chain_length(),
         active_series,
-    }
+    };
+
+    mgr.abort(&mut pinning_reader);
+
+    metrics
 }
 
 fn run_comparison(kind: WorkloadKind, base_seed: u64) -> WorkloadComparison {

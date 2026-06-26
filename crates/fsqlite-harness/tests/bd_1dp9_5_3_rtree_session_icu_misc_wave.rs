@@ -295,21 +295,27 @@ fn test_unit_session_changeset_apply_invariants() -> Result<(), String> {
     let decoded = Changeset::decode(&encoded)
         .ok_or_else(|| format!("bead_id={BEAD_ID} case=changeset_decode_failed"))?;
     assert_eq!(decoded.tables.len(), 1);
-    assert_eq!(decoded.tables[0].rows.len(), 3);
+    assert_eq!(decoded.tables[0].rows.len(), 2);
     assert_eq!(decoded.tables[0].rows[0].op, ChangeOp::Insert);
-    assert_eq!(decoded.tables[0].rows[1].op, ChangeOp::Update);
-    assert_eq!(decoded.tables[0].rows[2].op, ChangeOp::Delete);
+    assert_eq!(
+        decoded.tables[0].rows[0].new_values,
+        vec![
+            ChangesetValue::Integer(1),
+            ChangesetValue::Text("alice".to_owned()),
+            ChangesetValue::Integer(125),
+        ],
+    );
+    assert_eq!(decoded.tables[0].rows[1].op, ChangeOp::Delete);
 
     let inverted = decoded.invert();
     assert_eq!(inverted.tables[0].rows[0].op, ChangeOp::Delete);
-    assert_eq!(inverted.tables[0].rows[1].op, ChangeOp::Update);
-    assert_eq!(inverted.tables[0].rows[2].op, ChangeOp::Insert);
+    assert_eq!(inverted.tables[0].rows[1].op, ChangeOp::Insert);
 
     let mut target = SimpleTarget::default();
     let outcome = target.apply(&decoded, |_kind, _row| ConflictAction::OmitChange);
     match outcome {
         ApplyOutcome::Success { applied, skipped } => {
-            assert_eq!(applied, 2);
+            assert_eq!(applied, 1);
             assert_eq!(skipped, 1);
         }
         ApplyOutcome::Aborted { applied } => {

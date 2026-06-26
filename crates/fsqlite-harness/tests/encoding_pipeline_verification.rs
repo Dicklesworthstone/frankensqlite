@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use asupersync::raptorq::decoder::{DecodeError, InactivationDecoder, ReceivedSymbol};
 use asupersync::raptorq::gf256::Gf256;
+use asupersync::raptorq::rfc6330::repair_indices_for_esi;
 use asupersync::raptorq::systematic::{ConstraintMatrix, SystematicEncoder, SystematicParams};
 
 const BEAD_ID: &str = "bd-1hi.3";
@@ -51,7 +52,7 @@ fn encoder_or_skip(k: usize, symbol_size: usize) -> Option<SystematicEncoder> {
 
 /// Build decode input: constraint equations (S+H) + source symbols (K) + repair.
 /// The decoder requires L received symbols minimum. constraint_symbols() provides
-/// LDPC+HDPC rows; source symbols use their LT equations from the constraint matrix.
+/// LDPC+HDPC rows; source symbols use the decoder's canonical systematic identity equation.
 fn build_full_decode_input(
     source: &[Vec<u8>],
     encoder: &SystematicEncoder,
@@ -61,30 +62,14 @@ fn build_full_decode_input(
 ) -> (InactivationDecoder, Vec<ReceivedSymbol>) {
     let decoder = InactivationDecoder::new(k, sym_sz, seed);
     let params = decoder.params();
-    let constraints = ConstraintMatrix::build(params, seed);
-    let base_rows = params.s + params.h;
 
     let mut received = decoder.constraint_symbols();
 
     for (i, data) in source.iter().enumerate() {
-        let row = base_rows + i;
-        let mut columns = Vec::new();
-        let mut coefficients = Vec::new();
-        for col in 0..constraints.cols {
-            let coeff = constraints.get(row, col);
-            if !coeff.is_zero() {
-                columns.push(col);
-                coefficients.push(coeff);
-            }
-        }
-        received.push(ReceivedSymbol {
-            #[allow(clippy::cast_possible_truncation)]
-            esi: i as u32,
-            is_source: true,
-            columns,
-            coefficients,
-            data: data.clone(),
-        });
+        received.push(ReceivedSymbol::source(
+            u32::try_from(i).expect("ESI fits u32"),
+            data.clone(),
+        ));
     }
 
     let k_u32 = k as u32;
@@ -110,8 +95,6 @@ fn build_decode_with_erasures(
 ) -> (InactivationDecoder, Vec<ReceivedSymbol>) {
     let decoder = InactivationDecoder::new(k, sym_sz, seed);
     let params = decoder.params();
-    let constraints = ConstraintMatrix::build(params, seed);
-    let base_rows = params.s + params.h;
 
     let mut received = decoder.constraint_symbols();
 
@@ -119,24 +102,10 @@ fn build_decode_with_erasures(
         if drop_indices.contains(&i) {
             continue;
         }
-        let row = base_rows + i;
-        let mut columns = Vec::new();
-        let mut coefficients = Vec::new();
-        for col in 0..constraints.cols {
-            let coeff = constraints.get(row, col);
-            if !coeff.is_zero() {
-                columns.push(col);
-                coefficients.push(coeff);
-            }
-        }
-        received.push(ReceivedSymbol {
-            #[allow(clippy::cast_possible_truncation)]
-            esi: i as u32,
-            is_source: true,
-            columns,
-            coefficients,
-            data: data.clone(),
-        });
+        received.push(ReceivedSymbol::source(
+            u32::try_from(i).expect("ESI fits u32"),
+            data.clone(),
+        ));
     }
 
     let k_u32 = k as u32;
@@ -150,6 +119,47 @@ fn build_decode_with_erasures(
     }
 
     (decoder, received)
+}
+
+fn source_equation_columns(params: &SystematicParams, esi: usize) -> Vec<usize> {
+    let cols = repair_indices_for_esi(params.j, params.w, params.p, esi as u32);
+    assert!(
+        !cols.is_empty(),
+        "bead_id={BEAD_ID} source equation has no columns esi={esi}"
+    );
+    assert!(
+        cols.iter().all(|&col| col < params.l),
+        "bead_id={BEAD_ID} source equation column out of range esi={esi} cols={cols:?}"
+    );
+    cols
+}
+
+fn reconstruct_source_from_encoder(encoder: &SystematicEncoder, esi: usize) -> Vec<u8> {
+    let params = encoder.params();
+    let mut reconstructed = vec![0u8; params.symbol_size];
+    for col in source_equation_columns(params, esi) {
+        for (out, &byte) in reconstructed
+            .iter_mut()
+            .zip(encoder.intermediate_symbol(col))
+        {
+            *out ^= byte;
+        }
+    }
+    reconstructed
+}
+
+fn reconstruct_source_from_symbols(
+    params: &SystematicParams,
+    intermediate: &[Vec<u8>],
+    esi: usize,
+) -> Vec<u8> {
+    let mut reconstructed = vec![0u8; params.symbol_size];
+    for col in source_equation_columns(params, esi) {
+        for (out, &byte) in reconstructed.iter_mut().zip(&intermediate[col]) {
+            *out ^= byte;
+        }
+    }
+    reconstructed
 }
 
 // ============================================================================
@@ -208,7 +218,7 @@ fn test_step2_ldpc_identity_block() {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
         for i in 0..params.s {
-            assert_eq!(matrix.get(i, params.k_prime + i), Gf256::ONE);
+            assert_eq!(matrix.get(i, params.b + i), Gf256::ONE);
         }
     }
 }
@@ -239,17 +249,26 @@ fn test_step2_hdpc_pi_identity_block() {
 }
 
 #[test]
-fn test_step2_lt_rows_systematic_identity() {
+fn test_step2_lt_rows_match_rfc_source_equations() {
     for &k in &[10, 50] {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
         for i in 0..params.k_prime {
             let row = params.s + params.h + i;
-            assert_eq!(matrix.get(row, i), Gf256::ONE);
+            let expected = source_equation_columns(&params, i)
+                .into_iter()
+                .collect::<HashSet<_>>();
             for col in 0..params.l {
-                if col != i {
-                    assert!(matrix.get(row, col).is_zero());
-                }
+                let expected_value = if expected.contains(&col) {
+                    Gf256::ONE
+                } else {
+                    Gf256::ZERO
+                };
+                assert_eq!(
+                    matrix.get(row, col),
+                    expected_value,
+                    "bead_id={BEAD_ID} source row mismatch k={k} esi={i} col={col}"
+                );
             }
         }
     }
@@ -283,14 +302,14 @@ fn test_step3_4_solve_produces_intermediate_symbols() {
 }
 
 #[test]
-fn test_step3_4_intermediate_first_k_match_source() {
+fn test_step3_4_source_equations_reconstruct_source() {
     let k = 50;
     let source = make_source(k, 64);
     let Some(enc) = SystematicEncoder::new(&source, 64, 42) else {
         return;
     };
     for (i, src) in source.iter().enumerate() {
-        assert_eq!(enc.intermediate_symbol(i), &src[..]);
+        assert_eq!(reconstruct_source_from_encoder(&enc, i), *src);
     }
 }
 
@@ -381,7 +400,8 @@ fn test_encoding_pipeline_stages() {
 
     for i in 0..k {
         assert_eq!(
-            intermediate[i], source[i],
+            reconstruct_source_from_symbols(&params, &intermediate, i),
+            source[i],
             "bead_id={BEAD_ID} systematic i={i}"
         );
     }
@@ -508,7 +528,7 @@ fn test_e2e_encode_decode_pipeline_k64_t4096() {
         return;
     };
     for (i, src) in source.iter().enumerate() {
-        assert_eq!(enc.intermediate_symbol(i), &src[..]);
+        assert_eq!(reconstruct_source_from_encoder(&enc, i), *src);
     }
     let drop: HashSet<usize> = [7, 31].into_iter().collect();
     let (decoder, received) = build_decode_with_erasures(&source, &drop, &enc, k, 4096, seed);
@@ -603,8 +623,8 @@ fn test_e2e_larger_k_500() {
         eprintln!("bead_id={BEAD_ID} SKIP: singular k=500");
         return;
     };
-    for (i, s) in source.iter().enumerate() {
-        assert_eq!(enc.intermediate_symbol(i), &s[..]);
+    for (i, src) in source.iter().enumerate() {
+        assert_eq!(reconstruct_source_from_encoder(&enc, i), *src);
     }
     let (decoder, received) = build_full_decode_input(&source, &enc, k, 256, seed);
     let result = decoder.decode(&received).expect("decode k=500");

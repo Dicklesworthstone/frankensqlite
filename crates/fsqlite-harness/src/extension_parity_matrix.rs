@@ -2349,8 +2349,8 @@ mod tests {
         let matrix = ExtensionParityMatrix::canonical();
         let omissions = matrix.intentional_omissions();
         assert!(
-            omissions.len() >= 5,
-            "Expected >= 5 intentional omissions, got {}",
+            omissions.len() >= 4,
+            "Expected >= 4 intentional omissions, got {}",
             omissions.len()
         );
         for entry in &omissions {

@@ -202,7 +202,7 @@ printf '{"schema_version":"%s","bead_id":"%s","run_id":"%s","timestamp":"%s","sc
     "${ARTIFACT_PATH}" "${ARTIFACT_SHA}" "${LOG_STANDARD_REF}" >>"${REPORT_JSONL}"
 
 if [[ "${overall_status}" == "pass" ]]; then
-    printf 'bead_id=%s level=WARN run_id=%s seed=%s scenario_id=SQL-PIPELINE-OPT phase=summary degraded_mode_count=0 reference=%s\n' \
+    printf 'bead_id=%s level=INFO run_id=%s seed=%s scenario_id=SQL-PIPELINE-OPT phase=summary degraded_mode_count=0 reference=%s\n' \
         "${BEAD_ID}" "${RUN_ID}" "${SEED}" "${LOG_STANDARD_REF}"
     printf 'bead_id=%s level=INFO run_id=%s seed=%s scenario_id=SQL-PIPELINE-OPT phase=summary status=pass report=%s report_sha256=%s artifact=%s artifact_sha256=%s\n' \
         "${BEAD_ID}" "${RUN_ID}" "${SEED}" "${REPORT_JSONL}" "${summary_sha256}" "${ARTIFACT_PATH}" "${ARTIFACT_SHA}"

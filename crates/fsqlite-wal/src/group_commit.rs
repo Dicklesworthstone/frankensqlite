@@ -267,6 +267,15 @@ pub enum SubmitOutcome {
     Waiter,
 }
 
+/// Result of submitting a transaction batch to the group-commit consolidator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitReceipt {
+    /// Whether the caller should flush or wait.
+    pub outcome: SubmitOutcome,
+    /// The epoch whose completion makes this submitted batch durable.
+    pub target_epoch: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Lock-free phase histogram (bd-db300.3.8.1)
 // ---------------------------------------------------------------------------
@@ -1285,7 +1294,7 @@ impl GroupCommitConsolidator {
     /// # Errors
     ///
     /// Returns `Err` if the consolidator is in an unexpected phase.
-    pub fn submit_batch(&mut self, batch: TransactionFrameBatch) -> Result<SubmitOutcome> {
+    pub fn submit_batch(&mut self, batch: TransactionFrameBatch) -> Result<SubmitReceipt> {
         // ── Epoch pipelining: accept submissions during FLUSHING ──
         // Instead of blocking, queue batches for the next epoch. This
         // eliminates the flushing_wait bottleneck entirely — threads
@@ -1304,7 +1313,10 @@ impl GroupCommitConsolidator {
 
             // Always a Waiter — the next epoch's flusher will be elected
             // when complete_flush() promotes these batches.
-            return Ok(SubmitOutcome::Waiter);
+            return Ok(SubmitReceipt {
+                outcome: SubmitOutcome::Waiter,
+                target_epoch: self.epoch.saturating_add(1),
+            });
         }
 
         // If we're in COMPLETE, transition to new FILLING epoch.
@@ -1337,7 +1349,10 @@ impl GroupCommitConsolidator {
             "batch submitted"
         );
 
-        Ok(outcome)
+        Ok(SubmitReceipt {
+            outcome,
+            target_epoch: self.epoch.saturating_add(1),
+        })
     }
 
     /// Check whether the flusher should flush now.
@@ -1700,8 +1715,9 @@ mod tests {
             page_data: sample_page(0x01),
             db_size_if_commit: 0,
         }]);
-        let outcome = c.submit_batch(batch).unwrap();
-        assert_eq!(outcome, SubmitOutcome::Flusher);
+        let receipt = c.submit_batch(batch).unwrap();
+        assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+        assert_eq!(receipt.target_epoch, 1);
         assert_eq!(c.pending_frame_count(), 1);
         assert_eq!(c.pending_batch_count(), 1);
     }
@@ -1715,14 +1731,20 @@ mod tests {
             page_data: sample_page(0x01),
             db_size_if_commit: 0,
         }]);
-        assert_eq!(c.submit_batch(batch1).unwrap(), SubmitOutcome::Flusher);
+        assert_eq!(
+            c.submit_batch(batch1).unwrap().outcome,
+            SubmitOutcome::Flusher
+        );
 
         let batch2 = TransactionFrameBatch::new(vec![FrameSubmission {
             page_number: 2,
             page_data: sample_page(0x02),
             db_size_if_commit: 0,
         }]);
-        assert_eq!(c.submit_batch(batch2).unwrap(), SubmitOutcome::Waiter);
+        assert_eq!(
+            c.submit_batch(batch2).unwrap().outcome,
+            SubmitOutcome::Waiter
+        );
         assert_eq!(c.pending_frame_count(), 2);
         assert_eq!(c.pending_batch_count(), 2);
     }
@@ -1756,7 +1778,12 @@ mod tests {
             page_data: sample_page(0x10),
             db_size_if_commit: 0,
         }]);
-        assert_eq!(c.submit_batch(batch_extra).unwrap(), SubmitOutcome::Waiter);
+        let receipt = c.submit_batch(batch_extra).unwrap();
+        assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+        assert_eq!(
+            receipt.target_epoch, 2,
+            "pipelined submissions belong to the promoted next epoch"
+        );
 
         // Complete flush: FLUSHING → FILLING with a promoted next epoch.
         let promoted = c.complete_flush().unwrap();
@@ -1794,8 +1821,9 @@ mod tests {
             page_data: sample_page(0x02),
             db_size_if_commit: 2,
         }]);
-        let outcome = c.submit_batch(batch2).unwrap();
-        assert_eq!(outcome, SubmitOutcome::Flusher);
+        let receipt = c.submit_batch(batch2).unwrap();
+        assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+        assert_eq!(receipt.target_epoch, 2);
         assert_eq!(c.phase(), ConsolidationPhase::Filling);
     }
 
@@ -1867,14 +1895,15 @@ mod tests {
         assert_eq!(c.phase(), ConsolidationPhase::Complete);
         assert_eq!(c.completed_epoch(), 0);
 
-        let outcome = c
+        let receipt = c
             .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
                 page_data: sample_page(0x02),
                 db_size_if_commit: 2,
             }]))
             .unwrap();
-        assert_eq!(outcome, SubmitOutcome::Flusher);
+        assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+        assert_eq!(receipt.target_epoch, 2);
         assert_eq!(c.phase(), ConsolidationPhase::Filling);
         assert_eq!(c.pending_batch_count(), 1);
         assert_eq!(c.epoch(), 1);
@@ -1889,7 +1918,10 @@ mod tests {
             page_data: sample_page(0x01),
             db_size_if_commit: 1,
         }]);
-        assert_eq!(c.submit_batch(batch1).unwrap(), SubmitOutcome::Flusher);
+        assert_eq!(
+            c.submit_batch(batch1).unwrap().outcome,
+            SubmitOutcome::Flusher
+        );
 
         let _flushing_batches = c.begin_flush().unwrap();
         assert_eq!(c.epoch(), 1);
@@ -1900,10 +1932,9 @@ mod tests {
             page_data: sample_page(0x02),
             db_size_if_commit: 2,
         }]);
-        assert_eq!(
-            c.submit_batch(pipelined_batch).unwrap(),
-            SubmitOutcome::Waiter
-        );
+        let receipt = c.submit_batch(pipelined_batch).unwrap();
+        assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+        assert_eq!(receipt.target_epoch, 2);
 
         let promoted = c.complete_flush().unwrap();
         assert!(
@@ -1922,11 +1953,13 @@ mod tests {
             page_data: sample_page(0x03),
             db_size_if_commit: 3,
         }]);
+        let receipt = c.submit_batch(takeover_batch).unwrap();
         assert_eq!(
-            c.submit_batch(takeover_batch).unwrap(),
+            receipt.outcome,
             SubmitOutcome::Waiter,
             "promoted work stays queued until someone explicitly claims the flusher vacancy"
         );
+        assert_eq!(receipt.target_epoch, 2);
         assert!(c.claim_flusher_vacancy());
         assert!(!c.has_flusher_vacancy());
         assert!(!c.claim_flusher_vacancy());
@@ -2322,16 +2355,18 @@ mod tests {
                 db_size_if_commit: 2,
             },
         ]);
-        let outcome1 = consolidator.submit_batch(batch1).unwrap();
-        assert_eq!(outcome1, SubmitOutcome::Flusher);
+        let receipt1 = consolidator.submit_batch(batch1).unwrap();
+        assert_eq!(receipt1.outcome, SubmitOutcome::Flusher);
+        assert_eq!(receipt1.target_epoch, 1);
 
         let batch2 = TransactionFrameBatch::new(vec![FrameSubmission {
             page_number: 3,
             page_data: sample_page(0x03),
             db_size_if_commit: 3,
         }]);
-        let outcome2 = consolidator.submit_batch(batch2).unwrap();
-        assert_eq!(outcome2, SubmitOutcome::Waiter);
+        let receipt2 = consolidator.submit_batch(batch2).unwrap();
+        assert_eq!(receipt2.outcome, SubmitOutcome::Waiter);
+        assert_eq!(receipt2.target_epoch, 1);
 
         let batch3 = TransactionFrameBatch::new(vec![
             FrameSubmission {
@@ -2345,8 +2380,9 @@ mod tests {
                 db_size_if_commit: 5,
             },
         ]);
-        let outcome3 = consolidator.submit_batch(batch3).unwrap();
-        assert_eq!(outcome3, SubmitOutcome::Waiter);
+        let receipt3 = consolidator.submit_batch(batch3).unwrap();
+        assert_eq!(receipt3.outcome, SubmitOutcome::Waiter);
+        assert_eq!(receipt3.target_epoch, 1);
 
         // Flusher begins flush.
         let batches = consolidator.begin_flush().unwrap();

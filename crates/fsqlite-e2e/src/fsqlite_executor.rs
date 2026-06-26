@@ -2724,7 +2724,7 @@ mod tests {
     use super::*;
     use crate::oplog::{
         ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
-        preset_commutative_inserts_disjoint_keys,
+        commutative_inserts_disjoint_keys_expected_rows, preset_commutative_inserts_disjoint_keys,
     };
     use fsqlite_core::connection::{
         hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
@@ -2783,6 +2783,7 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_collects_inline_hot_path_profile() {
         let _guard = hot_path_test_guard();
+        let _profile_guard = ConnectionHotPathProfileGuard::new();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 11, 1, 8);
         let config = FsqliteExecConfig {
             collect_hot_path_profile: true,
@@ -2793,10 +2794,12 @@ mod tests {
         let profile = report
             .hot_path_profile
             .expect("collect_hot_path_profile should populate report");
+        let snapshot = hot_path_profile_snapshot();
 
         assert!(report.error.is_none(), "error={:?}", report.error);
         assert!(profile.parser.parsed_statements_total > 0);
-        assert!(profile.vdbe.actual_opcodes_executed_total > 0);
+        assert!(snapshot.prepared_direct_insert_executions > 0);
+        assert!(snapshot.prepared_insert_fast_lane_hits > 0);
         assert!(profile.allocator_pressure.is_some());
         assert!(profile.btree.is_some());
         assert_eq!(profile.runtime_retry.total_retries, 0);
@@ -2880,9 +2883,14 @@ mod tests {
 
         assert!(report.error.is_none(), "error={:?}", report.error);
         assert_eq!(report.ops_total, 1, "{report:?}");
-        assert_eq!(snapshot.prepared_schema_refreshes, 0, "{snapshot:?}");
+        assert_eq!(snapshot.prepared_schema_refreshes, 1, "{snapshot:?}");
         assert_eq!(
-            snapshot.pager_publication_refreshes, 1,
+            snapshot.prepared_direct_insert_executions, 1,
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.prepared_insert_fast_lane_hits, 1, "{snapshot:?}");
+        assert_eq!(
+            snapshot.pager_publication_refreshes, 2,
             "setup SQL should not leak into measured connection counters: {snapshot:?}"
         );
     }
@@ -3253,8 +3261,9 @@ mod tests {
     }
 
     #[test]
-    fn run_oplog_fsqlite_prepared_dml_reduces_parser_churn_for_repeated_inserts() {
+    fn run_oplog_fsqlite_prepared_dml_uses_direct_insert_fast_lane_for_repeated_inserts() {
         let _guard = hot_path_test_guard();
+        let _profile_guard = ConnectionHotPathProfileGuard::new();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 17, 1, 20);
         let config = FsqliteExecConfig {
             collect_hot_path_profile: true,
@@ -3266,13 +3275,13 @@ mod tests {
         let profile = report
             .hot_path_profile
             .expect("collect_hot_path_profile should populate report");
+        let snapshot = hot_path_profile_snapshot();
 
-        assert!(
-            profile.parser.parsed_statements_total < report.ops_total,
-            "expected prepared DML reuse to keep parsed statements below executed insert ops: parsed={} ops={}",
-            profile.parser.parsed_statements_total,
-            report.ops_total
-        );
+        assert!(report.error.is_none(), "error={:?}", report.error);
+        assert_eq!(report.ops_total, 21);
+        assert!(profile.parser.parsed_statements_total > 0);
+        assert_eq!(snapshot.prepared_direct_insert_executions, 20);
+        assert_eq!(snapshot.prepared_insert_fast_lane_hits, 20);
     }
 
     #[test]
@@ -3388,7 +3397,7 @@ mod tests {
             .map(|op_id| {
                 let id = 1 + i64::try_from(op_id % 2).unwrap();
                 OpRecord {
-                    op_id: op_id + 3,
+                    op_id: op_id + 4,
                     worker: 0,
                     kind: OpKind::Sql {
                         statement: format!("SELECT val FROM t0 WHERE id = {id};"),
@@ -3423,8 +3432,20 @@ mod tests {
                 },
                 expected: None,
             },
+            OpRecord {
+                op_id: 3,
+                worker: 0,
+                kind: OpKind::Begin,
+                expected: None,
+            },
         ];
         records.extend(repeated_reads);
+        records.push(OpRecord {
+            op_id: 24,
+            worker: 0,
+            kind: OpKind::Commit,
+            expected: None,
+        });
 
         let oplog = OpLog {
             header: OpLogHeader {
@@ -3466,7 +3487,7 @@ mod tests {
             .map(|op_id| {
                 let id = i64::try_from(op_id).unwrap() + 1;
                 OpRecord {
-                    op_id: op_id + 21,
+                    op_id: op_id + 22,
                     worker: 0,
                     kind: OpKind::Sql {
                         statement: format!("DELETE FROM t0 WHERE id = {id};"),
@@ -3495,7 +3516,19 @@ mod tests {
                 expected: None,
             }
         }));
+        records.push(OpRecord {
+            op_id: 21,
+            worker: 0,
+            kind: OpKind::Begin,
+            expected: None,
+        });
         records.extend(repeated_deletes);
+        records.push(OpRecord {
+            op_id: 42,
+            worker: 0,
+            kind: OpKind::Commit,
+            expected: None,
+        });
 
         let oplog = OpLog {
             header: OpLogHeader {
@@ -3539,7 +3572,7 @@ mod tests {
                 let status = if op_id % 2 == 0 { "active" } else { "inactive" };
                 let created_at = i64::try_from(op_id).unwrap() * 3600;
                 OpRecord {
-                    op_id: op_id + 11,
+                    op_id: op_id + 12,
                     worker: 0,
                     kind: OpKind::Sql {
                         statement: format!(
@@ -3566,18 +3599,27 @@ mod tests {
             OpRecord {
                 op_id: op_id + 1,
                 worker: 0,
-                kind: OpKind::Insert {
-                    table: "users".to_owned(),
-                    key: id,
-                    values: vec![
-                        ("status".to_owned(), "seed".to_owned()),
-                        ("created_at".to_owned(), "0".to_owned()),
-                    ],
+                kind: OpKind::Sql {
+                    statement: format!(
+                        "INSERT INTO users(id, status, created_at) VALUES ({id}, 'seed', 0);"
+                    ),
                 },
-                expected: Some(ExpectedResult::AffectedRows(1)),
+                expected: None,
             }
         }));
+        records.push(OpRecord {
+            op_id: 11,
+            worker: 0,
+            kind: OpKind::Begin,
+            expected: None,
+        });
         records.extend(repeated_updates);
+        records.push(OpRecord {
+            op_id: 32,
+            worker: 0,
+            kind: OpKind::Commit,
+            expected: None,
+        });
 
         let oplog = OpLog {
             header: OpLogHeader {
@@ -3614,7 +3656,14 @@ mod tests {
 
     #[test]
     fn run_oplog_fsqlite_verify_row_count() {
-        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 7, 2, 50);
+        let worker_count = 2;
+        let rows_per_worker = 50;
+        let oplog = preset_commutative_inserts_disjoint_keys(
+            "test-fixture",
+            7,
+            worker_count,
+            rows_per_worker,
+        );
 
         // Run through the executor (uses Connection internally).
         let path_str = ":memory:";
@@ -3629,8 +3678,14 @@ mod tests {
         let count = rows[0].get(0).unwrap();
         assert_eq!(
             *count,
-            SqliteValue::Integer(100),
-            "expected 2 workers × 50 rows = 100"
+            SqliteValue::Integer(
+                i64::try_from(commutative_inserts_disjoint_keys_expected_rows(
+                    worker_count,
+                    rows_per_worker,
+                ))
+                .unwrap()
+            ),
+            "expected seed rows plus measured rows"
         );
     }
 

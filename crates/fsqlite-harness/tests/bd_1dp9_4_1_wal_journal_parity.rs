@@ -126,21 +126,13 @@ fn parity_score_bounds() {
 }
 
 #[test]
-fn known_gaps_documented() {
+fn no_known_gaps_after_parity_closure() {
     let report = assess_wal_journal_parity(&WalJournalParityConfig::default());
 
-    assert_eq!(
-        report.known_gaps.len(),
-        1,
-        "bead_id={BEAD_ID} case=known_gap_count"
-    );
-    assert_eq!(
-        report.known_gaps[0].feature, "wal_autocheckpoint",
-        "bead_id={BEAD_ID} case=autocheckpoint_gap"
-    );
     assert!(
-        !report.known_gaps[0].affects_query_results,
-        "bead_id={BEAD_ID} case=gap_no_query_effect"
+        report.known_gaps.is_empty(),
+        "bead_id={BEAD_ID} case=no_known_gaps_after_parity gaps={:?}",
+        report.known_gaps,
     );
 }
 

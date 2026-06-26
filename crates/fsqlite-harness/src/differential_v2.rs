@@ -768,7 +768,7 @@ pub trait SqlExecutor {
             }
         } else {
             match self.execute(trimmed) {
-                Ok(n) => StmtOutcome::Execute(n),
+                Ok(n) => StmtOutcome::Execute(normalized_execute_count(trimmed, n)),
                 Err(e) => StmtOutcome::Error(e),
             }
         }
@@ -855,6 +855,29 @@ fn statement_returns_rows(statement: &Statement) -> bool {
         | Statement::Reindex(_)
         | Statement::Analyze(_) => false,
     }
+}
+
+fn normalized_execute_count(sql: &str, affected_rows: usize) -> usize {
+    if transaction_control_execute_count_is_driver_metadata(sql) {
+        0
+    } else {
+        affected_rows
+    }
+}
+
+fn transaction_control_execute_count_is_driver_metadata(sql: &str) -> bool {
+    let mut parser = Parser::from_sql(sql);
+    let Ok(statement) = parser.parse_statement() else {
+        return false;
+    };
+    matches!(
+        statement,
+        Statement::Begin(_)
+            | Statement::Commit
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::Release(_)
+    )
 }
 
 /// FrankenSQLite executor wrapping `fsqlite::Connection`.
@@ -2001,7 +2024,15 @@ mod tests {
         let csqlite = CsqliteExecutor::open_in_memory().expect("open C SQLite executor");
         let result = run_differential(&envelope, &fsqlite, &csqlite);
 
-        assert_eq!(result.outcome, Outcome::Pass);
+        assert_eq!(
+            result.outcome,
+            Outcome::Pass,
+            "divergences={:?} logical_state_matched={} f_hash={} c_hash={}",
+            result.divergences,
+            result.logical_state_matched,
+            result.logical_state_hash_fsqlite,
+            result.logical_state_hash_csqlite
+        );
         assert!(result.logical_state_matched);
         assert_eq!(
             result.statements_total,

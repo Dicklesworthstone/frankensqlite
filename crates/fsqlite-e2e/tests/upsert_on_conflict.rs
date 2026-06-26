@@ -7,13 +7,29 @@
 //!
 //! SQLite 3.24+ reference: <https://www.sqlite.org/lang_upsert.html>
 
-use fsqlite::Connection;
-use tempfile::tempdir;
+use std::ops::Deref;
 
-fn open_db(name: &str) -> Connection {
+use fsqlite::Connection;
+use tempfile::{TempDir, tempdir};
+
+struct TestConnection {
+    conn: Connection,
+    _temp: TempDir,
+}
+
+impl Deref for TestConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+fn open_db(name: &str) -> TestConnection {
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join(name);
-    Connection::open(db_path.to_string_lossy().to_string()).expect("open connection")
+    let conn = Connection::open(db_path.to_string_lossy().to_string()).expect("open connection");
+    TestConnection { conn, _temp: temp }
 }
 
 /// Helper: extract column value as text (without surrounding quotes).

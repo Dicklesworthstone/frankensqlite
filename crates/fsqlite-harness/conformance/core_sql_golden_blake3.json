@@ -5,7 +5,7 @@
     {
       "fixture_id": "001_basic_create_insert_select",
       "parser_blake3": "389f102f02442ac0f89fc98732fab47d2cfc2c15210c45bb4cc2dccf7ed14137",
-      "planner_blake3": "bb221e23abf5fe1d029fb2dbf068b341d5eab9059fca1f1bbfad93f6b04140c3",
+      "planner_blake3": "18c1043832076f50aa0ff0f99a1e05c2c7b150ecf4d88f5ad364c76697645037",
       "execution_blake3": "d32f8603b67fc6dfd321f958cea238dd994c3684ee467b07a3b79c054e854fff",
       "statement_count": 4,
       "query_count": 1
@@ -13,7 +13,7 @@
     {
       "fixture_id": "002_null_handling",
       "parser_blake3": "84f67cf0d4f03cda1efe3c64e92945e7cef5620586ae7d9490efd802ecb62cf8",
-      "planner_blake3": "b0b74b4854e6413218297df95c3964a7381d9ecd3ef14baa4a58f646bf7fe986",
+      "planner_blake3": "b009c3b75f98dfa01fca59ccb221d42ea9cc1a2c1d4462e531f7c5684ed25c6f",
       "execution_blake3": "9a027096109544da5bd12cefdda3360a0c74c007c214b140553f11246b41597c",
       "statement_count": 7,
       "query_count": 3
@@ -37,7 +37,7 @@
     {
       "fixture_id": "005_aggregate_functions",
       "parser_blake3": "6bb78af7040b57c1696cefc60db33138dd31ea80f4cd53ea66720d5d1b2e4bd6",
-      "planner_blake3": "c01b8ecce8dc1a02bc2fa65e97b79af3f315922dcb4e6d75db2d0ead3c77ce10",
+      "planner_blake3": "fe51ab186e09a4fe588f6c9e8158b3a292173e187aab12db22fc37a23719246f",
       "execution_blake3": "7affd3d4a0a040d2176e7e5c4008ab230fd90014bf478e8e6dbb11d4ea48a807",
       "statement_count": 7,
       "query_count": 2
@@ -45,7 +45,7 @@
     {
       "fixture_id": "006_join_basic",
       "parser_blake3": "839f6422fb650fb643ae073f24f9feaf27dd3e175aa64e3719c435adab20a8c1",
-      "planner_blake3": "7b9cfcfbe1fb206bc9d481b3988a0f4878861e5e20daae79b7aae312821076a8",
+      "planner_blake3": "8c31406ffb07ff2b7931e69cdfe0e43176dcfe5bfedb4a080aa61658dff4ff5c",
       "execution_blake3": "39e4a6b6cff99370158409232e58fd7b539761aabb9904a9473dc5e65056d111",
       "statement_count": 10,
       "query_count": 2
@@ -53,15 +53,15 @@
     {
       "fixture_id": "007_subquery",
       "parser_blake3": "f252cbc8448233e0ca867d777ad37afcf764b512c639957c8190fb2f0a1826bb",
-      "planner_blake3": "a6d351acab7cfe903c9b0aca7f881c6163ccf397b207bb0fe11c73ec3c19ba7e",
-      "execution_blake3": "cca305c5755bc245f9694d1f8ae749d6b054594e6e2e0942bb3cb9670c659cec",
+      "planner_blake3": "35270b8558e47eface8112ed6268ffc6b9bdc4e9f41cb353b03370f241def506",
+      "execution_blake3": "d7fbb29cee03573bfdfe8f0ebefc86442d18c46c7c651d821933a480e4bb0861",
       "statement_count": 7,
       "query_count": 3
     },
     {
       "fixture_id": "008_update_delete",
       "parser_blake3": "0acd557dbf424325af8073fca937f421b4cf4557ce98eaa0fac2dcb993cf5104",
-      "planner_blake3": "f65bed1dd1dc4302e4fad0a2fe6c8ad401e9ced228ed03e8842afdd82a0a96ce",
+      "planner_blake3": "62c80dbd3eeb918a8ef8fe7d0949f9f5f6e48198bf1d44cb90918ceb86714579",
       "execution_blake3": "dbe5922456e8d359e0709403b5f15dee776bff951e669d4ddeab4e28fb6eb27a",
       "statement_count": 7,
       "query_count": 1
@@ -69,7 +69,7 @@
     {
       "fixture_id": "009_expressions_and_functions",
       "parser_blake3": "0f2e0e95f52f0f4c511f76f3e0efa56bfd236c9945af290e230e073eb6db3456",
-      "planner_blake3": "34196d03d3b784f29ec137cfb991fe897108f5acbcb5db27761aaed065477fa5",
+      "planner_blake3": "27461cc9f5d1ab78f5c40ab56b7346ad1b5f763b8020646e3c03be9e0c2f8b58",
       "execution_blake3": "d6a45e48ee453e3dc7a7337d2df50fed2056d354b6cb0c0b44444f2632c5f13e",
       "statement_count": 5,
       "query_count": 5
@@ -77,7 +77,7 @@
     {
       "fixture_id": "010_index_and_ordering",
       "parser_blake3": "9ce893e331af5f254139ae7f99e84f5594a6e72e6acf452cc9086ec98c0d0f54",
-      "planner_blake3": "bb8485de1020ba64bf6d66a36e5aae0d8b4188819d3dea6fb608bf2fe631707d",
+      "planner_blake3": "7124f1080ed02bd6a489e355a460cc3f01332429d6168914575b68b047160eff",
       "execution_blake3": "1c661774bb5f44e6274ca6258392e6a701c827e3e0142db9f06a56a0aec82662",
       "statement_count": 7,
       "query_count": 2
@@ -85,7 +85,7 @@
     {
       "fixture_id": "011_transactions_rollback",
       "parser_blake3": "7a6f478cce3487d6f9b9fa0b3135b530e7d4cf1bd034c92cdc8d1c159b755363",
-      "planner_blake3": "3b50560bc070addf70bbbc2f5368c10a3a9d0fb3fdf0e13432b96caff4ed0724",
+      "planner_blake3": "09295ab9994e835c93a5a79022a0fe217aed67c70a35e11975c44f316897dfc9",
       "execution_blake3": "b67f152a4f68ffe3eea6d88dcf316b635846eef5e29bf97dede19d59905f685a",
       "statement_count": 10,
       "query_count": 2
@@ -101,7 +101,7 @@
     {
       "fixture_id": "013_compound_order_by_alias",
       "parser_blake3": "e87e0eaf2ee2c67dfd6e4ebecb6fad3ba4ad5252ab5230110b6368d727014221",
-      "planner_blake3": "da4adbe80d01d464e02d09592585a9da3056a94a798c81454f0ca3a8cad4ac70",
+      "planner_blake3": "fa8b1c6db159340ccb870fdc6d118e8fa204225d229c44b5660055758fbd887a",
       "execution_blake3": "350550290ff0bc92fca84c7975f1d7382ecd32ef9bedfaadc08425d721468d52",
       "statement_count": 3,
       "query_count": 3
@@ -109,7 +109,7 @@
     {
       "fixture_id": "014_compound_order_by_numeric",
       "parser_blake3": "c8b89f59bdac46096dba43977bd597cb872fe303084db0a6d86741ef2ce39aff",
-      "planner_blake3": "c72ca6c6b463008f57f613faa53cd61814db8a7cf4f7bead0b78d2f082453ce2",
+      "planner_blake3": "61277242ea9845212775533d3891b80ea7c4254ce7a02d3f807079afaad17b45",
       "execution_blake3": "a6691659351a4fa3107339a2f58dd57f67f6ff393350a2f53ad45bd4071ee265",
       "statement_count": 3,
       "query_count": 3
@@ -125,7 +125,7 @@
     {
       "fixture_id": "016_compound_order_by_multi",
       "parser_blake3": "acc0ed309231422f285daec5265fe458a6c2216f693da91da87fb1418be5cc20",
-      "planner_blake3": "d56fd8374e81c173e6576fd2086311738a641091d63cb8fae21329670d13a62b",
+      "planner_blake3": "fbc84b842e95aa32ea07454dd122ba4e3ad5a9380defa0d1f6ae6ca5f8e35508",
       "execution_blake3": "2a8394eb5645168141cf568f70e9ad379e6e70fa69c2bc5f27c8c76494bf224e",
       "statement_count": 5,
       "query_count": 5
@@ -141,7 +141,7 @@
     {
       "fixture_id": "018_collation_ascii_unicode_nocase",
       "parser_blake3": "e5748fa933083093660c4cc45a31cb1b29562ec9628b79ba0e2002b7cc50dd9f",
-      "planner_blake3": "68a7a686baeec6417f3d65f85c2cf8e6791d8b209dd96f24a647dc6f8b74f245",
+      "planner_blake3": "b542bee2872a791351111e9e4276b8b38d22fa9033c9e0ad6dac7bfdf4e57c6f",
       "execution_blake3": "854411ca199766e6512a727d717e1a5c68d92a027a2edae74db3d8311566fe2f",
       "statement_count": 1,
       "query_count": 1
@@ -149,15 +149,15 @@
     {
       "fixture_id": "019_null_unique_edge",
       "parser_blake3": "1f9448ce7c553b383849154f916af15f1139382156bf35d84d28033e0abeb360",
-      "planner_blake3": "533b1984c77c34efde42472662391e696a0fa4ef302fde7f3b95b4f1f15aa304",
+      "planner_blake3": "dd90f18f8ef14b712400a60438975e3b6ada05bf5f17249b62dc85a952e6aeb0",
       "execution_blake3": "acaa3f0699261949b139ea095bf75dead899d03c08fe3a97cdcc0ae5891a9f86",
       "statement_count": 7,
       "query_count": 2
     },
     {
       "fixture_id": "020_integer_overflow_semantics",
-      "parser_blake3": "22a286aa206a0063bb812e95076e4050b41e684c0f87f7f1cd879d50e3fb833c",
-      "planner_blake3": "9562e791c3e8b300a9d06268e4e8c528c5b4c51cb42383bcb7d60d18b09ebddf",
+      "parser_blake3": "602ac092363863bf1cf5efcf348d41f73ce054a01952ad09b8f8d3ab7ea28831",
+      "planner_blake3": "9a3b5e80a56d56a8bb944449bd0f95c0301e05f3b19390f3169179ec70944094",
       "execution_blake3": "e500e4e09a904190f13f31e078985078840b1db66d700b8ce8a6123a8df8edfe",
       "statement_count": 1,
       "query_count": 1
@@ -165,7 +165,7 @@
     {
       "fixture_id": "021_transaction_edge_cases",
       "parser_blake3": "fd50d4383672ad704eac9038b879cd737910b5bd6ee3fbd3755bf3983d6e0b20",
-      "planner_blake3": "4667cf11b3da97d7d8c736d624eae34aa1ab9bf47cca1321805692512fcdf8f2",
+      "planner_blake3": "b1b2ab19b33da132c43d65e8264b1a30bc28fe0b02192ab128e570eeab7360d5",
       "execution_blake3": "af877fd93a504e70a839a5e0dc3cc1fd1c5d594ce2e2eea70a00f528f2dda34c",
       "statement_count": 12,
       "query_count": 1
@@ -173,7 +173,7 @@
     {
       "fixture_id": "022_datetime_functions",
       "parser_blake3": "0f0b1002dfe43f52bf325bc5591eb78ac6b241cb37c22ee832b9dca3228cabfc",
-      "planner_blake3": "33c8f0d96dd3b4927ace6408e5b02f8da24a0ad85e9d5d231692dc8abf9b706a",
+      "planner_blake3": "3ac0b433a6b20063f582e8127dd5ac5e99e5e2eb3a736205a67aa05f8428463d",
       "execution_blake3": "c2fefbbbf94df4814629aea485f1c9f32fbc91d8c48d740bc76d33a16229794d",
       "statement_count": 23,
       "query_count": 23
@@ -181,7 +181,7 @@
     {
       "fixture_id": "023_expression_evaluation",
       "parser_blake3": "3ad4e64f7cd8664d14563d1d4f4e2183b792f3c2461f889a96c23cfa5a45c31a",
-      "planner_blake3": "38873a318cfcd7b001cfaf1d728a84b11c6ac0785dffbad622c5ea481cd8c0a6",
+      "planner_blake3": "ad53fba8d0eb5a63677c57c9d7fac757c6582bb0862b3e360089cb786eb9feae",
       "execution_blake3": "506aaec73977326b1f97130dc312cd59806d413374c5ef0ce655ea076693c3ac",
       "statement_count": 33,
       "query_count": 33
@@ -189,7 +189,7 @@
     {
       "fixture_id": "024_string_functions",
       "parser_blake3": "d225fa09c6d8178fb1b9804a4b8fc24d1b22da5457d14fdaaf27b4271eac9709",
-      "planner_blake3": "c66cd1287415ed59dbaa0b1ee5276e1b2f8f68298ad5cab168a6b68452f0d3cf",
+      "planner_blake3": "adba9cf30abf3913f579c4459f747c2df92d53e89aacad4b9d0828a336d800d9",
       "execution_blake3": "0290b0a4d5931f2a6b17ad6fa34a9f02012e73f7b67940448ce6a08b8446af45",
       "statement_count": 32,
       "query_count": 32
@@ -197,7 +197,7 @@
     {
       "fixture_id": "025_expression_operators",
       "parser_blake3": "8e8af24437d4c7fd4911a84422c67bdf52a2dde123851c4e922d7c1fcb817f02",
-      "planner_blake3": "2749f2fafead1659b7cb1e4f8dc3b84ac5d267de5de056d35c3eca7703870be7",
+      "planner_blake3": "16c3fdc3f940be145fb9f4e3623fd5f61c9f6e883f0468ba36867bcd70735a1a",
       "execution_blake3": "13edf63e825b01b7d4c3ee8a1c02f9ef86ad282ddc0e62ae068acc2b0d4503aa",
       "statement_count": 34,
       "query_count": 32
@@ -205,7 +205,7 @@
     {
       "fixture_id": "026_subquery_and_cte",
       "parser_blake3": "0220a15d0443d3073a9be2ea17803f31ddcad042bd39af51bf2f60bff6e9d72e",
-      "planner_blake3": "00335cfd4f0d18911b7fff72bff8327884a2c21a7422b2d480b9e4ada170cc98",
+      "planner_blake3": "e9cb9161e7ed66d2913d89dab1cffdee7ba3356b0466ad0a4097aad7cd0b87cc",
       "execution_blake3": "62e4d0b637f1d836d6870508c408a05966f2b74150c75b47366697fec2428ea9",
       "statement_count": 15,
       "query_count": 11
@@ -213,8 +213,8 @@
     {
       "fixture_id": "027_window_functions",
       "parser_blake3": "c7c235581dc11a893d5b7e1c7c664174e4dfd2d9dc9c692dfab08e21119dfff1",
-      "planner_blake3": "16ef19217956ab56465045bb65897901894f735b4aa34e87219644b4d70d4c72",
-      "execution_blake3": "b1d48aba5ed3f59fb30f0673e3fde4358b1af2b4cc49485fd15841a490a917ab",
+      "planner_blake3": "e0353e0a8f2f94717edef1ed2a2927a56b57ea1fd4764543ec9cf5bee902096d",
+      "execution_blake3": "e1cfa5c30f596ce85e422d391b0551408dcbdfb79682fd9cec04f2d7d0ec0073",
       "statement_count": 11,
       "query_count": 9
     },
@@ -229,7 +229,7 @@
     {
       "fixture_id": "029_group_by_having",
       "parser_blake3": "880f2f5783ca4effb2a45a968ef3ff2dbed358b1e0123dce3051deb9853fde54",
-      "planner_blake3": "cb1034578fc8e9eff59a530641f37d40c729f190c4426f89442e9521314bf4f1",
+      "planner_blake3": "abeb4df34f55cfb6928069830b5f913232a4a3032f822e5e0f8b7c30f200fcba",
       "execution_blake3": "fc7b10f4ac1ae0af61c25b96d424ffd0ad18cf49996743f0d46a8f4dc0dc8775",
       "statement_count": 11,
       "query_count": 9
@@ -237,7 +237,7 @@
     {
       "fixture_id": "030_case_expressions",
       "parser_blake3": "ec1768348d56746e884586ec2162761ad27f5a57e7aac61cd39b523248bf31d4",
-      "planner_blake3": "fb9747fb408f6cfab8e3a5e9caaa8c0d83a901fd89f7afed0b62faa1da59b706",
+      "planner_blake3": "8f1c77a8883bd497cc2e0811e8be5fdf10bd8ed25a5ccad2a9ea25be39d07d7b",
       "execution_blake3": "30e62687af898d421d7d40354d14037c9d935378e0be45ff2704953bf5b740a6",
       "statement_count": 12,
       "query_count": 10
@@ -245,23 +245,23 @@
     {
       "fixture_id": "031_insert_conflict",
       "parser_blake3": "73be0f023363e8385a204ed125efdef2ab0c30c6a812629a12ee0b7342cfe937",
-      "planner_blake3": "8ea61da5c8fe4cbdbdb223582694629b8fdd2ac462018ac98ec0abb581190c81",
-      "execution_blake3": "d69186688faca98787262b08b7c1b472ce6b27c418c28c0ddcd044b9b6c83904",
+      "planner_blake3": "8335f9da8c022a987aae0302cf42acc8851e4689c0283c159863622e4eba4b10",
+      "execution_blake3": "a846384aa3080ca413f8a0306e5673c5b85291e628d7088b1e91b334c0683407",
       "statement_count": 16,
       "query_count": 6
     },
     {
       "fixture_id": "032_alter_table",
       "parser_blake3": "85c0e685328675738a3d70e9841ca9006f7f36d187d86e909b32ec811c12ceaf",
-      "planner_blake3": "05a68f21dd53a6f9e8c606feb9da234201451f4495b1c8cd54de1781d64c1d1e",
+      "planner_blake3": "5a525363394492aa3d5bab38895338fb541e184117e6e73d28286d6f3125b7a0",
       "execution_blake3": "f2e59881fd0b73e58e3e985bcafdee03f383eb6637df3c0fb862da281b155952",
       "statement_count": 10,
       "query_count": 4
     },
     {
       "fixture_id": "core_sql_edge_cases",
-      "parser_blake3": "4959cdf926d038981c1bdcb808a081ccd98ccb00e2085a7991a1c1add6fc09d6",
-      "planner_blake3": "13f8ca383438ce1bfa3b389b930898e858e16e3c41c2b92eb9a357b9edfe7158",
+      "parser_blake3": "d482572dd88cec40ac338a59420b0044a897ebc61831f81d29dcbd252dcd73be",
+      "planner_blake3": "796c6d073764eb00e88fb069d226c82b6361ccf27e78c9c0347349e31664ee63",
       "execution_blake3": "4a14092b69556b7cf6630fe5236d0898e313aa0e4e0dea750d3f6a294c068524",
       "statement_count": 4,
       "query_count": 4

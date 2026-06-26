@@ -73,6 +73,10 @@ fn is_query_sql(sql: &str) -> bool {
 }
 
 fn load_fuzz_query_corpus(limit: usize) -> Result<Vec<(String, String)>, String> {
+    let raw_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FUZZ_SQL_CORPUS_RELATIVE);
+    if !raw_dir.exists() && MIN_CORE_SQL_QUERY_COUNT == 0 {
+        return Ok(Vec::new());
+    }
     let dir = fuzz_sql_corpus_dir()?;
     let mut files = fs::read_dir(&dir)
         .map_err(|error| format!("bead_id={BEAD_ID} case=fuzz_dir_read error={error}"))?

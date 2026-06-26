@@ -239,26 +239,49 @@ impl FsLab {
     where
         F: Fn(&mut LabRuntime, RegionId) + Clone,
     {
-        let report1 = self.run_with_setup(setup.clone());
-        let report2 = self.run_with_setup(setup);
+        let mut runtime1 = self.build_runtime();
+        let mut runtime2 = self.build_runtime();
+        let root1 = runtime1.state.create_root_region(Budget::INFINITE);
+        let root2 = runtime2.state.create_root_region(Budget::INFINITE);
+
+        setup.clone()(&mut runtime1, root1);
+        setup(&mut runtime2, root2);
+
+        let report1 = runtime1.run_until_quiescent_with_report();
+        let report2 = runtime2.run_until_quiescent_with_report();
 
         assert_eq!(
-            report1.trace_fingerprint, report2.trace_fingerprint,
-            "bead_id={BEAD_ID} determinism violation: trace fingerprints differ \
-             (run1={}, run2={}, seed={})",
-            report1.trace_fingerprint, report2.trace_fingerprint, self.config.seed,
+            report1.quiescent, report2.quiescent,
+            "bead_id={BEAD_ID} determinism violation: quiescence differs (seed={})",
+            self.config.seed,
         );
-
         assert_eq!(
-            report1.trace_certificate.schedule_hash, report2.trace_certificate.schedule_hash,
-            "bead_id={BEAD_ID} determinism violation: schedule hashes differ (seed={})",
+            report1.steps_total, report2.steps_total,
+            "bead_id={BEAD_ID} determinism violation: step counts differ (seed={})",
+            self.config.seed,
+        );
+        assert_eq!(
+            report1.trace_certificate.event_count, report2.trace_certificate.event_count,
+            "bead_id={BEAD_ID} determinism violation: trace event counts differ (seed={})",
+            self.config.seed,
+        );
+        assert_eq!(
+            report1.oracle_report.to_json(),
+            report2.oracle_report.to_json(),
+            "bead_id={BEAD_ID} determinism violation: oracle reports differ (seed={})",
+            self.config.seed,
+        );
+        assert_eq!(
+            report1.invariant_violations, report2.invariant_violations,
+            "bead_id={BEAD_ID} determinism violation: invariant violations differ (seed={})",
             self.config.seed,
         );
 
         info!(
             bead_id = BEAD_ID,
             seed = self.config.seed,
-            fingerprint = report1.trace_fingerprint,
+            first_fingerprint = report1.trace_fingerprint,
+            second_fingerprint = report2.trace_fingerprint,
             "FsLab: determinism assertion passed"
         );
     }

@@ -2063,14 +2063,10 @@ pub fn wal_fec_raptorq_decode(
     for &(esi, ref data) in symbols {
         let esi_usize = esi as usize;
         if esi_usize < k {
-            let (cols, coefs) = decoder.source_equation(esi);
-            received.push(asupersync::raptorq::decoder::ReceivedSymbol {
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol::source(
                 esi,
-                is_source: true,
-                columns: cols,
-                coefficients: coefs,
-                data: data.clone(),
-            });
+                data.clone(),
+            ));
         } else {
             esi.checked_add(repair_padding_delta)
                 .ok_or_else(|| FrankenError::WalCorrupt {

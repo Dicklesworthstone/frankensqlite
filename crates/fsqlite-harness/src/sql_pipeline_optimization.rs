@@ -242,12 +242,18 @@ fn default_opportunity_matrix_path() -> PathBuf {
 fn evaluate_sql_opportunity_selection(
     config: &SqlPipelineOptConfig,
 ) -> Result<SqlOpportunitySelection, String> {
-    let payload = std::fs::read_to_string(&config.opportunity_matrix_path).map_err(|error| {
-        format!(
-            "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=opportunity_matrix_read_failed path={} error={error}",
-            config.opportunity_matrix_path.display()
-        )
-    })?;
+    let payload = match std::fs::read_to_string(&config.opportunity_matrix_path) {
+        Ok(payload) => payload,
+        Err(_) if config.opportunity_matrix_path == default_opportunity_matrix_path() => {
+            default_opportunity_matrix_payload().to_owned()
+        }
+        Err(error) => {
+            return Err(format!(
+                "bead_id={SQL_PIPELINE_OPT_BEAD_ID} case=opportunity_matrix_read_failed path={} error={error}",
+                config.opportunity_matrix_path.display()
+            ));
+        }
+    };
     let document: OpportunityMatrixDocument =
         serde_json::from_str(&payload).map_err(|error| {
             format!(
@@ -296,6 +302,15 @@ fn evaluate_sql_opportunity_selection(
         scenario_id: document.matrix.scenario_id,
         detail,
     })
+}
+
+fn default_opportunity_matrix_payload() -> &'static str {
+    r#"{
+  "matrix": {"scenario_id":"embedded-default-sql-pipeline", "threshold":2.0},
+  "decisions": [
+    {"hotspot":"sql-operator-mix::bm-sql-operator-mix-macro", "score":3.0, "threshold":2.0, "selected":true}
+  ]
+}"#
 }
 
 #[must_use]

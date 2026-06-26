@@ -777,14 +777,10 @@ pub fn attempt_page_repair(
 
     for (esi, data) in &available {
         if (*esi as usize) < k_usize {
-            let (cols, coefs) = decoder.source_equation(*esi);
-            received.push(asupersync::raptorq::decoder::ReceivedSymbol {
-                esi: *esi,
-                is_source: true,
-                columns: cols,
-                coefficients: coefs,
-                data: data.clone(),
-            });
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol::source(
+                *esi,
+                data.clone(),
+            ));
         } else {
             esi.checked_add(repair_padding_delta)
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {

@@ -80,8 +80,8 @@ pub use checksum::{
 pub use group_commit::{
     ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase, FrameSubmission,
     GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, PhaseHistogram,
-    PhasePercentiles, SubmitOutcome, TransactionConflictSnapshot, TransactionFrameBatch,
-    TransactionFrameBatchContext, WakeReasonCounters, WakeReasonSnapshot,
+    PhasePercentiles, SubmitOutcome, SubmitReceipt, TransactionConflictSnapshot,
+    TransactionFrameBatch, TransactionFrameBatchContext, WakeReasonCounters, WakeReasonSnapshot,
     commit_phase_timing_enabled, commit_phase_timing_forced_enabled,
     detailed_consolidation_metrics_enabled, set_commit_phase_timing_enabled,
     write_consolidated_frames,

@@ -31,7 +31,7 @@ use crate::{AggregateFunction, FunctionRegistry};
 
 /// Kahan-Babuska-Neumaier compensated summation step.  Uses magnitude-aware
 /// error term selection to match the precision behavior of C SQLite's
-/// `kahanBabuskaNeumaierStep` (func.c:1871-1883).
+/// `kahanBabuskaNeumaierStep` aggregate helper.
 #[inline]
 fn kahan_add(sum: &mut f64, compensation: &mut f64, value: f64) {
     let s = *sum;

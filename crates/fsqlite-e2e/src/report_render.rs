@@ -1778,7 +1778,7 @@ mod tests {
         assert!(md.contains("## Errors"));
         assert!(md.contains("1/3 measurement iterations failed; first=setup failed"));
         assert!(!md.contains("| sqlite3 | inserts | 1 |"));
-        assert!(md.contains("| fsqlite | inserts | 1 |"));
+        assert!(md.contains("| fsqlite_mvcc | inserts | 1 |"));
     }
 
     #[test]

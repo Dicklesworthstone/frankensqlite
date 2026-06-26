@@ -532,7 +532,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
 
-        let log = oplog::preset_commutative_inserts_disjoint_keys("test", 42, 1, 5);
+        let worker_count = 1;
+        let rows_per_worker = 5;
+        let log = oplog::preset_commutative_inserts_disjoint_keys(
+            "test",
+            42,
+            worker_count,
+            rows_per_worker,
+        );
 
         let executor = Sqlite3Executor::with_defaults();
         let report = executor.run(&log, &db_path).unwrap();
@@ -548,7 +555,15 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM t0", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 5, "should have 5 rows from 1 worker × 5 rows");
+        let expected_count = i64::try_from(oplog::commutative_inserts_disjoint_keys_expected_rows(
+            worker_count,
+            rows_per_worker,
+        ))
+        .unwrap();
+        assert_eq!(
+            count, expected_count,
+            "should include seed rows plus measured rows"
+        );
     }
 
     #[test]
@@ -566,7 +581,14 @@ mod tests {
         let db_path = dir.path().join("concurrent.db");
 
         // 8 workers with 10 rows each (disjoint keys — no conflict).
-        let log = oplog::preset_commutative_inserts_disjoint_keys("test", 7, 8, 10);
+        let worker_count = 8;
+        let rows_per_worker = 10;
+        let log = oplog::preset_commutative_inserts_disjoint_keys(
+            "test",
+            7,
+            worker_count,
+            rows_per_worker,
+        );
 
         let executor = Sqlite3Executor::with_defaults();
         let report = executor.run(&log, &db_path).unwrap();
@@ -588,7 +610,15 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM t0", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 80, "should have 80 rows from 8 workers × 10 rows");
+        let expected_count = i64::try_from(oplog::commutative_inserts_disjoint_keys_expected_rows(
+            worker_count,
+            rows_per_worker,
+        ))
+        .unwrap();
+        assert_eq!(
+            count, expected_count,
+            "should include seed rows plus measured rows"
+        );
     }
 
     #[test]

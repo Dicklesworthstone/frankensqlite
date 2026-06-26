@@ -405,9 +405,14 @@ fn m2_concurrent_update_delete() {
         while !u_stop.load(std::sync::atomic::Ordering::Relaxed) {
             let target = (ops % 1000) + 1;
             if conn.execute("BEGIN").is_ok() {
-                conn.execute(&format!("UPDATE data SET val = {ops} WHERE id = {target}"))
-                    .ok();
-                if conn.execute("COMMIT").is_err() {
+                if conn
+                    .execute(&format!("UPDATE data SET val = {ops} WHERE id = {target}"))
+                    .is_ok()
+                {
+                    if conn.execute("COMMIT").is_err() {
+                        conn.execute("ROLLBACK").ok();
+                    }
+                } else {
                     conn.execute("ROLLBACK").ok();
                 }
             }
@@ -425,13 +430,20 @@ fn m2_concurrent_update_delete() {
         while !d_stop.load(std::sync::atomic::Ordering::Relaxed) {
             let target = (ops % 1000) + 1;
             if conn.execute("BEGIN").is_ok() {
-                conn.execute(&format!("DELETE FROM data WHERE id = {target}"))
-                    .ok();
-                conn.execute(&format!(
-                    "INSERT OR REPLACE INTO data VALUES ({target}, {ops}, 'reinserted')"
-                ))
-                .ok();
-                if conn.execute("COMMIT").is_err() {
+                let deleted = conn
+                    .execute(&format!("DELETE FROM data WHERE id = {target}"))
+                    .is_ok();
+                let inserted = deleted
+                    && conn
+                        .execute(&format!(
+                            "INSERT OR REPLACE INTO data VALUES ({target}, {ops}, 'reinserted')"
+                        ))
+                        .is_ok();
+                if deleted && inserted {
+                    if conn.execute("COMMIT").is_err() {
+                        conn.execute("ROLLBACK").ok();
+                    }
+                } else {
                     conn.execute("ROLLBACK").ok();
                 }
             }

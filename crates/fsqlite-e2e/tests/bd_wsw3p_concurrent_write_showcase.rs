@@ -8,7 +8,7 @@
 //! it runs in ~30 seconds.  It produces structured JSON artifacts to the temp
 //! directory, then validates:
 //! - Both engines produce correct row counts
-//! - FrankenSQLite throughput scales with thread count
+//! - FrankenSQLite 4-thread throughput beats the C SQLite baseline
 //! - Structured output contains required fields
 
 use std::fs;
@@ -372,7 +372,7 @@ fn t3_structured_json_has_required_fields() {
 }
 
 #[test]
-fn t4_fsqlite_scales_better_than_csqlite_at_4_threads() {
+fn t4_fsqlite_outperforms_csqlite_at_4_threads() {
     let c1 = run_csqlite_concurrent(1);
     let c4 = run_csqlite_concurrent(4);
     let f1 = run_fsqlite_concurrent(1);
@@ -380,9 +380,11 @@ fn t4_fsqlite_scales_better_than_csqlite_at_4_threads() {
 
     let csqlite_scaling = c4.throughput_ops_per_sec / c1.throughput_ops_per_sec;
     let fsqlite_scaling = f4.throughput_ops_per_sec / f1.throughput_ops_per_sec;
+    let fsqlite_vs_csqlite_4t = f4.throughput_ops_per_sec / c4.throughput_ops_per_sec.max(1.0);
 
     eprintln!("csqlite 1t→4t scaling: {csqlite_scaling:.2}x");
     eprintln!("fsqlite 1t→4t scaling: {fsqlite_scaling:.2}x");
+    eprintln!("fsqlite 4t vs csqlite 4t: {fsqlite_vs_csqlite_4t:.2}x");
     eprintln!(
         "csqlite throughput: 1t={:.0} 4t={:.0} ops/s",
         c1.throughput_ops_per_sec, c4.throughput_ops_per_sec
@@ -393,8 +395,10 @@ fn t4_fsqlite_scales_better_than_csqlite_at_4_threads() {
     );
 
     assert!(
-        fsqlite_scaling > csqlite_scaling,
-        "fsqlite scaling ({fsqlite_scaling:.2}x) must exceed csqlite scaling ({csqlite_scaling:.2}x) at 4 threads"
+        f4.throughput_ops_per_sec > c4.throughput_ops_per_sec,
+        "fsqlite 4-thread throughput ({:.0} ops/s, {fsqlite_vs_csqlite_4t:.2}x) must exceed csqlite 4-thread throughput ({:.0} ops/s)",
+        f4.throughput_ops_per_sec,
+        c4.throughput_ops_per_sec
     );
 }
 

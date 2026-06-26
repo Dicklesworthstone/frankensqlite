@@ -132,8 +132,8 @@ printf \
     "${BEAD_ID}" "${member_count}"
 
 if (cd "${WORKSPACE_ROOT}" && ./e2e/build_matrix.sh); then
-    printf 'bead_id=%s level=WARN case=degraded_mode_count=0 reference=bd-1fpm\n' "${BEAD_ID}"
-    printf 'bead_id=%s level=ERROR case=terminal_failure_count=0 reference=bd-1fpm\n' "${BEAD_ID}"
+    printf 'bead_id=%s level=INFO case=degraded_mode_count=0 reference=bd-1fpm\n' "${BEAD_ID}"
+    printf 'bead_id=%s level=INFO case=terminal_failure_count=0 reference=bd-1fpm\n' "${BEAD_ID}"
     printf 'bead_id=%s level=INFO case=pass\n' "${BEAD_ID}"
     exit 0
 fi

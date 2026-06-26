@@ -84,6 +84,42 @@ impl ModelState {
     }
 }
 
+fn lab_runtime_diagnostics(rt: &LabRuntime) -> String {
+    let live_tasks = rt
+        .state
+        .tasks_iter()
+        .filter(|(_, task)| !task.state.is_terminal())
+        .map(|(idx, task)| {
+            format!(
+                "{idx:?}: id={:?} owner={:?} state={:?} phase={:?} last_polled_step={} polls_remaining={} total_polls={}",
+                task.id,
+                task.owner,
+                task.state,
+                task.phase.load(),
+                task.last_polled_step,
+                task.polls_remaining,
+                task.total_polls
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let scheduler = rt.scheduler.lock();
+    let scheduler_empty = scheduler.is_empty();
+    let scheduler_state = format!("{scheduler:?}");
+    drop(scheduler);
+
+    format!(
+        "quiescent={} steps={} live_task_count={} pending_obligations={} scheduler_empty={} live_tasks=[{}] scheduler={}",
+        rt.is_quiescent(),
+        rt.steps(),
+        rt.state.live_task_count(),
+        rt.state.pending_obligation_count(),
+        scheduler_empty,
+        live_tasks.join("; "),
+        scheduler_state
+    )
+}
+
 /// A minimal, SHM-shaped hot witness bucket with double-buffered epochs and a spinlock.
 ///
 /// This is a *model* used for DPOR/injection testing. It is intentionally small:
@@ -706,6 +742,11 @@ fn dpor_outgoing_edges_cover_committed_and_freed_writers() {
             sched.schedule(t_w, 0);
         }
         rt.run_until_quiescent();
+        assert!(
+            rt.is_quiescent(),
+            "outgoing DPOR run did not quiesce: {}",
+            lab_runtime_diagnostics(rt)
+        );
     });
 
     assert!(
@@ -873,6 +914,11 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {
             sched.schedule(t_t, 0);
         }
         rt.run_until_quiescent();
+        assert!(
+            rt.is_quiescent(),
+            "incoming DPOR run did not quiesce: {}",
+            lab_runtime_diagnostics(rt)
+        );
     });
 
     assert!(
@@ -939,6 +985,11 @@ fn pages_overlap(a: &[u32], b: &[u32]) -> bool {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
     #[test]
     fn prop_outgoing_edges_covers_committed_writer(begin_seq in 0_u64..1_000, w_commit_seq in 0_u64..1_000) {
         let mut commit_index = BTreeMap::new();

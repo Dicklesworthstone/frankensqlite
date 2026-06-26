@@ -103,7 +103,7 @@ struct StressResult {
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
+fn run_stale_reader_stress(max_steps_per_writer: u32) -> StressResult {
     // Tight per-page cap so the force-abort path is exercised quickly under
     // sustained writer load.
     let stale_cfg = StaleReaderConfig {
@@ -196,7 +196,6 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
         );
 
         // Spawn 4 writer threads.
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let commit_count = Arc::new(AtomicU64::new(0));
         let peak_rss = Arc::new(AtomicU64::new(0));
         let force_abort_fired = Arc::new(AtomicBool::new(false));
@@ -204,7 +203,6 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
         let writers: Vec<_> = (0..4_u32)
             .map(|wid| {
                 let mgr = Arc::clone(&mgr);
-                let stop = Arc::clone(&stop_flag);
                 let commits = Arc::clone(&commit_count);
                 let registry = Arc::clone(&registry);
                 let abort_fired = Arc::clone(&force_abort_fired);
@@ -212,8 +210,7 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
                 let pages = pages.clone();
                 let cap = stale_cfg.max_pending_versions_per_page;
                 thread::spawn(move || {
-                    let mut step: u32 = 0;
-                    while !stop.load(Ordering::Relaxed) {
+                    for step in 0..max_steps_per_writer {
                         let pgno = pages[(wid as usize + step as usize) % pages.len()];
                         let byte = u8::try_from(step % 251).expect("modulo bounds u8");
                         let mut txn = match mgr.begin(BeginKind::Concurrent) {
@@ -225,7 +222,6 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
                         };
                         if mgr.write_page(&mut txn, pgno, test_page(byte)).is_err() {
                             mgr.abort(&mut txn);
-                            step = step.wrapping_add(1);
                             continue;
                         }
                         if mgr.commit(&mut txn).is_ok() {
@@ -252,8 +248,6 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
                                 "per-page chain cap exceeded; force-aborting stale reader (bd-wt4uu)"
                             );
                         }
-
-                        step = step.wrapping_add(1);
                     }
                     // Suppress unused warning about mgr_registry — we rely on
                     // the registry for force-abort contract, not mgr_registry.
@@ -262,11 +256,12 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
             .collect();
 
         // RSS sampler.
+        let sampler_stop = Arc::new(AtomicBool::new(false));
         let rss_sampler = {
-            let stop = Arc::clone(&stop_flag);
+            let stop = Arc::clone(&sampler_stop);
             let peak = Arc::clone(&peak_rss);
             thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
+                while !stop.load(Ordering::Acquire) {
                     if let Some(kb) = rss_kb() {
                         peak.fetch_max(kb, Ordering::Relaxed);
                     }
@@ -275,13 +270,10 @@ fn run_stale_reader_stress(run_duration: Duration) -> StressResult {
             })
         };
 
-        // Let the race run.
-        thread::sleep(run_duration);
-        stop_flag.store(true, Ordering::Relaxed);
-
         for w in writers {
             w.join().expect("writer thread join");
         }
+        sampler_stop.store(true, Ordering::Release);
         rss_sampler.join().expect("rss sampler join");
 
         // Observe reader state BEFORE dropping the ticket.
@@ -330,7 +322,7 @@ fn bd_wt4uu_stale_reader_stress_no_oom_bounded_chain() {
     let run_id = "bd-wt4uu-stale-reader-stress";
     let scenario_id = "STALE-READER-STRESS";
     let seed: u64 = 0x0BD4_0042; // deterministic marker for bd-wt4uu
-    let result = run_stale_reader_stress(Duration::from_secs(2));
+    let result = run_stale_reader_stress(256);
 
     assert!(
         result.total_commits > 0,

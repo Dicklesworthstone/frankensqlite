@@ -392,9 +392,11 @@ fn test_api_mirrors_asupersync_sqlite() -> Result<(), String> {
         }
     }
 
-    if !(facade.contains("pub use fsqlite_core::connection::{Connection")
-        && facade.contains("PreparedStatement")
-        && facade.contains("Row"))
+    let compact_facade = facade.split_whitespace().collect::<String>();
+    if !(compact_facade.contains("pubusefsqlite_core::connection::{")
+        && compact_facade.contains("Connection,")
+        && compact_facade.contains("PreparedStatement,")
+        && compact_facade.contains("Row,"))
     {
         return Err(format!(
             "bead_id={BEAD_ID} case=fsqlite_facade_missing_connection_reexport"

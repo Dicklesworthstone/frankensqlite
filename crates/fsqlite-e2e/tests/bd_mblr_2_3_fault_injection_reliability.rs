@@ -488,13 +488,15 @@ fn fault_injection_partial_read_on_page_fetch_reports_short_read_diagnostic() {
     let cx = Cx::new();
 
     let fault_vfs = TargetedFaultVfs::new(backing.clone());
-    fault_vfs.inject_partial_read_after(1, PageSize::DEFAULT.as_usize() / 2);
     let pager =
         SimplePager::open_with_cx(&cx, fault_vfs, &path, PageSize::DEFAULT).expect("open pager");
 
     let reader = pager
         .begin(&cx, TransactionMode::ReadOnly)
         .expect("begin readonly txn");
+    pager
+        .vfs_handle()
+        .inject_partial_read_after(0, PageSize::DEFAULT.as_usize() / 2);
     let err = reader
         .get_page(&cx, page_no)
         .expect_err("short read on page fetch should fail");

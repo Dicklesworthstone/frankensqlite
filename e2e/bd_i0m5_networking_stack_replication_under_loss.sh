@@ -104,8 +104,8 @@ if [[ "${#missing_tokens[@]}" -gt 0 ]]; then
 fi
 
 if (cd "${WORKSPACE_ROOT}" && cargo test -p fsqlite-harness --test "${TEST_TARGET}" -- --nocapture); then
-    printf 'bead_id=%s level=WARN case=degraded_mode_count=0\n' "${BEAD_ID}"
-    printf 'bead_id=%s level=ERROR case=terminal_failure_count=0\n' "${BEAD_ID}"
+    printf 'bead_id=%s level=INFO case=degraded_mode_count=0\n' "${BEAD_ID}"
+    printf 'bead_id=%s level=INFO case=terminal_failure_count=0\n' "${BEAD_ID}"
     printf 'bead_id=%s level=INFO case=pass\n' "${BEAD_ID}"
     exit 0
 fi

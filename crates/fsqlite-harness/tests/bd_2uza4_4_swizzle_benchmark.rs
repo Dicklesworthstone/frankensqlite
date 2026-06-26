@@ -143,14 +143,10 @@ fn swizzled_lookup(
 
 // ── Direct array lookup (optimal baseline) ────────────────────────────────
 
-/// Traverse using direct array indices — no hash, no atomic, just array[idx].
+/// Traverse using direct frame indices — no hash, no atomic, just child id →
+/// frame index.
 /// This represents the theoretical optimum with zero indirection overhead.
-fn direct_lookup(
-    direct_children: &[Vec<usize>],
-    pages: &[SimNode],
-    root_frame: usize,
-    target_child_indices: &[usize],
-) -> u64 {
+fn direct_lookup(pages: &[SimNode], root_frame: usize, target_child_indices: &[usize]) -> u64 {
     let mut frame_idx = root_frame;
     let mut level = 0;
     loop {
@@ -158,8 +154,8 @@ fn direct_lookup(
         if node.is_leaf {
             return node.leaf_value;
         }
-        let child_idx = target_child_indices[level] % direct_children[frame_idx].len();
-        frame_idx = direct_children[frame_idx][child_idx];
+        let child_idx = target_child_indices[level] % node.children.len();
+        frame_idx = node.children[child_idx] as usize;
         level += 1;
     }
 }
@@ -199,12 +195,6 @@ fn run_benchmark(
         swizzle_ptrs.push(ptrs);
     }
 
-    // Build direct children indices (optimal baseline).
-    let direct_children: Vec<Vec<usize>> = pages
-        .iter()
-        .map(|node| node.children.iter().map(|&pid| pid as usize).collect())
-        .collect();
-
     // Generate deterministic lookup targets (pseudo-random child choices per level).
     let max_depth = depth - 1; // number of interior levels to traverse
     let targets: Vec<Vec<usize>> = (0..num_lookups)
@@ -225,7 +215,7 @@ fn run_benchmark(
     for t in targets.iter().take(num_lookups.min(1000)) {
         std::hint::black_box(unswizzled_lookup(&page_table, &pages, root, t));
         std::hint::black_box(swizzled_lookup(&swizzle_ptrs, &pages, root as usize, t));
-        std::hint::black_box(direct_lookup(&direct_children, &pages, root as usize, t));
+        std::hint::black_box(direct_lookup(&pages, root as usize, t));
     }
 
     // ── Benchmark: Unswizzled (HashMap) ──
@@ -251,8 +241,7 @@ fn run_benchmark(
     let start = Instant::now();
     let mut checksum3 = 0u64;
     for t in &targets {
-        checksum3 =
-            checksum3.wrapping_add(direct_lookup(&direct_children, &pages, root as usize, t));
+        checksum3 = checksum3.wrapping_add(direct_lookup(&pages, root as usize, t));
     }
     std::hint::black_box(checksum3);
     let direct_elapsed = start.elapsed().as_nanos();
@@ -360,11 +349,6 @@ fn bench_skewed_access_pattern() {
         .map(|pid| (pid, pid as usize))
         .collect();
 
-    let direct_children: Vec<Vec<usize>> = pages
-        .iter()
-        .map(|node| node.children.iter().map(|&pid| pid as usize).collect())
-        .collect();
-
     // Generate skewed targets: 80% of lookups go to first 20% of children.
     let max_depth = depth - 1;
     let targets: Vec<Vec<usize>> = (0..num_lookups)
@@ -388,7 +372,7 @@ fn bench_skewed_access_pattern() {
     // Warmup.
     for t in targets.iter().take(1000) {
         std::hint::black_box(unswizzled_lookup(&page_table, &pages, root, t));
-        std::hint::black_box(direct_lookup(&direct_children, &pages, root as usize, t));
+        std::hint::black_box(direct_lookup(&pages, root as usize, t));
     }
 
     // Unswizzled.
@@ -404,7 +388,7 @@ fn bench_skewed_access_pattern() {
     let start = Instant::now();
     let mut sum2 = 0u64;
     for t in &targets {
-        sum2 = sum2.wrapping_add(direct_lookup(&direct_children, &pages, root as usize, t));
+        sum2 = sum2.wrapping_add(direct_lookup(&pages, root as usize, t));
     }
     std::hint::black_box(sum2);
     let direct_ns = start.elapsed().as_nanos();

@@ -2069,6 +2069,9 @@ pub fn parse_filter_args(args: &[String]) -> FixtureFilter {
             "--ci-safe" => {
                 filter.ci_safe_only = true;
             }
+            "--requires-wal" => {
+                filter.requires_wal = true;
+            }
             _ => {}
         }
         i += 1;

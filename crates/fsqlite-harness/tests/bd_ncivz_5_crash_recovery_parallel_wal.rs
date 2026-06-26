@@ -274,8 +274,9 @@ fn group_commit_epoch_ordering_across_flush_cycles() {
     let mut epochs = Vec::new();
     for cycle in 0..5 {
         let batch = make_batch(2);
-        let outcome = consolidator.submit_batch(batch).unwrap();
-        assert_eq!(outcome, SubmitOutcome::Flusher);
+        let receipt = consolidator.submit_batch(batch).unwrap();
+        assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+        assert_eq!(receipt.target_epoch, cycle + 1);
 
         let batches = consolidator.begin_flush().unwrap();
         assert!(!batches.is_empty(), "cycle {cycle} should have batches");
@@ -454,11 +455,14 @@ fn multi_epoch_consolidator_with_interleaved_batches() {
 
     // Epoch 1: 3 batches from "concurrent writers".
     let o1 = consolidator.submit_batch(make_batch(3)).unwrap();
-    assert_eq!(o1, SubmitOutcome::Flusher);
+    assert_eq!(o1.outcome, SubmitOutcome::Flusher);
+    assert_eq!(o1.target_epoch, 1);
     let o2 = consolidator.submit_batch(make_batch(2)).unwrap();
-    assert_eq!(o2, SubmitOutcome::Waiter);
+    assert_eq!(o2.outcome, SubmitOutcome::Waiter);
+    assert_eq!(o2.target_epoch, 1);
     let o3 = consolidator.submit_batch(make_batch(1)).unwrap();
-    assert_eq!(o3, SubmitOutcome::Waiter);
+    assert_eq!(o3.outcome, SubmitOutcome::Waiter);
+    assert_eq!(o3.target_epoch, 1);
 
     assert_eq!(consolidator.pending_frame_count(), 6);
     assert_eq!(consolidator.pending_batch_count(), 3);

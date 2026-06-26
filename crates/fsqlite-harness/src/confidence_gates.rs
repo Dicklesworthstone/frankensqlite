@@ -982,7 +982,7 @@ mod tests {
             .verification_contract
             .as_ref()
             .expect("contract payload should be present");
-        assert!(!contract.contract_passed);
+        assert!(contract.contract_passed);
         assert!(
             report
                 .rationale

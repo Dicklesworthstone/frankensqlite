@@ -500,14 +500,15 @@ fn test_e2e_raptorq_source_symbol_constructor() {
         assert!(sym.is_source, "bead_id={BEAD_ID} expected source symbol");
         assert_eq!(
             sym.columns,
-            vec![i],
-            "bead_id={BEAD_ID} source constructor columns mismatch"
+            Vec::<usize>::new(),
+            "bead_id={BEAD_ID} source constructor should store compact derived columns"
         );
         assert_eq!(
             sym.coefficients.len(),
-            1,
-            "bead_id={BEAD_ID} source constructor coefficient count mismatch"
+            0,
+            "bead_id={BEAD_ID} source constructor should store compact derived coefficients"
         );
+        assert_eq!(sym.esi, i as u32, "bead_id={BEAD_ID} source ESI mismatch");
     }
 }
 

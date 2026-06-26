@@ -35,7 +35,7 @@ fn load_taxonomy() -> (Vec<Feature>, Vec<Exclusion>, toml::Value) {
             path.display()
         )
     });
-    let doc: toml::Value = content.parse().expect("Failed to parse TOML");
+    let doc: toml::Value = toml::from_str(&content).expect("Failed to parse TOML");
 
     let features: Vec<Feature> = doc["features"]
         .as_array()

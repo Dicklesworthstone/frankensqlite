@@ -2327,7 +2327,7 @@ mod tests {
                 "fixture",
                 "commutative_inserts_disjoint_keys",
                 1,
-                95,
+                100,
                 1_050,
             ),
             scorecard_summary(

@@ -201,8 +201,8 @@ fn wtest_update_simple_where_hits_fast_lane() {
 
     let snap = hot_path_profile_snapshot();
     assert!(
-        snap.prepared_update_delete_fast_lane_hits >= 2,
-        "simple WHERE UPDATE should hit fast lane: {snap:?}"
+        snap.prepared_direct_update_executions >= 2,
+        "simple WHERE UPDATE should hit the direct UPDATE lane: {snap:?}"
     );
     assert_eq!(
         snap.prepared_update_delete_fallback_trigger, 0,
@@ -237,8 +237,8 @@ fn wtest_delete_simple_where_hits_fast_lane() {
 
     let snap = hot_path_profile_snapshot();
     assert!(
-        snap.prepared_update_delete_fast_lane_hits >= 2,
-        "simple WHERE DELETE should hit fast lane: {snap:?}"
+        snap.prepared_direct_delete_executions >= 2,
+        "simple WHERE DELETE should hit the direct DELETE lane: {snap:?}"
     );
 
     let rows = conn.query("SELECT id FROM wd1").unwrap();
@@ -445,10 +445,12 @@ fn wtest_mixed_oltp_prepared_lanes_all_active() {
         snap.prepared_table_engine_reuses
     );
     eprintln!(
-        "UPDATE/DELETE: fast_lane={} instrumented={} dml_handoff={}",
+        "UPDATE/DELETE: fused_fast_lane={} instrumented={} dml_handoff={} direct_update={} direct_delete={}",
         snap.prepared_update_delete_fast_lane_hits,
         snap.prepared_update_delete_instrumented_lane_hits,
-        snap.prepared_update_delete_dml_direct_handoff_runs
+        snap.prepared_update_delete_dml_direct_handoff_runs,
+        snap.prepared_direct_update_executions,
+        snap.prepared_direct_delete_executions
     );
     eprintln!(
         "fallbacks: trigger={} fk={} returning={} vtab={}",
@@ -466,12 +468,14 @@ fn wtest_mixed_oltp_prepared_lanes_all_active() {
         snap.prepared_insert_fast_lane_hits
     );
 
-    // UPDATE/DELETE fast lane should cover all update+delete ops (no triggers/FKs)
+    // UPDATE/DELETE direct lanes should cover all update+delete ops (no triggers/FKs)
+    let direct_update_delete =
+        snap.prepared_direct_update_executions + snap.prepared_direct_delete_executions;
     assert!(
-        snap.prepared_update_delete_fast_lane_hits >= update_count + delete_count,
-        "all {} UPDATE/DELETE ops should hit fast lane, got {}: {snap:?}",
+        direct_update_delete >= update_count + delete_count,
+        "all {} UPDATE/DELETE ops should hit direct lanes, got {}: {snap:?}",
         update_count + delete_count,
-        snap.prepared_update_delete_fast_lane_hits
+        direct_update_delete
     );
 
     // Zero fallbacks expected — no triggers, FKs, RETURNING, vtabs
@@ -804,8 +808,9 @@ fn wtest_fk_pragma_toggle_dynamic_fast_lane_eligibility() {
         .unwrap();
     let off_snap = hot_path_profile_snapshot();
     assert!(
-        off_snap.prepared_update_delete_fast_lane_hits >= 1,
-        "FK=OFF DELETE should hit fast lane: {off_snap:?}"
+        off_snap.prepared_update_delete_fast_lane_hits + off_snap.prepared_direct_delete_executions
+            >= 1,
+        "FK=OFF DELETE should hit a prepared fast lane: {off_snap:?}"
     );
     assert_eq!(off_snap.prepared_update_delete_fallback_foreign_key, 0);
 
@@ -884,8 +889,8 @@ fn wtest_multi_table_prepared_dml_no_interference() {
         "all 40 INSERTs across 2 tables should hit fast lane: {snap:?}"
     );
     assert!(
-        snap.prepared_update_delete_fast_lane_hits >= 10,
-        "UPDATE+DELETE across tables should hit fast lane: {snap:?}"
+        snap.prepared_direct_update_executions + snap.prepared_direct_delete_executions >= 20,
+        "UPDATE+DELETE across tables should hit direct lanes: {snap:?}"
     );
 
     let a_count = conn.query("SELECT COUNT(*) FROM mt_a").unwrap();

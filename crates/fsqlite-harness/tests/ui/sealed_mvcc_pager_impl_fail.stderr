@@ -10,12 +10,15 @@ help: the trait `traits::sealed::Sealed` is not implemented for `ExternalPager`
  5 | struct ExternalPager;
    | ^^^^^^^^^^^^^^^^^^^^
    = help: the following other types implement trait `traits::sealed::Sealed`:
+             MemoryMockMvccPager
+             MemoryMockTransaction
              MockCheckpointPageWriter
              MockMvccPager
              MockTransaction
              SimplePager<V>
              SimplePagerCheckpointWriter<V>
              SimpleTransaction<V>
+             TransactionKind
 note: required by a bound in `MvccPager`
   --> $WORKSPACE/crates/fsqlite-pager/src/traits.rs
    |
@@ -28,15 +31,19 @@ note: required by a bound in `MvccPager`
              fsqlite_pager::SimplePagerCheckpointWriter<V>
              fsqlite_pager::MockMvccPager
              fsqlite_pager::MockTransaction
+             fsqlite_pager::MemoryMockMvccPager
+             fsqlite_pager::MemoryMockTransaction
+             fsqlite_pager::TransactionKind
              fsqlite_pager::MockCheckpointPageWriter
 
-error[E0046]: not all trait items implemented, missing: `journal_mode`, `set_journal_mode`, `set_wal_backend`
+error[E0046]: not all trait items implemented, missing: `journal_mode`, `is_readonly`, `set_journal_mode`, `set_wal_backend`
  --> tests/ui/sealed_mvcc_pager_impl_fail.rs:7:1
   |
 7 | impl MvccPager for ExternalPager {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `journal_mode`, `set_journal_mode`, `set_wal_backend` in implementation
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `journal_mode`, `is_readonly`, `set_journal_mode`, `set_wal_backend` in implementation
   |
   = help: implement the missing item: `fn journal_mode(&self) -> fsqlite_pager::JournalMode { todo!() }`
+  = help: implement the missing item: `fn is_readonly(&self) -> bool { todo!() }`
   = help: implement the missing item: `fn set_journal_mode(&self, _: &Cx, _: fsqlite_pager::JournalMode) -> Result<fsqlite_pager::JournalMode, FrankenError> { todo!() }`
   = help: implement the missing item: `fn set_wal_backend(&self, _: Box<(dyn WalBackend + 'static)>) -> Result<(), FrankenError> { todo!() }`
 
@@ -52,12 +59,15 @@ help: the trait `traits::sealed::Sealed` is not implemented for `ExternalPager`
 5 | struct ExternalPager;
   | ^^^^^^^^^^^^^^^^^^^^
   = help: the following other types implement trait `traits::sealed::Sealed`:
+            MemoryMockMvccPager
+            MemoryMockTransaction
             MockCheckpointPageWriter
             MockMvccPager
             MockTransaction
             SimplePager<V>
             SimplePagerCheckpointWriter<V>
             SimpleTransaction<V>
+            TransactionKind
 note: required by a bound in `MvccPager`
  --> $WORKSPACE/crates/fsqlite-pager/src/traits.rs
   |
@@ -70,4 +80,7 @@ note: required by a bound in `MvccPager`
             fsqlite_pager::SimplePagerCheckpointWriter<V>
             fsqlite_pager::MockMvccPager
             fsqlite_pager::MockTransaction
+            fsqlite_pager::MemoryMockMvccPager
+            fsqlite_pager::MemoryMockTransaction
+            fsqlite_pager::TransactionKind
             fsqlite_pager::MockCheckpointPageWriter

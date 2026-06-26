@@ -135,7 +135,7 @@ fn e2e_scorecard_release_blocked_when_contract_missing() {
     fs::create_dir_all(&beads_dir).expect("create .beads directory");
     fs::write(
         beads_dir.join("issues.jsonl"),
-        r#"{"id":"bd-1dp9.7.7","issue_type":"task"}"#,
+        r#"{"id":"bd-1dp9.7.7-missing-contract","issue_type":"task","status":"open"}"#,
     )
     .expect("write issues.jsonl");
 
@@ -153,6 +153,10 @@ fn e2e_scorecard_release_blocked_when_contract_missing() {
         .expect("scorecard should include contract payload");
     assert!(contract.base_gate_passed);
     assert!(!contract.contract_passed);
+    assert_eq!(
+        contract.bead_verdicts[0].bead_id,
+        "bd-1dp9.7.7-missing-contract"
+    );
     assert_eq!(
         contract.disposition,
         EnforcementDisposition::BlockedByContract

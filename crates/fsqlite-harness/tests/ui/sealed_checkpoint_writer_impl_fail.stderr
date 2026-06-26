@@ -10,12 +10,15 @@ help: the trait `traits::sealed::Sealed` is not implemented for `ExternalCheckpo
 6 | struct ExternalCheckpointWriter;
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   = help: the following other types implement trait `traits::sealed::Sealed`:
+            MemoryMockMvccPager
+            MemoryMockTransaction
             MockCheckpointPageWriter
             MockMvccPager
             MockTransaction
             SimplePager<V>
             SimplePagerCheckpointWriter<V>
             SimpleTransaction<V>
+            TransactionKind
 note: required by a bound in `CheckpointPageWriter`
  --> $WORKSPACE/crates/fsqlite-pager/src/traits.rs
   |
@@ -28,4 +31,7 @@ note: required by a bound in `CheckpointPageWriter`
             fsqlite_pager::SimplePagerCheckpointWriter<V>
             fsqlite_pager::MockMvccPager
             fsqlite_pager::MockTransaction
+            fsqlite_pager::MemoryMockMvccPager
+            fsqlite_pager::MemoryMockTransaction
+            fsqlite_pager::TransactionKind
             fsqlite_pager::MockCheckpointPageWriter

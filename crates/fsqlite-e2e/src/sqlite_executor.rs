@@ -830,7 +830,7 @@ mod tests {
     use super::*;
     use crate::oplog::{
         ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
-        preset_commutative_inserts_disjoint_keys,
+        commutative_inserts_disjoint_keys_expected_rows, preset_commutative_inserts_disjoint_keys,
     };
 
     #[test]
@@ -841,7 +841,14 @@ mod tests {
         // Start from an empty DB file.
         Connection::open(&db_path).unwrap();
 
-        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 1, 4, 25);
+        let worker_count = 4;
+        let rows_per_worker = 25;
+        let oplog = preset_commutative_inserts_disjoint_keys(
+            "test-fixture",
+            1,
+            worker_count,
+            rows_per_worker,
+        );
         let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
         assert!(report.error.is_none(), "error={:?}", report.error);
         assert!(report.ops_total > 0);
@@ -851,7 +858,14 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM t0", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 100);
+        assert_eq!(
+            count,
+            i64::try_from(commutative_inserts_disjoint_keys_expected_rows(
+                worker_count,
+                rows_per_worker
+            ))
+            .unwrap()
+        );
     }
 
     #[test]

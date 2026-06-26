@@ -30,6 +30,11 @@ fn rollback_best_effort(conn: &fsqlite::Connection) {
     let _ = conn.execute("ROLLBACK;");
 }
 
+fn record_transient_abort(result: &mut ThreadResult, total_aborted: &AtomicU64) {
+    result.aborted += 1;
+    total_aborted.fetch_add(1, Ordering::Relaxed);
+}
+
 /// LCG-based PRNG for deterministic test scheduling.
 fn lcg_next(state: u64) -> u64 {
     state
@@ -307,8 +312,12 @@ fn test_e2e_10w_10r_hot_row_contention() {
                     let mut retry_count = 0;
                     loop {
                         if let Err(e) = conn.execute("BEGIN;") {
-                            if e.is_transient() && retry_count < MAX_RETRIES {
+                            if e.is_transient() {
                                 rollback_best_effort(&conn);
+                                if retry_count >= MAX_RETRIES {
+                                    record_transient_abort(&mut result, &aborted);
+                                    break;
+                                }
                                 result.retries += 1;
                                 retry_count += 1;
                                 thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
@@ -320,8 +329,12 @@ fn test_e2e_10w_10r_hot_row_contention() {
 
                         match conn.execute("UPDATE counter SET val = val + 1 WHERE id = 1;") {
                             Ok(_) => {}
-                            Err(e) if e.is_transient() && retry_count < MAX_RETRIES => {
+                            Err(e) if e.is_transient() => {
                                 rollback_best_effort(&conn);
+                                if retry_count >= MAX_RETRIES {
+                                    record_transient_abort(&mut result, &aborted);
+                                    break;
+                                }
                                 result.retries += 1;
                                 retry_count += 1;
                                 thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
@@ -340,8 +353,12 @@ fn test_e2e_10w_10r_hot_row_contention() {
                                 committed.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            Err(e) if e.is_transient() && retry_count < MAX_RETRIES => {
+                            Err(e) if e.is_transient() => {
                                 rollback_best_effort(&conn);
+                                if retry_count >= MAX_RETRIES {
+                                    record_transient_abort(&mut result, &aborted);
+                                    break;
+                                }
                                 result.retries += 1;
                                 retry_count += 1;
                                 thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));

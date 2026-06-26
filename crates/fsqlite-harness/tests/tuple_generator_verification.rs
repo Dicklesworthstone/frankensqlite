@@ -555,31 +555,16 @@ fn verify_roundtrip(k: usize, symbol_size: usize, seed: u64) {
     let params = decoder.params();
     let k_u32 = u32::try_from(k).expect("k fits u32");
     let l_u32 = u32::try_from(params.l).expect("l fits u32");
-    let base_rows = params.s + params.h;
-    let constraints = ConstraintMatrix::build(params, seed);
 
     // Collect all received symbols: constraints + source + repair.
     let mut received: Vec<ReceivedSymbol> = decoder.constraint_symbols();
 
-    // Add source symbols with their LT equations.
+    // Add source symbols using the decoder's canonical systematic identity equation.
     for (i, data) in source.iter().enumerate() {
-        let row = base_rows + i;
-        let mut columns = Vec::new();
-        let mut coefficients = Vec::new();
-        for col in 0..constraints.cols {
-            let coeff = constraints.get(row, col);
-            if !coeff.is_zero() {
-                columns.push(col);
-                coefficients.push(coeff);
-            }
-        }
-        received.push(ReceivedSymbol {
-            esi: u32::try_from(i).expect("esi fits u32"),
-            is_source: true,
-            columns,
-            coefficients,
-            data: data.clone(),
-        });
+        received.push(ReceivedSymbol::source(
+            u32::try_from(i).expect("esi fits u32"),
+            data.clone(),
+        ));
     }
 
     // Add repair symbols to reach L total.

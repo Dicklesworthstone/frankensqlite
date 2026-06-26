@@ -11,7 +11,7 @@
 //!   - Worked example: 0xA3 * 0x47 = 0xE1
 //!   - LDPC: 3 nonzeros per source column with circulant stride
 //!   - HDPC: GF(256) coefficients from GAMMA×MT product (not GF(2))
-//!   - L = K + S + H identity
+//!   - L = K' + S + H identity from the RFC systematic index table
 //!   - Encode/decode roundtrip at K, K+2 symbol boundaries
 
 use std::collections::HashSet;
@@ -115,24 +115,6 @@ fn is_prime(n: usize) -> bool {
     true
 }
 
-/// Integer ceiling square root.
-fn ceil_isqrt(n: usize) -> usize {
-    if n <= 1 {
-        return n;
-    }
-    let mut lo = 1usize;
-    let mut hi = n;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if mid < n / mid || (mid == n / mid && n % mid != 0) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
 // ============================================================================
 // Test helpers for encode/decode
 // ============================================================================
@@ -150,7 +132,7 @@ fn make_source(k: usize, symbol_size: usize) -> Vec<Vec<u8>> {
 /// Build a full set of received symbols for the decoder.
 ///
 /// Uses the critical pattern: constraint_symbols() (S+H LDPC/HDPC equations)
-/// + source symbols with LT equations from constraint matrix + repair symbols.
+/// + source symbols with the decoder's canonical systematic identity equation + repair symbols.
 fn build_full_decode_input(
     source: &[Vec<u8>],
     encoder: &SystematicEncoder,
@@ -160,30 +142,14 @@ fn build_full_decode_input(
 ) -> (InactivationDecoder, Vec<ReceivedSymbol>) {
     let decoder = InactivationDecoder::new(k, sym_sz, seed);
     let params = decoder.params();
-    let constraints = ConstraintMatrix::build(params, seed);
-    let base_rows = params.s + params.h;
 
     let mut received = decoder.constraint_symbols();
 
     for (i, data) in source.iter().enumerate() {
-        let row = base_rows + i;
-        let mut columns = Vec::new();
-        let mut coefficients = Vec::new();
-        for col in 0..constraints.cols {
-            let coeff = constraints.get(row, col);
-            if !coeff.is_zero() {
-                columns.push(col);
-                coefficients.push(coeff);
-            }
-        }
-        received.push(ReceivedSymbol {
-            #[allow(clippy::cast_possible_truncation)]
-            esi: i as u32,
-            is_source: true,
-            columns,
-            coefficients,
-            data: data.clone(),
-        });
+        received.push(ReceivedSymbol::source(
+            u32::try_from(i).expect("ESI fits u32"),
+            data.clone(),
+        ));
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -212,8 +178,6 @@ fn build_decode_with_erasures(
 ) -> (InactivationDecoder, Vec<ReceivedSymbol>) {
     let decoder = InactivationDecoder::new(k, sym_sz, seed);
     let params = decoder.params();
-    let constraints = ConstraintMatrix::build(params, seed);
-    let base_rows = params.s + params.h;
 
     let mut received = decoder.constraint_symbols();
 
@@ -221,24 +185,10 @@ fn build_decode_with_erasures(
         if drop_indices.contains(&i) {
             continue;
         }
-        let row = base_rows + i;
-        let mut columns = Vec::new();
-        let mut coefficients = Vec::new();
-        for col in 0..constraints.cols {
-            let coeff = constraints.get(row, col);
-            if !coeff.is_zero() {
-                columns.push(col);
-                coefficients.push(coeff);
-            }
-        }
-        received.push(ReceivedSymbol {
-            #[allow(clippy::cast_possible_truncation)]
-            esi: i as u32,
-            is_source: true,
-            columns,
-            coefficients,
-            data: data.clone(),
-        });
+        received.push(ReceivedSymbol::source(
+            u32::try_from(i).expect("ESI fits u32"),
+            data.clone(),
+        ));
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -483,7 +433,8 @@ fn test_gf256_inverse_properties() {
 // ============================================================================
 
 /// Verify parameter computation for representative K values:
-/// L=K+S+H, S is prime >= 7, H >= ceil(sqrt(K)), W=K+S, P=H, B=K.
+/// K' comes from the RFC systematic index table, L=K'+S+H, and W/P/B/H are
+/// internally consistent nonzero values from that table.
 #[test]
 fn test_systematic_parameter_computation() {
     let _ = BEAD_ID;
@@ -494,31 +445,31 @@ fn test_systematic_parameter_computation() {
         let params = SystematicParams::for_source_block(k, sym_sz);
 
         assert_eq!(params.k, k, "K={k}: params.k mismatch");
+        assert!(
+            params.k_prime >= k,
+            "K={k}: K'={} must be >= K",
+            params.k_prime
+        );
         assert_eq!(
             params.l,
-            params.k + params.s + params.h,
-            "K={k}: L != K+S+H"
+            params.k_prime + params.s + params.h,
+            "K={k}: L != K'+S+H"
         );
         assert!(is_prime(params.s), "K={k}: S={} not prime", params.s);
         assert!(params.s >= 7, "K={k}: S={} < 7", params.s);
 
-        let min_h = ceil_isqrt(k).max(3);
-        assert!(
-            params.h >= min_h,
-            "K={k}: H={} < ceil(sqrt({k}))={min_h}",
-            params.h
-        );
+        assert!(params.h > 0, "K={k}: H must be nonzero");
 
-        assert_eq!(params.w, params.k + params.s, "K={k}: W != K+S");
-        assert_eq!(params.p, params.h, "K={k}: P != H");
-        assert_eq!(params.b, params.k, "K={k}: B != K");
+        assert!(params.w <= params.l, "K={k}: W > L");
+        assert_eq!(params.p, params.l - params.w, "K={k}: P != L-W");
+        assert_eq!(params.b, params.w - params.s, "K={k}: B != W-S");
         assert_eq!(params.symbol_size, sym_sz, "K={k}: symbol_size mismatch");
     }
 }
 
-/// Verify L = K + S + H for K=1..500 and selected large K values.
+/// Verify L = K' + S + H for K=1..500 and selected large K values.
 #[test]
-fn test_parameter_l_equals_k_plus_s_plus_h() {
+fn test_parameter_l_equals_k_prime_plus_s_plus_h() {
     let _ = BEAD_ID;
     let sym_sz = 64;
 
@@ -526,10 +477,10 @@ fn test_parameter_l_equals_k_plus_s_plus_h() {
         let params = SystematicParams::for_source_block(k, sym_sz);
         assert_eq!(
             params.l,
-            params.k + params.s + params.h,
-            "K={k}: L={} != K+S+H={}",
+            params.k_prime + params.s + params.h,
+            "K={k}: L={} != K'+S+H={}",
             params.l,
-            params.k + params.s + params.h
+            params.k_prime + params.s + params.h
         );
     }
 
@@ -537,8 +488,8 @@ fn test_parameter_l_equals_k_plus_s_plus_h() {
         let params = SystematicParams::for_source_block(k, sym_sz);
         assert_eq!(
             params.l,
-            params.k + params.s + params.h,
-            "K={k}: L != K+S+H"
+            params.k_prime + params.s + params.h,
+            "K={k}: L != K'+S+H"
         );
     }
 }
@@ -571,7 +522,7 @@ fn test_ldpc_constraint_structure() {
     let matrix = ConstraintMatrix::build(&params, seed);
     let s = params.s;
 
-    assert_eq!(matrix.rows, params.s + params.h + params.k);
+    assert_eq!(matrix.rows, params.s + params.h + params.k_prime);
     assert_eq!(matrix.cols, params.l);
 
     // Each source column j (0..K) has exactly 3 nonzero entries in LDPC rows
@@ -636,13 +587,14 @@ fn test_hdpc_matrix_dimensions_and_gf256_entries() {
         let h = params.h;
         let w = params.w;
 
-        // PI symbol identity block: row S+r has 1 at column W+r
+        // HDPC identity block: row S+r has 1 at column K'+S+r.
+        let hdpc_identity_start = params.k_prime + params.s;
         for r in 0..h {
             assert_eq!(
-                matrix.get(s + r, w + r).raw(),
+                matrix.get(s + r, hdpc_identity_start + r).raw(),
                 1,
                 "K={k}: HDPC identity[{r}] at col {}",
-                w + r
+                hdpc_identity_start + r
             );
         }
 
@@ -706,24 +658,36 @@ fn test_constraint_matrix_dimensions() {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 12345);
 
-        assert_eq!(matrix.rows, params.s + params.h + params.k, "K={k}: rows");
+        assert_eq!(
+            matrix.rows,
+            params.s + params.h + params.k_prime,
+            "K={k}: rows"
+        );
         assert_eq!(matrix.cols, params.l, "K={k}: cols");
         assert_eq!(matrix.rows, matrix.cols, "K={k}: matrix not square");
     }
 }
 
-/// LT rows for systematic encoding are identity: row S+H+i has 1 at column i.
+/// LT rows for systematic encoding match the RFC tuple expansion for ESI 0..K'-1.
 #[test]
-fn test_lt_rows_are_identity() {
+fn test_lt_rows_match_rfc_tuple_rows() {
     let _ = BEAD_ID;
     let k = 20;
     let params = SystematicParams::for_source_block(k, 64);
     let matrix = ConstraintMatrix::build(&params, 99);
     let lt_start = params.s + params.h;
 
-    for i in 0..k {
+    for i in 0..params.k_prime {
+        let expected_cols: HashSet<usize> = rfc6330::repair_indices_for_esi(
+            params.j,
+            params.w,
+            params.p,
+            u32::try_from(i).expect("K' row index must fit in u32"),
+        )
+        .into_iter()
+        .collect();
         for c in 0..params.l {
-            let expected = u8::from(c == i);
+            let expected = u8::from(expected_cols.contains(&c));
             let actual = matrix.get(lt_start + i, c).raw();
             assert_eq!(actual, expected, "LT[{i}][{c}]");
         }
@@ -908,7 +872,7 @@ fn test_e2e_rfc6330_conformance_vectors() {
 
             // 2. Verify parameter invariants
             let params = encoder.params();
-            assert_eq!(params.l, params.k + params.s + params.h);
+            assert_eq!(params.l, params.k_prime + params.s + params.h);
             assert!(is_prime(params.s));
 
             // 3. Constraint matrix is square

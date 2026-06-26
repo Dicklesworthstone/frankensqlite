@@ -308,7 +308,7 @@ fn release_gating_with_contract_blocks_when_evidence_missing() {
     fs::create_dir_all(&beads_dir).expect("create .beads directory");
     fs::write(
         beads_dir.join("issues.jsonl"),
-        r#"{"id":"bd-1dp9.7.7","issue_type":"task"}"#,
+        r#"{"id":"bd-1dp9.7.7","status":"open","issue_type":"task"}"#,
     )
     .expect("write issues.jsonl");
 

@@ -11,6 +11,7 @@ use fsqlite_harness::differential_v2::TARGET_SQLITE_VERSION;
 use fsqlite_harness::oracle_preflight_doctor::{
     DoctorConfig, DoctorOutcome, RemediationClass, run_oracle_preflight_doctor,
 };
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const BEAD_ID: &str = "bd-2yqp6.2.5";
@@ -50,11 +51,31 @@ fn write_fixture(workspace_root: &Path) -> PathBuf {
     fixture_path
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    fsqlite_harness::bytes_to_lower_hex(hasher.finalize())
+}
+
+fn fixture_tree_hash(fixtures_dir: &Path) -> String {
+    let fixture_path = fixtures_dir.join("001_basic_doctor_fixture.json");
+    let bytes = fs::read(&fixture_path).expect("read doctor fixture for tree hash");
+    let file_hash = sha256_hex(&bytes);
+    let payload = format!(
+        "001_basic_doctor_fixture.json\t{}\t{file_hash}\n",
+        bytes.len()
+    );
+    sha256_hex(payload.as_bytes())
+}
+
 fn write_manifest(workspace_root: &Path) -> PathBuf {
     let manifest_path = workspace_root.join("corpus_manifest.toml");
+    let fixtures_dir = workspace_root.join("crates/fsqlite-harness/conformance");
+    let fixture_content_hash = fixture_tree_hash(&fixtures_dir);
     fs::write(
         &manifest_path,
-        r#"[meta]
+        format!(
+            r#"[meta]
 schema_version = "1.0.0"
 bead_id = "bd-2yqp6.2.5"
 generated_at = "2026-02-27T00:00:00Z"
@@ -83,6 +104,15 @@ required_category_families = [
   "pragma",
   "error_paths",
 ]
+
+[[fixture_roots.hash_locked_roots]]
+root_id = "doctor-fixtures"
+path = "crates/fsqlite-harness/conformance"
+kind = "fixture_json"
+hash_algorithm = "sha256-tree-v1"
+include_extensions = ["json"]
+content_hash = "{fixture_content_hash}"
+min_files = 1
 
 [[category_floors]]
 category = "ddl"
@@ -123,7 +153,8 @@ min_entries = 1
 [[category_floors]]
 category = "error_paths"
 min_entries = 1
-"#,
+"#
+        ),
     )
     .expect("write manifest");
     manifest_path
@@ -133,6 +164,9 @@ min_entries = 1
 fn base_config(workspace_root: &Path, sqlite_binary: PathBuf) -> DoctorConfig {
     let mut config = DoctorConfig::new(workspace_root.to_path_buf());
     config.fixture_manifest_path = workspace_root.join("corpus_manifest.toml");
+    config.min_fixture_json_files = 1;
+    config.min_fixture_entries = 1;
+    config.min_fixture_sql_statements = 2;
     config.oracle_binary_override = Some(sqlite_binary);
     TARGET_SQLITE_VERSION.clone_into(&mut config.expected_sqlite_version_prefix);
     config.run_id = format!("{BEAD_ID}-test-run");
@@ -156,8 +190,8 @@ fn doctor_reports_green_for_ready_configuration() {
     assert_eq!(report.outcome, DoctorOutcome::Green);
     assert!(report.certifying);
     assert!(report.replay_command.contains("--fixture-manifest-path"));
-    assert!(!report.replay_command.contains("--fixtures-dir"));
-    assert!(!report.replay_command.contains("--min-fixture-json-files"));
+    assert!(report.replay_command.contains("--fixtures-dir"));
+    assert!(report.replay_command.contains("--min-fixture-json-files 1"));
     assert!(
         report.findings.is_empty(),
         "expected no findings in healthy config, got {:?}",
@@ -219,6 +253,7 @@ fn doctor_classifies_self_compare_risk_as_red() {
 #[test]
 fn doctor_classifies_stale_manifest_as_yellow_non_certifying() {
     let workspace = TempDir::new().expect("temp workspace");
+    write_fixture(workspace.path());
     write_manifest(workspace.path());
     thread::sleep(Duration::from_millis(1_100));
     write_fixture(workspace.path());

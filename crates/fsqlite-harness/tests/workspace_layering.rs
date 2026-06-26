@@ -790,10 +790,10 @@ fn test_e2e_bd_2v8x_compliance() {
 
     if output.status.success() {
         eprintln!(
-            "bead_id={DEP_BUILD_BEAD_ID} level=WARN case=e2e_bd_2v8x degraded_mode=0 reference=bd-1fpm"
+            "bead_id={DEP_BUILD_BEAD_ID} level=INFO case=e2e_bd_2v8x degraded_mode=0 reference=bd-1fpm"
         );
         eprintln!(
-            "bead_id={DEP_BUILD_BEAD_ID} level=ERROR case=e2e_bd_2v8x terminal_failure_count=0 reference=bd-1fpm"
+            "bead_id={DEP_BUILD_BEAD_ID} level=INFO case=e2e_bd_2v8x terminal_failure_count=0 reference=bd-1fpm"
         );
     } else {
         eprintln!(
@@ -935,10 +935,10 @@ fn test_e2e_bd_sxm2_compliance() -> Result<(), String> {
         "bead_id={DESC_BEAD_ID} level=INFO case=e2e_sxm2 described_count={described_count} module_listed_count={module_listed_count}"
     );
     eprintln!(
-        "bead_id={DESC_BEAD_ID} level=WARN case=e2e_sxm2 degraded_mode_count=0 reference=bd-1fpm"
+        "bead_id={DESC_BEAD_ID} level=INFO case=e2e_sxm2 degraded_mode_count=0 reference=bd-1fpm"
     );
     eprintln!(
-        "bead_id={DESC_BEAD_ID} level=ERROR case=e2e_sxm2 terminal_failure_count=0 reference=bd-1fpm"
+        "bead_id={DESC_BEAD_ID} level=INFO case=e2e_sxm2 terminal_failure_count=0 reference=bd-1fpm"
     );
 
     assert_eq!(

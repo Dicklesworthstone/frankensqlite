@@ -53,6 +53,8 @@ fn setup_csqlite() -> rusqlite::Connection {
 
 // ─── Prepare-only: parse + compile, no execution ─────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_prepare_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/prepare_only");
 
@@ -78,6 +80,8 @@ fn bench_prepare_only(c: &mut Criterion) {
 
 // ─── Execute-only: pre-prepared statement, just run ──────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_execute_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/execute_only");
 
@@ -111,6 +115,8 @@ fn bench_execute_only(c: &mut Criterion) {
 
 // ─── Full pipeline: conn.query() = prepare + execute ─────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_full_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/full");
 
@@ -139,6 +145,8 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
 // ─── B-tree seek: point lookups across key space ─────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_btree_seek(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/btree_seek");
 
@@ -177,6 +185,8 @@ fn bench_btree_seek(c: &mut Criterion) {
 
 // ─── Full table scan ─────────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_full_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/full_scan");
 
@@ -205,6 +215,8 @@ fn bench_full_scan(c: &mut Criterion) {
 
 // ─── Aggregate pipeline ──────────────────────────────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=memory, concurrency=sequential
 fn bench_aggregate(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/aggregate");
 
@@ -233,6 +245,8 @@ fn bench_aggregate(c: &mut Criterion) {
 
 // ─── Insert pipeline (single row, autocommit) ───────────────────────
 
+// BENCH-META: engine=csqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
+// BENCH-META: engine=frankensqlite, lifecycle=ad_hoc, storage=memory, concurrency=sequential
 fn bench_insert_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/insert_single");
 

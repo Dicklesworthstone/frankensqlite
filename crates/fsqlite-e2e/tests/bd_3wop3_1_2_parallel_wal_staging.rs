@@ -75,39 +75,43 @@ fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barri
     ))
     .expect("insert row");
     conn.execute("COMMIT;").expect("commit transaction");
+    conn.close().expect("close writer connection");
 }
 
 fn fetch_final_rows(path: &Path) -> Vec<FinalRow> {
     let conn = open_connection(path);
-    conn.query(
-        "SELECT table_name, id, value FROM (\
+    let rows = conn
+        .query(
+            "SELECT table_name, id, value FROM (\
              SELECT 'a' AS table_name, id, value FROM a \
              UNION ALL \
              SELECT 'b' AS table_name, id, value FROM b\
          ) ORDER BY table_name, id",
-    )
-    .expect("query final rows")
-    .into_iter()
-    .map(|row| {
-        let table_name = match row.get(0) {
-            Some(SqliteValue::Text(value)) => value.to_string(),
-            other => panic!("expected TEXT table_name, got {other:?}"),
-        };
-        let id = match row.get(1) {
-            Some(SqliteValue::Integer(value)) => *value,
-            other => panic!("expected INTEGER id, got {other:?}"),
-        };
-        let value = match row.get(2) {
-            Some(SqliteValue::Text(value)) => value.to_string(),
-            other => panic!("expected TEXT value, got {other:?}"),
-        };
-        FinalRow {
-            table_name,
-            id,
-            value,
-        }
-    })
-    .collect()
+        )
+        .expect("query final rows")
+        .into_iter()
+        .map(|row| {
+            let table_name = match row.get(0) {
+                Some(SqliteValue::Text(value)) => value.to_string(),
+                other => panic!("expected TEXT table_name, got {other:?}"),
+            };
+            let id = match row.get(1) {
+                Some(SqliteValue::Integer(value)) => *value,
+                other => panic!("expected INTEGER id, got {other:?}"),
+            };
+            let value = match row.get(2) {
+                Some(SqliteValue::Text(value)) => value.to_string(),
+                other => panic!("expected TEXT value, got {other:?}"),
+            };
+            FinalRow {
+                table_name,
+                id,
+                value,
+            }
+        })
+        .collect();
+    conn.close().expect("close final row connection");
+    rows
 }
 
 fn field_value<'a>(event: &'a Value, key: &str) -> Option<&'a Value> {
@@ -274,6 +278,7 @@ fn run_child_workload(run_dir: &Path, mode: &str) -> LaneRunSummary {
             .expect("create table a");
         conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, value TEXT)")
             .expect("create table b");
+        conn.close().expect("close setup connection");
     }
 
     let mut wave_lane_ids = Vec::new();

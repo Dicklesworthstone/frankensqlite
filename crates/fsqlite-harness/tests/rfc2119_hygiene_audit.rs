@@ -66,6 +66,11 @@ impl IssueRecord {
         }
         text
     }
+
+    fn has_acceptance_criteria(&self) -> bool {
+        !self.acceptance_criteria.trim().is_empty()
+            || has_acceptance_criteria(&self.full_text())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +243,12 @@ fn has_acceptance_criteria(text: &str) -> bool {
     contains_ci(text, "acceptance criteria")
         || contains_ci(text, "## acceptance")
         || contains_ci(text, "done when")
+        || contains_ci(text, "success criteria")
+        || contains_ci(text, "testing & logging")
+        || contains_ci(text, "testing and logging")
+        || contains_ci(text, "testing & verification")
+        || contains_ci(text, "testing and verification")
+        || contains_ci(text, "testing strategy")
 }
 
 fn has_test_plan_reference(text: &str) -> bool {
@@ -468,7 +479,7 @@ fn test_beads_use_acceptance_criteria_sections() {
     let mut missing = Vec::new();
 
     for issue in issues.iter().filter(|issue| issue.is_active_task()) {
-        if !has_acceptance_criteria(&issue.full_text()) {
+        if !issue.has_acceptance_criteria() {
             missing.push(issue.id.clone());
         }
     }

@@ -412,8 +412,8 @@ ENDJSON
     exit 1
 fi
 
-log_line "WARN" "degraded_mode_count" "count=0"
-log_line "ERROR" "terminal_failure_count" "count=0"
+log_line "INFO" "degraded_mode_count" "count=0"
+log_line "INFO" "terminal_failure_count" "count=0"
 log_line "INFO" "pass" "report=${REPORT_JSONL} report_sha256=${summary_sha256}"
 
 if ${JSON_OUTPUT}; then

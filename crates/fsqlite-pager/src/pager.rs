@@ -7654,10 +7654,10 @@ where
         let waiter_id = batch.context.batch_id;
         let waiter_frames_contributed = batch.frames.len();
 
-        // Step 2: Submit batch to consolidator, get Flusher or Waiter role.
-        // If phase is FLUSHING, wait for current flush to complete before submitting.
+        // Step 2: Submit batch to consolidator, get Flusher or Waiter role and
+        // the exact epoch that will make this batch durable.
         let t_consolidator_lock_start = phase_timing.then(Instant::now);
-        let (outcome, our_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
+        let (outcome, our_epoch, target_epoch, consolidator_lock_wait_us, flushing_wait_us) = {
             let mut consolidator = queue
                 .consolidator
                 .lock()
@@ -7671,12 +7671,16 @@ where
             // flushing_wait bottleneck that was 1-2.7ms at 16 threads.
             let flushing_wait = 0u64; // No longer blocks
 
-            // Record epoch BEFORE submit (begin_flush will increment it).
-            let epoch = consolidator.epoch();
-            let outcome = consolidator.submit_batch(batch)?;
-            (outcome, epoch, lock_wait_us, flushing_wait)
+            let epoch_at_queue = consolidator.epoch();
+            let receipt = consolidator.submit_batch(batch)?;
+            (
+                receipt.outcome,
+                epoch_at_queue,
+                receipt.target_epoch,
+                lock_wait_us,
+                flushing_wait,
+            )
         };
-        let target_epoch = our_epoch.saturating_add(1);
         trace_group_commit(format_args!(
             "waiter waiter_id={waiter_id} role={outcome:?} epoch_at_queue={our_epoch} target_epoch={target_epoch} frames_i_contributed={waiter_frames_contributed}"
         ));
@@ -7838,9 +7842,30 @@ where
                     };
                     queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                     if let Err(abort_error) = abort_result {
+                        if flush_epoch != target_epoch {
+                            tracing::debug!(
+                                target: "fsqlite::wal::lock_scope",
+                                epoch = flush_epoch,
+                                caller_target_epoch = target_epoch,
+                                error = %error,
+                                abort_error = %abort_error,
+                                "promoted group-commit epoch overlap abort failed after caller epoch completed"
+                            );
+                            return Ok(());
+                        }
                         return Err(FrankenError::internal(format!(
                             "group commit overlap abort failed for epoch {flush_epoch}: overlap={error}; abort={abort_error}"
                         )));
+                    }
+                    if flush_epoch != target_epoch {
+                        tracing::debug!(
+                            target: "fsqlite::wal::lock_scope",
+                            epoch = flush_epoch,
+                            caller_target_epoch = target_epoch,
+                            error = %error,
+                            "promoted group-commit epoch failed after caller epoch completed"
+                        );
+                        return Ok(());
                     }
                     return Err(error);
                 }
@@ -8117,9 +8142,30 @@ where
                             };
                             queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                             if let Err(abort_error) = abort_result {
+                                if flush_epoch != target_epoch {
+                                    tracing::debug!(
+                                        target: "fsqlite::wal::lock_scope",
+                                        epoch = flush_epoch,
+                                        caller_target_epoch = target_epoch,
+                                        error = %error,
+                                        abort_error = %abort_error,
+                                        "promoted group-commit epoch publish hook abort failed after caller epoch completed"
+                                    );
+                                    return Ok(());
+                                }
                                 return Err(FrankenError::internal(format!(
                                     "group commit flush hook failed for epoch {flush_epoch} and abort_flush also failed: hook={error}; abort={abort_error}"
                                 )));
+                            }
+                            if flush_epoch != target_epoch {
+                                tracing::debug!(
+                                    target: "fsqlite::wal::lock_scope",
+                                    epoch = flush_epoch,
+                                    caller_target_epoch = target_epoch,
+                                    error = %error,
+                                    "promoted group-commit epoch publish hook failed after caller epoch completed"
+                                );
+                                return Ok(());
                             }
                             return Err(error);
                         }
@@ -8283,16 +8329,30 @@ where
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             let promoted = consolidator.complete_flush()?;
-                            if promoted && !consolidator.claim_flusher_vacancy() {
+                            (consolidator.epoch(), promoted)
+                        };
+                        let caller_target_completed = completed_epoch >= target_epoch;
+                        queue.publish_completed_epoch(
+                            completed_epoch,
+                            has_promoted && caller_target_completed,
+                        );
+
+                        if has_promoted {
+                            if caller_target_completed {
+                                break 'flusher_loop;
+                            }
+                            let claimed_promoted = {
+                                let mut consolidator = queue
+                                    .consolidator
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                consolidator.claim_flusher_vacancy()
+                            };
+                            if !claimed_promoted {
                                 return Err(FrankenError::internal(format!(
                                     "group commit flusher could not reserve promoted epoch after completing epoch {flush_epoch}"
                                 )));
                             }
-                            (consolidator.epoch(), promoted)
-                        };
-                        queue.publish_completed_epoch(completed_epoch, false);
-
-                        if has_promoted {
                             record_initial_metrics = false;
                             needs_arrival_wait = false;
                             continue 'flusher_loop;
@@ -8349,9 +8409,30 @@ where
                         };
                         queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                         if let Err(abort_error) = abort_result {
+                            if flush_epoch != target_epoch {
+                                tracing::debug!(
+                                    target: "fsqlite::wal::lock_scope",
+                                    epoch = flush_epoch,
+                                    caller_target_epoch = target_epoch,
+                                    error = %error,
+                                    abort_error = %abort_error,
+                                    "promoted group-commit epoch flush abort failed after caller epoch completed"
+                                );
+                                return Ok(());
+                            }
                             return Err(FrankenError::internal(format!(
                                 "group commit flush failed for epoch {flush_epoch} and abort_flush also failed: flush={error}; abort={abort_error}"
                             )));
+                        }
+                        if flush_epoch != target_epoch {
+                            tracing::debug!(
+                                target: "fsqlite::wal::lock_scope",
+                                epoch = flush_epoch,
+                                caller_target_epoch = target_epoch,
+                                error = %error,
+                                "promoted group-commit epoch flush failed after caller epoch completed"
+                            );
+                            return Ok(());
                         }
                         return Err(error);
                     }
@@ -8371,12 +8452,10 @@ where
             SubmitOutcome::Waiter => {
                 // Step 3b: WAITER path — wait for flusher to complete our epoch.
                 //
-                // We submitted during epoch N. The flusher will:
-                // - Call begin_flush() which increments epoch to N+1
-                // - Write our frames
-                // - Call complete_flush() which sets completed_epoch = N+1
-                //
-                // So we wait for completed_epoch >= N+1.
+                // The consolidator receipt tells us the exact epoch that owns
+                // this batch. A batch submitted while another epoch is already
+                // flushing is queued for the promoted next epoch, so deriving
+                // `epoch_at_queue + 1` here can wake too early.
                 let t_waiter_start = phase_timing.then(Instant::now);
                 let guard = queue
                     .consolidator
@@ -17994,20 +18073,18 @@ mod tests {
                 page_data: sample_page(0x01),
                 db_size_if_commit: 1,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(batch1).unwrap(),
-                SubmitOutcome::Flusher
-            );
+            let receipt = consolidator.submit_batch(batch1).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+            assert_eq!(receipt.target_epoch, 1);
             let _ = consolidator.begin_flush().unwrap();
             let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
                 page_data: sample_page(0x02),
                 db_size_if_commit: 2,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(pipelined_batch).unwrap(),
-                SubmitOutcome::Waiter
-            );
+            let receipt = consolidator.submit_batch(pipelined_batch).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+            assert_eq!(receipt.target_epoch, 2);
         }
 
         {
@@ -18129,20 +18206,18 @@ mod tests {
                 page_data: sample_page(0x10),
                 db_size_if_commit: 1,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(batch1).unwrap(),
-                SubmitOutcome::Flusher
-            );
+            let receipt = consolidator.submit_batch(batch1).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+            assert_eq!(receipt.target_epoch, 1);
             let _ = consolidator.begin_flush().unwrap();
             let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
                 page_data: sample_page(0x20),
                 db_size_if_commit: 2,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(pipelined_batch).unwrap(),
-                SubmitOutcome::Waiter
-            );
+            let receipt = consolidator.submit_batch(pipelined_batch).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+            assert_eq!(receipt.target_epoch, 2);
         }
 
         let waiter_queue = Arc::clone(&queue);
@@ -18209,20 +18284,18 @@ mod tests {
                 page_data: sample_page(0x31),
                 db_size_if_commit: 1,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(batch1).unwrap(),
-                SubmitOutcome::Flusher
-            );
+            let receipt = consolidator.submit_batch(batch1).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+            assert_eq!(receipt.target_epoch, 1);
             let _ = consolidator.begin_flush().unwrap();
             let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
                 page_data: sample_page(0x32),
                 db_size_if_commit: 2,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(pipelined_batch).unwrap(),
-                SubmitOutcome::Waiter
-            );
+            let receipt = consolidator.submit_batch(pipelined_batch).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+            assert_eq!(receipt.target_epoch, 2);
         }
 
         let _target_slot = queue.epoch_waiters.slot(1);
@@ -18328,20 +18401,18 @@ mod tests {
                 page_data: sample_page(0x51),
                 db_size_if_commit: 1,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(batch1).unwrap(),
-                SubmitOutcome::Flusher
-            );
+            let receipt = consolidator.submit_batch(batch1).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+            assert_eq!(receipt.target_epoch, 1);
             let _ = consolidator.begin_flush().unwrap();
             let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
                 page_data: sample_page(0x52),
                 db_size_if_commit: 2,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(pipelined_batch).unwrap(),
-                SubmitOutcome::Waiter
-            );
+            let receipt = consolidator.submit_batch(pipelined_batch).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+            assert_eq!(receipt.target_epoch, 2);
         }
 
         let waiter_queue = Arc::clone(&queue);
@@ -18421,20 +18492,18 @@ mod tests {
                 page_data: sample_page(0x41),
                 db_size_if_commit: 1,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(batch1).unwrap(),
-                SubmitOutcome::Flusher
-            );
+            let receipt = consolidator.submit_batch(batch1).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Flusher);
+            assert_eq!(receipt.target_epoch, 1);
             let _ = consolidator.begin_flush().unwrap();
             let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 2,
                 page_data: sample_page(0x42),
                 db_size_if_commit: 2,
             }]);
-            assert_eq!(
-                consolidator.submit_batch(pipelined_batch).unwrap(),
-                SubmitOutcome::Waiter
-            );
+            let receipt = consolidator.submit_batch(pipelined_batch).unwrap();
+            assert_eq!(receipt.outcome, SubmitOutcome::Waiter);
+            assert_eq!(receipt.target_epoch, 2);
         }
 
         let _failed_slot = queue.epoch_waiters.slot(1);
