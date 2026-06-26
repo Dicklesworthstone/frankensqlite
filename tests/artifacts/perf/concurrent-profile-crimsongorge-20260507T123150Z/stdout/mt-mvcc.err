@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=1000 threads=[2, 4, 8] iters=5 apples_to_apples=false
-mt-mvcc-bench: wrote json report /data/projects/frankensqlite/tests/artifacts/perf/concurrent-profile-crimsongorge-20260507T123150Z/mt-mvcc.json
-mt-mvcc-bench: wrote markdown summary /data/projects/frankensqlite/tests/artifacts/perf/concurrent-profile-crimsongorge-20260507T123150Z/mt-mvcc-summary.md
-mt-mvcc-bench: updated pass-over-pass history /data/tmp/frankensqlite-concurrent-profile-history-crimsongorge.json

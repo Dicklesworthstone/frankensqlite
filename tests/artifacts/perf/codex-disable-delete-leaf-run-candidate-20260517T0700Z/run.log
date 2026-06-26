@@ -1,270 +1,0 @@
-[RCH] local (no admissible workers: critical_pressure=5)
-   Compiling cfg-if v1.0.4
-   Compiling proc-macro2 v1.0.106
-   Compiling quote v1.0.45
-   Compiling unicode-ident v1.0.24
-   Compiling libc v0.2.185
-   Compiling serde_core v1.0.228
-   Compiling typenum v1.20.0
-   Compiling serde v1.0.228
-   Compiling allocator-api2 v0.2.21
-   Compiling version_check v0.9.5
-   Compiling once_cell v1.21.4
-   Compiling autocfg v1.5.0
-   Compiling foldhash v0.2.0
-   Compiling equivalent v1.0.2
-   Compiling memchr v2.8.0
-   Compiling shlex v1.3.0
-   Compiling find-msvc-tools v0.1.9
-   Compiling crossbeam-utils v0.8.21
-   Compiling cfg_aliases v0.2.1
-   Compiling zmij v1.0.21
-   Compiling serde_json v1.0.149
-   Compiling cmov v0.5.3
-   Compiling smallvec v1.15.1
-   Compiling parking_lot_core v0.9.12
-   Compiling itoa v1.0.18
-   Compiling anyhow v1.0.102
-   Compiling rustix v1.1.4
-   Compiling regex-syntax v0.8.10
-   Compiling const-oid v0.10.2
-   Compiling either v1.15.0
-   Compiling thiserror v2.0.18
-   Compiling pin-project-lite v0.2.17
-   Compiling cpufeatures v0.3.0
-   Compiling scopeguard v1.2.0
-   Compiling linux-raw-sys v0.12.1
-   Compiling getrandom v0.4.2
-   Compiling nix v0.31.2
-   Compiling cc v1.2.60
-   Compiling tracing-core v0.1.36
-   Compiling lock_api v0.4.14
-   Compiling io-uring v0.7.12
-   Compiling crc32fast v1.5.0
-   Compiling virtue-next v0.1.3
-   Compiling fastrand v2.4.1
-   Compiling ctutils v0.4.2
-   Compiling signal-hook v0.4.4
-   Compiling lazy_static v1.5.0
-   Compiling log v0.4.29
-   Compiling generic-array v0.14.7
-   Compiling itertools v0.14.0
-   Compiling sharded-slab v0.1.7
-   Compiling thread_local v1.1.9
-   Compiling parking v2.2.1
-   Compiling unty-next v0.1.1
-   Compiling nu-ansi-term v0.50.3
-   Compiling futures-io v0.3.32
-   Compiling hashbrown v0.17.0
-   Compiling num-traits v0.2.19
-   Compiling memoffset v0.9.1
-   Compiling futures-core v0.3.32
-   Compiling bytes v1.11.1
-   Compiling slab v0.4.12
-   Compiling arrayvec v0.7.6
-   Compiling constant_time_eq v0.4.2
-   Compiling base64 v0.22.1
-   Compiling arrayref v0.3.9
-   Compiling xxhash-rust v0.8.15
-   Compiling zerocopy v0.8.48
-   Compiling futures-lite v2.6.1
-   Compiling simdutf8 v0.1.5
-   Compiling ahash v0.8.12
-   Compiling subtle v2.6.1
-   Compiling iana-time-zone v0.1.65
-   Compiling cpufeatures v0.2.17
-   Compiling aho-corasick v1.1.4
-   Compiling semver v1.0.28
-   Compiling nix v0.29.0
-   Compiling zeroize v1.8.2
-   Compiling opaque-debug v0.3.1
-   Compiling tracing-log v0.2.0
-   Compiling pollster v0.4.0
-   Compiling base64ct v1.8.3
-   Compiling bumpalo v3.20.2
-   Compiling hashbrown v0.16.1
-   Compiling ucd-trie v0.1.7
-   Compiling crossbeam-epoch v0.9.18
-   Compiling crossbeam-queue v0.3.12
-   Compiling pkg-config v0.3.33
-   Compiling vcpkg v0.2.15
-   Compiling bincode_derive-next v2.1.0
-   Compiling rustc_version v0.4.1
-   Compiling winnow v0.7.15
-   Compiling toml_write v0.1.2
-   Compiling fallible-streaming-iterator v0.1.9
-   Compiling syn v2.0.117
-   Compiling fallible-iterator v0.3.0
-   Compiling hybrid-array v0.4.10
-   Compiling crossbeam-deque v0.8.6
-   Compiling crc32c v0.6.8
-   Compiling blake3 v1.8.4
-   Compiling libsqlite3-sys v0.30.1
-   Compiling indexmap v2.14.0
-   Compiling rmp v0.8.15
-   Compiling chrono v0.4.44
-   Compiling crypto-common v0.2.1
-   Compiling block-buffer v0.12.0
-   Compiling lru v0.16.4
-   Compiling block-buffer v0.10.4
-   Compiling inout v0.1.4
-   Compiling getrandom v0.2.17
-   Compiling errno v0.3.14
-   Compiling socket2 v0.6.3
-   Compiling signal-hook-registry v1.4.8
-   Compiling rand_core v0.6.4
-   Compiling regex-automata v0.4.14
-   Compiling parking_lot v0.12.5
-   Compiling digest v0.11.2
-   Compiling crypto-common v0.1.7
-   Compiling password-hash v0.5.0
-   Compiling digest v0.10.7
-   Compiling cipher v0.4.4
-   Compiling universal-hash v0.5.1
-   Compiling aead v0.5.2
-   Compiling hmac v0.13.0
-   Compiling sha2 v0.11.0
-   Compiling sha1 v0.11.0
-   Compiling poly1305 v0.8.0
-   Compiling blake2 v0.10.6
-   Compiling sha2 v0.10.9
-   Compiling chacha20 v0.9.1
-   Compiling bitflags v2.11.1
-   Compiling chacha20poly1305 v0.10.1
-   Compiling argon2 v0.5.3
-   Compiling serde_derive v1.0.228
-   Compiling tracing-attributes v0.1.31
-   Compiling thiserror-impl v2.0.18
-   Compiling pin-project-internal v1.1.11
-   Compiling prost-derive v0.13.5
-   Compiling asupersync-macros v0.3.1
-   Compiling visibility v0.1.1
-   Compiling ppv-lite86 v0.2.21
-   Compiling rand_chacha v0.3.1
-   Compiling pin-project v1.1.11
-   Compiling tracing v0.1.44
-   Compiling rand v0.8.6
-   Compiling fsqlite-error v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-error)
-   Compiling prost v0.13.5
-   Compiling matchers v0.2.0
-   Compiling regex v1.12.3
-   Compiling polling v3.11.0
-   Compiling tempfile v3.27.0
-   Compiling franken-kernel v0.3.1
-   Compiling franken-evidence v0.3.1
-   Compiling tracing-serde v0.2.0
-   Compiling rmp-serde v1.3.1
-   Compiling hashbrown v0.14.5
-   Compiling json5 v1.3.1
-   Compiling serde_spanned v0.6.9
-   Compiling toml_datetime v0.6.11
-   Compiling bincode-next v2.1.0
-   Compiling tracing-subscriber v0.3.23
-   Compiling toml_edit v0.22.27
-   Compiling franken-decision v0.3.1
-   Compiling dashmap v6.1.0
-   Compiling hashlink v0.9.1
-   Compiling asupersync v0.3.1
-   Compiling toml v0.8.23
-   Compiling rusqlite v0.32.1
-   Compiling fsqlite-types v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-types)
-   Compiling fsqlite-func v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-func)
-   Compiling fsqlite-observability v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-observability)
-   Compiling fsqlite-ast v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ast)
-   Compiling fsqlite-vfs v0.1.5 (/data/projects/frankensqlite/crates/fsqlite-vfs)
-   Compiling fsqlite-parser v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-parser)
-   Compiling fsqlite-ext-icu v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)
-   Compiling fsqlite-ext-rtree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)
-   Compiling fsqlite-ext-json v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-json)
-   Compiling fsqlite-ext-misc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)
-   Compiling fsqlite-ext-fts5 v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)
-   Compiling fsqlite-wal v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-wal)
-   Compiling fsqlite-planner v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-planner)
-   Compiling fsqlite-pager v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-pager)
-   Compiling fsqlite-btree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-btree)
-   Compiling fsqlite-mvcc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-mvcc)
-   Compiling fsqlite-vdbe v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-vdbe)
-   Compiling fsqlite-core v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-core)
-   Compiling fsqlite v0.1.3 (/data/projects/frankensqlite/crates/fsqlite)
-   Compiling fsqlite-harness v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-harness)
-   Compiling fsqlite-e2e v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 4m 04s
-     Running `/data/tmp/frankensqlite-disable-delete-run-bench-20260517/release-perf/comprehensive-bench --quick --filter update-delete --json-out tests/artifacts/perf/codex-disable-delete-leaf-run-candidate-20260517T0700Z/update-delete.json --no-html`
-
-================================================================================
-  Comprehensive FrankenSQLite vs C SQLite Benchmark
-================================================================================
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-19-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 499.3 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (d7f14d3d8 2026-05-15)
-  Cargo: cargo 1.97.0-nightly (a343accce 2026-05-08)
-  Git: main @ 6b4181415c1e1a38c013b895cdca5f8ace522aaa
-  Git dirty: yes
-  Binary modified: 2026-05-17 05:44:53 UTC
-  Build: release-perf (opt-level 3, LTO)
-  Mode: quick
-  Row counts: [100, 1000, 10000]
-  Measurement: 2 warmup, 3-10 iters, target 5s
-  Filter: update-delete
-================================================================================
-
-
-[1/10] UPDATE/DELETE throughput
-  Benchmarking update 10/100 rows...     [cs_update_100] warmup 1/2...    [cs_update_100] warmup 2/2...    [cs_update_100] iter 1/10 (total: 0.0s)        [cs_update_100] iter 2/10 (total: 0.0s)        [cs_update_100] iter 3/10 (total: 0.0s)        [cs_update_100] iter 4/10 (total: 0.0s)        [cs_update_100] iter 5/10 (total: 0.0s)        [cs_update_100] iter 6/10 (total: 0.0s)        [cs_update_100] iter 7/10 (total: 0.0s)        [cs_update_100] iter 8/10 (total: 0.0s)        [cs_update_100] iter 9/10 (total: 0.0s)        [cs_update_100] iter 10/10 (total: 0.0s)                                                                                        [fs_update_100] warmup 1/2...    [fs_update_100] warmup 2/2...    [fs_update_100] iter 1/10 (total: 0.0s)        [fs_update_100] iter 2/10 (total: 0.0s)        [fs_update_100] iter 3/10 (total: 0.0s)        [fs_update_100] iter 4/10 (total: 0.0s)        [fs_update_100] iter 5/10 (total: 0.0s)        [fs_update_100] iter 6/10 (total: 0.0s)        [fs_update_100] iter 7/10 (total: 0.0s)        [fs_update_100] iter 8/10 (total: 0.0s)        [fs_update_100] iter 9/10 (total: 0.0s)        [fs_update_100] iter 10/10 (total: 0.0s)                                                                                        [fs_update_100] dml_profile setup_us=120.1 begin_us=7.7 prepare_us=15.8 mutate_us=6.0 commit_us=6.7 mutations=10 direct_update=10 direct_delete=0 delete_qf_ns=0 delete_seek_ns=0 delete_physical_ns=0 delete_leaf_start=0/0 delete_leaf_start_ns=0 delete_leaf_active=0/0 delete_leaf_miss=0 delete_leaf_miss_shape=0 delete_leaf_miss_staged=0 delete_leaf_miss_out_of_leaf=0 delete_leaf_miss_duplicate=0 delete_leaf_miss_empty_leaf=0 delete_leaf_miss_last_cell=0 delete_leaf_miss_noncompact=0 delete_leaf_miss_cell_shape=0 delete_leaf_active_ns=0 delete_leaf_flush=0/0 delete_leaf_flush_ns=0 delete_leaf_materialize=0/0 delete_leaf_write=0/0 delete_leaf_search=0/0 delete_leaf_dupcheck=0/0 delete_leaf_compact=0/0 delete_leaf_cellparse=0/0 fast=10 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=2405 execute_body_ns=7334 direct_flush_calls=2 direct_flush_ns=481 commit_pre_ns=461 commit_roundtrip_ns=1894 pager_commit_calls=1 pager_phase_a_ns=491 pager_wal_ns=0 pager_mem_flush_ns=351 pager_journal_ns=0 pager_c_metadata_ns=221 pager_file_size_ns=30 pager_unlock_ns=20 pager_publish_ns=80 pager_cache_finish_ns=501 commit_finalize_ns=531 commit_handle_ns=862 post_write_ns=70 finalize_post_ns=1032 parser_multi_calls=2 parser_cache_hits=3 parser_cache_misses=0 parser_parse_ns=0 parser_rewrite_ns=430 bg_checks=14 bg_ns=391 op_cx_bg_gates=1 dispatch_bg_gates=0 pager_pub_refreshes=0 commit_refreshes=0 prepared_lookup_ns=2304 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=0 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=4.2 us F=6.4 us
-  Benchmarking delete 5/100 rows...     [cs_delete_100] warmup 1/2...    [cs_delete_100] warmup 2/2...    [cs_delete_100] iter 1/10 (total: 0.0s)        [cs_delete_100] iter 2/10 (total: 0.0s)        [cs_delete_100] iter 3/10 (total: 0.0s)        [cs_delete_100] iter 4/10 (total: 0.0s)        [cs_delete_100] iter 5/10 (total: 0.0s)        [cs_delete_100] iter 6/10 (total: 0.0s)        [cs_delete_100] iter 7/10 (total: 0.0s)        [cs_delete_100] iter 8/10 (total: 0.0s)        [cs_delete_100] iter 9/10 (total: 0.0s)        [cs_delete_100] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_100] warmup 1/2...    [fs_delete_100] warmup 2/2...    [fs_delete_100] iter 1/10 (total: 0.0s)        [fs_delete_100] iter 2/10 (total: 0.0s)        [fs_delete_100] iter 3/10 (total: 0.0s)        [fs_delete_100] iter 4/10 (total: 0.0s)        [fs_delete_100] iter 5/10 (total: 0.0s)        [fs_delete_100] iter 6/10 (total: 0.0s)        [fs_delete_100] iter 7/10 (total: 0.0s)        [fs_delete_100] iter 8/10 (total: 0.0s)        [fs_delete_100] iter 9/10 (total: 0.0s)        [fs_delete_100] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_100] dml_profile setup_us=62.6 begin_us=4.9 prepare_us=13.6 mutate_us=8.7 commit_us=5.8 mutations=5 direct_update=0 direct_delete=5 delete_qf_ns=140 delete_seek_ns=2065 delete_physical_ns=3898 delete_leaf_start=0/0 delete_leaf_start_ns=0 delete_leaf_active=0/0 delete_leaf_miss=0 delete_leaf_miss_shape=0 delete_leaf_miss_staged=0 delete_leaf_miss_out_of_leaf=0 delete_leaf_miss_duplicate=0 delete_leaf_miss_empty_leaf=0 delete_leaf_miss_last_cell=0 delete_leaf_miss_noncompact=0 delete_leaf_miss_cell_shape=0 delete_leaf_active_ns=0 delete_leaf_flush=0/0 delete_leaf_flush_ns=0 delete_leaf_materialize=0/0 delete_leaf_write=0/0 delete_leaf_search=0/0 delete_leaf_dupcheck=0/0 delete_leaf_compact=0/0 delete_leaf_cellparse=0/0 fast=5 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=2004 execute_body_ns=5971 direct_flush_calls=2 direct_flush_ns=70 commit_pre_ns=471 commit_roundtrip_ns=1573 pager_commit_calls=1 pager_phase_a_ns=320 pager_wal_ns=0 pager_mem_flush_ns=321 pager_journal_ns=0 pager_c_metadata_ns=191 pager_file_size_ns=40 pager_unlock_ns=30 pager_publish_ns=70 pager_cache_finish_ns=391 commit_finalize_ns=451 commit_handle_ns=771 post_write_ns=60 finalize_post_ns=921 parser_multi_calls=2 parser_cache_hits=3 parser_cache_misses=0 parser_parse_ns=0 parser_rewrite_ns=280 bg_checks=9 bg_ns=250 op_cx_bg_gates=1 dispatch_bg_gates=0 pager_pub_refreshes=0 commit_refreshes=0 prepared_lookup_ns=1964 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=0 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=2.3 us F=9.4 us
-  Benchmarking update 100/1000 rows...     [cs_update_1000] warmup 1/2...    [cs_update_1000] warmup 2/2...    [cs_update_1000] iter 1/10 (total: 0.0s)        [cs_update_1000] iter 2/10 (total: 0.0s)        [cs_update_1000] iter 3/10 (total: 0.0s)        [cs_update_1000] iter 4/10 (total: 0.0s)        [cs_update_1000] iter 5/10 (total: 0.0s)        [cs_update_1000] iter 6/10 (total: 0.0s)        [cs_update_1000] iter 7/10 (total: 0.0s)        [cs_update_1000] iter 8/10 (total: 0.0s)        [cs_update_1000] iter 9/10 (total: 0.0s)        [cs_update_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_1000] warmup 1/2...    [fs_update_1000] warmup 2/2...    [fs_update_1000] iter 1/10 (total: 0.0s)        [fs_update_1000] iter 2/10 (total: 0.0s)        [fs_update_1000] iter 3/10 (total: 0.0s)        [fs_update_1000] iter 4/10 (total: 0.0s)        [fs_update_1000] iter 5/10 (total: 0.0s)        [fs_update_1000] iter 6/10 (total: 0.0s)        [fs_update_1000] iter 7/10 (total: 0.0s)        [fs_update_1000] iter 8/10 (total: 0.0s)        [fs_update_1000] iter 9/10 (total: 0.0s)        [fs_update_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_1000] dml_profile setup_us=307.8 begin_us=5.8 prepare_us=16.3 mutate_us=33.6 commit_us=9.9 mutations=100 direct_update=100 direct_delete=0 delete_qf_ns=0 delete_seek_ns=0 delete_physical_ns=0 delete_leaf_start=0/0 delete_leaf_start_ns=0 delete_leaf_active=0/0 delete_leaf_miss=0 delete_leaf_miss_shape=0 delete_leaf_miss_staged=0 delete_leaf_miss_out_of_leaf=0 delete_leaf_miss_duplicate=0 delete_leaf_miss_empty_leaf=0 delete_leaf_miss_last_cell=0 delete_leaf_miss_noncompact=0 delete_leaf_miss_cell_shape=0 delete_leaf_active_ns=0 delete_leaf_flush=0/0 delete_leaf_flush_ns=0 delete_leaf_materialize=0/0 delete_leaf_write=0/0 delete_leaf_search=0/0 delete_leaf_dupcheck=0/0 delete_leaf_compact=0/0 delete_leaf_cellparse=0/0 fast=100 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=2605 execute_body_ns=10680 direct_flush_calls=2 direct_flush_ns=290 commit_pre_ns=1553 commit_roundtrip_ns=3958 pager_commit_calls=1 pager_phase_a_ns=741 pager_wal_ns=0 pager_mem_flush_ns=1002 pager_journal_ns=0 pager_c_metadata_ns=321 pager_file_size_ns=40 pager_unlock_ns=41 pager_publish_ns=80 pager_cache_finish_ns=1553 commit_finalize_ns=581 commit_handle_ns=992 post_write_ns=120 finalize_post_ns=1212 parser_multi_calls=2 parser_cache_hits=3 parser_cache_misses=0 parser_parse_ns=0 parser_rewrite_ns=360 bg_checks=104 bg_ns=2826 op_cx_bg_gates=1 dispatch_bg_gates=0 pager_pub_refreshes=0 commit_refreshes=0 prepared_lookup_ns=2474 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=7 page_pool_misses=1 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=38.0 us F=30.4 us
-  Benchmarking delete 50/1000 rows...     [cs_delete_1000] warmup 1/2...    [cs_delete_1000] warmup 2/2...    [cs_delete_1000] iter 1/10 (total: 0.0s)        [cs_delete_1000] iter 2/10 (total: 0.0s)        [cs_delete_1000] iter 3/10 (total: 0.0s)        [cs_delete_1000] iter 4/10 (total: 0.0s)        [cs_delete_1000] iter 5/10 (total: 0.0s)        [cs_delete_1000] iter 6/10 (total: 0.0s)        [cs_delete_1000] iter 7/10 (total: 0.0s)        [cs_delete_1000] iter 8/10 (total: 0.0s)        [cs_delete_1000] iter 9/10 (total: 0.0s)        [cs_delete_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_1000] warmup 1/2...    [fs_delete_1000] warmup 2/2...    [fs_delete_1000] iter 1/10 (total: 0.0s)        [fs_delete_1000] iter 2/10 (total: 0.0s)        [fs_delete_1000] iter 3/10 (total: 0.0s)        [fs_delete_1000] iter 4/10 (total: 0.0s)        [fs_delete_1000] iter 5/10 (total: 0.0s)        [fs_delete_1000] iter 6/10 (total: 0.0s)        [fs_delete_1000] iter 7/10 (total: 0.0s)        [fs_delete_1000] iter 8/10 (total: 0.0s)        [fs_delete_1000] iter 9/10 (total: 0.0s)        [fs_delete_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_1000] dml_profile setup_us=285.1 begin_us=5.7 prepare_us=14.5 mutate_us=65.8 commit_us=9.8 mutations=50 direct_update=0 direct_delete=50 delete_qf_ns=1212 delete_seek_ns=18626 delete_physical_ns=30103 delete_leaf_start=0/0 delete_leaf_start_ns=0 delete_leaf_active=0/0 delete_leaf_miss=0 delete_leaf_miss_shape=0 delete_leaf_miss_staged=0 delete_leaf_miss_out_of_leaf=0 delete_leaf_miss_duplicate=0 delete_leaf_miss_empty_leaf=0 delete_leaf_miss_last_cell=0 delete_leaf_miss_noncompact=0 delete_leaf_miss_cell_shape=0 delete_leaf_active_ns=0 delete_leaf_flush=0/0 delete_leaf_flush_ns=0 delete_leaf_materialize=0/0 delete_leaf_write=0/0 delete_leaf_search=0/0 delete_leaf_dupcheck=0/0 delete_leaf_compact=0/0 delete_leaf_cellparse=0/0 fast=50 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=2464 execute_body_ns=10118 direct_flush_calls=2 direct_flush_ns=100 commit_pre_ns=1433 commit_roundtrip_ns=4058 pager_commit_calls=1 pager_phase_a_ns=1042 pager_wal_ns=0 pager_mem_flush_ns=1093 pager_journal_ns=0 pager_c_metadata_ns=210 pager_file_size_ns=40 pager_unlock_ns=20 pager_publish_ns=80 pager_cache_finish_ns=1313 commit_finalize_ns=551 commit_handle_ns=882 post_write_ns=60 finalize_post_ns=1032 parser_multi_calls=2 parser_cache_hits=3 parser_cache_misses=0 parser_parse_ns=0 parser_rewrite_ns=290 bg_checks=54 bg_ns=1452 op_cx_bg_gates=1 dispatch_bg_gates=0 pager_pub_refreshes=0 commit_refreshes=0 prepared_lookup_ns=1934 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=6 page_pool_misses=1 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=16.2 us F=68.1 us
-  Benchmarking update 1000/10000 rows...     [cs_update_10000] warmup 1/2...    [cs_update_10000] warmup 2/2...    [cs_update_10000] iter 1/10 (total: 0.0s)        [cs_update_10000] iter 2/10 (total: 0.0s)        [cs_update_10000] iter 3/10 (total: 0.0s)        [cs_update_10000] iter 4/10 (total: 0.0s)        [cs_update_10000] iter 5/10 (total: 0.0s)        [cs_update_10000] iter 6/10 (total: 0.0s)        [cs_update_10000] iter 7/10 (total: 0.0s)        [cs_update_10000] iter 8/10 (total: 0.0s)        [cs_update_10000] iter 9/10 (total: 0.0s)        [cs_update_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_10000] warmup 1/2...    [fs_update_10000] warmup 2/2...    [fs_update_10000] iter 1/10 (total: 0.0s)        [fs_update_10000] iter 2/10 (total: 0.0s)        [fs_update_10000] iter 3/10 (total: 0.0s)        [fs_update_10000] iter 4/10 (total: 0.0s)        [fs_update_10000] iter 5/10 (total: 0.0s)        [fs_update_10000] iter 6/10 (total: 0.0s)        [fs_update_10000] iter 7/10 (total: 0.0s)        [fs_update_10000] iter 8/10 (total: 0.0s)        [fs_update_10000] iter 9/10 (total: 0.0s)        [fs_update_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_10000] dml_profile setup_us=2575.4 begin_us=8.2 prepare_us=20.1 mutate_us=317.4 commit_us=36.6 mutations=1000 direct_update=1000 direct_delete=0 delete_qf_ns=0 delete_seek_ns=0 delete_physical_ns=0 delete_leaf_start=0/0 delete_leaf_start_ns=0 delete_leaf_active=0/0 delete_leaf_miss=0 delete_leaf_miss_shape=0 delete_leaf_miss_staged=0 delete_leaf_miss_out_of_leaf=0 delete_leaf_miss_duplicate=0 delete_leaf_miss_empty_leaf=0 delete_leaf_miss_last_cell=0 delete_leaf_miss_noncompact=0 delete_leaf_miss_cell_shape=0 delete_leaf_active_ns=0 delete_leaf_flush=0/0 delete_leaf_flush_ns=0 delete_leaf_materialize=0/0 delete_leaf_write=0/0 delete_leaf_search=0/0 delete_leaf_dupcheck=0/0 delete_leaf_compact=0/0 delete_leaf_cellparse=0/0 fast=1000 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=50 begin_ns=3747 execute_body_ns=37751 direct_flush_calls=2 direct_flush_ns=340 commit_pre_ns=5510 commit_roundtrip_ns=25157 pager_commit_calls=1 pager_phase_a_ns=832 pager_wal_ns=0 pager_mem_flush_ns=9317 pager_journal_ns=0 pager_c_metadata_ns=311 pager_file_size_ns=90 pager_unlock_ns=20 pager_publish_ns=70 pager_cache_finish_ns=14327 commit_finalize_ns=1112 commit_handle_ns=1203 post_write_ns=80 finalize_post_ns=1363 parser_multi_calls=2 parser_cache_hits=3 parser_cache_misses=0 parser_parse_ns=0 parser_rewrite_ns=611 bg_checks=1004 bg_ns=27792 op_cx_bg_gates=1 dispatch_bg_gates=0 pager_pub_refreshes=0 commit_refreshes=0 prepared_lookup_ns=2294 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=64 page_pool_misses=1 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=366.1 us F=259.7 us
-  Benchmarking delete 500/10000 rows...     [cs_delete_10000] warmup 1/2...    [cs_delete_10000] warmup 2/2...    [cs_delete_10000] iter 1/10 (total: 0.0s)        [cs_delete_10000] iter 2/10 (total: 0.0s)        [cs_delete_10000] iter 3/10 (total: 0.0s)        [cs_delete_10000] iter 4/10 (total: 0.0s)        [cs_delete_10000] iter 5/10 (total: 0.0s)        [cs_delete_10000] iter 6/10 (total: 0.0s)        [cs_delete_10000] iter 7/10 (total: 0.0s)        [cs_delete_10000] iter 8/10 (total: 0.0s)        [cs_delete_10000] iter 9/10 (total: 0.0s)        [cs_delete_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_10000] warmup 1/2...    [fs_delete_10000] warmup 2/2...    [fs_delete_10000] iter 1/10 (total: 0.0s)        [fs_delete_10000] iter 2/10 (total: 0.0s)        [fs_delete_10000] iter 3/10 (total: 0.0s)        [fs_delete_10000] iter 4/10 (total: 0.0s)        [fs_delete_10000] iter 5/10 (total: 0.0s)        [fs_delete_10000] iter 6/10 (total: 0.0s)        [fs_delete_10000] iter 7/10 (total: 0.0s)        [fs_delete_10000] iter 8/10 (total: 0.0s)        [fs_delete_10000] iter 9/10 (total: 0.0s)        [fs_delete_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_10000] dml_profile setup_us=2374.4 begin_us=7.8 prepare_us=23.1 mutate_us=622.9 commit_us=35.8 mutations=500 direct_update=0 direct_delete=500 delete_qf_ns=11963 delete_seek_ns=170071 delete_physical_ns=297892 delete_leaf_start=0/0 delete_leaf_start_ns=0 delete_leaf_active=0/0 delete_leaf_miss=0 delete_leaf_miss_shape=0 delete_leaf_miss_staged=0 delete_leaf_miss_out_of_leaf=0 delete_leaf_miss_duplicate=0 delete_leaf_miss_empty_leaf=0 delete_leaf_miss_last_cell=0 delete_leaf_miss_noncompact=0 delete_leaf_miss_cell_shape=0 delete_leaf_active_ns=0 delete_leaf_flush=0/0 delete_leaf_flush_ns=0 delete_leaf_materialize=0/0 delete_leaf_write=0/0 delete_leaf_search=0/0 delete_leaf_dupcheck=0/0 delete_leaf_compact=0/0 delete_leaf_cellparse=0/0 fast=500 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=3136 execute_body_ns=36398 direct_flush_calls=2 direct_flush_ns=90 commit_pre_ns=5610 commit_roundtrip_ns=24697 pager_commit_calls=1 pager_phase_a_ns=681 pager_wal_ns=0 pager_mem_flush_ns=9878 pager_journal_ns=0 pager_c_metadata_ns=320 pager_file_size_ns=60 pager_unlock_ns=40 pager_publish_ns=80 pager_cache_finish_ns=13405 commit_finalize_ns=962 commit_handle_ns=1112 post_write_ns=110 finalize_post_ns=1312 parser_multi_calls=2 parser_cache_hits=3 parser_cache_misses=0 parser_parse_ns=0 parser_rewrite_ns=351 bg_checks=504 bg_ns=13946 op_cx_bg_gates=1 dispatch_bg_gates=0 pager_pub_refreshes=0 commit_refreshes=0 prepared_lookup_ns=2354 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=65 page_pool_misses=1 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=159.5 us F=655.2 us
-
-Benchmark complete in 0.2s. Generating reports...
-
-============================================================================================================================================
-  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
-  2026-05-17 05:44:53 UTC
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-19-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 499.3 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (d7f14d3d8 2026-05-15)
-  Cargo: cargo 1.97.0-nightly (a343accce 2026-05-08)
-  Git: main @ 6b4181415c1e1a38c013b895cdca5f8ace522aaa
-  Git dirty: yes
-  Binary modified: 2026-05-17 05:44:53 UTC
-  Build: release-perf (opt-level 3, LTO)
-  Total benchmark time: 0.2s
-============================================================================================================================================
-
-
-## UPDATE/DELETE Throughput
-   Pre-populated table with N rows. Measures batch update (10% of rows) and batch delete (5% of rows).
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  100 rows / update 10 rows                        4.2 us       6.4 us      2.37M/s      1.57M/s 1.51x [31mslower[0m     8.4%     4.2%
-  100 rows / delete 5 rows                         2.3 us       9.4 us      2.16M/s     534.4K/s 4.04x [31mslower[0m     3.1%    33.1%
-  1000 rows / update 100 rows                     38.0 us      30.4 us      2.63M/s      3.29M/s 1.25x [32mfaster[0m    39.9%   193.8%
-  1000 rows / delete 50 rows                      16.2 us      68.1 us      3.09M/s     734.0K/s 4.21x [31mslower[0m    61.7%     8.6%
-  10000 rows / update 1000 rows                  366.1 us     259.7 us      2.73M/s      3.85M/s 1.41x [32mfaster[0m     2.2%    13.8%
-  10000 rows / delete 500 rows                   159.5 us     655.2 us      3.13M/s     763.1K/s 4.11x [31mslower[0m     6.9%     1.8%
-
-========================================================================================================================
-  SUMMARY STATISTICS
-========================================================================================================================
-
-  Total scenarios: 6  |  FrankenSQLite faster: 2  |  Comparable: 0  |  C SQLite faster: 4
-  Average time ratio (FrankenSQLite / C SQLite): 2.56x
-
-JSON report written to: tests/artifacts/perf/codex-disable-delete-leaf-run-candidate-20260517T0700Z/update-delete.json

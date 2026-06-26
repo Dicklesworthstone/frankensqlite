@@ -1,1 +1,0 @@
-    Finished `release-perf` profile [optimized] target(s) in 0.14s

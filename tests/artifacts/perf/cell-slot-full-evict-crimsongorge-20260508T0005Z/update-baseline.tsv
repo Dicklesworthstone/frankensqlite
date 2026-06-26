@@ -1,6 +1,0 @@
-update-deletethroughput__100-rows-update-10-rows	100 rows / update 10 rows	0.824629060286058	0.14962	0.12338099999999999
-update-deletethroughput__100-rows-delete-5-rows	100 rows / delete 5 rows	1.385192596298149	0.083958	0.116298
-update-deletethroughput__1000-rows-update-100-rows	1000 rows / update 100 rows	0.9746935046422746	0.418114	0.40753300000000003
-update-deletethroughput__1000-rows-delete-50-rows	1000 rows / delete 50 rows	0.9250150432399906	0.402174	0.372017
-update-deletethroughput__10000-rows-update-1000-rows	10000 rows / update 1000 rows	0.8974752628617642	3.844321	3.450183
-update-deletethroughput__10000-rows-delete-500-rows	10000 rows / delete 500 rows	0.8788703697979227	3.623168	3.184295

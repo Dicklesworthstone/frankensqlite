@@ -1,7 +1,0 @@
-insertthroughput-single-transaction-tiny-1col__100-rows	1.0634515173188923	0.07285599999999999	0.068509
-insertthroughput-single-transaction-small-3col__100-rows	1.1680005353319058	0.087273	0.07472000000000001
-insertthroughput-single-transaction-medium-6col__100-rows	1.1089407210838205	0.11115799999999999	0.100238
-insertthroughput-single-transaction-large-10col__100-rows	1.1632724358315694	0.169818	0.145983
-insertthroughput-single-transaction-large-10col__10000-rows	1.0622245163013286	10.118721	9.525972000000001
-insertthroughput-transaction-strategy-comparison-small-3col__100-rows-batched-100-txn	1.1667531524051684	0.089938	0.077084
-insertthroughput-transaction-strategy-comparison-small-3col__100-rows-single-txn	1.1605891260938903	0.086602	0.074619

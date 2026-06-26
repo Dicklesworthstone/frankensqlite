@@ -1,2 +1,0 @@
-threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
-      2 |       98661 |     118654 |             0.83x |          106786 |          108260 |         128964 |         132375 |           2.03 |           2.79 |           3.00 |          1.69 |          2.69 |          2.75 |       1.20x |              0 |             0

@@ -1,9 +1,0 @@
-[RCH] local (no admissible workers: critical_pressure=6)
-    Finished `release-perf` profile [optimized] target(s) in 0.14s
-     Running `/data/tmp/frankensqlite-fresh-eyes-20260517i/release-perf/perf-update-delete 100 1000 update compare standard`
-perf-update-delete: rows=100 iters=1000 which=update engine=compare mode=standard (do_update=true do_delete=false update_count=10 delete_count=5)
-  (first iter complete)
-fsqlite: total=146ms populate=32ms update=7ms delete=0ms  |  per-row-update=782ns  per-row-delete=0ns
-  (first sqlite iter complete)
-sqlite: total=76ms populate=28ms update=4ms delete=0ms  |  per-row-update=417ns  per-row-delete=0ns
-fsqlite/sqlite time ratio: total=1.92x populate=1.11x update=1.87x delete=0.00x

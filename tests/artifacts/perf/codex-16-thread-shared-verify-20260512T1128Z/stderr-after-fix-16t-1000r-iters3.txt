@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=1000 threads=[16] iters=3 apples_to_apples=false separate_tables=false
-mt-mvcc-bench: wrote json report tests/artifacts/perf/codex-16-thread-shared-verify-20260512T1128Z/after-fix-16t-1000r-iters3.json
-mt-mvcc-bench: wrote markdown summary tests/artifacts/perf/codex-16-thread-shared-verify-20260512T1128Z/summary-after-fix.md
-mt-mvcc-bench: updated pass-over-pass history tests/artifacts/perf/codex-16-thread-shared-verify-20260512T1128Z/history-after-fix-16t-1000r-iters3.json

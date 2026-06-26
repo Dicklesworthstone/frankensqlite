@@ -1,8 +1,0 @@
-mt-mvcc-bench: rows_per_thread=1000 threads=[16] iters=3 apples_to_apples=false separate_tables=false
-[fsqlite t8] INSERT 8000102 failed: database is busy (snapshot conflict on pages: 76)
-[fsqlite t8] INSERT 8000103 failed: database is busy (snapshot conflict on pages: 77)
-[fsqlite t8] INSERT 8000104 failed: database is busy (snapshot conflict on pages: 84)
-[fsqlite t8] INSERT 8000111 failed: database is busy (snapshot conflict on pages: 2)
-...
-[fsqlite t8] INSERT 8000999 failed: database is busy (snapshot conflict on pages: 2)
-error: [fsqlite t8] COMMIT failed: database is busy (snapshot conflict on pages: 76,77,78,79,80,81,82,83,84)

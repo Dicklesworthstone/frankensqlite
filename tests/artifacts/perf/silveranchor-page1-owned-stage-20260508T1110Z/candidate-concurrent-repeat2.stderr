@@ -1,563 +1,0 @@
-  [2m2026-05-08T11:19:28.767726Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ts2 at ubuntu@192.168.1.124 (20 slots, speed 50.0)[0m
-    [2;3mat[0m rch/src/hook.rs:314 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:29.152446Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankensqlite (hash: e425b324acb4981b)[0m
-    [2;3mat[0m rch/src/hook.rs:4933 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:29.152554Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 28 roots[0m
-    [2;3mat[0m rch/src/hook.rs:4955 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:30.627320Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ts2...[0m
-    [2;3mat[0m rch/src/hook.rs:4982 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:30.627413Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 1 pattern(s) from .rchignore (total: 51)[0m
-    [2;3mat[0m rch/src/transfer.rs:574 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:30.627425Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:31.356143Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 728ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:31.356291Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:31.681977Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 325ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:31.682138Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.005991Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 323ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.006089Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.327694Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 321ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.327809Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-c-api -> /data/projects/frankensqlite/crates/fsqlite-c-api on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.653352Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 325ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.653423Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-cli -> /data/projects/frankensqlite/crates/fsqlite-cli on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.987537Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 334ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:32.987607Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:33.318009Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 330ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:33.318080Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-e2e -> /data/projects/frankensqlite/crates/fsqlite-e2e on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:33.689013Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 370ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:33.689084Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.016291Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 327ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.016398Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts3 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts3 on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.346796Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 330ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.346926Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.668213Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 321ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.668321Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.988376Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 320ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:34.988483Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:35.314507Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 326ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:35.314640Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:35.646085Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 331ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:35.646211Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:35.974306Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 328ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:35.974414Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-session -> /data/projects/frankensqlite/crates/fsqlite-ext-session on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:36.300906Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 326ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:36.301055Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:36.638088Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 337ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:36.638201Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-harness -> /data/projects/frankensqlite/crates/fsqlite-harness on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:36.965753Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 327ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:36.965850Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:37.294827Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 328ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:37.294952Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:37.623278Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 328ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:37.623359Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:37.950044Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 326ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:37.950181Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:38.284100Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 333ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:38.284213Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:38.605634Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 321ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:38.605735Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:38.941320Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 335ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:38.941411Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:39.272387Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 330ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:39.272509Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:39.598380Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 325ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:39.598481Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:39.923719Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 325ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:39.923865Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wasm -> /data/projects/frankensqlite/crates/fsqlite-wasm on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:40.250498Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 326ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:40.250563Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 19354 files, 642423 bytes in 9606ms[0m
-    [2;3mat[0m rch/src/hook.rs:5142 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:40.550789Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: env 'CARGO_BUILD_JOBS=12' cargo run -p fsqlite-e2e --bin comprehensive-bench --profile release-perf -- --quick --filter concurrent --no-html --json-stdout[0m
-    [2;3mat[0m rch/src/hook.rs:5169 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:19:40.550819Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/frankensqlite-silveranchor-page1-target -> /data/projects/frankensqlite/.rch-target[0m
-    [2;3mat[0m rch/src/transfer.rs:499 [2;3mon[0m ThreadId(1)
-
-    Finished `release-perf` profile [optimized] target(s) in 1.65s
-     Running `.rch-target/release-perf/comprehensive-bench --quick --filter concurrent --no-html --json-stdout`
-
-================================================================================
-  Comprehensive FrankenSQLite vs C SQLite Benchmark
-================================================================================
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-23-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 247.2 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (f53b654a8 2026-04-30)
-  Cargo: cargo 1.97.0-nightly (eb9b60f1f 2026-04-24)
-  Git: main @ 36014ec4f6e2bca1515dace9c52e607e17772dc1
-  Binary modified: 2026-05-08 11:17:34 UTC
-  Build: release-perf (opt-level 3, LTO)
-  Mode: quick
-  Row counts: [100, 1000, 10000]
-  Measurement: 2 warmup, 3-10 iters, target 5s
-  Filter: concurrent
-================================================================================
-
-
-[1/10] Concurrent writers
-  Benchmarking 2 concurrent writers (2000 total rows)...     [cs_concurrent_2t] warmup 1/2...    [cs_concurrent_2t] warmup 2/2...    [cs_concurrent_2t] iter 1/10 (total: 0.0s)        [cs_concurrent_2t] iter 2/10 (total: 1.4s)        [cs_concurrent_2t] iter 3/10 (total: 2.4s)        [cs_concurrent_2t] iter 4/10 (total: 4.4s)                                                                                        [fs_concurrent_2t] warmup 1/2...    [fs_concurrent_2t] warmup 2/2...    [fs_concurrent_2t] iter 1/10 (total: 0.0s)        [fs_concurrent_2t] iter 2/10 (total: 0.1s)        [fs_concurrent_2t] iter 3/10 (total: 0.1s)        [fs_concurrent_2t] iter 4/10 (total: 0.2s)        [fs_concurrent_2t] iter 5/10 (total: 0.3s)        [fs_concurrent_2t] iter 6/10 (total: 0.3s)        [fs_concurrent_2t] iter 7/10 (total: 0.4s)        [fs_concurrent_2t] iter 8/10 (total: 0.6s)        [fs_concurrent_2t] iter 9/10 (total: 0.9s)        [fs_concurrent_2t] iter 10/10 (total: 1.1s)                                                                                    C=1.943 s F=120.01 ms
-  Benchmarking 4 concurrent writers (4000 total rows)...     [cs_concurrent_4t] warmup 1/2...    [cs_concurrent_4t] warmup 2/2...    [cs_concurrent_4t] iter 1/10 (total: 0.0s)        [cs_concurrent_4t] iter 2/10 (total: 1.2s)        [cs_concurrent_4t] iter 3/10 (total: 2.2s)        [cs_concurrent_4t] iter 4/10 (total: 2.9s)        [cs_concurrent_4t] iter 5/10 (total: 4.2s)                                                                                        [fs_concurrent_4t] warmup 1/2...    [fs_concurrent_4t] warmup 2/2...    [fs_concurrent_4t] iter 1/10 (total: 0.0s)        [fs_concurrent_4t] iter 2/10 (total: 0.1s)        [fs_concurrent_4t] iter 3/10 (total: 0.3s)        [fs_concurrent_4t] iter 4/10 (total: 0.4s)        [fs_concurrent_4t] iter 5/10 (total: 0.5s)        [fs_concurrent_4t] iter 6/10 (total: 0.6s)        [fs_concurrent_4t] iter 7/10 (total: 0.7s)        [fs_concurrent_4t] iter 8/10 (total: 0.8s)        [fs_concurrent_4t] iter 9/10 (total: 0.9s)        [fs_concurrent_4t] iter 10/10 (total: 1.0s)                                                                                    C=1.241 s F=101.68 ms
-  Benchmarking 8 concurrent writers (8000 total rows)...     [cs_concurrent_8t] warmup 1/2...    [cs_concurrent_8t] warmup 2/2...    [cs_concurrent_8t] iter 1/10 (total: 0.0s)        [cs_concurrent_8t] iter 2/10 (total: 1.5s)        [cs_concurrent_8t] iter 3/10 (total: 4.3s)        [cs_concurrent_8t] iter 4/10 (total: 5.7s)                                                                                        [fs_concurrent_8t] warmup 1/2...    [fs_concurrent_8t] warmup 2/2...    [fs_concurrent_8t] iter 1/10 (total: 0.0s)        [fs_concurrent_8t] iter 2/10 (total: 0.1s)        [fs_concurrent_8t] iter 3/10 (total: 0.2s)        [fs_concurrent_8t] iter 4/10 (total: 0.3s)        [fs_concurrent_8t] iter 5/10 (total: 0.4s)        [fs_concurrent_8t] iter 6/10 (total: 0.5s)        [fs_concurrent_8t] iter 7/10 (total: 0.6s)        [fs_concurrent_8t] iter 8/10 (total: 0.8s)        [fs_concurrent_8t] iter 9/10 (total: 0.9s)        [fs_concurrent_8t] iter 10/10 (total: 1.0s)                                                                                    C=1.463 s F=110.68 ms
-  Benchmarking C SQLite single-thread baseline (2000 rows)...     [cs_single_2t_equiv] warmup 1/2...    [cs_single_2t_equiv] warmup 2/2...    [cs_single_2t_equiv] iter 1/10 (total: 0.0s)        [cs_single_2t_equiv] iter 2/10 (total: 0.4s)        [cs_single_2t_equiv] iter 3/10 (total: 0.9s)        [cs_single_2t_equiv] iter 4/10 (total: 1.3s)        [cs_single_2t_equiv] iter 5/10 (total: 1.8s)        [cs_single_2t_equiv] iter 6/10 (total: 2.5s)        [cs_single_2t_equiv] iter 7/10 (total: 2.8s)        [cs_single_2t_equiv] iter 8/10 (total: 3.1s)        [cs_single_2t_equiv] iter 9/10 (total: 3.7s)        [cs_single_2t_equiv] iter 10/10 (total: 4.3s)                                                                                    C_single=512.15 ms
-  Benchmarking C SQLite single-thread baseline (4000 rows)...     [cs_single_4t_equiv] warmup 1/2...    [cs_single_4t_equiv] warmup 2/2...    [cs_single_4t_equiv] iter 1/10 (total: 0.0s)        [cs_single_4t_equiv] iter 2/10 (total: 0.4s)        [cs_single_4t_equiv] iter 3/10 (total: 0.9s)        [cs_single_4t_equiv] iter 4/10 (total: 1.3s)        [cs_single_4t_equiv] iter 5/10 (total: 2.0s)        [cs_single_4t_equiv] iter 6/10 (total: 2.4s)        [cs_single_4t_equiv] iter 7/10 (total: 3.0s)        [cs_single_4t_equiv] iter 8/10 (total: 3.6s)        [cs_single_4t_equiv] iter 9/10 (total: 4.2s)        [cs_single_4t_equiv] iter 10/10 (total: 4.6s)                                                                                    C_single=515.07 ms
-  Benchmarking C SQLite single-thread baseline (8000 rows)...     [cs_single_8t_equiv] warmup 1/2...    [cs_single_8t_equiv] warmup 2/2...    [cs_single_8t_equiv] iter 1/10 (total: 0.0s)        [cs_single_8t_equiv] iter 2/10 (total: 0.5s)        [cs_single_8t_equiv] iter 3/10 (total: 0.7s)        [cs_single_8t_equiv] iter 4/10 (total: 1.5s)        [cs_single_8t_equiv] iter 5/10 (total: 4.6s)                                                                                    C_single=568.41 ms
-
-Benchmark complete in 79.0s. Generating reports...
-{
-  "schema_version": "fsqlite-e2e.comprehensive-bench-report.v3",
-  "generated_at_utc": "2026-05-08 11:21:01 UTC",
-  "total_elapsed_ms": 78971,
-  "config": {
-    "quick": true,
-    "filter": "concurrent",
-    "warmup_iterations": 2,
-    "min_iterations": 3,
-    "max_iterations": 10,
-    "target_duration_secs": 5,
-    "row_counts": [
-      100,
-      1000,
-      10000
-    ],
-    "html_output_path": null,
-    "json_output_path": null,
-    "json_stdout": true
-  },
-  "environment": {
-    "os": "Ubuntu 25.10",
-    "arch": "x86_64",
-    "kernel_release": "6.17.0-23-generic",
-    "cpu_model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
-    "cpu_cores": 128,
-    "ram_gb": 247.24682998657227,
-    "active_toolchain": "nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)",
-    "rust_version": "rustc 1.97.0-nightly (f53b654a8 2026-04-30)",
-    "cargo_version": "cargo 1.97.0-nightly (eb9b60f1f 2026-04-24)",
-    "git_commit_sha": "36014ec4f6e2bca1515dace9c52e607e17772dc1",
-    "git_branch": "main",
-    "git_head_unix_ts": null,
-    "git_dirty": null,
-    "benchmark_binary_modified_unix_ts": 1778239054,
-    "benchmark_binary_older_than_git_head": null,
-    "build_profile": "release-perf"
-  },
-  "summary": {
-    "total_scenarios": 3,
-    "franken_faster": 3,
-    "comparable": 0,
-    "csqlite_faster": 0,
-    "avg_ratio": 0.0731203048317652,
-    "average_ratio": 0.0731203048317652,
-    "geomean_ratio": 0.07261663546099387,
-    "median_ratio": 0.07565514762826925,
-    "p90_ratio": 0.08192491849493076,
-    "p99_ratio": 0.08192491849493076,
-    "primary_metric": "per_category_weighted.score",
-    "per_category": {
-      "concurrent_writers": {
-        "n": 3,
-        "avg_ratio": 0.0731203048317652,
-        "geomean_ratio": 0.07261663546099387,
-        "median_ratio": 0.07565514762826925,
-        "p90_ratio": 0.08192491849493076,
-        "p99_ratio": 0.08192491849493076
-      },
-      "mixed": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "read_aggregate": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "read_single": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "write_bulk": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "write_single": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      }
-    },
-    "per_category_weighted": {
-      "primary": true,
-      "score": 0.07261663546099387,
-      "weights": {
-        "concurrent_writers": 0.05,
-        "mixed": 0.05,
-        "read_aggregate": 0.15,
-        "read_single": 0.35,
-        "write_bulk": 0.1,
-        "write_single": 0.3
-      },
-      "observed_weight": 0.05,
-      "missing_categories": [
-        "mixed",
-        "read_aggregate",
-        "read_single",
-        "write_bulk",
-        "write_single"
-      ]
-    }
-  },
-  "ci_regression_gate": {
-    "schema_version": "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2",
-    "bead_id": "bd-m4tju",
-    "depends_on_bead_id": "bd-0winn",
-    "status": "rich_scorecard_schema_ready",
-    "thresholds": {
-      "avg_ratio_baseline": 2.74,
-      "avg_ratio_max": null,
-      "mt_p95_ratio_max": null,
-      "primary_score_max_regression_pct": 0.03,
-      "geomean_max_regression_pct": 0.05,
-      "per_category_geomean_max_regression_pct": 0.1,
-      "p90_max_regression_pct": 0.15,
-      "threshold_source": "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score"
-    },
-    "observed": {
-      "avg_ratio": 0.0731203048317652,
-      "primary_score": 0.07261663546099387,
-      "geomean_ratio": 0.07261663546099387,
-      "median_ratio": 0.07565514762826925,
-      "p90_ratio": 0.08192491849493076,
-      "max_mt_p95_ratio": 0.11992053657265966,
-      "max_mt_p95_scenario_id": "concurrent-writers-c-sqlite-wal-vs-frankensqlite-mvcc__4-writers-x-1000-rows"
-    }
-  },
-  "sections": [
-    {
-      "section_id": "concurrent-writers-c-sqlite-wal-vs-frankensqlite-mvcc",
-      "title": "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC",
-      "description": "Each writer inserts 1000 rows into non-overlapping key ranges on the same file-backed WAL database. Both engines spawn N OS threads each owning its own connection; C SQLite uses WAL + busy_timeout, FrankenSQLite uses the MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + `BEGIN CONCURRENT` (falling back to plain BEGIN if the pragma is declined). This mirrors the standalone `mt_mvcc_bench` harness.",
-      "rows": [
-        {
-          "scenario_id": "concurrent-writers-c-sqlite-wal-vs-frankensqlite-mvcc__2-writers-x-1000-rows",
-          "scenario": "2 writers x 1000 rows",
-          "category": "concurrent_writers",
-          "csqlite": {
-            "median_ms": 1942.5134189999999,
-            "mean_ms": 2827.5771240000004,
-            "min_ms": 997.869153,
-            "p95_ms": 6935.67637,
-            "p99_ms": 6935.67637,
-            "stddev_ms": 2395.256257,
-            "cv_pct": 84.71055437071784,
-            "rows_per_sec": 1029.5939170549432,
-            "us_per_row": 971.2567094999999,
-            "iterations": 4
-          },
-          "fsqlite": {
-            "median_ms": 120.010127,
-            "mean_ms": 143.751385,
-            "min_ms": 39.050511,
-            "p95_ms": 296.398082,
-            "p99_ms": 296.398082,
-            "stddev_ms": 93.674276,
-            "cv_pct": 65.16408589732892,
-            "rows_per_sec": 16665.2602575781,
-            "us_per_row": 60.0050635,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 0.0617808483720956
-        },
-        {
-          "scenario_id": "concurrent-writers-c-sqlite-wal-vs-frankensqlite-mvcc__4-writers-x-1000-rows",
-          "scenario": "4 writers x 1000 rows",
-          "category": "concurrent_writers",
-          "csqlite": {
-            "median_ms": 1241.174027,
-            "mean_ms": 1086.884718,
-            "min_ms": 760.660353,
-            "p95_ms": 1246.317247,
-            "p99_ms": 1246.317247,
-            "stddev_ms": 201.241151,
-            "cv_pct": 18.51540900955054,
-            "rows_per_sec": 3222.7551600223746,
-            "us_per_row": 310.29350675,
-            "iterations": 5
-          },
-          "fsqlite": {
-            "median_ms": 101.683081,
-            "mean_ms": 106.05564600000001,
-            "min_ms": 72.26358099999999,
-            "p95_ms": 149.459033,
-            "p99_ms": 149.459033,
-            "stddev_ms": 21.623174,
-            "cv_pct": 20.38851755238,
-            "rows_per_sec": 39337.9110926035,
-            "us_per_row": 25.420770249999997,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 0.08192491849493076
-        },
-        {
-          "scenario_id": "concurrent-writers-c-sqlite-wal-vs-frankensqlite-mvcc__8-writers-x-1000-rows",
-          "scenario": "8 writers x 1000 rows",
-          "category": "concurrent_writers",
-          "csqlite": {
-            "median_ms": 1463.011936,
-            "mean_ms": 1752.266565,
-            "min_ms": 1316.509843,
-            "p95_ms": 2857.996811,
-            "p99_ms": 2857.996811,
-            "stddev_ms": 640.534623,
-            "cv_pct": 36.55463362676215,
-            "rows_per_sec": 5468.171382027604,
-            "us_per_row": 182.87649199999998,
-            "iterations": 4
-          },
-          "fsqlite": {
-            "median_ms": 110.684384,
-            "mean_ms": 109.526784,
-            "min_ms": 80.176838,
-            "p95_ms": 140.925518,
-            "p99_ms": 140.925518,
-            "stddev_ms": 19.433645,
-            "cv_pct": 17.74328094943425,
-            "rows_per_sec": 72277.58524635236,
-            "us_per_row": 13.835548,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 0.07565514762826925
-        }
-      ]
-    },
-    {
-      "section_id": "concurrent-writers-c-sqlite-single-thread-baseline",
-      "title": "Concurrent Writers — C SQLite Single-Thread Baseline",
-      "description": "Same total row count as concurrent tests, but single-threaded file-backed C SQLite.",
-      "rows": [
-        {
-          "scenario_id": "concurrent-writers-c-sqlite-single-thread-baseline__c-sqlite-1-thread-2000-rows-baseline",
-          "scenario": "C SQLite 1 thread / 2000 rows (baseline)",
-          "category": "concurrent_writers",
-          "csqlite": {
-            "median_ms": 512.148278,
-            "mean_ms": 492.050884,
-            "min_ms": 321.444594,
-            "p95_ms": 691.7235109999999,
-            "p99_ms": 691.7235109999999,
-            "stddev_ms": 121.34154799999999,
-            "cv_pct": 24.660365816962944,
-            "rows_per_sec": 3905.119056165215,
-            "us_per_row": 256.07413899999995,
-            "iterations": 10
-          },
-          "fsqlite": null,
-          "ratio_fsqlite_over_csqlite": null
-        },
-        {
-          "scenario_id": "concurrent-writers-c-sqlite-single-thread-baseline__c-sqlite-1-thread-4000-rows-baseline",
-          "scenario": "C SQLite 1 thread / 4000 rows (baseline)",
-          "category": "concurrent_writers",
-          "csqlite": {
-            "median_ms": 515.066727,
-            "mean_ms": 511.04564100000005,
-            "min_ms": 385.98497100000003,
-            "p95_ms": 645.913956,
-            "p99_ms": 645.913956,
-            "stddev_ms": 89.124996,
-            "cv_pct": 17.439733137260045,
-            "rows_per_sec": 7765.984076078748,
-            "us_per_row": 128.76668175,
-            "iterations": 10
-          },
-          "fsqlite": null,
-          "ratio_fsqlite_over_csqlite": null
-        },
-        {
-          "scenario_id": "concurrent-writers-c-sqlite-single-thread-baseline__c-sqlite-1-thread-8000-rows-baseline",
-          "scenario": "C SQLite 1 thread / 8000 rows (baseline)",
-          "category": "concurrent_writers",
-          "csqlite": {
-            "median_ms": 568.407428,
-            "mean_ms": 1028.4791129999999,
-            "min_ms": 286.93091799999996,
-            "p95_ms": 3028.310167,
-            "p99_ms": 3028.310167,
-            "stddev_ms": 1013.59204,
-            "cv_pct": 98.5525157670363,
-            "rows_per_sec": 14074.411427290497,
-            "us_per_row": 71.0509285,
-            "iterations": 5
-          },
-          "fsqlite": null,
-          "ratio_fsqlite_over_csqlite": null
-        }
-      ]
-    }
-  ]
-}
-  [2m2026-05-08T11:21:01.544254Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 80993ms[0m
-    [2;3mat[0m rch/src/hook.rs:5290 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:01.544551Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
-    [2;3mat[0m rch/src/hook.rs:5339 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:01.544584Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1716 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:01.544656Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 1 retrieval exclude pattern(s) from .rchignore (total: 4)[0m
-    [2;3mat[0m rch/src/transfer.rs:612 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:02.253699Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 709ms (2354 files, 245 bytes)[0m
-    [2;3mat[0m rch/src/transfer.rs:1755 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:02.253737Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 2354 files, 245 bytes in 709ms[0m
-    [2;3mat[0m rch/src/hook.rs:5372 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:02.253823Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite/.rch-target on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1716 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:03.573738Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1319ms (13680 files, 47351 bytes)[0m
-    [2;3mat[0m rch/src/transfer.rs:1755 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-08T11:21:03.573764Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 13680 files, 47351 bytes in 1319ms[0m
-    [2;3mat[0m rch/src/hook.rs:5490 [2;3mon[0m ThreadId(1)
-
-[RCH] remote ts2 (94.8s)

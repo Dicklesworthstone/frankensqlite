@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=1000 threads=[2] iters=10 apples_to_apples=false
-mt-mvcc-bench: wrote json report tests/artifacts/perf/windyibis-current-frontier-repeat-20260508T091105Z/mt-mvcc-2t-current.json
-mt-mvcc-bench: wrote markdown summary tests/artifacts/perf/windyibis-current-frontier-repeat-20260508T091105Z/mt-mvcc-2t-current.md
-mt-mvcc-bench: updated pass-over-pass history .bench-history/mt-mvcc-bench.latest.json

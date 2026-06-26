@@ -1,6 +1,0 @@
-insert-profile.json
-manifest.txt
-run-context.txt
-stderr.txt
-stdout.txt
-summary.md

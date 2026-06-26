@@ -1,7 +1,0 @@
-Date: 2026-05-11 02:51:46 UTC
-Repo: /data/projects/frankensqlite
-Base commit: a9f4a52396a3a00b155c9defba9c8ad38cb6e8b1
-Worktree: dirty with final lazy monotone multi-leaf direct DELETE batching changes
-Build target: /data/tmp/frankensqlite-delete-batch-target-final
-Build command: env CARGO_TARGET_DIR=/data/tmp/frankensqlite-delete-batch-target-final cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench
-Benchmark command: /data/tmp/frankensqlite-delete-batch-target-final/release-perf/comprehensive-bench --quick --json-out tests/artifacts/perf/codex-delete-multileaf-full-20260511T025146Z/full-quick.json --no-html

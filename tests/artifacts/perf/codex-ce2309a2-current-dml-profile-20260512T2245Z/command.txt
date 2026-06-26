@@ -1,1 +1,0 @@
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-perf-ce2309a2 FSQLITE_BENCH_PROFILE_DML=1 cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick --filter update --json-out tests/artifacts/perf/codex-ce2309a2-current-dml-profile-20260512T2245Z/update-delete-profile.json --no-html

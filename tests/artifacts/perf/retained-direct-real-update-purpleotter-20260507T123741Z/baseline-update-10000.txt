@@ -1,4 +1,0 @@
-perf-update-delete: rows=10000 iters=50 which=update engine=compare mode=isolated (do_update=true do_delete=false update_count=1000 delete_count=500)
-fsqlite: total=51ms populate=3ms update=44ms delete=0ms  |  per-row-update=888ns  per-row-delete=0ns
-sqlite: total=22ms populate=3ms update=18ms delete=0ms  |  per-row-update=370ns  per-row-delete=0ns
-fsqlite/sqlite time ratio: total=2.29x populate=1.04x update=2.40x delete=0.00x

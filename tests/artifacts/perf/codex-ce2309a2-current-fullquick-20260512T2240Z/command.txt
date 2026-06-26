@@ -1,1 +1,0 @@
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-perf-ce2309a2 cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick --json-out tests/artifacts/perf/codex-ce2309a2-current-fullquick-20260512T2240Z/full-quick.json --no-html

@@ -1,661 +1,0 @@
-  [2m2026-05-16T23:20:11.388436Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1293453 at ubuntu@149.102.137.103 (4 slots, speed 50.0)[0m
-    [2;3mat[0m rch/src/hook.rs:513 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:11.728754Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankensqlite (hash: 17d196fd98b037b7)[0m
-    [2;3mat[0m rch/src/hook.rs:5914 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:11.728854Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 28 roots[0m
-    [2;3mat[0m rch/src/hook.rs:5936 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:13.739690Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker vmi1293453...[0m
-    [2;3mat[0m rch/src/hook.rs:5966 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:13.739807Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 3 pattern(s) from .rchignore (total: 40)[0m
-    [2;3mat[0m rch/src/transfer.rs:763 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:13.739817Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:16.405586Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2665ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:16.405721Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:18.207296Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1801ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:18.207440Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:20.033569Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1826ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:20.033687Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:21.863896Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1830ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:21.864040Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-c-api -> /data/projects/frankensqlite/crates/fsqlite-c-api on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:23.622236Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1758ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:23.622344Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-cli -> /data/projects/frankensqlite/crates/fsqlite-cli on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:25.418655Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1796ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:25.418748Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:27.194213Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1775ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:27.194346Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-e2e -> /data/projects/frankensqlite/crates/fsqlite-e2e on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:28.993594Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1799ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:28.993687Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:30.787238Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1793ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:30.787323Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts3 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts3 on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:32.575416Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1788ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:32.575528Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:34.425415Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1849ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:34.425517Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:36.197349Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1771ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:36.197455Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:38.002835Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1805ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:38.002972Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:39.735847Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1732ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:39.735982Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:41.558991Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1822ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:41.559085Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-session -> /data/projects/frankensqlite/crates/fsqlite-ext-session on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:43.320346Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1761ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:43.320439Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:45.092974Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1772ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:45.093102Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-harness -> /data/projects/frankensqlite/crates/fsqlite-harness on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:46.933259Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1840ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:46.933378Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:48.706385Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1772ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:48.706521Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:50.462392Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1755ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:50.462496Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:52.257371Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1794ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:52.257490Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:54.046741Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1789ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:54.046851Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:55.867017Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1820ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:55.867149Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:57.602819Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1735ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:57.602955Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:59.334833Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1731ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:20:59.334964Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:01.190964Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1855ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:01.191085Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:02.972843Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1781ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:02.972977Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wasm -> /data/projects/frankensqlite/crates/fsqlite-wasm on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:1363 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:05.006593Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2033ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1432 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:05.006624Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 6903 files, 219359 bytes in 51248ms[0m
-    [2;3mat[0m rch/src/hook.rs:6129 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:14.504198Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: env 'FSQLITE_BENCH_PROFILE_CONCURRENT=1' cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick --filter concurrent --json-out tests/artifacts/perf/codex-current-concurrent-profile-b871658b-20260516T2320Z/concurrent.json --no-html[0m
-    [2;3mat[0m rch/src/hook.rs:6156 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:21:14.504253Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/frankensqlite-current-concurrent-profile -> /data/projects/frankensqlite/.rch-target-vmi1293453-job-29845309030924517-1778973613739683897-0[0m
-    [2;3mat[0m rch/src/transfer.rs:676 [2;3mon[0m ThreadId(1)
-
-    Updating crates.io index
- Downloading crates ...
-  Downloaded bitflags v2.11.1
-  Downloaded ahash v0.8.12
-  Downloaded argon2 v0.5.3
-  Downloaded anyhow v1.0.102
-  Downloaded aead v0.5.2
-  Downloaded autocfg v1.5.0
-  Downloaded bincode_derive-next v2.1.0
-  Downloaded base64ct v1.8.3
-  Downloaded block-buffer v0.10.4
-  Downloaded crypto-common v0.2.1
-  Downloaded franken-kernel v0.3.1
-  Downloaded blake2 v0.10.6
-  Downloaded inout v0.1.4
-  Downloaded errno v0.3.14
-  Downloaded crossbeam-queue v0.3.12
-  Downloaded opaque-debug v0.3.1
-  Downloaded memoffset v0.9.1
-  Downloaded iana-time-zone v0.1.65
-  Downloaded lru v0.16.4
-  Downloaded generic-array v0.14.7
-  Downloaded futures-core v0.3.32
-  Downloaded pollster v0.4.0
-  Downloaded futures-lite v2.6.1
-  Downloaded pin-project-lite v0.2.17
-  Downloaded rand_chacha v0.3.1
-  Downloaded hybrid-array v0.4.10
-  Downloaded constant_time_eq v0.4.2
-  Downloaded getrandom v0.2.17
-  Downloaded fastrand v2.4.1
-  Downloaded const-oid v0.10.2
-  Downloaded cipher v0.4.4
-  Downloaded matchers v0.2.0
-  Downloaded tracing-serde v0.2.0
-  Downloaded digest v0.11.2
-  Downloaded subtle v2.6.1
-  Downloaded cmov v0.5.3
-  Downloaded parking_lot_core v0.9.12
-  Downloaded lock_api v0.4.14
-  Downloaded hashlink v0.9.1
-  Downloaded nu-ansi-term v0.50.3
-  Downloaded cpufeatures v0.3.0
-  Downloaded crossbeam-utils v0.8.21
-  Downloaded once_cell v1.21.4
-  Downloaded sha1 v0.11.0
-  Downloaded parking_lot v0.12.5
-  Downloaded pin-project v1.1.11
-  Downloaded visibility v0.1.1
-  Downloaded prost v0.13.5
-  Downloaded json5 v1.3.1
-  Downloaded prost-derive v0.13.5
-  Downloaded num-traits v0.2.19
-  Downloaded ppv-lite86 v0.2.21
-  Downloaded bytes v1.11.1
-  Downloaded version_check v0.9.5
-  Downloaded universal-hash v0.5.1
-  Downloaded serde_spanned v0.6.9
-  Downloaded unty-next v0.1.1
-  Downloaded scopeguard v1.2.0
-  Downloaded chacha20poly1305 v0.10.1
-  Downloaded blake3 v1.8.4
-  Downloaded memchr v2.8.0
-  Downloaded bumpalo v3.20.2
-  Downloaded indexmap v2.14.0
-  Downloaded xxhash-rust v0.8.15
-  Downloaded zmij v1.0.21
-  Downloaded tracing-log v0.2.0
-  Downloaded quote v1.0.45
-  Downloaded toml_write v0.1.2
-  Downloaded zeroize v1.8.2
-  Downloaded sha2 v0.10.9
-  Downloaded pkg-config v0.3.33
-  Downloaded thiserror v2.0.18
-  Downloaded simdutf8 v0.1.5
-  Downloaded virtue-next v0.1.3
-  Downloaded tracing-attributes v0.1.31
-  Downloaded rmp-serde v1.3.1
-  Downloaded tempfile v3.27.0
-  Downloaded smallvec v1.15.1
-  Downloaded polling v3.11.0
-  Downloaded chrono v0.4.44
-  Downloaded ucd-trie v0.1.7
-  Downloaded socket2 v0.6.3
-  Downloaded sharded-slab v0.1.7
-  Downloaded unicode-ident v1.0.24
-  Downloaded tracing-core v0.1.36
-  Downloaded serde_derive v1.0.228
-  Downloaded proc-macro2 v1.0.106
-  Downloaded nix v0.29.0
-  Downloaded nix v0.31.2
-  Downloaded zerocopy-derive v0.8.48
-  Downloaded typenum v1.20.0
-  Downloaded toml_edit v0.22.27
-  Downloaded serde v1.0.228
-  Downloaded rand v0.8.6
-  Downloaded sha2 v0.11.0
-  Downloaded serde_core v1.0.228
-  Downloaded semver v1.0.28
-  Downloaded toml v0.8.23
-  Downloaded rusqlite v0.32.1
-  Downloaded serde_json v1.0.149
-  Downloaded regex v1.12.3
-  Downloaded winnow v0.7.15
-  Downloaded signal-hook v0.4.4
-  Downloaded vcpkg v0.2.15
-  Downloaded tracing-subscriber v0.3.23
-  Downloaded rmp v0.8.15
-  Downloaded signal-hook-registry v1.4.8
-  Downloaded rand_core v0.6.4
-  Downloaded shlex v1.3.0
-  Downloaded poly1305 v0.8.0
-  Downloaded itertools v0.14.0
-  Downloaded zerocopy v0.8.48
-  Downloaded syn v2.0.117
-  Downloaded thread_local v1.1.9
-  Downloaded thiserror-impl v2.0.18
-  Downloaded libc v0.2.185
-  Downloaded slab v0.4.12
-  Downloaded regex-syntax v0.8.10
-  Downloaded rustix v1.1.4
-  Downloaded rustc_version v0.4.1
-  Downloaded hashbrown v0.17.0
-  Downloaded tracing v0.1.44
-  Downloaded hashbrown v0.16.1
-  Downloaded hashbrown v0.14.5
-  Downloaded cc v1.2.60
-  Downloaded io-uring v0.7.12
-  Downloaded getrandom v0.4.2
-  Downloaded toml_datetime v0.6.11
-  Downloaded hmac v0.13.0
-  Downloaded aho-corasick v1.1.4
-  Downloaded getrandom v0.3.4
-  Downloaded regex-automata v0.4.14
-  Downloaded fallible-iterator v0.3.0
-  Downloaded dashmap v6.1.0
-  Downloaded crossbeam-deque v0.8.6
-  Downloaded crc32fast v1.5.0
-  Downloaded crossbeam-epoch v0.9.18
-  Downloaded chacha20 v0.9.1
-  Downloaded cfg_aliases v0.2.1
-  Downloaded pin-project-internal v1.1.11
-  Downloaded password-hash v0.5.0
-  Downloaded parking v2.2.1
-  Downloaded log v0.4.29
-  Downloaded lazy_static v1.5.0
-  Downloaded find-msvc-tools v0.1.9
-  Downloaded either v1.15.0
-  Downloaded digest v0.10.7
-  Downloaded cpufeatures v0.2.17
-  Downloaded crc32c v0.6.8
-  Downloaded cfg-if v1.0.4
-  Downloaded ctutils v0.4.2
-  Downloaded franken-evidence v0.3.1
-  Downloaded foldhash v0.2.0
-  Downloaded bincode-next v2.1.0
-  Downloaded franken-decision v0.3.1
-  Downloaded itoa v1.0.18
-  Downloaded fallible-streaming-iterator v0.1.9
-  Downloaded crypto-common v0.1.7
-  Downloaded futures-io v0.3.32
-  Downloaded equivalent v1.0.2
-  Downloaded block-buffer v0.12.0
-  Downloaded base64 v0.22.1
-  Downloaded arrayref v0.3.9
-  Downloaded allocator-api2 v0.2.21
-  Downloaded arrayvec v0.7.6
-  Downloaded asupersync-macros v0.3.1
-  Downloaded linux-raw-sys v0.12.1
-  Downloaded asupersync v0.3.1
-  Downloaded libsqlite3-sys v0.30.1
-   Compiling cfg-if v1.0.4
-   Compiling proc-macro2 v1.0.106
-   Compiling unicode-ident v1.0.24
-   Compiling quote v1.0.45
-   Compiling libc v0.2.185
-   Compiling serde_core v1.0.228
-   Compiling typenum v1.20.0
-   Compiling serde v1.0.228
-   Compiling allocator-api2 v0.2.21
-   Compiling autocfg v1.5.0
-   Compiling once_cell v1.21.4
-   Compiling version_check v0.9.5
-   Compiling equivalent v1.0.2
-   Compiling foldhash v0.2.0
-   Compiling memchr v2.8.0
-   Compiling find-msvc-tools v0.1.9
-   Compiling shlex v1.3.0
-   Compiling hashbrown v0.17.0
-   Compiling cc v1.2.60
-   Compiling hybrid-array v0.4.10
-   Compiling syn v2.0.117
-   Compiling cfg_aliases v0.2.1
-   Compiling crossbeam-utils v0.8.21
-   Compiling zmij v1.0.21
-   Compiling num-traits v0.2.19
-   Compiling indexmap v2.14.0
-   Compiling cmov v0.5.3
-   Compiling serde_json v1.0.149
-   Compiling smallvec v1.15.1
-   Compiling ctutils v0.4.2
-   Compiling crypto-common v0.2.1
-   Compiling block-buffer v0.12.0
-   Compiling aho-corasick v1.1.4
-   Compiling memoffset v0.9.1
-   Compiling tracing-core v0.1.36
-   Compiling itoa v1.0.18
-   Compiling parking_lot_core v0.9.12
-   Compiling regex-syntax v0.8.10
-   Compiling rustix v1.1.4
-   Compiling bitflags v2.11.1
-   Compiling const-oid v0.10.2
-   Compiling anyhow v1.0.102
-   Compiling digest v0.11.2
-   Compiling scopeguard v1.2.0
-   Compiling pin-project-lite v0.2.17
-   Compiling cpufeatures v0.3.0
-   Compiling thiserror v2.0.18
-   Compiling linux-raw-sys v0.12.1
-   Compiling getrandom v0.4.2
-   Compiling either v1.15.0
-   Compiling itertools v0.14.0
-   Compiling lock_api v0.4.14
-   Compiling errno v0.3.14
-   Compiling getrandom v0.2.17
-   Compiling nix v0.31.2
-   Compiling signal-hook v0.4.4
-   Compiling fastrand v2.4.1
-   Compiling virtue-next v0.1.3
-   Compiling regex-automata v0.4.14
-   Compiling log v0.4.29
-   Compiling io-uring v0.7.12
-   Compiling lazy_static v1.5.0
-   Compiling crc32fast v1.5.0
-   Compiling sharded-slab v0.1.7
-   Compiling tracing-log v0.2.0
-   Compiling bincode_derive-next v2.1.0
-   Compiling rand_core v0.6.4
-   Compiling signal-hook-registry v1.4.8
-   Compiling rmp v0.8.15
-   Compiling serde_derive v1.0.228
-   Compiling thiserror-impl v2.0.18
-   Compiling tracing-attributes v0.1.31
-   Compiling pin-project-internal v1.1.11
-   Compiling prost-derive v0.13.5
-   Compiling crossbeam-epoch v0.9.18
-   Compiling blake3 v1.8.4
-   Compiling tracing v0.1.44
-   Compiling generic-array v0.14.7
-   Compiling thread_local v1.1.9
-   Compiling futures-core v0.3.32
-   Compiling nu-ansi-term v0.50.3
-   Compiling bytes v1.11.1
-   Compiling parking v2.2.1
-   Compiling unty-next v0.1.1
-   Compiling futures-io v0.3.32
-   Compiling crossbeam-deque v0.8.6
-   Compiling pin-project v1.1.11
-   Compiling futures-lite v2.6.1
-   Compiling polling v3.11.0
-   Compiling tempfile v3.27.0
-   Compiling visibility v0.1.1
-   Compiling asupersync-macros v0.3.1
-   Compiling prost v0.13.5
-   Compiling matchers v0.2.0
-   Compiling parking_lot v0.12.5
-   Compiling sha2 v0.11.0
-   Compiling sha1 v0.11.0
-   Compiling hmac v0.13.0
-   Compiling crossbeam-queue v0.3.12
-   Compiling socket2 v0.6.3
-   Compiling base64 v0.22.1
-   Compiling arrayref v0.3.9
-   Compiling slab v0.4.12
-   Compiling constant_time_eq v0.4.2
-   Compiling arrayvec v0.7.6
-   Compiling fsqlite-error v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-error)
-   Compiling zerocopy v0.8.48
-   Compiling tracing-serde v0.2.0
-   Compiling franken-evidence v0.3.1
-   Compiling franken-kernel v0.3.1
-   Compiling tracing-subscriber v0.3.23
-   Compiling bincode-next v2.1.0
-   Compiling rmp-serde v1.3.1
-   Compiling xxhash-rust v0.8.15
-   Compiling franken-decision v0.3.1
-   Compiling simdutf8 v0.1.5
-   Compiling crypto-common v0.1.7
-   Compiling ahash v0.8.12
-   Compiling subtle v2.6.1
-   Compiling iana-time-zone v0.1.65
-   Compiling semver v1.0.28
-   Compiling cpufeatures v0.2.17
-   Compiling block-buffer v0.10.4
-   Compiling chrono v0.4.44
-   Compiling nix v0.29.0
-   Compiling asupersync v0.3.1
-   Compiling rustc_version v0.4.1
-   Compiling digest v0.10.7
-   Compiling crc32c v0.6.8
-   Compiling inout v0.1.4
-   Compiling zeroize v1.8.2
-   Compiling cipher v0.4.4
-   Compiling universal-hash v0.5.1
-   Compiling base64ct v1.8.3
-   Compiling opaque-debug v0.3.1
-   Compiling pollster v0.4.0
-   Compiling poly1305 v0.8.0
-   Compiling password-hash v0.5.0
-   Compiling chacha20 v0.9.1
-   Compiling blake2 v0.10.6
-   Compiling aead v0.5.2
-   Compiling chacha20poly1305 v0.10.1
-   Compiling argon2 v0.5.3
-   Compiling bumpalo v3.20.2
-   Compiling hashbrown v0.16.1
-   Compiling vcpkg v0.2.15
-   Compiling pkg-config v0.3.33
-   Compiling ucd-trie v0.1.7
-   Compiling ppv-lite86 v0.2.21
-   Compiling lru v0.16.4
-   Compiling hashbrown v0.14.5
-   Compiling json5 v1.3.1
-   Compiling libsqlite3-sys v0.30.1
-   Compiling serde_spanned v0.6.9
-   Compiling toml_datetime v0.6.11
-   Compiling rand_chacha v0.3.1
-   Compiling regex v1.12.3
-   Compiling toml_write v0.1.2
-   Compiling rand v0.8.6
-   Compiling winnow v0.7.15
-   Compiling fallible-iterator v0.3.0
-   Compiling dashmap v6.1.0
-   Compiling hashlink v0.9.1
-   Compiling fallible-streaming-iterator v0.1.9
-   Compiling sha2 v0.10.9
-   Compiling toml_edit v0.22.27
-   Compiling toml v0.8.23
-   Compiling fsqlite-types v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-types)
-   Compiling fsqlite-func v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-func)
-   Compiling fsqlite-observability v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-observability)
-   Compiling fsqlite-ast v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ast)
-   Compiling fsqlite-vfs v0.1.4 (/data/projects/frankensqlite/crates/fsqlite-vfs)
-   Compiling fsqlite-parser v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-parser)
-   Compiling fsqlite-ext-misc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)
-   Compiling fsqlite-ext-rtree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)
-   Compiling fsqlite-wal v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-wal)
-   Compiling fsqlite-planner v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-planner)
-   Compiling fsqlite-ext-icu v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)
-   Compiling fsqlite-ext-json v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-json)
-   Compiling fsqlite-ext-fts5 v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)
-   Compiling fsqlite-pager v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-pager)
-   Compiling rusqlite v0.32.1
-   Compiling fsqlite-btree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-btree)
-   Compiling fsqlite-mvcc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-mvcc)
-   Compiling fsqlite-vdbe v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-vdbe)
-   Compiling fsqlite-core v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-core)
-   Compiling fsqlite v0.1.3 (/data/projects/frankensqlite/crates/fsqlite)
-   Compiling fsqlite-harness v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-harness)
-   Compiling fsqlite-e2e v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 5m 27s
-     Running `.rch-target-vmi1293453-job-29845309030924517-1778973613739683897-0/release-perf/comprehensive-bench --quick --filter concurrent --json-out tests/artifacts/perf/codex-current-concurrent-profile-b871658b-20260516T2320Z/concurrent.json --no-html`
-
-================================================================================
-  Comprehensive FrankenSQLite vs C SQLite Benchmark
-================================================================================
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-23-generic
-  CPU: AMD EPYC Processor (with IBPB) (8 cores)
-  RAM: 29.4 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.95.0-nightly (a33907a7a 2026-02-14)
-  Cargo: cargo 1.95.0-nightly (ce69df6f7 2026-02-12)
-  Git: main @ b871658b255ac9aeb9003f4383b00ed5a5518dee
-  Binary modified: 2026-05-16 23:26:43 UTC
-  Build: release-perf (opt-level 3, LTO)
-  Mode: quick
-  Row counts: [100, 1000, 10000]
-  Measurement: 2 warmup, 3-10 iters, target 5s
-  Filter: concurrent
-================================================================================
-
-
-[1/10] Concurrent writers
-  Benchmarking 2 concurrent writers (2000 total rows)...     [cs_concurrent_2t] warmup 1/2...    [cs_concurrent_2t] warmup 2/2...    [cs_concurrent_2t] iter 1/10 (total: 0.0s)        [cs_concurrent_2t] iter 2/10 (total: 0.0s)        [cs_concurrent_2t] iter 3/10 (total: 0.0s)        [cs_concurrent_2t] iter 4/10 (total: 0.0s)        [cs_concurrent_2t] iter 5/10 (total: 0.0s)        [cs_concurrent_2t] iter 6/10 (total: 0.0s)        [cs_concurrent_2t] iter 7/10 (total: 0.0s)        [cs_concurrent_2t] iter 8/10 (total: 0.0s)        [cs_concurrent_2t] iter 9/10 (total: 0.0s)        [cs_concurrent_2t] iter 10/10 (total: 0.0s)                                                                                        [fs_concurrent_2t] warmup 1/2...    [fs_concurrent_2t] warmup 2/2...    [fs_concurrent_2t] iter 1/10 (total: 0.0s)        [fs_concurrent_2t] iter 2/10 (total: 0.0s)        [fs_concurrent_2t] iter 3/10 (total: 0.0s)        [fs_concurrent_2t] iter 4/10 (total: 0.0s)        [fs_concurrent_2t] iter 5/10 (total: 0.0s)        [fs_concurrent_2t] iter 6/10 (total: 0.0s)        [fs_concurrent_2t] iter 7/10 (total: 0.0s)        [fs_concurrent_2t] iter 8/10 (total: 0.0s)        [fs_concurrent_2t] iter 9/10 (total: 0.1s)        [fs_concurrent_2t] iter 10/10 (total: 0.1s)                                                                                        [fs_concurrent_2t] concurrent_profile rows=2000 fs_median=6.13 ms direct_insert=24012 fast=24012 slow=0 begin_ns=1009105 execute_body_ns=60811041 direct_flush_calls=48 direct_flush_ns=26474 page_run_flushes=0 page_run_records=0 page_run_bytes=0 page_run_owned=0 page_run_arena=0 page_run_repeated=0 page_run_depth2=0 row_build_ns=5374466 cursor_setup_ns=3430426 serialize_ns=1752699 btree_insert_ns=13184163 schema_validation_ns=1041710 change_tracking_ns=725169 commit_pre_ns=1326553 commit_roundtrip_ns=2626547 pager_commit_calls=36 pager_phase_a_ns=341025 pager_wal_ns=1957130 pager_mem_flush_ns=0 pager_journal_ns=0 pager_c_metadata_ns=70242 pager_file_size_ns=19021 pager_unlock_ns=12298 pager_publish_ns=49723 pager_cache_finish_ns=158618 commit_finalize_ns=1171451 commit_handle_ns=116685 post_write_ns=52340 finalize_post_ns=175826 concurrent_plan_attempts=36 concurrent_plan_successes=36 concurrent_plan_errors=0 concurrent_plan_busy_snapshot_errors=0 concurrent_plan_pending_pages=188 concurrent_plan_write_pages=188 concurrent_plan_held_lock_pages=188 concurrent_plan_uncontended_fast_paths=24 concurrent_plan_candidate_free_fast_paths=0 concurrent_plan_full_validations=12 parser_multi_calls=312 parser_cache_hits=78 parser_cache_misses=258 parser_parse_ns=947536 parser_rewrite_ns=57434 bg_checks=24624 bg_ns=881144 op_cx_bg_gates=264 dispatch_bg_gates=0 pager_pub_refreshes=96 commit_refreshes=12 prepared_lookup_ns=157422 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=36 page_pool_misses=166 vdbe_opcodes=0 vdbe_statements=0 vdbe_statement_us=0 vdbe_make_record=0 mvcc_tier0=5204 mvcc_tier1=176 mvcc_tier2=0 mvcc_page_lock_waits=12 mvcc_page_lock_wait_ns=18404225 mvcc_busy_retries=12 mvcc_busy_timeouts=0 mvcc_stale_snapshot=12 mvcc_page_one_tracks=0 mvcc_page_one_track_ns=0 mvcc_pending_clears=0 mvcc_pending_clear_ns=0 page_data_borrowed_norm=0 page_data_borrowed_exact_copies=0 page_data_owned_norm=5380 page_data_owned_passthrough=5380 page_data_owned_zero_extends=0 page_data_owned_resized_copies=0 page_data_payload_bytes=0 page_data_zero_fill_bytes=0 wal_frames=236 wal_bytes=972320 wal_group_commits=0 wal_group_commit_latency_us=0
-C=3.59 ms F=6.13 ms
-  Benchmarking 4 concurrent writers (4000 total rows)...     [cs_concurrent_4t] warmup 1/2...    [cs_concurrent_4t] warmup 2/2...    [cs_concurrent_4t] iter 1/10 (total: 0.0s)        [cs_concurrent_4t] iter 2/10 (total: 0.0s)        [cs_concurrent_4t] iter 3/10 (total: 0.0s)        [cs_concurrent_4t] iter 4/10 (total: 0.0s)        [cs_concurrent_4t] iter 5/10 (total: 0.0s)        [cs_concurrent_4t] iter 6/10 (total: 0.1s)        [cs_concurrent_4t] iter 7/10 (total: 0.1s)        [cs_concurrent_4t] iter 8/10 (total: 0.1s)        [cs_concurrent_4t] iter 9/10 (total: 0.1s)        [cs_concurrent_4t] iter 10/10 (total: 0.1s)                                                                                        [fs_concurrent_4t] warmup 1/2...    [fs_concurrent_4t] warmup 2/2...    [fs_concurrent_4t] iter 1/10 (total: 0.0s)        [fs_concurrent_4t] iter 2/10 (total: 0.0s)        [fs_concurrent_4t] iter 3/10 (total: 0.0s)        [fs_concurrent_4t] iter 4/10 (total: 0.1s)        [fs_concurrent_4t] iter 5/10 (total: 0.1s)        [fs_concurrent_4t] iter 6/10 (total: 0.1s)        [fs_concurrent_4t] iter 7/10 (total: 0.1s)        [fs_concurrent_4t] iter 8/10 (total: 0.1s)        [fs_concurrent_4t] iter 9/10 (total: 0.1s)        [fs_concurrent_4t] iter 10/10 (total: 0.1s)                                                                                        [fs_concurrent_4t] concurrent_profile rows=4000 fs_median=15.71 ms direct_insert=55130 fast=55130 slow=0 begin_ns=3473970 execute_body_ns=282487389 direct_flush_calls=79 direct_flush_ns=34095 page_run_flushes=0 page_run_records=0 page_run_bytes=0 page_run_owned=0 page_run_arena=0 page_run_repeated=0 page_run_depth2=0 row_build_ns=12179276 cursor_setup_ns=11641721 serialize_ns=3825264 btree_insert_ns=76201410 schema_validation_ns=2319616 change_tracking_ns=1611245 commit_pre_ns=5437095 commit_roundtrip_ns=5112943 pager_commit_calls=60 pager_phase_a_ns=708315 pager_wal_ns=3837135 pager_mem_flush_ns=0 pager_journal_ns=0 pager_c_metadata_ns=113550 pager_file_size_ns=38550 pager_unlock_ns=13935 pager_publish_ns=168984 pager_cache_finish_ns=205897 commit_finalize_ns=6929353 commit_handle_ns=284400 post_write_ns=83606 finalize_post_ns=378240 concurrent_plan_attempts=67 concurrent_plan_successes=60 concurrent_plan_errors=7 concurrent_plan_busy_snapshot_errors=7 concurrent_plan_pending_pages=485 concurrent_plan_write_pages=416 concurrent_plan_held_lock_pages=416 concurrent_plan_uncontended_fast_paths=24 concurrent_plan_candidate_free_fast_paths=0 concurrent_plan_full_validations=36 parser_multi_calls=669 parser_cache_hits=201 parser_cache_misses=516 parser_parse_ns=1640766 parser_rewrite_ns=213849 bg_checks=56334 bg_ns=2026496 op_cx_bg_gates=408 dispatch_bg_gates=0 pager_pub_refreshes=278 commit_refreshes=12 prepared_lookup_ns=509808 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=54 page_pool_misses=200 vdbe_opcodes=0 vdbe_statements=0 vdbe_statement_us=0 vdbe_make_record=0 mvcc_tier0=24532 mvcc_tier1=544 mvcc_tier2=0 mvcc_page_lock_waits=84 mvcc_page_lock_wait_ns=156020480 mvcc_busy_retries=84 mvcc_busy_timeouts=0 mvcc_stale_snapshot=72 mvcc_page_one_tracks=0 mvcc_page_one_track_ns=0 mvcc_pending_clears=0 mvcc_pending_clear_ns=0 page_data_borrowed_norm=0 page_data_borrowed_exact_copies=0 page_data_owned_norm=25076 page_data_owned_passthrough=25076 page_data_owned_zero_extends=0 page_data_owned_resized_copies=0 page_data_payload_bytes=0 page_data_zero_fill_bytes=0 wal_frames=503 wal_bytes=2072360 wal_group_commits=0 wal_group_commit_latency_us=0
-C=11.59 ms F=15.71 ms
-  Benchmarking 8 concurrent writers (8000 total rows)...     [cs_concurrent_8t] warmup 1/2...    [cs_concurrent_8t] warmup 2/2...    [cs_concurrent_8t] iter 1/10 (total: 0.0s)        [cs_concurrent_8t] iter 2/10 (total: 0.1s)        [cs_concurrent_8t] iter 3/10 (total: 0.2s)        [cs_concurrent_8t] iter 4/10 (total: 0.2s)        [cs_concurrent_8t] iter 5/10 (total: 0.3s)        [cs_concurrent_8t] iter 6/10 (total: 0.4s)        [cs_concurrent_8t] iter 7/10 (total: 0.5s)        [cs_concurrent_8t] iter 8/10 (total: 0.5s)        [cs_concurrent_8t] iter 9/10 (total: 0.6s)        [cs_concurrent_8t] iter 10/10 (total: 0.7s)                                                                                        [fs_concurrent_8t] warmup 1/2...    [fs_concurrent_8t] warmup 2/2...    [fs_concurrent_8t] iter 1/10 (total: 0.0s)        [fs_concurrent_8t] iter 2/10 (total: 0.0s)        [fs_concurrent_8t] iter 3/10 (total: 0.1s)        [fs_concurrent_8t] iter 4/10 (total: 0.1s)        [fs_concurrent_8t] iter 5/10 (total: 0.2s)        [fs_concurrent_8t] iter 6/10 (total: 0.3s)        [fs_concurrent_8t] iter 7/10 (total: 0.3s)        [fs_concurrent_8t] iter 8/10 (total: 0.4s)        [fs_concurrent_8t] iter 9/10 (total: 0.4s)        [fs_concurrent_8t] iter 10/10 (total: 0.5s)                                                                                        [fs_concurrent_8t] concurrent_profile rows=8000 fs_median=52.85 ms direct_insert=129524 fast=129524 slow=0 begin_ns=19631369 execute_body_ns=1411310044 direct_flush_calls=151 direct_flush_ns=68271 page_run_flushes=0 page_run_records=0 page_run_bytes=0 page_run_owned=0 page_run_arena=0 page_run_repeated=0 page_run_depth2=0 row_build_ns=29525584 cursor_setup_ns=38522128 serialize_ns=9216716 btree_insert_ns=447177175 schema_validation_ns=5777193 change_tracking_ns=4060924 commit_pre_ns=15723794 commit_roundtrip_ns=11309922 pager_commit_calls=108 pager_phase_a_ns=1792583 pager_wal_ns=8368746 pager_mem_flush_ns=0 pager_journal_ns=0 pager_c_metadata_ns=264762 pager_file_size_ns=87153 pager_unlock_ns=24857 pager_publish_ns=449255 pager_cache_finish_ns=268611 commit_finalize_ns=23184777 commit_handle_ns=733115 post_write_ns=157910 finalize_post_ns=912674 concurrent_plan_attempts=139 concurrent_plan_successes=108 concurrent_plan_errors=31 concurrent_plan_busy_snapshot_errors=31 concurrent_plan_pending_pages=1235 concurrent_plan_write_pages=895 concurrent_plan_held_lock_pages=895 concurrent_plan_uncontended_fast_paths=32 concurrent_plan_candidate_free_fast_paths=0 concurrent_plan_full_validations=76 parser_multi_calls=1669 parser_cache_hits=721 parser_cache_misses=1044 parser_parse_ns=3270998 parser_rewrite_ns=183087 bg_checks=132336 bg_ns=5134922 op_cx_bg_gates=696 dispatch_bg_gates=0 pager_pub_refreshes=918 commit_refreshes=12 prepared_lookup_ns=2047834 memdb_refresh=15 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=89 page_pool_misses=261 vdbe_opcodes=0 vdbe_statements=0 vdbe_statement_us=0 vdbe_make_record=0 mvcc_tier0=80358 mvcc_tier1=1631 mvcc_tier2=0 mvcc_page_lock_waits=441 mvcc_page_lock_wait_ns=994543679 mvcc_busy_retries=441 mvcc_busy_timeouts=0 mvcc_stale_snapshot=320 mvcc_page_one_tracks=0 mvcc_page_one_track_ns=0 mvcc_pending_clears=0 mvcc_pending_clear_ns=0 page_data_borrowed_norm=0 page_data_borrowed_exact_copies=0 page_data_owned_norm=81989 page_data_owned_passthrough=81989 page_data_owned_zero_extends=0 page_data_owned_resized_copies=0 page_data_payload_bytes=0 page_data_zero_fill_bytes=0 wal_frames=1063 wal_bytes=4379560 wal_group_commits=0 wal_group_commit_latency_us=0
-C=83.52 ms F=52.85 ms
-  Benchmarking C SQLite single-thread baseline (2000 rows)...     [cs_single_2t_equiv] warmup 1/2...    [cs_single_2t_equiv] warmup 2/2...    [cs_single_2t_equiv] iter 1/10 (total: 0.0s)        [cs_single_2t_equiv] iter 2/10 (total: 0.0s)        [cs_single_2t_equiv] iter 3/10 (total: 0.0s)        [cs_single_2t_equiv] iter 4/10 (total: 0.0s)        [cs_single_2t_equiv] iter 5/10 (total: 0.0s)        [cs_single_2t_equiv] iter 6/10 (total: 0.0s)        [cs_single_2t_equiv] iter 7/10 (total: 0.0s)        [cs_single_2t_equiv] iter 8/10 (total: 0.0s)        [cs_single_2t_equiv] iter 9/10 (total: 0.0s)        [cs_single_2t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=734.4 us
-  Benchmarking C SQLite single-thread baseline (4000 rows)...     [cs_single_4t_equiv] warmup 1/2...    [cs_single_4t_equiv] warmup 2/2...    [cs_single_4t_equiv] iter 1/10 (total: 0.0s)        [cs_single_4t_equiv] iter 2/10 (total: 0.0s)        [cs_single_4t_equiv] iter 3/10 (total: 0.0s)        [cs_single_4t_equiv] iter 4/10 (total: 0.0s)        [cs_single_4t_equiv] iter 5/10 (total: 0.0s)        [cs_single_4t_equiv] iter 6/10 (total: 0.0s)        [cs_single_4t_equiv] iter 7/10 (total: 0.0s)        [cs_single_4t_equiv] iter 8/10 (total: 0.0s)        [cs_single_4t_equiv] iter 9/10 (total: 0.0s)        [cs_single_4t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=1.12 ms
-  Benchmarking C SQLite single-thread baseline (8000 rows)...     [cs_single_8t_equiv] warmup 1/2...    [cs_single_8t_equiv] warmup 2/2...    [cs_single_8t_equiv] iter 1/10 (total: 0.0s)        [cs_single_8t_equiv] iter 2/10 (total: 0.0s)        [cs_single_8t_equiv] iter 3/10 (total: 0.0s)        [cs_single_8t_equiv] iter 4/10 (total: 0.0s)        [cs_single_8t_equiv] iter 5/10 (total: 0.0s)        [cs_single_8t_equiv] iter 6/10 (total: 0.0s)        [cs_single_8t_equiv] iter 7/10 (total: 0.0s)        [cs_single_8t_equiv] iter 8/10 (total: 0.0s)        [cs_single_8t_equiv] iter 9/10 (total: 0.0s)        [cs_single_8t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=3.13 ms
-
-Benchmark complete in 2.4s. Generating reports...
-
-============================================================================================================================================
-  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
-  2026-05-16 23:26:46 UTC
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-23-generic
-  CPU: AMD EPYC Processor (with IBPB) (8 cores)
-  RAM: 29.4 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.95.0-nightly (a33907a7a 2026-02-14)
-  Cargo: cargo 1.95.0-nightly (ce69df6f7 2026-02-12)
-  Git: main @ b871658b255ac9aeb9003f4383b00ed5a5518dee
-  Binary modified: 2026-05-16 23:26:43 UTC
-  Build: release-perf (opt-level 3, LTO)
-  Total benchmark time: 2.4s
-============================================================================================================================================
-
-
-## Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC
-   Each writer inserts 1000 rows into non-overlapping key ranges on the same file-backed WAL database. Both engines spawn N OS threads each owning its own connection; C SQLite uses WAL + busy_timeout, FrankenSQLite uses the MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + `BEGIN CONCURRENT` (falling back to plain BEGIN if the pragma is declined). This mirrors the standalone `mt_mvcc_bench` harness.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  2 writers x 1000 rows                           3.59 ms      6.13 ms     556.6K/s     326.4K/s 1.71x [31mslower[0m    68.6%    14.1%
-  4 writers x 1000 rows                          11.59 ms     15.71 ms     345.1K/s     254.6K/s 1.36x [31mslower[0m    13.5%    19.4%
-  8 writers x 1000 rows                          83.52 ms     52.85 ms      95.8K/s     151.4K/s 1.58x [32mfaster[0m    21.3%    22.7%
-
-## Concurrent Writers — C SQLite Single-Thread Baseline
-   Same total row count as concurrent tests, but single-threaded file-backed C SQLite.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  C SQLite 1 thread / 2000 rows (baseline)       734.4 us          N/A      2.72M/s          N/A              N/A    15.4%      N/A
-  C SQLite 1 thread / 4000 rows (baseline)        1.12 ms          N/A      3.57M/s          N/A              N/A    19.1%      N/A
-  C SQLite 1 thread / 8000 rows (baseline)        3.13 ms          N/A      2.55M/s          N/A              N/A    11.6%      N/A
-
-========================================================================================================================
-  SUMMARY STATISTICS
-========================================================================================================================
-
-  Total scenarios: 3  |  FrankenSQLite faster: 1  |  Comparable: 0  |  C SQLite faster: 2
-  Average time ratio (FrankenSQLite / C SQLite): 1.23x
-
-JSON report written to: tests/artifacts/perf/codex-current-concurrent-profile-b871658b-20260516T2320Z/concurrent.json
-  [2m2026-05-16T23:26:46.154364Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 331650ms[0m
-    [2;3mat[0m rch/src/hook.rs:6280 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:26:46.154670Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
-    [2;3mat[0m rch/src/hook.rs:6329 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:26:46.154685Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:2033 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:26:46.154730Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 3 retrieval exclude pattern(s) from .rchignore (total: 7)[0m
-    [2;3mat[0m rch/src/transfer.rs:872 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:26:48.016291Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1861ms (1 files, 8774 bytes)[0m
-    [2;3mat[0m rch/src/transfer.rs:2072 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:26:48.016307Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1 files, 8774 bytes in 1861ms[0m
-    [2;3mat[0m rch/src/hook.rs:6362 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:26:48.016429Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite/.rch-target-vmi1293453-job-29845309030924517-1778973613739683897-0 on vmi1293453[0m
-    [2;3mat[0m rch/src/transfer.rs:2033 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:27:08.448522Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 20432ms (2009 files, 33053 bytes)[0m
-    [2;3mat[0m rch/src/transfer.rs:2072 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-16T23:27:08.448556Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 2009 files, 33053 bytes in 20432ms[0m
-    [2;3mat[0m rch/src/hook.rs:6486 [2;3mon[0m ThreadId(1)
-
-[RCH] remote vmi1293453 (417.1s)

@@ -1,203 +1,0 @@
-   Compiling cfg-if v1.0.4
-   Compiling proc-macro2 v1.0.106
-   Compiling unicode-ident v1.0.24
-   Compiling quote v1.0.45
-   Compiling libc v0.2.185
-   Compiling serde_core v1.0.228
-   Compiling typenum v1.20.0
-   Compiling serde v1.0.228
-   Compiling allocator-api2 v0.2.21
-   Compiling once_cell v1.21.4
-   Compiling version_check v0.9.5
-   Compiling autocfg v1.5.0
-   Compiling foldhash v0.2.0
-   Compiling equivalent v1.0.2
-   Compiling memchr v2.8.0
-   Compiling shlex v1.3.0
-   Compiling find-msvc-tools v0.1.9
-   Compiling cfg_aliases v0.2.1
-   Compiling zmij v1.0.21
-   Compiling crossbeam-utils v0.8.21
-   Compiling cmov v0.5.3
-   Compiling serde_json v1.0.149
-   Compiling smallvec v1.15.1
-   Compiling parking_lot_core v0.9.12
-   Compiling const-oid v0.10.2
-   Compiling itoa v1.0.18
-   Compiling rustix v1.1.4
-   Compiling regex-syntax v0.8.10
-   Compiling anyhow v1.0.102
-   Compiling getrandom v0.4.2
-   Compiling either v1.15.0
-   Compiling linux-raw-sys v0.12.1
-   Compiling pin-project-lite v0.2.17
-   Compiling thiserror v2.0.18
-   Compiling scopeguard v1.2.0
-   Compiling cpufeatures v0.3.0
-   Compiling lock_api v0.4.14
-   Compiling cc v1.2.60
-   Compiling tracing-core v0.1.36
-   Compiling nix v0.31.2
-   Compiling fastrand v2.4.1
-   Compiling log v0.4.29
-   Compiling lazy_static v1.5.0
-   Compiling virtue-next v0.1.3
-   Compiling io-uring v0.7.12
-   Compiling signal-hook v0.4.4
-   Compiling crc32fast v1.5.0
-   Compiling generic-array v0.14.7
-   Compiling itertools v0.14.0
-   Compiling ctutils v0.4.2
-   Compiling sharded-slab v0.1.7
-   Compiling thread_local v1.1.9
-   Compiling futures-core v0.3.32
-   Compiling futures-io v0.3.32
-   Compiling nu-ansi-term v0.50.3
-   Compiling num-traits v0.2.19
-   Compiling memoffset v0.9.1
-   Compiling hashbrown v0.17.0
-   Compiling bytes v1.11.1
-   Compiling unty-next v0.1.1
-   Compiling parking v2.2.1
-   Compiling arrayref v0.3.9
-   Compiling base64 v0.22.1
-   Compiling constant_time_eq v0.4.2
-   Compiling slab v0.4.12
-   Compiling arrayvec v0.7.6
-   Compiling simdutf8 v0.1.5
-   Compiling zerocopy v0.8.48
-   Compiling xxhash-rust v0.8.15
-   Compiling futures-lite v2.6.1
-   Compiling ahash v0.8.12
-   Compiling subtle v2.6.1
-   Compiling iana-time-zone v0.1.65
-   Compiling semver v1.0.28
-   Compiling cpufeatures v0.2.17
-   Compiling aho-corasick v1.1.4
-   Compiling nix v0.29.0
-   Compiling zeroize v1.8.2
-   Compiling tracing-log v0.2.0
-   Compiling pollster v0.4.0
-   Compiling opaque-debug v0.3.1
-   Compiling base64ct v1.8.3
-   Compiling bumpalo v3.20.2
-   Compiling hashbrown v0.16.1
-   Compiling ucd-trie v0.1.7
-   Compiling crossbeam-epoch v0.9.18
-   Compiling crossbeam-queue v0.3.12
-   Compiling vcpkg v0.2.15
-   Compiling rustc_version v0.4.1
-   Compiling pkg-config v0.3.33
-   Compiling toml_write v0.1.2
-   Compiling winnow v0.7.15
-   Compiling fallible-iterator v0.3.0
-   Compiling fallible-streaming-iterator v0.1.9
-   Compiling bincode_derive-next v2.1.0
-   Compiling syn v2.0.117
-   Compiling hybrid-array v0.4.10
-   Compiling crc32c v0.6.8
-   Compiling crossbeam-deque v0.8.6
-   Compiling indexmap v2.14.0
-   Compiling blake3 v1.8.4
-   Compiling libsqlite3-sys v0.30.1
-   Compiling rmp v0.8.15
-   Compiling chrono v0.4.44
-   Compiling crypto-common v0.2.1
-   Compiling block-buffer v0.12.0
-   Compiling lru v0.16.4
-   Compiling block-buffer v0.10.4
-   Compiling inout v0.1.4
-   Compiling errno v0.3.14
-   Compiling getrandom v0.2.17
-   Compiling socket2 v0.6.3
-   Compiling signal-hook-registry v1.4.8
-   Compiling rand_core v0.6.4
-   Compiling regex-automata v0.4.14
-   Compiling parking_lot v0.12.5
-   Compiling crypto-common v0.1.7
-   Compiling password-hash v0.5.0
-   Compiling digest v0.11.2
-   Compiling digest v0.10.7
-   Compiling universal-hash v0.5.1
-   Compiling cipher v0.4.4
-   Compiling aead v0.5.2
-   Compiling poly1305 v0.8.0
-   Compiling hmac v0.13.0
-   Compiling sha1 v0.11.0
-   Compiling sha2 v0.11.0
-   Compiling blake2 v0.10.6
-   Compiling sha2 v0.10.9
-   Compiling chacha20 v0.9.1
-   Compiling chacha20poly1305 v0.10.1
-   Compiling argon2 v0.5.3
-   Compiling bitflags v2.11.1
-   Compiling serde_derive v1.0.228
-   Compiling tracing-attributes v0.1.31
-   Compiling thiserror-impl v2.0.18
-   Compiling pin-project-internal v1.1.11
-   Compiling prost-derive v0.13.5
-   Compiling asupersync-macros v0.3.1
-   Compiling visibility v0.1.1
-   Compiling ppv-lite86 v0.2.21
-   Compiling rand_chacha v0.3.1
-   Compiling pin-project v1.1.11
-   Compiling rand v0.8.6
-   Compiling tracing v0.1.44
-   Compiling fsqlite-error v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-error)
-   Compiling prost v0.13.5
-   Compiling matchers v0.2.0
-   Compiling regex v1.12.3
-   Compiling tempfile v3.27.0
-   Compiling polling v3.11.0
-   Compiling franken-kernel v0.3.1
-   Compiling franken-evidence v0.3.1
-   Compiling tracing-serde v0.2.0
-   Compiling rmp-serde v1.3.1
-   Compiling hashbrown v0.14.5
-   Compiling json5 v1.3.1
-   Compiling serde_spanned v0.6.9
-   Compiling toml_datetime v0.6.11
-   Compiling bincode-next v2.1.0
-   Compiling tracing-subscriber v0.3.23
-   Compiling toml_edit v0.22.27
-   Compiling franken-decision v0.3.1
-   Compiling dashmap v6.1.0
-   Compiling hashlink v0.9.1
-   Compiling asupersync v0.3.1
-   Compiling toml v0.8.23
-   Compiling rusqlite v0.32.1
-   Compiling fsqlite-types v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-types)
-   Compiling fsqlite-func v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-func)
-   Compiling fsqlite-observability v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-observability)
-   Compiling fsqlite-ast v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-ast)
-   Compiling fsqlite-vfs v0.1.4 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-vfs)
-   Compiling fsqlite-parser v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-parser)
-   Compiling fsqlite-ext-json v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-ext-json)
-   Compiling fsqlite-ext-fts5 v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-ext-fts5)
-   Compiling fsqlite-ext-misc v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-ext-misc)
-   Compiling fsqlite-ext-icu v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-ext-icu)
-   Compiling fsqlite-ext-rtree v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-ext-rtree)
-   Compiling fsqlite-wal v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-wal)
-   Compiling fsqlite-planner v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-planner)
-   Compiling fsqlite-pager v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-pager)
-   Compiling fsqlite-btree v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-btree)
-   Compiling fsqlite-mvcc v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-mvcc)
-   Compiling fsqlite-vdbe v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-vdbe)
-   Compiling fsqlite-core v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-core)
-   Compiling fsqlite v0.1.3 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite)
-   Compiling fsqlite-harness v0.1.0 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-harness)
-   Compiling fsqlite-e2e v0.1.0 (/data/tmp/frankensqlite-rusticgrove-concurrent-profile-20260508T1347Z/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 4m 03s
-     Running `/data/tmp/frankensqlite-target-rusticgrove-concurrent-profile-20260508T1347Z/release-perf/comprehensive-bench --filter concurrent --json-out /data/projects/frankensqlite/tests/artifacts/perf/rusticgrove-concurrent-wal-profile-20260508T1347Z/concurrent-profile.json --html /data/projects/frankensqlite/tests/artifacts/perf/rusticgrove-concurrent-wal-profile-20260508T1347Z/concurrent-profile.html`
-
-[1/10] Concurrent writers
-  Benchmarking 2 concurrent writers (2000 total rows)...     [cs_concurrent_2t] warmup 1/2...    [cs_concurrent_2t] warmup 2/2...    [cs_concurrent_2t] iter 1/10 (total: 0.0s)        [cs_concurrent_2t] iter 2/10 (total: 0.0s)        [cs_concurrent_2t] iter 3/10 (total: 0.0s)        [cs_concurrent_2t] iter 4/10 (total: 0.0s)        [cs_concurrent_2t] iter 5/10 (total: 0.1s)        [cs_concurrent_2t] iter 6/10 (total: 0.1s)        [cs_concurrent_2t] iter 7/10 (total: 0.1s)        [cs_concurrent_2t] iter 8/10 (total: 0.1s)        [cs_concurrent_2t] iter 9/10 (total: 0.1s)        [cs_concurrent_2t] iter 10/10 (total: 0.1s)                                                                                        [fs_concurrent_2t] warmup 1/2...    [fs_concurrent_2t] warmup 2/2...    [fs_concurrent_2t] iter 1/10 (total: 0.0s)        [fs_concurrent_2t] iter 2/10 (total: 0.0s)        [fs_concurrent_2t] iter 3/10 (total: 0.0s)        [fs_concurrent_2t] iter 4/10 (total: 0.0s)        [fs_concurrent_2t] iter 5/10 (total: 0.1s)        [fs_concurrent_2t] iter 6/10 (total: 0.1s)        [fs_concurrent_2t] iter 7/10 (total: 0.1s)        [fs_concurrent_2t] iter 8/10 (total: 0.1s)        [fs_concurrent_2t] iter 9/10 (total: 0.1s)        [fs_concurrent_2t] iter 10/10 (total: 0.1s)                                                                                    C=12.75 ms F=14.02 ms
-  Benchmarking 4 concurrent writers (4000 total rows)...     [cs_concurrent_4t] warmup 1/2...    [cs_concurrent_4t] warmup 2/2...    [cs_concurrent_4t] iter 1/10 (total: 0.0s)        [cs_concurrent_4t] iter 2/10 (total: 0.0s)        [cs_concurrent_4t] iter 3/10 (total: 0.0s)        [cs_concurrent_4t] iter 4/10 (total: 0.1s)        [cs_concurrent_4t] iter 5/10 (total: 0.1s)        [cs_concurrent_4t] iter 6/10 (total: 0.1s)        [cs_concurrent_4t] iter 7/10 (total: 0.1s)        [cs_concurrent_4t] iter 8/10 (total: 0.1s)        [cs_concurrent_4t] iter 9/10 (total: 0.2s)        [cs_concurrent_4t] iter 10/10 (total: 0.2s)                                                                                        [fs_concurrent_4t] warmup 1/2...    [fs_concurrent_4t] warmup 2/2...    [fs_concurrent_4t] iter 1/10 (total: 0.0s)        [fs_concurrent_4t] iter 2/10 (total: 0.0s)        [fs_concurrent_4t] iter 3/10 (total: 0.0s)        [fs_concurrent_4t] iter 4/10 (total: 0.1s)        [fs_concurrent_4t] iter 5/10 (total: 0.1s)        [fs_concurrent_4t] iter 6/10 (total: 0.1s)        [fs_concurrent_4t] iter 7/10 (total: 0.1s)        [fs_concurrent_4t] iter 8/10 (total: 0.2s)        [fs_concurrent_4t] iter 9/10 (total: 0.2s)        [fs_concurrent_4t] iter 10/10 (total: 0.2s)                                                                                    C=20.13 ms F=21.94 ms
-  Benchmarking 8 concurrent writers (8000 total rows)...     [cs_concurrent_8t] warmup 1/2...    [cs_concurrent_8t] warmup 2/2...    [cs_concurrent_8t] iter 1/10 (total: 0.0s)        [cs_concurrent_8t] iter 2/10 (total: 0.1s)        [cs_concurrent_8t] iter 3/10 (total: 0.2s)        [cs_concurrent_8t] iter 4/10 (total: 0.2s)        [cs_concurrent_8t] iter 5/10 (total: 0.3s)        [cs_concurrent_8t] iter 6/10 (total: 0.3s)        [cs_concurrent_8t] iter 7/10 (total: 0.4s)        [cs_concurrent_8t] iter 8/10 (total: 0.5s)        [cs_concurrent_8t] iter 9/10 (total: 0.6s)        [cs_concurrent_8t] iter 10/10 (total: 0.7s)                                                                                        [fs_concurrent_8t] warmup 1/2...    [fs_concurrent_8t] warmup 2/2...    [fs_concurrent_8t] iter 1/10 (total: 0.0s)        [fs_concurrent_8t] iter 2/10 (total: 0.0s)        [fs_concurrent_8t] iter 3/10 (total: 0.1s)        [fs_concurrent_8t] iter 4/10 (total: 0.1s)        [fs_concurrent_8t] iter 5/10 (total: 0.1s)        [fs_concurrent_8t] iter 6/10 (total: 0.2s)        [fs_concurrent_8t] iter 7/10 (total: 0.2s)        [fs_concurrent_8t] iter 8/10 (total: 0.3s)        [fs_concurrent_8t] iter 9/10 (total: 0.3s)        [fs_concurrent_8t] iter 10/10 (total: 0.4s)                                                                                    C=90.78 ms F=38.73 ms
-  Benchmarking C SQLite single-thread baseline (2000 rows)...     [cs_single_2t_equiv] warmup 1/2...    [cs_single_2t_equiv] warmup 2/2...    [cs_single_2t_equiv] iter 1/10 (total: 0.0s)        [cs_single_2t_equiv] iter 2/10 (total: 0.0s)        [cs_single_2t_equiv] iter 3/10 (total: 0.0s)        [cs_single_2t_equiv] iter 4/10 (total: 0.0s)        [cs_single_2t_equiv] iter 5/10 (total: 0.0s)        [cs_single_2t_equiv] iter 6/10 (total: 0.0s)        [cs_single_2t_equiv] iter 7/10 (total: 0.0s)        [cs_single_2t_equiv] iter 8/10 (total: 0.0s)        [cs_single_2t_equiv] iter 9/10 (total: 0.0s)        [cs_single_2t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=1.01 ms
-  Benchmarking C SQLite single-thread baseline (4000 rows)...     [cs_single_4t_equiv] warmup 1/2...    [cs_single_4t_equiv] warmup 2/2...    [cs_single_4t_equiv] iter 1/10 (total: 0.0s)        [cs_single_4t_equiv] iter 2/10 (total: 0.0s)        [cs_single_4t_equiv] iter 3/10 (total: 0.0s)        [cs_single_4t_equiv] iter 4/10 (total: 0.0s)        [cs_single_4t_equiv] iter 5/10 (total: 0.0s)        [cs_single_4t_equiv] iter 6/10 (total: 0.0s)        [cs_single_4t_equiv] iter 7/10 (total: 0.0s)        [cs_single_4t_equiv] iter 8/10 (total: 0.0s)        [cs_single_4t_equiv] iter 9/10 (total: 0.0s)        [cs_single_4t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=1.62 ms
-  Benchmarking C SQLite single-thread baseline (8000 rows)...     [cs_single_8t_equiv] warmup 1/2...    [cs_single_8t_equiv] warmup 2/2...    [cs_single_8t_equiv] iter 1/10 (total: 0.0s)        [cs_single_8t_equiv] iter 2/10 (total: 0.0s)        [cs_single_8t_equiv] iter 3/10 (total: 0.0s)        [cs_single_8t_equiv] iter 4/10 (total: 0.0s)        [cs_single_8t_equiv] iter 5/10 (total: 0.0s)        [cs_single_8t_equiv] iter 6/10 (total: 0.0s)        [cs_single_8t_equiv] iter 7/10 (total: 0.0s)        [cs_single_8t_equiv] iter 8/10 (total: 0.0s)        [cs_single_8t_equiv] iter 9/10 (total: 0.0s)        [cs_single_8t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=2.95 ms
-
-Benchmark complete in 2.4s. Generating reports...
-HTML report written to: /data/projects/frankensqlite/tests/artifacts/perf/rusticgrove-concurrent-wal-profile-20260508T1347Z/concurrent-profile.html
-JSON report written to: /data/projects/frankensqlite/tests/artifacts/perf/rusticgrove-concurrent-wal-profile-20260508T1347Z/concurrent-profile.json

@@ -1,6 +1,0 @@
-run-context.txt
-stdout.txt
-stderr.txt
-update-delete.json
-summary.md
-SHA256SUMS

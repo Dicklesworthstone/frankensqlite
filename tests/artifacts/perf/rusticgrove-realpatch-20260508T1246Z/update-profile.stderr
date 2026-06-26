@@ -1,229 +1,0 @@
-   Compiling cfg-if v1.0.4
-   Compiling proc-macro2 v1.0.106
-   Compiling quote v1.0.45
-   Compiling unicode-ident v1.0.24
-   Compiling libc v0.2.185
-   Compiling serde_core v1.0.228
-   Compiling typenum v1.20.0
-   Compiling serde v1.0.228
-   Compiling allocator-api2 v0.2.21
-   Compiling once_cell v1.21.4
-   Compiling autocfg v1.5.0
-   Compiling version_check v0.9.5
-   Compiling foldhash v0.2.0
-   Compiling equivalent v1.0.2
-   Compiling memchr v2.8.0
-   Compiling find-msvc-tools v0.1.9
-   Compiling shlex v1.3.0
-   Compiling cfg_aliases v0.2.1
-   Compiling crossbeam-utils v0.8.21
-   Compiling zmij v1.0.21
-   Compiling serde_json v1.0.149
-   Compiling cc v1.2.60
-   Compiling num-traits v0.2.19
-   Compiling hashbrown v0.17.0
-   Compiling cmov v0.5.3
-   Compiling smallvec v1.15.1
-   Compiling ctutils v0.4.2
-   Compiling memoffset v0.9.1
-   Compiling aho-corasick v1.1.4
-   Compiling tracing-core v0.1.36
-   Compiling anyhow v1.0.102
-   Compiling const-oid v0.10.2
-   Compiling syn v2.0.117
-   Compiling hybrid-array v0.4.10
-   Compiling rustix v1.1.4
-   Compiling itoa v1.0.18
-   Compiling parking_lot_core v0.9.12
-   Compiling regex-syntax v0.8.10
-   Compiling indexmap v2.14.0
-   Compiling thiserror v2.0.18
-   Compiling linux-raw-sys v0.12.1
-   Compiling pin-project-lite v0.2.17
-   Compiling getrandom v0.4.2
-   Compiling either v1.15.0
-   Compiling crypto-common v0.2.1
-   Compiling block-buffer v0.12.0
-   Compiling cpufeatures v0.3.0
-   Compiling scopeguard v1.2.0
-   Compiling itertools v0.14.0
-   Compiling lock_api v0.4.14
-   Compiling getrandom v0.2.17
-   Compiling errno v0.3.14
-   Compiling nix v0.31.2
-   Compiling crc32fast v1.5.0
-   Compiling signal-hook v0.4.4
-   Compiling lazy_static v1.5.0
-   Compiling log v0.4.29
-   Compiling fastrand v2.4.1
-   Compiling io-uring v0.7.12
-   Compiling virtue-next v0.1.3
-   Compiling tracing-log v0.2.0
-   Compiling digest v0.11.2
-   Compiling sharded-slab v0.1.7
-   Compiling signal-hook-registry v1.4.8
-   Compiling rmp v0.8.15
-   Compiling rand_core v0.6.4
-   Compiling blake3 v1.8.4
-   Compiling crossbeam-epoch v0.9.18
-   Compiling generic-array v0.14.7
-   Compiling thread_local v1.1.9
-   Compiling bitflags v2.11.1
-   Compiling bincode_derive-next v2.1.0
-   Compiling nu-ansi-term v0.50.3
-   Compiling futures-core v0.3.32
-   Compiling unty-next v0.1.1
-   Compiling futures-io v0.3.32
-   Compiling parking v2.2.1
-   Compiling bytes v1.11.1
-   Compiling futures-lite v2.6.1
-   Compiling regex-automata v0.4.14
-   Compiling crossbeam-deque v0.8.6
-   Compiling sha2 v0.11.0
-   Compiling hmac v0.13.0
-   Compiling sha1 v0.11.0
-   Compiling parking_lot v0.12.5
-   Compiling socket2 v0.6.3
-   Compiling crossbeam-queue v0.3.12
-   Compiling slab v0.4.12
-   Compiling base64 v0.22.1
-   Compiling arrayvec v0.7.6
-   Compiling constant_time_eq v0.4.2
-   Compiling arrayref v0.3.9
-   Compiling zerocopy v0.8.48
-   Compiling simdutf8 v0.1.5
-   Compiling xxhash-rust v0.8.15
-   Compiling ahash v0.8.12
-   Compiling subtle v2.6.1
-   Compiling iana-time-zone v0.1.65
-   Compiling semver v1.0.28
-   Compiling cpufeatures v0.2.17
-   Compiling nix v0.29.0
-   Compiling crypto-common v0.1.7
-   Compiling chrono v0.4.44
-   Compiling block-buffer v0.10.4
-   Compiling rustc_version v0.4.1
-   Compiling digest v0.10.7
-   Compiling inout v0.1.4
-   Compiling zeroize v1.8.2
-   Compiling universal-hash v0.5.1
-   Compiling cipher v0.4.4
-   Compiling pollster v0.4.0
-   Compiling base64ct v1.8.3
-   Compiling crc32c v0.6.8
-   Compiling opaque-debug v0.3.1
-   Compiling poly1305 v0.8.0
-   Compiling chacha20 v0.9.1
-   Compiling password-hash v0.5.0
-   Compiling blake2 v0.10.6
-   Compiling aead v0.5.2
-   Compiling bumpalo v3.20.2
-   Compiling hashbrown v0.16.1
-   Compiling chacha20poly1305 v0.10.1
-   Compiling serde_derive v1.0.228
-   Compiling thiserror-impl v2.0.18
-   Compiling tracing-attributes v0.1.31
-   Compiling prost-derive v0.13.5
-   Compiling pin-project-internal v1.1.11
-   Compiling tempfile v3.27.0
-   Compiling polling v3.11.0
-   Compiling matchers v0.2.0
-   Compiling visibility v0.1.1
-   Compiling asupersync-macros v0.3.1
-   Compiling tracing v0.1.44
-   Compiling argon2 v0.5.3
-   Compiling ucd-trie v0.1.7
-   Compiling pin-project v1.1.11
-   Compiling fsqlite-error v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-error)
-   Compiling pkg-config v0.3.33
-   Compiling vcpkg v0.2.15
-   Compiling lru v0.16.4
-   Compiling prost v0.13.5
-   Compiling regex v1.12.3
-   Compiling toml_write v0.1.2
-   Compiling winnow v0.7.15
-   Compiling fallible-streaming-iterator v0.1.9
-   Compiling fallible-iterator v0.3.0
-   Compiling sha2 v0.10.9
-   Compiling libsqlite3-sys v0.30.1
-   Compiling tracing-serde v0.2.0
-   Compiling franken-kernel v0.3.1
-   Compiling franken-evidence v0.3.1
-   Compiling rmp-serde v1.3.1
-   Compiling json5 v1.3.1
-   Compiling toml_datetime v0.6.11
-   Compiling serde_spanned v0.6.9
-   Compiling bincode-next v2.1.0
-   Compiling tracing-subscriber v0.3.23
-   Compiling ppv-lite86 v0.2.21
-   Compiling hashbrown v0.14.5
-   Compiling franken-decision v0.3.1
-   Compiling rand_chacha v0.3.1
-   Compiling toml_edit v0.22.27
-   Compiling rand v0.8.6
-   Compiling dashmap v6.1.0
-   Compiling hashlink v0.9.1
-   Compiling asupersync v0.3.1
-   Compiling toml v0.8.23
-   Compiling fsqlite-types v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-types)
-   Compiling fsqlite-func v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-func)
-   Compiling fsqlite-observability v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-observability)
-   Compiling fsqlite-ast v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ast)
-   Compiling rusqlite v0.32.1
-   Compiling fsqlite-vfs v0.1.4 (/data/projects/frankensqlite/crates/fsqlite-vfs)
-   Compiling fsqlite-parser v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-parser)
-   Compiling fsqlite-ext-fts5 v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)
-   Compiling fsqlite-ext-icu v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)
-   Compiling fsqlite-ext-rtree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)
-   Compiling fsqlite-ext-misc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)
-   Compiling fsqlite-ext-json v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-json)
-   Compiling fsqlite-wal v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-wal)
-   Compiling fsqlite-planner v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-planner)
-   Compiling fsqlite-pager v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-pager)
-   Compiling fsqlite-btree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-btree)
-   Compiling fsqlite-mvcc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-mvcc)
-   Compiling fsqlite-vdbe v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-vdbe)
-   Compiling fsqlite-core v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-core)
-   Compiling fsqlite v0.1.3 (/data/projects/frankensqlite/crates/fsqlite)
-   Compiling fsqlite-harness v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-harness)
-   Compiling fsqlite-e2e v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 4m 06s
-     Running `/data/tmp/frankensqlite-rusticgrove-realpatch-bench-target/release-perf/comprehensive-bench --quick --filter update --no-html --json-stdout`
-
-================================================================================
-  Comprehensive FrankenSQLite vs C SQLite Benchmark
-================================================================================
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-19-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 499.3 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (f964de49b 2026-05-07)
-  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
-  Git: main @ ac57295ba1b5ab1596968f81719a9db028ae5ccd
-  Git dirty: yes
-  Binary modified: 2026-05-08 12:51:06 UTC
-  Build: release-perf (opt-level 3, LTO)
-  Mode: quick
-  Row counts: [100, 1000, 10000]
-  Measurement: 2 warmup, 3-10 iters, target 5s
-  Filter: update
-================================================================================
-
-
-[1/10] UPDATE/DELETE throughput
-  Benchmarking update 10/100 rows...     [cs_update_100] warmup 1/2...    [cs_update_100] warmup 2/2...    [cs_update_100] iter 1/10 (total: 0.0s)        [cs_update_100] iter 2/10 (total: 0.0s)        [cs_update_100] iter 3/10 (total: 0.0s)        [cs_update_100] iter 4/10 (total: 0.0s)        [cs_update_100] iter 5/10 (total: 0.0s)        [cs_update_100] iter 6/10 (total: 0.0s)        [cs_update_100] iter 7/10 (total: 0.0s)        [cs_update_100] iter 8/10 (total: 0.0s)        [cs_update_100] iter 9/10 (total: 0.0s)        [cs_update_100] iter 10/10 (total: 0.0s)                                                                                        [fs_update_100] warmup 1/2...    [fs_update_100] warmup 2/2...    [fs_update_100] iter 1/10 (total: 0.0s)        [fs_update_100] iter 2/10 (total: 0.0s)        [fs_update_100] iter 3/10 (total: 0.0s)        [fs_update_100] iter 4/10 (total: 0.0s)        [fs_update_100] iter 5/10 (total: 0.0s)        [fs_update_100] iter 6/10 (total: 0.0s)        [fs_update_100] iter 7/10 (total: 0.0s)        [fs_update_100] iter 8/10 (total: 0.0s)        [fs_update_100] iter 9/10 (total: 0.0s)        [fs_update_100] iter 10/10 (total: 0.0s)                                                                                        [fs_update_100] dml_profile setup_us=54.2 begin_us=6.7 prepare_us=13.8 mutate_us=11.9 commit_us=6.0 mutations=10 direct_update=10 direct_delete=0 fast=10 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=2073 execute_body_ns=6162 commit_pre_ns=411 commit_roundtrip_ns=1352 commit_finalize_ns=541 commit_handle_ns=1041 post_write_ns=80 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=0 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=86.0 us F=117.1 us
-  Benchmarking delete 5/100 rows...     [cs_delete_100] warmup 1/2...    [cs_delete_100] warmup 2/2...    [cs_delete_100] iter 1/10 (total: 0.0s)        [cs_delete_100] iter 2/10 (total: 0.0s)        [cs_delete_100] iter 3/10 (total: 0.0s)        [cs_delete_100] iter 4/10 (total: 0.0s)        [cs_delete_100] iter 5/10 (total: 0.0s)        [cs_delete_100] iter 6/10 (total: 0.0s)        [cs_delete_100] iter 7/10 (total: 0.0s)        [cs_delete_100] iter 8/10 (total: 0.0s)        [cs_delete_100] iter 9/10 (total: 0.0s)        [cs_delete_100] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_100] warmup 1/2...    [fs_delete_100] warmup 2/2...    [fs_delete_100] iter 1/10 (total: 0.0s)        [fs_delete_100] iter 2/10 (total: 0.0s)        [fs_delete_100] iter 3/10 (total: 0.0s)        [fs_delete_100] iter 4/10 (total: 0.0s)        [fs_delete_100] iter 5/10 (total: 0.0s)        [fs_delete_100] iter 6/10 (total: 0.0s)        [fs_delete_100] iter 7/10 (total: 0.0s)        [fs_delete_100] iter 8/10 (total: 0.0s)        [fs_delete_100] iter 9/10 (total: 0.0s)        [fs_delete_100] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_100] dml_profile setup_us=51.9 begin_us=5.1 prepare_us=11.4 mutate_us=8.7 commit_us=5.5 mutations=5 direct_update=0 direct_delete=5 fast=5 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=2174 execute_body_ns=5842 commit_pre_ns=411 commit_roundtrip_ns=1263 commit_finalize_ns=411 commit_handle_ns=861 post_write_ns=101 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=0 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=80.6 us F=111.0 us
-  Benchmarking update 100/1000 rows...     [cs_update_1000] warmup 1/2...    [cs_update_1000] warmup 2/2...    [cs_update_1000] iter 1/10 (total: 0.0s)        [cs_update_1000] iter 2/10 (total: 0.0s)        [cs_update_1000] iter 3/10 (total: 0.0s)        [cs_update_1000] iter 4/10 (total: 0.0s)        [cs_update_1000] iter 5/10 (total: 0.0s)        [cs_update_1000] iter 6/10 (total: 0.0s)        [cs_update_1000] iter 7/10 (total: 0.0s)        [cs_update_1000] iter 8/10 (total: 0.0s)        [cs_update_1000] iter 9/10 (total: 0.0s)        [cs_update_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_1000] warmup 1/2...    [fs_update_1000] warmup 2/2...    [fs_update_1000] iter 1/10 (total: 0.0s)        [fs_update_1000] iter 2/10 (total: 0.0s)        [fs_update_1000] iter 3/10 (total: 0.0s)        [fs_update_1000] iter 4/10 (total: 0.0s)        [fs_update_1000] iter 5/10 (total: 0.0s)        [fs_update_1000] iter 6/10 (total: 0.0s)        [fs_update_1000] iter 7/10 (total: 0.0s)        [fs_update_1000] iter 8/10 (total: 0.0s)        [fs_update_1000] iter 9/10 (total: 0.0s)        [fs_update_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_1000] dml_profile setup_us=231.6 begin_us=6.0 prepare_us=13.6 mutate_us=100.7 commit_us=8.8 mutations=100 direct_update=100 direct_delete=0 fast=100 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=2364 execute_body_ns=9367 commit_pre_ns=1032 commit_roundtrip_ns=3466 commit_finalize_ns=561 commit_handle_ns=1133 post_write_ns=100 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=6 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=399.0 us F=384.6 us
-  Benchmarking delete 50/1000 rows...     [cs_delete_1000] warmup 1/2...    [cs_delete_1000] warmup 2/2...    [cs_delete_1000] iter 1/10 (total: 0.0s)        [cs_delete_1000] iter 2/10 (total: 0.0s)        [cs_delete_1000] iter 3/10 (total: 0.0s)        [cs_delete_1000] iter 4/10 (total: 0.0s)        [cs_delete_1000] iter 5/10 (total: 0.0s)        [cs_delete_1000] iter 6/10 (total: 0.0s)        [cs_delete_1000] iter 7/10 (total: 0.0s)        [cs_delete_1000] iter 8/10 (total: 0.0s)        [cs_delete_1000] iter 9/10 (total: 0.0s)        [cs_delete_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_1000] warmup 1/2...    [fs_delete_1000] warmup 2/2...    [fs_delete_1000] iter 1/10 (total: 0.0s)        [fs_delete_1000] iter 2/10 (total: 0.0s)        [fs_delete_1000] iter 3/10 (total: 0.0s)        [fs_delete_1000] iter 4/10 (total: 0.0s)        [fs_delete_1000] iter 5/10 (total: 0.0s)        [fs_delete_1000] iter 6/10 (total: 0.0s)        [fs_delete_1000] iter 7/10 (total: 0.0s)        [fs_delete_1000] iter 8/10 (total: 0.0s)        [fs_delete_1000] iter 9/10 (total: 0.0s)        [fs_delete_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_1000] dml_profile setup_us=229.5 begin_us=5.1 prepare_us=12.3 mutate_us=66.3 commit_us=8.1 mutations=50 direct_update=0 direct_delete=50 fast=50 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=2214 execute_body_ns=8386 commit_pre_ns=862 commit_roundtrip_ns=3086 commit_finalize_ns=571 commit_handle_ns=922 post_write_ns=110 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=5 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=376.5 us F=344.0 us
-  Benchmarking update 1000/10000 rows...     [cs_update_10000] warmup 1/2...    [cs_update_10000] warmup 2/2...    [cs_update_10000] iter 1/10 (total: 0.0s)        [cs_update_10000] iter 2/10 (total: 0.0s)        [cs_update_10000] iter 3/10 (total: 0.0s)        [cs_update_10000] iter 4/10 (total: 0.0s)        [cs_update_10000] iter 5/10 (total: 0.0s)        [cs_update_10000] iter 6/10 (total: 0.0s)        [cs_update_10000] iter 7/10 (total: 0.0s)        [cs_update_10000] iter 8/10 (total: 0.0s)        [cs_update_10000] iter 9/10 (total: 0.0s)        [cs_update_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_10000] warmup 1/2...    [fs_update_10000] warmup 2/2...    [fs_update_10000] iter 1/10 (total: 0.0s)        [fs_update_10000] iter 2/10 (total: 0.0s)        [fs_update_10000] iter 3/10 (total: 0.0s)        [fs_update_10000] iter 4/10 (total: 0.0s)        [fs_update_10000] iter 5/10 (total: 0.0s)        [fs_update_10000] iter 6/10 (total: 0.0s)        [fs_update_10000] iter 7/10 (total: 0.0s)        [fs_update_10000] iter 8/10 (total: 0.0s)        [fs_update_10000] iter 9/10 (total: 0.0s)        [fs_update_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_update_10000] dml_profile setup_us=2293.1 begin_us=8.3 prepare_us=18.1 mutate_us=1094.5 commit_us=43.6 mutations=1000 direct_update=1000 direct_delete=0 fast=1000 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=3476 execute_body_ns=44002 commit_pre_ns=3236 commit_roundtrip_ns=33743 commit_finalize_ns=1012 commit_handle_ns=1593 post_write_ns=120 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=63 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=3.57 ms F=3.47 ms
-  Benchmarking delete 500/10000 rows...     [cs_delete_10000] warmup 1/2...    [cs_delete_10000] warmup 2/2...    [cs_delete_10000] iter 1/10 (total: 0.0s)        [cs_delete_10000] iter 2/10 (total: 0.0s)        [cs_delete_10000] iter 3/10 (total: 0.0s)        [cs_delete_10000] iter 4/10 (total: 0.0s)        [cs_delete_10000] iter 5/10 (total: 0.0s)        [cs_delete_10000] iter 6/10 (total: 0.0s)        [cs_delete_10000] iter 7/10 (total: 0.0s)        [cs_delete_10000] iter 8/10 (total: 0.0s)        [cs_delete_10000] iter 9/10 (total: 0.0s)        [cs_delete_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_10000] warmup 1/2...    [fs_delete_10000] warmup 2/2...    [fs_delete_10000] iter 1/10 (total: 0.0s)        [fs_delete_10000] iter 2/10 (total: 0.0s)        [fs_delete_10000] iter 3/10 (total: 0.0s)        [fs_delete_10000] iter 4/10 (total: 0.0s)        [fs_delete_10000] iter 5/10 (total: 0.0s)        [fs_delete_10000] iter 6/10 (total: 0.0s)        [fs_delete_10000] iter 7/10 (total: 0.0s)        [fs_delete_10000] iter 8/10 (total: 0.0s)        [fs_delete_10000] iter 9/10 (total: 0.0s)        [fs_delete_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_delete_10000] dml_profile setup_us=2311.4 begin_us=7.5 prepare_us=15.5 mutate_us=1216.6 commit_us=94.6 mutations=500 direct_update=0 direct_delete=500 fast=500 slow=0 ud_fast_lane=0 ud_instrumented_lane=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=3266 execute_body_ns=92193 commit_pre_ns=4779 commit_roundtrip_ns=75472 commit_finalize_ns=2224 commit_handle_ns=4378 post_write_ns=220 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=2 page_pool_misses=64 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=0 btree_cell_assembly_bytes=0 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=3.40 ms F=3.61 ms
-
-Benchmark complete in 0.3s. Generating reports...

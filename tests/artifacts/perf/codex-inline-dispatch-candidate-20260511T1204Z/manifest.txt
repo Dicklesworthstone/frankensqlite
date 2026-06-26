@@ -1,5 +1,0 @@
-candidate: TransactionKind hot-method force-inline retry
-base_commit: d49f5ed64325d4a5ee78014d03bed4d64a9f956c
-source_status: candidate patch rejected and manually unwound
-benchmark: comprehensive-bench --quick --filter update
-profile_env: FSQLITE_BENCH_PROFILE_DML=1

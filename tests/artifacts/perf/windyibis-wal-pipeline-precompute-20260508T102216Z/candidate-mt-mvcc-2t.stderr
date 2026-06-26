@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=1000 threads=[2] iters=10 apples_to_apples=false
-mt-mvcc-bench: wrote json report /data/projects/frankensqlite/tests/artifacts/perf/windyibis-wal-pipeline-precompute-20260508T102216Z/candidate-mt-mvcc-2t.json
-mt-mvcc-bench: wrote markdown summary /data/projects/frankensqlite/tests/artifacts/perf/windyibis-wal-pipeline-precompute-20260508T102216Z/candidate-mt-mvcc-2t.md
-mt-mvcc-bench: updated pass-over-pass history /data/projects/frankensqlite/tests/artifacts/perf/windyibis-wal-pipeline-precompute-20260508T102216Z/candidate-mt-mvcc-2t-history.json

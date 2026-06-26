@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=250 threads=[1, 2, 4, 8] iters=3 apples_to_apples=false separate_tables=true
-mt-mvcc-bench: wrote json report tests/artifacts/perf/rusticgrove-mt-mvcc-separate-tables-20260508T1508Z/separate-tables.json
-mt-mvcc-bench: wrote markdown summary tests/artifacts/perf/rusticgrove-mt-mvcc-separate-tables-20260508T1508Z/separate-tables.md
-mt-mvcc-bench: updated pass-over-pass history tests/artifacts/perf/rusticgrove-mt-mvcc-separate-tables-20260508T1508Z/history.json

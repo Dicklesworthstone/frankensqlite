@@ -1,8 +1,0 @@
-summary.md
-stdout.txt
-stderr.txt
-perf-report-no-children.txt
-delete-only-stdout.txt
-delete-only-stderr.txt
-perf-report-delete-only-no-children.txt
-SHA256SUMS

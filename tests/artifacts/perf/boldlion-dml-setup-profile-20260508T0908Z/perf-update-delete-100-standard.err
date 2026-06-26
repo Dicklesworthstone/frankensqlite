@@ -1,6 +1,0 @@
-perf-update-delete: rows=100 iters=200 which=both engine=compare mode=standard (do_update=true do_delete=true update_count=10 delete_count=5)
-  (first iter complete)
-fsqlite: total=33ms populate=5ms update=2ms delete=1ms  |  per-row-update=1442ns  per-row-delete=1891ns
-  (first sqlite iter complete)
-sqlite: total=17ms populate=5ms update=0ms delete=0ms  |  per-row-update=430ns  per-row-delete=430ns
-fsqlite/sqlite time ratio: total=1.97x populate=0.99x update=3.35x delete=4.40x

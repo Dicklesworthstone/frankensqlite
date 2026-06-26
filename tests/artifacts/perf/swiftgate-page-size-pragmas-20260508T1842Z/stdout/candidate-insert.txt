@@ -1,2 +1,0 @@
-env: '/data/tmp/frankensqlite-swiftgate-page-size-skip-target/release-perf/comprehensive-bench': No such file or directory
-env: use -[v]S to pass options in shebang lines

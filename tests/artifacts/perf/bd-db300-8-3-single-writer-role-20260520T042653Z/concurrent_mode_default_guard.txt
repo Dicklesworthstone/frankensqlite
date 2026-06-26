@@ -1,2 +1,0 @@
-crates/fsqlite-core/src/connection.rs:8670:            concurrent_mode_default: RefCell::new(true),
-crates/fsqlite-core/src/connection.rs:8970:            concurrent_mode_default: RefCell::new(true),

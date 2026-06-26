@@ -1,9 +1,0 @@
-   Compiling fsqlite-e2e v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 1m 05s
-     Running `/data/tmp/frankensqlite-silveranchor-insert-profile-target/release-perf/perf-update-delete 100 1000 both compare standard`
-perf-update-delete: rows=100 iters=1000 which=both engine=compare mode=standard (do_update=true do_delete=true update_count=10 delete_count=5)
-  (first iter complete)
-fsqlite: total=201ms populate=37ms update=19ms delete=12ms  |  per-row-update=1902ns  per-row-delete=2495ns
-  (first sqlite iter complete)
-sqlite: total=106ms populate=38ms update=5ms delete=3ms  |  per-row-update=585ns  per-row-delete=694ns
-fsqlite/sqlite time ratio: total=1.89x populate=0.98x update=3.25x delete=3.60x

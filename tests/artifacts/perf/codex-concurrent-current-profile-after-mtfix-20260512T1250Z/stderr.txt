@@ -1,205 +1,0 @@
-   Compiling cfg-if v1.0.4
-   Compiling proc-macro2 v1.0.106
-   Compiling unicode-ident v1.0.24
-   Compiling quote v1.0.45
-   Compiling libc v0.2.185
-   Compiling serde_core v1.0.228
-   Compiling typenum v1.20.0
-   Compiling syn v2.0.117
-   Compiling serde v1.0.228
-   Compiling allocator-api2 v0.2.21
-   Compiling once_cell v1.21.4
-   Compiling version_check v0.9.5
-   Compiling autocfg v1.5.0
-   Compiling equivalent v1.0.2
-   Compiling foldhash v0.2.0
-   Compiling memchr v2.8.0
-   Compiling hashbrown v0.17.0
-   Compiling bitflags v2.11.1
-   Compiling shlex v1.3.0
-   Compiling find-msvc-tools v0.1.9
-   Compiling indexmap v2.14.0
-   Compiling cc v1.2.60
-   Compiling hybrid-array v0.4.10
-   Compiling zmij v1.0.21
-   Compiling cfg_aliases v0.2.1
-   Compiling crossbeam-utils v0.8.21
-   Compiling num-traits v0.2.19
-   Compiling smallvec v1.15.1
-   Compiling serde_json v1.0.149
-   Compiling cmov v0.5.3
-   Compiling ctutils v0.4.2
-   Compiling block-buffer v0.12.0
-   Compiling crypto-common v0.2.1
-   Compiling aho-corasick v1.1.4
-   Compiling memoffset v0.9.1
-   Compiling tracing-core v0.1.36
-   Compiling serde_derive v1.0.228
-   Compiling regex-syntax v0.8.10
-   Compiling anyhow v1.0.102
-   Compiling parking_lot_core v0.9.12
-   Compiling const-oid v0.10.2
-   Compiling itoa v1.0.18
-   Compiling rustix v1.1.4
-   Compiling regex-automata v0.4.14
-   Compiling digest v0.11.2
-   Compiling either v1.15.0
-   Compiling getrandom v0.4.2
-   Compiling thiserror v2.0.18
-   Compiling scopeguard v1.2.0
-   Compiling linux-raw-sys v0.12.1
-   Compiling pin-project-lite v0.2.17
-   Compiling cpufeatures v0.3.0
-   Compiling lock_api v0.4.14
-   Compiling itertools v0.14.0
-   Compiling thiserror-impl v2.0.18
-   Compiling tracing-attributes v0.1.31
-   Compiling nix v0.31.2
-   Compiling getrandom v0.2.17
-   Compiling errno v0.3.14
-   Compiling crc32fast v1.5.0
-   Compiling io-uring v0.7.12
-   Compiling virtue-next v0.1.3
-   Compiling log v0.4.29
-   Compiling lazy_static v1.5.0
-   Compiling signal-hook v0.4.4
-   Compiling fastrand v2.4.1
-   Compiling sharded-slab v0.1.7
-   Compiling bincode_derive-next v2.1.0
-   Compiling tracing-log v0.2.0
-   Compiling tracing v0.1.44
-   Compiling signal-hook-registry v1.4.8
-   Compiling rand_core v0.6.4
-   Compiling prost-derive v0.13.5
-   Compiling matchers v0.2.0
-   Compiling rmp v0.8.15
-   Compiling tracing-serde v0.2.0
-   Compiling franken-kernel v0.3.1
-   Compiling franken-evidence v0.3.1
-   Compiling pin-project-internal v1.1.11
-   Compiling crossbeam-epoch v0.9.18
-   Compiling blake3 v1.8.4
-   Compiling generic-array v0.14.7
-   Compiling thread_local v1.1.9
-   Compiling futures-io v0.3.32
-   Compiling unty-next v0.1.1
-   Compiling futures-core v0.3.32
-   Compiling nu-ansi-term v0.50.3
-   Compiling bytes v1.11.1
-   Compiling parking v2.2.1
-   Compiling futures-lite v2.6.1
-   Compiling prost v0.13.5
-   Compiling tracing-subscriber v0.3.23
-   Compiling bincode-next v2.1.0
-   Compiling crossbeam-deque v0.8.6
-   Compiling pin-project v1.1.11
-   Compiling franken-decision v0.3.1
-   Compiling rmp-serde v1.3.1
-   Compiling tempfile v3.27.0
-   Compiling polling v3.11.0
-   Compiling parking_lot v0.12.5
-   Compiling sha2 v0.11.0
-   Compiling sha1 v0.11.0
-   Compiling hmac v0.13.0
-   Compiling asupersync-macros v0.3.1
-   Compiling visibility v0.1.1
-   Compiling crossbeam-queue v0.3.12
-   Compiling socket2 v0.6.3
-   Compiling arrayvec v0.7.6
-   Compiling constant_time_eq v0.4.2
-   Compiling base64 v0.22.1
-   Compiling slab v0.4.12
-   Compiling arrayref v0.3.9
-   Compiling asupersync v0.3.1
-   Compiling fsqlite-error v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-error)
-   Compiling xxhash-rust v0.8.15
-   Compiling simdutf8 v0.1.5
-   Compiling zerocopy v0.8.48
-   Compiling crypto-common v0.1.7
-   Compiling ahash v0.8.12
-   Compiling subtle v2.6.1
-   Compiling iana-time-zone v0.1.65
-   Compiling semver v1.0.28
-   Compiling chrono v0.4.44
-   Compiling cpufeatures v0.2.17
-   Compiling rustc_version v0.4.1
-   Compiling block-buffer v0.10.4
-   Compiling nix v0.29.0
-   Compiling digest v0.10.7
-   Compiling crc32c v0.6.8
-   Compiling inout v0.1.4
-   Compiling zeroize v1.8.2
-   Compiling cipher v0.4.4
-   Compiling universal-hash v0.5.1
-   Compiling pollster v0.4.0
-   Compiling base64ct v1.8.3
-   Compiling opaque-debug v0.3.1
-   Compiling poly1305 v0.8.0
-   Compiling password-hash v0.5.0
-   Compiling hashbrown v0.14.5
-   Compiling chacha20 v0.9.1
-   Compiling blake2 v0.10.6
-   Compiling aead v0.5.2
-   Compiling chacha20poly1305 v0.10.1
-   Compiling argon2 v0.5.3
-   Compiling dashmap v6.1.0
-   Compiling bumpalo v3.20.2
-   Compiling ppv-lite86 v0.2.21
-   Compiling hashbrown v0.16.1
-   Compiling ucd-trie v0.1.7
-   Compiling rand_chacha v0.3.1
-   Compiling pkg-config v0.3.33
-   Compiling vcpkg v0.2.15
-   Compiling lru v0.16.4
-   Compiling rand v0.8.6
-   Compiling json5 v1.3.1
-   Compiling libsqlite3-sys v0.30.1
-   Compiling regex v1.12.3
-   Compiling serde_spanned v0.6.9
-   Compiling toml_datetime v0.6.11
-   Compiling winnow v0.7.15
-   Compiling toml_write v0.1.2
-   Compiling hashlink v0.9.1
-   Compiling fallible-iterator v0.3.0
-   Compiling fallible-streaming-iterator v0.1.9
-   Compiling sha2 v0.10.9
-   Compiling toml_edit v0.22.27
-   Compiling toml v0.8.23
-   Compiling fsqlite-types v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-types)
-   Compiling fsqlite-func v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-func)
-   Compiling fsqlite-observability v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-observability)
-   Compiling fsqlite-vfs v0.1.4 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-vfs)
-   Compiling fsqlite-ast v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-ast)
-   Compiling fsqlite-wal v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-wal)
-   Compiling fsqlite-parser v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-parser)
-   Compiling fsqlite-pager v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-pager)
-   Compiling fsqlite-planner v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-planner)
-   Compiling fsqlite-btree v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-btree)
-   Compiling fsqlite-mvcc v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-mvcc)
-   Compiling fsqlite-ext-json v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-ext-json)
-   Compiling fsqlite-ext-rtree v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-ext-rtree)
-   Compiling fsqlite-ext-misc v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-ext-misc)
-   Compiling fsqlite-ext-icu v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-ext-icu)
-   Compiling fsqlite-ext-fts5 v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-ext-fts5)
-   Compiling rusqlite v0.32.1
-   Compiling fsqlite-vdbe v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-vdbe)
-   Compiling fsqlite-core v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-core)
-   Compiling fsqlite v0.1.3 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite)
-   Compiling fsqlite-harness v0.1.0 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-harness)
-   Compiling fsqlite-e2e v0.1.0 (/data/tmp/frankensqlite-perf-frontier-20260512-0710/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 3m 57s
-     Running `/data/tmp/frankensqlite-target-frontier-concurrent-7ce06a0e/release-perf/comprehensive-bench --quick --filter concurrent --no-html --json-out tests/artifacts/perf/codex-concurrent-current-profile-after-mtfix-20260512T1250Z/concurrent-current.json`
-
-[1/10] Concurrent writers
-  Benchmarking 2 concurrent writers (2000 total rows)...     [cs_concurrent_2t] warmup 1/2...    [cs_concurrent_2t] warmup 2/2...    [cs_concurrent_2t] iter 1/10 (total: 0.0s)        [cs_concurrent_2t] iter 2/10 (total: 0.0s)        [cs_concurrent_2t] iter 3/10 (total: 0.0s)        [cs_concurrent_2t] iter 4/10 (total: 0.0s)        [cs_concurrent_2t] iter 5/10 (total: 0.1s)        [cs_concurrent_2t] iter 6/10 (total: 0.1s)        [cs_concurrent_2t] iter 7/10 (total: 0.1s)        [cs_concurrent_2t] iter 8/10 (total: 0.1s)        [cs_concurrent_2t] iter 9/10 (total: 0.1s)        [cs_concurrent_2t] iter 10/10 (total: 0.1s)                                                                                        [fs_concurrent_2t] warmup 1/2...    [fs_concurrent_2t] warmup 2/2...    [fs_concurrent_2t] iter 1/10 (total: 0.0s)        [fs_concurrent_2t] iter 2/10 (total: 0.0s)        [fs_concurrent_2t] iter 3/10 (total: 0.0s)        [fs_concurrent_2t] iter 4/10 (total: 0.0s)        [fs_concurrent_2t] iter 5/10 (total: 0.1s)        [fs_concurrent_2t] iter 6/10 (total: 0.1s)        [fs_concurrent_2t] iter 7/10 (total: 0.1s)        [fs_concurrent_2t] iter 8/10 (total: 0.1s)        [fs_concurrent_2t] iter 9/10 (total: 0.1s)        [fs_concurrent_2t] iter 10/10 (total: 0.1s)                                                                                        [fs_concurrent_2t] concurrent_profile rows=2000 fs_median=14.50 ms direct_insert=24012 fast=24012 slow=0 begin_ns=1293619 execute_body_ns=60164627 direct_flush_calls=48 direct_flush_ns=8049 page_run_flushes=0 page_run_records=0 page_run_bytes=0 page_run_owned=0 page_run_arena=0 page_run_repeated=0 page_run_depth2=0 row_build_ns=4910309 cursor_setup_ns=3960419 serialize_ns=1464880 btree_insert_ns=14009172 schema_validation_ns=850694 change_tracking_ns=640074 commit_pre_ns=1670856 commit_roundtrip_ns=2600243 pager_commit_calls=36 pager_phase_a_ns=226631 pager_wal_ns=2108770 pager_mem_flush_ns=0 pager_journal_ns=0 pager_c_metadata_ns=86888 pager_file_size_ns=35336 pager_unlock_ns=30637 pager_publish_ns=36369 pager_cache_finish_ns=115605 commit_finalize_ns=1032113 commit_handle_ns=79755 post_write_ns=18172 finalize_post_ns=105439 concurrent_plan_attempts=36 concurrent_plan_successes=36 concurrent_plan_errors=0 concurrent_plan_busy_snapshot_errors=0 concurrent_plan_pending_pages=196 concurrent_plan_write_pages=196 concurrent_plan_held_lock_pages=196 concurrent_plan_uncontended_fast_paths=24 concurrent_plan_candidate_free_fast_paths=0 concurrent_plan_full_validations=12 parser_multi_calls=312 parser_cache_hits=78 parser_cache_misses=258 parser_parse_ns=1086760 parser_rewrite_ns=39027 bg_checks=24624 bg_ns=819610 op_cx_bg_gates=264 dispatch_bg_gates=0 pager_pub_refreshes=96 commit_refreshes=12 prepared_lookup_ns=113773 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=36 page_pool_misses=170 vdbe_opcodes=0 vdbe_statements=0 vdbe_statement_us=0 vdbe_make_record=0 mvcc_tier0=7204 mvcc_tier1=184 mvcc_tier2=0 mvcc_page_lock_waits=12 mvcc_page_lock_wait_ns=18265716 mvcc_busy_retries=12 mvcc_busy_timeouts=0 mvcc_stale_snapshot=12 mvcc_page_one_tracks=0 mvcc_page_one_track_ns=0 mvcc_pending_clears=0 mvcc_pending_clear_ns=0 page_data_borrowed_norm=0 page_data_borrowed_exact_copies=0 page_data_owned_norm=7388 page_data_owned_passthrough=7388 page_data_owned_zero_extends=0 page_data_owned_resized_copies=0 page_data_payload_bytes=0 page_data_zero_fill_bytes=0 wal_frames=244 wal_bytes=1005280 wal_group_commits=0 wal_group_commit_latency_us=0
-C=12.24 ms F=14.50 ms
-  Benchmarking 4 concurrent writers (4000 total rows)...     [cs_concurrent_4t] warmup 1/2...    [cs_concurrent_4t] warmup 2/2...    [cs_concurrent_4t] iter 1/10 (total: 0.0s)        [cs_concurrent_4t] iter 2/10 (total: 0.0s)        [cs_concurrent_4t] iter 3/10 (total: 0.0s)        [cs_concurrent_4t] iter 4/10 (total: 0.1s)        [cs_concurrent_4t] iter 5/10 (total: 0.1s)        [cs_concurrent_4t] iter 6/10 (total: 0.1s)        [cs_concurrent_4t] iter 7/10 (total: 0.1s)        [cs_concurrent_4t] iter 8/10 (total: 0.1s)        [cs_concurrent_4t] iter 9/10 (total: 0.1s)        [cs_concurrent_4t] iter 10/10 (total: 0.2s)                                                                                        [fs_concurrent_4t] warmup 1/2...    [fs_concurrent_4t] warmup 2/2...    [fs_concurrent_4t] iter 1/10 (total: 0.0s)        [fs_concurrent_4t] iter 2/10 (total: 0.0s)        [fs_concurrent_4t] iter 3/10 (total: 0.0s)        [fs_concurrent_4t] iter 4/10 (total: 0.1s)        [fs_concurrent_4t] iter 5/10 (total: 0.1s)        [fs_concurrent_4t] iter 6/10 (total: 0.1s)        [fs_concurrent_4t] iter 7/10 (total: 0.1s)        [fs_concurrent_4t] iter 8/10 (total: 0.2s)        [fs_concurrent_4t] iter 9/10 (total: 0.2s)        [fs_concurrent_4t] iter 10/10 (total: 0.2s)                                                                                        [fs_concurrent_4t] concurrent_profile rows=4000 fs_median=23.99 ms direct_insert=58178 fast=58178 slow=0 begin_ns=4376781 execute_body_ns=288868817 direct_flush_calls=82 direct_flush_ns=11408 page_run_flushes=0 page_run_records=0 page_run_bytes=0 page_run_owned=0 page_run_arena=0 page_run_repeated=0 page_run_depth2=0 row_build_ns=12087607 cursor_setup_ns=13496111 serialize_ns=3772608 btree_insert_ns=75017292 schema_validation_ns=2063604 change_tracking_ns=1506320 commit_pre_ns=6421649 commit_roundtrip_ns=4452969 pager_commit_calls=60 pager_phase_a_ns=417820 pager_wal_ns=3619687 pager_mem_flush_ns=0 pager_journal_ns=0 pager_c_metadata_ns=123242 pager_file_size_ns=55863 pager_unlock_ns=30316 pager_publish_ns=105709 pager_cache_finish_ns=142120 commit_finalize_ns=5482084 commit_handle_ns=147643 post_write_ns=24997 finalize_post_ns=183619 concurrent_plan_attempts=70 concurrent_plan_successes=60 concurrent_plan_errors=10 concurrent_plan_busy_snapshot_errors=10 concurrent_plan_pending_pages=521 concurrent_plan_write_pages=422 concurrent_plan_held_lock_pages=422 concurrent_plan_uncontended_fast_paths=24 concurrent_plan_candidate_free_fast_paths=0 concurrent_plan_full_validations=36 parser_multi_calls=678 parser_cache_hits=210 parser_cache_misses=516 parser_parse_ns=1875051 parser_rewrite_ns=36631 bg_checks=59394 bg_ns=2060061 op_cx_bg_gates=408 dispatch_bg_gates=0 pager_pub_refreshes=284 commit_refreshes=12 prepared_lookup_ns=400537 memdb_refresh=0 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=56 page_pool_misses=211 vdbe_opcodes=0 vdbe_statements=0 vdbe_statement_us=0 vdbe_make_record=0 mvcc_tier0=28608 mvcc_tier1=587 mvcc_tier2=0 mvcc_page_lock_waits=85 mvcc_page_lock_wait_ns=157288723 mvcc_busy_retries=85 mvcc_busy_timeouts=0 mvcc_stale_snapshot=72 mvcc_page_one_tracks=0 mvcc_page_one_track_ns=0 mvcc_pending_clears=0 mvcc_pending_clear_ns=0 page_data_borrowed_norm=0 page_data_borrowed_exact_copies=0 page_data_owned_norm=29195 page_data_owned_passthrough=29195 page_data_owned_zero_extends=0 page_data_owned_resized_copies=0 page_data_payload_bytes=0 page_data_zero_fill_bytes=0 wal_frames=509 wal_bytes=2097080 wal_group_commits=0 wal_group_commit_latency_us=0
-C=19.61 ms F=23.99 ms
-  Benchmarking 8 concurrent writers (8000 total rows)...     [cs_concurrent_8t] warmup 1/2...    [cs_concurrent_8t] warmup 2/2...    [cs_concurrent_8t] iter 1/10 (total: 0.0s)        [cs_concurrent_8t] iter 2/10 (total: 0.1s)        [cs_concurrent_8t] iter 3/10 (total: 0.2s)        [cs_concurrent_8t] iter 4/10 (total: 0.3s)        [cs_concurrent_8t] iter 5/10 (total: 0.4s)        [cs_concurrent_8t] iter 6/10 (total: 0.5s)        [cs_concurrent_8t] iter 7/10 (total: 0.6s)        [cs_concurrent_8t] iter 8/10 (total: 0.7s)        [cs_concurrent_8t] iter 9/10 (total: 0.7s)        [cs_concurrent_8t] iter 10/10 (total: 0.8s)                                                                                        [fs_concurrent_8t] warmup 1/2...    [fs_concurrent_8t] warmup 2/2...    [fs_concurrent_8t] iter 1/10 (total: 0.0s)        [fs_concurrent_8t] iter 2/10 (total: 0.1s)        [fs_concurrent_8t] iter 3/10 (total: 0.1s)        [fs_concurrent_8t] iter 4/10 (total: 0.2s)        [fs_concurrent_8t] iter 5/10 (total: 0.2s)        [fs_concurrent_8t] iter 6/10 (total: 0.3s)        [fs_concurrent_8t] iter 7/10 (total: 0.4s)        [fs_concurrent_8t] iter 8/10 (total: 0.4s)        [fs_concurrent_8t] iter 9/10 (total: 0.5s)        [fs_concurrent_8t] iter 10/10 (total: 0.5s)                                                                                        [fs_concurrent_8t] concurrent_profile rows=8000 fs_median=62.47 ms direct_insert=144170 fast=144170 slow=0 begin_ns=14110379 execute_body_ns=1484025273 direct_flush_calls=165 direct_flush_ns=21206 page_run_flushes=0 page_run_records=0 page_run_bytes=0 page_run_owned=0 page_run_arena=0 page_run_repeated=0 page_run_depth2=0 row_build_ns=30224272 cursor_setup_ns=46673685 serialize_ns=9693834 btree_insert_ns=531616747 schema_validation_ns=5257632 change_tracking_ns=3779562 commit_pre_ns=17621383 commit_roundtrip_ns=8158420 pager_commit_calls=108 pager_phase_a_ns=904653 pager_wal_ns=6423048 pager_mem_flush_ns=0 pager_journal_ns=0 pager_c_metadata_ns=227619 pager_file_size_ns=110667 pager_unlock_ns=41130 pager_publish_ns=319405 pager_cache_finish_ns=181333 commit_finalize_ns=20923751 commit_handle_ns=302887 post_write_ns=36456 finalize_post_ns=360774 concurrent_plan_attempts=153 concurrent_plan_successes=108 concurrent_plan_errors=45 concurrent_plan_busy_snapshot_errors=45 concurrent_plan_pending_pages=1413 concurrent_plan_write_pages=916 concurrent_plan_held_lock_pages=916 concurrent_plan_uncontended_fast_paths=32 concurrent_plan_candidate_free_fast_paths=0 concurrent_plan_full_validations=76 parser_multi_calls=1693 parser_cache_hits=746 parser_cache_misses=1043 parser_parse_ns=3601747 parser_rewrite_ns=66823 bg_checks=147011 bg_ns=5322042 op_cx_bg_gates=696 dispatch_bg_gates=0 pager_pub_refreshes=928 commit_refreshes=12 prepared_lookup_ns=1486538 memdb_refresh=19 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=89 page_pool_misses=258 vdbe_opcodes=0 vdbe_statements=0 vdbe_statement_us=0 vdbe_make_record=0 mvcc_tier0=100126 mvcc_tier1=1817 mvcc_tier2=0 mvcc_page_lock_waits=493 mvcc_page_lock_wait_ns=1054590906 mvcc_busy_retries=493 mvcc_busy_timeouts=0 mvcc_stale_snapshot=311 mvcc_page_one_tracks=0 mvcc_page_one_track_ns=0 mvcc_pending_clears=0 mvcc_pending_clear_ns=0 page_data_borrowed_norm=0 page_data_borrowed_exact_copies=0 page_data_owned_norm=101943 page_data_owned_passthrough=101943 page_data_owned_zero_extends=0 page_data_owned_resized_copies=0 page_data_payload_bytes=0 page_data_zero_fill_bytes=0 wal_frames=1082 wal_bytes=4457840 wal_group_commits=0 wal_group_commit_latency_us=0
-C=91.73 ms F=62.47 ms
-  Benchmarking C SQLite single-thread baseline (2000 rows)...     [cs_single_2t_equiv] warmup 1/2...    [cs_single_2t_equiv] warmup 2/2...    [cs_single_2t_equiv] iter 1/10 (total: 0.0s)        [cs_single_2t_equiv] iter 2/10 (total: 0.0s)        [cs_single_2t_equiv] iter 3/10 (total: 0.0s)        [cs_single_2t_equiv] iter 4/10 (total: 0.0s)        [cs_single_2t_equiv] iter 5/10 (total: 0.0s)        [cs_single_2t_equiv] iter 6/10 (total: 0.0s)        [cs_single_2t_equiv] iter 7/10 (total: 0.0s)        [cs_single_2t_equiv] iter 8/10 (total: 0.0s)        [cs_single_2t_equiv] iter 9/10 (total: 0.0s)        [cs_single_2t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=972.7 us
-  Benchmarking C SQLite single-thread baseline (4000 rows)...     [cs_single_4t_equiv] warmup 1/2...    [cs_single_4t_equiv] warmup 2/2...    [cs_single_4t_equiv] iter 1/10 (total: 0.0s)        [cs_single_4t_equiv] iter 2/10 (total: 0.0s)        [cs_single_4t_equiv] iter 3/10 (total: 0.0s)        [cs_single_4t_equiv] iter 4/10 (total: 0.0s)        [cs_single_4t_equiv] iter 5/10 (total: 0.0s)        [cs_single_4t_equiv] iter 6/10 (total: 0.0s)        [cs_single_4t_equiv] iter 7/10 (total: 0.0s)        [cs_single_4t_equiv] iter 8/10 (total: 0.0s)        [cs_single_4t_equiv] iter 9/10 (total: 0.0s)        [cs_single_4t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=1.61 ms
-  Benchmarking C SQLite single-thread baseline (8000 rows)...     [cs_single_8t_equiv] warmup 1/2...    [cs_single_8t_equiv] warmup 2/2...    [cs_single_8t_equiv] iter 1/10 (total: 0.0s)        [cs_single_8t_equiv] iter 2/10 (total: 0.0s)        [cs_single_8t_equiv] iter 3/10 (total: 0.0s)        [cs_single_8t_equiv] iter 4/10 (total: 0.0s)        [cs_single_8t_equiv] iter 5/10 (total: 0.0s)        [cs_single_8t_equiv] iter 6/10 (total: 0.0s)        [cs_single_8t_equiv] iter 7/10 (total: 0.0s)        [cs_single_8t_equiv] iter 8/10 (total: 0.0s)        [cs_single_8t_equiv] iter 9/10 (total: 0.0s)        [cs_single_8t_equiv] iter 10/10 (total: 0.0s)                                                                                    C_single=2.95 ms
-
-Benchmark complete in 2.8s. Generating reports...
-JSON report written to: tests/artifacts/perf/codex-concurrent-current-profile-after-mtfix-20260512T1250Z/concurrent-current.json

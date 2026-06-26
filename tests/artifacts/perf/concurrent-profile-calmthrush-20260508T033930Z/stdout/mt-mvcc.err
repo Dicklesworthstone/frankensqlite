@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=1000 threads=[1, 2, 4, 8] iters=8 apples_to_apples=false
-mt-mvcc-bench: wrote json report tests/artifacts/perf/concurrent-profile-calmthrush-20260508T033930Z/mt-mvcc-1-2-4-8.json
-mt-mvcc-bench: wrote markdown summary tests/artifacts/perf/concurrent-profile-calmthrush-20260508T033930Z/mt-mvcc-1-2-4-8.md
-mt-mvcc-bench: updated pass-over-pass history tests/artifacts/perf/concurrent-profile-calmthrush-20260508T033930Z/mt-mvcc-history.json
