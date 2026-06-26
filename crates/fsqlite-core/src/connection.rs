@@ -48634,86 +48634,118 @@ impl Connection {
                     },
                     None => None,
                 };
-                // Snapshot (table, fk defs) for tables with FKs so we don't hold
-                // the schema borrow across the row-scanning queries below.
-                let targets: Vec<(String, Vec<_>)> = {
+                // Resolve every FK to check (column NAMES + fkid) up front so no
+                // schema borrow is held across the queries below.
+                struct FkCheck {
+                    child_table: String,
+                    parent_table: String,
+                    fkid: i64,
+                    child_cols: Vec<String>,
+                    parent_cols: Vec<String>,
+                }
+                let checks: Vec<FkCheck> = {
                     let schema = self.schema.borrow();
-                    schema
-                        .iter()
-                        .filter(|t| !t.foreign_keys.is_empty())
-                        .filter(|t| {
-                            only_table
-                                .as_ref()
-                                .is_none_or(|n| t.name.eq_ignore_ascii_case(n))
-                        })
-                        .map(|t| (t.name.clone(), t.foreign_keys.clone()))
-                        .collect()
-                };
-                let mut out: Vec<Row> = Vec::new();
-                for (tname, fks) in &targets {
-                    let n_fks = fks.len();
-                    // rowid first, then columns in schema order.
-                    let scan_sql = format!("SELECT rowid, * FROM {}", quote_identifier(tname));
-                    let child_rows = self.query_with_params(&scan_sql, &[])?;
-                    for (decl_idx, fk) in fks.iter().enumerate() {
-                        // FK numbering mirrors foreign_key_list: the last-declared
-                        // FK is id 0 (reverse declaration order).
-                        let fkid = i64::try_from(n_fks - 1 - decl_idx).unwrap_or(0);
-                        // Resolve parent match columns (empty => parent's IPK).
-                        let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
-                            let schema = self.schema.borrow();
-                            schema
-                                .iter()
-                                .find(|t| t.name.eq_ignore_ascii_case(&fk.parent_table))
-                                .and_then(|p| {
-                                    p.columns
-                                        .iter()
-                                        .find(|c| c.is_ipk)
-                                        .map(|c| vec![c.name.clone()])
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            fk.parent_columns.clone()
-                        };
-                        if parent_cols.is_empty() {
+                    let mut checks = Vec::new();
+                    for t in schema.iter() {
+                        if t.foreign_keys.is_empty() {
                             continue;
                         }
-                        let where_parts: Vec<String> = parent_cols
-                            .iter()
-                            .enumerate()
-                            .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
-                            .collect();
-                        let parent_sql = format!(
-                            "SELECT 1 FROM {} WHERE {} LIMIT 1",
-                            quote_identifier(&fk.parent_table),
-                            where_parts.join(" AND ")
-                        );
-                        for row in &child_rows {
-                            let vals = row.values();
-                            let Some(rowid_val) = vals.first().cloned() else {
-                                continue;
-                            };
-                            // Child column indices are offset by 1 (rowid is col 0).
-                            let child_vals: Vec<SqliteValue> = fk
+                        if !only_table
+                            .as_ref()
+                            .is_none_or(|n| t.name.eq_ignore_ascii_case(n))
+                        {
+                            continue;
+                        }
+                        let n_fks = t.foreign_keys.len();
+                        for (decl_idx, fk) in t.foreign_keys.iter().enumerate() {
+                            // FK numbering mirrors foreign_key_list: the
+                            // last-declared FK is id 0 (reverse declaration order).
+                            let fkid = i64::try_from(n_fks - 1 - decl_idx).unwrap_or(0);
+                            let child_cols: Vec<String> = fk
                                 .child_columns
                                 .iter()
-                                .map(|&ci| vals.get(ci + 1).cloned().unwrap_or(SqliteValue::Null))
+                                .filter_map(|&ci| t.columns.get(ci).map(|c| c.name.clone()))
                                 .collect();
-                            // A partially/fully NULL child FK is satisfied.
-                            if child_vals.iter().any(SqliteValue::is_null) {
+                            if child_cols.len() != fk.child_columns.len() {
                                 continue;
                             }
-                            let parent_hit = self.query_with_params(&parent_sql, &child_vals)?;
-                            if parent_hit.is_empty() {
-                                out.push(Row {
-                                    values: vec![
-                                        SqliteValue::Text(tname.clone().into()),
-                                        rowid_val,
-                                        SqliteValue::Text(fk.parent_table.clone().into()),
-                                        SqliteValue::Integer(fkid),
-                                    ],
-                                });
+                            // Parent match columns (empty => parent's IPK).
+                            let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                                schema
+                                    .iter()
+                                    .find(|p| p.name.eq_ignore_ascii_case(&fk.parent_table))
+                                    .and_then(|p| {
+                                        p.columns
+                                            .iter()
+                                            .find(|c| c.is_ipk)
+                                            .map(|c| vec![c.name.clone()])
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                fk.parent_columns.clone()
+                            };
+                            if parent_cols.is_empty() || parent_cols.len() != child_cols.len() {
+                                continue;
                             }
+                            checks.push(FkCheck {
+                                child_table: t.name.clone(),
+                                parent_table: fk.parent_table.clone(),
+                                fkid,
+                                child_cols,
+                                parent_cols,
+                            });
+                        }
+                    }
+                    checks
+                };
+
+                // One set-difference (anti-join) query per FK: report every child
+                // row whose fully-non-NULL foreign key has no matching parent.
+                // This replaces the previous one-parent-lookup-per-child-row loop,
+                // which was O(child_rows × parent_lookup) and degraded to
+                // O(child × parent) without an index (br-xugii). The correlated
+                // NOT EXISTS lets the planner use the parent's rowid/unique index,
+                // and frank's exists-probe memo dedupes repeated child keys.
+                let mut out: Vec<Row> = Vec::new();
+                for chk in &checks {
+                    let child_q = quote_identifier(&chk.child_table);
+                    let parent_q = quote_identifier(&chk.parent_table);
+                    // MATCH SIMPLE: a child FK with any NULL column is satisfied,
+                    // so only check rows whose FK columns are all non-NULL.
+                    let not_null = chk
+                        .child_cols
+                        .iter()
+                        .map(|c| format!("{child_q}.{} IS NOT NULL", quote_identifier(c)))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    let join_eq = chk
+                        .child_cols
+                        .iter()
+                        .zip(&chk.parent_cols)
+                        .map(|(cc, pc)| {
+                            format!(
+                                "p.{} = {child_q}.{}",
+                                quote_identifier(pc),
+                                quote_identifier(cc)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    let sql = format!(
+                        "SELECT {child_q}.rowid FROM {child_q} WHERE {not_null} \
+                         AND NOT EXISTS (SELECT 1 FROM {parent_q} AS p WHERE {join_eq})"
+                    );
+                    let violating = self.query_with_params(&sql, &[])?;
+                    for row in &violating {
+                        if let Some(rowid_val) = row.values().first().cloned() {
+                            out.push(Row {
+                                values: vec![
+                                    SqliteValue::Text(chk.child_table.clone().into()),
+                                    rowid_val,
+                                    SqliteValue::Text(chk.parent_table.clone().into()),
+                                    SqliteValue::Integer(chk.fkid),
+                                ],
+                            });
                         }
                     }
                 }

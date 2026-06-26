@@ -164,3 +164,61 @@ fn pragma_foreign_key_check_reports_violation() {
         "pragma_foreign_key_check_reports_violation",
     );
 }
+
+/// br-xugii: `PRAGMA foreign_key_check` must scale. The previous implementation
+/// issued one parent-existence query per child row (O(child × parent_lookup),
+/// degrading to O(child × parent) and pegging a core for minutes on tens of
+/// thousands of rows). The anti-join rewrite runs one set-difference query per
+/// FK. This builds a non-trivial table and asserts the orphan report still
+/// matches rusqlite at scale (and completes effectively instantly).
+#[test]
+fn pragma_foreign_key_check_scale() {
+    const N: i64 = 1500;
+    let f = Connection::open(":memory:").expect("open frank");
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+
+    for stmt in [
+        "PRAGMA foreign_keys = OFF",
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+    ] {
+        f.execute(stmt).expect("frank ddl");
+        r.execute_batch(stmt).expect("sqlite ddl");
+    }
+
+    // Insert N parent rows and N child rows in chunks. Every 200th child is an
+    // orphan (pid points past the parent range), so there are exactly N/200.
+    let mut parent_chunk = String::new();
+    let mut child_chunk = String::new();
+    for id in 1..=N {
+        if !parent_chunk.is_empty() {
+            parent_chunk.push(',');
+            child_chunk.push(',');
+        }
+        parent_chunk.push_str(&format!("({id})"));
+        let pid = if id % 200 == 0 { id + 1_000_000 } else { id };
+        child_chunk.push_str(&format!("({id},{pid})"));
+        if id % 300 == 0 || id == N {
+            let psql = format!("INSERT INTO parent (id) VALUES {parent_chunk}");
+            let csql = format!("INSERT INTO child (id, pid) VALUES {child_chunk}");
+            f.execute(&psql).expect("frank parent insert");
+            r.execute_batch(&psql).expect("sqlite parent insert");
+            f.execute(&csql).expect("frank child insert");
+            r.execute_batch(&csql).expect("sqlite child insert");
+            parent_chunk.clear();
+            child_chunk.clear();
+        }
+    }
+
+    let fc = frank_rows(&f, "PRAGMA foreign_key_check").expect("frank fkc");
+    let rc = sqlite_rows(&r, "PRAGMA foreign_key_check").expect("sqlite fkc");
+    assert_eq!(
+        fc, rc,
+        "foreign_key_check orphan report must match rusqlite at scale"
+    );
+    assert_eq!(
+        i64::try_from(fc.len()).unwrap(),
+        N / 200,
+        "expected exactly N/200 planted orphans"
+    );
+}
