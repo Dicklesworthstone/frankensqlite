@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-ext-icu"
-version = "0.1.11"
+version = "0.1.12"
 description = "ICU collation extension"
 edition.workspace = true
 license.workspace = true

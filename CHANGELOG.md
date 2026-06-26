@@ -17,15 +17,23 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.11] -- 2026-06-19 (dependency refresh, conformance fixes, release hardening)
+## [0.1.12] -- 2026-06-19 (post-0.1.11 correctness and release hardening)
 
-Full-workspace lockstep release candidate (`0.1.10 -> 0.1.11`).
+Full-workspace lockstep release candidate (`0.1.11 -> 0.1.12`).
 
 ### Fixed
 
 - Corrected in-transaction `PRAGMA integrity_check` false positives around
   transaction-local page growth and reserved-but-unissued pager leases
   ([#113](https://github.com/Dicklesworthstone/frankensqlite/issues/113)).
+- Fixed pager transaction live-size accounting so reserved-but-unissued page
+  leases do not leak into `freelist_count`/integrity-style observations.
+- Preserved indexed `COUNT(*)` correlated-`EXISTS` probes while routing the
+  unsupported correlated `EXISTS` WHERE shapes through the connection fallback.
+- Matched SQLite compound DISTINCT result ordering for
+  `UNION`/`INTERSECT`/`EXCEPT` while preserving `UNION ALL` append order.
+- Corrected `concat_ws` so empty-string arguments are retained and only `NULL`
+  separator/payload semantics are special.
 - Hardened the concurrent commit validate/write/publish regression test for
   [#115](https://github.com/Dicklesworthstone/frankensqlite/issues/115) so the
   process-global hook cannot be stolen by unrelated parallel tests.
@@ -41,6 +49,8 @@ Full-workspace lockstep release candidate (`0.1.10 -> 0.1.11`).
   including the latest local `/dp/asupersync` checkout.
 - Updated browser SDK/worker tooling to TypeScript 6, Vitest 4, and Playwright
   1.61.
+- Added a dev-profile override for the local `asupersync` path dependency to
+  reduce debug compile cost during workspace release gates.
 
 ### Release Notes
 
