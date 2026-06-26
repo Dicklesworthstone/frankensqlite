@@ -32557,8 +32557,13 @@ impl Connection {
         let Some(structure) = structure.filter(|s| s.segment_count() > 0) else {
             return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
         };
-        let averages =
-            averages.unwrap_or_else(|| Fts5AveragesRecord::new(0, vec![0; column_count]));
+        // Segments imply at least one tokenised document, so the full encode
+        // always wrote a (non-empty) averages row alongside them. If it is
+        // somehow missing, the `_data` shadow is inconsistent: rebuild from the
+        // in-memory index rather than appending onto undercounted corpus stats.
+        let Some(averages) = averages else {
+            return self.persist_rootpage_zero_fts5_shadow_rows(table_name);
+        };
         let next_segid = structure
             .levels
             .iter()
