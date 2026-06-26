@@ -54,9 +54,6 @@ fn insert_doc(conn: &Connection, rowid: i64, content: &str, title: &str) {
 }
 
 #[test]
-#[ignore = "bd-sf8dx / cass y8n3i: asserts the POST-FIX behaviour (contentless reopen-mutate + open-validation). \
-Currently fails on HEAD — un-ignore once the frankensqlite contentless-FTS fix lands. \
-Reproducer authored 2026-06-25 during cass v0.6.18 release triage."]
 fn contentless_fts_reopen_then_incremental_insert() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap().to_owned();

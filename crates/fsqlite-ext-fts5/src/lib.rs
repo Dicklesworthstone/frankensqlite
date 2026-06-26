@@ -2288,6 +2288,50 @@ pub trait Fts5OnDiskReader {
     fn read_content(&mut self, rowid: i64, column_count: usize) -> Result<Option<Vec<String>>>;
 }
 
+/// In-memory [`Fts5OnDiskReader`] over the decoded shadow rows currently bound
+/// to a reopened table. It lets the recency-correct lazy enumeration
+/// ([`collect_doclist_recency`]) run directly over a [`Fts5ShadowRows`] without
+/// a pager, which is how a reopened CONTENTLESS table hydrates its in-memory
+/// index from persisted segments before the first mutation. Only the two
+/// segment-reading primitives are meaningful here; `_docsize`/`_content`
+/// point-reads are unused by the term enumeration (a contentless table keeps no
+/// `_content` rows anyway).
+struct Fts5ShadowRowReader<'a> {
+    data: &'a [Fts5DataRow],
+    idx: &'a [Fts5IdxRow],
+}
+
+impl Fts5OnDiskReader for Fts5ShadowRowReader<'_> {
+    fn read_data_block(&mut self, id: i64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .data
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.block.clone()))
+    }
+
+    fn idx_candidate_page(&mut self, segid: u32, term: &[u8]) -> Result<Option<u32>> {
+        Ok(self
+            .idx
+            .iter()
+            .filter(|row| row.segid == segid && row.term.as_slice() <= term)
+            .max_by(|left, right| left.term.cmp(&right.term))
+            .map(|row| row.btree_page))
+    }
+
+    fn read_docsize(
+        &mut self,
+        _rowid: i64,
+        _column_count: usize,
+    ) -> Result<Option<Fts5DocsizeRow>> {
+        Ok(None)
+    }
+
+    fn read_content(&mut self, _rowid: i64, _column_count: usize) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
+}
+
 /// Lazily fetch the doclist for an exact `term` within one on-disk segment,
 /// reading only the leaf pages from the term's candidate page onward. Mirrors
 /// the leaf scan in [`Fts5SegmentReader::exact_postings`] but sources leaf
@@ -2414,6 +2458,45 @@ where
         }
     }
     Ok(out)
+}
+
+/// Collect every LIVE posting across `structure`'s segments, grouped by stored
+/// term, applying the same multi-segment recency + tombstone semantics as
+/// [`collect_doclist_recency`] but PRESERVING the per-term identity (which the
+/// flat merge discards). Each returned term still carries its stored index
+/// marker byte (`FTS5_MAIN_PREFIX_BYTE ++ token` for main-index terms).
+///
+/// Used to hydrate a reopened contentless table's in-memory inverted index from
+/// its persisted segments: an empty prefix enumerates all main-index terms,
+/// recency keeps the newest `(term, rowid)` occurrence, and deletes/tombstones
+/// are dropped so the rebuilt index matches what a live query would see.
+fn collect_live_term_groups(
+    reader: &mut dyn Fts5OnDiskReader,
+    structure: &Fts5StructureRecord,
+) -> Result<Vec<(Vec<u8>, Vec<Fts5DoclistEntry>)>> {
+    let mut by_term: BTreeMap<Vec<u8>, Vec<Fts5DoclistEntry>> = BTreeMap::new();
+    let mut seen: HashSet<(Vec<u8>, u64)> = HashSet::new();
+    for level in &structure.levels {
+        for segment in level.segments.iter().rev() {
+            for (term, entries) in lazy_segment_prefix_groups(reader, segment, &[])? {
+                for entry in entries {
+                    if !seen.insert((term.clone(), entry.rowid)) {
+                        // Older segment's (term, rowid): shadowed by the newer one.
+                        continue;
+                    }
+                    if entry.poslist.delete {
+                        // Newest occurrence is a delete marker: rowid is dead.
+                        continue;
+                    }
+                    if rowid_tombstoned_in_segment(reader, segment, entry.rowid)? {
+                        continue;
+                    }
+                    by_term.entry(term.clone()).or_default().push(entry);
+                }
+            }
+        }
+    }
+    Ok(by_term.into_iter().collect())
 }
 
 /// Lazily collect the LIVE doclist entries for an exact `term`.
@@ -4955,6 +5038,32 @@ impl InvertedIndex {
         }
     }
 
+    /// Replay one persisted doclist entry (read back from on-disk segments) into
+    /// this index, reproducing the postings `add_document` would have created for
+    /// the originally-indexed positions. Used to hydrate a reopened CONTENTLESS
+    /// table's in-memory index from its persisted segments before mutation —
+    /// contentless tables keep no `_content` rows to re-tokenize, so the postings
+    /// are recovered directly from the segment poslists. `term` is the raw token
+    /// (the stored index marker already stripped); `append_position` re-applies
+    /// the marker and maintains the reverse map and prefix indexes.
+    fn replay_persisted_entry(&mut self, term: &str, docid: i64, poslist: &Fts5Poslist) {
+        self.doc_ids.insert(docid);
+        if poslist.columns.is_empty() {
+            // detail=none (or a positionless posting): record presence only.
+            self.append_position(term, docid, 0, 0);
+            return;
+        }
+        for column in &poslist.columns {
+            if column.offsets.is_empty() {
+                self.append_position(term, docid, column.column, 0);
+            } else {
+                for &position in &column.offsets {
+                    self.append_position(term, docid, column.column, position);
+                }
+            }
+        }
+    }
+
     /// Index a document's tokens for a given column.
     pub fn add_document(&mut self, docid: i64, column: u32, tokens: &[Fts5Token]) {
         self.doc_ids.insert(docid);
@@ -7338,26 +7447,81 @@ impl Fts5Table {
         self.apply_docsize_rows(&docsize);
     }
 
-    fn has_bound_persisted_segments(&self) -> Result<bool> {
+    /// Hydrate the in-memory inverted index from the persisted on-disk segments
+    /// of a reopened CONTENTLESS table, so an incremental mutation appends to the
+    /// existing postings instead of dropping them.
+    ///
+    /// A no-op for content-backed tables (their index is rebuilt by
+    /// re-tokenizing the bound `_content` rows in
+    /// [`Self::materialize_shadow_rows_for_mutation`]) and for tables with no
+    /// persisted segments. On success the lazy shadow binding is consumed, so the
+    /// subsequent `materialize_shadow_rows_for_mutation` becomes a no-op and the
+    /// new row is appended to the fully-hydrated index.
+    fn hydrate_contentless_index_from_segments(&mut self) -> Result<()> {
+        if self.config.content_mode != ContentMode::Contentless {
+            return Ok(());
+        }
         let Some(rows) = self.shadow_rows.as_ref() else {
-            return Ok(false);
+            return Ok(());
         };
         let metadata = Fts5DataMetadata::decode_rows(&rows.data, self.columns.len())?;
-        Ok(metadata
-            .structure
-            .as_ref()
-            .is_some_and(|structure| structure.segment_count() > 0))
+        let Some(structure) = metadata.structure else {
+            return Ok(());
+        };
+        if structure.segment_count() == 0 {
+            return Ok(());
+        }
+        let groups = {
+            let mut reader = Fts5ShadowRowReader {
+                data: &rows.data,
+                idx: &rows.idx,
+            };
+            collect_live_term_groups(&mut reader, &structure)?
+        };
+        let docsize = rows.docsize.clone();
+        // Last use of `rows` (the &self.shadow_rows borrow) — released here so the
+        // index/docsize writes below can take `self` mutably.
+        let mut index = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+        for (stored_term, entries) in groups {
+            // `collect_live_term_groups` (empty prefix) yields only MAIN-index
+            // terms; `append_position` rebuilds the prefix indexes from the raw
+            // token. A given segment stores terms in ONE encoding: stock SQLite
+            // and frankensqlite's own writer mark main terms as
+            // `FTS5_MAIN_PREFIX_BYTE ++ token`, but some segments store the raw
+            // token, so strip the marker when present and otherwise use the term
+            // as-is.
+            let raw = match stored_term.split_first() {
+                Some((&FTS5_MAIN_PREFIX_BYTE, rest)) => rest,
+                _ => stored_term.as_slice(),
+            };
+            let term = String::from_utf8_lossy(raw);
+            for entry in entries {
+                let Ok(docid) = i64::try_from(entry.rowid) else {
+                    continue;
+                };
+                index.replay_persisted_entry(&term, docid, &entry.poslist);
+            }
+        }
+        self.index = index;
+        self.apply_docsize_rows(&docsize);
+        self.shadow_rows = None;
+        Ok(())
     }
 
-    pub fn ensure_shadow_rows_materializable_for_mutation(&self) -> Result<()> {
-        if self.config.content_mode == ContentMode::Contentless
-            && self.has_bound_persisted_segments()?
-        {
-            return Err(FrankenError::function_error(
-                "fts5: cannot mutate a lazily opened contentless table with persisted segments",
-            ));
-        }
-        Ok(())
+    /// Prepare a (possibly lazily reopened) table for an in-place mutation.
+    ///
+    /// For a CONTENTLESS table reopened with persisted segments this hydrates the
+    /// in-memory index from those segments (the postings are otherwise
+    /// unrecoverable — contentless keeps no `_content` rows); for every other
+    /// table it is a cheap no-op and the standard content materialization runs at
+    /// mutation time.
+    pub fn ensure_shadow_rows_materializable_for_mutation(&mut self) -> Result<()> {
+        self.hydrate_contentless_index_from_segments()
     }
 
     pub fn ensure_rebuild_supported(&self) -> Result<()> {
@@ -11759,7 +11923,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fts5_contentless_lazy_shadow_mutation_rejects_without_losing_segments() {
+    fn test_fts5_contentless_lazy_shadow_mutation_hydrates_and_preserves_segments() {
+        // bd-sf8dx / cass y8n3i: a reopened contentless table with persisted
+        // segments must hydrate its in-memory index from those segments on the
+        // first mutation (the postings are otherwise unrecoverable — contentless
+        // keeps no `_content` rows), then append the new row WITHOUT dropping the
+        // old postings.
         let cx = Cx::new();
         let base = Fts5Table::connect(
             &cx,
@@ -11793,7 +11962,7 @@ mod tests {
         reopened.apply_shadow_rows(&rows).unwrap();
         assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
 
-        let err = reopened
+        reopened
             .update(
                 &cx,
                 &[
@@ -11803,12 +11972,14 @@ mod tests {
                     SqliteValue::Text(SmallText::from_string("row")),
                 ],
             )
-            .expect_err("contentless lazy mutation cannot preserve persisted postings");
+            .expect("contentless lazy mutation hydrates segments and appends");
 
-        assert!(err.to_string().contains("lazily opened contentless"));
-        assert!(reopened.shadow_rows.is_some());
+        // The lazy shadow binding is consumed by the hydration.
+        assert!(reopened.shadow_rows.is_none());
+        // Old postings survive the hydrate+append...
         assert_eq!(search_rowids(&reopened, "brown").unwrap(), vec![1, 4]);
-        assert!(search_rowids(&reopened, "fresh").unwrap().is_empty());
+        // ...and the freshly inserted row is searchable.
+        assert_eq!(search_rowids(&reopened, "fresh").unwrap(), vec![99]);
     }
 
     #[test]
