@@ -66178,37 +66178,42 @@ fn rewrite_in_select_core(
     Ok(())
 }
 
-/// bd-8ewbk: rewrite a single `UPDATE ... FROM` source that is an aliased
-/// subquery into a named-table reference to a freshly-minted CTE, accumulating
-/// the CTE in `ctes`. Non-subquery sources (and the rare unaliased subquery)
-/// pass through unchanged. The CTE is named after the subquery alias so every
-/// `alias.col` reference resolves to the materialized relation by name.
+/// bd-8ewbk: rewrite a single `UPDATE ... FROM` source that is a subquery into a
+/// named-table reference to a freshly-minted CTE, accumulating the CTE in `ctes`.
+/// Non-subquery sources pass through unchanged.
+///
+/// An aliased subquery keeps its alias as the CTE name so every `alias.col`
+/// reference resolves to the materialized relation by name. An unaliased
+/// subquery (legal but rare, e.g. `FROM src, (SELECT 1)`) gets a synthetic,
+/// collision-resistant name derived from its FROM position; its columns remain
+/// reachable only unqualified, exactly as SQLite treats an unaliased FROM
+/// subquery.
 fn hoist_update_from_source_to_cte(
     src: &TableOrSubquery,
+    position: usize,
     ctes: &mut Vec<fsqlite_ast::Cte>,
 ) -> TableOrSubquery {
-    if let TableOrSubquery::Subquery {
-        query,
-        alias: Some(alias),
-    } = src
-    {
-        ctes.push(fsqlite_ast::Cte {
-            name: alias.clone(),
-            columns: Vec::new(),
-            materialized: None,
-            query: (**query).clone(),
-        });
-        TableOrSubquery::Table {
-            name: QualifiedName {
-                schema: None,
-                name: alias.clone(),
-            },
-            alias: None,
-            index_hint: None,
-            time_travel: None,
-        }
-    } else {
-        src.clone()
+    let TableOrSubquery::Subquery { query, alias } = src else {
+        return src.clone();
+    };
+    let cte_name = match alias {
+        Some(alias) => alias.clone(),
+        None => format!("__fsqlite_update_from_subquery_{position}"),
+    };
+    ctes.push(fsqlite_ast::Cte {
+        name: cte_name.clone(),
+        columns: Vec::new(),
+        materialized: None,
+        query: (**query).clone(),
+    });
+    TableOrSubquery::Table {
+        name: QualifiedName {
+            schema: None,
+            name: cte_name,
+        },
+        alias: None,
+        index_hint: None,
+        time_travel: None,
     }
 }
 
@@ -66220,33 +66225,32 @@ fn hoist_update_from_source_to_cte(
 /// joins, column renames, DISTINCT, compounds, ...), including a subquery that is
 /// one arm of a multi-source FROM.
 ///
-/// Each aliased subquery FROM source becomes a CTE named after its alias and the
-/// source is replaced with a named-table reference to that CTE. Returns `None`
-/// when there is nothing to hoist (no FROM clause, or no aliased subquery
-/// source), leaving simple/flattened shapes on their existing fast paths. The
-/// hoisted CTEs are appended after any pre-existing WITH CTEs so they may
-/// reference them.
+/// Each subquery FROM source becomes a CTE (named after its alias, or a
+/// synthetic positional name when unaliased) and the source is replaced with a
+/// named-table reference to that CTE. Returns `None` when there is nothing to
+/// hoist (no FROM clause, or no subquery source), leaving simple/flattened
+/// shapes on their existing fast paths. The hoisted CTEs are appended after any
+/// pre-existing WITH CTEs so they may reference them.
 fn hoist_update_from_subqueries_to_ctes(
     update: &fsqlite_ast::UpdateStatement,
 ) -> Option<fsqlite_ast::UpdateStatement> {
     let from = update.from.as_ref()?;
-    let leading_is_aliased_subquery =
-        matches!(&from.source, TableOrSubquery::Subquery { alias: Some(_), .. });
-    let joined_has_aliased_subquery = from
+    let leading_is_subquery = matches!(&from.source, TableOrSubquery::Subquery { .. });
+    let joined_has_subquery = from
         .joins
         .iter()
-        .any(|join| matches!(&join.table, TableOrSubquery::Subquery { alias: Some(_), .. }));
-    if !leading_is_aliased_subquery && !joined_has_aliased_subquery {
+        .any(|join| matches!(&join.table, TableOrSubquery::Subquery { .. }));
+    if !leading_is_subquery && !joined_has_subquery {
         return None;
     }
 
     let mut hoisted_ctes: Vec<fsqlite_ast::Cte> = Vec::new();
-    let new_source = hoist_update_from_source_to_cte(&from.source, &mut hoisted_ctes);
+    let new_source = hoist_update_from_source_to_cte(&from.source, 0, &mut hoisted_ctes);
     let mut new_joins = Vec::with_capacity(from.joins.len());
-    for join in &from.joins {
+    for (position, join) in from.joins.iter().enumerate() {
         new_joins.push(JoinClause {
             join_type: join.join_type,
-            table: hoist_update_from_source_to_cte(&join.table, &mut hoisted_ctes),
+            table: hoist_update_from_source_to_cte(&join.table, position + 1, &mut hoisted_ctes),
             constraint: join.constraint.clone(),
         });
     }

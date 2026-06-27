@@ -22921,6 +22921,34 @@ fn test_conformance_update_with_from_clause_s291() {
     }
 }
 
+// bd-8ewbk: an unaliased subquery as one arm of a comma-joined `UPDATE ... FROM`
+// (e.g. `FROM src, (SELECT 1)`) is a legal SQLite shape. The subquery is hoisted
+// into a synthetic-named CTE so the materialized relation participates as a
+// cross-join multiplier with its columns reachable only unqualified.
+#[test]
+fn test_conformance_update_from_comma_unaliased_subquery_s291b() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
+        "INSERT INTO t VALUES(1,0),(2,0),(3,0)",
+        "INSERT INTO src VALUES(1,11,111),(2,22,222),(3,33,333)",
+        "UPDATE t SET v = src.v FROM src, (SELECT 1) WHERE t.id = src.id",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = ["SELECT id, v FROM t ORDER BY id"];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} UPDATE...FROM comma unaliased subquery mismatches", mismatches.len());
+    }
+}
+
 #[test]
 fn test_conformance_window_cume_dist_percent_rank_s292() {
     let fconn = Connection::open(":memory:").unwrap();
