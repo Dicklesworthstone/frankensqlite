@@ -25834,50 +25834,78 @@ fn test_conformance_complex_case_nested_s366() {
     }
 }
 
-#[test]
-#[ignore = "DELETE...ORDER BY...LIMIT requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT"]
-fn test_conformance_delete_with_limit_s367() {
-    let fconn = Connection::open(":memory:").unwrap();
+// s367/s368: FrankenSQLite intentionally supports `UPDATE/DELETE ... ORDER BY
+// ... LIMIT` — the SQLITE_ENABLE_UPDATE_DELETE_LIMIT surface — implemented via
+// the materialize_{update,delete}_limit_scope key-set rewrite (connection.rs).
+// The bundled rusqlite oracle is SQLite built WITHOUT that compile option, so it
+// rejects the syntax and cannot oracle-compare. This is therefore a documented
+// intentional divergence (per docs/canonical_parity_contract.md), wired into the
+// harness as a direct-behavior regression guard rather than left ambiguously
+// ignored: frank must mutate exactly the LIMIT-scoped, ORDER-BY-selected rows,
+// and the default-build oracle must still reject the statement.
+fn assert_oracle_rejects_update_delete_limit(dml: &str) {
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &[
-        "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
-        "INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40),(5,50)",
-        "DELETE FROM t WHERE val > 20 ORDER BY val LIMIT 2",
-    ] {
-        fconn.execute(s).unwrap();
-        rconn.execute_batch(s).unwrap();
-    }
-    let queries = ["SELECT * FROM t ORDER BY id"];
-    let mismatches = oracle_compare(&fconn, &rconn, &queries);
-    if !mismatches.is_empty() {
-        for m in &mismatches {
-            eprintln!("{m}\n");
-        }
-        panic!("{} DELETE with LIMIT mismatches", mismatches.len());
-    }
+    rconn
+        .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    assert!(
+        rconn.execute_batch(dml).is_err(),
+        "oracle (SQLite without SQLITE_ENABLE_UPDATE_DELETE_LIMIT) is expected to \
+         reject `{dml}`; if this starts passing the divergence is gone and these \
+         tests can become oracle comparisons",
+    );
 }
 
 #[test]
-#[ignore = "UPDATE...ORDER BY...LIMIT requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT"]
-fn test_conformance_update_with_limit_s368() {
+fn test_conformance_delete_with_limit_s367() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
     for s in &[
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
         "INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40),(5,50)",
+        // Deletes the 2 lowest-val rows among val > 20: val=30 (id 3), val=40 (id 4).
+        "DELETE FROM t WHERE val > 20 ORDER BY val LIMIT 2",
+    ] {
+        fconn.execute(s).unwrap();
+    }
+    let rows = query_fsqlite_strings(&fconn, "SELECT id, val FROM t ORDER BY id").unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_owned(), "10".to_owned()],
+            vec!["2".to_owned(), "20".to_owned()],
+            vec!["5".to_owned(), "50".to_owned()],
+        ],
+        "DELETE ... ORDER BY val LIMIT 2 must remove only val=30 and val=40",
+    );
+    assert_oracle_rejects_update_delete_limit("DELETE FROM t WHERE val > 20 ORDER BY val LIMIT 2");
+}
+
+#[test]
+fn test_conformance_update_with_limit_s368() {
+    let fconn = Connection::open(":memory:").unwrap();
+    for s in &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
+        "INSERT INTO t VALUES(1,10),(2,20),(3,30),(4,40),(5,50)",
+        // Updates the 2 lowest-val rows among val > 20: val=30 -> 300, val=40 -> 400.
         "UPDATE t SET val = val * 10 WHERE val > 20 ORDER BY val LIMIT 2",
     ] {
         fconn.execute(s).unwrap();
-        rconn.execute_batch(s).unwrap();
     }
-    let queries = ["SELECT * FROM t ORDER BY id"];
-    let mismatches = oracle_compare(&fconn, &rconn, &queries);
-    if !mismatches.is_empty() {
-        for m in &mismatches {
-            eprintln!("{m}\n");
-        }
-        panic!("{} UPDATE with LIMIT mismatches", mismatches.len());
-    }
+    let rows = query_fsqlite_strings(&fconn, "SELECT id, val FROM t ORDER BY id").unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_owned(), "10".to_owned()],
+            vec!["2".to_owned(), "20".to_owned()],
+            vec!["3".to_owned(), "300".to_owned()],
+            vec!["4".to_owned(), "400".to_owned()],
+            vec!["5".to_owned(), "50".to_owned()],
+        ],
+        "UPDATE ... ORDER BY val LIMIT 2 must change only val=30->300 and val=40->400",
+    );
+    assert_oracle_rejects_update_delete_limit(
+        "UPDATE t SET val = val * 10 WHERE val > 20 ORDER BY val LIMIT 2",
+    );
 }
 
 #[test]
