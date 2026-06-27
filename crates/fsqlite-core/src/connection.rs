@@ -24878,15 +24878,19 @@ impl Connection {
             statement,
             Statement::Select(select) if flatten_simple_from_subquery_select(select).is_some()
         );
-        // bd-kkfok: an `UPDATE ... FROM (subquery)` carries its only subquery in
-        // the FROM source, which `statement_contains_rewritable_subquery` does not
-        // flag. Without this the fast path would skip the flatten rewrite below.
+        // bd-kkfok / bd-8ewbk: an `UPDATE ... FROM (subquery)` carries its only
+        // subquery in the FROM source (leading source or a JOIN arm), which
+        // `statement_contains_rewritable_subquery` does not flag. Without this the
+        // fast path would skip the flatten/hoist rewrite below.
         let has_update_from_subquery = matches!(
             statement,
             Statement::Update(update)
                 if update.with.is_none()
                     && update.from.as_ref().is_some_and(|from| {
                         matches!(from.source, TableOrSubquery::Subquery { .. })
+                            || from.joins.iter().any(|join| {
+                                matches!(join.table, TableOrSubquery::Subquery { .. })
+                            })
                     })
         );
         if !statement_contains_rewritable_subquery(statement)
@@ -24977,6 +24981,15 @@ impl Connection {
                 // can drive it. Done before the IN/subquery rewrites so they see the
                 // flattened (plain-table) shape.
                 try_flatten_update_from_subquery(&mut update);
+                // bd-8ewbk: any FROM subquery source that flattening could not
+                // reduce to a base table (aggregate/GROUP BY/join/rename/...) is
+                // hoisted into a CTE. The resulting WITH-clause UPDATE routes
+                // through the CTE-materialization path (in both the prepared and
+                // deferred dispatch paths), turning the subquery into a temporary
+                // relation that `codegen_update_from` drives as a named table.
+                if let Some(hoisted) = hoist_update_from_subqueries_to_ctes(&update) {
+                    return Ok(Cow::Owned(Statement::Update(hoisted)));
+                }
                 let eager_in_subqueries =
                     self.attached_target_update_requires_eager_in_subquery_rewrite(&update)?;
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
@@ -66163,6 +66176,93 @@ fn rewrite_in_select_core(
         }
     }
     Ok(())
+}
+
+/// bd-8ewbk: rewrite a single `UPDATE ... FROM` source that is an aliased
+/// subquery into a named-table reference to a freshly-minted CTE, accumulating
+/// the CTE in `ctes`. Non-subquery sources (and the rare unaliased subquery)
+/// pass through unchanged. The CTE is named after the subquery alias so every
+/// `alias.col` reference resolves to the materialized relation by name.
+fn hoist_update_from_source_to_cte(
+    src: &TableOrSubquery,
+    ctes: &mut Vec<fsqlite_ast::Cte>,
+) -> TableOrSubquery {
+    if let TableOrSubquery::Subquery {
+        query,
+        alias: Some(alias),
+    } = src
+    {
+        ctes.push(fsqlite_ast::Cte {
+            name: alias.clone(),
+            columns: Vec::new(),
+            materialized: None,
+            query: (**query).clone(),
+        });
+        TableOrSubquery::Table {
+            name: QualifiedName {
+                schema: None,
+                name: alias.clone(),
+            },
+            alias: None,
+            index_hint: None,
+            time_travel: None,
+        }
+    } else {
+        src.clone()
+    }
+}
+
+/// bd-8ewbk: hoist non-flattenable `UPDATE ... FROM (subquery) AS alias` sources
+/// into CTEs so the existing CTE-materialization path turns each subquery into a
+/// temporary relation, after which the named-table nested-loop codegen
+/// (`codegen_update_from`) drives the join. This handles subquery FROM sources
+/// that `try_flatten_update_from_subquery` cannot flatten (GROUP BY, aggregates,
+/// joins, column renames, DISTINCT, compounds, ...), including a subquery that is
+/// one arm of a multi-source FROM.
+///
+/// Each aliased subquery FROM source becomes a CTE named after its alias and the
+/// source is replaced with a named-table reference to that CTE. Returns `None`
+/// when there is nothing to hoist (no FROM clause, or no aliased subquery
+/// source), leaving simple/flattened shapes on their existing fast paths. The
+/// hoisted CTEs are appended after any pre-existing WITH CTEs so they may
+/// reference them.
+fn hoist_update_from_subqueries_to_ctes(
+    update: &fsqlite_ast::UpdateStatement,
+) -> Option<fsqlite_ast::UpdateStatement> {
+    let from = update.from.as_ref()?;
+    let leading_is_aliased_subquery =
+        matches!(&from.source, TableOrSubquery::Subquery { alias: Some(_), .. });
+    let joined_has_aliased_subquery = from
+        .joins
+        .iter()
+        .any(|join| matches!(&join.table, TableOrSubquery::Subquery { alias: Some(_), .. }));
+    if !leading_is_aliased_subquery && !joined_has_aliased_subquery {
+        return None;
+    }
+
+    let mut hoisted_ctes: Vec<fsqlite_ast::Cte> = Vec::new();
+    let new_source = hoist_update_from_source_to_cte(&from.source, &mut hoisted_ctes);
+    let mut new_joins = Vec::with_capacity(from.joins.len());
+    for join in &from.joins {
+        new_joins.push(JoinClause {
+            join_type: join.join_type,
+            table: hoist_update_from_source_to_cte(&join.table, &mut hoisted_ctes),
+            constraint: join.constraint.clone(),
+        });
+    }
+
+    let mut result = update.clone();
+    result.from = Some(FromClause {
+        source: new_source,
+        joins: new_joins,
+    });
+    let mut with = result.with.take().unwrap_or(fsqlite_ast::WithClause {
+        recursive: false,
+        ctes: Vec::new(),
+    });
+    with.ctes.extend(hoisted_ctes);
+    result.with = Some(with);
+    Some(result)
 }
 
 /// bd-kkfok: flatten a simple-projection subquery used as an `UPDATE ... FROM`

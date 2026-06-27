@@ -22898,7 +22898,6 @@ fn test_conformance_replace_function_s290() {
 }
 
 #[test]
-#[ignore = "UPDATE...FROM with subquery source not implemented"]
 fn test_conformance_update_with_from_clause_s291() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
