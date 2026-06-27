@@ -260,3 +260,117 @@ fn codegen_gap_probe() {
         true,
     );
 }
+
+// Second diagnostic harness: broader SELECT / aggregate / window / compound /
+// table-valued constructs (areas the first probe does not exercise). Same GAP /
+// ok / legit / loose classification. Run with:
+//   cargo test -p fsqlite-core --test codegen_gap_probe -- --ignored --nocapture
+#[test]
+#[ignore = "diagnostic triage harness; run with --ignored --nocapture"]
+fn codegen_gap_probe_select_window_aggregate() {
+    let t = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,2,50)",
+    ][..];
+
+    // ---- aggregate FILTER clause (SQLite 3.30+) ----
+    classify(
+        "agg_filter_clause",
+        t,
+        "SELECT g, count(*) FILTER (WHERE v > 20) AS c FROM t GROUP BY g ORDER BY g",
+        true,
+    );
+    classify(
+        "agg_filter_sum",
+        t,
+        "SELECT sum(v) FILTER (WHERE v < 40) AS s FROM t",
+        true,
+    );
+
+    // ---- window frame variants ----
+    classify(
+        "window_range_frame",
+        t,
+        "SELECT v, sum(v) OVER (ORDER BY v RANGE BETWEEN 15 PRECEDING AND 15 FOLLOWING) FROM t ORDER BY v",
+        true,
+    );
+    classify(
+        "window_groups_frame",
+        t,
+        "SELECT v, sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY v",
+        true,
+    );
+    classify(
+        "window_exclude_current",
+        t,
+        "SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t ORDER BY v",
+        true,
+    );
+    classify(
+        "window_named_window_clause",
+        t,
+        "SELECT v, row_number() OVER w FROM t WINDOW w AS (ORDER BY v) ORDER BY v",
+        true,
+    );
+    classify(
+        "window_filter_on_window_agg",
+        t,
+        "SELECT v, sum(v) FILTER (WHERE v > 15) OVER (ORDER BY v) FROM t ORDER BY v",
+        true,
+    );
+
+    // ---- VALUES as a relation / top-level ----
+    classify("values_top_level", &[], "VALUES (1, 2), (3, 4)", true);
+    classify(
+        "select_from_values",
+        &[],
+        "SELECT column1, column2 FROM (VALUES (1, 'a'), (2, 'b')) ORDER BY column1",
+        true,
+    );
+
+    // ---- compound SELECT edges ----
+    classify(
+        "compound_order_by_ordinal",
+        t,
+        "SELECT v FROM t UNION SELECT v + 1000 FROM t ORDER BY 1 DESC LIMIT 3",
+        true,
+    );
+    classify(
+        "compound_limit_on_values",
+        &[],
+        "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2",
+        true,
+    );
+
+    // ---- correlated scalar subquery in projection ----
+    classify(
+        "correlated_scalar_in_select",
+        t,
+        "SELECT id, (SELECT count(*) FROM t t2 WHERE t2.g = t.g) AS gc FROM t ORDER BY id",
+        true,
+    );
+
+    // ---- DISTINCT aggregate + GROUP BY HAVING ----
+    classify(
+        "group_by_having_count_distinct",
+        t,
+        "SELECT g, count(DISTINCT v) AS d FROM t GROUP BY g HAVING count(DISTINCT v) > 1 ORDER BY g",
+        true,
+    );
+
+    // ---- json table-valued + scalar ----
+    classify(
+        "json_each_table_valued",
+        &[],
+        "SELECT value FROM json_each('[10,20,30]') ORDER BY value",
+        true,
+    );
+
+    // ---- SELECT with LIMIT and OFFSET expression ----
+    classify(
+        "select_limit_offset_expr",
+        t,
+        "SELECT v FROM t ORDER BY v LIMIT 2 + 1 OFFSET 1",
+        true,
+    );
+}
