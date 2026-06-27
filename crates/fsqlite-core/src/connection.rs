@@ -59995,8 +59995,26 @@ impl Connection {
         self.planner_directive_cache.borrow().len()
     }
 
-    /// Read the current file change counter value.
+    /// Read the current file change counter (database header offset 24).
+    ///
+    /// For file-backed databases the authoritative value lives in page 1, which
+    /// the pager rewrites (with `version_valid_for` kept in sync) whenever a
+    /// committing write transaction touches page 1. We read it live through the
+    /// pager so the result is WAL-aware: the main-file copy can lag until
+    /// checkpoint, but the pager sees the WAL page-1 image. This matches C
+    /// SQLite semantics — in rollback-journal mode the counter advances once per
+    /// write transaction, while in WAL mode it only advances when page 1 itself
+    /// is rewritten (DDL, page-count change). For `:memory:` databases there is
+    /// no persistent header, so the cached counter (maintained by reload/VACUUM)
+    /// is returned. (5D.4 / bd-lxm9j)
     pub fn change_counter(&self) -> u32 {
+        if !self.pager.is_memory()
+            && let Ok(Some(header)) = self.pragma_database_header()
+        {
+            let counter = header.change_counter;
+            *self.change_counter.borrow_mut() = counter;
+            return counter;
+        }
         *self.change_counter.borrow()
     }
 
@@ -126925,26 +126943,78 @@ mod schema_cookie_tests {
     }
 
     #[test]
-    #[ignore = "5D.4: change_counter is now managed by pager; needs header write wiring"]
     fn test_change_counter_increments_on_persist() {
-        // Use a temp file to trigger actual persistence.
-        // NOTE: With 5D.4, change_counter updates require pager header writes.
+        use std::io::{Read, Seek, SeekFrom};
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_counter.db");
         let db_str = db_path.to_str().unwrap();
 
-        let conn = Connection::open(db_str).unwrap();
-        assert_eq!(conn.change_counter(), 0);
+        // Rollback-journal (DELETE) mode is where C SQLite bumps the file change
+        // counter (header offset 24) exactly once per write transaction. In WAL
+        // mode the counter only advances when page 1 itself is rewritten, so the
+        // per-INSERT property below is specifically a rollback-journal property.
+        let after_insert;
+        {
+            let conn = Connection::open(db_str).unwrap();
+            // `delete` is a keyword, so the value must be quoted; any non-WAL
+            // journal mode resolves to rollback-journal (JournalMode::Delete).
+            conn.execute("PRAGMA journal_mode = 'delete';").unwrap();
+            let baseline = conn.change_counter();
 
-        // CREATE TABLE triggers persist → counter goes to 1.
-        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
-        assert!(conn.change_counter() >= 1);
+            // CREATE TABLE writes sqlite_master (page 1) and commits → one txn.
+            conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+            let after_create = conn.change_counter();
+            assert!(
+                after_create > baseline,
+                "CREATE should bump the file change counter: {after_create} !> {baseline}"
+            );
 
-        let counter_after_create = conn.change_counter();
+            // A plain INSERT commits another write transaction → +1 in
+            // rollback-journal mode (page 1 is rewritten with the new counter).
+            conn.execute("INSERT INTO t1 VALUES (42);").unwrap();
+            after_insert = conn.change_counter();
+            assert!(
+                after_insert > after_create,
+                "INSERT (rollback-journal) should bump the file change counter: \
+                 {after_insert} !> {after_create}"
+            );
+        }
 
-        // INSERT triggers persist → counter increases again.
-        conn.execute("INSERT INTO t1 VALUES (42);").unwrap();
-        assert!(conn.change_counter() > counter_after_create);
+        // Round-trip: reopen and confirm the persisted counter is read back.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            assert_eq!(
+                conn.change_counter(),
+                after_insert,
+                "reopened change counter must match the persisted value"
+            );
+        }
+
+        // C-SQLite parity 1: the raw header bytes at offset 24..28 (big-endian)
+        // hold the same value the API reports.
+        {
+            let mut file = std::fs::File::open(db_str).unwrap();
+            file.seek(SeekFrom::Start(24)).unwrap();
+            let mut buf = [0_u8; 4];
+            file.read_exact(&mut buf).unwrap();
+            assert_eq!(
+                u32::from_be_bytes(buf),
+                after_insert,
+                "on-disk header change counter (offset 24) must match change_counter()"
+            );
+        }
+
+        // C-SQLite parity 2: the frank-written file opens cleanly in C SQLite
+        // (rusqlite) and the row is visible — proves the header rewrite did not
+        // corrupt page 1.
+        {
+            let sqlite = rusqlite::Connection::open(db_str).unwrap();
+            let value: i64 = sqlite
+                .query_row("SELECT a FROM t1;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, 42, "C SQLite must read the frank-written row");
+        }
     }
 
     #[test]
