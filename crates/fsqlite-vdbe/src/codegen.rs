@@ -3456,7 +3456,7 @@ fn codegen_select_count_star(
         table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     if let Some((idx_schema, probe_target)) =
         extract_count_indexed_exists_target(where_clause, table, table_alias, schema)
@@ -4010,7 +4010,7 @@ fn codegen_select_count_star_indexed_in_scan(
             table_alias: probe_source.table_alias,
             schema: Some(schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
         if source_rowid_reg.is_none() {
             emit_in_probe_value(b, source_cursor, probe_source, r_probe_value, &probe_scan);
@@ -4256,7 +4256,7 @@ fn codegen_select_count_star_indexed_in_scan(
                 table_alias: probe_source.table_alias,
                 schema: Some(schema),
                 register_base: None,
-                secondary: None,
+                secondaries: &[],
             };
             emit_in_probe_value(b, source_cursor, &probe_source, r_value, &probe_scan);
 
@@ -4429,7 +4429,7 @@ fn resolved_rowid_range_comparison(
         table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     ResolvedComparisonInfo::new(bound.rowid_expr, bound.expr, &scan)
 }
@@ -4448,7 +4448,7 @@ fn resolved_index_range_comparison(
         table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     ResolvedComparisonInfo::new(&column_expr, bound_expr, &scan)
 }
@@ -5132,7 +5132,7 @@ fn codegen_select_ordered_scan(
             table_alias,
             schema: Some(schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
         for (reg, key) in (sorter_base..).zip(sort_keys.iter()) {
             match key {
@@ -6206,7 +6206,7 @@ fn emit_join_probe_source(
         table_alias,
         schema: None,
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     emit_resolved_column(b, source, cursor, target_reg, &scan);
 }
@@ -6918,7 +6918,7 @@ fn codegen_multi_join_lookup_select(
             table_alias: probe_tables[step.probe_table_index].1,
             schema: None,
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
         emit_resolved_column(b, &step.probe_source, probe_cursor, probe_base, &probe_scan);
 
@@ -8296,7 +8296,7 @@ fn codegen_select_aggregate(
                 table_alias,
                 schema: Some(schema),
                 register_base: None,
-                secondary: None,
+                secondaries: &[],
             };
             emit_expr(b, bare, accum_reg, Some(&scan_ctx));
             continue;
@@ -8312,7 +8312,7 @@ fn codegen_select_aggregate(
                 table_alias,
                 schema: Some(schema),
                 register_base: None,
-                secondary: None,
+                secondaries: &[],
             };
             emit_expr(b, filter_expr, filter_reg, Some(&scan_ctx));
             // p3=1: treat NULL as false (skip AggStep).
@@ -8352,7 +8352,7 @@ fn codegen_select_aggregate(
                     table_alias,
                     schema: Some(schema),
                     register_base: None,
-                    secondary: None,
+                    secondaries: &[],
                 };
                 emit_expr(b, expr, arg_base, Some(&scan_ctx));
             } else {
@@ -8376,7 +8376,7 @@ fn codegen_select_aggregate(
                     table_alias,
                     schema: Some(schema),
                     register_base: None,
-                    secondary: None,
+                    secondaries: &[],
                 };
                 for (j, extra_expr) in agg.extra_args.iter().enumerate() {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -8763,7 +8763,7 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
         table_alias: None,
         schema: None,
         register_base: Some(result_reg),
-        secondary: None,
+        secondaries: &[],
     };
     let temp = b.alloc_temp();
     emit_expr(b, wrapper, temp, Some(&scan));
@@ -8814,7 +8814,7 @@ fn emit_simple_agg_wrapper(
         table_alias: None,
         schema: None,
         register_base: Some(accum_reg),
-        secondary: None,
+        secondaries: &[],
     };
     let temp = b.alloc_temp();
     emit_expr(b, wrapper, temp, Some(&scan));
@@ -8878,7 +8878,7 @@ fn emit_multi_agg_wrapper(
         table_alias: None,
         schema: None,
         register_base: Some(fake_base),
-        secondary: None,
+        secondaries: &[],
     };
     let temp = b.alloc_temp();
     emit_expr(b, wrapper, temp, Some(&scan));
@@ -10381,7 +10381,7 @@ fn codegen_select_group_by_aggregate(
             table_alias,
             schema: Some(schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
         let mut reg = sorter_base;
         for key in &group_by_keys {
@@ -11549,7 +11549,7 @@ fn codegen_insert_values(
                     table_alias: Some("excluded"),
                     schema: None,
                     register_base: Some(val_regs),
-                    secondary: None,
+                    secondaries: &[],
                 };
                 let existing_ctx = ScanCtx {
                     cursor,
@@ -11557,7 +11557,7 @@ fn codegen_insert_values(
                     table_alias,
                     schema: None,
                     register_base: Some(existing_regs),
-                    secondary: None,
+                    secondaries: &[],
                 };
                 let existing_hidden_rowid_reg = ctx
                     .rowid_alias_col_idx
@@ -12658,7 +12658,7 @@ pub fn codegen_update(
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
     b.set_next_anon_placeholder(1);
@@ -13093,28 +13093,85 @@ fn codegen_update_from(
     schema: &[TableSchema],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    // Resolve the FROM source table (only simple named tables for now).
-    let (from_table_name, from_alias) = match &from_clause.source {
-        TableOrSubquery::Table { name, alias, .. } => (name.name.as_str(), alias.as_deref()),
-        _ => {
+    use fsqlite_ast::{JoinConstraint, JoinKind};
+
+    // Resolve a single FROM source to (name, alias). Only named tables are
+    // supported in VDBE codegen: a single `FROM (subquery)` is flattened to a
+    // named table before codegen (try_flatten_update_from_subquery in
+    // connection.rs), and codegen has no general FROM-relation materialization.
+    fn resolve_from_table(src: &TableOrSubquery) -> Result<(&str, Option<&str>), CodegenError> {
+        match src {
+            TableOrSubquery::Table { name, alias, .. } => {
+                Ok((name.name.as_str(), alias.as_deref()))
+            }
+            TableOrSubquery::Subquery { .. } => Err(CodegenError::Unsupported(
+                "UPDATE ... FROM subquery sources are not yet supported (only named tables; \
+                 a single FROM (subquery) is flattened before codegen)"
+                    .to_owned(),
+            )),
+            _ => Err(CodegenError::Unsupported(
+                "UPDATE ... FROM only supports named tables".to_owned(),
+            )),
+        }
+    }
+
+    // Collect every FROM source (the leading source plus comma/JOIN sources)
+    // and the ON conditions of any joins. Comma sources and CROSS/INNER joins
+    // form a cross product filtered by (ON conditions AND WHERE); this matches
+    // SQLite's UPDATE ... FROM semantics for inner joins.
+    let mut from_specs: Vec<(&str, Option<&str>)> = Vec::with_capacity(1 + from_clause.joins.len());
+    from_specs.push(resolve_from_table(&from_clause.source)?);
+
+    let mut on_conditions: Vec<&Expr> = Vec::new();
+    for join in &from_clause.joins {
+        if join.join_type.natural {
             return Err(CodegenError::Unsupported(
-                "UPDATE ... FROM only supports named tables (not subqueries or joins)".to_owned(),
+                "UPDATE ... FROM with NATURAL JOIN is not yet supported".to_owned(),
             ));
         }
-    };
-    if !from_clause.joins.is_empty() {
-        return Err(CodegenError::Unsupported(
-            "UPDATE ... FROM with JOIN clauses is not yet supported".to_owned(),
-        ));
+        match join.join_type.kind {
+            JoinKind::Inner | JoinKind::Cross => {}
+            JoinKind::Left | JoinKind::Right | JoinKind::Full => {
+                return Err(CodegenError::Unsupported(
+                    "UPDATE ... FROM with an OUTER JOIN source is not yet supported".to_owned(),
+                ));
+            }
+        }
+        from_specs.push(resolve_from_table(&join.table)?);
+        match &join.constraint {
+            Some(JoinConstraint::On(expr)) => on_conditions.push(expr),
+            Some(JoinConstraint::Using(_)) => {
+                return Err(CodegenError::Unsupported(
+                    "UPDATE ... FROM with a USING(...) join constraint is not yet supported"
+                        .to_owned(),
+                ));
+            }
+            None => {}
+        }
     }
 
     let table_name = table_name_from_qualified(&stmt.table);
     let target = find_table(schema, table_name)?;
-    let from_table = find_table(schema, from_table_name)?;
     let n_cols = target.columns.len();
 
+    // Resolve each FROM source to its schema and assign a read cursor.
+    // Cursor allocation: 0 = target (write), 1..=K = target indexes,
+    // K+1.. = one read cursor per FROM source.
+    let target_cursor = 0_i32;
+    let n_indexes = target.indexes.len();
+    let mut secondaries: Vec<SecondaryScan> = Vec::with_capacity(from_specs.len());
+    for (i, (src_name, src_alias)) in from_specs.iter().enumerate() {
+        let src_table = find_table(schema, src_name)?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let cursor = (1 + n_indexes + i) as i32;
+        secondaries.push(SecondaryScan {
+            cursor,
+            table: src_table,
+            table_alias: *src_alias,
+        });
+    }
+
     let end_label = b.emit_label();
-    let done_label = b.emit_label();
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -13125,27 +13182,23 @@ fn codegen_update_from(
     // Validate assignment targets before emitting loops.
     collect_update_assignment_columns(target, &stmt.assignments)?;
 
-    // Cursor allocation: 0 = target (write), 1..N = indexes, N+1 = FROM (read).
-    let target_cursor = 0_i32;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let from_cursor = (1 + target.indexes.len()) as i32;
-    let validation_scan = ScanCtx {
+    // Scan context with all FROM sources for multi-table column resolution.
+    let scan = ScanCtx {
         cursor: target_cursor,
         table: target,
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
         register_base: None,
-        secondary: Some(SecondaryScan {
-            cursor: from_cursor,
-            table: from_table,
-            table_alias: from_alias,
-        }),
+        secondaries: &secondaries,
     };
     for assign in &stmt.assignments {
-        validate_scan_expr_columns(&assign.value, &validation_scan)?;
+        validate_scan_expr_columns(&assign.value, &scan)?;
+    }
+    for cond in &on_conditions {
+        validate_scan_expr_columns(cond, &scan)?;
     }
     if let Some(where_expr) = &stmt.where_clause {
-        validate_scan_expr_columns(where_expr, &validation_scan)?;
+        validate_scan_expr_columns(where_expr, &scan)?;
     }
     validate_single_table_result_columns(&stmt.returning, target, stmt.table.alias.as_deref())?;
 
@@ -13174,75 +13227,82 @@ fn codegen_update_from(
     }
     register_table_index_meta(b, target, target_cursor);
 
-    // OpenRead for FROM table.
-    b.emit_op(
-        Opcode::OpenRead,
-        from_cursor,
-        from_table.root_page,
-        0,
-        P4::Table(from_table.name.clone()),
-        0,
-    );
+    // OpenRead for each FROM source.
+    for sec in &secondaries {
+        b.emit_op(
+            Opcode::OpenRead,
+            sec.cursor,
+            sec.table.root_page,
+            0,
+            P4::Table(sec.table.name.clone()),
+            0,
+        );
+    }
 
-    // Outer loop: scan FROM table.
-    let outer_loop_start = b.current_addr();
-    let outer_done_label = done_label;
-    b.emit_jump_to_label(
-        Opcode::Rewind,
-        from_cursor,
-        0,
-        outer_done_label,
-        P4::None,
-        0,
-    );
+    // Emit one nested scan loop per FROM source (outermost = first source),
+    // recording each loop's body address (Next target) and done label.
+    struct LoopFrame {
+        cursor: i32,
+        body: i32,
+        done: Label,
+    }
+    let mut frames: Vec<LoopFrame> = Vec::with_capacity(secondaries.len());
+    for sec in &secondaries {
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, sec.cursor, 0, done, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let body = b.current_addr() as i32;
+        frames.push(LoopFrame {
+            cursor: sec.cursor,
+            body,
+            done,
+        });
+    }
 
-    // Inner loop: scan target table.
-    let inner_done_label = b.emit_label();
-    let inner_loop_start = b.current_addr();
+    // Innermost loop: scan target table.
+    let target_done_label = b.emit_label();
     b.emit_jump_to_label(
         Opcode::Rewind,
         target_cursor,
         0,
-        inner_done_label,
+        target_done_label,
         P4::None,
         0,
     );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let target_body = b.current_addr() as i32;
 
-    // Build scan context with secondary for multi-table column resolution.
-    let scan = ScanCtx {
-        cursor: target_cursor,
-        table: target,
-        table_alias: stmt.table.alias.as_deref(),
-        schema: Some(schema),
-        register_base: None,
-        secondary: Some(SecondaryScan {
-            cursor: from_cursor,
-            table: from_table,
-            table_alias: from_alias,
-        }),
-    };
-
-    // Count anonymous placeholders in SET assignments so WHERE
-    // placeholders start after them (SQL textual order: SET before WHERE).
+    // Count anonymous placeholders so each clause numbers from the right base.
+    // SQL textual order: SET, then FROM (ON conditions), then WHERE, then
+    // RETURNING.
     let set_placeholder_count: u32 = stmt
         .assignments
         .iter()
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
+    let on_placeholder_count: u32 = on_conditions.iter().map(|e| count_anon_placeholders(e)).sum();
     let where_placeholder_count: u32 = stmt
         .where_clause
         .as_ref()
         .map_or(0, count_anon_placeholders);
 
-    // WHERE filter.
+    // Combined filter: each ON condition (in join order) then the WHERE clause.
+    // Any failed condition jumps to skip_label (the innermost loop's Next).
     let skip_label = b.emit_label();
-    if let Some(where_expr) = &stmt.where_clause {
-        // Set placeholder counter to start after SET placeholders.
+    let filter_conditions: Vec<&Expr> = on_conditions
+        .iter()
+        .copied()
+        .chain(stmt.where_clause.as_ref())
+        .collect();
+    if !filter_conditions.is_empty() {
+        // Placeholders in ON/WHERE follow the SET placeholders textually.
         b.set_next_anon_placeholder(set_placeholder_count + 1);
-        let cond_reg = b.alloc_temp();
-        emit_expr(b, where_expr, cond_reg, Some(&scan));
-        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
-        b.free_temp(cond_reg);
+        for cond in &filter_conditions {
+            let cond_reg = b.alloc_temp();
+            emit_expr(b, cond, cond_reg, Some(&scan));
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+            b.free_temp(cond_reg);
+        }
     }
 
     // Read ALL existing columns from target into registers.
@@ -13360,9 +13420,11 @@ fn codegen_update_from(
     // Insert new index entries.
     emit_index_inserts(b, target, target_cursor, col_regs, rowid_reg, stmt.or_conflict);
 
-    // RETURNING clause.
+    // RETURNING clause (numbered after SET + ON + WHERE placeholders).
     if !stmt.returning.is_empty() {
-        b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
+        b.set_next_anon_placeholder(
+            set_placeholder_count + on_placeholder_count + where_placeholder_count + 1,
+        );
         emit_returning(
             b,
             target_cursor,
@@ -13373,25 +13435,25 @@ fn codegen_update_from(
         )?;
     }
 
-    // Skip label for WHERE-filtered rows.
+    // Skip label for filtered-out rows.
     b.resolve_label(skip_label);
 
-    // Inner Next: loop back to inner loop body.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let inner_body = (inner_loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, target_cursor, inner_body, 0, P4::None, 0);
+    // Innermost (target) Next: loop back to the target loop body.
+    b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
+    b.resolve_label(target_done_label);
 
-    // Inner done.
-    b.resolve_label(inner_done_label);
+    // Unwind the FROM-source loops from innermost to outermost. Each loop's
+    // Next jumps back to its body; its done label lands here so an exhausted or
+    // empty source falls through to the next-outer loop's Next.
+    for frame in frames.iter().rev() {
+        b.emit_op(Opcode::Next, frame.cursor, frame.body, 0, P4::None, 0);
+        b.resolve_label(frame.done);
+    }
 
-    // Outer Next: loop back to outer loop body.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let outer_body = (outer_loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, from_cursor, outer_body, 0, P4::None, 0);
-
-    // Done: close cursors.
-    b.resolve_label(done_label);
-    b.emit_op(Opcode::Close, from_cursor, 0, 0, P4::None, 0);
+    // Close all cursors.
+    for sec in &secondaries {
+        b.emit_op(Opcode::Close, sec.cursor, 0, 0, P4::None, 0);
+    }
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     for idx_offset in 0..target.indexes.len() {
         let idx_cursor = target_cursor + 1 + idx_offset as i32;
@@ -13711,7 +13773,7 @@ fn emit_without_rowid_index_inserts(
             table_alias: None,
             schema: None,
             register_base: Some(col_regs),
-            secondary: None,
+            secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
 
@@ -13784,7 +13846,7 @@ fn emit_without_rowid_index_deletes(
             table_alias: None,
             schema: None,
             register_base: col_regs,
-            secondary: None,
+            secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
 
@@ -14371,7 +14433,7 @@ fn codegen_update_without_rowid(
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
         register_base: Some(col_regs),
-        secondary: None,
+        secondaries: &[],
     };
     emit_update_assignments(b, &stmt.assignments, table, col_regs, &update_ctx)?;
     emit_stored_generated_columns(b, table, col_regs);
@@ -14622,7 +14684,7 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
                     table_alias: None,
                     schema: None,
                     register_base: Some(val_regs),
-                    secondary: None,
+                    secondaries: &[],
                 };
                 emit_expr(b, &expr, dest_reg, Some(&gen_ctx));
             } else {
@@ -14696,7 +14758,7 @@ fn emit_table_column_read(
             table_alias,
             schema,
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
         emit_expr(b, &gen_expr, reg, Some(&scan));
         emit_single_column_affinity(b, reg, col.affinity);
@@ -14738,7 +14800,7 @@ fn emit_check_constraints(
             table_alias: None,
             schema: None,
             register_base: Some(val_regs),
-            secondary: None,
+            secondaries: &[],
         };
 
         emit_expr(b, &expr, result_reg, Some(&check_ctx));
@@ -14885,7 +14947,7 @@ fn emit_index_inserts_filtered(
             table_alias: None,
             schema: None,
             register_base: Some(col_regs),
-            secondary: None,
+            secondaries: &[],
         };
 
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
@@ -14988,7 +15050,7 @@ fn emit_index_deletes_filtered(
             table_alias: None,
             schema: None,
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
 
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
@@ -15146,7 +15208,7 @@ fn emit_column_reads(
                         table_alias,
                         schema: Some(schema),
                         register_base: None,
-                        secondary: None,
+                        secondaries: &[],
                     };
                     emit_expr(b, expr, reg, Some(&scan));
                 }
@@ -15437,7 +15499,7 @@ fn emit_where_filter(
         table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     emit_where_filter_with_ctx(b, where_expr, &scan, skip_label);
 }
@@ -16136,8 +16198,10 @@ fn validate_scan_column_ref(col_ref: &ColumnRef, scan: &ScanCtx<'_>) -> Result<(
             }
             return Err(qualified_column_not_found(qualifier, &col_ref.column));
         }
-        if let Some(secondary) = &scan.secondary
-            && matches_table_or_alias(qualifier, secondary.table, secondary.table_alias)
+        if let Some(secondary) = scan
+            .secondaries
+            .iter()
+            .find(|secondary| matches_table_or_alias(qualifier, secondary.table, secondary.table_alias))
         {
             if table_has_column_or_rowid(secondary.table, &col_ref.column) {
                 return Ok(());
@@ -16147,19 +16211,20 @@ fn validate_scan_column_ref(col_ref: &ColumnRef, scan: &ScanCtx<'_>) -> Result<(
         return Err(qualified_column_not_found(qualifier, &col_ref.column));
     }
 
-    let primary_has_column = table_has_column_or_rowid(scan.table, &col_ref.column);
-    let secondary_has_column = scan
-        .secondary
-        .as_ref()
-        .is_some_and(|secondary| table_has_column_or_rowid(secondary.table, &col_ref.column));
+    let mut match_count = usize::from(table_has_column_or_rowid(scan.table, &col_ref.column));
+    match_count += scan
+        .secondaries
+        .iter()
+        .filter(|secondary| table_has_column_or_rowid(secondary.table, &col_ref.column))
+        .count();
 
-    match (primary_has_column, secondary_has_column) {
-        (true, true) => Err(CodegenError::AmbiguousColumn(col_ref.column.to_string())),
-        (true, false) | (false, true) => Ok(()),
-        (false, false) => Err(CodegenError::ColumnNotFound {
+    match match_count {
+        0 => Err(CodegenError::ColumnNotFound {
             table: scan.table.name.clone(),
             column: col_ref.column.to_string(),
         }),
+        1 => Ok(()),
+        _ => Err(CodegenError::AmbiguousColumn(col_ref.column.to_string())),
     }
 }
 
@@ -17534,8 +17599,13 @@ struct ScanCtx<'a> {
     /// (`register_base + col_index`) instead of reading from the B-tree cursor.
     /// Used for generated column expression evaluation during INSERT.
     register_base: Option<i32>,
-    /// Secondary table context for UPDATE ... FROM multi-table resolution.
-    secondary: Option<SecondaryScan<'a>>,
+    /// Secondary table contexts for UPDATE ... FROM multi-table resolution.
+    ///
+    /// A single-table `UPDATE ... FROM src` carries one entry; a multi-source
+    /// `UPDATE ... FROM a JOIN b` / `FROM a, b` carries one entry per FROM
+    /// source. Column references are resolved against the primary (target)
+    /// table first, then each secondary in order.
+    secondaries: &'a [SecondaryScan<'a>],
 }
 
 /// Secondary table scan context for UPDATE ... FROM.
@@ -17941,7 +18011,7 @@ fn try_emit_complex_in_subquery(
             table_alias,
             schema: Some(schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
 
         // Emit sort key columns.
@@ -18117,7 +18187,7 @@ fn try_emit_complex_in_subquery(
             table_alias,
             schema: Some(schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
 
         let r_probe = b.alloc_temp();
@@ -18256,7 +18326,7 @@ fn emit_in_probe_expr(
         table_alias: probe_source.table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
     // Apply the comparison affinity between the outer operand and the subquery
@@ -18668,12 +18738,13 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             };
             if let Some(qualifier) = &col_ref.table {
                 if !matches_table_or_alias(qualifier, sc.table, sc.table_alias) {
-                    // Check secondary table context (UPDATE ... FROM).
-                    if let Some(sec) = &sc.secondary {
-                        if matches_table_or_alias(qualifier, sec.table, sec.table_alias) {
-                            emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
-                            return;
-                        }
+                    // Check secondary table contexts (UPDATE ... FROM, possibly
+                    // multiple FROM sources joined together).
+                    if let Some(sec) = sc.secondaries.iter().find(|sec| {
+                        matches_table_or_alias(qualifier, sec.table, sec.table_alias)
+                    }) {
+                        emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
+                        return;
                     }
                     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                     return;
@@ -18721,8 +18792,13 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 }
             } else if sc.table.resolves_to_hidden_rowid(&col_ref.column) {
                 b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
-            } else if let Some(sec) = &sc.secondary {
-                // Unqualified column not found in primary — try secondary.
+            } else if let Some(sec) = sc
+                .secondaries
+                .iter()
+                .find(|sec| table_has_column_or_rowid(sec.table, &col_ref.column))
+            {
+                // Unqualified column not found in primary — resolve against the
+                // first secondary FROM source that has it.
                 emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
             } else {
                 // Unknown column — emit Null.
@@ -18943,7 +19019,7 @@ fn probe_expr_references_outer_scan(
                 return false;
             }
             resolve_column_ref(expr, scan_ctx.table, scan_ctx.table_alias).is_some()
-                || scan_ctx.secondary.as_ref().is_some_and(|secondary| {
+                || scan_ctx.secondaries.iter().any(|secondary| {
                     resolve_column_ref(expr, secondary.table, secondary.table_alias).is_some()
                 })
         }
@@ -19319,7 +19395,7 @@ fn emit_once_materialized_in_probe_source(
         table_alias: probe_source.table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     // Apply the comparison affinity between the outer operand and the subquery
     // probe column to both the materialized values and the probe key, mirroring
@@ -19492,7 +19568,7 @@ fn emit_once_materialized_exists_subquery(
         table_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
 
     let scan_done = b.emit_label();
@@ -19596,7 +19672,7 @@ fn emit_exists_subquery(
         table_alias: sub_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
 
     if subquery.with.is_none()
@@ -19783,7 +19859,7 @@ fn emit_scalar_subquery(
         table_alias: sub_alias,
         schema: Some(schema),
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
 
     // Check if this is an aggregate query (e.g., SELECT MAX(x) FROM t).
@@ -20921,8 +20997,8 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
                 if let Some(aff) = check_table(ctx.table, ctx.table_alias) {
                     return aff;
                 }
-                // Check secondary table (UPDATE ... FROM)
-                if let Some(sec) = &ctx.secondary {
+                // Check secondary tables (UPDATE ... FROM, possibly multi-source)
+                for sec in ctx.secondaries {
                     if let Some(aff) = check_table(sec.table, sec.table_alias) {
                         return aff;
                     }
@@ -21054,7 +21130,7 @@ pub fn emit_scan_filter(
         table_alias: None,
         schema: None,
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     let filter_reg = b.alloc_temp();
     emit_expr(b, where_expr, filter_reg, Some(&scan));
@@ -21078,7 +21154,7 @@ pub fn emit_backfill_key_expr(
         table_alias: None,
         schema: None,
         register_base: None,
-        secondary: None,
+        secondaries: &[],
     };
     emit_expr(b, expr, target_reg, Some(&scan));
 }
@@ -28522,7 +28598,7 @@ mod tests {
             table_alias: None,
             schema: Some(&schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
         let SelectCore::Select {
             where_clause: Some(where_clause),
@@ -28580,7 +28656,7 @@ mod tests {
             table_alias: None,
             schema: Some(&schema),
             register_base: None,
-            secondary: None,
+            secondaries: &[],
         };
 
         assert!(
@@ -31242,17 +31318,18 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         };
+        let secondaries = [SecondaryScan {
+            cursor: 1,
+            table: &secondary_table,
+            table_alias: Some("u"),
+        }];
         let scan_ctx = ScanCtx {
             cursor: 0,
             table: outer_table,
             table_alias: Some("t"),
             schema: Some(&schema),
             register_base: None,
-            secondary: Some(SecondaryScan {
-                cursor: 1,
-                table: &secondary_table,
-                table_alias: Some("u"),
-            }),
+            secondaries: &secondaries,
         };
         let probe_source = InProbeSource {
             table: probe_table,

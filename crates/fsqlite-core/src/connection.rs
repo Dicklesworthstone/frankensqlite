@@ -184176,7 +184176,6 @@ mod pager_routing_tests {
 
     /// Oracle: Multi-table UPDATE with FROM and JOIN.
     #[test]
-    #[ignore = "UPDATE ... FROM with JOIN not yet supported"]
     fn test_conformance_update_from_join() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -184206,6 +184205,75 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} update from join mismatches", mismatches.len());
+        }
+    }
+
+    /// bd-p0xje: multi-source `UPDATE ... FROM` with comma-joined tables.
+    #[test]
+    fn test_conformance_update_from_comma_tables() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO t VALUES(1,0),(2,0),(3,0)",
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
+            "INSERT INTO src VALUES(1,11,111),(2,22,222),(3,33,333)",
+            "CREATE TABLE factor(f INTEGER)",
+            "INSERT INTO factor VALUES(10)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // Comma join (CROSS): src provides per-row values, factor a scalar.
+        let dml = "UPDATE t SET v = src.w + factor.f FROM src, factor WHERE t.id = src.id";
+        fconn.execute(dml).unwrap();
+        rconn.execute_batch(dml).unwrap();
+
+        let queries = ["SELECT id, v FROM t ORDER BY id"];
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} update from comma mismatches", mismatches.len());
+        }
+    }
+
+    /// bd-p0xje: three-table `UPDATE ... FROM` chain of JOINs feeding SET + WHERE.
+    #[test]
+    fn test_conformance_update_from_three_table_join() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, cust INTEGER, total INTEGER)",
+            "INSERT INTO orders VALUES(1,10,0),(2,20,0),(3,30,0)",
+            "CREATE TABLE cust(id INTEGER PRIMARY KEY, tier TEXT)",
+            "INSERT INTO cust VALUES(10,'gold'),(20,'silver'),(30,'gold')",
+            "CREATE TABLE tiers(tier TEXT, bonus INTEGER)",
+            "INSERT INTO tiers VALUES('gold',100),('silver',50)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let dml = "UPDATE orders SET total = total + ti.bonus \
+                   FROM cust c JOIN tiers ti ON c.tier = ti.tier \
+                   WHERE c.id = orders.cust";
+        fconn.execute(dml).unwrap();
+        rconn.execute_batch(dml).unwrap();
+
+        let queries = ["SELECT id, total FROM orders ORDER BY id"];
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} update from three-table join mismatches", mismatches.len());
         }
     }
 
