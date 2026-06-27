@@ -24428,7 +24428,6 @@ fn test_conformance_trigger_after_delete_s348() {
 }
 
 #[test]
-#[ignore = "INSTEAD OF trigger on view: INSERT INTO view not routed to trigger"]
 fn test_conformance_trigger_instead_of_on_view_s349() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

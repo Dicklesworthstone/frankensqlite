@@ -181230,7 +181230,6 @@ mod pager_routing_tests {
 
     /// Oracle: Window functions (ROW_NUMBER, RANK, SUM OVER, etc.).
     #[test]
-    #[ignore = "Window functions not yet wired through VDBE codegen"]
     fn test_conformance_window_func_basic() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -181806,7 +181805,6 @@ mod pager_routing_tests {
     /// Oracle: Views — creation, querying, interaction with underlying data changes.
     /// Known gap: VDBE root page tracking breaks for views after DML on underlying table.
     #[test]
-    #[ignore = "not yet supported"]
     fn test_conformance_view_live_data() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
