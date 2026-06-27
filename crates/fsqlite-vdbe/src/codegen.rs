@@ -12858,6 +12858,54 @@ fn collect_update_assignment_columns(
     Ok(columns)
 }
 
+/// Number of statically-known result columns in a subquery used as the RHS of a
+/// row-value UPDATE `SET (a, b) = (SELECT ...)`. Returns `None` for shapes whose
+/// arity is not knowable here (compound SELECT, `VALUES`, or `*` / `table.*`
+/// result columns), which the caller turns into a clear diagnostic.
+fn row_value_subquery_arity(select: &SelectStatement) -> Option<usize> {
+    if !select.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { columns, .. } = &select.body.select else {
+        return None;
+    };
+    if columns
+        .iter()
+        .any(|c| !matches!(c, ResultColumn::Expr { .. }))
+    {
+        return None;
+    }
+    Some(columns.len())
+}
+
+/// Project a row-value subquery down to its `col_idx`-th result column so it can
+/// be emitted as a scalar subquery feeding a single UPDATE `SET` target. The
+/// FROM/WHERE/ORDER BY/LIMIT are preserved verbatim, so each projected column is
+/// drawn from the same (first) row and correlation against the outer UPDATE row
+/// is retained. Returns `None` for the same unsupported shapes as
+/// [`row_value_subquery_arity`].
+fn project_row_value_subquery_column(
+    select: &SelectStatement,
+    col_idx: usize,
+) -> Option<SelectStatement> {
+    if !select.body.compounds.is_empty() {
+        return None;
+    }
+    let SelectCore::Select { columns, .. } = &select.body.select else {
+        return None;
+    };
+    let target = columns.get(col_idx)?;
+    if !matches!(target, ResultColumn::Expr { .. }) {
+        return None;
+    }
+    let target = target.clone();
+    let mut projected = select.clone();
+    if let SelectCore::Select { columns, .. } = &mut projected.body.select {
+        *columns = vec![target];
+    }
+    Some(projected)
+}
+
 fn emit_update_assignments(
     b: &mut ProgramBuilder,
     assignments: &[fsqlite_ast::Assignment],
@@ -12879,20 +12927,73 @@ fn emit_update_assignments(
                 let target_reg = col_regs + col_idx as i32;
                 emit_expr(b, &assignment.value, target_reg, Some(scan));
             }
-            AssignmentTarget::ColumnList(names) => {
-                let Expr::RowValue(values, _) = &assignment.value else {
-                    return Err(CodegenError::Unsupported(
-                        "multi-column SET requires a row-value expression".to_owned(),
-                    ));
-                };
-                if names.len() != values.len() {
-                    return Err(CodegenError::Unsupported(format!(
-                        "multi-column SET arity mismatch: {} targets, {} values",
-                        names.len(),
-                        values.len()
-                    )));
+            AssignmentTarget::ColumnList(names) => match &assignment.value {
+                // `SET (a, b) = (e1, e2)` — parenthesized row-value of scalars.
+                Expr::RowValue(values, _) => {
+                    if names.len() != values.len() {
+                        return Err(CodegenError::Unsupported(format!(
+                            "multi-column SET arity mismatch: {} targets, {} values",
+                            names.len(),
+                            values.len()
+                        )));
+                    }
+                    for (name, value) in names.iter().zip(values) {
+                        let col_idx = table.column_index(name).ok_or_else(|| {
+                            CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: name.to_owned(),
+                            }
+                        })?;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        let target_reg = col_regs + col_idx as i32;
+                        emit_expr(b, value, target_reg, Some(scan));
+                    }
                 }
-                for (name, value) in names.iter().zip(values) {
+                // `SET (a, b) = (SELECT a, b FROM ...)` — a row-value whose RHS is
+                // a (possibly correlated) subquery. Each target column is fed by
+                // the matching output column of the subquery; project the subquery
+                // one column at a time and reuse the scalar-subquery emitter, which
+                // resolves correlation against the outer UPDATE row via `scan`.
+                // bd-6utze.
+                Expr::Subquery(select, _) => {
+                    let arity = row_value_subquery_arity(select).ok_or_else(|| {
+                        CodegenError::Unsupported(
+                            "multi-column SET subquery source must be a single SELECT with \
+                             explicit result columns (no '*' or compound SELECT)"
+                                .to_owned(),
+                        )
+                    })?;
+                    if names.len() != arity {
+                        return Err(CodegenError::Unsupported(format!(
+                            "multi-column SET arity mismatch: {} targets, {} subquery columns",
+                            names.len(),
+                            arity
+                        )));
+                    }
+                    for (col_pos, name) in names.iter().enumerate() {
+                        let col_idx = table.column_index(name).ok_or_else(|| {
+                            CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: name.to_owned(),
+                            }
+                        })?;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        let target_reg = col_regs + col_idx as i32;
+                        let projected = project_row_value_subquery_column(select, col_pos)
+                            .expect("subquery shape validated by row_value_subquery_arity");
+                        if let Some(schema) = scan.schema {
+                            emit_scalar_subquery(b, &projected, target_reg, scan, schema);
+                        } else {
+                            b.emit_op(Opcode::Null, 0, target_reg, 0, P4::None, 0);
+                        }
+                    }
+                }
+                // A single-target list `(v) = <scalar>` is equivalent to
+                // `v = <scalar>`. This also catches `(v) = (SELECT ...)` whose
+                // uncorrelated scalar subquery the DML rewrite pass already folded
+                // to a literal before codegen (so it arrives as a plain expr).
+                scalar if names.len() == 1 => {
+                    let name = &names[0];
                     let col_idx =
                         table
                             .column_index(name)
@@ -12902,9 +13003,14 @@ fn emit_update_assignments(
                             })?;
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     let target_reg = col_regs + col_idx as i32;
-                    emit_expr(b, value, target_reg, Some(scan));
+                    emit_expr(b, scalar, target_reg, Some(scan));
                 }
-            }
+                _ => {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET requires a row-value or subquery expression".to_owned(),
+                    ));
+                }
+            },
         }
     }
     Ok(())

@@ -24878,9 +24878,21 @@ impl Connection {
             statement,
             Statement::Select(select) if flatten_simple_from_subquery_select(select).is_some()
         );
+        // bd-kkfok: an `UPDATE ... FROM (subquery)` carries its only subquery in
+        // the FROM source, which `statement_contains_rewritable_subquery` does not
+        // flag. Without this the fast path would skip the flatten rewrite below.
+        let has_update_from_subquery = matches!(
+            statement,
+            Statement::Update(update)
+                if update.with.is_none()
+                    && update.from.as_ref().is_some_and(|from| {
+                        matches!(from.source, TableOrSubquery::Subquery { .. })
+                    })
+        );
         if !statement_contains_rewritable_subquery(statement)
             && !statement_requires_in_table_name_rewrite(statement)
             && !has_flattenable_derived_table
+            && !has_update_from_subquery
         {
             return Ok(Cow::Borrowed(statement));
         }
@@ -24960,6 +24972,11 @@ impl Connection {
             Statement::Update(update) if update.with.is_some() => Ok(Cow::Borrowed(statement)),
             Statement::Update(update) => {
                 let mut update = update.clone();
+                // bd-kkfok: flatten a simple-projection subquery `UPDATE ... FROM`
+                // source into its base table so the named-table nested-loop codegen
+                // can drive it. Done before the IN/subquery rewrites so they see the
+                // flattened (plain-table) shape.
+                try_flatten_update_from_subquery(&mut update);
                 let eager_in_subqueries =
                     self.attached_target_update_requires_eager_in_subquery_rewrite(&update)?;
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
@@ -66148,6 +66165,222 @@ fn rewrite_in_select_core(
     Ok(())
 }
 
+/// bd-kkfok: flatten a simple-projection subquery used as an `UPDATE ... FROM`
+/// source into its underlying base table, so the existing named-table nested-loop
+/// codegen (`codegen_update_from`) can drive it without materialization.
+///
+/// Only the collision-safe shape is flattened: `(SELECT <plain cols | *> FROM
+/// <single base table> [WHERE ...]) AS s` with no DISTINCT / GROUP BY / HAVING /
+/// window / LIMIT / compound / WITH / joins and no column renames. The subquery
+/// alias is kept as the base table's alias, so every reference of the form
+/// `s.col` stays qualified and resolves to the FROM source — never colliding with
+/// a like-named column on the UPDATE target. Any inner WHERE is re-qualified with
+/// the alias and merged (AND) into the UPDATE's WHERE. Returns `true` when a
+/// flatten was applied (renamed/aggregated/filtered-with-rename/multi-table
+/// sources are left untouched and rejected later by codegen with a clear error).
+fn try_flatten_update_from_subquery(update: &mut fsqlite_ast::UpdateStatement) -> bool {
+    let Some(from) = update.from.as_ref() else {
+        return false;
+    };
+    if !from.joins.is_empty() {
+        return false; // multi-source FROM is bd-p0xje, not this path
+    }
+    let TableOrSubquery::Subquery {
+        query,
+        alias: Some(alias),
+    } = &from.source
+    else {
+        return false; // need a subquery source with an alias to keep refs qualified
+    };
+    if query.with.is_some()
+        || !query.body.compounds.is_empty()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+    {
+        return false;
+    }
+    let SelectCore::Select {
+        distinct,
+        columns,
+        from: Some(inner_from),
+        where_clause: inner_where,
+        group_by,
+        having,
+        windows,
+    } = &query.body.select
+    else {
+        return false;
+    };
+    if *distinct != Distinctness::All
+        || !inner_from.joins.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+    {
+        return false;
+    }
+    let TableOrSubquery::Table {
+        name: base_name,
+        index_hint,
+        time_travel,
+        ..
+    } = &inner_from.source
+    else {
+        return false;
+    };
+    // Every projected column must be a plain column ref with no rename (exposed
+    // name == base column name) or `*`. Otherwise a reference to `s.<exposed>`
+    // would not exist on the base table and flattening would be unsound.
+    for column in columns {
+        match column {
+            ResultColumn::Star => {}
+            ResultColumn::Expr {
+                expr: Expr::Column(col_ref, _),
+                alias: col_alias,
+            } => {
+                let exposed = col_alias
+                    .clone()
+                    .unwrap_or_else(|| col_ref.column.to_string());
+                if !exposed.eq_ignore_ascii_case(&col_ref.column) {
+                    return false;
+                }
+            }
+            ResultColumn::Expr { .. } | ResultColumn::TableStar(_) => return false,
+        }
+    }
+
+    let base_name = base_name.clone();
+    let index_hint = index_hint.clone();
+    let time_travel = time_travel.clone();
+    let alias_arc: Arc<str> = Arc::from(alias.as_str());
+    let mut merged_inner_where = inner_where.as_deref().cloned();
+    if let Some(where_expr) = merged_inner_where.as_mut() {
+        qualify_column_refs_with_alias(where_expr, &alias_arc);
+    }
+
+    update.from = Some(fsqlite_ast::FromClause {
+        source: TableOrSubquery::Table {
+            name: base_name,
+            alias: Some(alias.clone()),
+            index_hint,
+            time_travel,
+        },
+        joins: Vec::new(),
+    });
+
+    if let Some(inner_where) = merged_inner_where {
+        update.where_clause = Some(match update.where_clause.take() {
+            Some(outer) => Expr::BinaryOp {
+                left: Box::new(outer),
+                op: BinaryOp::And,
+                right: Box::new(inner_where),
+                span: Span::ZERO,
+            },
+            None => inner_where,
+        });
+    }
+    true
+}
+
+/// Re-qualify every (non-subquery-nested) column reference in `expr` with
+/// `alias`. Used when merging a flattened `UPDATE ... FROM` subquery's inner
+/// WHERE into the outer WHERE: the inner predicate only references the single
+/// base table, so forcing the alias qualifier makes those references resolve to
+/// the FROM source (aliased as `alias`) instead of accidentally binding to a
+/// like-named column on the UPDATE target. Nested subqueries are not descended
+/// into — they carry their own name scope. Mirrors the variant coverage of
+/// [`rename_column_refs_in_expr`].
+fn qualify_column_refs_with_alias(expr: &mut Expr, alias: &Arc<str>) {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => {}
+        Expr::Column(col_ref, _) => {
+            col_ref.table = Some(alias.clone());
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            qualify_column_refs_with_alias(left, alias);
+            qualify_column_refs_with_alias(right, alias);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => qualify_column_refs_with_alias(expr, alias),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            qualify_column_refs_with_alias(expr, alias);
+            qualify_column_refs_with_alias(low, alias);
+            qualify_column_refs_with_alias(high, alias);
+        }
+        Expr::In { expr, set, .. } => {
+            qualify_column_refs_with_alias(expr, alias);
+            if let InSet::List(values) = set {
+                for value in values {
+                    qualify_column_refs_with_alias(value, alias);
+                }
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            qualify_column_refs_with_alias(expr, alias);
+            qualify_column_refs_with_alias(pattern, alias);
+            if let Some(escape) = escape.as_deref_mut() {
+                qualify_column_refs_with_alias(escape, alias);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand.as_deref_mut() {
+                qualify_column_refs_with_alias(operand, alias);
+            }
+            for (when, then) in whens {
+                qualify_column_refs_with_alias(when, alias);
+                qualify_column_refs_with_alias(then, alias);
+            }
+            if let Some(else_expr) = else_expr.as_deref_mut() {
+                qualify_column_refs_with_alias(else_expr, alias);
+            }
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            if let FunctionArgs::List(args) = args {
+                for arg in args {
+                    qualify_column_refs_with_alias(arg, alias);
+                }
+            }
+            for term in order_by {
+                qualify_column_refs_with_alias(&mut term.expr, alias);
+            }
+            if let Some(filter) = filter.as_deref_mut() {
+                qualify_column_refs_with_alias(filter, alias);
+            }
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            qualify_column_refs_with_alias(expr, alias);
+            qualify_column_refs_with_alias(path, alias);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                qualify_column_refs_with_alias(value, alias);
+            }
+        }
+        // Do not descend into nested subqueries / window specs: they introduce
+        // their own name scope and must not be re-qualified with this alias.
+        Expr::Exists { .. } | Expr::Subquery(..) => {}
+    }
+}
+
 fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<SelectStatement> {
     if select.with.is_some() || !select.body.compounds.is_empty() {
         return None;
@@ -70718,6 +70951,15 @@ fn rewrite_in_expr(
             // must be evaluated per-row; skip the eager rewrite so they survive
             // into the VDBE codegen which handles them via emit_scalar_subquery.
             if is_correlated_subquery(sub) {
+                return Ok(());
+            }
+            // Only fold a *scalar* (single-column) subquery to a literal. A
+            // multi-column row subquery — e.g. the RHS of a row-value assignment
+            // `SET (a, b) = (SELECT a, b FROM ...)` — must survive to codegen,
+            // which binds each output column to its target. Folding it here takes
+            // only the first row's first value and would silently drop the rest.
+            // bd-6utze.
+            if conn.select_result_column_count(sub, &[], &mut Vec::new()) != 1 {
                 return Ok(());
             }
             let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;

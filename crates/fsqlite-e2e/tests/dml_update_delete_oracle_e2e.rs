@@ -150,6 +150,143 @@ fn update_rewrites_integer_primary_key() {
 }
 
 #[test]
+fn update_multicol_set_row_value_literals() {
+    // bd-cz9o6: multi-column SET (a, b) = (e1, e2) with a parenthesized
+    // row-value of scalar expressions (SQLite 3.15+).
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "INSERT INTO t VALUES (1,10,100),(2,20,200),(3,30,300)",
+            "UPDATE t SET (a, b) = (99, 999) WHERE id = 1",
+            // RHS elements may be arbitrary scalar expressions, incl. the row's
+            // own columns (read of the pre-update value, SQLite semantics).
+            "UPDATE t SET (a, b) = (b + 1, a + 1) WHERE id = 2",
+        ],
+        &["SELECT id, a, b FROM t ORDER BY id"], // (1,99,999),(2,201,21),(3,30,300)
+        "update_multicol_set_row_value_literals",
+    );
+}
+
+#[test]
+fn update_multicol_set_subquery_scalar() {
+    // bd-6utze: row-value SET fed by an (uncorrelated) scalar subquery.
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO t VALUES (1,0),(2,0),(3,0)",
+            "INSERT INTO src VALUES (1,11),(2,22),(3,33)",
+            "UPDATE t SET (v) = (SELECT max(v) FROM src) WHERE id = 1",
+        ],
+        &["SELECT id, v FROM t ORDER BY id"], // (1,33),(2,0),(3,0)
+        "update_multicol_set_subquery_scalar",
+    );
+}
+
+#[test]
+fn update_multicol_set_subquery_correlated() {
+    // bd-6utze: single-column row-value SET fed by a correlated subquery,
+    // plus a no-match row (subquery returns no rows -> NULL).
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO t VALUES (1,0),(2,0),(3,0)",
+            "INSERT INTO src VALUES (1,11),(2,22)",
+            "UPDATE t SET (v) = (SELECT v FROM src WHERE src.id = t.id)",
+        ],
+        &["SELECT id, v FROM t ORDER BY id"], // (1,11),(2,22),(3,NULL)
+        "update_multicol_set_subquery_correlated",
+    );
+}
+
+#[test]
+fn update_multicol2_set_subquery_correlated() {
+    // bd-6utze: two-column row-value SET fed by a correlated subquery.
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "INSERT INTO t VALUES (1,0,0),(2,0,0),(3,0,0)",
+            "INSERT INTO src VALUES (1,11,111),(2,22,222)",
+            "UPDATE t SET (a, b) = (SELECT a, b FROM src WHERE src.id = t.id)",
+        ],
+        &["SELECT id, a, b FROM t ORDER BY id"], // (1,11,111),(2,22,222),(3,NULL,NULL)
+        "update_multicol2_set_subquery_correlated",
+    );
+}
+
+#[test]
+fn update_multicol2_set_subquery_uncorrelated() {
+    // bd-6utze: two-column row-value SET fed by an uncorrelated row subquery
+    // (cannot fold to a scalar -> stays a Subquery; both targets drawn from the
+    // same matched row).
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "INSERT INTO t VALUES (1,0,0),(2,0,0)",
+            "INSERT INTO src VALUES (7,77,777),(8,88,888)",
+            "UPDATE t SET (a, b) = (SELECT a, b FROM src WHERE src.id = 7) WHERE id = 1",
+        ],
+        &["SELECT id, a, b FROM t ORDER BY id"], // (1,77,777),(2,0,0)
+        "update_multicol2_set_subquery_uncorrelated",
+    );
+}
+
+#[test]
+fn update_from_subquery_source() {
+    // bd-kkfok: UPDATE ... FROM a (flattenable) subquery source. Note `val`
+    // exists on BOTH t and src, so `s.val` must resolve to the source (not the
+    // target) after flattening.
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)",
+            "INSERT INTO t VALUES (1,0),(2,0),(3,0)",
+            "INSERT INTO src VALUES (1,100),(2,200)",
+            "UPDATE t SET val = s.val FROM (SELECT id, val FROM src) s WHERE t.id = s.id",
+        ],
+        &["SELECT id, val FROM t ORDER BY id"], // (1,100),(2,200),(3,0)
+        "update_from_subquery_source",
+    );
+}
+
+#[test]
+fn update_from_subquery_with_inner_where() {
+    // bd-kkfok: the subquery's own WHERE must be merged (and alias-qualified)
+    // into the join so only those source rows participate.
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)",
+            "INSERT INTO t VALUES (1,0),(2,0),(3,0)",
+            "INSERT INTO src VALUES (1,100),(2,200),(3,300)",
+            // Only src rows with val >= 200 contribute; row 1 keeps its old value.
+            "UPDATE t SET val = s.val FROM (SELECT id, val FROM src WHERE val >= 200) s WHERE t.id = s.id",
+        ],
+        &["SELECT id, val FROM t ORDER BY id"], // (1,0),(2,200),(3,300)
+        "update_from_subquery_with_inner_where",
+    );
+}
+
+#[test]
+fn update_from_subquery_star() {
+    // bd-kkfok: `SELECT *` subquery source (passthrough columns).
+    scenario(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)",
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)",
+            "INSERT INTO t VALUES (1,0),(2,0)",
+            "INSERT INTO src VALUES (1,11),(2,22)",
+            "UPDATE t SET val = s.val FROM (SELECT * FROM src) s WHERE t.id = s.id",
+        ],
+        &["SELECT id, val FROM t ORDER BY id"], // (1,11),(2,22)
+        "update_from_subquery_star",
+    );
+}
+
+#[test]
 fn update_from_source_table() {
     // UPDATE ... FROM (SQLite 3.33+). Unmatched rows keep their old value.
     scenario(
