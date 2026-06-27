@@ -9274,7 +9274,7 @@ where
             // pure freelist bookkeeping would masquerade as a direct Page 1
             // write and become a cross-process first-committer-wins conflict.
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-            pending_freed = self.freed_pages.drain(..).collect();
+            pending_freed = std::mem::take(&mut self.freed_pages);
             self.freed_page_bounds = None;
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
@@ -9681,7 +9681,7 @@ where
         pending_returned_pages.append(&mut self.page_lease);
         let mut pending_free_pages = pending_returned_pages.clone();
         pending_free_pages.extend(self.freed_pages.iter().copied());
-        let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
+        let pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
         self.freed_page_bounds = None;
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
