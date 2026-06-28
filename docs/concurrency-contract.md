@@ -236,6 +236,28 @@ boundary between parity-claimed and parity-aspired.
   boundary, committed rows from other Connections are visible.
 - `PRAGMA integrity_check = ok` after the workload terminates.
 
+**`journal_mode = 'wal'` means MVCC here, not SQLite's single-writer WAL.**
+For file-format compatibility, `PRAGMA journal_mode` reports `wal` (and
+file-backed databases default to it), but FrankenSQLite intentionally
+replaces SQLite's single-writer `WAL_WRITE_LOCK` with page-level MVCC:
+while `concurrent_mode_default` is on (the default and a core invariant),
+every `BEGIN` auto-promotes to `BEGIN CONCURRENT`, so multiple writers
+commit in parallel as long as they touch disjoint pages. Do **not** assume
+the classic single-writer WAL contract from the `journal_mode` value alone.
+Query the live model with the read-only introspection PRAGMA:
+
+```sql
+PRAGMA fsqlite_concurrency;   -- aliases: fsqlite.concurrency, concurrency
+```
+
+It returns key/value rows: `journal_mode`, `write_concurrency`
+(`concurrent` | `single_writer`), `begin_promotes_to`
+(`BEGIN CONCURRENT` | `BEGIN`), `wal_contract` (`mvcc_page_level` |
+`sqlite_single_writer` | `n/a`), `write_merge`, and a human-readable
+`note`. It is purely observational and changes no behavior. The classic
+single-writer WAL contract is available as a comparison/fallback path —
+see "Supported: multi-reader, single-writer WAL" below.
+
 **Obligation on callers**: open one Connection per logical worker;
 do not try to share a single `Connection` across OS threads — it is
 `!Send + !Sync` and will not compile.

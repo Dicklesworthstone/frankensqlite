@@ -47219,6 +47219,13 @@ impl Connection {
                     }])
                 }
             }
+            // Read-only introspection of the active write-concurrency model
+            // (bd-nao48). Makes the `journal_mode = 'wal'` -> page-level MVCC
+            // divergence explicit so callers do not silently assume SQLite's
+            // single-writer WAL contract. Reports only; changes no behavior.
+            "fsqlite.concurrency" | "concurrency" | "fsqlite_concurrency" => {
+                Ok(self.concurrency_model_rows())
+            }
             // ── AAC-P6: statement micro-batcher knobs ──────────────────────
             // `fsqlite.stmt_microbatch`         — enable/disable (SAFE=on)
             // `fsqlite.stmt_microbatch_max_r`   — consecutive-call row budget
@@ -49068,6 +49075,71 @@ impl Connection {
     fn apply_current_journal_mode_to_pager(&self) -> Result<()> {
         let journal_mode = self.pragma_state.borrow().journal_mode.clone();
         self.apply_journal_mode_to_pager(&journal_mode)
+    }
+
+    /// Build the rows for `PRAGMA fsqlite_concurrency` — a read-only
+    /// introspection surface that reports the active write-concurrency
+    /// model (bd-nao48).
+    ///
+    /// `PRAGMA journal_mode` reports `wal` for compatibility, but
+    /// FrankenSQLite intentionally replaces SQLite's single-writer
+    /// `WAL_WRITE_LOCK` with page-level MVCC: every `BEGIN` auto-promotes
+    /// to `BEGIN CONCURRENT` while `concurrent_mode_default` is on (the
+    /// project default and core invariant). This surface makes that
+    /// divergence explicit so callers do not silently assume SQLite's
+    /// single-writer WAL contract. It is purely observational and changes
+    /// no behavior. See `docs/concurrency-contract.md`.
+    fn concurrency_model_rows(&self) -> Vec<Row> {
+        let mut journal_mode = self.pragma_state.borrow().journal_mode.clone();
+        if self.pager.is_memory() && !journal_mode.eq_ignore_ascii_case("off") {
+            "memory".clone_into(&mut journal_mode);
+        }
+        let concurrent = *self.concurrent_mode_default.borrow();
+        let is_wal = journal_mode.eq_ignore_ascii_case("wal");
+        let write_concurrency = if concurrent {
+            "concurrent"
+        } else {
+            "single_writer"
+        };
+        let begin_promotes_to = if concurrent {
+            "BEGIN CONCURRENT"
+        } else {
+            "BEGIN"
+        };
+        let wal_contract = if is_wal {
+            if concurrent {
+                "mvcc_page_level"
+            } else {
+                "sqlite_single_writer"
+            }
+        } else {
+            "n/a"
+        };
+        let write_merge = self.write_merge_mode.get().as_label();
+        let note: &str = if is_wal && concurrent {
+            "journal_mode=wal runs page-level MVCC concurrent writers; BEGIN auto-promotes to \
+             BEGIN CONCURRENT, intentionally replacing SQLite's single-writer WAL_WRITE_LOCK. \
+             See docs/concurrency-contract.md."
+        } else if concurrent {
+            "BEGIN auto-promotes to BEGIN CONCURRENT (page-level MVCC). \
+             See docs/concurrency-contract.md."
+        } else {
+            "Single-writer comparison/fallback mode mirroring SQLite's WAL contract."
+        };
+        let row = |key: &str, value: &str| Row {
+            values: vec![
+                SqliteValue::Text(key.to_owned().into()),
+                SqliteValue::Text(value.to_owned().into()),
+            ],
+        };
+        vec![
+            row("journal_mode", &journal_mode),
+            row("write_concurrency", write_concurrency),
+            row("begin_promotes_to", begin_promotes_to),
+            row("wal_contract", wal_contract),
+            row("write_merge", write_merge),
+            row("note", note),
+        ]
     }
 
     fn normalize_private_memory_journal_mode_output(&self, journal_mode: &mut String) {
@@ -119996,6 +120068,77 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));
+    }
+
+    /// `PRAGMA fsqlite_concurrency` is a read-only introspection surface that
+    /// makes the `journal_mode = 'wal'` -> page-level MVCC divergence explicit
+    /// (bd-nao48). It reports the live concurrency model and changes nothing.
+    #[test]
+    fn test_pragma_fsqlite_concurrency_reports_active_model() {
+        fn value_for(rows: &[Row], key: &str) -> Option<SqliteValue> {
+            rows.iter()
+                .find(|r| r.get(0) == Some(&SqliteValue::Text(key.into())))
+                .and_then(|r| r.get(1).cloned())
+        }
+
+        // Default :memory: connection runs concurrent MVCC.
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA fsqlite_concurrency;").unwrap();
+        assert_eq!(
+            value_for(&rows, "write_concurrency"),
+            Some(SqliteValue::Text("concurrent".into()))
+        );
+        assert_eq!(
+            value_for(&rows, "begin_promotes_to"),
+            Some(SqliteValue::Text("BEGIN CONCURRENT".into()))
+        );
+        // :memory: journal mode is reported as "memory" -> wal_contract n/a.
+        assert_eq!(
+            value_for(&rows, "journal_mode"),
+            Some(SqliteValue::Text("memory".into()))
+        );
+        match value_for(&rows, "note") {
+            Some(SqliteValue::Text(note)) => assert!(note.contains("BEGIN CONCURRENT")),
+            other => panic!("expected a text note row, got {other:?}"),
+        }
+
+        // All three alias spellings resolve to the same surface.
+        let dotted = conn.query("PRAGMA fsqlite.concurrency;").unwrap();
+        let bare = conn.query("PRAGMA concurrency;").unwrap();
+        assert_eq!(dotted.len(), rows.len());
+        assert_eq!(bare.len(), rows.len());
+
+        // The surface reflects live state: flipping into the single-writer
+        // comparison mode is mirrored, then restored. This does NOT change the
+        // project default (concurrent) — only this connection's knob.
+        conn.query("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        let off = conn.query("PRAGMA fsqlite_concurrency;").unwrap();
+        assert_eq!(
+            value_for(&off, "write_concurrency"),
+            Some(SqliteValue::Text("single_writer".into()))
+        );
+        assert_eq!(
+            value_for(&off, "begin_promotes_to"),
+            Some(SqliteValue::Text("BEGIN".into()))
+        );
+        conn.query("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+
+        // File-backed databases default to WAL: the wal_contract row must make
+        // the page-level MVCC reality explicit rather than implying SQLite's
+        // single-writer WAL contract.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("concurrency-model.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let file_conn = Connection::open(&db_path).unwrap();
+        let file_rows = file_conn.query("PRAGMA fsqlite_concurrency;").unwrap();
+        assert_eq!(
+            value_for(&file_rows, "journal_mode"),
+            Some(SqliteValue::Text("wal".into()))
+        );
+        assert_eq!(
+            value_for(&file_rows, "wal_contract"),
+            Some(SqliteValue::Text("mvcc_page_level".into()))
+        );
     }
 
     #[test]
