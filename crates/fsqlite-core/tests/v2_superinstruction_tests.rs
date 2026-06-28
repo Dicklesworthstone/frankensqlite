@@ -516,3 +516,88 @@ fn test_v2_large_insert_page_splits() {
         .unwrap();
     assert!(last.values()[0].to_text().starts_with("data_padding_5000_"));
 }
+
+#[test]
+fn test_v2_file_backed_sequential_append_preserves_integrity_and_persists() {
+    // bd-udl9m (Track G): a file-backed (real pager + B-tree) large sequential
+    // append must engage the zero-seek append fast path, leave the on-disk
+    // B-tree structurally valid (PRAGMA integrity_check == "ok"), and survive a
+    // reopen with the exact same row set. This is the strongest "zero behavior
+    // drift" guard for the Track G append optimization because it exercises page
+    // splits and persistence — not just the in-memory execution image. Explicit
+    // rowids keep these inserts on the counted Insert lane (auto-rowid inserts
+    // take the separate, equally zero-seek FusedAppendInsert lane).
+    let _guard = v2_test_guard();
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("track_g_append_integrity.db");
+    let db_path = db_path.to_string_lossy().into_owned();
+
+    let conn = new_file_conn(&db_path);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")
+        .unwrap();
+
+    let rows: i64 = 4000;
+    let (_result, metrics) = capture_vdbe_metrics(|| {
+        conn.execute("BEGIN").unwrap();
+        for id in 1..=rows {
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({id}, 'payload_{id}_padpadpadpadpadpadpad')"
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    });
+    log_track_t_metrics("file_backed_sequential_append_integrity", &metrics);
+
+    // The append fast path must carry the right edge across the page splits this
+    // workload triggers; only the seed insert (plus at most a few cold-cursor
+    // re-entries) should fall back to a full existence seek.
+    let min_appends = u64::try_from(rows - 16).expect("append threshold fits in u64");
+    assert!(
+        metrics.insert_append_count >= min_appends,
+        "file-backed sequential inserts should stay on the append no-seek path across page splits, got {:?}",
+        metrics
+    );
+    assert!(
+        metrics.insert_seek_count <= 16,
+        "file-backed sequential inserts should not fall back to repeated existence seeks, got {:?}",
+        metrics
+    );
+
+    let count = conn.query_row("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(count.values()[0].to_integer(), rows);
+
+    // Structural proof: the append fast path must not corrupt the on-disk B-tree
+    // (no orphaned cells, valid interior dividers, intact freelist).
+    let integrity = conn.query("PRAGMA integrity_check").unwrap();
+    assert_eq!(
+        integrity[0].values()[0].to_text(),
+        "ok",
+        "append fast path must leave the B-tree structurally valid, got {:?}",
+        integrity[0].values()
+    );
+    drop(conn);
+
+    // Persistence proof: reopen from disk and confirm the exact row set and the
+    // boundary rows survive a fresh pager/B-tree hydration.
+    let reopened = new_file_conn(&db_path);
+    let count = reopened.query_row("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(count.values()[0].to_integer(), rows);
+    let min = reopened.query_row("SELECT MIN(id) FROM t").unwrap();
+    assert_eq!(min.values()[0].to_integer(), 1);
+    let max = reopened.query_row("SELECT MAX(id) FROM t").unwrap();
+    assert_eq!(max.values()[0].to_integer(), rows);
+    let mid = reopened
+        .query_row("SELECT data FROM t WHERE id = 2000")
+        .unwrap();
+    assert_eq!(
+        mid.values()[0].to_text(),
+        "payload_2000_padpadpadpadpadpadpad"
+    );
+    let integrity = reopened.query("PRAGMA integrity_check").unwrap();
+    assert_eq!(
+        integrity[0].values()[0].to_text(),
+        "ok",
+        "reopened database must remain structurally valid after an append-only load"
+    );
+}
