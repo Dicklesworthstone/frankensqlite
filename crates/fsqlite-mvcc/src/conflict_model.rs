@@ -473,9 +473,7 @@ impl AmsSketch {
 
     /// Reset accumulators for a new window (preserves seeds).
     pub fn reset_window(&mut self) {
-        for acc in &mut self.accumulators {
-            *acc = 0;
-        }
+        self.accumulators.fill(0);
         self.txn_count = 0;
     }
 
