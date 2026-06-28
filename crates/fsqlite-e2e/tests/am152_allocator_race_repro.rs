@@ -25,8 +25,19 @@
 //!
 //! Two scenarios: `am152_allocator_race_rollback_journal` (DELETE journal,
 //! default) and `am152_allocator_race_wal` (explicit WAL, the harness's normal
-//! mode), used to compare conflict-detection behaviour. Result: NOT reproduced
-//! — both stay consistent with zero lost rows (see bd-9inpb).
+//! mode), used to compare conflict-detection behaviour.
+//!
+//! RESULT (bd-9inpb): REPRODUCED + FIXED. The rollback-journal scenario
+//! reproduces the page-aliasing corruption ("page N referenced multiple times"
+//! / "2nd reference to page N", canonical sqlite3 confirms the malformed image)
+//! because rollback-journal commits previously had NO cross-connection
+//! page-conflict check (the WAL path's `cross_process_conflict_pages` is empty
+//! for non-WAL commits). The WAL scenario stayed clean (its first-committer-wins
+//! page-conflict check protected it). Fix: `commit_journal` now re-reads the
+//! on-disk page-1 db size under the EXCLUSIVE commit lock and aborts with
+//! `BusySnapshot` (first-committer-wins) when a write-set page aliases the
+//! peer-claimed page range. These remain `#[ignore]`d heavy stress harnesses;
+//! run with `--ignored` on demand to validate that the fix holds.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -245,7 +256,7 @@ fn run_scenario(wal: bool) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "am#152 stress harness: heavy concurrency negative-result repro (race NOT reproduced); run on demand with --ignored"]
+#[ignore = "am#152 / bd-9inpb stress harness: reproduced+fixed; run on demand with --ignored to validate the page-alias fix"]
 fn am152_allocator_race_rollback_journal() {
     // The suspected-vulnerable path: concurrent_mode ON + DELETE journal,
     // where commit-time cross-process conflict detection is empty.
@@ -256,7 +267,7 @@ fn am152_allocator_race_rollback_journal() {
 }
 
 #[test]
-#[ignore = "am#152 stress harness: heavy concurrency negative-result repro (race NOT reproduced); run on demand with --ignored"]
+#[ignore = "am#152 / bd-9inpb stress harness: reproduced+fixed; run on demand with --ignored to validate the page-alias fix"]
 fn am152_allocator_race_wal() {
     // Control: WAL mode has the first-committer-wins page conflict check.
     match run_scenario(true) {
@@ -436,7 +447,7 @@ fn run_barrier_scenario(wal: bool) -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "am#152 stress harness: heavy concurrency negative-result repro (race NOT reproduced); run on demand with --ignored"]
+#[ignore = "am#152 / bd-9inpb stress harness: reproduced+fixed; run on demand with --ignored to validate the page-alias fix"]
 fn am152_allocator_race_barrier_rollback_journal() {
     match run_barrier_scenario(false) {
         Ok(()) => eprintln!("[am152 barrier rollback] clean"),
@@ -445,7 +456,7 @@ fn am152_allocator_race_barrier_rollback_journal() {
 }
 
 #[test]
-#[ignore = "am#152 stress harness: heavy concurrency negative-result repro (race NOT reproduced); run on demand with --ignored"]
+#[ignore = "am#152 / bd-9inpb stress harness: reproduced+fixed; run on demand with --ignored to validate the page-alias fix"]
 fn am152_allocator_race_barrier_wal() {
     match run_barrier_scenario(true) {
         Ok(()) => eprintln!("[am152 barrier wal] clean"),

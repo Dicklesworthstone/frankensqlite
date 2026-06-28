@@ -7333,11 +7333,79 @@ where
             // written pages during the commit.
             inner.db_file.lock(cx, LockLevel::Exclusive)?;
 
-            // Phase 1: Write rollback journal with pre-images.
             let nonce = 0x4652_414E; // "FRAN" — deterministic nonce.
             let page_size = inner.page_size;
             let ps = page_size.as_usize();
 
+            // bd-9inpb / am#152: cross-connection page-allocation conflict
+            // detection for rollback-journal mode.
+            //
+            // The WAL commit path guards against two connections committing the
+            // same physical page for different b-trees via
+            // `cross_process_conflict_pages` + `conflicting_pages_since_snapshot`.
+            // Rollback-journal commits had NO such check (that vector is empty
+            // for non-WAL commits), so two concurrent connections — each with its
+            // own `PagerInner` and therefore its own `next_page` snapshot — could
+            // both allocate the same EOF page number for different trees and both
+            // commit, aliasing the page on disk ("page N referenced multiple
+            // times" / lost rows).
+            //
+            // The EXCLUSIVE lock serializes committers across connections, so the
+            // most-recently-committed peer's database size is already durable in
+            // the on-disk page-1 header (page count at offset 28..32). If the
+            // committed db has grown past our snapshot (`original_db_size`), then
+            // any page we are about to write that falls in the peer-claimed range
+            // `(original_db_size, committed]` aliases a page that peer now owns
+            // (concurrent `allocate_page` only hands out pages above the snapshot
+            // db_size, and every committed page <= db_size is owned by either a
+            // b-tree or the freelist, so such a page is provably an alias rather
+            // than a coincidental overlap). Abort first-committer-wins style with
+            // `BusySnapshot` so the caller retries against the refreshed db size;
+            // the retry re-snapshots the grown db_size and allocates a
+            // non-conflicting EOF range. Page 1 and any modified existing page are
+            // <= original_db_size, so they never trip this check.
+            //
+            // The page-1 image is read exactly once here and REUSED as the
+            // journal pre-image below, so the check adds no extra counted I/O
+            // (page 1 is always staged in the write_set for a journal commit and
+            // the pre-image loop would read it regardless).
+            let mut page_one_preimage: Option<Vec<u8>> =
+                if write_set.contains_key(&PageNumber::ONE) && original_db_size >= PageNumber::ONE.get()
+                {
+                    let mut image = vec![0u8; ps];
+                    let bytes_read = inner.db_file.read(cx, &mut image, 0)?;
+                    if bytes_read < ps {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short read while journaling pre-image for page 1: got {bytes_read} of {ps}"
+                            ),
+                        });
+                    }
+                    let committed_db_size =
+                        u32::from_be_bytes([image[28], image[29], image[30], image[31]]);
+                    if committed_db_size > original_db_size {
+                        let mut conflicts: Vec<u32> = write_set
+                            .keys()
+                            .map(|page| page.get())
+                            .filter(|&page| page > original_db_size && page <= committed_db_size)
+                            .collect();
+                        if !conflicts.is_empty() {
+                            conflicts.sort_unstable();
+                            return Err(FrankenError::BusySnapshot {
+                                conflicting_pages: conflicts
+                                    .iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            });
+                        }
+                    }
+                    Some(image)
+                } else {
+                    None
+                };
+
+            // Phase 1: Write rollback journal with pre-images.
             let jrnl_flags =
                 VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
             let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
@@ -7359,19 +7427,28 @@ where
                 // needs images for pages that existed when this transaction
                 // began; pages allocated later may not exist on disk yet even
                 // if in-memory db_size/page-count metadata has already advanced.
-                let mut pre_image = vec![0u8; ps];
-                if page_no.get() <= original_db_size {
-                    let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
-                    let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
-                    if bytes_read < ps {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "short read while journaling pre-image for page {}: got {bytes_read} of {ps}",
-                                page_no.get()
-                            ),
-                        });
+                // Page 1's image was already read above for the conflict check;
+                // reuse it instead of reading it a second time.
+                let pre_image = if page_no == PageNumber::ONE
+                    && let Some(image) = page_one_preimage.take()
+                {
+                    image
+                } else {
+                    let mut pre_image = vec![0u8; ps];
+                    if page_no.get() <= original_db_size {
+                        let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
+                        let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
+                        if bytes_read < ps {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "short read while journaling pre-image for page {}: got {bytes_read} of {ps}",
+                                    page_no.get()
+                                ),
+                            });
+                        }
                     }
-                }
+                    pre_image
+                };
 
                 let record = JournalPageRecord::new(page_no.get(), pre_image, nonce);
                 let rec_bytes = record.encode();
