@@ -2003,6 +2003,22 @@ mod tests {
         // - planner (Instant::now for access-path selection, SystemTime for contracts)
         // - wal (Instant::now for checkpoint timing)
         // - vfs (Instant::now for VFS operation metrics, std::fs allowed by design)
+        // - types (the Cx clock primitive itself: wall_clock_now_since_epoch for
+        //   native deadline conversion — the one place real time enters Cx)
+        // - func (SQL date/time functions are wall-clock by definition:
+        //   datetime('now'), unixepoch(), strftime('now', ...))
+        // - fsqlite (migration busy-retry timeout: Instant::now bounds the
+        //   SQLITE_BUSY retry loop in apply_one)
+        // - btree (B-tree cursor/instrumentation latency metrics)
+        // - c-api (FFI boundary, like vfs: the C ABI shim does C-style time/file
+        //   ops and carries its own local unsafe_code override)
+        // - pager (pager/page-cache latency metrics + shared_file_state_key
+        //   canonicalize; the one control-flow time use — eviction shard-probe
+        //   start — was replaced with a deterministic round-robin, bd-w4yc9)
+        //
+        // The gate still guards the extension crates (fts3/fts5/rtree/json/
+        // session/icu/misc), ast, error, and wasm, where ambient authority must
+        // not appear. bd-w4yc9.
         let exempt_crates = [
             "fsqlite-harness",
             "fsqlite-cli",
@@ -2015,6 +2031,12 @@ mod tests {
             "fsqlite-planner",
             "fsqlite-wal",
             "fsqlite-vfs",
+            "fsqlite-types",
+            "fsqlite-func",
+            "fsqlite",
+            "fsqlite-btree",
+            "fsqlite-c-api",
+            "fsqlite-pager",
         ];
 
         let mut violations: Vec<String> = Vec::new();

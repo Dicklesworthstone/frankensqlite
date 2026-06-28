@@ -2810,8 +2810,14 @@ impl ShardedPageCache {
             self.forget_eviction_page(page_no);
             return true;
         }
-        // Overflow shards
-        let start = (std::time::Instant::now().elapsed().as_nanos() as usize) & self.shard_mask;
+        // Overflow shards. Spread the probe start across shards with a
+        // deterministic round-robin cursor (bd-w4yc9). The previous
+        // `std::time::Instant::now().elapsed()` source measured ~0 ns, so the
+        // start was almost always shard 0 (poor spread) AND was a
+        // non-deterministic ambient-authority use; a process-global atomic
+        // round-robin avoids wall-clock time and actually rotates the start.
+        static EVICT_PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+        let start = EVICT_PROBE_CURSOR.fetch_add(1, Ordering::Relaxed) & self.shard_mask;
         for i in 0..self.shards.len() {
             let idx = (start + i) & self.shard_mask;
             let mut shard = self.shards[idx].lock();
