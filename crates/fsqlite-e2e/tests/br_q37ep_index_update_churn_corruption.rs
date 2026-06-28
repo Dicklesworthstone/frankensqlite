@@ -318,3 +318,260 @@ fn index_churn_tiny_pages_deep_tree_stays_intact() {
         .expect("canonical integrity_check");
     assert_eq!(ic, "ok", "canonical SQLite on tiny-page fsqlite file: {ic}");
 }
+
+// ============================================================================
+// Concurrent shared-index churn (bd-9inpb validation + bd-l9yii concurrent angle).
+//
+// The single-connection guards above and the separate-table am#152 repros never
+// combined this dimension: MANY writers, each on its OWN Connection to the same
+// FILE-BACKED db, all churning the SAME low-cardinality `state` index (shared
+// index B-tree) with delete+reinsert freelist churn. Each writer owns a disjoint
+// id-stripe (no pure rowid write-write conflict on the table) but their `state`
+// index entries interleave across the same index leaves/interiors, so the shared
+// index B-tree sees concurrent splits/merges and freelist page REUSE.
+//
+// rollback-journal (DELETE) mode is the regime where bd-9inpb / am#152 reproduced
+// (the cross-connection page-alias that produced "invalid page number" in index
+// interior cells). With the bd-9inpb fix (commit_journal re-reads the on-disk
+// page-1 db size under the EXCLUSIVE lock and aborts BusySnapshot on a
+// peer-claimed page) these stay consistent. Heavy/probabilistic stress: #[ignore]d,
+// run with --ignored. Env-tunable via Q37EP_WRITERS / Q37EP_ROWS / Q37EP_ROUNDS.
+// ============================================================================
+
+fn cc_is_transient(err: &fsqlite::FrankenError) -> bool {
+    matches!(
+        err,
+        fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::DatabaseLocked { .. }
+    )
+}
+
+fn cc_with_retry<T>(
+    label: &str,
+    mut f: impl FnMut() -> Result<T, fsqlite::FrankenError>,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut attempt = 0u32;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(err) if cc_is_transient(&err) && std::time::Instant::now() < deadline => {
+                attempt = attempt.saturating_add(1);
+                let shift = attempt.min(6);
+                std::thread::sleep(std::time::Duration::from_millis((1u64 << shift).min(40)));
+            }
+            Err(err) => return Err(format!("{label}: {err}")),
+        }
+    }
+}
+
+fn cc_writer(
+    path: &str,
+    writer_id: usize,
+    writers: usize,
+    rows: i64,
+    rounds: i64,
+    wal: bool,
+    barrier: &std::sync::Barrier,
+) -> Result<(), String> {
+    let conn = fsqlite::Connection::open(path.to_string()).map_err(|e| format!("open: {e}"))?;
+    let _ = conn.execute("PRAGMA busy_timeout=10000;");
+    if wal {
+        cc_with_retry("journal_mode=WAL", || {
+            conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
+        })?;
+    }
+    assert!(
+        conn.is_concurrent_mode_default(),
+        "concurrent_mode default must be ON (the whole point of the repro)"
+    );
+    let states = ["planned", "dispatched", "executed", "resolved"];
+    let w = writer_id as i64;
+    let n = writers as i64;
+    barrier.wait();
+
+    for round in 0..rounds {
+        // Advance the SHARED indexed column for this writer's id-stripe
+        // (autocommit: each UPDATE is its own MVCC commit).
+        let advance = format!(
+            "UPDATE atc_experiences SET state = CASE state \
+             WHEN 'planned' THEN 'dispatched' WHEN 'dispatched' THEN 'executed' \
+             WHEN 'executed' THEN 'resolved' WHEN 'resolved' THEN 'planned' END \
+             WHERE id % {n} = {w}"
+        );
+        cc_with_retry(&format!("advance w{writer_id} r{round}"), || {
+            conn.execute(&advance).map(|_| ())
+        })?;
+
+        // Every 4th round: free this writer's stripe then reinsert it (freelist
+        // page reuse in the shared index B-tree).
+        if round % 4 == 3 {
+            cc_with_retry(&format!("delete w{writer_id} r{round}"), || {
+                conn.execute(&format!("DELETE FROM atc_experiences WHERE id % {n} = {w}"))
+                    .map(|_| ())
+            })?;
+            let mut chunk = String::new();
+            for id in 1..=rows {
+                if id % n != w {
+                    continue;
+                }
+                if !chunk.is_empty() {
+                    chunk.push(',');
+                }
+                let st = states[(id as usize) % states.len()];
+                chunk.push_str(&format!("({id},'{st}','payload-{id:08}-filler')"));
+                if chunk.len() > 40_000 {
+                    let stmt =
+                        format!("INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}");
+                    cc_with_retry(&format!("reinsert w{writer_id} r{round}"), || {
+                        conn.execute(&stmt).map(|_| ())
+                    })?;
+                    chunk.clear();
+                }
+            }
+            if !chunk.is_empty() {
+                let stmt = format!("INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}");
+                cc_with_retry(&format!("reinsert tail w{writer_id} r{round}"), || {
+                    conn.execute(&stmt).map(|_| ())
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bool) {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("q37ep_concurrent.db");
+    let path = db_path.to_string_lossy().into_owned();
+
+    // Seed rows 1..=rows partitioned by id % writers across the writers.
+    {
+        let conn = fsqlite::Connection::open(path.clone()).expect("open seed");
+        if wal {
+            conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        }
+        conn.execute("PRAGMA foreign_keys=off").unwrap();
+        conn.execute(
+            "CREATE TABLE atc_experiences (id INTEGER PRIMARY KEY, state TEXT, payload TEXT)",
+        )
+        .expect("create table");
+        conn.execute("CREATE INDEX idx_atc_exp_open ON atc_experiences(state)")
+            .expect("create index");
+        let states = ["planned", "dispatched", "executed", "resolved"];
+        let mut chunk = String::new();
+        for id in 1..=rows {
+            if !chunk.is_empty() {
+                chunk.push(',');
+            }
+            let st = states[(id as usize) % states.len()];
+            chunk.push_str(&format!("({id},'{st}','payload-{id:08}-filler')"));
+            if id % 500 == 0 || id == rows {
+                conn.execute(&format!(
+                    "INSERT INTO atc_experiences(id,state,payload) VALUES {chunk}"
+                ))
+                .expect("seed");
+                chunk.clear();
+            }
+        }
+        quick_check(&conn).unwrap_or_else(|e| panic!("corrupt after seed: {e}"));
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
+    let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let path_arc = std::sync::Arc::new(path.clone());
+    let handles: Vec<_> = (0..writers)
+        .map(|w| {
+            let path = std::sync::Arc::clone(&path_arc);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let errors = std::sync::Arc::clone(&errors);
+            std::thread::spawn(move || {
+                if let Err(e) = cc_writer(&path, w, writers, rows, rounds, wal, &barrier) {
+                    eprintln!("[cc writer {w}] FAILED: {e}");
+                    errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+
+    // frank quick_check on the committed state.
+    let verify = fsqlite::Connection::open(path.clone()).expect("verify open");
+    if wal {
+        let _ = verify.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    if let Err(msg) = quick_check(&verify) {
+        panic!("INDEX CORRUPTION (concurrent, frank quick_check, wal={wal}): {msg}");
+    }
+    drop(verify);
+
+    // Canonical SQLite cross-check of the committed file: integrity + every
+    // state's indexed count must equal a forced table scan (missing index
+    // entries == silent data loss on indexed reads, the bd-l9yii / GH#113 claim).
+    let cconn = rusqlite::Connection::open(&path).expect("open canonical");
+    let _ = cconn.execute_batch("PRAGMA busy_timeout=10000; PRAGMA wal_checkpoint(TRUNCATE);");
+    let ic: String = cconn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .expect("canonical integrity_check");
+    assert_eq!(ic, "ok", "canonical SQLite on concurrently-churned file: {ic}");
+
+    let states: Vec<String> = {
+        let mut stmt = cconn
+            .prepare("SELECT DISTINCT state FROM atc_experiences ORDER BY state")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    for st in states {
+        let via_index: i64 = cconn
+            .query_row(
+                "SELECT count(*) FROM atc_experiences WHERE state = ?1",
+                [&st],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let via_scan: i64 = cconn
+            .query_row(
+                "SELECT count(*) FROM atc_experiences WHERE +state = ?1",
+                [&st],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            via_index, via_scan,
+            "state={st}: indexed lookup {via_index} != table scan {via_scan} (missing index entries)"
+        );
+    }
+}
+
+/// Concurrent shared-index churn in rollback-journal (DELETE) mode — the mode
+/// whose commit-time cross-process page-conflict check was empty before bd-9inpb.
+#[test]
+#[ignore = "bd-9inpb/bd-l9yii concurrent shared-index churn stress harness; run with --ignored"]
+fn concurrent_shared_index_churn_rollback_journal_stays_intact() {
+    concurrent_shared_index_churn(
+        env_i64("Q37EP_WRITERS", 8) as usize,
+        env_i64("Q37EP_ROWS", 6_000),
+        env_i64("Q37EP_ROUNDS", 160),
+        false,
+    );
+}
+
+/// Concurrent shared-index churn in WAL mode (first-committer-wins page conflict
+/// detection) — the harness's normal mode and the bd-9inpb control.
+#[test]
+#[ignore = "bd-9inpb/bd-l9yii concurrent shared-index churn stress harness; run with --ignored"]
+fn concurrent_shared_index_churn_wal_stays_intact() {
+    concurrent_shared_index_churn(
+        env_i64("Q37EP_WRITERS", 8) as usize,
+        env_i64("Q37EP_ROWS", 6_000),
+        env_i64("Q37EP_ROUNDS", 160),
+        true,
+    );
+}
