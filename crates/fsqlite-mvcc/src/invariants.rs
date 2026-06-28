@@ -1950,6 +1950,97 @@ mod tests {
         }
     }
 
+    /// bd-707lc: the stable commit watermark must never name a `CommitSeq` that
+    /// has not been finished.
+    ///
+    /// Before the fix, `combine_locked` advanced `next_commit_seq` (the
+    /// allocation counter) *outside* the `active_commits` lock, then registered
+    /// the new sequences *inside* it. A concurrent `finish_commit_seq` that
+    /// drained the active list to empty could therefore read a `next_commit_seq`
+    /// that already covered freshly-allocated-but-not-yet-registered (in-flight)
+    /// sequences and push `stable_commit_seq` past them — making a partial
+    /// commit visible to a new snapshot (an INV-6 violation). The fix performs
+    /// the allocation and registration atomically under the same lock.
+    ///
+    /// Invariant: `stable_commit_seq == X` ⟹ commit `X` is finished. Each worker
+    /// records its seq as "finished" *before* calling `finish_commit_seq`, so a
+    /// legitimate watermark advance to that seq cannot trip a false positive;
+    /// only a premature advance past a seq still held in-flight by another
+    /// worker (one still blocked inside allocation, unable to have recorded it)
+    /// can.
+    #[test]
+    fn test_bd707lc_stable_watermark_never_names_inflight_commit() {
+        use std::collections::HashSet;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let mgr = Arc::new(TxnManager::new(1, 1));
+        let finished: Arc<StdMutex<HashSet<u64>>> = Arc::new(StdMutex::new(HashSet::new()));
+        let violations = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let num_workers = 8_u64;
+        let per_worker = 2_000_u64;
+
+        let mut handles = Vec::new();
+        for _ in 0..num_workers {
+            let mgr = Arc::clone(&mgr);
+            let finished = Arc::clone(&finished);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..per_worker {
+                    let seq = mgr.alloc_commit_seq().get();
+                    // Widen the in-flight window a touch.
+                    std::hint::spin_loop();
+                    // Record finished BEFORE the call that may advance the
+                    // watermark, so a correct advance to this seq is never a
+                    // false positive.
+                    finished.lock().unwrap().insert(seq);
+                    mgr.finish_commit_seq(CommitSeq::new(seq));
+                }
+            }));
+        }
+
+        // Checker: continuously verify the watermark names a finished commit.
+        let checker = {
+            let mgr = Arc::clone(&mgr);
+            let finished = Arc::clone(&finished);
+            let violations = Arc::clone(&violations);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let stable = mgr.current_commit_counter().saturating_sub(1);
+                    if stable >= 1 && !finished.lock().unwrap().contains(&stable) {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        stop.store(true, Ordering::Relaxed);
+        checker.join().expect("checker thread panicked");
+
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "stable_commit_seq named an unfinished (in-flight) commit — a \
+             partial commit could be visible to a snapshot (bd-707lc)"
+        );
+
+        // After every in-flight commit drains, the watermark reflects every
+        // allocation: seqs [1, total] allocated ⟹ stable == total, counter ==
+        // total + 1.
+        let total = num_workers * per_worker;
+        assert_eq!(
+            mgr.current_commit_counter(),
+            total + 1,
+            "after draining all in-flight commits the stable watermark must \
+             equal the highest allocated sequence"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // INV-7: Serialized Mode (global write mutex)
     // -----------------------------------------------------------------------

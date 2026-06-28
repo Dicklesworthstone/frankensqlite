@@ -208,9 +208,17 @@ impl CommitSequenceCombiner {
     }
 
     /// Current next_commit_seq value (for diagnostics).
+    ///
+    /// Uses `Acquire` to pair with the `AcqRel` `fetch_add` in
+    /// `combine_locked`, so a reader synchronizes-with the latest allocation
+    /// rather than observing a stale epoch (bd-707lc). The one correctness
+    /// consumer (`TxnManager::finish_commit_seq`) additionally reads this while
+    /// holding the `active_commits` lock, which the combiner now also holds
+    /// across the allocation; the `Acquire` here keeps unlocked diagnostic
+    /// reads honest too.
     #[must_use]
     pub fn next_seq(&self) -> u64 {
-        self.next_commit_seq.load(Ordering::Relaxed)
+        self.next_commit_seq.load(Ordering::Acquire)
     }
 
     /// Number of registered threads.
@@ -317,24 +325,41 @@ impl CommitSequenceCombiner {
         }
 
         // Single batched fetch_add for all pending requests.
-        let base_seq = self
-            .next_commit_seq
-            .fetch_add(pending_count, Ordering::AcqRel);
+        //
+        // bd-707lc: When an active-commits registry is present, the allocation
+        // (`fetch_add` on `next_commit_seq`) and the registration of those
+        // sequences into `active_commits` MUST be atomic with respect to
+        // `TxnManager::finish_commit_seq`, which holds the same `active_commits`
+        // lock and — when the active list drains to empty — advances
+        // `stable_commit_seq` to `next_commit_seq - 1`. If the `fetch_add` ran
+        // outside the registry lock (as it previously did), a concurrent
+        // finisher could empty the active list and then observe a
+        // `next_commit_seq` that already covers freshly-allocated but
+        // not-yet-registered (in-flight) sequences, advancing the stable
+        // watermark past uncommitted commits and making a partial commit
+        // visible to new snapshots (INV-6 violation). Doing the `fetch_add`
+        // under the lock closes that window: whenever a finisher sees the list
+        // empty, every allocation reflected in `next_commit_seq` has already
+        // been registered-then-finished, so `next_commit_seq - 1` is genuinely
+        // stable. (No-registry path is unit-test only; production
+        // `TxnManager::new` always supplies the registry.)
+        let base_seq = if let Some(ref registry) = self.active_registry {
+            let mut active = registry.lock();
+            let base = self
+                .next_commit_seq
+                .fetch_add(pending_count, Ordering::AcqRel);
+            for i in 0..pending_count {
+                active.push(base + i);
+            }
+            base
+        } else {
+            self.next_commit_seq
+                .fetch_add(pending_count, Ordering::AcqRel)
+        };
         debug_assert!(
             base_seq < u64::MAX - pending_count,
             "CommitSeq allocation overflow"
         );
-
-        // D1-CRITICAL Change 4: Batch-register in active-commits registry
-        // BEFORE signaling DONE to waiters. This ensures sequences are
-        // visible in active_commits before any waiter can call finish_commit_seq,
-        // preventing stable_commit_seq from advancing past uncommitted sequences.
-        if let Some(ref registry) = self.active_registry {
-            let mut active = registry.lock();
-            for i in 0..pending_count {
-                active.push(base_seq + i);
-            }
-        }
 
         // Assign sequences to each pending slot.
         let mut assigned = 0u64;
