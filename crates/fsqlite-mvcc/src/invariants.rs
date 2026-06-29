@@ -1029,6 +1029,19 @@ impl VersionStore {
     }
 
     /// Read a version from the arena by index.
+    ///
+    /// Returns an owned clone taken under the arena read lock, which is mutually
+    /// exclusive with the write lock `gc_tick` holds while recycling slots. A
+    /// caller may therefore hold the returned `VersionIdx` across a concurrent
+    /// `gc_tick` without pinning an EBR epoch: `VersionIdx` is generation-tagged
+    /// and `take_for_retirement` bumps the slot generation on retirement, so a
+    /// stale index resolves to `None` here (never another version's data — no
+    /// use-after-free, no ABA read). This is why the live copy-out read paths
+    /// (`TimeTravelPageIo`, `resolve_visible_version`) need no reader pins; the
+    /// `VersionGuard` pin machinery is reserved for transaction snapshot
+    /// lifetimes and any future lock-free reader that retains an arena
+    /// reference across reclamation. See
+    /// `test_unpinned_reader_stale_version_idx_resolves_none_after_recycle_reuse`.
     #[must_use]
     pub fn get_version(&self, idx: VersionIdx) -> Option<PageVersion> {
         let arena = self.arena.read();
@@ -2732,6 +2745,72 @@ mod tests {
             "gc_tick should complete the EBR recycle pass when no reader guard pins the retire epoch"
         );
         assert_eq!(store.arena_free_count(), 1);
+    }
+
+    #[test]
+    fn test_unpinned_reader_stale_version_idx_resolves_none_after_recycle_reuse() {
+        // bd-3wop3.5 item (3) determination — proves reader epoch-pins are NOT
+        // required for memory-safety on the live copy-out read path.
+        //
+        // An unpinned "reader" captures a version's arena index, then a GC pass
+        // (with no VersionGuard pinned) prunes + recycles that slot and a new
+        // version reuses it. Because VersionIdx is generation-tagged and
+        // VersionArena::get rejects a generation mismatch, the stale index must
+        // resolve to None — never to the recycled slot's new contents. This is
+        // why live readers (which copy out under the arena RwLock) are safe
+        // without epoch pins; the pin machinery is reserved for transaction
+        // snapshot lifetimes (lifecycle.rs VersionGuardTicket::register) and any
+        // future lock-free reader that would retain an arena reference across
+        // reclamation.
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(21).unwrap();
+
+        // Reader captures the arena index of V1 without pinning an epoch guard.
+        let v1_idx = store.publish(make_version(21, 1, None));
+        store.publish(make_version(21, 2, None));
+        store.publish(make_version(21, 3, None));
+
+        // Pre-GC: the captured index resolves to V1 (owned clone, copied out).
+        assert_eq!(
+            store.get_version(v1_idx).map(|v| v.commit_seq),
+            Some(CommitSeq::new(1)),
+            "captured index must resolve before GC"
+        );
+
+        let mut todo = GcTodo::new();
+        todo.enqueue(pgno);
+
+        // No VersionGuard pinned: gc_tick prunes V1 (seq 1 < horizon 2) and
+        // recycles its slot in the same pass (min_pinned_epoch is None).
+        let result = store.gc_tick(&mut todo, CommitSeq::new(2));
+        assert_eq!(result.versions_freed, 1);
+        assert_eq!(result.pruned_indices.len(), 1);
+        assert_eq!(result.pruned_indices[0].chunk(), v1_idx.chunk());
+        assert_eq!(result.pruned_indices[0].offset(), v1_idx.offset());
+        assert_eq!(
+            store.pending_recycle_count(),
+            0,
+            "with no reader guard, the retired slot recycles in the same pass"
+        );
+
+        // A new version reuses the recycled (chunk, offset) with a bumped generation.
+        let reused_idx = store.publish(make_version(21, 4, None));
+        assert_eq!(reused_idx.chunk(), v1_idx.chunk());
+        assert_eq!(reused_idx.offset(), v1_idx.offset());
+        assert_ne!(reused_idx.generation(), v1_idx.generation());
+
+        // THE SAFETY PROPERTY: the unpinned reader's now-stale index resolves to
+        // None (generation mismatch) — never V4's data. No use-after-free, no ABA
+        // wrong-version read, so reader pins are unnecessary on this path.
+        assert!(
+            store.get_version(v1_idx).is_none(),
+            "stale arena index must resolve to None after recycle+reuse"
+        );
+        assert_eq!(
+            store.get_version(reused_idx).map(|v| v.commit_seq),
+            Some(CommitSeq::new(4)),
+            "a fresh resolve sees the reused slot's new version"
+        );
     }
 
     #[test]
