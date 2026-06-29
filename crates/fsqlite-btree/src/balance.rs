@@ -3374,6 +3374,90 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_topology_policy_mode_consistency_advisory_does_not_enact() {
+        // bd-1dp9.6.7.13.2 AC#3 (mode consistency): the conflict-topology split
+        // policy must compute the SAME advice across advisory and enforced modes
+        // and differ ONLY in whether it is enacted; baseline mode must ignore the
+        // heat entirely; and selecting baseline (the kill switch) must revert to
+        // the byte-identical baseline split target. This is the policy-stability
+        // / advisory-vs-enforced-consistency guarantee, independent of the
+        // bench-gated p95/p99 throughput question.
+        let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hot_page = pn(46);
+
+        // Cold baseline target for this (cell_count, insert_idx) shape (no page,
+        // so no topology heat is consulted).
+        let baseline_target = leaf_table_split_policy_for_page(None, 12, 11).target_left_basis_points;
+
+        // ENFORCED: heat shifts the *enacted* target off baseline.
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::record_conflict_topology_heat(hot_page, 3, 4);
+        let enforced = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        assert!(
+            enforced.topology_advice.applied,
+            "enforced mode must enact the topology advice for a hot page"
+        );
+        assert_ne!(
+            enforced.target_left_basis_points, baseline_target,
+            "enforced mode with heat must shift the enacted split target off baseline"
+        );
+        assert_eq!(
+            enforced.topology_advice.advised_target_left_basis_points,
+            enforced.target_left_basis_points,
+            "enforced: the advised target is the one actually enacted"
+        );
+
+        // ADVISORY: identical heat. The advice is COMPUTED (advised target matches
+        // what enforced enacts) but NOT applied (effective target stays baseline).
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Advisory,
+        );
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::record_conflict_topology_heat(hot_page, 3, 4);
+        let advisory = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        assert!(
+            !advisory.topology_advice.applied,
+            "advisory mode must NOT enact the advice"
+        );
+        assert_eq!(
+            advisory.target_left_basis_points, baseline_target,
+            "advisory mode must leave the enacted split target at baseline"
+        );
+        assert_eq!(
+            advisory.topology_advice.advised_target_left_basis_points,
+            enforced.target_left_basis_points,
+            "advisory and enforced must compute the SAME advice; only enactment differs"
+        );
+
+        // BASELINE (kill switch): identical heat is ignored entirely.
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Baseline,
+        );
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::record_conflict_topology_heat(hot_page, 3, 4);
+        let baseline_mode = leaf_table_split_policy_for_page(Some(hot_page), 12, 11);
+        assert!(
+            !baseline_mode.topology_advice.applied,
+            "baseline mode (kill switch) must not enact the advice"
+        );
+        assert_eq!(
+            baseline_mode.target_left_basis_points, baseline_target,
+            "baseline mode (kill switch) must revert to the byte-identical baseline target"
+        );
+
+        // Restore the enforced default for sibling tests (mirrors existing tests).
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+    }
+
+    #[test]
     fn test_pathological_conflict_heat_deflects_leaf_table_split_once_bounded() {
         let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
             .lock()
