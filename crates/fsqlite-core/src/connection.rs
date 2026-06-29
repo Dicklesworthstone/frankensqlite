@@ -138664,6 +138664,90 @@ mod pager_routing_tests {
         assert_eq!(rows[0].values()[1], SqliteValue::Text("new".into()));
     }
 
+    #[test]
+    fn test_returning_dml_engages_vdbe_codegen_not_interpreted_fallback() {
+        // bd-asvja determination: UPDATE/DELETE ... RETURNING route through the
+        // VDBE codegen path (which emits a real VDBE program), NOT the
+        // connection-level interpreted path. The prepared_update_delete_fallback_
+        // returning counter only records that RETURNING disqualifies the narrow
+        // direct-BtCursor bypass; this proves the fall-through lands on VDBE
+        // codegen (opcodes_executed_total > 0), so there is no 10-100x interpreted
+        // slowdown. (Global counters: any parallel-test noise can only ADD
+        // opcodes, so a > 0 assertion never fails spuriously on a true-codegen
+        // engine; it only guards against a regression to the interpreted path.)
+        // File-backed (not :memory:): the :memory: image executes through the
+        // MemDatabase interpreter and records zero VDBE opcodes, so the routing
+        // determination must use the real pager/VDBE storage path.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("returning_route.db");
+        let conn = Connection::open(db_path.to_string_lossy().to_string()).unwrap();
+        conn.execute("CREATE TABLE t_ret_route (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t_ret_route VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
+            .unwrap();
+
+        // `set_hot_path_profile_enabled` only flips a thread-local override in
+        // test mode (it deliberately does NOT touch the cross-crate VDBE flag),
+        // so enable the global VDBE opcode counter directly.
+        super::set_hot_path_profile_enabled(true);
+        fsqlite_vdbe::engine::set_vdbe_metrics_enabled(true);
+
+        // Metrics sanity control: a SELECT scan runs a VDBE program.
+        fsqlite_vdbe::engine::reset_vdbe_metrics();
+        let _ = conn.query("SELECT id, v FROM t_ret_route;").unwrap();
+        let select_opcodes = fsqlite_vdbe::engine::vdbe_metrics_snapshot().opcodes_executed_total;
+
+        // DML control: a non-direct-simple UPDATE (non-PK predicate) without
+        // RETURNING — establishes whether ad-hoc UPDATE compiles to VDBE.
+        fsqlite_vdbe::engine::reset_vdbe_metrics();
+        conn.execute("UPDATE t_ret_route SET v = v + 1 WHERE v = 40;")
+            .unwrap();
+        let control_update_opcodes =
+            fsqlite_vdbe::engine::vdbe_metrics_snapshot().opcodes_executed_total;
+
+        // UPDATE ... RETURNING (non-PK predicate, same shape as the control).
+        fsqlite_vdbe::engine::reset_vdbe_metrics();
+        let update_rows = conn
+            .query("UPDATE t_ret_route SET v = v + 100 WHERE v = 20 RETURNING id, v;")
+            .unwrap();
+        let update_opcodes = fsqlite_vdbe::engine::vdbe_metrics_snapshot().opcodes_executed_total;
+
+        // DELETE ... RETURNING.
+        fsqlite_vdbe::engine::reset_vdbe_metrics();
+        let delete_rows = conn
+            .query("DELETE FROM t_ret_route WHERE v = 30 RETURNING id, v;")
+            .unwrap();
+        let delete_opcodes = fsqlite_vdbe::engine::vdbe_metrics_snapshot().opcodes_executed_total;
+        let fallback_returning = super::hot_path_profile_snapshot()
+            .prepared_update_delete_fallback_returning;
+
+        fsqlite_vdbe::engine::set_vdbe_metrics_enabled(false);
+        super::set_hot_path_profile_enabled(false);
+
+        // Behavior: RETURNING returns the modified / deleted row.
+        assert_eq!(update_rows.len(), 1);
+        assert_eq!(update_rows[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(update_rows[0].values()[1], SqliteValue::Integer(120));
+        assert_eq!(delete_rows.len(), 1);
+        assert_eq!(delete_rows[0].values()[0], SqliteValue::Integer(3));
+        assert_eq!(delete_rows[0].values()[1], SqliteValue::Integer(30));
+
+        // Metrics sanity must hold (otherwise the determination is meaningless).
+        assert!(
+            select_opcodes > 0,
+            "metrics sanity: a SELECT scan must record VDBE opcodes; select_opcodes={select_opcodes}"
+        );
+
+        // Routing determination: each RETURNING DML executed a real VDBE program
+        // (codegen), not the interpreted fallback (which runs zero VDBE opcodes).
+        // The combined message reveals all signals for the bd-asvja determination.
+        assert!(
+            update_opcodes > 0 && delete_opcodes > 0,
+            "DETERMINATION bd-asvja: select={select_opcodes} control_update={control_update_opcodes} \
+             ret_update={update_opcodes} ret_delete={delete_opcodes} fallback_returning={fallback_returning}"
+        );
+    }
+
     // ── SQL pattern probes: identify gaps in VDBE codegen ──
 
     #[test]
