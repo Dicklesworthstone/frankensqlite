@@ -49090,10 +49090,11 @@ impl Connection {
     /// single-writer WAL contract. It is purely observational and changes
     /// no behavior. See `docs/concurrency-contract.md`.
     fn concurrency_model_rows(&self) -> Vec<Row> {
-        let mut journal_mode = self.pragma_state.borrow().journal_mode.clone();
-        if self.pager.is_memory() && !journal_mode.eq_ignore_ascii_case("off") {
-            "memory".clone_into(&mut journal_mode);
-        }
+        // Report journal_mode exactly as `PRAGMA journal_mode` does: the raw
+        // connection-local state. Its read path applies no :memory: rewrite
+        // (normalization is gated on the SET path), so reading the same state
+        // here guarantees the two introspection surfaces never disagree.
+        let journal_mode = self.pragma_state.borrow().journal_mode.clone();
         let concurrent = *self.concurrent_mode_default.borrow();
         let is_wal = journal_mode.eq_ignore_ascii_case("wal");
         let write_concurrency = if concurrent {
