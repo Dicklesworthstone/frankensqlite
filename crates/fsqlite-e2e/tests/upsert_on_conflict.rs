@@ -302,3 +302,57 @@ fn insert_or_replace_replaces_entire_row() {
     // With REPLACE, extra should be the default 42 since the whole row is replaced.
     assert_eq!(col(&rows, 0, 1), "42");
 }
+
+// ─── Non-target UNIQUE conflict during DO UPDATE must abort ─────────────
+
+#[test]
+fn upsert_do_update_aborts_on_nontarget_unique_conflict() {
+    // Regression for the targeted-upsert "non-target conflict swallow" bug
+    // (hfdt-fsqlite-upsert-conflict-target-a756a). `ON CONFLICT(<target>) DO UPDATE`
+    // resolves a conflict only on the named target index. When the inserted row
+    // instead violates a DIFFERENT unique index, stock SQLite ABORTs with a
+    // constraint error — it must never silently swallow the write as a no-op.
+    let conn = open_db("upsert-nontarget-unique.db");
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT NOT NULL UNIQUE, v TEXT);")
+        .expect("create");
+    conn.execute("INSERT INTO t VALUES (1, 'alpha', 'one');")
+        .expect("seed row 1");
+    conn.execute("INSERT INTO t VALUES (2, 'beta', 'two');")
+        .expect("seed row 2");
+
+    // id = 99 is a NEW pk (no conflict on the ON CONFLICT(id) target), but
+    // label = 'beta' already exists on the secondary UNIQUE index. This MUST
+    // abort, not be swallowed.
+    let result = conn.execute(
+        "INSERT INTO t VALUES (99, 'beta', 'ninety-nine') ON CONFLICT(id) DO UPDATE SET v = excluded.v;",
+    );
+    assert!(
+        result.is_err(),
+        "non-target UNIQUE(label) conflict during DO UPDATE must abort, got {result:?}",
+    );
+
+    // Nothing should have been inserted or mutated.
+    let count = conn.query("SELECT COUNT(*) FROM t;").expect("count");
+    assert_eq!(
+        col(&count, 0, 0),
+        "2",
+        "no new row may be inserted by an aborted upsert"
+    );
+    let beta = conn
+        .query("SELECT id, v FROM t WHERE label = 'beta';")
+        .expect("query beta");
+    assert_eq!(col(&beta, 0, 0), "2", "existing beta row id unchanged");
+    assert_eq!(col(&beta, 0, 1), "two", "existing beta row value unchanged");
+
+    // Positive control: a genuine target conflict still performs the DO UPDATE.
+    conn.execute(
+        "INSERT INTO t VALUES (1, 'alpha', 'one-updated') ON CONFLICT(id) DO UPDATE SET v = excluded.v;",
+    )
+    .expect("target-conflict upsert should still update");
+    let alpha = conn.query("SELECT v FROM t WHERE id = 1;").expect("query alpha");
+    assert_eq!(
+        col(&alpha, 0, 0),
+        "one-updated",
+        "target conflict still updates"
+    );
+}

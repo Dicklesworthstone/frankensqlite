@@ -10936,13 +10936,27 @@ pub fn codegen_insert(
         (conflict_action_to_oe(stmt.or_conflict.as_ref()), None)
     };
     // Statement-level conflict algorithm: an explicit `INSERT OR <algo>`
-    // overrides per-constraint `ON CONFLICT` clauses. For an upsert we keep the
-    // upsert's IGNORE semantics on the non-conflict path (so per-constraint
-    // actions are not re-applied on top of it).
+    // overrides per-constraint `ON CONFLICT` clauses.
+    //
+    // For an upsert, the *target* conflict is resolved by the check-before-insert
+    // probe in `codegen_insert_values` (the DO UPDATE branch does its own REPLACE
+    // handling). The `stmt_level` here governs the no-conflict INSERT path's
+    // remaining constraints (non-target UNIQUE/PK indexes via `emit_index_inserts`,
+    // plus NOT NULL on the update path):
+    //   * DO NOTHING legitimately ignores the conflicting row, so keep IGNORE.
+    //   * DO UPDATE must NOT blanket-IGNORE a violation on a *different* index:
+    //     stock SQLite aborts (or applies an explicit `INSERT OR <algo>`) when the
+    //     inserted row collides on a non-target UNIQUE/PK constraint. Forcing
+    //     IGNORE here silently swallowed those writes as Ok(0)
+    //     (hfdt-fsqlite-upsert-conflict-target-a756a), so carry the genuine
+    //     statement conflict action instead (`None` => default ABORT).
     let stmt_level: Option<ConflictAction> = if stmt.upsert.is_empty() {
         stmt.or_conflict
     } else {
-        Some(ConflictAction::Ignore)
+        match &stmt.upsert[0].action {
+            UpsertAction::Nothing => Some(ConflictAction::Ignore),
+            UpsertAction::Update { .. } => stmt.or_conflict,
+        }
     };
     if let Some(UpsertClause {
         action: UpsertAction::Update {
