@@ -2,7 +2,9 @@
 //!
 //! Maintains a Bayesian posterior (Beta distribution) per candidate
 //! hot-partition ratio and uses Thompson sampling to pick the current arm.
-//! Not yet wired into `ShardedPageCache`; this module provides the primitive.
+//! Wired into the page cache via `PageCacheEvictionPolicy::S3FifoAdaptive`
+//! (see `crate::page_cache`), which uses [`ThompsonPartitioner::current_hot_ratio`]
+//! to tune the S3-FIFO small/main split online from cache hit/miss feedback.
 //!
 //! Sampling details:
 //! - Beta(alpha, beta) drawn via two Gamma draws (`X / (X + Y)`).
@@ -40,12 +42,32 @@ impl BetaArm {
     }
 }
 
+impl Clone for BetaArm {
+    fn clone(&self) -> Self {
+        Self {
+            alpha: AtomicU64::new(self.alpha.load(Ordering::Relaxed)),
+            beta: AtomicU64::new(self.beta.load(Ordering::Relaxed)),
+            arm_ratio: self.arm_ratio,
+        }
+    }
+}
+
 /// Thompson-sampled partitioner over a fixed grid of hot-partition ratios.
 #[derive(Debug)]
 pub struct ThompsonPartitioner {
     arms: Vec<BetaArm>,
     current_arm: AtomicUsize,
     access_count: AtomicU64,
+}
+
+impl Clone for ThompsonPartitioner {
+    fn clone(&self) -> Self {
+        Self {
+            arms: self.arms.clone(),
+            current_arm: AtomicUsize::new(self.current_arm.load(Ordering::Relaxed)),
+            access_count: AtomicU64::new(self.access_count.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Default for ThompsonPartitioner {

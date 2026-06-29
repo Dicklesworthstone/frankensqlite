@@ -37,6 +37,7 @@ use fsqlite_vfs::VfsFile;
 use crate::arc_cache::{ArcEvictionModel, CacheLookup};
 use crate::page_buf::{PageBuf, PageBufPool};
 use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
+use crate::thompson_partitioner::ThompsonPartitioner;
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -251,6 +252,11 @@ pub enum PageCacheEvictionPolicy {
     /// recency list (T1) and a frequency list (T2) with ghost history, giving
     /// strong scan resistance — see [`crate::arc_cache::ArcEvictionModel`].
     Arc(ArcEvictionConfig),
+    /// S3-FIFO whose small/main (hot-partition) split is tuned online by a
+    /// Thompson-sampling bandit ([`crate::thompson_partitioner::ThompsonPartitioner`])
+    /// from cache hit/miss feedback. Starts from the given config's split and
+    /// adapts the small-queue size toward whichever ratio yields more hits.
+    S3FifoAdaptive(S3FifoConfig),
 }
 
 /// Configuration for the ARC eviction policy ([`PageCacheEvictionPolicy::Arc`]).
@@ -571,12 +577,93 @@ impl ArcEvictionTracker {
     }
 }
 
+/// S3-FIFO eviction whose small/main (hot-partition) split is tuned online by a
+/// Thompson-sampling bandit (bd-5ftij). The bandit rewards the current ratio on
+/// cache hits and penalises it on misses; at each resample boundary the S3-FIFO
+/// small-queue size is retargeted to the winning ratio. This makes
+/// [`ThompsonPartitioner`] a live consumer of the cache hit/miss signal.
+#[derive(Debug, Clone)]
+struct S3FifoAdaptiveTracker {
+    inner: S3FifoEvictionTracker,
+    thompson: ThompsonPartitioner,
+}
+
+impl S3FifoAdaptiveTracker {
+    fn new(config: S3FifoConfig) -> Self {
+        Self {
+            inner: S3FifoEvictionTracker::new(config),
+            thompson: ThompsonPartitioner::new(),
+        }
+    }
+
+    /// Feed the bandit one cache outcome and, on a resample boundary, retarget
+    /// the S3-FIFO small-queue size to the newly selected hot-partition ratio.
+    fn observe_outcome(&mut self, hit: bool) {
+        self.thompson.record_outcome(hit);
+        if self.thompson.tick() {
+            self.apply_current_ratio();
+        }
+    }
+
+    fn apply_current_ratio(&mut self) {
+        let capacity = self.inner.config.capacity().max(1);
+        let ratio = self.thompson.current_hot_ratio();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let small = (ratio * capacity as f64).round() as usize;
+        let small = small.clamp(1, capacity);
+        self.inner.config = S3FifoConfig::with_limits(
+            capacity,
+            small,
+            self.inner.config.ghost_capacity(),
+            self.inner.config.max_reinsert(),
+        );
+    }
+
+    fn record_access(&mut self, page_no: PageNumber) {
+        self.inner.record_access(page_no);
+        self.observe_outcome(true);
+    }
+
+    fn record_admit(&mut self, page_no: PageNumber) {
+        self.inner.record_admit(page_no);
+        self.observe_outcome(false);
+    }
+
+    fn forget(&mut self, page_no: PageNumber) {
+        self.inner.forget(page_no);
+    }
+
+    fn clear_history(&mut self) {
+        self.inner.clear_history();
+    }
+
+    fn choose_victim(&self, resident_pages: &[PageNumber]) -> Option<PageNumber> {
+        self.inner.choose_victim(resident_pages)
+    }
+
+    fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
+        self.inner.queue_snapshot(resident_pages)
+    }
+
+    fn queue_assignments(
+        &self,
+        resident_pages: &[PageNumber],
+    ) -> std::collections::HashMap<PageNumber, PageCacheQueueKind> {
+        self.inner.queue_assignments(resident_pages)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 enum PageCacheEvictionTracker {
     #[default]
     Arbitrary,
     S3Fifo(S3FifoEvictionTracker),
     Arc(ArcEvictionTracker),
+    S3FifoAdaptive(S3FifoAdaptiveTracker),
 }
 
 impl PageCacheEvictionTracker {
@@ -587,6 +674,9 @@ impl PageCacheEvictionTracker {
                 Self::S3Fifo(S3FifoEvictionTracker::new(config))
             }
             PageCacheEvictionPolicy::Arc(config) => Self::Arc(ArcEvictionTracker::new(config)),
+            PageCacheEvictionPolicy::S3FifoAdaptive(config) => {
+                Self::S3FifoAdaptive(S3FifoAdaptiveTracker::new(config))
+            }
         }
     }
 
@@ -595,6 +685,9 @@ impl PageCacheEvictionTracker {
             Self::Arbitrary => PageCacheEvictionPolicy::Arbitrary,
             Self::S3Fifo(tracker) => PageCacheEvictionPolicy::S3Fifo(tracker.config),
             Self::Arc(tracker) => PageCacheEvictionPolicy::Arc(tracker.config),
+            Self::S3FifoAdaptive(tracker) => {
+                PageCacheEvictionPolicy::S3FifoAdaptive(tracker.inner.config)
+            }
         }
     }
 
@@ -607,6 +700,7 @@ impl PageCacheEvictionTracker {
             Self::Arbitrary => {}
             Self::S3Fifo(tracker) => tracker.record_access(page_no),
             Self::Arc(tracker) => tracker.record_access(page_no),
+            Self::S3FifoAdaptive(tracker) => tracker.record_access(page_no),
         }
     }
 
@@ -615,6 +709,7 @@ impl PageCacheEvictionTracker {
             Self::Arbitrary => {}
             Self::S3Fifo(tracker) => tracker.record_admit(page_no),
             Self::Arc(tracker) => tracker.record_admit(page_no),
+            Self::S3FifoAdaptive(tracker) => tracker.record_admit(page_no),
         }
     }
 
@@ -623,6 +718,7 @@ impl PageCacheEvictionTracker {
             Self::Arbitrary => {}
             Self::S3Fifo(tracker) => tracker.forget(page_no),
             Self::Arc(tracker) => tracker.forget(page_no),
+            Self::S3FifoAdaptive(tracker) => tracker.forget(page_no),
         }
     }
 
@@ -631,6 +727,7 @@ impl PageCacheEvictionTracker {
             Self::Arbitrary => {}
             Self::S3Fifo(tracker) => tracker.clear_history(),
             Self::Arc(tracker) => tracker.clear_history(),
+            Self::S3FifoAdaptive(tracker) => tracker.clear_history(),
         }
     }
 
@@ -639,6 +736,7 @@ impl PageCacheEvictionTracker {
             Self::Arbitrary => None,
             Self::S3Fifo(tracker) => tracker.choose_victim(resident_pages),
             Self::Arc(tracker) => tracker.choose_victim(resident_pages),
+            Self::S3FifoAdaptive(tracker) => tracker.choose_victim(resident_pages),
         }
     }
 
@@ -646,6 +744,7 @@ impl PageCacheEvictionTracker {
         match self {
             Self::Arbitrary | Self::Arc(_) => None,
             Self::S3Fifo(tracker) => tracker.queue_snapshot(resident_pages),
+            Self::S3FifoAdaptive(tracker) => tracker.queue_snapshot(resident_pages),
         }
     }
 
@@ -656,6 +755,7 @@ impl PageCacheEvictionTracker {
         match self {
             Self::Arbitrary | Self::Arc(_) => std::collections::HashMap::new(),
             Self::S3Fifo(tracker) => tracker.queue_assignments(resident_pages),
+            Self::S3FifoAdaptive(tracker) => tracker.queue_assignments(resident_pages),
         }
     }
 }
@@ -935,7 +1035,9 @@ impl PageCache {
     pub fn evict_any(&mut self) -> bool {
         let policy = self.eviction_policy.borrow().policy();
         let key = match policy {
-            PageCacheEvictionPolicy::S3Fifo(_) | PageCacheEvictionPolicy::Arc(_)
+            PageCacheEvictionPolicy::S3Fifo(_)
+            | PageCacheEvictionPolicy::Arc(_)
+            | PageCacheEvictionPolicy::S3FifoAdaptive(_)
                 if self.pages.len() <= S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS =>
             {
                 let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
@@ -947,7 +1049,8 @@ impl PageCache {
             }
             PageCacheEvictionPolicy::Arbitrary
             | PageCacheEvictionPolicy::S3Fifo(_)
-            | PageCacheEvictionPolicy::Arc(_) => self.pages.keys().next().copied(),
+            | PageCacheEvictionPolicy::Arc(_)
+            | PageCacheEvictionPolicy::S3FifoAdaptive(_) => self.pages.keys().next().copied(),
         };
         if let Some(key) = key {
             self.pages.remove(&key);
@@ -2968,7 +3071,9 @@ impl ShardedPageCache {
             let tracker = self.eviction_policy.lock();
             matches!(
                 &*tracker,
-                PageCacheEvictionTracker::S3Fifo(_) | PageCacheEvictionTracker::Arc(_)
+                PageCacheEvictionTracker::S3Fifo(_)
+                    | PageCacheEvictionTracker::Arc(_)
+                    | PageCacheEvictionTracker::S3FifoAdaptive(_)
             )
         };
         if !tracks_reconstruction
@@ -4758,6 +4863,57 @@ mod tests {
         assert!(
             three_resident ^ four_resident,
             "bead_id=bd-q7zls case=arc_evicts_exactly_one_recency_page three={three_resident} four={four_resident}"
+        );
+    }
+
+    /// bd-5ftij: the Thompson-adaptive S3-FIFO tracker is a live consumer of the
+    /// cache hit/miss signal. After a full resample interval of outcomes it
+    /// retargets the S3-FIFO small-queue size to the bandit's selected
+    /// hot-partition ratio (`round(ratio * capacity)`, ratio in [0.1, 0.9]).
+    #[test]
+    fn test_s3fifo_adaptive_tracker_retargets_small_queue_on_resample() {
+        use crate::thompson_partitioner::RESAMPLE_INTERVAL;
+        let mut tracker = S3FifoAdaptiveTracker::new(S3FifoConfig::new(100));
+        let page = PageNumber::new(1).unwrap();
+        // Drive one full resample interval of (hit) outcomes; tick() crosses the
+        // RESAMPLE_INTERVAL boundary exactly once and retargets the small queue.
+        for _ in 0..RESAMPLE_INTERVAL {
+            tracker.record_access(page);
+        }
+        let small = tracker.inner.config.small_capacity();
+        assert!(
+            (10..=90).contains(&small),
+            "bead_id=bd-5ftij case=thompson_retargets_small_queue small={small} (expected round(ratio*100), ratio in [0.1,0.9])"
+        );
+    }
+
+    /// bd-5ftij: the adaptive policy round-trips through the cache and still
+    /// protects frequently-accessed pages (it delegates victim choice to its
+    /// inner S3-FIFO model, now with a Thompson-tuned split).
+    #[test]
+    fn test_page_cache_s3fifo_adaptive_policy_round_trips_and_evicts() {
+        let mut cache = PageCache::new(PageSize::DEFAULT);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3FifoAdaptive(S3FifoConfig::new(8)));
+        assert!(
+            matches!(
+                cache.eviction_policy(),
+                PageCacheEvictionPolicy::S3FifoAdaptive(_)
+            ),
+            "bead_id=bd-5ftij case=adaptive_policy_round_trips"
+        );
+        for n in 1..=4 {
+            cache.insert_fresh(PageNumber::new(n).unwrap()).unwrap();
+        }
+        for _ in 0..3 {
+            assert!(cache.get(PageNumber::new(1).unwrap()).is_some());
+        }
+        assert!(
+            cache.evict_any(),
+            "bead_id=bd-5ftij case=adaptive_policy_evicts"
+        );
+        assert!(
+            cache.get(PageNumber::new(1).unwrap()).is_some(),
+            "bead_id=bd-5ftij case=adaptive_keeps_frequent_page"
         );
     }
 
