@@ -4919,6 +4919,102 @@ mod tests {
         );
     }
 
+    /// bd-9johq: real-policy hit-rate comparison through the live
+    /// `ShardedPageCache` (not the s3_fifo simulator). Deterministic hot-set +
+    /// cold-scan workload — a small hot set touched every round, interleaved
+    /// with cold-scan bursts that drive the resident set past capacity. Scan-
+    /// resistant policies (S3-FIFO main, ARC T2) keep the hot set resident
+    /// across the cold churn; recency-blind `Arbitrary` does not. The printed
+    /// numbers feed the default-policy decision (bd-9johq); the asserts guard
+    /// that the ARC / adaptive policies actually engage and protect the hot set
+    /// end-to-end (not that one policy wins).
+    #[test]
+    fn bench_real_eviction_policies_hot_cold_scan_hit_rate() {
+        const MAX_BUFFERS: usize = 64;
+        const HOT: u32 = 8;
+        const COLD_BURST: u32 = 24;
+        const ROUNDS: usize = 200;
+
+        fn touch(cache: &ShardedPageCache, page: u32) {
+            let pn = PageNumber::new(page).unwrap();
+            if cache.get_copy(pn).is_some() {
+                return;
+            }
+            loop {
+                match cache.insert_fresh(pn, |_| {}) {
+                    Ok(()) => return,
+                    Err(FrankenError::OutOfMemory) => assert!(
+                        cache.evict_any(),
+                        "bead_id=bd-9johq case=admission_must_free_a_victim"
+                    ),
+                    Err(err) => panic!("bead_id=bd-9johq insert_fresh failed: {err}"),
+                }
+            }
+        }
+
+        fn hot_cold_hit_rate(policy: PageCacheEvictionPolicy) -> f64 {
+            let cache =
+                ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, MAX_BUFFERS, 1);
+            cache.set_eviction_policy(policy);
+            cache.reset_metrics();
+            let mut cold = 1_000_u32;
+            for _ in 0..ROUNDS {
+                for hot in 1..=HOT {
+                    touch(&cache, hot);
+                }
+                for _ in 0..COLD_BURST {
+                    touch(&cache, cold);
+                    cold += 1;
+                }
+            }
+            cache.metrics_snapshot().hit_rate_percent()
+        }
+
+        let arbitrary = hot_cold_hit_rate(PageCacheEvictionPolicy::Arbitrary);
+        let s3fifo = hot_cold_hit_rate(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            MAX_BUFFERS,
+        )));
+        let arc = hot_cold_hit_rate(PageCacheEvictionPolicy::Arc(ArcEvictionConfig::new(
+            MAX_BUFFERS,
+        )));
+        let adaptive = hot_cold_hit_rate(PageCacheEvictionPolicy::S3FifoAdaptive(
+            S3FifoConfig::new(MAX_BUFFERS),
+        ));
+
+        // Perfect hot-set protection yields ~HOT/(HOT+COLD_BURST).
+        let ideal = f64::from(HOT) / f64::from(HOT + COLD_BURST) * 100.0;
+        eprintln!(
+            "bead_id=bd-9johq workload=hot_cold_scan max_buffers={MAX_BUFFERS} hot={HOT} cold_burst={COLD_BURST} rounds={ROUNDS} ideal_protected={ideal:.2}%"
+        );
+        eprintln!(
+            "bead_id=bd-9johq hit_rate%: arbitrary={arbitrary:.2} s3fifo={s3fifo:.2} arc={arc:.2} s3fifo_adaptive={adaptive:.2}"
+        );
+
+        // The scan-resistant policies must protect the hot set (proves they are
+        // wired end-to-end and choose cold victims) — within reach of the ideal.
+        for (name, rate) in [
+            ("s3fifo", s3fifo),
+            ("arc", arc),
+            ("s3fifo_adaptive", adaptive),
+        ] {
+            assert!(
+                rate >= 20.0,
+                "bead_id=bd-9johq case=scan_resistant_protects_hot_set policy={name} hit_rate={rate:.2} ideal={ideal:.2}"
+            );
+        }
+        for (name, rate) in [
+            ("arbitrary", arbitrary),
+            ("s3fifo", s3fifo),
+            ("arc", arc),
+            ("s3fifo_adaptive", adaptive),
+        ] {
+            assert!(
+                (0.0..=100.0).contains(&rate),
+                "bead_id=bd-9johq case=valid_hit_rate policy={name} hit_rate={rate}"
+            );
+        }
+    }
+
     #[test]
     fn test_cache_monitor_page_snapshots_rank_hot_pages_by_access_frequency() {
         let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 32, 1);
