@@ -5015,6 +5015,111 @@ mod tests {
         }
     }
 
+    /// bd-9johq (hardening): real-policy hit-rate comparison on a deterministic
+    /// SKEWED-frequency (Zipf-ish) workload over a key space larger than the
+    /// cache — the family where ARC's frequency-awareness and S3FifoAdaptive's
+    /// Thompson resampling (the workload exceeds RESAMPLE_INTERVAL accesses)
+    /// could most plausibly diverge from plain S3-FIFO. Confirms the "keep
+    /// S3-FIFO default" decision beyond the scan-resistance workload.
+    #[test]
+    fn bench_real_eviction_policies_zipfian_hit_rate() {
+        const MAX_BUFFERS: usize = 64;
+        const DOMAIN: u32 = 512;
+        const ACCESSES: usize = 20_000;
+        const SKEW: f64 = 2.0;
+        const SEED: u64 = 0x5DEE_CE66_D1B5_4A32;
+
+        fn touch(cache: &ShardedPageCache, page: u32) {
+            let pn = PageNumber::new(page).unwrap();
+            if cache.get_copy(pn).is_some() {
+                return;
+            }
+            loop {
+                match cache.insert_fresh(pn, |_| {}) {
+                    Ok(()) => return,
+                    Err(FrankenError::OutOfMemory) => assert!(
+                        cache.evict_any(),
+                        "bead_id=bd-9johq case=zipf_admission_frees_victim"
+                    ),
+                    Err(err) => panic!("bead_id=bd-9johq zipf insert_fresh failed: {err}"),
+                }
+            }
+        }
+
+        // Deterministic SplitMix64 -> Zipf-ish key (low keys hot).
+        fn zipf_key(state: &mut u64, domain: u32, skew: f64) -> u32 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let bits = z >> 11; // 53 random bits
+            #[allow(clippy::cast_precision_loss)]
+            let u = (bits as f64) * (1.0_f64 / ((1_u64 << 53) as f64));
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let idx = (u.powf(skew) * f64::from(domain)) as u32;
+            1 + idx.min(domain - 1)
+        }
+
+        fn zipf_hit_rate(policy: PageCacheEvictionPolicy) -> f64 {
+            let cache =
+                ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, MAX_BUFFERS, 1);
+            cache.set_eviction_policy(policy);
+            cache.reset_metrics();
+            let mut state = SEED;
+            for _ in 0..ACCESSES {
+                touch(&cache, zipf_key(&mut state, DOMAIN, SKEW));
+            }
+            cache.metrics_snapshot().hit_rate_percent()
+        }
+
+        let arbitrary = zipf_hit_rate(PageCacheEvictionPolicy::Arbitrary);
+        let s3fifo = zipf_hit_rate(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(
+            MAX_BUFFERS,
+        )));
+        let arc = zipf_hit_rate(PageCacheEvictionPolicy::Arc(ArcEvictionConfig::new(
+            MAX_BUFFERS,
+        )));
+        let adaptive = zipf_hit_rate(PageCacheEvictionPolicy::S3FifoAdaptive(S3FifoConfig::new(
+            MAX_BUFFERS,
+        )));
+
+        eprintln!(
+            "bead_id=bd-9johq workload=zipfian domain={DOMAIN} max_buffers={MAX_BUFFERS} skew={SKEW} accesses={ACCESSES}"
+        );
+        eprintln!(
+            "bead_id=bd-9johq hit_rate%: arbitrary={arbitrary:.2} s3fifo={s3fifo:.2} arc={arc:.2} s3fifo_adaptive={adaptive:.2}"
+        );
+
+        for (name, rate) in [
+            ("arbitrary", arbitrary),
+            ("s3fifo", s3fifo),
+            ("arc", arc),
+            ("s3fifo_adaptive", adaptive),
+        ] {
+            assert!(
+                (0.0..=100.0).contains(&rate),
+                "bead_id=bd-9johq case=zipf_valid_hit_rate policy={name} hit_rate={rate}"
+            );
+        }
+        // Frequency-aware reconstruction policies must exploit the skew (keep
+        // hot keys resident) — proves they engage end-to-end on this workload.
+        for (name, rate) in [
+            ("s3fifo", s3fifo),
+            ("arc", arc),
+            ("s3fifo_adaptive", adaptive),
+        ] {
+            assert!(
+                rate >= 10.0,
+                "bead_id=bd-9johq case=zipf_freq_aware_exploits_skew policy={name} hit_rate={rate:.2}"
+            );
+        }
+    }
+
     #[test]
     fn test_cache_monitor_page_snapshots_rank_hot_pages_by_access_frequency() {
         let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 32, 1);

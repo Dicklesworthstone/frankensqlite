@@ -21564,7 +21564,7 @@ mod tests {
                 "bead_id={BEAD_ID} case=freelist_serialization_plan_not_direct_page_one_write"
             );
 
-            let pending_freed = txn.freed_pages.drain(..).collect::<Vec<_>>();
+            let pending_freed = std::mem::take(&mut txn.freed_pages);
             serialize_freelist_to_write_set(
                 &cx,
                 &mut inner,
@@ -21626,7 +21626,7 @@ mod tests {
             let committed_db_size = txn.committed_db_size_with_inner(&inner);
             let freelist_dirty = txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
             let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-            let pending_freed = txn.freed_pages.drain(..).collect::<Vec<_>>();
+            let pending_freed = std::mem::take(&mut txn.freed_pages);
             serialize_freelist_to_write_set(
                 &cx,
                 &mut inner,
