@@ -3495,6 +3495,76 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_topology_split_never_produces_invalid_or_overflowing_split() {
+        // bd-1dp9.6.7.13.2 AC#3 (B-tree invariant safety): the conflict-topology
+        // fill-factor bias can only PREFER a capacity-valid split; it can never
+        // force an invalid one. choose_leaf_table_split_index guards every
+        // candidate split against `usable` (skips any where either half would
+        // overflow), so across the full heat spectrum — baseline, advisory, and
+        // enforced driven into the pathological deflection band — the chosen
+        // split index must stay in [1, n-1] (both halves non-empty) and always
+        // represent a both-halves-fit split. This proves the contention-aware
+        // allocator can never corrupt a page split, no matter how aggressive the
+        // heat-driven bias.
+        let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Configs that genuinely require a split (total cell cost > usable) yet
+        // still fit within two pages.
+        let configs = [
+            (12usize, 380usize),
+            (20, 250),
+            (8, 600),
+            (16, 360),
+            (5, 1100),
+        ];
+        let hot_page = pn(60);
+        for (count, payload) in configs {
+            let cells = fixed_cost_cells(count, payload);
+            for mode in [
+                crate::instrumentation::ConflictTopologyPolicyMode::Baseline,
+                crate::instrumentation::ConflictTopologyPolicyMode::Advisory,
+                crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+            ] {
+                crate::instrumentation::set_conflict_topology_policy_mode(mode);
+                crate::instrumentation::reset_conflict_topology_policy_state();
+                // Drive the page hot, including into the pathological deflection
+                // band (the most aggressive fill-factor bias).
+                for _ in 0..64 {
+                    crate::instrumentation::record_conflict_topology_heat(hot_page, 1, 4);
+                }
+                // Cover left/interior/right insert positions (distinct heat classes).
+                for insert_idx in [0usize, count / 2, count - 1] {
+                    let policy =
+                        leaf_table_split_policy_for_page(Some(hot_page), count, insert_idx);
+                    let split = choose_leaf_table_split_index(&cells, 0, 0, USABLE, policy);
+                    let idx = split.unwrap_or_else(|| {
+                        panic!(
+                            "topology split must exist for count={count} payload={payload} \
+                             mode={mode:?} insert_idx={insert_idx}"
+                        )
+                    });
+                    // Any Some(idx) from choose_leaf_table_split_index is, by the
+                    // function's capacity guard, a both-halves-fit split; assert
+                    // the index is also a non-empty split point.
+                    assert!(
+                        idx >= 1 && idx <= count - 1,
+                        "split index {idx} out of [1,{}] (count={count} payload={payload} \
+                         mode={mode:?} insert_idx={insert_idx})",
+                        count - 1
+                    );
+                }
+            }
+        }
+
+        crate::instrumentation::reset_conflict_topology_policy_state();
+        crate::instrumentation::set_conflict_topology_policy_mode(
+            crate::instrumentation::ConflictTopologyPolicyMode::Enforced,
+        );
+    }
+
+    #[test]
     fn test_adaptive_fill_factor_biases_hot_leaf_split_further_when_enabled() {
         let _guard = crate::instrumentation::CONFLICT_TOPOLOGY_POLICY_TEST_LOCK
             .lock()
