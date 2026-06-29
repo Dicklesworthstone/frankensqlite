@@ -21408,6 +21408,131 @@ mod tests {
         );
     }
 
+    /// bd-db300.3.7 / bd-db300.3.6: two logically disjoint concurrent growth
+    /// writers must not collide on page 1.
+    ///
+    /// The bug's original evidence (2026-03-13) showed `allocate_page`/`free_page`
+    /// forcing `PageNumber::ONE` into the per-op MVCC conflict surface, so every
+    /// growing writer converged on page 1 before it ever reached commit. The fix
+    /// landed in two parts: commit `1eb0ed67` deferred per-op page-1 tracking to
+    /// the commit surface for concurrent transactions, and bd-3wop3.8
+    /// (D1-CRITICAL) made the commit surface treat a pure page-count advance as a
+    /// commutative synthetic update rather than a cross-writer conflict (only a
+    /// *direct* page-1 rewrite — schema ops — stays a conflict).
+    ///
+    /// The existing tests cover each gate in isolation; this is the missing
+    /// multi-writer regression guard: two overlapping concurrent writers that
+    /// each grow the database on disjoint EOF pages must (a) keep page 1 out of
+    /// their predicted conflict surface and (b) both commit and persist.
+    #[test]
+    fn test_disjoint_concurrent_growth_writers_exclude_page_one_from_conflict_surface() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut writer_a = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut writer_b = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        // Neither pure-growth writer pre-declares page 1 in the per-op MVCC
+        // conflict surface (commit 1eb0ed67 deferral).
+        assert!(
+            !writer_a
+                .allocate_page_requires_page_one_conflict_tracking()
+                .unwrap(),
+            "bead_id=bd-db300.3.7 case=writer_a_growth_defers_page_one_conflict_tracking"
+        );
+        assert!(
+            !writer_b
+                .allocate_page_requires_page_one_conflict_tracking()
+                .unwrap(),
+            "bead_id=bd-db300.3.7 case=writer_b_growth_defers_page_one_conflict_tracking"
+        );
+
+        let page_a = writer_a.allocate_page(&cx).unwrap();
+        let page_b = writer_b.allocate_page(&cx).unwrap();
+        assert_ne!(
+            page_a, page_b,
+            "bead_id=bd-db300.3.7 case=leased_allocator_gives_disjoint_eof_pages a={} b={}",
+            page_a.get(),
+            page_b.get()
+        );
+        assert_ne!(
+            page_a,
+            PageNumber::ONE,
+            "bead_id=bd-db300.3.7 case=growth_allocates_beyond_page_one"
+        );
+        assert_ne!(
+            page_b,
+            PageNumber::ONE,
+            "bead_id=bd-db300.3.7 case=growth_allocates_beyond_page_one"
+        );
+
+        writer_a.write_page(&cx, page_a, &vec![0x3A; ps]).unwrap();
+        writer_b.write_page(&cx, page_b, &vec![0x3B; ps]).unwrap();
+
+        // Each writer's predicted cross-process conflict surface excludes page 1
+        // (a pure page-count advance is not a direct page-1 rewrite) while still
+        // keeping its own disjoint data page.
+        let assert_excludes_page_one =
+            |label: &str, txn: &SimpleTransaction<MemoryVfs>, page: PageNumber| {
+                let inner = txn.inner.lock().unwrap();
+                let committed_db_size = txn.committed_db_size_with_inner(&inner);
+                let freelist_dirty =
+                    txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+                let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+                assert!(
+                    !wal_page1_plan.requires_page_one_rewrite(),
+                    "bead_id=bd-db300.3.7 case=writer_{label}_growth_is_not_direct_page_one_rewrite"
+                );
+                assert!(
+                    wal_page1_plan.requires_page_count_advance(),
+                    "bead_id=bd-db300.3.7 case=writer_{label}_growth_advances_page_count"
+                );
+                let conflict_pages = txn
+                    .predicted_conflict_pages_for_wal_commit_with_inner(&inner, wal_page1_plan, &[]);
+                assert!(
+                    !conflict_pages.contains(&PageNumber::ONE),
+                    "bead_id=bd-db300.3.7 case=writer_{label}_growth_excludes_page_one conflicts={conflict_pages:?}"
+                );
+                assert!(
+                    conflict_pages.contains(&page),
+                    "bead_id=bd-db300.3.7 case=writer_{label}_disjoint_data_page_remains_conflict page={}",
+                    page.get()
+                );
+            };
+        assert_excludes_page_one("a", &writer_a, page_a);
+        assert_excludes_page_one("b", &writer_b, page_b);
+
+        // Both disjoint writers commit successfully — no false page-1 collision
+        // serializes the second committer behind the first.
+        writer_a.commit(&cx).unwrap();
+        writer_b.commit(&cx).unwrap();
+
+        // Both disjoint pages persist, and the committed db size covers both.
+        let inner = pager.inner.lock().unwrap();
+        assert!(
+            inner.db_size >= page_a.get().max(page_b.get()),
+            "bead_id=bd-db300.3.7 case=committed_db_size_covers_both_disjoint_pages db_size={} a={} b={}",
+            inner.db_size,
+            page_a.get(),
+            page_b.get()
+        );
+        let persisted_a = inner
+            .read_committed_page_copy(&cx, &pager.wal_backend, page_a)
+            .unwrap();
+        let persisted_b = inner
+            .read_committed_page_copy(&cx, &pager.wal_backend, page_b)
+            .unwrap();
+        assert_eq!(
+            persisted_a[0], 0x3A,
+            "bead_id=bd-db300.3.7 case=writer_a_disjoint_page_persisted"
+        );
+        assert_eq!(
+            persisted_b[0], 0x3B,
+            "bead_id=bd-db300.3.7 case=writer_b_disjoint_page_persisted"
+        );
+    }
+
     #[test]
     fn test_commit_conflict_pages_exclude_synthetic_page_one_after_freelist_serialization() {
         let (pager, _) = wal_pager();
