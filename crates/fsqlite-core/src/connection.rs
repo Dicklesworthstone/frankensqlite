@@ -49116,15 +49116,20 @@ impl Connection {
             "n/a"
         };
         let write_merge = self.write_merge_mode.get().as_label();
-        let note: &str = if is_wal && concurrent {
-            "journal_mode=wal runs page-level MVCC concurrent writers; BEGIN auto-promotes to \
-             BEGIN CONCURRENT, intentionally replacing SQLite's single-writer WAL_WRITE_LOCK. \
-             See docs/concurrency-contract.md."
-        } else if concurrent {
-            "BEGIN auto-promotes to BEGIN CONCURRENT (page-level MVCC). \
-             See docs/concurrency-contract.md."
+        let note: &str = if concurrent {
+            if is_wal {
+                "journal_mode=wal runs page-level MVCC concurrent writers; BEGIN auto-promotes \
+                 to BEGIN CONCURRENT, intentionally replacing SQLite's single-writer \
+                 WAL_WRITE_LOCK. See docs/concurrency-contract.md."
+            } else {
+                "BEGIN auto-promotes to BEGIN CONCURRENT (page-level MVCC). \
+                 See docs/concurrency-contract.md."
+            }
+        } else if is_wal {
+            "Single-writer WAL comparison/fallback mode mirroring SQLite's single-writer WAL \
+             contract."
         } else {
-            "Single-writer comparison/fallback mode mirroring SQLite's WAL contract."
+            "Single-writer comparison/fallback mode."
         };
         let row = |key: &str, value: &str| Row {
             values: vec![
@@ -120121,6 +120126,15 @@ mod tests {
             value_for(&off, "begin_promotes_to"),
             Some(SqliteValue::Text("BEGIN".into()))
         );
+        // A :memory: single-writer connection is NOT in WAL mode, so its note
+        // must not claim a WAL contract.
+        match value_for(&off, "note") {
+            Some(SqliteValue::Text(note)) => assert!(
+                !note.contains("WAL"),
+                ":memory: single-writer note must not imply a WAL contract: {note}"
+            ),
+            other => panic!("expected a text note row, got {other:?}"),
+        }
         conn.query("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
 
         // File-backed databases default to WAL: the wal_contract row must make
