@@ -15276,8 +15276,14 @@ impl VdbeEngine {
                     };
                     page[5..7].copy_from_slice(&content_raw.to_be_bytes());
 
-                    // Write the initialized page to pager.
-                    if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
+                    // Write the initialized page to pager. The buffer is owned,
+                    // exactly page-size, and dead after this call, so move it into
+                    // the owned-passthrough write lane (`write_page_data`) instead
+                    // of the borrowed `write_page` lane, which clones a second
+                    // full-page image via `to_vec()` in `normalize_owned_page_data`.
+                    if let Err(err) =
+                        page_io.write_page_data(&txn_cx, root_pgno, PageData::from_vec(page))
+                    {
                         Self::log_open_storage_cursor_fallback_decision(
                             trace_id,
                             certifying_mode,
@@ -28085,6 +28091,93 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_open_storage_cursor_zero_page_init_uses_owned_passthrough_write() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        // bd-1dp9.6.2 single-lever, proof-preserving optimization guard:
+        // initializing a freshly-allocated (zeroed) writable B-tree root page must
+        // move its owned, exactly-page-size image straight through the owned
+        // write-normalization lane (owned passthrough), never the borrowed
+        // `write_page` lane that clones a second full-page image via `to_vec()`.
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let root_pgno = PageNumber::new(2).unwrap();
+
+        let mut header = DatabaseHeader {
+            page_size: PageSize::DEFAULT,
+            reserved_per_page: 0,
+            page_count: root_pgno.get(),
+            ..DatabaseHeader::default()
+        };
+        header.version_valid_for = header.change_counter;
+        let mut page_one = vec![0u8; PageSize::DEFAULT.as_usize()];
+        page_one[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
+        txn.write_page(&cx, PageNumber::ONE, &page_one).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction(txn);
+
+        // Snapshot motion counters immediately before the root-init write so the
+        // delta isolates exactly the zero-page initialization path.
+        let before = vdbe_metrics_snapshot();
+        assert!(
+            engine.open_storage_cursor(0, root_pgno.get() as i32, true),
+            "txn-backed writable cursor should open on a fresh zeroed root page"
+        );
+        let after = vdbe_metrics_snapshot();
+
+        // The root-init write takes the owned-passthrough lane: at least one owned
+        // passthrough, and zero borrowed/resized full-page copies on this path.
+        assert!(
+            after.page_data_motion.owned_passthrough_total
+                - before.page_data_motion.owned_passthrough_total
+                >= 1,
+            "zeroed-root init must write its owned page image via owned passthrough"
+        );
+        assert_eq!(
+            after.page_data_motion.borrowed_exact_size_copies_total
+                - before.page_data_motion.borrowed_exact_size_copies_total,
+            0,
+            "zeroed-root init must not clone a full page image through the borrowed lane"
+        );
+        assert_eq!(
+            after.page_data_motion.owned_resized_copies_total
+                - before.page_data_motion.owned_resized_copies_total,
+            0,
+            "an exactly-page-size root image must never trigger a resize copy"
+        );
+
+        // Behavior preservation: the initialized root page is still a correctly
+        // formed empty leaf-table page (type flag + cell-content offset).
+        let root_page = engine
+            .txn_page_io
+            .as_ref()
+            .unwrap()
+            .read_page(&cx, root_pgno)
+            .unwrap();
+        assert_eq!(root_page[0], BtreePageType::LeafTable as u8);
+        assert_eq!(
+            u32::from(u16::from_be_bytes([root_page[5], root_page[6]])),
+            PageSize::DEFAULT.get(),
+            "fresh reserved-byte-free root pages start their cell content area at usable_size"
+        );
+
+        engine.storage_cursors.clear();
+        let _txn = engine
+            .take_transaction()
+            .expect("take_transaction should succeed");
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 
     #[test]
