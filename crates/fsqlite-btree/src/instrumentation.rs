@@ -127,6 +127,14 @@ pub struct BtreeLeafReuseSnapshot {
     pub nonroot_balance_calls: u64,
     /// Time spent in the generic nonroot rebalance path.
     pub nonroot_balance_time_ns: u64,
+    /// Invocations of the deferred-delete rebalance fixup (`balance_for_delete`).
+    ///
+    /// Per the K2 deferred-delete strategy (bd-yywuv), DELETE removes a leaf
+    /// cell in place and only triggers `balance_for_delete` when the leaf
+    /// becomes empty — never per DELETE. A run of DELETEs that does not empty a
+    /// leaf therefore leaves this counter unchanged, so it stays far below the
+    /// `fsqlite_btree_operations_total.delete` count.
+    pub balance_for_delete_calls: u64,
     /// Retained same-leaf DELETE run materializations.
     pub delete_leaf_run_materialize_calls: u64,
     /// Time spent materializing retained same-leaf DELETE runs into page images.
@@ -984,6 +992,7 @@ static BTREE_LOCAL_SPLIT_HITS: AtomicU64 = AtomicU64::new(0);
 static BTREE_LOCAL_SPLIT_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_NONROOT_BALANCE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_NONROOT_BALANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_BALANCE_FOR_DELETE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static BTREE_DELETE_LEAF_RUN_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1220,6 +1229,17 @@ pub(crate) fn record_nonroot_balance(start: Option<std::time::Instant>) {
     BTREE_NONROOT_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
+/// Count one invocation of the deferred-delete rebalance fixup.
+///
+/// Gated on the general B-tree metrics flag (not the copy-profile flag) so the
+/// production hot path pays a single `AtomicBool` load when metrics are off.
+pub(crate) fn record_balance_for_delete() {
+    if !btree_metrics_enabled() {
+        return;
+    }
+    BTREE_BALANCE_FOR_DELETE_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn record_delete_leaf_run_materialize(start: Option<std::time::Instant>) {
     let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
@@ -1441,6 +1461,7 @@ pub fn btree_leaf_reuse_snapshot() -> BtreeLeafReuseSnapshot {
         local_split_time_ns: BTREE_LOCAL_SPLIT_TIME_NS.load(Ordering::Relaxed),
         nonroot_balance_calls: BTREE_NONROOT_BALANCE_CALLS.load(Ordering::Relaxed),
         nonroot_balance_time_ns: BTREE_NONROOT_BALANCE_TIME_NS.load(Ordering::Relaxed),
+        balance_for_delete_calls: BTREE_BALANCE_FOR_DELETE_CALLS.load(Ordering::Relaxed),
         delete_leaf_run_materialize_calls: BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS
             .load(Ordering::Relaxed),
         delete_leaf_run_materialize_time_ns: BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS
@@ -1533,6 +1554,7 @@ pub fn reset_btree_leaf_reuse_profile() {
     BTREE_LOCAL_SPLIT_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_NONROOT_BALANCE_CALLS.store(0, Ordering::Relaxed);
     BTREE_NONROOT_BALANCE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_BALANCE_FOR_DELETE_CALLS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_MATERIALIZE_CALLS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_MATERIALIZE_TIME_NS.store(0, Ordering::Relaxed);
     BTREE_DELETE_LEAF_RUN_WRITE_CALLS.store(0, Ordering::Relaxed);

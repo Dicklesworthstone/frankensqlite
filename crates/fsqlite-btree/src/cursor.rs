@@ -7089,6 +7089,11 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(());
         }
 
+        // K2 (bd-yywuv): this deferred rebalance fixup runs only when a leaf
+        // empties, not per DELETE. Count it so tests can prove the deferral
+        // (invocations stay far below the DELETE count).
+        instrumentation::record_balance_for_delete();
+
         // Start at the leaf's parent and propagate upward as needed.
         let mut level = depth - 2;
 
@@ -10679,7 +10684,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::instrumentation::{btree_metrics_snapshot, set_btree_metrics_enabled};
+    use crate::instrumentation::{
+        btree_leaf_reuse_snapshot, btree_metrics_snapshot, set_btree_metrics_enabled,
+    };
     use fsqlite_pager::{MemoryMockMvccPager, MockMvccPager, MvccPager as _, TransactionMode};
     use fsqlite_types::SqliteValue;
     use fsqlite_types::record::serialize_record;
@@ -14138,6 +14145,106 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
+    }
+
+    #[test]
+    fn test_balance_for_delete_defers_until_leaf_empties() {
+        // bd-yywuv (K2 deferred delete): prove balance_for_delete (the rebalance
+        // fixup) fires ONLY when a leaf empties, not per DELETE. Deleting every
+        // cell of the leftmost leaf EXCEPT the last must trigger zero rebalances;
+        // the final delete that empties the leaf triggers the rebalance.
+        let _gate_guard = crate::instrumentation::BTREE_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_btree_metrics_enabled(true);
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        // Insert until the table root splits into a multi-level tree, so the
+        // leftmost leaf is a non-root leaf that balance_for_delete can rebalance.
+        let mut max_rowid = 0i64;
+        loop {
+            let payload = vec![b'Q'; 220];
+            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorTable {
+                break;
+            }
+            max_rowid += 1;
+            assert!(
+                max_rowid < 1000,
+                "table root did not split under sustained inserts"
+            );
+        }
+
+        // Max rowid contained in the leftmost leaf subtree.
+        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
+        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+        let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+        let first_divider_cell = CellRef::parse(
+            root_page,
+            usize::from(root_ptrs[0]),
+            root_header.page_type,
+            USABLE,
+        )
+        .unwrap();
+        let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
+        assert!(
+            leftmost_max_rowid >= 1,
+            "leftmost leaf must hold >= 2 cells for this proof"
+        );
+
+        // Phase A: delete every cell of the leftmost leaf EXCEPT the last. The
+        // leaf stays non-empty, so the deferred-delete strategy performs no
+        // rebalance (balance_for_delete is gated on new_count == 0). The balance
+        // counter lives on the leaf-reuse snapshot; the DELETE op total on the
+        // metrics snapshot.
+        let before_balance = btree_leaf_reuse_snapshot();
+        let before_ops = btree_metrics_snapshot();
+        for rowid in 0..leftmost_max_rowid {
+            assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
+            cursor.delete(&cx).unwrap();
+        }
+        let after_partial_balance = btree_leaf_reuse_snapshot();
+        let after_partial_ops = btree_metrics_snapshot();
+        assert_eq!(
+            after_partial_balance.balance_for_delete_calls - before_balance.balance_for_delete_calls,
+            0,
+            "deleting non-emptying cells must defer rebalancing (zero balance_for_delete)"
+        );
+        assert!(
+            after_partial_ops.fsqlite_btree_operations_total.delete
+                - before_ops.fsqlite_btree_operations_total.delete
+                >= u64::try_from(leftmost_max_rowid).unwrap(),
+            "Phase A must have performed real DELETEs"
+        );
+
+        // Phase B: delete the final cell of the leftmost leaf -> it empties ->
+        // the deferred rebalance runs exactly now.
+        assert!(
+            cursor
+                .table_move_to(&cx, leftmost_max_rowid)
+                .unwrap()
+                .is_found()
+        );
+        cursor.delete(&cx).unwrap();
+        let after_empty_balance = btree_leaf_reuse_snapshot();
+        assert!(
+            after_empty_balance.balance_for_delete_calls
+                - after_partial_balance.balance_for_delete_calls
+                >= 1,
+            "emptying a leaf must trigger the deferred rebalance exactly then"
+        );
+
+        set_btree_metrics_enabled(false);
+
+        // Behavior preserved: the surviving right-subtree rows remain reachable.
         assert!(cursor.first(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
     }
