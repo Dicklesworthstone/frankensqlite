@@ -7369,41 +7369,41 @@ where
             // journal pre-image below, so the check adds no extra counted I/O
             // (page 1 is always staged in the write_set for a journal commit and
             // the pre-image loop would read it regardless).
-            let mut page_one_preimage: Option<Vec<u8>> =
-                if write_set.contains_key(&PageNumber::ONE) && original_db_size >= PageNumber::ONE.get()
-                {
-                    let mut image = vec![0u8; ps];
-                    let bytes_read = inner.db_file.read(cx, &mut image, 0)?;
-                    if bytes_read < ps {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "short read while journaling pre-image for page 1: got {bytes_read} of {ps}"
-                            ),
+            let mut page_one_preimage: Option<Vec<u8>> = if write_set.contains_key(&PageNumber::ONE)
+                && original_db_size >= PageNumber::ONE.get()
+            {
+                let mut image = vec![0u8; ps];
+                let bytes_read = inner.db_file.read(cx, &mut image, 0)?;
+                if bytes_read < ps {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "short read while journaling pre-image for page 1: got {bytes_read} of {ps}"
+                        ),
+                    });
+                }
+                let committed_db_size =
+                    u32::from_be_bytes([image[28], image[29], image[30], image[31]]);
+                if committed_db_size > original_db_size {
+                    let mut conflicts: Vec<u32> = write_set
+                        .keys()
+                        .map(|page| page.get())
+                        .filter(|&page| page > original_db_size && page <= committed_db_size)
+                        .collect();
+                    if !conflicts.is_empty() {
+                        conflicts.sort_unstable();
+                        return Err(FrankenError::BusySnapshot {
+                            conflicting_pages: conflicts
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(","),
                         });
                     }
-                    let committed_db_size =
-                        u32::from_be_bytes([image[28], image[29], image[30], image[31]]);
-                    if committed_db_size > original_db_size {
-                        let mut conflicts: Vec<u32> = write_set
-                            .keys()
-                            .map(|page| page.get())
-                            .filter(|&page| page > original_db_size && page <= committed_db_size)
-                            .collect();
-                        if !conflicts.is_empty() {
-                            conflicts.sort_unstable();
-                            return Err(FrankenError::BusySnapshot {
-                                conflicting_pages: conflicts
-                                    .iter()
-                                    .map(u32::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(","),
-                            });
-                        }
-                    }
-                    Some(image)
-                } else {
-                    None
-                };
+                }
+                Some(image)
+            } else {
+                None
+            };
 
             // Phase 1: Write rollback journal with pre-images.
             let jrnl_flags =
@@ -21451,7 +21451,8 @@ mod tests {
         let page_a = writer_a.allocate_page(&cx).unwrap();
         let page_b = writer_b.allocate_page(&cx).unwrap();
         assert_ne!(
-            page_a, page_b,
+            page_a,
+            page_b,
             "bead_id=bd-db300.3.7 case=leased_allocator_gives_disjoint_eof_pages a={} b={}",
             page_a.get(),
             page_b.get()
@@ -21473,33 +21474,33 @@ mod tests {
         // Each writer's predicted cross-process conflict surface excludes page 1
         // (a pure page-count advance is not a direct page-1 rewrite) while still
         // keeping its own disjoint data page.
-        let assert_excludes_page_one =
-            |label: &str, txn: &SimpleTransaction<MemoryVfs>, page: PageNumber| {
-                let inner = txn.inner.lock().unwrap();
-                let committed_db_size = txn.committed_db_size_with_inner(&inner);
-                let freelist_dirty =
-                    txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
-                let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-                assert!(
-                    !wal_page1_plan.requires_page_one_rewrite(),
-                    "bead_id=bd-db300.3.7 case=writer_{label}_growth_is_not_direct_page_one_rewrite"
-                );
-                assert!(
-                    wal_page1_plan.requires_page_count_advance(),
-                    "bead_id=bd-db300.3.7 case=writer_{label}_growth_advances_page_count"
-                );
-                let conflict_pages = txn
-                    .predicted_conflict_pages_for_wal_commit_with_inner(&inner, wal_page1_plan, &[]);
-                assert!(
-                    !conflict_pages.contains(&PageNumber::ONE),
-                    "bead_id=bd-db300.3.7 case=writer_{label}_growth_excludes_page_one conflicts={conflict_pages:?}"
-                );
-                assert!(
-                    conflict_pages.contains(&page),
-                    "bead_id=bd-db300.3.7 case=writer_{label}_disjoint_data_page_remains_conflict page={}",
-                    page.get()
-                );
-            };
+        let assert_excludes_page_one = |label: &str,
+                                        txn: &SimpleTransaction<MemoryVfs>,
+                                        page: PageNumber| {
+            let inner = txn.inner.lock().unwrap();
+            let committed_db_size = txn.committed_db_size_with_inner(&inner);
+            let freelist_dirty = txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            assert!(
+                !wal_page1_plan.requires_page_one_rewrite(),
+                "bead_id=bd-db300.3.7 case=writer_{label}_growth_is_not_direct_page_one_rewrite"
+            );
+            assert!(
+                wal_page1_plan.requires_page_count_advance(),
+                "bead_id=bd-db300.3.7 case=writer_{label}_growth_advances_page_count"
+            );
+            let conflict_pages =
+                txn.predicted_conflict_pages_for_wal_commit_with_inner(&inner, wal_page1_plan, &[]);
+            assert!(
+                !conflict_pages.contains(&PageNumber::ONE),
+                "bead_id=bd-db300.3.7 case=writer_{label}_growth_excludes_page_one conflicts={conflict_pages:?}"
+            );
+            assert!(
+                conflict_pages.contains(&page),
+                "bead_id=bd-db300.3.7 case=writer_{label}_disjoint_data_page_remains_conflict page={}",
+                page.get()
+            );
+        };
         assert_excludes_page_one("a", &writer_a, page_a);
         assert_excludes_page_one("b", &writer_b, page_b);
 

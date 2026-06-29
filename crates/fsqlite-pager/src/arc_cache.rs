@@ -1984,7 +1984,11 @@ mod tests {
         let l = model.request(pn(3));
         assert_eq!(l, CacheLookup::Miss);
         model.admit(pn(3), l); // evicts page 2 -> B1 ghost
-        assert_eq!(model.p(), 0, "bead_id={BEAD_ID_BD_Q7ZLS} case=p_starts_zero");
+        assert_eq!(
+            model.p(),
+            0,
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=p_starts_zero"
+        );
 
         let ghost = model.request(pn(2));
         assert_eq!(

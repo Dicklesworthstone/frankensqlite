@@ -17,9 +17,7 @@ pub mod submodular_prefetch;
 pub mod thompson_partitioner;
 pub mod traits;
 
-pub use arc_cache::{
-    ArcCache, ArcCacheInner, ArcEvictionModel, CacheKey, CacheLookup, CachedPage,
-};
+pub use arc_cache::{ArcCache, ArcCacheInner, ArcEvictionModel, CacheKey, CacheLookup, CachedPage};
 #[cfg(feature = "encryption")]
 pub use encrypt::{
     Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError, KEY_SIZE,

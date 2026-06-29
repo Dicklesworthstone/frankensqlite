@@ -4893,7 +4893,9 @@ mod tests {
     #[test]
     fn test_page_cache_s3fifo_adaptive_policy_round_trips_and_evicts() {
         let mut cache = PageCache::new(PageSize::DEFAULT);
-        cache.set_eviction_policy(PageCacheEvictionPolicy::S3FifoAdaptive(S3FifoConfig::new(8)));
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3FifoAdaptive(S3FifoConfig::new(
+            8,
+        )));
         assert!(
             matches!(
                 cache.eviction_policy(),
