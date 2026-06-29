@@ -17,6 +17,49 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.13] -- 2026-06-29 (post-0.1.12 UPSERT correctness + adaptive pager eviction)
+
+Full-workspace lockstep release (`0.1.12 -> 0.1.13`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Fixed
+
+- **UPSERT `DO UPDATE` now aborts on a non-target UNIQUE/PK conflict.**
+  `INSERT ... ON CONFLICT(<target>) DO UPDATE` resolved a conflict only on the
+  named target index; when the inserted row instead violated a *different*
+  unique/PK index, the statement silently swallowed it (reported 0 rows
+  affected, no error) instead of raising `SQLITE_CONSTRAINT` like stock SQLite.
+  VDBE codegen now scopes the forced `IGNORE` to `DO NOTHING`; `DO UPDATE`
+  carries the genuine statement conflict action (default ABORT) on the
+  no-conflict insert path. The target-conflict UPDATE branch is unchanged.
+  Adds oracle-backed regression coverage that was previously absent (bd-1z8wg).
+- MVCC: atomic commit-sequence allocation + registration closes the INV-6
+  visibility window (bd-707lc); unpinned MVCC reads proven ABA-safe via
+  generational `VersionIdx` without epoch pins (bd-3wop3.5).
+- Pager: journal-mode cross-connection page-alias detection (bd-9inpb).
+- Core: `PRAGMA fsqlite_concurrency` reports the raw `journal_mode` for exact
+  parity with `PRAGMA journal_mode` and de-silences a `journal_mode='wal'`
+  -> MVCC divergence (bd-nao48).
+- Pager/types: deterministic eviction probe greens the ambient-authority gate
+  (bd-w4yc9).
+
+### Added
+
+- Pager: ARC adaptive-replacement eviction model + page-cache policy wiring,
+  with Thompson-sampling auto-tuning of the S3-FIFO split (bd-5ftij, bd-q7zls).
+  Real-policy eviction hit-rate benchmarks select S3-FIFO as the default.
+- Core: `PRAGMA fsqlite_concurrency` diagnostic (bd-nao48).
+
+### Changed
+
+- VDBE: root-page init writes via owned passthrough rather than a borrowed copy
+  (bd-1dp9.6.2); `RETURNING` DML proven to route through VDBE codegen rather
+  than the interpreter (bd-asvja).
+- BTree: conflict-topology split-policy mode consistency and K2 deferred-delete
+  rebalancing instrumentation (bd-1dp9.6.7, bd-yywuv).
+
+---
+
 ## [0.1.12] -- 2026-06-19 (post-0.1.11 correctness and release hardening)
 
 Full-workspace lockstep release candidate (`0.1.11 -> 0.1.12`).
