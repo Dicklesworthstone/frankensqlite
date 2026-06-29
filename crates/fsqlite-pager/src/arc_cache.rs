@@ -342,7 +342,6 @@ impl<T> IntrusiveList<T> {
     }
 
     /// Get the least-recently-used value (front).
-    #[cfg(test)]
     fn front(&self) -> Option<&T> {
         let idx = self.head?;
         self.get(idx)
@@ -1664,6 +1663,252 @@ impl std::fmt::Debug for ArcCache {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// ArcEvictionModel — data-less ARC ordering core (bd-q7zls)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Data-less ARC ordering core for victim selection.
+///
+/// Mirrors [`ArcCacheInner`]'s REQUEST + REPLACE + adaptive-`p` logic over bare
+/// [`PageNumber`]s. It reuses the same [`IntrusiveList`]/[`Location`] machinery
+/// and the same algorithm, but carries **no** page data, pin counts, MVCC
+/// version chains, or byte accounting — only the recency/frequency ordering
+/// needed to decide *which* page ARC would evict next.
+///
+/// This lets the page-cache eviction policy ([`crate::page_cache`]) offer a real
+/// ARC victim selector without paying [`ArcCacheInner`]'s per-entry page-buffer
+/// cost on every eviction. The full data-owning [`ArcCacheInner`] remains the
+/// authoritative cache; this is its lightweight ordering twin for the
+/// reconstruct-from-trace selector pattern already used by S3-FIFO.
+pub struct ArcEvictionModel {
+    /// Recency list (accessed once): LRU at front, MRU at back.
+    t1: IntrusiveList<PageNumber>,
+    /// Frequency list (accessed 2+ times): LRU at front, MRU at back.
+    t2: IntrusiveList<PageNumber>,
+    /// Ghost history evicted from T1.
+    b1: IntrusiveList<PageNumber>,
+    /// Ghost history evicted from T2.
+    b2: IntrusiveList<PageNumber>,
+    /// Directory mapping a resident/ghost page to its list location.
+    directory: HashMap<PageNumber, Location>,
+    /// Adaptive target size for T1 (ARC's `p`).
+    p: usize,
+    /// Resident capacity (|T1| + |T2| ceiling).
+    capacity: usize,
+}
+
+impl std::fmt::Debug for ArcEvictionModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArcEvictionModel")
+            .field("t1_len", &self.t1.len())
+            .field("t2_len", &self.t2.len())
+            .field("b1_len", &self.b1.len())
+            .field("b2_len", &self.b2.len())
+            .field("p", &self.p)
+            .field("capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ArcEvictionModel {
+    /// Create an empty model with the given resident capacity.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            t1: IntrusiveList::new(),
+            t2: IntrusiveList::new(),
+            b1: IntrusiveList::new(),
+            b2: IntrusiveList::new(),
+            directory: HashMap::with_capacity(capacity.saturating_mul(2)),
+            p: 0,
+            capacity,
+        }
+    }
+
+    /// Current adaptive `p` (target T1 size).
+    #[must_use]
+    pub fn p(&self) -> usize {
+        self.p
+    }
+
+    /// Number of resident pages (|T1| + |T2|).
+    #[must_use]
+    pub fn resident_len(&self) -> usize {
+        self.t1.len() + self.t2.len()
+    }
+
+    /// True when the page is resident in T1 or T2.
+    #[must_use]
+    pub fn contains_resident(&self, page: PageNumber) -> bool {
+        matches!(
+            self.directory.get(&page),
+            Some(Location::T1(_) | Location::T2(_))
+        )
+    }
+
+    /// ARC REQUEST: apply promotion / ghost `p`-adaptation and report the
+    /// outcome. Mirrors [`ArcCacheInner::request`] without data movement.
+    pub fn request(&mut self, page: PageNumber) -> CacheLookup {
+        match self.directory.get(&page).copied() {
+            Some(Location::T1(idx)) => {
+                // T1 hit → promote to T2 (recency → frequency).
+                let value = self.t1.remove(idx);
+                let new_idx = self.t2.push_back(value);
+                self.directory.insert(page, Location::T2(new_idx));
+                CacheLookup::Hit
+            }
+            Some(Location::T2(idx)) => {
+                // T2 hit → refresh to MRU.
+                self.t2.move_to_back(idx);
+                CacheLookup::Hit
+            }
+            Some(Location::B1(idx)) => {
+                // Ghost hit in B1 → increase p (favour recency).
+                let delta = std::cmp::max(self.b2.len() / std::cmp::max(self.b1.len(), 1), 1);
+                self.p = std::cmp::min(self.capacity, self.p.saturating_add(delta));
+                self.b1.remove(idx);
+                self.directory.remove(&page);
+                CacheLookup::GhostHitB1
+            }
+            Some(Location::B2(idx)) => {
+                // Ghost hit in B2 → decrease p (favour frequency).
+                let delta = std::cmp::max(self.b1.len() / std::cmp::max(self.b2.len(), 1), 1);
+                self.p = self.p.saturating_sub(delta);
+                self.b2.remove(idx);
+                self.directory.remove(&page);
+                CacheLookup::GhostHitB2
+            }
+            None => CacheLookup::Miss,
+        }
+    }
+
+    /// Admit a page after a miss or ghost hit. Mirrors [`ArcCacheInner::admit`]
+    /// phases 1-2 (directory room + insert); the data-only byte-limit phase is
+    /// intentionally omitted.
+    pub fn admit(&mut self, page: PageNumber, lookup: CacheLookup) {
+        debug_assert!(
+            !matches!(lookup, CacheLookup::Hit),
+            "admit called after a cache hit"
+        );
+        if self.capacity == 0 {
+            return;
+        }
+
+        // Phase 1: make directory room (ARC ghost eviction + REPLACE).
+        let l1_len = self.t1.len() + self.b1.len();
+        if l1_len >= self.capacity {
+            if self.t1.len() < self.capacity {
+                if let Some(ghost) = self.b1.pop_front() {
+                    self.directory.remove(&ghost);
+                }
+                self.replace(page, matches!(lookup, CacheLookup::GhostHitB2));
+            } else {
+                let _ = self.delete_lru_from_t1() || self.delete_lru_from_t2();
+            }
+        } else {
+            let total_dir = l1_len + self.t2.len() + self.b2.len();
+            if total_dir >= self.capacity.saturating_mul(2) {
+                if let Some(ghost) = self.b2.pop_front() {
+                    self.directory.remove(&ghost);
+                }
+            }
+            if self.t1.len() + self.t2.len() >= self.capacity {
+                self.replace(page, matches!(lookup, CacheLookup::GhostHitB2));
+            }
+        }
+
+        // Phase 2: insert. Ghost hits go to T2 (frequent); misses go to T1.
+        match lookup {
+            CacheLookup::GhostHitB1 | CacheLookup::GhostHitB2 => {
+                let idx = self.t2.push_back(page);
+                self.directory.insert(page, Location::T2(idx));
+            }
+            CacheLookup::Miss => {
+                let idx = self.t1.push_back(page);
+                self.directory.insert(page, Location::T1(idx));
+            }
+            CacheLookup::Hit => unreachable!("admit called after a cache hit"),
+        }
+    }
+
+    /// Return the page ARC's REPLACE rule would evict next, without mutating.
+    ///
+    /// Faithful to [`ArcCacheInner::replace`]'s primary branch: prefer the T1
+    /// LRU when `|T1| > p` (recency overflow), otherwise the T2 LRU, with the
+    /// opposite list as fallback. Returns `None` only when both lists are empty.
+    #[must_use]
+    pub fn peek_victim(&self) -> Option<PageNumber> {
+        let prefer_t1 = !self.t1.is_empty() && self.t1.len() > self.p;
+        if prefer_t1 {
+            self.t1.front().or_else(|| self.t2.front()).copied()
+        } else {
+            self.t2.front().or_else(|| self.t1.front()).copied()
+        }
+    }
+
+    /// Evict the LRU of T1 (front) to the B1 ghost list.
+    fn evict_lru_from_t1(&mut self) -> bool {
+        if let Some(key) = self.t1.pop_front() {
+            self.directory.remove(&key);
+            let ghost_idx = self.b1.push_back(key);
+            self.directory.insert(key, Location::B1(ghost_idx));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict the LRU of T2 (front) to the B2 ghost list.
+    fn evict_lru_from_t2(&mut self) -> bool {
+        if let Some(key) = self.t2.pop_front() {
+            self.directory.remove(&key);
+            let ghost_idx = self.b2.push_back(key);
+            self.directory.insert(key, Location::B2(ghost_idx));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete the LRU of T1 outright (no ghost retained).
+    fn delete_lru_from_t1(&mut self) -> bool {
+        if let Some(key) = self.t1.pop_front() {
+            self.directory.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete the LRU of T2 outright (no ghost retained).
+    fn delete_lru_from_t2(&mut self) -> bool {
+        if let Some(key) = self.t2.pop_front() {
+            self.directory.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// ARC REPLACE: move one resident page to a ghost list. Mirrors
+    /// [`ArcCacheInner::replace`] without the superseded-version coalescing
+    /// (which is data/MVCC specific and inapplicable to the ordering twin).
+    fn replace(&mut self, incoming: PageNumber, from_b2: bool) {
+        let incoming_in_b2 = matches!(self.directory.get(&incoming), Some(Location::B2(_)));
+        let from_b2_bias = from_b2 || incoming_in_b2;
+        let t1_len = self.t1.len();
+        let prefer_t1 = t1_len > 0 && (t1_len > self.p || (from_b2_bias && t1_len == self.p));
+        if prefer_t1 {
+            if !self.evict_lru_from_t1() {
+                self.evict_lru_from_t2();
+            }
+        } else if !self.evict_lru_from_t2() {
+            self.evict_lru_from_t1();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1685,6 +1930,107 @@ mod tests {
     /// Helper: create a `CacheKey` from raw parts.
     fn key(pgno: u32, commit_seq: u64) -> CacheKey {
         CacheKey::new(PageNumber::new(pgno).unwrap(), CommitSeq::new(commit_seq))
+    }
+
+    /// Helper: bare `PageNumber` for [`ArcEvictionModel`] tests.
+    fn pn(n: u32) -> PageNumber {
+        PageNumber::new(n).unwrap()
+    }
+
+    const BEAD_ID_BD_Q7ZLS: &str = "bd-q7zls";
+
+    #[test]
+    fn arc_eviction_model_evicts_recency_before_frequency() {
+        // Three single-access pages land in T1; re-accessing page 1 promotes it
+        // to the frequency list T2, so the next victim must be the LRU of T1
+        // (page 2), never the frequently-used page 1. This is ARC's core
+        // scan-resistance property.
+        let mut model = ArcEvictionModel::new(3);
+        for p in [1, 2, 3] {
+            let lookup = model.request(pn(p));
+            assert_eq!(lookup, CacheLookup::Miss);
+            model.admit(pn(p), lookup);
+        }
+        assert_eq!(model.resident_len(), 3);
+
+        assert_eq!(
+            model.request(pn(1)),
+            CacheLookup::Hit,
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=t1_hit_promotes_to_t2"
+        );
+
+        assert_eq!(
+            model.peek_victim(),
+            Some(pn(2)),
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=evict_recency_lru_not_frequency"
+        );
+        assert!(
+            model.contains_resident(pn(1)),
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=frequent_page_stays_resident"
+        );
+    }
+
+    #[test]
+    fn arc_eviction_model_b1_ghost_hit_increases_p() {
+        // Build a state with a B1 ghost, then re-request it: ARC must report a
+        // B1 ghost hit and increase the adaptive parameter p (favour recency).
+        let mut model = ArcEvictionModel::new(2);
+        for p in [1, 2] {
+            let l = model.request(pn(p));
+            model.admit(pn(p), l);
+        }
+        // Promote page 1 to T2 so the next admit evicts T1's LRU (page 2) to B1.
+        assert_eq!(model.request(pn(1)), CacheLookup::Hit);
+        let l = model.request(pn(3));
+        assert_eq!(l, CacheLookup::Miss);
+        model.admit(pn(3), l); // evicts page 2 -> B1 ghost
+        assert_eq!(model.p(), 0, "bead_id={BEAD_ID_BD_Q7ZLS} case=p_starts_zero");
+
+        let ghost = model.request(pn(2));
+        assert_eq!(
+            ghost,
+            CacheLookup::GhostHitB1,
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=evicted_page_is_b1_ghost"
+        );
+        assert!(
+            model.p() >= 1,
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=b1_ghost_hit_raises_p p={}",
+            model.p()
+        );
+    }
+
+    #[test]
+    fn arc_eviction_model_empty_has_no_victim() {
+        let model = ArcEvictionModel::new(4);
+        assert_eq!(
+            model.peek_victim(),
+            None,
+            "bead_id={BEAD_ID_BD_Q7ZLS} case=empty_model_no_victim"
+        );
+        assert_eq!(model.resident_len(), 0);
+    }
+
+    #[test]
+    fn arc_eviction_model_peek_victim_is_always_resident() {
+        // Drive a mixed workload and assert the chosen victim is a resident page
+        // (never a ghost), across a deterministic access sequence.
+        let mut model = ArcEvictionModel::new(4);
+        let trace = [1u32, 2, 3, 1, 4, 5, 2, 6, 3, 7, 1, 8];
+        for p in trace {
+            let l = model.request(pn(p));
+            if !matches!(l, CacheLookup::Hit) {
+                model.admit(pn(p), l);
+            }
+        }
+        if let Some(victim) = model.peek_victim() {
+            assert!(
+                model.contains_resident(victim),
+                "bead_id={BEAD_ID_BD_Q7ZLS} case=victim_is_resident victim={}",
+                victim.get()
+            );
+        } else {
+            panic!("bead_id={BEAD_ID_BD_Q7ZLS} case=nonempty_model_must_have_victim");
+        }
     }
 
     /// Helper: create a `CachedPage` with the given key and a 4096-byte page.

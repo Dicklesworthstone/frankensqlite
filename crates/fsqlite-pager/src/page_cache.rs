@@ -34,6 +34,7 @@ use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_types::{PageData, PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 
+use crate::arc_cache::{ArcEvictionModel, CacheLookup};
 use crate::page_buf::{PageBuf, PageBufPool};
 use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
 
@@ -245,6 +246,35 @@ pub enum PageCacheEvictionPolicy {
     /// Reconstruct an S3-FIFO queue state from recent accesses and use it to
     /// choose the next victim.
     S3Fifo(S3FifoConfig),
+    /// Reconstruct an ARC (Adaptive Replacement Cache) ordering from recent
+    /// accesses and use its REPLACE rule to choose the next victim. ARC keeps a
+    /// recency list (T1) and a frequency list (T2) with ghost history, giving
+    /// strong scan resistance — see [`crate::arc_cache::ArcEvictionModel`].
+    Arc(ArcEvictionConfig),
+}
+
+/// Configuration for the ARC eviction policy ([`PageCacheEvictionPolicy::Arc`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArcEvictionConfig {
+    capacity: usize,
+}
+
+impl ArcEvictionConfig {
+    /// Create an ARC eviction config with the given prototype capacity. The
+    /// capacity is a sizing hint for the reconstructed model and access-trace
+    /// bound; the live capacity used per eviction is the current resident count.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Prototype capacity hint.
+    #[must_use]
+    pub fn capacity(self) -> usize {
+        self.capacity
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -453,11 +483,100 @@ impl S3FifoEvictionTracker {
     }
 }
 
+/// Reconstruct-from-trace ARC victim selector (bd-q7zls).
+///
+/// Mirrors [`S3FifoEvictionTracker`]: keeps a bounded access trace and, on
+/// [`Self::choose_victim`], replays it into a data-less [`ArcEvictionModel`]
+/// scaled to the current resident set, then applies ARC's REPLACE rule. This
+/// reuses the real ARC algorithm without allocating page-data buffers per
+/// eviction.
+#[derive(Debug, Clone)]
+struct ArcEvictionTracker {
+    config: ArcEvictionConfig,
+    access_trace: VecDeque<PageNumber>,
+    max_trace_entries: usize,
+}
+
+impl ArcEvictionTracker {
+    fn new(config: ArcEvictionConfig) -> Self {
+        let max_trace_entries = config
+            .capacity()
+            .saturating_mul(8)
+            .clamp(64, S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES);
+        Self {
+            config,
+            access_trace: VecDeque::with_capacity(max_trace_entries),
+            max_trace_entries,
+        }
+    }
+
+    fn record_access(&mut self, page_no: PageNumber) {
+        if self.access_trace.len() >= self.max_trace_entries {
+            let _ = self.access_trace.pop_front();
+        }
+        self.access_trace.push_back(page_no);
+    }
+
+    fn record_admit(&mut self, page_no: PageNumber) {
+        self.record_access(page_no);
+    }
+
+    fn forget(&mut self, page_no: PageNumber) {
+        if self.access_trace.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
+            return;
+        }
+        self.access_trace.retain(|candidate| *candidate != page_no);
+    }
+
+    fn clear_history(&mut self) {
+        self.access_trace.clear();
+    }
+
+    fn choose_victim(&self, resident_pages: &[PageNumber]) -> Option<PageNumber> {
+        if resident_pages.is_empty()
+            || resident_pages.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS
+        {
+            return None;
+        }
+        let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
+        let mut model = ArcEvictionModel::new(resident_pages.len());
+
+        // Replay the recorded trace (resident pages only) to rebuild ARC's
+        // recency (T1) / frequency (T2) split: pages touched 2+ times promote to
+        // T2 and are protected; single-touch pages stay in the recency lane.
+        for &page_no in &self.access_trace {
+            if !resident_set.contains(&page_no) {
+                continue;
+            }
+            let lookup = model.request(page_no);
+            if !matches!(lookup, CacheLookup::Hit) {
+                model.admit(page_no, lookup);
+            }
+        }
+
+        // Ensure every current resident is represented, in deterministic order.
+        let mut resident_order = resident_pages.to_vec();
+        resident_order.sort_unstable_by_key(|page_no| page_no.get());
+        for &page_no in &resident_order {
+            if !model.contains_resident(page_no) {
+                let lookup = model.request(page_no);
+                if !matches!(lookup, CacheLookup::Hit) {
+                    model.admit(page_no, lookup);
+                }
+            }
+        }
+
+        let victim = model.peek_victim()?;
+        resident_set.contains(&victim).then_some(victim)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 enum PageCacheEvictionTracker {
     #[default]
     Arbitrary,
     S3Fifo(S3FifoEvictionTracker),
+    Arc(ArcEvictionTracker),
 }
 
 impl PageCacheEvictionTracker {
@@ -467,6 +586,7 @@ impl PageCacheEvictionTracker {
             PageCacheEvictionPolicy::S3Fifo(config) => {
                 Self::S3Fifo(S3FifoEvictionTracker::new(config))
             }
+            PageCacheEvictionPolicy::Arc(config) => Self::Arc(ArcEvictionTracker::new(config)),
         }
     }
 
@@ -474,6 +594,7 @@ impl PageCacheEvictionTracker {
         match self {
             Self::Arbitrary => PageCacheEvictionPolicy::Arbitrary,
             Self::S3Fifo(tracker) => PageCacheEvictionPolicy::S3Fifo(tracker.config),
+            Self::Arc(tracker) => PageCacheEvictionPolicy::Arc(tracker.config),
         }
     }
 
@@ -482,26 +603,34 @@ impl PageCacheEvictionTracker {
     }
 
     fn record_access(&mut self, page_no: PageNumber) {
-        if let Self::S3Fifo(tracker) = self {
-            tracker.record_access(page_no);
+        match self {
+            Self::Arbitrary => {}
+            Self::S3Fifo(tracker) => tracker.record_access(page_no),
+            Self::Arc(tracker) => tracker.record_access(page_no),
         }
     }
 
     fn record_admit(&mut self, page_no: PageNumber) {
-        if let Self::S3Fifo(tracker) = self {
-            tracker.record_admit(page_no);
+        match self {
+            Self::Arbitrary => {}
+            Self::S3Fifo(tracker) => tracker.record_admit(page_no),
+            Self::Arc(tracker) => tracker.record_admit(page_no),
         }
     }
 
     fn forget(&mut self, page_no: PageNumber) {
-        if let Self::S3Fifo(tracker) = self {
-            tracker.forget(page_no);
+        match self {
+            Self::Arbitrary => {}
+            Self::S3Fifo(tracker) => tracker.forget(page_no),
+            Self::Arc(tracker) => tracker.forget(page_no),
         }
     }
 
     fn clear_history(&mut self) {
-        if let Self::S3Fifo(tracker) = self {
-            tracker.clear_history();
+        match self {
+            Self::Arbitrary => {}
+            Self::S3Fifo(tracker) => tracker.clear_history(),
+            Self::Arc(tracker) => tracker.clear_history(),
         }
     }
 
@@ -509,12 +638,13 @@ impl PageCacheEvictionTracker {
         match self {
             Self::Arbitrary => None,
             Self::S3Fifo(tracker) => tracker.choose_victim(resident_pages),
+            Self::Arc(tracker) => tracker.choose_victim(resident_pages),
         }
     }
 
     fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
         match self {
-            Self::Arbitrary => None,
+            Self::Arbitrary | Self::Arc(_) => None,
             Self::S3Fifo(tracker) => tracker.queue_snapshot(resident_pages),
         }
     }
@@ -524,7 +654,7 @@ impl PageCacheEvictionTracker {
         resident_pages: &[PageNumber],
     ) -> std::collections::HashMap<PageNumber, PageCacheQueueKind> {
         match self {
-            Self::Arbitrary => std::collections::HashMap::new(),
+            Self::Arbitrary | Self::Arc(_) => std::collections::HashMap::new(),
             Self::S3Fifo(tracker) => tracker.queue_assignments(resident_pages),
         }
     }
@@ -805,7 +935,7 @@ impl PageCache {
     pub fn evict_any(&mut self) -> bool {
         let policy = self.eviction_policy.borrow().policy();
         let key = match policy {
-            PageCacheEvictionPolicy::S3Fifo(_)
+            PageCacheEvictionPolicy::S3Fifo(_) | PageCacheEvictionPolicy::Arc(_)
                 if self.pages.len() <= S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS =>
             {
                 let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
@@ -815,9 +945,9 @@ impl PageCache {
                 };
                 preferred.or_else(|| residents.first().copied())
             }
-            PageCacheEvictionPolicy::Arbitrary | PageCacheEvictionPolicy::S3Fifo(_) => {
-                self.pages.keys().next().copied()
-            }
+            PageCacheEvictionPolicy::Arbitrary
+            | PageCacheEvictionPolicy::S3Fifo(_)
+            | PageCacheEvictionPolicy::Arc(_) => self.pages.keys().next().copied(),
         };
         if let Some(key) = key {
             self.pages.remove(&key);
@@ -2787,7 +2917,7 @@ impl ShardedPageCache {
     /// Tries flat slots first, then iterates shards.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
-        let preferred_victim = self.preferred_s3_fifo_victim();
+        let preferred_victim = self.preferred_reconstructed_victim();
         if let Some(page_no) = preferred_victim
             && self.evict(page_no)
         {
@@ -2830,15 +2960,18 @@ impl ShardedPageCache {
         false
     }
 
-    fn preferred_s3_fifo_victim(&self) -> Option<PageNumber> {
+    fn preferred_reconstructed_victim(&self) -> Option<PageNumber> {
         if !self.eviction_tracking_enabled() {
             return None;
         }
-        let tracks_s3_fifo = {
+        let tracks_reconstruction = {
             let tracker = self.eviction_policy.lock();
-            matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_))
+            matches!(
+                &*tracker,
+                PageCacheEvictionTracker::S3Fifo(_) | PageCacheEvictionTracker::Arc(_)
+            )
         };
-        if !tracks_s3_fifo
+        if !tracks_reconstruction
             || self.metrics_lightweight_snapshot().cached_pages
                 > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS
         {
@@ -4454,7 +4587,7 @@ mod tests {
         }
 
         assert!(
-            cache.preferred_s3_fifo_victim().is_none(),
+            cache.preferred_reconstructed_victim().is_none(),
             "large sharded caches must skip reconstructed S3-FIFO victim selection"
         );
         assert!(
@@ -4585,6 +4718,46 @@ mod tests {
         assert!(
             hot_pages_in_t2 >= 3,
             "most hot pages should graduate into the frequency queue, got {hot_pages_in_t2}"
+        );
+    }
+
+    /// bd-q7zls: the ARC eviction policy is wired into `PageCache::evict_any`
+    /// and reuses `ArcEvictionModel` to protect frequently-accessed pages. After
+    /// pages 1 & 2 are promoted to ARC's frequency lane (T2), eviction must fall
+    /// on a single-access recency page (3 or 4), never on a frequent page.
+    #[test]
+    fn test_page_cache_arc_policy_protects_frequently_accessed_pages() {
+        let mut cache = PageCache::new(PageSize::DEFAULT);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::Arc(ArcEvictionConfig::new(8)));
+        assert!(
+            matches!(cache.eviction_policy(), PageCacheEvictionPolicy::Arc(_)),
+            "bead_id=bd-q7zls case=arc_policy_round_trips"
+        );
+
+        let pages: [PageNumber; 4] = [1, 2, 3, 4].map(|n| PageNumber::new(n).unwrap());
+        for &p in &pages {
+            cache.insert_fresh(p).unwrap();
+        }
+        // Promote pages 1 and 2 into ARC's frequency lane (T2) via repeat access.
+        for _ in 0..3 {
+            assert!(cache.get(pages[0]).is_some());
+            assert!(cache.get(pages[1]).is_some());
+        }
+
+        assert!(cache.evict_any(), "evict_any must free a page");
+        assert!(
+            cache.get(pages[0]).is_some(),
+            "bead_id=bd-q7zls case=arc_keeps_frequent_page_1"
+        );
+        assert!(
+            cache.get(pages[1]).is_some(),
+            "bead_id=bd-q7zls case=arc_keeps_frequent_page_2"
+        );
+        let three_resident = cache.get(pages[2]).is_some();
+        let four_resident = cache.get(pages[3]).is_some();
+        assert!(
+            three_resident ^ four_resident,
+            "bead_id=bd-q7zls case=arc_evicts_exactly_one_recency_page three={three_resident} four={four_resident}"
         );
     }
 
