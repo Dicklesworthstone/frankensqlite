@@ -113,6 +113,140 @@ fn check(label: &str, setup: &[&str], sql: &str) {
     }
 }
 
+/// Parity gate for higher-complexity surfaces: collation (NOCASE/RTRIM) in
+/// GROUP BY / DISTINCT / comparison, generated columns, recursive CTEs,
+/// compound set ops, UPSERT, PRAGMA introspection, and JSON operators.
+///
+/// Includes the regression guard for the GROUP BY-ignores-COLLATE bug
+/// (bd-cdl4w): the VDBE storage-substrate GROUP BY path keyed grouping on raw
+/// BINARY values, so `GROUP BY t` on a `COLLATE NOCASE` column grouped
+/// 'Apple'/'apple' separately. Fixed by disqualifying that fast path when a
+/// GROUP BY key has a non-BINARY collation.
+#[test]
+fn collation_complex_parity() {
+    let none: &[&str] = &[];
+
+    // ── generated columns (VIRTUAL + STORED) ──
+    let gc = &[
+        "CREATE TABLE gc (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL, d INT AS (a * b) STORED)",
+        "INSERT INTO gc (a, b) VALUES (2, 3),(4, 5),(0, 7)",
+    ][..];
+    check("gencol_select", gc, "SELECT a, b, c, d FROM gc ORDER BY a");
+    check("gencol_where", gc, "SELECT a FROM gc WHERE c > 6 ORDER BY a");
+    check("gencol_typeof", gc, "SELECT typeof(c), typeof(d) FROM gc LIMIT 1");
+    let gci = &[
+        "CREATE TABLE gci (a INT, b INT, s INT AS (a + b) STORED)",
+        "CREATE INDEX gci_s ON gci(s)",
+        "INSERT INTO gci (a, b) VALUES (1, 1),(2, 2),(3, 3)",
+    ][..];
+    check("gencol_indexed", gci, "SELECT a FROM gci WHERE s = 4");
+
+    // ── recursive CTEs ──
+    check(
+        "rcte_count",
+        none,
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt ORDER BY x",
+    );
+    check(
+        "rcte_fib",
+        none,
+        "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 50) SELECT a FROM fib ORDER BY a",
+    );
+    check(
+        "rcte_limit",
+        none,
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt) SELECT x FROM cnt LIMIT 4",
+    );
+    let tree = &[
+        "CREATE TABLE org (id INT PRIMARY KEY, mgr INT, name TEXT)",
+        "INSERT INTO org VALUES (1,NULL,'ceo'),(2,1,'vp'),(3,2,'dir'),(4,1,'cfo')",
+    ][..];
+    check(
+        "rcte_tree",
+        tree,
+        "WITH RECURSIVE chain(id, name, depth) AS (SELECT id, name, 0 FROM org WHERE mgr IS NULL UNION ALL SELECT o.id, o.name, c.depth + 1 FROM org o JOIN chain c ON o.mgr = c.id) SELECT name, depth FROM chain ORDER BY depth, name",
+    );
+
+    // ── collation (NOCASE / RTRIM) ──
+    let col = &[
+        "CREATE TABLE col (t TEXT COLLATE NOCASE)",
+        "INSERT INTO col VALUES ('Apple'),('apple'),('BANANA'),('banana'),('Cherry')",
+    ][..];
+    check("coll_distinct_nocase", col, "SELECT DISTINCT t FROM col ORDER BY t");
+    check("coll_groupby_nocase", col, "SELECT t, count(*) FROM col GROUP BY t ORDER BY t");
+    check("coll_eq_explicit", none, "SELECT 'ABC' = 'abc' COLLATE NOCASE");
+    check("coll_order_explicit", col, "SELECT t FROM col ORDER BY t COLLATE BINARY");
+    check("coll_rtrim_eq", none, "SELECT 'abc' = 'abc   ' COLLATE RTRIM");
+    check("coll_in_nocase", col, "SELECT count(*) FROM col WHERE t = 'APPLE'");
+    // GROUP BY collation regression variants (bd-cdl4w): each routes through the
+    // VDBE-substrate eligibility guard to the collation-aware grouping path.
+    let coln = &[
+        "CREATE TABLE coln (t TEXT COLLATE NOCASE, n INT)",
+        "INSERT INTO coln VALUES ('Apple',1),('apple',2),('BANANA',3),('banana',4),('Cherry',5)",
+    ][..];
+    check("coll_groupby_sum_nocase", coln, "SELECT t, sum(n) FROM coln GROUP BY t ORDER BY t");
+    let colb = &[
+        "CREATE TABLE colb (t TEXT, n INT)",
+        "INSERT INTO colb VALUES ('Apple',1),('apple',2),('BANANA',3),('banana',4)",
+    ][..];
+    check(
+        "coll_groupby_explicit_collate",
+        colb,
+        "SELECT t COLLATE NOCASE, sum(n) FROM colb GROUP BY t COLLATE NOCASE ORDER BY 1",
+    );
+    let colr = &[
+        "CREATE TABLE colr (t TEXT COLLATE RTRIM)",
+        "INSERT INTO colr VALUES ('ab'),('ab  '),('ab '),('cd')",
+    ][..];
+    check("coll_groupby_rtrim", colr, "SELECT t, count(*) FROM colr GROUP BY t ORDER BY t");
+
+    // ── compound set operations ──
+    let cs = &[
+        "CREATE TABLE x (v INT)",
+        "CREATE TABLE y (v INT)",
+        "INSERT INTO x VALUES (1),(2),(2),(3)",
+        "INSERT INTO y VALUES (2),(3),(4)",
+    ][..];
+    check("compound_union", cs, "SELECT v FROM x UNION SELECT v FROM y ORDER BY v");
+    check("compound_union_all", cs, "SELECT v FROM x UNION ALL SELECT v FROM y ORDER BY v");
+    check("compound_intersect", cs, "SELECT v FROM x INTERSECT SELECT v FROM y ORDER BY v");
+    check("compound_except", cs, "SELECT v FROM x EXCEPT SELECT v FROM y ORDER BY v");
+    check(
+        "compound_coerce",
+        none,
+        "SELECT 1 UNION SELECT 1.0 UNION SELECT '1' ORDER BY 1",
+    );
+
+    // ── UPSERT ──
+    let up = &[
+        "CREATE TABLE up (id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INT)",
+        "INSERT INTO up VALUES (1,'a',10),(2,'b',20)",
+    ][..];
+    check(
+        "upsert_do_update",
+        up,
+        "INSERT INTO up VALUES (3,'a',5) ON CONFLICT(k) DO UPDATE SET n = n + excluded.n RETURNING id, k, n",
+    );
+    check(
+        "upsert_do_nothing",
+        up,
+        "INSERT INTO up VALUES (4,'b',99) ON CONFLICT(k) DO NOTHING RETURNING id",
+    );
+
+    // ── PRAGMA introspection ──
+    let pi = &[
+        "CREATE TABLE pt (id INTEGER PRIMARY KEY, name TEXT NOT NULL, val REAL DEFAULT 1.5)",
+    ][..];
+    check("pragma_table_info", pi, "SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('pt') ORDER BY cid");
+
+    // ── JSON operators (extension; may be unwired) ──
+    check("json_extract", none, "SELECT json_extract('{\"a\":1,\"b\":[2,3]}', '$.a')");
+    check("json_arrow", none, "SELECT '{\"a\":1}' -> '$.a'");
+    check("json_arrow2", none, "SELECT '{\"a\":1}' ->> '$.a'");
+    check("json_array_len", none, "SELECT json_array_length('[1,2,3,4]')");
+    check("json_type", none, "SELECT json_type('{\"a\":1}', '$.a')");
+}
+
 #[test]
 fn scalar_parity_basic() {
     let none: &[&str] = &[];

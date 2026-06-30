@@ -12199,11 +12199,34 @@ impl Connection {
         }
 
         let TableOrSubquery::Table {
-            time_travel: None, ..
+            name: table_name,
+            time_travel: None,
+            ..
         } = &from.source
         else {
             return false;
         };
+
+        // A GROUP BY key whose effective collation is non-BINARY (e.g. a
+        // `COLLATE NOCASE` column, or an explicit `COLLATE`) must group under
+        // that collation — 'Apple' and 'apple' are one NOCASE group. The VDBE
+        // storage-substrate grouping path keys on raw values (BINARY only), so
+        // disqualify it here and let the collation-aware connection path
+        // (`execute_group_by_select`) handle these queries instead. The common
+        // all-BINARY case is unaffected, so this adds no fast-path regression.
+        {
+            let schema = self.schema.borrow();
+            if let Some(table_schema) = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&table_name.name))
+                && group_by.iter().any(|expr| {
+                    expr_effective_collation_for_table(expr, table_schema)
+                        .is_some_and(|coll| !coll.eq_ignore_ascii_case("BINARY"))
+                })
+            {
+                return false;
+            }
+        }
 
         columns.iter().any(|column| {
             matches!(
