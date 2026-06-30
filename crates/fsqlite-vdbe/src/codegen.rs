@@ -14170,10 +14170,20 @@ fn codegen_insert_without_rowid(
                 schema,
             )?;
         }
-        InsertSource::Select(_) => {
-            return Err(CodegenError::Unsupported(
-                "INSERT ... SELECT into WITHOUT ROWID tables is not yet supported".to_owned(),
-            ));
+        InsertSource::Select(select_stmt) => {
+            let target_mapping = build_insert_target_mapping(&stmt.columns, table)?;
+            emit_without_rowid_insert_select(
+                b,
+                stmt,
+                select_stmt,
+                table,
+                schema,
+                &pk_indices,
+                oe_flag,
+                stmt_level,
+                target_mapping.as_ref(),
+                table_cursor,
+            )?;
         }
     }
 
@@ -14181,6 +14191,236 @@ fn codegen_insert_without_rowid(
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
+}
+
+/// `INSERT ... SELECT` into a WITHOUT ROWID table. Scans a single source table
+/// (or evaluates a FROM-less constant projection), maps the projected columns
+/// into table-declared order (honoring an explicit column list, filling the
+/// rest with DEFAULTs), and routes each row through
+/// [`emit_without_rowid_row_insert`] so conflict handling, constraints, index
+/// maintenance, and RETURNING are shared with the VALUES path.
+///
+/// Only the shapes the rowid `codegen_insert_select` itself supports are
+/// accepted: a single named source table or no FROM. CTEs, compound
+/// (UNION/INTERSECT/EXCEPT), ORDER BY/LIMIT, DISTINCT/GROUP BY/HAVING/window,
+/// joins, subquery/VALUES sources, and `source == target` are rejected with a
+/// clear error rather than silently mis-executed.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn emit_without_rowid_insert_select(
+    b: &mut ProgramBuilder,
+    stmt: &InsertStatement,
+    select_stmt: &SelectStatement,
+    table: &TableSchema,
+    schema: &[TableSchema],
+    pk_indices: &[usize],
+    oe_flag: u16,
+    stmt_level: Option<ConflictAction>,
+    target_mapping: Option<&InsertTargetMapping>,
+    table_cursor: i32,
+) -> Result<(), CodegenError> {
+    if select_stmt.with.is_some() {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... WITH ... SELECT into WITHOUT ROWID tables is not yet supported".to_owned(),
+        ));
+    }
+    if !select_stmt.body.compounds.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... SELECT with a compound (UNION/INTERSECT/EXCEPT) into WITHOUT ROWID tables \
+             is not yet supported"
+                .to_owned(),
+        ));
+    }
+    if !select_stmt.order_by.is_empty() || select_stmt.limit.is_some() {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... SELECT with ORDER BY/LIMIT into WITHOUT ROWID tables is not yet supported"
+                .to_owned(),
+        ));
+    }
+    let (distinct, columns, from, where_clause, group_by, having, windows) =
+        match &select_stmt.body.select {
+            SelectCore::Select {
+                distinct,
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+            } => (distinct, columns, from, where_clause, group_by, having, windows),
+            SelectCore::Values(_) => {
+                return Err(CodegenError::Unsupported(
+                    "INSERT ... SELECT with a VALUES body into WITHOUT ROWID tables is not yet \
+                     supported"
+                        .to_owned(),
+                ));
+            }
+        };
+    if *distinct != Distinctness::All
+        || !group_by.is_empty()
+        || having.is_some()
+        || !windows.is_empty()
+    {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... SELECT with DISTINCT/GROUP BY/HAVING/window into WITHOUT ROWID tables is \
+             not yet supported"
+                .to_owned(),
+        ));
+    }
+
+    let n_cols = table.columns.len();
+    let expected = target_mapping.map_or(n_cols, |m| m.expected_source_cols);
+    let returning = &stmt.returning;
+
+    // Reorder a SELECT-output row (`sel_regs`, `n_sel` columns) into
+    // table-declared order, filling unmentioned columns with DEFAULTs, then run
+    // the shared WITHOUT ROWID per-row insert. Returns nothing; emits opcodes.
+    // Implemented inline in both branches below because the borrow of `b` cannot
+    // be shared across a closure that also calls other `&mut b` helpers.
+
+    if let Some(from_clause) = from {
+        if !from_clause.joins.is_empty() {
+            return Err(CodegenError::Unsupported(
+                "INSERT ... SELECT with a JOIN into WITHOUT ROWID tables is not yet supported"
+                    .to_owned(),
+            ));
+        }
+        let (src_name, src_alias) = match &from_clause.source {
+            fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => {
+                (&name.name, alias.as_deref())
+            }
+            _ => {
+                return Err(CodegenError::Unsupported(
+                    "INSERT ... SELECT from a non-table source into WITHOUT ROWID tables is not \
+                     yet supported"
+                        .to_owned(),
+                ));
+            }
+        };
+        if src_name.eq_ignore_ascii_case(&table.name) {
+            return Err(CodegenError::Unsupported(
+                "INSERT ... SELECT where the source is the target WITHOUT ROWID table is not yet \
+                 supported"
+                    .to_owned(),
+            ));
+        }
+        let src_table = find_table(schema, src_name)?;
+        let read_cursor = table.indexes.len() as i32 + 1;
+        let n_sel = result_column_count(columns, src_table);
+        if n_sel as usize != expected {
+            return Err(CodegenError::Unsupported(format!(
+                "table {} has {} columns but {} values were supplied",
+                table.name, expected, n_sel
+            )));
+        }
+
+        b.emit_op(
+            Opcode::OpenRead,
+            read_cursor,
+            src_table.root_page,
+            0,
+            P4::Table(src_table.name.clone()),
+            0,
+        );
+        let done_label = b.emit_label();
+        let loop_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, read_cursor, 0, done_label, P4::None, 0);
+        let skip_label = b.emit_label();
+        if let Some(where_expr) = where_clause {
+            emit_where_filter(
+                b,
+                where_expr,
+                read_cursor,
+                src_table,
+                src_alias,
+                schema,
+                skip_label,
+            );
+        }
+        let sel_regs = b.alloc_regs(n_sel);
+        emit_column_reads(b, read_cursor, columns, src_table, src_alias, schema, sel_regs)?;
+        let val_regs =
+            map_insert_select_row_to_table_order(b, table, target_mapping, sel_regs, n_cols)?;
+        emit_without_rowid_row_insert(
+            b,
+            table,
+            table_cursor,
+            val_regs,
+            pk_indices,
+            oe_flag,
+            stmt_level,
+            returning,
+            schema,
+        )?;
+        b.resolve_label(skip_label);
+        b.emit_op(Opcode::Next, read_cursor, (loop_start + 1) as i32, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
+    } else {
+        // FROM-less constant projection: a single row (optionally gated by a
+        // constant WHERE predicate).
+        let n_sel = result_column_count_without_from(columns)?;
+        if n_sel as usize != expected {
+            return Err(CodegenError::Unsupported(format!(
+                "table {} has {} columns but {} values were supplied",
+                table.name, expected, n_sel
+            )));
+        }
+        let skip_label = b.emit_label();
+        if let Some(where_expr) = where_clause {
+            let pred = b.alloc_temp();
+            emit_expr(b, where_expr, pred, None);
+            b.emit_jump_to_label(Opcode::IfNot, pred, 1, skip_label, P4::None, 0);
+            b.free_temp(pred);
+        }
+        let sel_regs = b.alloc_regs(n_sel);
+        emit_projection_without_from(b, columns, sel_regs)?;
+        let val_regs =
+            map_insert_select_row_to_table_order(b, table, target_mapping, sel_regs, n_cols)?;
+        emit_without_rowid_row_insert(
+            b,
+            table,
+            table_cursor,
+            val_regs,
+            pk_indices,
+            oe_flag,
+            stmt_level,
+            returning,
+            schema,
+        )?;
+        b.resolve_label(skip_label);
+    }
+    Ok(())
+}
+
+/// Reorder a SELECT-output row (`sel_regs`, in SELECT order) into table-declared
+/// column order for an `INSERT ... SELECT` with an explicit column list, filling
+/// unmentioned columns with their DEFAULTs. With no explicit column list the
+/// SELECT row is already in table order and `sel_regs` is returned unchanged.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn map_insert_select_row_to_table_order(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    target_mapping: Option<&InsertTargetMapping>,
+    sel_regs: i32,
+    n_cols: usize,
+) -> Result<i32, CodegenError> {
+    let Some(mapping) = target_mapping else {
+        return Ok(sel_regs);
+    };
+    let table_regs = b.alloc_regs(n_cols as i32);
+    for (tbl_idx, src) in mapping.col_mapping.iter().enumerate() {
+        let dest = table_regs + tbl_idx as i32;
+        if let Some(pos) = src {
+            b.emit_op(Opcode::Copy, sel_regs + *pos as i32, dest, 0, P4::None, 0);
+        } else {
+            emit_default_value(b, &table.columns[tbl_idx], dest)?;
+        }
+    }
+    Ok(table_regs)
 }
 
 /// Emit pass 1 of a WITHOUT ROWID UPDATE/DELETE: scan the table, apply the WHERE

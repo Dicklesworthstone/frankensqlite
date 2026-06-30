@@ -399,6 +399,143 @@ fn without_rowid_returning_parity() {
     }
 }
 
+/// INSERT ... SELECT into WITHOUT ROWID tables (bd-eja6l). The INSERT runs in
+/// `setup`; the case query is an ordered SELECT verifying the resulting table
+/// contents matches C SQLite. Covers different-table source, explicit column
+/// lists with DEFAULT fill, WHERE, expression projections, FROM-less constant
+/// SELECT, OR IGNORE/REPLACE conflict modes, composite PK, and NULL-PK rejection.
+#[test]
+fn without_rowid_insert_select_parity() {
+    let cases: Vec<Case> = vec![
+        // basic SELECT from a different table
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 1), ('b', 2), ('c', 3)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t SELECT k, v FROM src",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // explicit column list + DEFAULT fill for unmentioned columns
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER DEFAULT 99, w INTEGER) WITHOUT ROWID",
+                "INSERT INTO t(k, w) SELECT k, v FROM src",
+            ],
+            sql: "SELECT k, v, w FROM t ORDER BY k",
+        },
+        // WHERE filter on the source
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 1), ('b', 2), ('c', 3)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t SELECT k, v FROM src WHERE v >= 2",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // expression projection
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t SELECT k || 'x', v * 10 FROM src",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // FROM-less constant SELECT
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t SELECT 'z', 26",
+            ],
+            sql: "SELECT k, v FROM t",
+        },
+        // FROM-less with explicit column list (DEFAULT fill)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER DEFAULT 7) WITHOUT ROWID",
+                "INSERT INTO t(k) SELECT 'q'",
+            ],
+            sql: "SELECT k, v FROM t",
+        },
+        // OR IGNORE: conflicting PK skipped
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 100), ('z', 1)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT OR IGNORE INTO t SELECT k, v FROM src",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // OR REPLACE: conflicting PK replaced
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 100)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT OR REPLACE INTO t SELECT k, v FROM src",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // composite PK target
+        Case {
+            setup: &[
+                "CREATE TABLE src(a INTEGER, b INTEGER, p TEXT)",
+                "INSERT INTO src VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')",
+                "CREATE TABLE t(a INTEGER, b INTEGER, p TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+                "INSERT INTO t SELECT a, b, p FROM src",
+            ],
+            sql: "SELECT a, b, p FROM t ORDER BY a, b",
+        },
+        // INSERT ... SELECT with RETURNING
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+            ],
+            sql: "INSERT INTO t SELECT k, v FROM src RETURNING k, v",
+        },
+        // NULL primary key produced by SELECT — both engines reject
+        Case {
+            setup: &[
+                "CREATE TABLE src(k TEXT, v INTEGER)",
+                "INSERT INTO src VALUES (NULL, 1)",
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t SELECT k, v FROM src",
+            ],
+            sql: "SELECT k, v FROM t",
+        },
+    ];
+
+    let mut divergences = Vec::new();
+    for c in &cases {
+        // The RETURNING case has impl-defined order; the rest are ORDER BY'd.
+        if c.sql.contains("RETURNING") {
+            check_unordered(&mut divergences, c);
+        } else {
+            check(&mut divergences, c);
+        }
+    }
+    if !divergences.is_empty() {
+        let report = divergences.join("\n\n");
+        panic!(
+            "\n===== {} WITHOUT ROWID INSERT...SELECT DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+            divergences.len(),
+            cases.len(),
+            report
+        );
+    }
+}
+
 #[test]
 fn divergence_hunt_hard_constructs() {
     let cases: Vec<Case> = vec![
