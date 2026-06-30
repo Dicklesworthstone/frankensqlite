@@ -723,13 +723,42 @@ impl<'a> Lexer<'a> {
             self.advance(); // 0
             self.advance(); // x
             let hex_start = self.pos;
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() {
-                self.advance();
+            // Consume hex digits, allowing a single `_` digit separator that is
+            // surrounded on both sides by a hex digit (SQLite 3.46+ digit
+            // separators). `0x_1F`, `0x1__F`, and a trailing `0x1F_` are
+            // rejected because the underscore is not between two hex digits.
+            while self.pos < self.src.len() {
+                let c = self.src[self.pos];
+                let is_separator = c == b'_'
+                    && self.pos > hex_start
+                    && self.src[self.pos - 1].is_ascii_hexdigit()
+                    && self.peek_at(1).is_some_and(|n| n.is_ascii_hexdigit());
+                if c.is_ascii_hexdigit() || is_separator {
+                    self.advance();
+                } else {
+                    break;
+                }
             }
             if self.pos == hex_start {
                 return TokenKind::Error("empty hex literal".to_owned());
             }
-            let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]);
+            // A hex literal cannot be immediately followed by an alphanumeric or
+            // `_` (e.g. `0x1F_` or `0xFFg`) — that is an unrecognized token, the
+            // same rule the decimal path enforces below.
+            if self
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphanumeric() || n == b'_')
+            {
+                let err_start = start;
+                while self.pos < self.src.len()
+                    && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == b'_')
+                {
+                    self.advance();
+                }
+                let err_text = String::from_utf8_lossy(&self.src[err_start..self.pos]);
+                return TokenKind::Error(format!("unrecognized token: \"{err_text}\""));
+            }
+            let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]).replace('_', "");
             // Strip leading zeros then check significant digit count,
             // matching C SQLite's sqlite3DecOrHexToI64 which rejects
             // hex literals with >16 significant digits.
@@ -757,10 +786,9 @@ impl<'a> Lexer<'a> {
         // Decimal integer or float
         let mut is_float = false;
 
-        // Integer part (may be empty for `.5` style)
-        while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-            self.advance();
-        }
+        // Integer part (may be empty for `.5` style). Allow `_` digit
+        // separators that are surrounded on both sides by a decimal digit.
+        self.consume_decimal_digit_run();
 
         // Helper to check if the current position (+ offset) starts a valid exponent.
         let is_valid_exponent = |lexer: &Self, mut offset: usize| -> bool {
@@ -787,9 +815,7 @@ impl<'a> Lexer<'a> {
         {
             is_float = true;
             self.advance(); // skip dot
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-                self.advance();
-            }
+            self.consume_decimal_digit_run();
         } else if self.pos < self.src.len()
             && self.src[self.pos] == b'.'
             && start < self.pos // we had digits before the dot
@@ -814,9 +840,7 @@ impl<'a> Lexer<'a> {
             {
                 self.advance();
             }
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-                self.advance();
-            }
+            self.consume_decimal_digit_run();
         }
 
         // SQLite strictness: a number cannot be immediately followed by an alphabetical character or underscore.
@@ -843,7 +867,14 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        let text = String::from_utf8_lossy(&self.src[start..self.pos]);
+        let text_raw = String::from_utf8_lossy(&self.src[start..self.pos]);
+        // Strip `_` digit separators before numeric parsing; they were only
+        // consumed when validly placed between two digits above.
+        let text: std::borrow::Cow<'_, str> = if text_raw.as_ref().contains('_') {
+            std::borrow::Cow::Owned(text_raw.replace('_', ""))
+        } else {
+            text_raw
+        };
         if is_float {
             let clamp = |v: f64| -> f64 { if v.is_finite() { v } else { f64::MAX } };
             match text.parse::<f64>() {
@@ -868,6 +899,26 @@ impl<'a> Lexer<'a> {
                     // token to allow the parser to fold `-9223372036854775808` correctly.
                     TokenKind::OversizedInt(text.into_owned())
                 }
+            }
+        }
+    }
+
+    /// Consume a run of decimal digits, allowing single `_` digit separators
+    /// (SQLite 3.46+) that are surrounded on both sides by a decimal digit. An
+    /// underscore that is leading, trailing, doubled, or adjacent to a non-digit
+    /// (`.`, `e`, sign) terminates the run, leaving it to be flagged as an
+    /// unrecognized token by the trailing-character check in `lex_number`.
+    fn consume_decimal_digit_run(&mut self) {
+        while self.pos < self.src.len() {
+            let c = self.src[self.pos];
+            let is_separator = c == b'_'
+                && self.pos > 0
+                && self.src[self.pos - 1].is_ascii_digit()
+                && self.peek_at(1).is_some_and(|n| n.is_ascii_digit());
+            if c.is_ascii_digit() || is_separator {
+                self.advance();
+            } else {
+                break;
             }
         }
     }
