@@ -247,6 +247,49 @@ fn collation_complex_parity() {
     check("json_type", none, "SELECT json_type('{\"a\":1}', '$.a')");
 }
 
+/// Parity gate for collation PROPAGATION beyond GROUP BY (the family of the
+/// bd-cdl4w bug): ORDER BY / range comparison / IN / BETWEEN / min-max /
+/// DISTINCT / index lookup on `COLLATE NOCASE` and `COLLATE RTRIM` columns.
+/// (UNION survivor-case divergence excluded — tracked by bd-a6mlo.)
+#[test]
+fn collation_propagation_parity() {
+    let p = check;
+    let nc = &[
+        "CREATE TABLE nc (t TEXT COLLATE NOCASE, n INT)",
+        "INSERT INTO nc VALUES ('Banana',1),('apple',2),('Apple',3),('CHERRY',4),('banana',5)",
+    ][..];
+    p("order_by_nocase_implicit", nc, "SELECT t FROM nc ORDER BY t");
+    p("order_by_nocase_then_n", nc, "SELECT t, n FROM nc ORDER BY t, n");
+    p("distinct_nocase_multi", nc, "SELECT DISTINCT t FROM nc ORDER BY t");
+    p("range_gt_nocase", nc, "SELECT t FROM nc WHERE t > 'b' ORDER BY n");
+    p("between_nocase", nc, "SELECT t FROM nc WHERE t BETWEEN 'a' AND 'c' ORDER BY n");
+    p("in_list_nocase", nc, "SELECT n FROM nc WHERE t IN ('APPLE','cherry') ORDER BY n");
+    p("min_max_nocase", nc, "SELECT min(t), max(t) FROM nc");
+    p("count_eq_nocase", nc, "SELECT count(*) FROM nc WHERE t = 'BANANA'");
+    // NOTE: `... UNION ...` survivor-case divergence on NOCASE columns is tracked
+    // by bd-a6mlo (low-severity: correct count+order, only representative case
+    // differs) and intentionally excluded from this gate until fixed.
+    p("groupby_having_nocase", nc, "SELECT t, count(*) FROM nc GROUP BY t HAVING count(*) >= 2 ORDER BY t");
+
+    // index on a NOCASE column
+    let idx = &[
+        "CREATE TABLE idx (id INTEGER PRIMARY KEY, t TEXT COLLATE NOCASE)",
+        "CREATE INDEX idx_t ON idx(t)",
+        "INSERT INTO idx (t) VALUES ('Apple'),('apple'),('Banana'),('BANANA')",
+    ][..];
+    p("index_eq_nocase", idx, "SELECT count(*) FROM idx WHERE t = 'apple'");
+    p("index_order_nocase", idx, "SELECT t FROM idx ORDER BY t");
+
+    // RTRIM column
+    let rt = &[
+        "CREATE TABLE rt (t TEXT COLLATE RTRIM)",
+        "INSERT INTO rt VALUES ('ab'),('ab  '),('cd '),('cd')",
+    ][..];
+    p("order_by_rtrim", rt, "SELECT t FROM rt ORDER BY t, rowid");
+    p("distinct_rtrim", rt, "SELECT DISTINCT t FROM rt ORDER BY t");
+    p("eq_rtrim", rt, "SELECT count(*) FROM rt WHERE t = 'ab'");
+}
+
 #[test]
 fn scalar_parity_basic() {
     let none: &[&str] = &[];
