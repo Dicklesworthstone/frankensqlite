@@ -82,6 +82,38 @@ struct Case {
     sql: &'static str,
 }
 
+/// Compare frank vs sqlite for a query whose row ORDER is implementation-defined
+/// (e.g. RETURNING from a multi-row DML). Rows are sorted before comparison so
+/// only the multiset of returned rows is asserted, not their order.
+fn check_unordered(divergences: &mut Vec<String>, c: &Case) {
+    let norm = |mut v: Vec<Vec<String>>| {
+        v.sort();
+        v
+    };
+    let f = frank_rows(c.setup, c.sql);
+    let s = sqlite_rows(c.setup, c.sql);
+    match (f, s) {
+        (Ok(fr), Ok(sr)) => {
+            let (fr, sr) = (norm(fr), norm(sr));
+            if fr != sr {
+                divergences.push(format!(
+                    "VALUE DIVERGENCE (unordered)\n  sql: {}\n  frank:  {:?}\n  sqlite: {:?}",
+                    c.sql, fr, sr
+                ));
+            }
+        }
+        (Err(_), Err(_)) => {}
+        (Ok(fr), Err(se)) => divergences.push(format!(
+            "ACCEPT/REJECT DIVERGENCE (frank accepts, sqlite rejects)\n  sql: {}\n  frank:  {:?}\n  sqlite-err: {}",
+            c.sql, fr, se
+        )),
+        (Err(fe), Ok(sr)) => divergences.push(format!(
+            "ACCEPT/REJECT DIVERGENCE (frank rejects, sqlite accepts)\n  sql: {}\n  frank-err: {}\n  sqlite: {:?}",
+            c.sql, fe, sr
+        )),
+    }
+}
+
 const NO_SETUP: &[&str] = &[];
 
 fn check(divergences: &mut Vec<String>, c: &Case) {
@@ -292,6 +324,74 @@ fn divergence_hunt_broad_surface() {
         let report = divergences.join("\n\n");
         panic!(
             "\n===== {} DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+            divergences.len(),
+            cases.len(),
+            report
+        );
+    }
+}
+
+/// RETURNING on WITHOUT ROWID tables (bd-eja6l): INSERT/UPDATE/DELETE ... RETURNING
+/// must produce the same rows C SQLite does (inserted image / new image / deleted
+/// image), including `*`, expressions, OR IGNORE/REPLACE conflict semantics, and
+/// composite primary keys. Row order is impl-defined, so compared as a multiset.
+#[test]
+fn without_rowid_returning_parity() {
+    const WR1: &[&str] = &["CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID"];
+    const WR_SEED: &[&str] = &[
+        "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+        "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)",
+    ];
+    const WR_COMPOSITE: &[&str] = &[
+        "CREATE TABLE t(a INTEGER, b INTEGER, payload TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+        "INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')",
+    ];
+    let cases: Vec<Case> = vec![
+        // INSERT ... RETURNING (inserted image, in statement order)
+        Case { setup: WR1, sql: "INSERT INTO t VALUES ('b', 2), ('a', 1) RETURNING k, v" },
+        Case { setup: WR1, sql: "INSERT INTO t VALUES ('c', 3) RETURNING *" },
+        Case { setup: WR1, sql: "INSERT INTO t VALUES ('d', 4) RETURNING k, v * 10, v || '!'" },
+        Case { setup: WR1, sql: "INSERT INTO t(v, k) VALUES (7, 'g') RETURNING k, v" },
+        // DEFAULT VALUES with defaults that satisfy the PK's implicit NOT NULL.
+        Case {
+            setup: &["CREATE TABLE t(k TEXT PRIMARY KEY DEFAULT 'x', v INTEGER DEFAULT 9) WITHOUT ROWID"],
+            sql: "INSERT INTO t DEFAULT VALUES RETURNING *",
+        },
+        // UPDATE ... RETURNING (NEW image)
+        Case { setup: WR_SEED, sql: "UPDATE t SET v = v + 100 WHERE k = 'a' RETURNING k, v" },
+        Case { setup: WR_SEED, sql: "UPDATE t SET v = v * 2 RETURNING k, v" },
+        Case { setup: WR_SEED, sql: "UPDATE t SET k = 'zz' WHERE k = 'b' RETURNING *" },
+        Case { setup: WR_SEED, sql: "UPDATE t SET v = v + 1 WHERE v >= 2 RETURNING k, v, v - 1" },
+        // DELETE ... RETURNING (OLD/deleted image)
+        Case { setup: WR_SEED, sql: "DELETE FROM t WHERE k = 'b' RETURNING k, v" },
+        Case { setup: WR_SEED, sql: "DELETE FROM t WHERE v > 1 RETURNING *" },
+        Case { setup: WR_SEED, sql: "DELETE FROM t RETURNING k" },
+        // conflict semantics: OR IGNORE skips the conflicting row (no RETURNING row)
+        Case { setup: WR_SEED, sql: "INSERT OR IGNORE INTO t VALUES ('a', 999), ('z', 1) RETURNING k, v" },
+        // OR REPLACE replaces and returns the new image
+        Case { setup: WR_SEED, sql: "INSERT OR REPLACE INTO t VALUES ('a', 555) RETURNING k, v" },
+        // composite PK
+        Case { setup: WR_COMPOSITE, sql: "INSERT INTO t VALUES (3, 3, 'w') RETURNING a, b, payload" },
+        Case { setup: WR_COMPOSITE, sql: "UPDATE t SET payload = 'NEW' WHERE a = 1 RETURNING *" },
+        Case { setup: WR_COMPOSITE, sql: "DELETE FROM t WHERE a = 1 RETURNING a, b, payload" },
+        // WITHOUT ROWID PK is implicitly NOT NULL (bd-0re6l): these must be
+        // rejected by both engines (NULL primary key), and OR IGNORE must skip.
+        Case { setup: WR1, sql: "INSERT INTO t DEFAULT VALUES RETURNING *" },
+        Case { setup: WR1, sql: "INSERT INTO t VALUES (NULL, 5) RETURNING k, v" },
+        Case { setup: WR_COMPOSITE, sql: "INSERT INTO t VALUES (NULL, 9, 'q') RETURNING *" },
+        Case { setup: WR_SEED, sql: "UPDATE t SET k = NULL WHERE k = 'a' RETURNING k, v" },
+        // OR IGNORE on a NULL PK skips the row (no error, no RETURNING row)
+        Case { setup: WR1, sql: "INSERT OR IGNORE INTO t VALUES (NULL, 1), ('ok', 2) RETURNING k, v" },
+    ];
+
+    let mut divergences = Vec::new();
+    for c in &cases {
+        check_unordered(&mut divergences, c);
+    }
+    if !divergences.is_empty() {
+        let report = divergences.join("\n\n");
+        panic!(
+            "\n===== {} WITHOUT ROWID RETURNING DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
             divergences.len(),
             cases.len(),
             report

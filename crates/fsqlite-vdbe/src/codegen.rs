@@ -13894,6 +13894,7 @@ fn emit_without_rowid_index_deletes(
 /// constraint validation, conflict resolution (ABORT/IGNORE/REPLACE), the table
 /// b-tree `IdxInsert`, and secondary-index maintenance.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(clippy::too_many_arguments)]
 fn emit_without_rowid_row_insert(
     b: &mut ProgramBuilder,
     table: &TableSchema,
@@ -13902,7 +13903,9 @@ fn emit_without_rowid_row_insert(
     pk_indices: &[usize],
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
-) {
+    returning: &[ResultColumn],
+    schema: &[TableSchema],
+) -> Result<(), CodegenError> {
     let n_cols = table.columns.len();
     let n_pk = pk_indices.len();
 
@@ -14019,7 +14022,15 @@ fn emit_without_rowid_row_insert(
     // Secondary-index maintenance (skipped by the IGNORE conflict path, which
     // jumps straight to `row_done`).
     emit_without_rowid_index_inserts(b, table, table_cursor, val_regs, pk_indices, stmt_level);
+
+    // RETURNING: emit the inserted row image. Placed on the insert path so an
+    // IGNORE conflict (which jumps to `row_done`) produces no RETURNING row,
+    // matching SQLite. `val_regs` holds the post-affinity stored values.
+    if !returning.is_empty() {
+        emit_returning_from_regs(b, table, returning, None, schema, val_regs)?;
+    }
     b.resolve_label(row_done);
+    Ok(())
 }
 
 /// Open the table (index) cursor plus all secondary-index cursors for write.
@@ -14062,17 +14073,12 @@ fn codegen_insert_without_rowid(
     b: &mut ProgramBuilder,
     stmt: &InsertStatement,
     table: &TableSchema,
-    _schema: &[TableSchema],
+    schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     if !stmt.upsert.is_empty() {
         return Err(CodegenError::Unsupported(
             "ON CONFLICT DO UPDATE on WITHOUT ROWID tables is not yet supported".to_owned(),
-        ));
-    }
-    if !stmt.returning.is_empty() {
-        return Err(CodegenError::Unsupported(
-            "RETURNING on WITHOUT ROWID tables is not yet supported".to_owned(),
         ));
     }
     let pk_indices = without_rowid_pk_indices(table)?;
@@ -14142,7 +14148,9 @@ fn codegen_insert_without_rowid(
                     &pk_indices,
                     oe_flag,
                     stmt_level,
-                );
+                    &stmt.returning,
+                    schema,
+                )?;
             }
         }
         InsertSource::DefaultValues => {
@@ -14158,7 +14166,9 @@ fn codegen_insert_without_rowid(
                 &pk_indices,
                 oe_flag,
                 stmt_level,
-            );
+                &stmt.returning,
+                schema,
+            )?;
         }
         InsertSource::Select(_) => {
             return Err(CodegenError::Unsupported(
@@ -14247,11 +14257,6 @@ fn codegen_delete_without_rowid(
             "DELETE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
         ));
     }
-    if !stmt.returning.is_empty() {
-        return Err(CodegenError::Unsupported(
-            "RETURNING on WITHOUT ROWID tables is not yet supported".to_owned(),
-        ));
-    }
     if let Some(where_expr) = &stmt.where_clause {
         validate_single_table_expr_columns(where_expr, table, stmt.table.alias.as_deref())?;
     }
@@ -14322,6 +14327,18 @@ fn codegen_delete_without_rowid(
     );
     emit_without_rowid_index_deletes(b, table, table_cursor, Some(row_regs), &pk_indices);
     b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 1);
+    // RETURNING: emit the deleted row image (row_regs holds the OLD values read
+    // from the sorter). Only reached when the row was actually found+deleted.
+    if !stmt.returning.is_empty() {
+        emit_returning_from_regs(
+            b,
+            table,
+            &stmt.returning,
+            stmt.table.alias.as_deref(),
+            schema,
+            row_regs,
+        )?;
+    }
     b.resolve_label(not_found);
     b.emit_op(Opcode::SorterNext, sorter_cursor, loop_body as i32, 0, P4::None, 0);
     b.resolve_label(pass2_done);
@@ -14350,11 +14367,6 @@ fn codegen_update_without_rowid(
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(CodegenError::Unsupported(
             "UPDATE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
-        ));
-    }
-    if !stmt.returning.is_empty() {
-        return Err(CodegenError::Unsupported(
-            "RETURNING on WITHOUT ROWID tables is not yet supported".to_owned(),
         ));
     }
     for assign in &stmt.assignments {
@@ -14487,6 +14499,18 @@ fn codegen_update_without_rowid(
         1u16 | (oe_flag << 1),
     );
     emit_without_rowid_index_inserts(b, table, table_cursor, col_regs, &pk_indices, stmt.or_conflict);
+
+    // RETURNING: emit the NEW row image (col_regs now holds the rewritten row).
+    if !stmt.returning.is_empty() {
+        emit_returning_from_regs(
+            b,
+            table,
+            &stmt.returning,
+            stmt.table.alias.as_deref(),
+            schema,
+            col_regs,
+        )?;
+    }
 
     b.resolve_label(row_done);
     b.emit_op(Opcode::SorterNext, sorter_cursor, loop_body as i32, 0, P4::None, 0);
@@ -14859,8 +14883,17 @@ fn emit_not_null_constraints(
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
 
+    // In a WITHOUT ROWID table the PRIMARY KEY columns are implicitly NOT NULL
+    // even when NOT NULL is not declared (C SQLite enforces this). For rowid
+    // tables this set is empty, so behavior is unchanged.
+    let wr_pk: Vec<usize> = if table.without_rowid {
+        without_rowid_pk_indices(table).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     for (col_idx, col) in table.columns.iter().enumerate() {
-        if col.notnull && !col.is_ipk {
+        if (col.notnull || wr_pk.contains(&col_idx)) && !col.is_ipk {
             let reg = val_regs + col_idx as i32;
             let ok_label = b.emit_label();
             b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
@@ -15285,6 +15318,60 @@ fn emit_returning(
     emit_column_reads(b, cursor, returning, table, table_alias, &[], ret_regs)?;
     b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     b.resolve_label(skip_returning);
+    Ok(())
+}
+
+/// Emit a RETURNING clause for a WITHOUT ROWID DML row whose full column image
+/// already lives in `col_regs` (column `i` at `col_regs + i`). Unlike
+/// [`emit_returning`], there is no rowid to re-seek by, so column references and
+/// expressions are evaluated directly against the in-register row image via
+/// `ScanCtx::register_base`. Used for INSERT (inserted image), UPDATE (new
+/// image), and DELETE (deleted image).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_returning_from_regs(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    returning: &[ResultColumn],
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    col_regs: i32,
+) -> Result<(), CodegenError> {
+    validate_single_table_result_columns(returning, table, table_alias)?;
+    let ret_count = result_column_count(returning, table);
+    let ret_regs = b.alloc_regs(ret_count);
+    let mut reg = ret_regs;
+    for col in returning {
+        match col {
+            ResultColumn::Star => {
+                for i in 0..table.columns.len() {
+                    b.emit_op(Opcode::Copy, col_regs + i as i32, reg, 0, P4::None, 0);
+                    reg += 1;
+                }
+            }
+            ResultColumn::TableStar(qualifier) => {
+                if !matches_table_or_alias(&qualifier.name, table, table_alias) {
+                    return Err(CodegenError::TableNotFound(qualifier.to_string()));
+                }
+                for i in 0..table.columns.len() {
+                    b.emit_op(Opcode::Copy, col_regs + i as i32, reg, 0, P4::None, 0);
+                    reg += 1;
+                }
+            }
+            ResultColumn::Expr { expr, .. } => {
+                let scan = ScanCtx {
+                    cursor: 0,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                    register_base: Some(col_regs),
+                    secondaries: &[],
+                };
+                emit_expr(b, expr, reg, Some(&scan));
+                reg += 1;
+            }
+        }
+    }
+    b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     Ok(())
 }
 
