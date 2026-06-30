@@ -55735,6 +55735,29 @@ impl Connection {
         };
         let mut result = self.execute_statement(&Statement::Select(first_arm), params)?;
 
+        // SQLite's UNION survivor rule for collation-equal-but-byte-distinct
+        // duplicates (e.g. 'Apple' vs 'apple' under NOCASE): the surviving
+        // representative is the FIRST occurrence within the LAST compound arm
+        // that contains the key — independent of any outer ORDER BY. (Verified
+        // against the bundled C SQLite oracle — see bd-a6mlo / bd-cdl4w.)
+        //
+        // The iterative merge below realizes "last arm wins" via the keep-last
+        // cross-arm dedup; pre-deduping each UNION arm keep-FIRST adds the
+        // "first within arm" half of the rule. Only engage when a non-binary
+        // collation is present: for plain BINARY UNIONs the duplicate rows are
+        // byte-identical, so the cheaper flat keep-last is observationally
+        // identical and the hot path stays a single dedup+sort per arm.
+        let union_collated_survivor = collations.iter().any(Option::is_some)
+            && !select.body.compounds.is_empty()
+            && select
+                .body
+                .compounds
+                .iter()
+                .all(|(op, _)| matches!(op, CompoundOp::Union));
+        if union_collated_survivor {
+            dedup_rows_collated(&mut result, &collations, &registry_snap);
+        }
+
         // Process each compound arm.
         for (op, core) in &select.body.compounds {
             let arm_select = SelectStatement {
@@ -55753,7 +55776,15 @@ impl Connection {
                     result.extend(arm_rows);
                 }
                 CompoundOp::Union => {
-                    result.extend(arm_rows);
+                    if union_collated_survivor {
+                        // Intra-arm survivor is the first occurrence; the merge
+                        // below keeps the last arm's representative (cross-arm).
+                        let mut arm_rows = arm_rows;
+                        dedup_rows_collated(&mut arm_rows, &collations, &registry_snap);
+                        result.extend(arm_rows);
+                    } else {
+                        result.extend(arm_rows);
+                    }
                     dedup_rows_collated_keep_last(&mut result, &collations, &registry_snap);
                     sort_compound_distinct_rows_collated(&mut result, &collations, &registry_snap);
                 }

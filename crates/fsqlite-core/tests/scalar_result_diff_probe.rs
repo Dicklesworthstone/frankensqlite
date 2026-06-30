@@ -249,8 +249,8 @@ fn collation_complex_parity() {
 
 /// Parity gate for collation PROPAGATION beyond GROUP BY (the family of the
 /// bd-cdl4w bug): ORDER BY / range comparison / IN / BETWEEN / min-max /
-/// DISTINCT / index lookup on `COLLATE NOCASE` and `COLLATE RTRIM` columns.
-/// (UNION survivor-case divergence excluded — tracked by bd-a6mlo.)
+/// DISTINCT / index lookup / UNION survivor-case on `COLLATE NOCASE` and
+/// `COLLATE RTRIM` columns. (UNION survivor case fixed under bd-a6mlo.)
 #[test]
 fn collation_propagation_parity() {
     let p = check;
@@ -266,10 +266,19 @@ fn collation_propagation_parity() {
     p("in_list_nocase", nc, "SELECT n FROM nc WHERE t IN ('APPLE','cherry') ORDER BY n");
     p("min_max_nocase", nc, "SELECT min(t), max(t) FROM nc");
     p("count_eq_nocase", nc, "SELECT count(*) FROM nc WHERE t = 'BANANA'");
-    // NOTE: `... UNION ...` survivor-case divergence on NOCASE columns is tracked
-    // by bd-a6mlo (low-severity: correct count+order, only representative case
-    // differs) and intentionally excluded from this gate until fixed.
     p("groupby_having_nocase", nc, "SELECT t, count(*) FROM nc GROUP BY t HAVING count(*) >= 2 ORDER BY t");
+
+    // bd-a6mlo: UNION survivor case under NOCASE. C SQLite keeps the value from
+    // the LAST compound arm containing the key; within that arm the FIRST
+    // occurrence wins when an outer ORDER BY is present, the LAST when it is not.
+    p("union_nocase_order_by", nc, "SELECT t FROM nc UNION SELECT t FROM nc ORDER BY t");
+    p("union_nocase_no_order", nc, "SELECT t FROM nc UNION SELECT t FROM nc");
+    p("union_nocase_desc", nc, "SELECT t FROM nc UNION SELECT t FROM nc ORDER BY t DESC");
+    p("union_nocase_key_left_only", nc, "SELECT t FROM nc UNION SELECT 'zzz' ORDER BY t");
+    p("union_nocase_three_arm", nc, "SELECT t FROM nc UNION SELECT upper(t) FROM nc UNION SELECT lower(t) FROM nc ORDER BY t");
+    p("union_nocase_three_arm_noord", nc, "SELECT t FROM nc UNION SELECT upper(t) FROM nc UNION SELECT lower(t) FROM nc");
+    p("union_nocase_swap_arms", nc, "SELECT t FROM nc WHERE n<=3 UNION SELECT t FROM nc WHERE n>=4 ORDER BY t");
+    p("union_nocase_swap_noord", nc, "SELECT t FROM nc WHERE n<=3 UNION SELECT t FROM nc WHERE n>=4");
 
     // index on a NOCASE column
     let idx = &[
