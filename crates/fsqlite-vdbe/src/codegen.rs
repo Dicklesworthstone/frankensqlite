@@ -13904,6 +13904,7 @@ fn emit_without_rowid_row_insert(
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
     upsert: Option<&UpsertClause>,
+    target_alias: Option<&str>,
     returning: &[ResultColumn],
     schema: &[TableSchema],
 ) -> Result<(), CodegenError> {
@@ -13927,6 +13928,7 @@ fn emit_without_rowid_row_insert(
             stmt_level,
             assignments,
             where_clause.as_deref(),
+            target_alias,
             returning,
             schema,
         );
@@ -14053,7 +14055,7 @@ fn emit_without_rowid_row_insert(
     // IGNORE conflict (which jumps to `row_done`) produces no RETURNING row,
     // matching SQLite. `val_regs` holds the post-affinity stored values.
     if !returning.is_empty() {
-        emit_returning_from_regs(b, table, returning, None, schema, val_regs)?;
+        emit_returning_from_regs(b, table, returning, target_alias, schema, val_regs)?;
     }
     b.resolve_label(row_done);
     Ok(())
@@ -14082,6 +14084,7 @@ fn emit_without_rowid_upsert_row(
     stmt_level: Option<ConflictAction>,
     assignments: &[fsqlite_ast::Assignment],
     where_clause: Option<&Expr>,
+    target_alias: Option<&str>,
     returning: &[ResultColumn],
     schema: &[TableSchema],
 ) -> Result<(), CodegenError> {
@@ -14149,7 +14152,7 @@ fn emit_without_rowid_upsert_row(
     let existing_ctx = ScanCtx {
         cursor: table_cursor,
         table,
-        table_alias: None,
+        table_alias: target_alias,
         schema: None,
         register_base: Some(existing_regs),
         secondaries: &[],
@@ -14231,7 +14234,7 @@ fn emit_without_rowid_upsert_row(
     emit_without_rowid_index_inserts(b, table, table_cursor, existing_regs, pk_indices, stmt_level);
 
     if !returning.is_empty() {
-        emit_returning_from_regs(b, table, returning, None, schema, existing_regs)?;
+        emit_returning_from_regs(b, table, returning, target_alias, schema, existing_regs)?;
     }
     b.emit_jump_to_label(Opcode::Goto, 0, 0, after_label, P4::None, 0);
 
@@ -14246,6 +14249,7 @@ fn emit_without_rowid_upsert_row(
         conflict_action_to_oe(stmt_level.as_ref()),
         stmt_level,
         None,
+        target_alias,
         returning,
         schema,
     )?;
@@ -14415,6 +14419,7 @@ fn codegen_insert_without_rowid(
                     oe_flag,
                     stmt_level,
                     upsert_clause,
+                    target_alias,
                     &stmt.returning,
                     schema,
                 )?;
@@ -14434,6 +14439,7 @@ fn codegen_insert_without_rowid(
                 oe_flag,
                 stmt_level,
                 upsert_clause,
+                target_alias,
                 &stmt.returning,
                 schema,
             )?;
@@ -14450,6 +14456,7 @@ fn codegen_insert_without_rowid(
                 oe_flag,
                 stmt_level,
                 upsert_clause,
+                target_alias,
                 target_mapping.as_ref(),
                 table_cursor,
             )?;
@@ -14489,6 +14496,7 @@ fn emit_without_rowid_insert_select(
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
     upsert: Option<&UpsertClause>,
+    target_alias: Option<&str>,
     target_mapping: Option<&InsertTargetMapping>,
     table_cursor: i32,
 ) -> Result<(), CodegenError> {
@@ -14623,6 +14631,7 @@ fn emit_without_rowid_insert_select(
             oe_flag,
             stmt_level,
             upsert,
+            target_alias,
             returning,
             schema,
         )?;
@@ -14660,6 +14669,7 @@ fn emit_without_rowid_insert_select(
             oe_flag,
             stmt_level,
             upsert,
+            target_alias,
             returning,
             schema,
         )?;

@@ -667,6 +667,25 @@ fn without_rowid_upsert_parity() {
             ],
             sql: "SELECT k, a, b FROM t ORDER BY k",
         },
+        // aliased INSERT target: `x` qualifies the EXISTING row; `excluded` the
+        // proposed row. Exercises target-alias resolution in the DO UPDATE.
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t AS x VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = x.v + excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // aliased INSERT target in the DO UPDATE WHERE guard
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 5)",
+                "INSERT INTO t AS x VALUES ('a', 1) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > x.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
         // RETURNING on the conflict (update) path
         Case {
             setup: &[
