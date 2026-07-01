@@ -13903,9 +13903,35 @@ fn emit_without_rowid_row_insert(
     pk_indices: &[usize],
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
+    upsert: Option<&UpsertClause>,
     returning: &[ResultColumn],
     schema: &[TableSchema],
 ) -> Result<(), CodegenError> {
+    // ON CONFLICT DO UPDATE: check-before-insert against the PRIMARY KEY. DO
+    // NOTHING is routed through the ordinary IGNORE path by the caller (which
+    // passes `upsert: None` and `oe_flag == OE_IGNORE`).
+    if let Some(UpsertClause {
+        action: UpsertAction::Update {
+            assignments,
+            where_clause,
+        },
+        ..
+    }) = upsert
+    {
+        return emit_without_rowid_upsert_row(
+            b,
+            table,
+            table_cursor,
+            val_regs,
+            pk_indices,
+            stmt_level,
+            assignments,
+            where_clause.as_deref(),
+            returning,
+            schema,
+        );
+    }
+
     let n_cols = table.columns.len();
     let n_pk = pk_indices.len();
 
@@ -14033,6 +14059,200 @@ fn emit_without_rowid_row_insert(
     Ok(())
 }
 
+/// Emit an `INSERT ... ON CONFLICT (pk) DO UPDATE SET ...` row for a WITHOUT
+/// ROWID table using the check-before-insert pattern against the PRIMARY KEY.
+///
+/// `val_regs` holds the attempted-insert row image (declared column order),
+/// which also supplies the `excluded.*` values. On a PK conflict the existing
+/// row is read into a register image, the DO UPDATE assignments are applied to
+/// it (honoring an optional `WHERE`), the OLD table + secondary-index entries
+/// are removed, and the rewritten row is re-inserted. With no conflict the row
+/// is inserted normally via [`emit_without_rowid_row_insert`].
+///
+/// Only the PRIMARY KEY is a valid conflict target here; a secondary-UNIQUE
+/// index target is rejected by the caller before this runs.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(clippy::too_many_arguments)]
+fn emit_without_rowid_upsert_row(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    val_regs: i32,
+    pk_indices: &[usize],
+    stmt_level: Option<ConflictAction>,
+    assignments: &[fsqlite_ast::Assignment],
+    where_clause: Option<&Expr>,
+    returning: &[ResultColumn],
+    schema: &[TableSchema],
+) -> Result<(), CodegenError> {
+    let n_cols = table.columns.len();
+    let n_pk = pk_indices.len();
+
+    let after_label = b.emit_label();
+    let do_insert = b.emit_label();
+
+    // Probe the PRIMARY KEY: build a PK-prefix key and test for an existing row.
+    // NoConflict falls through (cursor positioned on the conflicting row) when a
+    // match exists, else jumps to `do_insert`.
+    let pk_probe_regs = b.alloc_regs(n_pk as i32);
+    for (j, &pk_col) in pk_indices.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            val_regs + pk_col as i32,
+            pk_probe_regs + j as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let pk_probe_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        pk_probe_regs,
+        n_pk as i32,
+        pk_probe_rec,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::NoConflict,
+        table_cursor,
+        pk_probe_rec,
+        do_insert,
+        P4::None,
+        0,
+    );
+
+    // --- Conflict path: DO UPDATE against the existing row ---
+    let existing_regs = b.alloc_regs(n_cols as i32);
+    for i in 0..n_cols {
+        b.emit_op(
+            Opcode::Column,
+            table_cursor,
+            i as i32,
+            existing_regs + i as i32,
+            P4::None,
+            0,
+        );
+    }
+
+    // `excluded.*` resolves to the attempted-insert values (val_regs); unqualified
+    // column refs resolve to the existing row (existing_regs).
+    let excluded_ctx = ScanCtx {
+        cursor: table_cursor,
+        table,
+        table_alias: Some("excluded"),
+        schema: None,
+        register_base: Some(val_regs),
+        secondaries: &[],
+    };
+    let existing_ctx = ScanCtx {
+        cursor: table_cursor,
+        table,
+        table_alias: None,
+        schema: None,
+        register_base: Some(existing_regs),
+        secondaries: &[],
+    };
+    // WITHOUT ROWID tables have no hidden rowid, so no column ever resolves to a
+    // hidden rowid; the excluded-side helper still needs a register value, so
+    // pass a scratch register that is never read.
+    let excluded_hidden_rowid_reg = b.alloc_reg();
+
+    // Optional `DO UPDATE SET ... WHERE <cond>`: when false/NULL, skip the whole
+    // update (and its RETURNING row), leaving the existing row unchanged.
+    if let Some(where_expr) = where_clause {
+        let where_reg = b.alloc_reg();
+        emit_upsert_expr(
+            b,
+            where_expr,
+            where_reg,
+            &existing_ctx,
+            &excluded_ctx,
+            table,
+            None,
+            excluded_hidden_rowid_reg,
+        );
+        b.emit_jump_to_label(Opcode::IfNot, where_reg, 1, after_label, P4::None, 0);
+    }
+
+    // Apply the assignments into the existing-row image, recompute generated
+    // columns, and validate constraints on the new image.
+    emit_upsert_assignments(
+        b,
+        assignments,
+        table,
+        existing_regs,
+        &existing_ctx,
+        &excluded_ctx,
+        None,
+        excluded_hidden_rowid_reg,
+    )?;
+    emit_stored_generated_columns(b, table, existing_regs);
+    emit_strict_type_check(b, table, existing_regs);
+    emit_check_constraints(b, table, existing_regs, None);
+    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+
+    // Remove the OLD secondary-index entries (read from the cursor's old row)
+    // and the OLD table row, then insert the rewritten row + new index entries.
+    emit_without_rowid_index_deletes(b, table, table_cursor, None, pk_indices);
+    b.emit_op(Opcode::IdxDelete, table_cursor, 0, 0, P4::None, 0);
+
+    let aff_str = table.affinity_string();
+    b.emit_op(
+        Opcode::Affinity,
+        existing_regs,
+        n_cols as i32,
+        0,
+        P4::Affinity(aff_str.clone()),
+        0,
+    );
+    let rec_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        existing_regs,
+        n_cols as i32,
+        rec_reg,
+        P4::Affinity(aff_str),
+        0,
+    );
+    b.emit_op(
+        Opcode::IdxInsert,
+        table_cursor,
+        rec_reg,
+        n_pk as i32,
+        P4::Table(format!(
+            "{}.{}",
+            table.name,
+            without_rowid_pk_label(table, pk_indices)
+        )),
+        1u16 | (OE_ABORT << 1),
+    );
+    emit_without_rowid_index_inserts(b, table, table_cursor, existing_regs, pk_indices, stmt_level);
+
+    if !returning.is_empty() {
+        emit_returning_from_regs(b, table, returning, None, schema, existing_regs)?;
+    }
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, after_label, P4::None, 0);
+
+    // --- No-conflict path: ordinary insert of the attempted row ---
+    b.resolve_label(do_insert);
+    emit_without_rowid_row_insert(
+        b,
+        table,
+        table_cursor,
+        val_regs,
+        pk_indices,
+        conflict_action_to_oe(stmt_level.as_ref()),
+        stmt_level,
+        None,
+        returning,
+        schema,
+    )?;
+    b.resolve_label(after_label);
+    Ok(())
+}
+
 /// Open the table (index) cursor plus all secondary-index cursors for write.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_without_rowid_open_write(b: &mut ProgramBuilder, table: &TableSchema, table_cursor: i32) {
@@ -14076,16 +14296,62 @@ fn codegen_insert_without_rowid(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    if !stmt.upsert.is_empty() {
-        return Err(CodegenError::Unsupported(
-            "ON CONFLICT DO UPDATE on WITHOUT ROWID tables is not yet supported".to_owned(),
-        ));
-    }
     let pk_indices = without_rowid_pk_indices(table)?;
     let table_cursor = 0_i32;
     let n_cols = table.columns.len();
-    let stmt_level = stmt.or_conflict;
-    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    let target_alias = stmt.alias.as_deref();
+
+    // Conflict behavior: an ON CONFLICT (upsert) clause takes precedence over any
+    // statement-level `INSERT OR <algo>`. Mirrors the rowid path
+    // (`codegen_insert`): DO NOTHING behaves like OR IGNORE (routed through the
+    // ordinary IGNORE path with `upsert: None`); DO UPDATE runs the
+    // check-before-insert probe in `emit_without_rowid_row_insert`.
+    let (oe_flag, upsert_clause) = if let Some(clause) = stmt.upsert.first() {
+        match &clause.action {
+            UpsertAction::Nothing => (OE_IGNORE, None),
+            UpsertAction::Update { .. } => (OE_IGNORE, Some(clause)),
+        }
+    } else {
+        (conflict_action_to_oe(stmt.or_conflict.as_ref()), None)
+    };
+    // Statement-level conflict algorithm for the *non-target* constraints (other
+    // UNIQUE indexes, NOT NULL). DO NOTHING legitimately ignores; DO UPDATE must
+    // carry the genuine statement action (`None` => ABORT) so a collision on a
+    // different index is not silently swallowed.
+    let stmt_level: Option<ConflictAction> = if stmt.upsert.is_empty() {
+        stmt.or_conflict
+    } else {
+        match &stmt.upsert[0].action {
+            UpsertAction::Nothing => Some(ConflictAction::Ignore),
+            UpsertAction::Update { .. } => stmt.or_conflict,
+        }
+    };
+    // DO UPDATE against a *secondary* UNIQUE index target is not yet supported:
+    // the WITHOUT ROWID upsert probe positions on the PRIMARY KEY only. Validate
+    // the assignment targets and `excluded.*` references up front for error parity.
+    if let Some(UpsertClause {
+        action: UpsertAction::Update {
+            assignments,
+            where_clause,
+        },
+        ..
+    }) = upsert_clause
+    {
+        if find_upsert_target_index(table, upsert_clause.and_then(|c| c.target.as_ref())).is_some() {
+            return Err(CodegenError::Unsupported(
+                "ON CONFLICT DO UPDATE with a secondary UNIQUE index conflict target on WITHOUT \
+                 ROWID tables is not yet supported (only the PRIMARY KEY target is supported)"
+                    .to_owned(),
+            ));
+        }
+        for assign in assignments {
+            validate_assignment_target(table, &assign.target)?;
+            validate_upsert_expr_columns(&assign.value, table, target_alias)?;
+        }
+        if let Some(where_expr) = where_clause {
+            validate_upsert_expr_columns(where_expr, table, target_alias)?;
+        }
+    }
 
     let end_label = b.emit_label();
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -14148,6 +14414,7 @@ fn codegen_insert_without_rowid(
                     &pk_indices,
                     oe_flag,
                     stmt_level,
+                    upsert_clause,
                     &stmt.returning,
                     schema,
                 )?;
@@ -14166,6 +14433,7 @@ fn codegen_insert_without_rowid(
                 &pk_indices,
                 oe_flag,
                 stmt_level,
+                upsert_clause,
                 &stmt.returning,
                 schema,
             )?;
@@ -14181,6 +14449,7 @@ fn codegen_insert_without_rowid(
                 &pk_indices,
                 oe_flag,
                 stmt_level,
+                upsert_clause,
                 target_mapping.as_ref(),
                 table_cursor,
             )?;
@@ -14219,6 +14488,7 @@ fn emit_without_rowid_insert_select(
     pk_indices: &[usize],
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
+    upsert: Option<&UpsertClause>,
     target_mapping: Option<&InsertTargetMapping>,
     table_cursor: i32,
 ) -> Result<(), CodegenError> {
@@ -14352,6 +14622,7 @@ fn emit_without_rowid_insert_select(
             pk_indices,
             oe_flag,
             stmt_level,
+            upsert,
             returning,
             schema,
         )?;
@@ -14388,6 +14659,7 @@ fn emit_without_rowid_insert_select(
             pk_indices,
             oe_flag,
             stmt_level,
+            upsert,
             returning,
             schema,
         )?;
@@ -14599,10 +14871,8 @@ fn codegen_update_without_rowid(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    if stmt.from.is_some() {
-        return Err(CodegenError::Unsupported(
-            "UPDATE ... FROM on WITHOUT ROWID tables is not yet supported".to_owned(),
-        ));
+    if let Some(from_clause) = &stmt.from {
+        return codegen_update_from_without_rowid(b, stmt, from_clause, table, schema, _ctx);
     }
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(CodegenError::Unsupported(
@@ -14758,6 +15028,341 @@ fn codegen_update_without_rowid(
 
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
     emit_without_rowid_close(b, table, table_cursor);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Code generation for `UPDATE <wr_table> SET ... FROM <sources> [WHERE ...]`
+/// where the target is a WITHOUT ROWID table.
+///
+/// A nested-loop join (FROM sources outer, target inner) mirrors the rowid
+/// [`codegen_update_from`], but because the WITHOUT ROWID table IS the index
+/// b-tree being scanned, mutating it mid-scan would invalidate the cursor. So
+/// this is a two-pass strategy: pass 1 runs the join, and for every matching
+/// (target, source) combination collects the `[OLD image || NEW image]` into a
+/// sorter (the NEW image is computed while the FROM cursors are live, since the
+/// assignments may reference FROM columns); pass 2 re-seeks each target by its
+/// OLD primary key and rewrites it (delete OLD table + index entries, insert the
+/// NEW row + index entries). Inner-join semantics; only named table sources.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
+fn codegen_update_from_without_rowid(
+    b: &mut ProgramBuilder,
+    stmt: &UpdateStatement,
+    from_clause: &FromClause,
+    table: &TableSchema,
+    schema: &[TableSchema],
+    _ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    use fsqlite_ast::{JoinConstraint, JoinKind};
+
+    if !stmt.order_by.is_empty() || stmt.limit.is_some() {
+        return Err(CodegenError::Unsupported(
+            "UPDATE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
+        ));
+    }
+
+    // Resolve a single FROM source to (name, alias). Only named tables are
+    // supported (matching the rowid `codegen_update_from`).
+    fn resolve_from_table(src: &TableOrSubquery) -> Result<(&str, Option<&str>), CodegenError> {
+        match src {
+            TableOrSubquery::Table { name, alias, .. } => {
+                Ok((name.name.as_str(), alias.as_deref()))
+            }
+            TableOrSubquery::Subquery { .. } => Err(CodegenError::Unsupported(
+                "UPDATE ... FROM subquery sources are not yet supported on WITHOUT ROWID tables"
+                    .to_owned(),
+            )),
+            _ => Err(CodegenError::Unsupported(
+                "UPDATE ... FROM only supports named tables on WITHOUT ROWID tables".to_owned(),
+            )),
+        }
+    }
+
+    // Collect FROM sources (leading + comma/JOIN) and any ON conditions.
+    let mut from_specs: Vec<(&str, Option<&str>)> =
+        Vec::with_capacity(1 + from_clause.joins.len());
+    from_specs.push(resolve_from_table(&from_clause.source)?);
+    let mut on_conditions: Vec<&Expr> = Vec::new();
+    for join in &from_clause.joins {
+        if join.join_type.natural {
+            return Err(CodegenError::Unsupported(
+                "UPDATE ... FROM with NATURAL JOIN is not yet supported on WITHOUT ROWID tables"
+                    .to_owned(),
+            ));
+        }
+        match join.join_type.kind {
+            JoinKind::Inner | JoinKind::Cross => {}
+            JoinKind::Left | JoinKind::Right | JoinKind::Full => {
+                return Err(CodegenError::Unsupported(
+                    "UPDATE ... FROM with an OUTER JOIN source is not yet supported on WITHOUT \
+                     ROWID tables"
+                        .to_owned(),
+                ));
+            }
+        }
+        from_specs.push(resolve_from_table(&join.table)?);
+        match &join.constraint {
+            Some(JoinConstraint::On(expr)) => on_conditions.push(expr),
+            Some(JoinConstraint::Using(_)) => {
+                return Err(CodegenError::Unsupported(
+                    "UPDATE ... FROM with a USING(...) join constraint is not yet supported on \
+                     WITHOUT ROWID tables"
+                        .to_owned(),
+                ));
+            }
+            None => {}
+        }
+    }
+
+    let pk_indices = without_rowid_pk_indices(table)?;
+    let n_cols = table.columns.len();
+    let n_pk = pk_indices.len();
+    let n_indexes = table.indexes.len();
+    let target_cursor = 0_i32;
+    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+
+    // Cursor allocation: 0 = target (write), 1..=n_indexes = target indexes,
+    // then one read cursor per FROM source, then the sorter.
+    let mut secondaries: Vec<SecondaryScan> = Vec::with_capacity(from_specs.len());
+    for (i, (src_name, src_alias)) in from_specs.iter().enumerate() {
+        let src_table = find_table(schema, src_name)?;
+        let cursor = (1 + n_indexes + i) as i32;
+        secondaries.push(SecondaryScan {
+            cursor,
+            table: src_table,
+            table_alias: *src_alias,
+        });
+    }
+    let sorter_cursor = (1 + n_indexes + from_specs.len()) as i32;
+
+    let end_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
+
+    // Validate all column references across the target + FROM sources.
+    let scan = ScanCtx {
+        cursor: target_cursor,
+        table,
+        table_alias: stmt.table.alias.as_deref(),
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &secondaries,
+    };
+    for assign in &stmt.assignments {
+        validate_scan_expr_columns(&assign.value, &scan)?;
+    }
+    for cond in &on_conditions {
+        validate_scan_expr_columns(cond, &scan)?;
+    }
+    if let Some(where_expr) = &stmt.where_clause {
+        validate_scan_expr_columns(where_expr, &scan)?;
+    }
+    validate_single_table_result_columns(&stmt.returning, table, stmt.table.alias.as_deref())?;
+
+    // Open target (write) + its index cursors, then the FROM read cursors.
+    emit_without_rowid_open_write(b, table, target_cursor);
+    for sec in &secondaries {
+        b.emit_op(
+            Opcode::OpenRead,
+            sec.cursor,
+            sec.table.root_page,
+            0,
+            P4::Table(sec.table.name.clone()),
+            0,
+        );
+    }
+
+    // Sorter holds [OLD image (n_cols) || NEW image (n_cols)].
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        (2 * n_cols) as i32,
+        0,
+        P4::Str("+".repeat(2 * n_cols)),
+        0,
+    );
+
+    // Anonymous-placeholder base counts in SQL textual order: SET, ON, WHERE,
+    // RETURNING.
+    let set_ph: u32 = stmt
+        .assignments
+        .iter()
+        .map(|a| count_anon_placeholders(&a.value))
+        .sum();
+    let on_ph: u32 = on_conditions.iter().map(|e| count_anon_placeholders(e)).sum();
+    let where_ph: u32 = stmt
+        .where_clause
+        .as_ref()
+        .map_or(0, count_anon_placeholders);
+
+    // --- Pass 1: nested-loop join (FROM outer, target inner); collect matches. ---
+    struct LoopFrame {
+        cursor: i32,
+        body: i32,
+        done: Label,
+    }
+    let mut frames: Vec<LoopFrame> = Vec::with_capacity(secondaries.len());
+    for sec in &secondaries {
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, sec.cursor, 0, done, P4::None, 0);
+        let body = b.current_addr() as i32;
+        frames.push(LoopFrame {
+            cursor: sec.cursor,
+            body,
+            done,
+        });
+    }
+    // Innermost: scan the target table.
+    let target_done_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, target_cursor, 0, target_done_label, P4::None, 0);
+    let target_body = b.current_addr() as i32;
+
+    // Filters: each ON condition (join order) then WHERE. A failed condition
+    // skips to the innermost (target) Next.
+    let skip_label = b.emit_label();
+    let filter_conditions: Vec<&Expr> = on_conditions
+        .iter()
+        .copied()
+        .chain(stmt.where_clause.as_ref())
+        .collect();
+    if !filter_conditions.is_empty() {
+        b.set_next_anon_placeholder(set_ph + 1);
+        for cond in &filter_conditions {
+            let cond_reg = b.alloc_temp();
+            emit_expr(b, cond, cond_reg, Some(&scan));
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+            b.free_temp(cond_reg);
+        }
+    }
+
+    // Match: build the OLD image, seed the NEW image from it, apply the
+    // assignments (RHS resolves target cols via the cursor and FROM cols via the
+    // secondaries), validate, and stash [OLD || NEW] into the sorter.
+    let row_regs = b.alloc_regs((2 * n_cols) as i32);
+    let old_regs = row_regs;
+    let new_regs = row_regs + n_cols as i32;
+    for i in 0..n_cols {
+        b.emit_op(Opcode::Column, target_cursor, i as i32, old_regs + i as i32, P4::None, 0);
+        b.emit_op(Opcode::Copy, old_regs + i as i32, new_regs + i as i32, 0, P4::None, 0);
+    }
+    b.set_next_anon_placeholder(1);
+    emit_update_assignments(b, &stmt.assignments, table, new_regs, &scan)?;
+    emit_stored_generated_columns(b, table, new_regs);
+    emit_strict_type_check(b, table, new_regs);
+    emit_check_constraints(b, table, new_regs, None);
+    emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
+    let stash_rec = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, row_regs, (2 * n_cols) as i32, stash_rec, P4::None, 0);
+    b.emit_op(Opcode::SorterInsert, sorter_cursor, stash_rec, 0, P4::None, 0);
+
+    b.resolve_label(skip_label);
+    b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
+    b.resolve_label(target_done_label);
+
+    // Unwind the FROM-source loops from innermost to outermost.
+    for frame in frames.iter().rev() {
+        b.emit_op(Opcode::Next, frame.cursor, frame.body, 0, P4::None, 0);
+        b.resolve_label(frame.done);
+    }
+
+    // The FROM read cursors are no longer needed once the collect pass is done.
+    for sec in &secondaries {
+        b.emit_op(Opcode::Close, sec.cursor, 0, 0, P4::None, 0);
+    }
+
+    // --- Pass 2: re-seek each collected row by OLD primary key and rewrite. ---
+    let pass2_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, pass2_done, P4::None, 0);
+    let loop_body = b.current_addr();
+    let sorted_reg = b.alloc_reg();
+    b.emit_op(Opcode::SorterData, sorter_cursor, sorted_reg, 0, P4::None, 0);
+    let old_img = b.alloc_regs(n_cols as i32);
+    let new_img = b.alloc_regs(n_cols as i32);
+    for i in 0..n_cols {
+        b.emit_op(Opcode::Column, sorter_cursor, i as i32, old_img + i as i32, P4::None, 0);
+    }
+    for i in 0..n_cols {
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            (n_cols + i) as i32,
+            new_img + i as i32,
+            P4::None,
+            0,
+        );
+    }
+
+    // Re-seek the OLD row by primary key; NoConflict skips if it is gone.
+    let pk_probe_regs = b.alloc_regs(n_pk as i32);
+    for (j, &pk_col) in pk_indices.iter().enumerate() {
+        b.emit_op(
+            Opcode::Copy,
+            old_img + pk_col as i32,
+            pk_probe_regs + j as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+    let pk_probe_rec = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, pk_probe_regs, n_pk as i32, pk_probe_rec, P4::None, 0);
+    let row_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::NoConflict, target_cursor, pk_probe_rec, row_done, P4::None, 0);
+
+    // Remove the OLD secondary-index entries + OLD table row.
+    emit_without_rowid_index_deletes(b, table, target_cursor, Some(old_img), &pk_indices);
+    b.emit_op(Opcode::IdxDelete, target_cursor, 0, 0, P4::None, 0);
+
+    // Insert the NEW row + NEW index entries.
+    let aff_str = table.affinity_string();
+    b.emit_op(
+        Opcode::Affinity,
+        new_img,
+        n_cols as i32,
+        0,
+        P4::Affinity(aff_str.clone()),
+        0,
+    );
+    let rec_reg = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, new_img, n_cols as i32, rec_reg, P4::Affinity(aff_str), 0);
+    b.emit_op(
+        Opcode::IdxInsert,
+        target_cursor,
+        rec_reg,
+        n_pk as i32,
+        P4::Table(format!(
+            "{}.{}",
+            table.name,
+            without_rowid_pk_label(table, &pk_indices)
+        )),
+        1u16 | (oe_flag << 1),
+    );
+    emit_without_rowid_index_inserts(b, table, target_cursor, new_img, &pk_indices, stmt.or_conflict);
+
+    // RETURNING: the NEW image.
+    if !stmt.returning.is_empty() {
+        b.set_next_anon_placeholder(set_ph + on_ph + where_ph + 1);
+        emit_returning_from_regs(
+            b,
+            table,
+            &stmt.returning,
+            stmt.table.alias.as_deref(),
+            schema,
+            new_img,
+        )?;
+    }
+
+    b.resolve_label(row_done);
+    b.emit_op(Opcode::SorterNext, sorter_cursor, loop_body as i32, 0, P4::None, 0);
+    b.resolve_label(pass2_done);
+
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    emit_without_rowid_close(b, table, target_cursor);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())

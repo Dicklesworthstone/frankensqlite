@@ -536,6 +536,350 @@ fn without_rowid_insert_select_parity() {
     }
 }
 
+/// INSERT ... ON CONFLICT ... DO UPDATE / DO NOTHING into WITHOUT ROWID tables
+/// (bd-eja6l). The conflict target is the PRIMARY KEY. Covers `excluded.*`
+/// references, mixing existing + excluded values, the DO UPDATE WHERE guard,
+/// DO NOTHING, the no-conflict insert path, composite PK, secondary-index
+/// maintenance, RETURNING, and multi-row batches with mixed conflict/no-conflict.
+/// Non-RETURNING cases run the upsert in `setup` and verify final table state
+/// with an ordered SELECT; RETURNING cases compare rows as a multiset.
+#[test]
+fn without_rowid_upsert_parity() {
+    let cases: Vec<Case> = vec![
+        // basic DO UPDATE from excluded on PK conflict
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "INSERT INTO t VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // DO UPDATE mixing existing + excluded
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 100) ON CONFLICT(k) DO UPDATE SET v = v + excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // explicit target, DO UPDATE to a literal (no excluded reference)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 7) ON CONFLICT(k) DO UPDATE SET v = 7",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // DO NOTHING on conflict leaves the row unchanged
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 999) ON CONFLICT(k) DO NOTHING",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // no conflict -> plain insert via the DO UPDATE path
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('z', 26) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // DO UPDATE WHERE guard true -> update applied
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // DO UPDATE WHERE guard false -> row left unchanged
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 5)",
+                "INSERT INTO t VALUES ('a', 1) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // coalesce(excluded, existing)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', NULL) ON CONFLICT(k) DO UPDATE SET v = coalesce(excluded.v, v)",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // multi-row batch: mixed conflict + new
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "INSERT INTO t VALUES ('a', 10), ('z', 5) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // composite PK upsert
+        Case {
+            setup: &[
+                "CREATE TABLE t(a INTEGER, b INTEGER, payload TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+                "INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y')",
+                "INSERT INTO t VALUES (1, 1, 'NEW') ON CONFLICT(a, b) DO UPDATE SET payload = excluded.payload",
+            ],
+            sql: "SELECT a, b, payload FROM t ORDER BY a, b",
+        },
+        // secondary index maintenance across an upsert that changes an indexed
+        // col: verify row content by a PRIMARY KEY-ordered scan (the table
+        // b-tree, avoiding the WITHOUT ROWID index read accessor gap bd-rjaff),
+        // and that the index b-tree stays consistent via integrity_check below.
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "INSERT INTO t VALUES ('a', 100) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv2 ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "INSERT INTO t VALUES ('a', 100) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            ],
+            sql: "PRAGMA integrity_check",
+        },
+        // update a non-PK column, extra columns present
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, a INTEGER, b TEXT) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('r', 1, 'old')",
+                "INSERT INTO t VALUES ('r', 2, 'new') ON CONFLICT(k) DO UPDATE SET b = excluded.b",
+            ],
+            sql: "SELECT k, a, b FROM t ORDER BY k",
+        },
+        // RETURNING on the conflict (update) path
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+            ],
+            sql: "INSERT INTO t VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = excluded.v RETURNING k, v",
+        },
+        // RETURNING on the no-conflict (insert) path
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+            ],
+            sql: "INSERT INTO t VALUES ('z', 5) ON CONFLICT(k) DO UPDATE SET v = excluded.v RETURNING k, v",
+        },
+        // RETURNING skipped when the DO UPDATE WHERE guard is false
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 5)",
+            ],
+            sql: "INSERT INTO t VALUES ('a', 1) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > v RETURNING k, v",
+        },
+    ];
+
+    let mut divergences = Vec::new();
+    for c in &cases {
+        if c.sql.contains("RETURNING") {
+            check_unordered(&mut divergences, c);
+        } else {
+            check(&mut divergences, c);
+        }
+    }
+    if !divergences.is_empty() {
+        let report = divergences.join("\n\n");
+        panic!(
+            "\n===== {} WITHOUT ROWID UPSERT DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+            divergences.len(),
+            cases.len(),
+            report
+        );
+    }
+}
+
+/// UPDATE ... FROM into WITHOUT ROWID tables (bd-eja6l). Inner-join semantics:
+/// the target WITHOUT ROWID table joins the FROM source(s); matched target rows
+/// are rewritten with assignments that may reference both target and source
+/// columns. Covers single-source lookup, multi-column SET, expressions mixing
+/// target+source, aliased source, explicit INNER JOIN, comma (cross) join,
+/// composite PK, PK reassignment, WHERE filtering, no-match, and RETURNING.
+/// Each case is a single-match join (deterministic); non-RETURNING cases run the
+/// UPDATE in `setup` and verify via an ordered SELECT.
+#[test]
+fn without_rowid_update_from_parity() {
+    let cases: Vec<Case> = vec![
+        // single-source lookup: SET target col = source col
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)",
+                "CREATE TABLE s(k TEXT, x INTEGER)",
+                "INSERT INTO s VALUES ('a', 100), ('b', 200)",
+                "UPDATE t SET v = s.x FROM s WHERE t.k = s.k",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // multi-column SET from the source
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, a INTEGER, b INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('r', 1, 1), ('q', 9, 9)",
+                "CREATE TABLE s(k TEXT, a INTEGER, b INTEGER)",
+                "INSERT INTO s VALUES ('r', 10, 20)",
+                "UPDATE t SET a = s.a, b = s.b FROM s WHERE t.k = s.k",
+            ],
+            sql: "SELECT k, a, b FROM t ORDER BY k",
+        },
+        // expression mixing target + source columns
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE s(k TEXT, d INTEGER)",
+                "INSERT INTO s VALUES ('a', 5), ('b', 10)",
+                "UPDATE t SET v = v + s.d FROM s WHERE t.k = s.k",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // aliased source
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE s(k TEXT, x INTEGER)",
+                "INSERT INTO s VALUES ('a', 100)",
+                "UPDATE t SET v = src.x FROM s AS src WHERE t.k = src.k",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // explicit INNER JOIN with ON between two sources
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 0), ('b', 0)",
+                "CREATE TABLE s1(k TEXT, y INTEGER)",
+                "INSERT INTO s1 VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE s2(y INTEGER, z INTEGER)",
+                "INSERT INTO s2 VALUES (1, 100), (2, 200)",
+                "UPDATE t SET v = s2.z FROM s1 JOIN s2 ON s1.y = s2.y WHERE t.k = s1.k",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // comma (cross) join filtered by WHERE
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 0)",
+                "CREATE TABLE s1(k TEXT, id INTEGER)",
+                "INSERT INTO s1 VALUES ('a', 1)",
+                "CREATE TABLE s2(id INTEGER, b INTEGER)",
+                "INSERT INTO s2 VALUES (1, 50)",
+                "UPDATE t SET v = s2.b FROM s1, s2 WHERE t.k = s1.k AND s1.id = s2.id",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // composite PK target
+        Case {
+            setup: &[
+                "CREATE TABLE t(a INTEGER, b INTEGER, payload TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+                "INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')",
+                "CREATE TABLE s(a INTEGER, b INTEGER, p TEXT)",
+                "INSERT INTO s VALUES (1, 1, 'NEW'), (2, 1, 'ALSO')",
+                "UPDATE t SET payload = s.p FROM s WHERE t.a = s.a AND t.b = s.b",
+            ],
+            sql: "SELECT a, b, payload FROM t ORDER BY a, b",
+        },
+        // PK reassignment from the source (delete old key, insert new key)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE s(oldk TEXT, newk TEXT)",
+                "INSERT INTO s VALUES ('a', 'z')",
+                "UPDATE t SET k = s.newk FROM s WHERE t.k = s.oldk",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // WHERE filter also constrains the target; only some rows match
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 5)",
+                "CREATE TABLE s(k TEXT, x INTEGER)",
+                "INSERT INTO s VALUES ('a', 100), ('b', 200)",
+                "UPDATE t SET v = s.x FROM s WHERE t.k = s.k AND t.v < 3",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // no match -> table unchanged
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE s(k TEXT, x INTEGER)",
+                "INSERT INTO s VALUES ('a', 100)",
+                "UPDATE t SET v = s.x FROM s WHERE t.k = s.k AND s.x > 1000",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // secondary index maintenance during UPDATE ... FROM (verify integrity)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX ivf ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE s(k TEXT, x INTEGER)",
+                "INSERT INTO s VALUES ('a', 100)",
+                "UPDATE t SET v = s.x FROM s WHERE t.k = s.k",
+            ],
+            sql: "PRAGMA integrity_check",
+        },
+        // RETURNING the new image (impl-defined order -> multiset compare)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)",
+                "CREATE TABLE s(k TEXT, x INTEGER)",
+                "INSERT INTO s VALUES ('a', 100), ('b', 200)",
+            ],
+            sql: "UPDATE t SET v = s.x FROM s WHERE t.k = s.k RETURNING k, v",
+        },
+    ];
+
+    let mut divergences = Vec::new();
+    for c in &cases {
+        if c.sql.contains("RETURNING") {
+            check_unordered(&mut divergences, c);
+        } else {
+            check(&mut divergences, c);
+        }
+    }
+    if !divergences.is_empty() {
+        let report = divergences.join("\n\n");
+        panic!(
+            "\n===== {} WITHOUT ROWID UPDATE...FROM DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+            divergences.len(),
+            cases.len(),
+            report
+        );
+    }
+}
+
 #[test]
 fn divergence_hunt_hard_constructs() {
     let cases: Vec<Case> = vec![
