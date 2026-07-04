@@ -60830,6 +60830,7 @@ impl Connection {
         _schema: &[TableSchema],
         _rowid_alias_columns: &HashMap<String, usize>,
         _specs: &[(String, String, Vec<ColumnInfo>)],
+        _preserve_existing_live_vtabs: bool,
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let _ = self;
         Ok(HashMap::new())
