@@ -2464,7 +2464,19 @@ fn codegen_select_index_equality_scan(
             r
         })
     });
-    let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
+    // rowid (bd-rjaff): covering resolution is rowid-table shaped, so route
+    // WITHOUT ROWID through the table-lookup path below.
+    let wr_pk_indices = if table.without_rowid {
+        Some(without_rowid_pk_indices(table)?)
+    } else {
+        None
+    };
+    let covering_output = if wr_pk_indices.is_some() {
+        None
+    } else {
+        resolve_covering_output_sources(columns, table, table_alias, idx_schema)
+    };
     let needs_table_lookup = covering_output.is_none();
     let fast_path_done_label = if needs_table_lookup {
         done_label
@@ -2562,27 +2574,45 @@ fn codegen_select_index_equality_scan(
         );
     }
 
-    let rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
     let idx_skip_label = b.emit_label();
     b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
-    if needs_table_lookup {
-        b.emit_jump_to_label(
-            Opcode::SeekRowid,
+    if let Some(pk_indices) = wr_pk_indices.as_ref() {
+        // WITHOUT ROWID: read the PK suffix stored after the index key terms
+        // and position the table b-tree on it (prefix probe; fall-through
+        // leaves the cursor on the matching row).
+        emit_without_rowid_index_to_table_seek(
+            b,
             cursor,
-            rowid_reg,
+            idx_cursor,
+            idx_schema,
+            pk_indices,
             idx_skip_label,
-            P4::None,
-            0,
         );
-    }
-    if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
-    }
-    if let Some(covering_output) = covering_output.as_ref() {
-        emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
-    } else {
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
+        }
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    } else {
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        if needs_table_lookup {
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                idx_skip_label,
+                P4::None,
+                0,
+            );
+        }
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
+        }
+        if let Some(covering_output) = covering_output.as_ref() {
+            emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
+        } else {
+            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+        }
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     if let Some(lim_r) = limit_reg {
@@ -3059,7 +3089,19 @@ fn codegen_select_index_range_scan(
             .as_ref()
             .is_some_and(|(_, bound)| !bound.inclusive))
     .then(|| b.alloc_reg());
-    let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
+    // rowid (bd-rjaff): covering resolution is rowid-table shaped, so route
+    // WITHOUT ROWID through the table-lookup path below.
+    let wr_pk_indices = if table.without_rowid {
+        Some(without_rowid_pk_indices(table)?)
+    } else {
+        None
+    };
+    let covering_output = if wr_pk_indices.is_some() {
+        None
+    } else {
+        resolve_covering_output_sources(columns, table, table_alias, idx_schema)
+    };
     let needs_table_lookup = covering_output.is_none();
 
     if needs_table_lookup {
@@ -3142,28 +3184,46 @@ fn codegen_select_index_range_scan(
         );
     }
 
-    let rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-
-    if needs_table_lookup {
-        b.emit_jump_to_label(
-            Opcode::SeekRowid,
+    if let Some(pk_indices) = wr_pk_indices.as_ref() {
+        // WITHOUT ROWID: read the PK suffix stored after the index key terms
+        // and position the table b-tree on it (prefix probe; fall-through
+        // leaves the cursor on the matching row).
+        emit_without_rowid_index_to_table_seek(
+            b,
             cursor,
-            rowid_reg,
+            idx_cursor,
+            idx_schema,
+            pk_indices,
             skip_label,
-            P4::None,
-            0,
         );
-    }
-
-    if let Some(off_r) = offset_reg {
-        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
-    }
-
-    if let Some(covering_output) = &covering_output {
-        emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
-    } else {
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+        }
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    } else {
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+
+        if needs_table_lookup {
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
+        }
+
+        if let Some(off_r) = offset_reg {
+            b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+        }
+
+        if let Some(covering_output) = &covering_output {
+            emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
+        } else {
+            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+        }
     }
 
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -11518,8 +11578,81 @@ fn codegen_insert_values(
                     );
 
                     existing_rowid_reg
+                } else if upsert_clause.target.is_none()
+                    && table
+                        .indexes
+                        .iter()
+                        .any(|index| index.is_unique && index.supports_direct_column_lookup())
+                {
+                    // Omitted conflict target (SQLite 3.35+): DO UPDATE fires on
+                    // whichever uniqueness constraint the new row violates first.
+                    // Probe the rowid/IPK PRIMARY KEY, then every UNIQUE index in
+                    // schema order; the first hit supplies the existing row and
+                    // leaves the table cursor positioned on it.
+                    let conflict_label = b.emit_label();
+                    let found_rowid_reg = b.alloc_reg();
+                    let pk_miss = b.emit_label();
+                    b.emit_jump_to_label(Opcode::NotExists, cursor, rowid_reg, pk_miss, P4::None, 0);
+                    b.emit_op(Opcode::Copy, rowid_reg, found_rowid_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
+                    b.resolve_label(pk_miss);
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                    for (idx_offset, index) in table.indexes.iter().enumerate() {
+                        if !index.is_unique || !index.supports_direct_column_lookup() {
+                            continue;
+                        }
+                        let idx_miss = b.emit_label();
+                        let idx_cursor = cursor + 1 + idx_offset as i32;
+                        let n_key_cols = index.columns.len() as i32;
+                        let key_val_regs = b.alloc_regs(n_key_cols);
+                        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                        for (key_pos, col_name) in index.columns.iter().enumerate() {
+                            if let Some(col_idx) = table.column_index(col_name) {
+                                b.emit_op(
+                                    Opcode::Copy,
+                                    val_regs + col_idx as i32,
+                                    key_val_regs + key_pos as i32,
+                                    0,
+                                    P4::None,
+                                    0,
+                                );
+                            }
+                        }
+                        let key_rec_reg = b.alloc_reg();
+                        b.emit_op(
+                            Opcode::MakeRecord,
+                            key_val_regs,
+                            n_key_cols,
+                            key_rec_reg,
+                            P4::None,
+                            0,
+                        );
+                        b.emit_jump_to_label(
+                            Opcode::NoConflict,
+                            idx_cursor,
+                            key_rec_reg,
+                            idx_miss,
+                            P4::None,
+                            0,
+                        );
+                        b.emit_op(Opcode::IdxRowid, idx_cursor, found_rowid_reg, 0, P4::None, 0);
+                        b.emit_jump_to_label(
+                            Opcode::NotExists,
+                            cursor,
+                            found_rowid_reg,
+                            idx_miss,
+                            P4::None,
+                            0,
+                        );
+                        b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
+                        b.resolve_label(idx_miss);
+                    }
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, insert_label, P4::None, 0);
+                    b.resolve_label(conflict_label);
+                    found_rowid_reg
                 } else {
-                    // PK conflict check.
+                    // PK conflict check (explicit PK/rowid target, or omitted
+                    // target on a table with no UNIQUE indexes).
                     b.emit_jump_to_label(
                         Opcode::NotExists,
                         cursor,
@@ -13716,6 +13849,49 @@ pub fn codegen_delete(
 /// Returns the declared table-column index of each PK column. Errors if the
 /// table has no PRIMARY KEY, or if the PK is not the leading declared columns
 /// (a shape the declared-order storage model cannot represent today).
+/// Position a WITHOUT ROWID table cursor on the row referenced by the current
+/// entry of a secondary-index cursor (bd-rjaff).
+///
+/// WITHOUT ROWID secondary-index entries are `(key terms..., PK cols...)` —
+/// there is no trailing rowid. This reads the PK suffix columns from the index
+/// entry, packs them into a record, and probes the table b-tree with
+/// `NoConflict` (prefix match over the leading PK columns). On a match the
+/// table cursor is positioned on the row (fall-through); a missing row —
+/// index/table inconsistency — jumps to `miss_label`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_without_rowid_index_to_table_seek(
+    b: &mut ProgramBuilder,
+    table_cursor: i32,
+    idx_cursor: i32,
+    idx_schema: &IndexSchema,
+    pk_indices: &[usize],
+    miss_label: crate::Label,
+) {
+    let n_idx_key = idx_schema.key_term_count();
+    let n_pk = pk_indices.len();
+    let pk_regs = b.alloc_regs(n_pk as i32);
+    for j in 0..n_pk {
+        b.emit_op(
+            Opcode::Column,
+            idx_cursor,
+            (n_idx_key + j) as i32,
+            pk_regs + j as i32,
+            P4::None,
+            0,
+        );
+    }
+    let pk_rec_reg = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, pk_regs, n_pk as i32, pk_rec_reg, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::NoConflict,
+        table_cursor,
+        pk_rec_reg,
+        miss_label,
+        P4::None,
+        0,
+    );
+}
+
 fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
     let pk_group = table.primary_key_constraints.first().ok_or_else(|| {
         CodegenError::Unsupported(format!(
@@ -14345,6 +14521,19 @@ fn codegen_insert_without_rowid(
             return Err(CodegenError::Unsupported(
                 "ON CONFLICT DO UPDATE with a secondary UNIQUE index conflict target on WITHOUT \
                  ROWID tables is not yet supported (only the PRIMARY KEY target is supported)"
+                    .to_owned(),
+            ));
+        }
+        // An omitted conflict target must fire on *any* uniqueness constraint;
+        // the WITHOUT ROWID probe only covers the PRIMARY KEY, so reject loudly
+        // when a UNIQUE secondary index could also conflict rather than raising
+        // a spurious constraint error on it.
+        if upsert_clause.is_some_and(|c| c.target.is_none())
+            && table.indexes.iter().any(|index| index.is_unique)
+        {
+            return Err(CodegenError::Unsupported(
+                "ON CONFLICT DO UPDATE with an omitted conflict target on a WITHOUT ROWID table \
+                 with UNIQUE indexes is not yet supported"
                     .to_owned(),
             ));
         }

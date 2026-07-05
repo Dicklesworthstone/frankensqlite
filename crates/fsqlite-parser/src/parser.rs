@@ -1152,6 +1152,16 @@ impl Parser {
     fn parse_upsert_clauses(&mut self) -> Result<Vec<UpsertClause>, ParseError> {
         let mut clauses = Vec::new();
         while self.check_kw(&TokenKind::KwOn) && self.peek_nth(1) == &TokenKind::KwConflict {
+            // SQLite 3.35+: a clause without a conflict target is only valid as
+            // the final ON CONFLICT clause of the INSERT.
+            if clauses
+                .last()
+                .is_some_and(|clause: &UpsertClause| clause.target.is_none())
+            {
+                return Err(self.err_msg(
+                    "ON CONFLICT clause without a conflict target must be the last ON CONFLICT clause",
+                ));
+            }
             self.advance(); // ON
             self.advance(); // CONFLICT
             let target = if self.check(&TokenKind::LeftParen) {
@@ -1187,9 +1197,6 @@ impl Parser {
                     where_clause: wh,
                 }
             };
-            if target.is_none() && matches!(action, UpsertAction::Update { .. }) {
-                return Err(self.err_msg("ON CONFLICT DO UPDATE requires a conflict target"));
-            }
             clauses.push(UpsertClause { target, action });
         }
         Ok(clauses)

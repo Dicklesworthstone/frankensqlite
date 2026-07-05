@@ -1125,3 +1125,196 @@ fn divergence_hunt_hard_constructs() {
         );
     }
 }
+
+/// `INSERT ... ON CONFLICT DO UPDATE` with an OMITTED conflict target
+/// (SQLite 3.35+; bd-6geae). The upsert must fire on whichever uniqueness
+/// constraint the new row violates — the rowid/INTEGER PRIMARY KEY *or* any
+/// UNIQUE column/index — not just the PK. Also pins the parse rule that a
+/// targetless ON CONFLICT clause must be the last one.
+///
+/// Known remaining gap (kept out of this gate, documented on bd-6geae):
+/// WITHOUT ROWID tables with UNIQUE secondary indexes reject the omitted
+/// target loudly instead of probing the secondary index.
+#[test]
+fn omitted_conflict_target_upsert_parity() {
+    let cases: Vec<Case> = vec![
+        // IPK conflict, omitted target
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO t VALUES (1, 10)",
+                "INSERT INTO t VALUES (1, 99) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT id, v FROM t ORDER BY id",
+        },
+        // UNIQUE column conflict, omitted target (the bd-6geae repro shape)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 7) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // UNIQUE index (CREATE UNIQUE INDEX) conflict, omitted target
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT, v INTEGER)",
+                "CREATE UNIQUE INDEX tk ON t(k)",
+                "INSERT INTO t VALUES (1, 'a', 1)",
+                "INSERT INTO t(k, v) VALUES ('a', 7) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT id, k, v FROM t ORDER BY id",
+        },
+        // two UNIQUE constraints; the conflict lands on the SECOND one
+        Case {
+            setup: &[
+                "CREATE TABLE t(a TEXT UNIQUE, b TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a1', 'b1', 1)",
+                "INSERT INTO t VALUES ('aX', 'b1', 7) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT a, b, v FROM t ORDER BY a",
+        },
+        // conflict on the IPK when a UNIQUE column also exists (PK checked first)
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES (1, 'a', 1)",
+                "INSERT INTO t VALUES (1, 'z', 7) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT id, k, v FROM t ORDER BY id",
+        },
+        // no conflict anywhere -> plain insert through the omitted-target path
+        Case {
+            setup: &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES (1, 'a', 1)",
+                "INSERT INTO t VALUES (2, 'b', 2) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT id, k, v FROM t ORDER BY id",
+        },
+        // NULL in a UNIQUE column never conflicts -> plain insert
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES (NULL, 1)",
+                "INSERT INTO t VALUES (NULL, 2) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY v",
+        },
+        // omitted target + DO UPDATE ... WHERE guard true
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 10) ON CONFLICT DO UPDATE SET v = excluded.v WHERE excluded.v > v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // omitted target + DO UPDATE ... WHERE guard false -> unchanged
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 5)",
+                "INSERT INTO t VALUES ('a', 1) ON CONFLICT DO UPDATE SET v = excluded.v WHERE excluded.v > v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // assignments mixing existing + excluded values
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 100) ON CONFLICT DO UPDATE SET v = v + excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // multi-row batch: conflicting + fresh rows through the same statement
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+                "INSERT INTO t VALUES ('a', 10), ('z', 26) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // composite UNIQUE index, omitted target
+        Case {
+            setup: &[
+                "CREATE TABLE t(a INTEGER, b INTEGER, v TEXT)",
+                "CREATE UNIQUE INDEX tab ON t(a, b)",
+                "INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y')",
+                "INSERT INTO t VALUES (1, 1, 'NEW') ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT a, b, v FROM t ORDER BY a, b",
+        },
+        // secondary-index consistency after an omitted-target upsert
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 42) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "PRAGMA integrity_check",
+        },
+        // WITHOUT ROWID: PK conflict with omitted target
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 7) ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // WITHOUT ROWID composite PK, omitted target
+        Case {
+            setup: &[
+                "CREATE TABLE t(a INTEGER, b INTEGER, v TEXT, PRIMARY KEY(a, b)) WITHOUT ROWID",
+                "INSERT INTO t VALUES (1, 1, 'x')",
+                "INSERT INTO t VALUES (1, 1, 'NEW') ON CONFLICT DO UPDATE SET v = excluded.v",
+            ],
+            sql: "SELECT a, b, v FROM t ORDER BY a, b",
+        },
+        // omitted-target DO NOTHING still works (pre-existing surface)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1)",
+                "INSERT INTO t VALUES ('a', 999) ON CONFLICT DO NOTHING",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY k",
+        },
+        // parse rule: targetless clause must be the LAST ON CONFLICT clause
+        // (both engines reject)
+        Case {
+            setup: &["CREATE TABLE t(k TEXT UNIQUE, v INTEGER)"],
+            sql: "INSERT INTO t VALUES ('a', 1) ON CONFLICT DO NOTHING ON CONFLICT(k) DO NOTHING",
+        },
+        // RETURNING through the omitted-target conflict path
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT UNIQUE, v INTEGER)",
+                "INSERT INTO t VALUES ('a', 1)",
+            ],
+            sql: "INSERT INTO t VALUES ('a', 7) ON CONFLICT DO UPDATE SET v = excluded.v RETURNING k, v",
+        },
+    ];
+
+    let mut divergences = Vec::new();
+    for c in &cases {
+        if c.sql.contains("RETURNING") {
+            check_unordered(&mut divergences, c);
+        } else {
+            check(&mut divergences, c);
+        }
+    }
+    if !divergences.is_empty() {
+        let report = divergences.join("\n\n");
+        panic!(
+            "\n===== {} OMITTED-TARGET UPSERT DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+            divergences.len(),
+            cases.len(),
+            report
+        );
+    }
+}
