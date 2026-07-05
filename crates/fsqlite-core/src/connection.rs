@@ -27095,11 +27095,9 @@ impl Connection {
             // requires the full codegen INSERT path, which honors per-constraint
             // conflict resolution; the direct-simple lane does not (bd-587fx,
             // bd-24hno). Decline so such tables fall back to codegen.
-            let no_per_constraint_conflict = table
-                .columns
-                .iter()
-                .all(|c| c.conflict_action.is_none())
-                && table.indexes.iter().all(|i| i.conflict_action.is_none());
+            let no_per_constraint_conflict =
+                table.columns.iter().all(|c| c.conflict_action.is_none())
+                    && table.indexes.iter().all(|i| i.conflict_action.is_none());
             fk_ok && no_per_constraint_conflict
         })
     }
@@ -38909,14 +38907,14 @@ impl Connection {
                     .enumerate()
                     .map(|(col_idx, default_sql)| {
                         default_sql.as_deref().and_then(|sql| {
-                            self.evaluate_column_default_value(Some(sql)).ok().map(
-                                |value| match affinities
-                                    .and_then(|affs| affs.get(col_idx).copied())
-                                {
-                                    Some(aff) => value.apply_affinity(aff),
-                                    None => value,
-                                },
-                            )
+                            self.evaluate_column_default_value(Some(sql))
+                                .ok()
+                                .map(|value| {
+                                    match affinities.and_then(|affs| affs.get(col_idx).copied()) {
+                                        Some(aff) => value.apply_affinity(aff),
+                                        None => value,
+                                    }
+                                })
                         })
                     })
                     .collect();
@@ -39286,11 +39284,12 @@ impl Connection {
                         self.db.borrow_mut().create_table_at(idx_root, 0);
                         // Per-constraint ON CONFLICT declared on the column's
                         // UNIQUE / (non-IPK) PRIMARY KEY clause.
-                        let conflict_action = decl_col.constraints.iter().find_map(|c| match &c.kind {
-                            ColumnConstraintKind::Unique { conflict }
-                            | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                            _ => None,
-                        });
+                        let conflict_action =
+                            decl_col.constraints.iter().find_map(|c| match &c.kind {
+                                ColumnConstraintKind::Unique { conflict }
+                                | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                                _ => None,
+                            });
                         implicit_indexes.push(IndexSchema {
                             name: format!(
                                 "sqlite_autoindex_{}_{}",
@@ -42781,9 +42780,10 @@ impl Connection {
     /// fast lane, which would compile it as table DML and fail "no such table".
     fn statement_targets_instead_of_view(&self, statement: &Statement) -> bool {
         let (view_name, event): (&str, fsqlite_ast::TriggerEvent) = match statement {
-            Statement::Insert(insert) => {
-                (insert.table.name.as_str(), fsqlite_ast::TriggerEvent::Insert)
-            }
+            Statement::Insert(insert) => (
+                insert.table.name.as_str(),
+                fsqlite_ast::TriggerEvent::Insert,
+            ),
             Statement::Update(update) => (
                 update.table.name.name.as_str(),
                 fsqlite_ast::TriggerEvent::Update(Self::assignment_target_column_names(
@@ -42797,11 +42797,7 @@ impl Connection {
             _ => return false,
         };
         self.view_index_of(view_name).is_some()
-            && self.has_matching_triggers(
-                view_name,
-                fsqlite_ast::TriggerTiming::InsteadOf,
-                &event,
-            )
+            && self.has_matching_triggers(view_name, fsqlite_ast::TriggerTiming::InsteadOf, &event)
     }
 
     /// Effective output column names of a view, for binding NEW/OLD in an
@@ -42956,13 +42952,15 @@ impl Connection {
         col_map: &[(String, String, bool)],
         new_values: &mut [SqliteValue],
     ) -> Result<()> {
-        let assign_one = |new_values: &mut [SqliteValue], column: &str, value: &Expr| -> Result<()> {
-            let index = find_column_index_case_insensitive(column_names, column).ok_or_else(|| {
-                FrankenError::Internal(format!("UPDATE on view: unknown column `{column}`"))
-            })?;
-            new_values[index] = eval_join_expr(value, old_values, col_map)?;
-            Ok(())
-        };
+        let assign_one =
+            |new_values: &mut [SqliteValue], column: &str, value: &Expr| -> Result<()> {
+                let index =
+                    find_column_index_case_insensitive(column_names, column).ok_or_else(|| {
+                        FrankenError::Internal(format!("UPDATE on view: unknown column `{column}`"))
+                    })?;
+                new_values[index] = eval_join_expr(value, old_values, col_map)?;
+                Ok(())
+            };
         match &assignment.target {
             fsqlite_ast::AssignmentTarget::Column(column) => {
                 assign_one(new_values, column, &assignment.value)?;
@@ -50206,7 +50204,6 @@ impl Connection {
             .get(&table_name.to_ascii_lowercase())
             .is_some_and(|sql| is_without_rowid_table_sql(sql))
     }
-
 
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
     /// GROUP BY aggregation directly on the joined rows.
@@ -69904,9 +69901,10 @@ fn select_has_correlated_in_subquery_in_where(select: &SelectStatement) -> bool 
         return false;
     };
     where_clause.as_deref().is_some_and(|expr| {
-        expr_contains_subquery_match(expr, &mut |sub| {
-            matches!(sub, SubqueryExprRef::In(inner) if is_correlated_subquery(inner))
-        })
+        expr_contains_subquery_match(
+            expr,
+            &mut |sub| matches!(sub, SubqueryExprRef::In(inner) if is_correlated_subquery(inner)),
+        )
     })
 }
 
@@ -125318,7 +125316,9 @@ mod without_rowid_runtime_tests {
             .unwrap();
 
         // A duplicate primary key is a constraint violation.
-        let err = conn.execute("INSERT INTO wr VALUES ('a', 99);").unwrap_err();
+        let err = conn
+            .execute("INSERT INTO wr VALUES ('a', 99);")
+            .unwrap_err();
         assert!(
             matches!(err, FrankenError::UniqueViolation { .. }),
             "duplicate WITHOUT ROWID primary key must conflict: {err:?}"
@@ -138773,8 +138773,8 @@ mod pager_routing_tests {
             .query("DELETE FROM t_ret_route WHERE v = 30 RETURNING id, v;")
             .unwrap();
         let delete_opcodes = fsqlite_vdbe::engine::vdbe_metrics_snapshot().opcodes_executed_total;
-        let fallback_returning = super::hot_path_profile_snapshot()
-            .prepared_update_delete_fallback_returning;
+        let fallback_returning =
+            super::hot_path_profile_snapshot().prepared_update_delete_fallback_returning;
 
         fsqlite_vdbe::engine::set_vdbe_metrics_enabled(false);
         super::set_hot_path_profile_enabled(false);
@@ -184742,7 +184742,10 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!("{} update from three-table join mismatches", mismatches.len());
+            panic!(
+                "{} update from three-table join mismatches",
+                mismatches.len()
+            );
         }
     }
 

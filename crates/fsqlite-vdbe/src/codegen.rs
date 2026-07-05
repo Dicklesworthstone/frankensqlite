@@ -3189,12 +3189,7 @@ fn codegen_select_index_range_scan(
         // and position the table b-tree on it (prefix probe; fall-through
         // leaves the cursor on the matching row).
         emit_without_rowid_index_to_table_seek(
-            b,
-            cursor,
-            idx_cursor,
-            idx_schema,
-            pk_indices,
-            skip_label,
+            b, cursor, idx_cursor, idx_schema, pk_indices, skip_label,
         );
         if let Some(off_r) = offset_reg {
             b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
@@ -11514,7 +11509,11 @@ fn codegen_insert_values(
         };
         // CHECK constraints have no per-column conflict clause here, so they
         // only skip under a statement-level IGNORE.
-        let check_ignore = if oe_flag == OE_IGNORE { ignore_skip } else { None };
+        let check_ignore = if oe_flag == OE_IGNORE {
+            ignore_skip
+        } else {
+            None
+        };
         emit_check_constraints(b, table, val_regs, check_ignore);
         emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip);
 
@@ -11634,7 +11633,14 @@ fn codegen_insert_values(
                     let conflict_label = b.emit_label();
                     let found_rowid_reg = b.alloc_reg();
                     let pk_miss = b.emit_label();
-                    b.emit_jump_to_label(Opcode::NotExists, cursor, rowid_reg, pk_miss, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::NotExists,
+                        cursor,
+                        rowid_reg,
+                        pk_miss,
+                        P4::None,
+                        0,
+                    );
                     b.emit_op(Opcode::Copy, rowid_reg, found_rowid_reg, 0, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
                     b.resolve_label(pk_miss);
@@ -11677,7 +11683,14 @@ fn codegen_insert_values(
                             P4::None,
                             0,
                         );
-                        b.emit_op(Opcode::IdxRowid, idx_cursor, found_rowid_reg, 0, P4::None, 0);
+                        b.emit_op(
+                            Opcode::IdxRowid,
+                            idx_cursor,
+                            found_rowid_reg,
+                            0,
+                            P4::None,
+                            0,
+                        );
                         b.emit_jump_to_label(
                             Opcode::NotExists,
                             cursor,
@@ -11888,14 +11901,7 @@ fn codegen_insert_values(
                     &aff_str,
                     preformatted_record.as_deref(),
                 );
-                b.emit_op(
-                    Opcode::Insert,
-                    cursor,
-                    rec_reg,
-                    rowid_reg,
-                    insert_p4,
-                    pk_oe,
-                );
+                b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
                 emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
 
                 if !returning.is_empty() {
@@ -11914,14 +11920,7 @@ fn codegen_insert_values(
                     &aff_str,
                     preformatted_record.as_deref(),
                 );
-                b.emit_op(
-                    Opcode::Insert,
-                    cursor,
-                    rec_reg,
-                    rowid_reg,
-                    insert_p4,
-                    pk_oe,
-                );
+                b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
                 emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
                 if !returning.is_empty() {
                     emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
@@ -11938,14 +11937,7 @@ fn codegen_insert_values(
                 &aff_str,
                 preformatted_record.as_deref(),
             );
-            b.emit_op(
-                Opcode::Insert,
-                cursor,
-                rec_reg,
-                rowid_reg,
-                insert_p4,
-                pk_oe,
-            );
+            b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
             if !returning.is_empty() {
                 emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
@@ -12329,7 +12321,11 @@ fn codegen_insert_select(
     } else {
         None
     };
-    let check_ignore = if oe_flag == OE_IGNORE { ignore_target } else { None };
+    let check_ignore = if oe_flag == OE_IGNORE {
+        ignore_target
+    } else {
+        None
+    };
     emit_check_constraints(b, target_table, final_regs, check_ignore);
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
     let pk_oe = effective_oe(
@@ -12553,7 +12549,11 @@ fn codegen_insert_select_without_from(
     } else {
         None
     };
-    let check_ignore = if oe_flag == OE_IGNORE { ignore_target } else { None };
+    let check_ignore = if oe_flag == OE_IGNORE {
+        ignore_target
+    } else {
+        None
+    };
     let pk_oe = effective_oe(
         stmt_level,
         target_table
@@ -12871,7 +12871,13 @@ pub fn codegen_update(
         };
     emit_strict_type_check(b, table, col_regs);
     emit_check_constraints(b, table, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, constraint_ignore_label);
+    emit_not_null_constraints(
+        b,
+        table,
+        col_regs,
+        stmt.or_conflict,
+        constraint_ignore_label,
+    );
 
     // Constraints passed: now perform the destructive delete+insert rewrite.
     // Index maintenance (bd-2f9t): Delete OLD index entries. The indexed key
@@ -13469,7 +13475,10 @@ fn codegen_update_from(
         .iter()
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
-    let on_placeholder_count: u32 = on_conditions.iter().map(|e| count_anon_placeholders(e)).sum();
+    let on_placeholder_count: u32 = on_conditions
+        .iter()
+        .map(|e| count_anon_placeholders(e))
+        .sum();
     let where_placeholder_count: u32 = stmt
         .where_clause
         .as_ref()
@@ -13607,7 +13616,14 @@ fn codegen_update_from(
     );
 
     // Insert new index entries.
-    emit_index_inserts(b, target, target_cursor, col_regs, rowid_reg, stmt.or_conflict);
+    emit_index_inserts(
+        b,
+        target,
+        target_cursor,
+        col_regs,
+        rowid_reg,
+        stmt.or_conflict,
+    );
 
     // RETURNING clause (numbered after SET + ON + WHERE placeholders).
     if !stmt.returning.is_empty() {
@@ -13923,7 +13939,14 @@ fn emit_without_rowid_index_to_table_seek(
         );
     }
     let pk_rec_reg = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, pk_regs, n_pk as i32, pk_rec_reg, P4::None, 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        pk_regs,
+        n_pk as i32,
+        pk_rec_reg,
+        P4::None,
+        0,
+    );
     b.emit_jump_to_label(
         Opcode::NoConflict,
         table_cursor,
@@ -13959,7 +13982,10 @@ fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenEr
     }
     // Declared-order storage compares the leading `pk_count` columns as the
     // b-tree key, so the PK must be exactly the leading declared columns.
-    let is_leading = indices.iter().enumerate().all(|(pos, &col_idx)| pos == col_idx);
+    let is_leading = indices
+        .iter()
+        .enumerate()
+        .all(|(pos, &col_idx)| pos == col_idx);
     if !is_leading {
         return Err(CodegenError::Unsupported(format!(
             "WITHOUT ROWID table {} with a non-leading PRIMARY KEY is not yet supported",
@@ -14091,7 +14117,14 @@ fn emit_without_rowid_index_deletes(
             if let Some(cr) = col_regs {
                 b.emit_op(Opcode::Copy, cr + pk_col as i32, dst, 0, P4::None, 0);
             } else {
-                b.emit_op(Opcode::Column, table_cursor, pk_col as i32, dst, P4::None, 0);
+                b.emit_op(
+                    Opcode::Column,
+                    table_cursor,
+                    pk_col as i32,
+                    dst,
+                    P4::None,
+                    0,
+                );
             }
         }
         b.emit_op(
@@ -14449,7 +14482,14 @@ fn emit_without_rowid_upsert_row(
         )),
         1u16 | (OE_ABORT << 1),
     );
-    emit_without_rowid_index_inserts(b, table, table_cursor, existing_regs, pk_indices, stmt_level);
+    emit_without_rowid_index_inserts(
+        b,
+        table,
+        table_cursor,
+        existing_regs,
+        pk_indices,
+        stmt_level,
+    );
 
     if !returning.is_empty() {
         emit_returning_from_regs(b, table, returning, target_alias, schema, existing_regs)?;
@@ -14559,7 +14599,8 @@ fn codegen_insert_without_rowid(
         ..
     }) = upsert_clause
     {
-        if find_upsert_target_index(table, upsert_clause.and_then(|c| c.target.as_ref())).is_some() {
+        if find_upsert_target_index(table, upsert_clause.and_then(|c| c.target.as_ref())).is_some()
+        {
             return Err(CodegenError::Unsupported(
                 "ON CONFLICT DO UPDATE with a secondary UNIQUE index conflict target on WITHOUT \
                  ROWID tables is not yet supported (only the PRIMARY KEY target is supported)"
@@ -14759,7 +14800,15 @@ fn emit_without_rowid_insert_select(
                 group_by,
                 having,
                 windows,
-            } => (distinct, columns, from, where_clause, group_by, having, windows),
+            } => (
+                distinct,
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+            ),
             SelectCore::Values(_) => {
                 return Err(CodegenError::Unsupported(
                     "INSERT ... SELECT with a VALUES body into WITHOUT ROWID tables is not yet \
@@ -14850,7 +14899,15 @@ fn emit_without_rowid_insert_select(
             );
         }
         let sel_regs = b.alloc_regs(n_sel);
-        emit_column_reads(b, read_cursor, columns, src_table, src_alias, schema, sel_regs)?;
+        emit_column_reads(
+            b,
+            read_cursor,
+            columns,
+            src_table,
+            src_alias,
+            schema,
+            sel_regs,
+        )?;
         let val_regs =
             map_insert_select_row_to_table_order(b, table, target_mapping, sel_regs, n_cols)?;
         emit_without_rowid_row_insert(
@@ -14867,7 +14924,14 @@ fn emit_without_rowid_insert_select(
             schema,
         )?;
         b.resolve_label(skip_label);
-        b.emit_op(Opcode::Next, read_cursor, (loop_start + 1) as i32, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::Next,
+            read_cursor,
+            (loop_start + 1) as i32,
+            0,
+            P4::None,
+            0,
+        );
         b.resolve_label(done_label);
         b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
     } else {
@@ -14987,10 +15051,24 @@ fn emit_without_rowid_collect_matches(
         );
     }
     let rec_reg = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, row_regs, n_cols as i32, rec_reg, P4::None, 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        row_regs,
+        n_cols as i32,
+        rec_reg,
+        P4::None,
+        0,
+    );
     b.emit_op(Opcode::SorterInsert, sorter_cursor, rec_reg, 0, P4::None, 0);
     b.resolve_label(skip_label);
-    b.emit_op(Opcode::Next, table_cursor, (scan_start + 1) as i32, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::Next,
+        table_cursor,
+        (scan_start + 1) as i32,
+        0,
+        P4::None,
+        0,
+    );
     b.resolve_label(scan_done);
 
     sorter_cursor
@@ -15034,10 +15112,24 @@ fn codegen_delete_without_rowid(
 
     // Pass 2: re-seek each collected row by primary key and delete it.
     let pass2_done = b.emit_label();
-    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, pass2_done, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        pass2_done,
+        P4::None,
+        0,
+    );
     let loop_body = b.current_addr();
     let sorted_reg = b.alloc_reg();
-    b.emit_op(Opcode::SorterData, sorter_cursor, sorted_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
     let row_regs = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
         b.emit_op(
@@ -15093,7 +15185,14 @@ fn codegen_delete_without_rowid(
         )?;
     }
     b.resolve_label(not_found);
-    b.emit_op(Opcode::SorterNext, sorter_cursor, loop_body as i32, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        loop_body as i32,
+        0,
+        P4::None,
+        0,
+    );
     b.resolve_label(pass2_done);
 
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
@@ -15151,10 +15250,24 @@ fn codegen_update_without_rowid(
     // remove the old table + index entries), then are overwritten by the
     // assignments to become the NEW image for re-insertion.
     let pass2_done = b.emit_label();
-    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, pass2_done, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        pass2_done,
+        P4::None,
+        0,
+    );
     let loop_body = b.current_addr();
     let sorted_reg = b.alloc_reg();
-    b.emit_op(Opcode::SorterData, sorter_cursor, sorted_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
     let col_regs = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
         b.emit_op(
@@ -15249,7 +15362,14 @@ fn codegen_update_without_rowid(
         )),
         1u16 | (oe_flag << 1),
     );
-    emit_without_rowid_index_inserts(b, table, table_cursor, col_regs, &pk_indices, stmt.or_conflict);
+    emit_without_rowid_index_inserts(
+        b,
+        table,
+        table_cursor,
+        col_regs,
+        &pk_indices,
+        stmt.or_conflict,
+    );
 
     // RETURNING: emit the NEW row image (col_regs now holds the rewritten row).
     if !stmt.returning.is_empty() {
@@ -15264,7 +15384,14 @@ fn codegen_update_without_rowid(
     }
 
     b.resolve_label(row_done);
-    b.emit_op(Opcode::SorterNext, sorter_cursor, loop_body as i32, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        loop_body as i32,
+        0,
+        P4::None,
+        0,
+    );
     b.resolve_label(pass2_done);
 
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
@@ -15325,8 +15452,7 @@ fn codegen_update_from_without_rowid(
     }
 
     // Collect FROM sources (leading + comma/JOIN) and any ON conditions.
-    let mut from_specs: Vec<(&str, Option<&str>)> =
-        Vec::with_capacity(1 + from_clause.joins.len());
+    let mut from_specs: Vec<(&str, Option<&str>)> = Vec::with_capacity(1 + from_clause.joins.len());
     from_specs.push(resolve_from_table(&from_clause.source)?);
     let mut on_conditions: Vec<&Expr> = Vec::new();
     for join in &from_clause.joins {
@@ -15435,7 +15561,10 @@ fn codegen_update_from_without_rowid(
         .iter()
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
-    let on_ph: u32 = on_conditions.iter().map(|e| count_anon_placeholders(e)).sum();
+    let on_ph: u32 = on_conditions
+        .iter()
+        .map(|e| count_anon_placeholders(e))
+        .sum();
     let where_ph: u32 = stmt
         .where_clause
         .as_ref()
@@ -15460,7 +15589,14 @@ fn codegen_update_from_without_rowid(
     }
     // Innermost: scan the target table.
     let target_done_label = b.emit_label();
-    b.emit_jump_to_label(Opcode::Rewind, target_cursor, 0, target_done_label, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Rewind,
+        target_cursor,
+        0,
+        target_done_label,
+        P4::None,
+        0,
+    );
     let target_body = b.current_addr() as i32;
 
     // Filters: each ON condition (join order) then WHERE. A failed condition
@@ -15488,8 +15624,22 @@ fn codegen_update_from_without_rowid(
     let old_regs = row_regs;
     let new_regs = row_regs + n_cols as i32;
     for i in 0..n_cols {
-        b.emit_op(Opcode::Column, target_cursor, i as i32, old_regs + i as i32, P4::None, 0);
-        b.emit_op(Opcode::Copy, old_regs + i as i32, new_regs + i as i32, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::Column,
+            target_cursor,
+            i as i32,
+            old_regs + i as i32,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::Copy,
+            old_regs + i as i32,
+            new_regs + i as i32,
+            0,
+            P4::None,
+            0,
+        );
     }
     b.set_next_anon_placeholder(1);
     emit_update_assignments(b, &stmt.assignments, table, new_regs, &scan)?;
@@ -15498,8 +15648,22 @@ fn codegen_update_from_without_rowid(
     emit_check_constraints(b, table, new_regs, None);
     emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
     let stash_rec = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, row_regs, (2 * n_cols) as i32, stash_rec, P4::None, 0);
-    b.emit_op(Opcode::SorterInsert, sorter_cursor, stash_rec, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        row_regs,
+        (2 * n_cols) as i32,
+        stash_rec,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::SorterInsert,
+        sorter_cursor,
+        stash_rec,
+        0,
+        P4::None,
+        0,
+    );
 
     b.resolve_label(skip_label);
     b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
@@ -15518,14 +15682,35 @@ fn codegen_update_from_without_rowid(
 
     // --- Pass 2: re-seek each collected row by OLD primary key and rewrite. ---
     let pass2_done = b.emit_label();
-    b.emit_jump_to_label(Opcode::SorterSort, sorter_cursor, 0, pass2_done, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        pass2_done,
+        P4::None,
+        0,
+    );
     let loop_body = b.current_addr();
     let sorted_reg = b.alloc_reg();
-    b.emit_op(Opcode::SorterData, sorter_cursor, sorted_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
     let old_img = b.alloc_regs(n_cols as i32);
     let new_img = b.alloc_regs(n_cols as i32);
     for i in 0..n_cols {
-        b.emit_op(Opcode::Column, sorter_cursor, i as i32, old_img + i as i32, P4::None, 0);
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            i as i32,
+            old_img + i as i32,
+            P4::None,
+            0,
+        );
     }
     for i in 0..n_cols {
         b.emit_op(
@@ -15551,9 +15736,23 @@ fn codegen_update_from_without_rowid(
         );
     }
     let pk_probe_rec = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, pk_probe_regs, n_pk as i32, pk_probe_rec, P4::None, 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        pk_probe_regs,
+        n_pk as i32,
+        pk_probe_rec,
+        P4::None,
+        0,
+    );
     let row_done = b.emit_label();
-    b.emit_jump_to_label(Opcode::NoConflict, target_cursor, pk_probe_rec, row_done, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::NoConflict,
+        target_cursor,
+        pk_probe_rec,
+        row_done,
+        P4::None,
+        0,
+    );
 
     // Remove the OLD secondary-index entries + OLD table row.
     emit_without_rowid_index_deletes(b, table, target_cursor, Some(old_img), &pk_indices);
@@ -15570,7 +15769,14 @@ fn codegen_update_from_without_rowid(
         0,
     );
     let rec_reg = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, new_img, n_cols as i32, rec_reg, P4::Affinity(aff_str), 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        new_img,
+        n_cols as i32,
+        rec_reg,
+        P4::Affinity(aff_str),
+        0,
+    );
     b.emit_op(
         Opcode::IdxInsert,
         target_cursor,
@@ -15583,7 +15789,14 @@ fn codegen_update_from_without_rowid(
         )),
         1u16 | (oe_flag << 1),
     );
-    emit_without_rowid_index_inserts(b, table, target_cursor, new_img, &pk_indices, stmt.or_conflict);
+    emit_without_rowid_index_inserts(
+        b,
+        table,
+        target_cursor,
+        new_img,
+        &pk_indices,
+        stmt.or_conflict,
+    );
 
     // RETURNING: the NEW image.
     if !stmt.returning.is_empty() {
@@ -15599,7 +15812,14 @@ fn codegen_update_from_without_rowid(
     }
 
     b.resolve_label(row_done);
-    b.emit_op(Opcode::SorterNext, sorter_cursor, loop_body as i32, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        loop_body as i32,
+        0,
+        P4::None,
+        0,
+    );
     b.resolve_label(pass2_done);
 
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
@@ -16030,7 +16250,15 @@ fn emit_index_inserts(
     rowid_reg: i32,
     stmt_conflict: Option<ConflictAction>,
 ) {
-    emit_index_inserts_filtered(b, table, table_cursor, col_regs, rowid_reg, stmt_conflict, None);
+    emit_index_inserts_filtered(
+        b,
+        table,
+        table_cursor,
+        col_regs,
+        rowid_reg,
+        stmt_conflict,
+        None,
+    );
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -17385,11 +17613,9 @@ fn validate_scan_column_ref(col_ref: &ColumnRef, scan: &ScanCtx<'_>) -> Result<(
             }
             return Err(qualified_column_not_found(qualifier, &col_ref.column));
         }
-        if let Some(secondary) = scan
-            .secondaries
-            .iter()
-            .find(|secondary| matches_table_or_alias(qualifier, secondary.table, secondary.table_alias))
-        {
+        if let Some(secondary) = scan.secondaries.iter().find(|secondary| {
+            matches_table_or_alias(qualifier, secondary.table, secondary.table_alias)
+        }) {
             if table_has_column_or_rowid(secondary.table, &col_ref.column) {
                 return Ok(());
             }
@@ -19927,9 +20153,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 if !matches_table_or_alias(qualifier, sc.table, sc.table_alias) {
                     // Check secondary table contexts (UPDATE ... FROM, possibly
                     // multiple FROM sources joined together).
-                    if let Some(sec) = sc.secondaries.iter().find(|sec| {
-                        matches_table_or_alias(qualifier, sec.table, sec.table_alias)
-                    }) {
+                    if let Some(sec) = sc
+                        .secondaries
+                        .iter()
+                        .find(|sec| matches_table_or_alias(qualifier, sec.table, sec.table_alias))
+                    {
                         emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
                         return;
                     }

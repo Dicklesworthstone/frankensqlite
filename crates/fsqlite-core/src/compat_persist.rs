@@ -1338,13 +1338,14 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                         None
                     }
                 })],
-                conflict_action: column.constraints.iter().find_map(|constraint| {
-                    match &constraint.kind {
+                conflict_action: column
+                    .constraints
+                    .iter()
+                    .find_map(|constraint| match &constraint.kind {
                         ColumnConstraintKind::Unique { conflict }
                         | ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
                         _ => None,
-                    }
-                }),
+                    }),
             });
             autoindex_ordinal += 1;
         }
@@ -2509,15 +2510,19 @@ pub(crate) fn columns_from_create_table_statement(
                 // alias, NOT NULL clause otherwise (UNIQUE conflicts live on the
                 // backing index).
                 let conflict_action = if is_ipk {
-                    col.constraints.iter().find_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
-                        _ => None,
-                    })
+                    col.constraints
+                        .iter()
+                        .find_map(|constraint| match &constraint.kind {
+                            ColumnConstraintKind::PrimaryKey { conflict, .. } => *conflict,
+                            _ => None,
+                        })
                 } else {
-                    col.constraints.iter().find_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::NotNull { conflict } => *conflict,
-                        _ => None,
-                    })
+                    col.constraints
+                        .iter()
+                        .find_map(|constraint| match &constraint.kind {
+                            ColumnConstraintKind::NotNull { conflict } => *conflict,
+                            _ => None,
+                        })
                 };
 
                 ColumnInfo {
