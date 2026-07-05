@@ -495,6 +495,12 @@ impl<F: VfsFile> WalFile<F> {
             cx,
             u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64"),
         )?;
+        // Make the fresh header + truncation durable before any frame is
+        // appended. Without this barrier a crash can leave the previous WAL
+        // generation's frames on disk behind a header they chain-validate
+        // against (salts are currently deterministic), replaying stale
+        // frames as committed on the next open.
+        file.sync(cx, SyncFlags::NORMAL)?;
 
         let running_checksum = read_wal_header_checksum(&header_bytes)?;
 
