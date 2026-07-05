@@ -1126,6 +1126,114 @@ fn divergence_hunt_hard_constructs() {
     }
 }
 
+/// WITHOUT ROWID secondary-index READ accessors (bd-rjaff). Index entries on
+/// WITHOUT ROWID tables are `(key terms..., PK cols...)` with no trailing
+/// rowid; the index-driven read path must extract the PK suffix and seek the
+/// table b-tree by PK instead of `IdxRowid` + `SeekRowid`. `INDEXED BY`
+/// forces the accessor, which previously failed with "index key record
+/// missing trailing integer rowid". Multi-row cases rely on index scan order
+/// (ascending key, PK tiebreak), which is identical in both engines.
+#[test]
+fn without_rowid_index_read_parity() {
+    let cases: Vec<Case> = vec![
+        // the bd-rjaff repro: forced index range read
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v >= 2",
+        },
+        // forced index equality read
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v = 2",
+        },
+        // duplicate index keys: full duplicate run must be returned
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 2), ('b', 2), ('c', 3), ('d', 1)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v = 2",
+        },
+        // range with both bounds
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v > 1 AND v < 4",
+        },
+        // planner-chosen access (no hint) must also be correct
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)",
+            ],
+            sql: "SELECT k, v FROM t WHERE v >= 2",
+        },
+        // composite PK suffix: index must round-trip both PK columns
+        Case {
+            setup: &[
+                "CREATE TABLE t(a INTEGER, b INTEGER, v INTEGER, PRIMARY KEY(a, b)) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30)",
+            ],
+            sql: "SELECT a, b, v FROM t INDEXED BY iv WHERE v >= 20",
+        },
+        // TEXT PK with rows inserted out of index order
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('z', 5), ('m', 9), ('a', 7)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v > 5",
+        },
+        // no matching rows
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v > 100",
+        },
+        // UNIQUE secondary index read
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE UNIQUE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('a', 1), ('b', 2)",
+            ],
+            sql: "SELECT k, v FROM t INDEXED BY iv WHERE v = 2",
+        },
+    ];
+
+    let mut divergences = Vec::new();
+    for c in &cases {
+        check(&mut divergences, c);
+    }
+    if !divergences.is_empty() {
+        let report = divergences.join("\n\n");
+        panic!(
+            "\n===== {} WITHOUT ROWID INDEX-READ DIVERGENCE(S) vs C SQLite (of {} cases) =====\n{}\n",
+            divergences.len(),
+            cases.len(),
+            report
+        );
+    }
+}
+
 /// `INSERT ... ON CONFLICT DO UPDATE` with an OMITTED conflict target
 /// (SQLite 3.35+; bd-6geae). The upsert must fire on whichever uniqueness
 /// constraint the new row violates — the rowid/INTEGER PRIMARY KEY *or* any

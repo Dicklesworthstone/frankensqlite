@@ -4678,10 +4678,33 @@ fn codegen_select_index_ordered_scan(
 
     let skip_row = b.emit_label();
     let rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::IdxRowid, index_cursor, rowid_reg, 0, P4::None, 0);
+    // WITHOUT ROWID index entries carry a PK suffix instead of a trailing
+    // rowid (bd-rjaff): seek the table b-tree by the PK columns read from the
+    // index entry. Covering reads on WITHOUT ROWID never resolve a Rowid
+    // source (rowid aliases do not resolve on WITHOUT ROWID tables), so
+    // `rowid_reg` staying unwritten is safe there.
+    let wr_pk_indices = if table.without_rowid {
+        Some(without_rowid_pk_indices(table)?)
+    } else {
+        None
+    };
+    if let Some(pk_indices) = wr_pk_indices.as_ref() {
+        if needs_table_lookup {
+            emit_without_rowid_index_to_table_seek(
+                b,
+                cursor,
+                index_cursor,
+                &index_plan.index,
+                pk_indices,
+                skip_row,
+            );
+        }
+    } else {
+        b.emit_op(Opcode::IdxRowid, index_cursor, rowid_reg, 0, P4::None, 0);
 
-    if needs_table_lookup {
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+        if needs_table_lookup {
+            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+        }
     }
 
     if let Some(where_expr) = where_clause {
@@ -5823,6 +5846,12 @@ fn grouped_inner_join_count_sum_plan<'a>(
 
     let left_table = find_table(schema, &left_name.name)?;
     let right_table = find_table(schema, &right_name.name)?;
+    // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
+    // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
+    // instead (bd-rjaff), so fall back to the generic join path.
+    if left_table.without_rowid || right_table.without_rowid {
+        return Ok(None);
+    }
     let tables = [
         (left_table, left_alias.as_deref()),
         (right_table, right_alias.as_deref()),
@@ -6203,6 +6232,12 @@ fn resolve_single_join_lookup_plan<'a>(
     join_kind: fsqlite_ast::JoinKind,
     on_expr: Option<&'a Expr>,
 ) -> Option<SingleJoinLookupPlan<'a>> {
+    // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
+    // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
+    // instead (bd-rjaff), so fall back to the generic join path.
+    if left_table.without_rowid || right_table.without_rowid {
+        return None;
+    }
     let on_expr = on_expr?;
     let Expr::BinaryOp {
         left,
@@ -6708,6 +6743,13 @@ fn resolve_multi_join_lookup_plan<'a>(
     // We need at least one join — the single-join path handles the 1
     // case already with its own (sort-capable) codegen.
     if join_tables.len() < 2 {
+        return None;
+    }
+
+    // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
+    // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
+    // instead (bd-rjaff), so fall back to the generic join path.
+    if left_table.without_rowid || join_tables.iter().any(|(table, ..)| table.without_rowid) {
         return None;
     }
 
