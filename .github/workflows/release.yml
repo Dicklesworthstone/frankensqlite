@@ -39,11 +39,33 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Full closure of version-carrying dependencies of the `fsqlite`
+          # crate, in topological (normal-dependency) order. Every crate here
+          # must be published for `fsqlite-core`/`fsqlite` to be installable
+          # at the new version — the previous 6-crate list only worked while
+          # the remaining crates had been published manually at the same
+          # version.
           crates=(
             fsqlite-error
             fsqlite-types
-            fsqlite-ext-json
+            fsqlite-observability
+            fsqlite-ast
+            fsqlite-func
+            fsqlite-vfs
+            fsqlite-parser
+            fsqlite-planner
+            fsqlite-wal
+            fsqlite-pager
+            fsqlite-btree
+            fsqlite-mvcc
+            fsqlite-vdbe
+            fsqlite-ext-fts3
             fsqlite-ext-fts5
+            fsqlite-ext-json
+            fsqlite-ext-rtree
+            fsqlite-ext-session
+            fsqlite-ext-icu
+            fsqlite-ext-misc
             fsqlite-core
             fsqlite
           )
