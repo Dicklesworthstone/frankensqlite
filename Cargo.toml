@@ -171,13 +171,11 @@ hashbrown = { version = "0.17", features = ["serde"] }
 dashmap = "6.2"
 lru = "0.18"
 rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
-# `default-features = false` drops asupersync's default `test-internals` feature
-# (which pulls tracing/tracing-subscriber/visibility) from every fsqlite crate.
-# Otherwise those test-only deps leak into downstream production builds via
-# fsqlite-vfs and friends (#104). fsqlite uses only asupersync's
-# raptorq/transport/security/types modules (always-on) plus `io-uring`, which the
-# crates that need it enable explicitly; nothing here uses asupersync proc-macros.
-asupersync = { version = "0.3.4", path = "/dp/asupersync", default-features = false }
+# `default-features = false` drops asupersync's proc-macro/runtime extras from
+# every fsqlite crate. Keep this registry-resolvable so downstream git consumers
+# can build FrankenSQLite without a private `/dp/asupersync` checkout; local
+# asupersync development belongs in an uncommitted Cargo patch/config override.
+asupersync = { version = "0.3.5", default-features = false }
 
 # Dev dependencies
 criterion = { version = "0.7", features = ["html_reports"] }
