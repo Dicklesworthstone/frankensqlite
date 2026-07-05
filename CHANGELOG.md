@@ -17,6 +17,75 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.14] -- 2026-07-05 (WITHOUT ROWID completion, omitted ON CONFLICT target, C SQLite parity sweep)
+
+Full-workspace lockstep release (`0.1.13 -> 0.1.14`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Added
+
+- **WITHOUT ROWID DML completion (bd-eja6l).** `RETURNING` on INSERT/UPDATE/
+  DELETE, `INSERT ... SELECT`, `ON CONFLICT DO UPDATE` (PK target), and
+  `UPDATE ... FROM` now work on WITHOUT ROWID tables, all oracle-gated against
+  the bundled C SQLite. WITHOUT ROWID PRIMARY KEY columns now enforce their
+  implicit NOT NULL (bd-0re6l).
+- **Omitted `ON CONFLICT` target (SQLite 3.35+, bd-6geae).**
+  `INSERT ... ON CONFLICT DO UPDATE` without a conflict target fires on
+  whichever uniqueness constraint the new row violates first — the rowid/
+  INTEGER PRIMARY KEY or any UNIQUE column/index, probed in schema order. A
+  targetless clause must be the last `ON CONFLICT` clause (parse rule pinned).
+- **Per-constraint conflict actions + `ON CONFLICT DO NOTHING`/`IGNORE`
+  codegen** for declared `ON CONFLICT <algo>` column/index constraints.
+- **WITHOUT ROWID secondary-index reads (bd-rjaff).** Index-driven SELECTs
+  (`INDEXED BY`, planner-chosen equality/range scans, ORDER-BY-via-index) now
+  seek the table b-tree by the PK suffix stored in the index entry instead of
+  failing with "index key record missing trailing integer rowid"; join lookup
+  lanes fall back to the generic path.
+- New oracle parity gates: scalar/dtoa/aggregate result parity (180 cases),
+  collation propagation, broad divergence hunt, WITHOUT ROWID upsert/
+  UPDATE-FROM/index-read gates, omitted-target upsert gate, printf/datetime
+  edge gate.
+
+### Fixed
+
+- **`GROUP BY` honors column-declared `COLLATE NOCASE`/`RTRIM`** (bd-cdl4w):
+  collated group keys route off the BINARY-only VDBE storage substrate.
+- **UNION dedup survivor matches C SQLite on NOCASE/RTRIM collations**
+  (bd-a6mlo): first occurrence within the last compound arm wins.
+- **Underscore digit separators** in numeric literals (SQLite 3.46+,
+  bd-n8m5v): `1_000`, `0xFF_FF`, `1.0_5`, `1e1_0`.
+- **Overflowing float literals are ±Infinity** (`SELECT 9e999` returns `Inf`,
+  not `1.7976931348623157e308`), matching C SQLite text-to-real conversion.
+- **printf/format parity:** non-finite floats render as `Inf`/`-Inf`/`NaN`
+  with sign flags honored; `%e`/`%g` honor `+`/space/`0` flags; `.*` takes
+  precision from the argument list; `%s` precision counts bytes.
+- **date/time parity:** numeric arguments outside the valid Julian-day range
+  return NULL unless a reinterpreting modifier (`unixepoch`, `julianday`,
+  `auto`) comes first.
+- **CLI:** multi-line `CREATE TRIGGER ... BEGIN ... END;` works in the REPL,
+  `.read`, and batch mode (sqlite3_complete()-style END tracking); `.dump`
+  emits `PRAGMA foreign_keys=OFF;` and dumps non-finite REALs as
+  `9.0e+999`/`-9.0e+999`/NULL so output reloads cleanly.
+- **Pager (journal mode):** cross-connection commits now detect committed-
+  freelist page aliasing — a peer consuming (or resurrecting) a committed free
+  page without growing the file aborts the second committer with
+  `BusySnapshot` instead of corrupting the b-tree (extends the bd-9inpb/am#152
+  db-size growth check).
+- **WAL:** `WalFile::create` fsyncs the fresh header + truncation before any
+  frame append, closing a stale-generation frame-replay window after a crash.
+- **VDBE:** INSERT target alias resolves through the WITHOUT ROWID
+  upsert/insert paths (`INSERT INTO t AS x ... DO UPDATE SET v = x.v`).
+- Build: the `#[cfg(not(feature = "ext-fts5"))]` reload stub matches its call
+  site (fixes `--no-default-features`).
+
+### CI / Release
+
+- `release.yml` publishes the full topological closure of `fsqlite`'s
+  versioned dependencies (22 crates) instead of a 6-crate subset that relied
+  on prior manual publishes.
+
+---
+
 ## [0.1.13] -- 2026-06-29 (post-0.1.12 UPSERT correctness + adaptive pager eviction)
 
 Full-workspace lockstep release (`0.1.12 -> 0.1.13`). Semver-compatible 0.1.x;

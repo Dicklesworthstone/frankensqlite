@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-harness"
-version = "0.1.13"
+version = "0.1.14"
 publish = false
 description = "Conformance test runner and golden file comparison"
 edition.workspace = true

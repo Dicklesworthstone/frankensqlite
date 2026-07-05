@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vfs"
-version = "0.1.13"
+version = "0.1.14"
 description = "Virtual filesystem abstraction layer"
 edition.workspace = true
 license.workspace = true
@@ -17,7 +17,7 @@ linux-uring-fs = ["native", "dep:uring-fs", "dep:pollster"]
 
 [dependencies]
 smallvec = "1.15"
-fsqlite-types = { version = "0.1.13", path = "../fsqlite-types", default-features = false }
+fsqlite-types = { version = "0.1.14", path = "../fsqlite-types", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
 asupersync = { workspace = true, optional = true, features = ["io-uring"] }

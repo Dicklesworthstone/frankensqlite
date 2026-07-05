@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-pager"
-version = "0.1.13"
+version = "0.1.14"
 description = "Page cache and journal management"
 edition.workspace = true
 license.workspace = true
@@ -29,11 +29,11 @@ evalue-eviction = []
 foldhash = "0.2.0"
 smallvec = { version = "1.15.2", features = ["const_generics", "union", "const_new"] }
 bumpalo = { version = "3", features = ["collections"] }
-fsqlite-types = { path = "../fsqlite-types", version = "0.1.13", default-features = false }
-fsqlite-error = { path = "../fsqlite-error", version = "0.1.13" }
+fsqlite-types = { path = "../fsqlite-types", version = "0.1.14", default-features = false }
+fsqlite-error = { path = "../fsqlite-error", version = "0.1.14" }
 fsqlite-observability = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.13", default-features = false }
-fsqlite-wal = { path = "../fsqlite-wal", version = "0.1.13", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.14", default-features = false }
+fsqlite-wal = { path = "../fsqlite-wal", version = "0.1.14", default-features = false }
 xxhash-rust = { workspace = true }
 chacha20poly1305 = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }

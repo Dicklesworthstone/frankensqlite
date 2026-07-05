@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-c-api"
-version = "0.1.13"
+version = "0.1.14"
 description = "SQLite C API compatibility shim for drop-in replacement"
 edition.workspace = true
 license.workspace = true
