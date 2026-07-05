@@ -1217,6 +1217,55 @@ fn without_rowid_index_read_parity() {
             ],
             sql: "SELECT k, v FROM t INDEXED BY iv WHERE v = 2",
         },
+        // ORDER BY satisfiable by the index (index-ordered scan lane)
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('z', 5), ('m', 9), ('a', 7)",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY v",
+        },
+        // ORDER BY DESC via the index
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('z', 5), ('m', 9), ('a', 7)",
+            ],
+            sql: "SELECT k, v FROM t ORDER BY v DESC",
+        },
+        // covering-shaped output (only indexed column selected) + ORDER BY
+        Case {
+            setup: &[
+                "CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX iv ON t(v)",
+                "INSERT INTO t VALUES ('z', 5), ('m', 9), ('a', 7)",
+            ],
+            sql: "SELECT v FROM t ORDER BY v",
+        },
+        // join with a WITHOUT ROWID table on the lookup side (join fast paths
+        // must fall back to the generic path)
+        Case {
+            setup: &[
+                "CREATE TABLE w(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID",
+                "CREATE INDEX wv ON w(v)",
+                "INSERT INTO w VALUES ('a', 1), ('b', 2)",
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO r VALUES (10, 1), (20, 2)",
+            ],
+            sql: "SELECT r.id, w.k FROM r JOIN w ON r.v = w.v ORDER BY r.id",
+        },
+        // grouped count/sum join shape with a WITHOUT ROWID side
+        Case {
+            setup: &[
+                "CREATE TABLE w(k TEXT PRIMARY KEY, g INTEGER, v INTEGER) WITHOUT ROWID",
+                "INSERT INTO w VALUES ('a', 1, 10), ('b', 1, 20), ('c', 2, 30)",
+                "CREATE TABLE r(id INTEGER PRIMARY KEY, g INTEGER)",
+                "INSERT INTO r VALUES (1, 1), (2, 1), (3, 2)",
+            ],
+            sql: "SELECT r.g, count(*), sum(w.v) FROM r JOIN w ON r.g = w.g GROUP BY r.g ORDER BY r.g",
+        },
     ];
 
     let mut divergences = Vec::new();
