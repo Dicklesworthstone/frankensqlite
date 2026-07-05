@@ -22945,7 +22945,10 @@ fn test_conformance_update_from_comma_unaliased_subquery_s291b() {
         for m in &mismatches {
             eprintln!("{m}\n");
         }
-        panic!("{} UPDATE...FROM comma unaliased subquery mismatches", mismatches.len());
+        panic!(
+            "{} UPDATE...FROM comma unaliased subquery mismatches",
+            mismatches.len()
+        );
     }
 }
 

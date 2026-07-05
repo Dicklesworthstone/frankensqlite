@@ -707,7 +707,10 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
     // the default/`'ceiling'` behavior; the `'floor'` modifier later subtracts
     // the reported `n_floor` overflow days to clamp back to end-of-month.
     let n_floor = compute_floor(new_y, new_mo, d);
-    Ok(Some((ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac), n_floor)))
+    Ok(Some((
+        ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac),
+        n_floor,
+    )))
 }
 
 // ── Output Formatters ─────────────────────────────────────────────────────
@@ -1029,6 +1032,7 @@ fn parse_args(args: &[SqliteValue]) -> Option<(f64, bool)> {
         return None;
     }
 
+    let numeric_input = matches!(&args[0], SqliteValue::Integer(_) | SqliteValue::Float(_));
     let input = match &args[0] {
         SqliteValue::Text(s) => parse_timestring(s)?,
         SqliteValue::Integer(i) => *i as f64,
@@ -1042,6 +1046,20 @@ fn parse_args(args: &[SqliteValue]) -> Option<(f64, bool)> {
         return None;
     }
     let modifiers: Vec<String> = args[1..].iter().map(SqliteValue::to_text).collect();
+
+    // C SQLite rejects a numeric argument outside the representable
+    // Julian-day range (date.c validJulianDay), returning NULL rather than
+    // formatting a saturated garbage date — unless the first modifier
+    // reinterprets the raw number ('unixepoch', 'julianday', 'auto').
+    if numeric_input {
+        let first = modifiers
+            .first()
+            .map(|modifier| modifier.trim().to_ascii_lowercase());
+        let reinterprets_raw = matches!(first.as_deref(), Some("unixepoch" | "julianday" | "auto"));
+        if !reinterprets_raw && !(0.0..=AUTO_JDN_MAX).contains(&input) {
+            return None;
+        }
+    }
 
     apply_modifiers(input, &modifiers)
 }

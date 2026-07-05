@@ -2356,7 +2356,9 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             param_idx += 1;
             if w < 0 {
                 left_align = true;
-                width = usize::try_from(w.unsigned_abs()).unwrap_or(0).min(100_000_000);
+                width = usize::try_from(w.unsigned_abs())
+                    .unwrap_or(0)
+                    .min(100_000_000);
             } else {
                 width = usize::try_from(w).unwrap_or(0).min(100_000_000);
             }
@@ -2370,19 +2372,30 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             }
         }
 
-        // Parse precision
+        // Parse precision: a literal number, or `*` to take the precision from
+        // the next argument (like width above). A negative dynamic precision
+        // means "no precision", matching C printf.
         let mut precision = None;
         if i < chars.len() && chars[i] == '.' {
             i += 1;
-            let mut prec = 0usize;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                prec = prec
-                    .saturating_mul(10)
-                    .saturating_add(chars[i] as usize - '0' as usize)
-                    .min(100_000_000); // Prevent OOM from malicious formats
+            if i < chars.len() && chars[i] == '*' {
                 i += 1;
+                let p = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+                param_idx += 1;
+                if p >= 0 {
+                    precision = Some(usize::try_from(p).unwrap_or(0).min(100_000_000));
+                }
+            } else {
+                let mut prec = 0usize;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    prec = prec
+                        .saturating_mul(10)
+                        .saturating_add(chars[i] as usize - '0' as usize)
+                        .min(100_000_000); // Prevent OOM from malicious formats
+                    i += 1;
+                }
+                precision = Some(prec);
             }
-            precision = Some(prec);
         }
 
         if i >= chars.len() {
@@ -2429,22 +2442,36 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
                 let prec = precision.unwrap_or(6);
-                let raw = if spec == 'e' {
-                    format!("{val:.prec$e}")
+                if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
+                {
+                    result.push_str(&s);
                 } else {
-                    format!("{val:.prec$E}")
-                };
-                // C printf always uses explicit sign and minimum 2-digit exponent
-                let formatted = normalize_exponent(&raw);
-                result.push_str(&pad_string(&formatted, width, left_align));
+                    let raw = if spec == 'e' {
+                        format!("{val:.prec$e}")
+                    } else {
+                        format!("{val:.prec$E}")
+                    };
+                    // C printf always uses explicit sign and minimum 2-digit exponent
+                    let formatted = normalize_exponent(&raw);
+                    result.push_str(&finish_float_padding(
+                        &formatted, width, left_align, show_sign, space_sign, zero_pad,
+                    ));
+                }
             }
             'g' | 'G' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
                 let prec = precision.unwrap_or(6);
                 let sig = prec.max(1);
-                let formatted = format_float_g(val, sig, spec == 'G');
-                result.push_str(&pad_string(&formatted, width, left_align));
+                if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
+                {
+                    result.push_str(&s);
+                } else {
+                    let formatted = format_float_g(val, sig, spec == 'G');
+                    result.push_str(&finish_float_padding(
+                        &formatted, width, left_align, show_sign, space_sign, zero_pad,
+                    ));
+                }
             }
             's' | 'z' => {
                 let param = params.get(param_idx);
@@ -2454,8 +2481,20 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                     Some(SqliteValue::Null) | None => String::new(),
                     Some(v) => v.to_text(),
                 };
+                // C SQLite counts %s precision in BYTES. It will emit a bare
+                // partial code point; we floor to the previous char boundary
+                // instead (Rust strings must stay valid UTF-8), which matches
+                // C SQLite whenever the cut lands on a boundary.
                 let truncated = if let Some(prec) = precision {
-                    val.chars().take(prec).collect::<String>()
+                    if val.len() > prec {
+                        let mut end = prec;
+                        while end > 0 && !val.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        val[..end].to_owned()
+                    } else {
+                        val
+                    }
                 } else {
                     val
                 };
@@ -2609,6 +2648,69 @@ fn format_integer(
     }
 }
 
+/// C SQLite renders non-finite floats in printf as `Inf` / `-Inf` / `NaN`
+/// (sign flags honored for infinities, space-padded to width, never
+/// zero-padded). Returns `None` for finite values.
+fn nonfinite_float_str(
+    val: f64,
+    width: usize,
+    left_align: bool,
+    show_sign: bool,
+    space_sign: bool,
+) -> Option<String> {
+    let body = if val.is_nan() {
+        "NaN".to_owned()
+    } else if val.is_infinite() {
+        let sign = if val < 0.0 {
+            "-"
+        } else if show_sign {
+            "+"
+        } else if space_sign {
+            " "
+        } else {
+            ""
+        };
+        format!("{sign}Inf")
+    } else {
+        return None;
+    };
+    Some(pad_string(&body, width, left_align))
+}
+
+/// Apply printf sign flags and width padding to an already-formatted float
+/// body (which may carry a leading `-`). Zero padding is inserted between the
+/// sign and the digits, matching C printf.
+fn finish_float_padding(
+    body: &str,
+    width: usize,
+    left_align: bool,
+    show_sign: bool,
+    space_sign: bool,
+    zero_pad: bool,
+) -> String {
+    let (sign, digits) = if let Some(rest) = body.strip_prefix('-') {
+        ("-", rest)
+    } else if show_sign {
+        ("+", body)
+    } else if space_sign {
+        (" ", body)
+    } else {
+        ("", body)
+    };
+    let full_len = sign.len() + digits.len();
+    if full_len >= width {
+        return format!("{sign}{digits}");
+    }
+    let pad = width - full_len;
+    if left_align {
+        format!("{sign}{digits}{}", " ".repeat(pad))
+    } else if zero_pad {
+        format!("{sign}{}{digits}", "0".repeat(pad))
+    } else {
+        format!("{}{sign}{digits}", " ".repeat(pad))
+    }
+}
+
 fn format_float_f(
     val: f64,
     prec: usize,
@@ -2618,6 +2720,9 @@ fn format_float_f(
     space_sign: bool,
     zero_pad: bool,
 ) -> String {
+    if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign) {
+        return s;
+    }
     // Use is_sign_negative() to detect -0.0 (IEEE 754: -0.0 < 0.0 is false).
     let sign = if val.is_sign_negative() {
         "-".to_owned()
