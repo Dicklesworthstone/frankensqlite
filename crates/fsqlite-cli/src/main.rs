@@ -1817,6 +1817,10 @@ where
     }
     .map_err(|error| error.to_string())?;
 
+    // Match sqlite3's .dump preamble: tables are emitted in name order, not
+    // FK-dependency order, so the reload must run with FK enforcement off.
+    write_sql_statement(out, "PRAGMA foreign_keys=OFF;", colorize_sql)
+        .map_err(|error| error.to_string())?;
     write_sql_statement(out, "BEGIN TRANSACTION;", colorize_sql)
         .map_err(|error| error.to_string())?;
 
@@ -1972,6 +1976,13 @@ fn sql_literal(value: &SqliteValue) -> String {
             rendered.push('\'');
             rendered
         }
+        // Non-finite REALs have no SQL literal form; sqlite3's .dump emits
+        // 9.0e+999 / -9.0e+999 (which parse back as infinities) and NULL
+        // for NaN. `Display` would render `Inf`, a syntax error on reload.
+        SqliteValue::Float(f) if f.is_nan() => "NULL".to_owned(),
+        SqliteValue::Float(f) if f.is_infinite() => {
+            if *f < 0.0 { "-9.0e+999" } else { "9.0e+999" }.to_owned()
+        }
         _ => value.to_string(),
     }
 }
@@ -1988,6 +1999,14 @@ fn statement_complete(buffer: &str) -> bool {
     let bytes = buffer.as_bytes();
     let mut state = StatementScanState::Normal;
     let mut last_significant: Option<u8> = None;
+    // Trigger awareness (like sqlite3_complete()): a statement starting with
+    // CREATE [TEMP|TEMPORARY] TRIGGER contains `;`-terminated body statements
+    // and is only complete when its final `;` follows the closing END keyword.
+    // `head_words` tracks the first tokens of the CURRENT statement (reset at
+    // each top-level `;`), mirroring sqlite3_complete()'s per-statement state.
+    let mut head_words: Vec<String> = Vec::with_capacity(3);
+    let mut last_word = String::new();
+    let mut in_trigger = false;
 
     let mut i = 0usize;
     while i < bytes.len() {
@@ -2011,7 +2030,46 @@ fn statement_complete(buffer: &str) -> bool {
                     continue;
                 }
 
+                if b.is_ascii_alphanumeric() || b == b'_' {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    last_significant = Some(bytes[i - 1]);
+                    let word = buffer[start..i].to_ascii_uppercase();
+                    if !in_trigger && head_words.len() < 3 {
+                        head_words.push(word.clone());
+                        in_trigger = head_words.first().is_some_and(|w| w == "CREATE")
+                            && (head_words.get(1).is_some_and(|w| w == "TRIGGER")
+                                || (head_words
+                                    .get(1)
+                                    .is_some_and(|w| w == "TEMP" || w == "TEMPORARY")
+                                    && head_words.get(2).is_some_and(|w| w == "TRIGGER")));
+                    }
+                    last_word = word;
+                    continue;
+                }
+
                 last_significant = Some(b);
+
+                if b == b';' {
+                    if in_trigger {
+                        // Only `END ;` closes the trigger body; inner
+                        // `;`-terminated body statements do not.
+                        if last_word == "END" {
+                            in_trigger = false;
+                            head_words.clear();
+                        }
+                    } else {
+                        // Statement boundary: restart head tracking so a
+                        // trailing CREATE TRIGGER in a multi-statement buffer
+                        // is detected (sqlite3_complete() resets its state
+                        // machine at each semicolon the same way).
+                        head_words.clear();
+                    }
+                    last_word.clear();
+                }
 
                 match b {
                     b'\'' => state = StatementScanState::SingleQuote,
@@ -2092,7 +2150,7 @@ fn statement_complete(buffer: &str) -> bool {
         return false;
     }
 
-    last_significant == Some(b';')
+    last_significant == Some(b';') && !in_trigger
 }
 
 fn write_usage<W>(out: &mut W) -> io::Result<()>
@@ -2379,6 +2437,98 @@ mod tests {
         assert!(!statement_complete("SELECT ';'"));
         assert!(statement_complete("SELECT ';';"));
         assert!(statement_complete("SELECT 'it''s; fine';"));
+    }
+
+    #[test]
+    fn test_statement_complete_waits_for_trigger_end() {
+        // A trigger body's inner `;` must not complete the statement.
+        assert!(!statement_complete(
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  UPDATE y SET a = 1;\n"
+        ));
+        assert!(statement_complete(
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  UPDATE y SET a = 1;\nEND;"
+        ));
+        assert!(statement_complete(
+            "create temp trigger t before delete on x begin select 1; end ;"
+        ));
+        assert!(!statement_complete(
+            "CREATE TEMPORARY TRIGGER t AFTER INSERT ON x BEGIN\n  SELECT 1;\n  SELECT 2;\n"
+        ));
+        // `END` inside a string literal does not close the trigger.
+        assert!(!statement_complete(
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN INSERT INTO y VALUES('END;');\n"
+        ));
+        // Non-trigger statements are unaffected.
+        assert!(statement_complete("BEGIN;"));
+        assert!(statement_complete("CREATE TABLE endings(x);"));
+        // A trailing CREATE TRIGGER in a multi-statement buffer is still
+        // detected (head tracking resets at each top-level `;`).
+        assert!(!statement_complete(
+            "INSERT INTO t VALUES(1); CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1;"
+        ));
+        assert!(statement_complete(
+            "INSERT INTO t VALUES(1); CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1; END;"
+        ));
+    }
+
+    #[test]
+    fn test_repl_accepts_multi_line_trigger() {
+        let mut input = Cursor::new(
+            b"CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);\n\
+CREATE TABLE audit(item_id INTEGER, v TEXT);\n\
+CREATE TRIGGER items_ai AFTER INSERT ON items BEGIN\n\
+  INSERT INTO audit VALUES(NEW.id, NEW.v);\n\
+END;\n\
+INSERT INTO items(v) VALUES('hello');\n\
+SELECT item_id, v FROM audit;\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        let stderr = String::from_utf8_lossy(&err);
+        assert_eq!(exit_code, 0, "stderr: {stderr}");
+        assert!(err.is_empty(), "unexpected stderr: {stderr}");
+        let stdout = String::from_utf8(out).expect("output should be utf-8");
+        assert!(
+            stdout.contains("hello"),
+            "trigger should have fired and audit row should be selected, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_dump_emits_foreign_keys_off_and_nonfinite_reals() {
+        let mut input = Cursor::new(
+            b"CREATE TABLE r(x REAL);\n\
+INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
+.dump\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        assert_eq!(exit_code, 0);
+        let stdout = String::from_utf8(out).expect("output should be utf-8");
+        assert!(
+            stdout.contains("PRAGMA foreign_keys=OFF;"),
+            "dump must disable FK enforcement for reload, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("9.0e+999"),
+            "infinite REAL must dump as a parseable literal, got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Inf"),
+            "raw Inf is not a valid SQL literal, got: {stdout}"
+        );
     }
 
     #[test]
