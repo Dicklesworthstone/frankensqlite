@@ -7318,6 +7318,11 @@ where
     }
 
     /// Commit using the rollback journal protocol.
+    ///
+    /// `allocated_from_freelist` is the committing transaction's freelist
+    /// allocations (see `SimpleTransaction::allocated_from_freelist`); it is
+    /// needed to reconstruct the transaction's begin-time view of the
+    /// committed freelist for the cross-connection aliasing check below.
     #[allow(clippy::too_many_lines)]
     fn commit_journal<S: std::hash::BuildHasher>(
         cx: &Cx,
@@ -7326,6 +7331,7 @@ where
         inner: &mut PagerInner<V::File>,
         write_set: &HashMap<PageNumber, StagedPage, S>,
         original_db_size: u32,
+        allocated_from_freelist: &[PageNumber],
     ) -> Result<()> {
         if !write_set.is_empty() {
             // Escalate to EXCLUSIVE before writing to the database file.
@@ -7390,6 +7396,65 @@ where
                         .filter(|&page| page > original_db_size && page <= committed_db_size)
                         .collect();
                     if !conflicts.is_empty() {
+                        conflicts.sort_unstable();
+                        return Err(FrankenError::BusySnapshot {
+                            conflicting_pages: conflicts
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        });
+                    }
+                }
+
+                // A peer can also consume (or repopulate) a *committed
+                // freelist* page without growing the file, which the
+                // db-size check above cannot see. Reconstruct this
+                // transaction's begin-time view of the committed freelist
+                // (`inner.freelist` still excludes the pages this
+                // transaction popped, so restore them) and compare it
+                // against the on-disk committed freelist under the
+                // EXCLUSIVE lock. Any divergence within the snapshot range
+                // means a peer commit changed freelist ownership since our
+                // snapshot: a page we popped may now be owned by the
+                // peer's b-tree (writing it would alias), and a page the
+                // peer popped would be resurrected onto the freelist by
+                // our commit's stale serialization (aliasing a later
+                // allocation). Abort first-committer-wins style with
+                // `BusySnapshot`; the caller retries against refreshed
+                // committed state.
+                let snapshot_freelist = Self::durable_freelist_pages_with_inner(
+                    inner,
+                    original_db_size,
+                    allocated_from_freelist,
+                );
+                let first_trunk = u32::from_be_bytes([image[32], image[33], image[34], image[35]]);
+                let freelist_count =
+                    u32::from_be_bytes([image[36], image[37], image[38], image[39]]);
+                if !(snapshot_freelist.is_empty() && (first_trunk == 0 || freelist_count == 0)) {
+                    let committed_freelist: HashSet<u32> = load_freelist_from_disk(
+                        cx,
+                        &inner.db_file,
+                        page_size,
+                        committed_db_size,
+                        first_trunk,
+                        freelist_count,
+                    )?
+                    .into_iter()
+                    .map(|page| page.get())
+                    .filter(|&page| page <= original_db_size)
+                    .collect();
+                    let snapshot_freelist: HashSet<u32> =
+                        snapshot_freelist.iter().map(|page| page.get()).collect();
+                    if snapshot_freelist != committed_freelist {
+                        eprintln!(
+                            "FREELIST-DEBUG model={snapshot_freelist:?} disk={committed_freelist:?} original_db_size={original_db_size} committed_db_size={committed_db_size} first_trunk={first_trunk} count={freelist_count} allocated={allocated_from_freelist:?} inner_freelist={:?}",
+                            inner.freelist
+                        );
+                        let mut conflicts: Vec<u32> = snapshot_freelist
+                            .symmetric_difference(&committed_freelist)
+                            .copied()
+                            .collect();
                         conflicts.sort_unstable();
                         return Err(FrankenError::BusySnapshot {
                             conflicting_pages: conflicts
@@ -9509,6 +9574,7 @@ where
                 &mut inner,
                 &self.write_set,
                 self.original_db_size,
+                &self.allocated_from_freelist,
             );
             record_pager_commit_duration(&PAGER_COMMIT_JOURNAL_TIME_NS, t_journal_commit_start);
             result
@@ -9914,6 +9980,7 @@ where
                     &mut inner,
                     &self.write_set,
                     self.original_db_size,
+                    &self.allocated_from_freelist,
                 )
             }
         };
@@ -20729,6 +20796,75 @@ mod tests {
             p3.get()
         );
         concurrent.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_journal_commit_detects_cross_connection_committed_freelist_reuse_alias() {
+        // Two connections (their own `PagerInner` each) both snapshot the same
+        // committed freelist and both pop the same committed free page for
+        // different content. Reuse does not grow the file, so the am#152
+        // db-size growth check alone cannot see it. The second committer must
+        // abort with `BusySnapshot` (first-committer-wins) instead of writing
+        // its content over the page the first committer now owns.
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/journal_freelist_alias.db");
+        let cx = Cx::new();
+
+        // Seed: grow the db, then free one page onto the COMMITTED freelist.
+        let p2 = {
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p2 = txn.allocate_page(&cx).unwrap();
+            let p3 = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p2, &sample_page(0x22)).unwrap();
+            txn.write_page(&cx, p3, &sample_page(0x33)).unwrap();
+            txn.commit(&cx).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn.free_page(&cx, p2).unwrap();
+            txn.commit(&cx).unwrap();
+            p2
+        };
+
+        let pager_a = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager_b = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+        // Both writers begin (snapshotting the committed freelist) BEFORE
+        // either commits, so both see p2 as free.
+        let mut txn_a = pager_a.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut txn_b = pager_b.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let a_page = txn_a.allocate_page(&cx).unwrap();
+        let b_page = txn_b.allocate_page(&cx).unwrap();
+        assert_eq!(
+            a_page, p2,
+            "premise: writer A reuses the committed free page"
+        );
+        assert_eq!(
+            b_page, p2,
+            "premise: writer B reuses the SAME committed free page from its own snapshot"
+        );
+
+        txn_a.write_page(&cx, a_page, &sample_page(0xAA)).unwrap();
+        txn_b.write_page(&cx, b_page, &sample_page(0xBB)).unwrap();
+
+        txn_a.commit(&cx).unwrap();
+        let err = txn_b
+            .commit(&cx)
+            .expect_err("second committer reusing an already-claimed freelist page must abort");
+        assert!(
+            matches!(err, FrankenError::BusySnapshot { .. }),
+            "expected BusySnapshot first-committer-wins abort, got: {err}"
+        );
+
+        // The surviving on-disk content of the contested page is writer A's.
+        let verify = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let txn = verify.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let page = txn.get_page(&cx, p2).unwrap();
+        assert_eq!(
+            page.as_ref(),
+            &sample_page(0xAA)[..],
+            "contested page must hold the first committer's bytes"
+        );
     }
 
     #[test]
