@@ -7447,10 +7447,6 @@ where
                     let snapshot_freelist: HashSet<u32> =
                         snapshot_freelist.iter().map(|page| page.get()).collect();
                     if snapshot_freelist != committed_freelist {
-                        eprintln!(
-                            "FREELIST-DEBUG model={snapshot_freelist:?} disk={committed_freelist:?} original_db_size={original_db_size} committed_db_size={committed_db_size} first_trunk={first_trunk} count={freelist_count} allocated={allocated_from_freelist:?} inner_freelist={:?}",
-                            inner.freelist
-                        );
                         let mut conflicts: Vec<u32> = snapshot_freelist
                             .symmetric_difference(&committed_freelist)
                             .copied()
@@ -9567,6 +9563,14 @@ where
             // Journal mode: Direct commit (no group commit)
             // Journal mode keeps inner locked throughout - no parallelization.
             let t_journal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
+            // The freelist-alias check needs the transaction's FULL set of
+            // freelist pops. `drain_unstaged_allocated_pages` (Phase A) has
+            // already moved never-written allocations out of
+            // `allocated_from_freelist` into `pending_returned_pages`, so
+            // restore both when reconstructing the begin-time freelist view
+            // (EOF-origin entries are filtered out by the db-size bound).
+            let mut alias_check_restored = self.allocated_from_freelist.clone();
+            alias_check_restored.extend_from_slice(&pending_returned_pages);
             let result = Self::commit_journal(
                 cx,
                 &self.vfs,
@@ -9574,7 +9578,7 @@ where
                 &mut inner,
                 &self.write_set,
                 self.original_db_size,
-                &self.allocated_from_freelist,
+                &alias_check_restored,
             );
             record_pager_commit_duration(&PAGER_COMMIT_JOURNAL_TIME_NS, t_journal_commit_start);
             result
@@ -9973,6 +9977,10 @@ where
                 }
                 Ok(())
             } else {
+                // See commit(): restore drained never-written freelist pops
+                // (`pending_returned_pages`) for the freelist-alias check.
+                let mut alias_check_restored = self.allocated_from_freelist.clone();
+                alias_check_restored.extend_from_slice(&pending_returned_pages);
                 Self::commit_journal(
                     cx,
                     &self.vfs,
@@ -9980,7 +9988,7 @@ where
                     &mut inner,
                     &self.write_set,
                     self.original_db_size,
-                    &self.allocated_from_freelist,
+                    &alias_check_restored,
                 )
             }
         };

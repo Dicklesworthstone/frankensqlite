@@ -1620,6 +1620,31 @@ fn divergence_hunt_hard_constructs() {
 #[test]
 fn printf_and_datetime_edge_parity() {
     let cases: Vec<Case> = vec![
+        // overflowing float literals are ±Infinity, not f64::MAX
+        Case {
+            setup: NO_SETUP,
+            sql: "SELECT 9e999",
+        },
+        Case {
+            setup: NO_SETUP,
+            sql: "SELECT -9e999",
+        },
+        Case {
+            setup: NO_SETUP,
+            sql: "SELECT 9e999 = 1e999",
+        },
+        Case {
+            setup: NO_SETUP,
+            sql: "SELECT 9e999 + 1",
+        },
+        Case {
+            setup: NO_SETUP,
+            sql: "SELECT 9e999 / 9e999",
+        },
+        Case {
+            setup: NO_SETUP,
+            sql: "SELECT typeof(9e999)",
+        },
         Case {
             setup: NO_SETUP,
             sql: "SELECT printf('%f', 9e999)",
