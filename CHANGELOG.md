@@ -17,6 +17,27 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.15] -- 2026-07-06 (FTS5 UPDATE on WITHOUT ROWID shadow tables)
+
+Full-workspace lockstep release (`0.1.14 -> 0.1.15`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Fixed
+
+- **`UPDATE` on an FTS5-indexed table in a canonically-valid, stock-SQLite-created
+  store no longer aborts as false corruption** (#121). Such an `UPDATE` routes its
+  FTS5 shadow-table maintenance through the rootpage-0 FTS5 write path, whose
+  `replace_storage_table_rows` helper unconditionally opened a *table* cursor.
+  Stock SQLite persists the `%_idx` / `%_config` FTS5 shadows as `WITHOUT ROWID`
+  (index-structured) b-trees, so a table cursor anchored on an index-structured
+  root tripped the `table_seek_for_insert` `is_table` guard and aborted with
+  `database disk image is malformed: table_seek called on index page`. The
+  shadow-write path now reads each shadow's `without_rowid` flag and, for
+  `WITHOUT ROWID` shadows, opens an *index* cursor and re-inserts each row as a
+  full-record index key; the rowid-shadow path is unchanged. FrankenSQLite-created
+  stores were unaffected (their shadows are rowid tables), so this surfaced only
+  against stores built by stock SQLite (e.g. a pre-existing cass index).
+
 ## [0.1.14] -- 2026-07-05 (WITHOUT ROWID completion, omitted ON CONFLICT target, C SQLite parity sweep)
 
 Full-workspace lockstep release (`0.1.13 -> 0.1.14`). Semver-compatible 0.1.x;
