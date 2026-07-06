@@ -32807,19 +32807,49 @@ impl Connection {
     where
         I: IntoIterator<Item = (i64, Vec<SqliteValue>)>,
     {
-        let root_page = {
+        let (root_page, without_rowid) = {
             let schema = self.schema.borrow();
-            schema
+            let table = schema
                 .iter()
                 .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+            (table.root_page, table.without_rowid)
         };
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         let rows = rows.into_iter().collect::<Vec<_>>();
 
         self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            // A stock-SQLite-created FTS5 store persists the `%_idx` (and
+            // `%_config`) shadows as `WITHOUT ROWID` tables — index-structured
+            // b-trees, not rowid tables. They MUST be opened as *index* cursors
+            // and mutated via full-record index-key insert/delete. Opening a
+            // *table* cursor on an index-structured root page trips the
+            // `is_table` guard in `table_seek_for_insert`, aborting an
+            // otherwise-valid UPDATE with a false "database disk image is
+            // malformed: table_seek called on index page … cursor is_table flag
+            // likely incorrect". (frankensqlite#121)
+            //
+            // FrankenSQLite-created FTS5 stores model these same shadows as
+            // rowid tables (`without_rowid == false`), so they keep the table
+            // path unchanged.
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, !without_rowid)?;
+            if without_rowid {
+                // Clear every existing key (the leftmost entry shrinks the tree
+                // by one each iteration), then re-insert the full-record keys.
+                // WITHOUT ROWID cells store the entire row as the index key, with
+                // the PRIMARY KEY columns leading — for `%_idx`
+                // (segid, term, pgno PRIMARY KEY(segid, term)) and `%_config`
+                // (k PRIMARY KEY, v) the supplied column order already matches,
+                // and the synthetic rowid the caller supplies is irrelevant.
+                while cursor.first(cx)? {
+                    cursor.delete(cx)?;
+                }
+                for (_synthetic_rowid, values) in rows {
+                    let record = serialize_record(&values);
+                    cursor.index_insert(cx, &record)?;
+                }
+                return Ok(());
+            }
             let mut existing_rowids = Vec::new();
             if cursor.first(cx)? {
                 loop {
