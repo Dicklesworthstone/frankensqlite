@@ -3389,7 +3389,8 @@ mod tests {
 
         // Cold baseline target for this (cell_count, insert_idx) shape (no page,
         // so no topology heat is consulted).
-        let baseline_target = leaf_table_split_policy_for_page(None, 12, 11).target_left_basis_points;
+        let baseline_target =
+            leaf_table_split_policy_for_page(None, 12, 11).target_left_basis_points;
 
         // ENFORCED: heat shifts the *enacted* target off baseline.
         crate::instrumentation::set_conflict_topology_policy_mode(

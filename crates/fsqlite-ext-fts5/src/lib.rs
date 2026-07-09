@@ -8163,8 +8163,7 @@ impl Fts5Table {
             }));
         }
         let flush = pending.flush_to_segment(next_segid, existing_structure.clone())?;
-        let structure_data_row =
-            Fts5DataRow::new(FTS5_STRUCTURE_ROWID, flush.structure.encode());
+        let structure_data_row = Fts5DataRow::new(FTS5_STRUCTURE_ROWID, flush.structure.encode());
         let leaf_data_row = flush
             .data_rows
             .into_iter()

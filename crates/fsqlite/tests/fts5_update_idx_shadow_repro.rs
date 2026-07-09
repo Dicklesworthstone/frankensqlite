@@ -176,8 +176,11 @@ fn update_stock_created_fts_indexed_table_does_not_abort() {
         .expect("create stock schema");
         conn.execute("INSERT INTO commands(command) VALUES ('first command')", [])
             .expect("stock insert 1");
-        conn.execute("INSERT INTO commands(command) VALUES ('second command')", [])
-            .expect("stock insert 2");
+        conn.execute(
+            "INSERT INTO commands(command) VALUES ('second command')",
+            [],
+        )
+        .expect("stock insert 2");
         // Sanity: stock's own integrity_check passes.
         let ok: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))

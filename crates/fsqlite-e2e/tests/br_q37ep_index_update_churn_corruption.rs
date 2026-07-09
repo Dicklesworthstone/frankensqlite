@@ -517,7 +517,10 @@ fn concurrent_shared_index_churn(writers: usize, rows: i64, rounds: i64, wal: bo
     let ic: String = cconn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .expect("canonical integrity_check");
-    assert_eq!(ic, "ok", "canonical SQLite on concurrently-churned file: {ic}");
+    assert_eq!(
+        ic, "ok",
+        "canonical SQLite on concurrently-churned file: {ic}"
+    );
 
     let states: Vec<String> = {
         let mut stmt = cconn

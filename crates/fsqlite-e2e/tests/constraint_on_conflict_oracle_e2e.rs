@@ -203,7 +203,8 @@ fn unique_on_conflict_replace_survives_reopen() {
     // The conflicting INSERT runs AFTER reopen, so the REPLACE must come from the
     // reloaded autoindex's conflict_action (not the in-memory writer state).
     let conflicting = "INSERT INTO t VALUES (3,10,'c')"; // u=10 conflicts -> REPLACE id1
-    r.execute_batch(conflicting).expect("rusqlite conflict insert");
+    r.execute_batch(conflicting)
+        .expect("rusqlite conflict insert");
     let f = Connection::open(&db_str).expect("reopen frank");
     f.execute(conflicting)
         .unwrap_or_else(|e| panic!("frank reopened `{conflicting}`: {e}"));

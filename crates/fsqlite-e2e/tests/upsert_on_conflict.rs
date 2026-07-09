@@ -349,7 +349,9 @@ fn upsert_do_update_aborts_on_nontarget_unique_conflict() {
         "INSERT INTO t VALUES (1, 'alpha', 'one-updated') ON CONFLICT(id) DO UPDATE SET v = excluded.v;",
     )
     .expect("target-conflict upsert should still update");
-    let alpha = conn.query("SELECT v FROM t WHERE id = 1;").expect("query alpha");
+    let alpha = conn
+        .query("SELECT v FROM t WHERE id = 1;")
+        .expect("query alpha");
     assert_eq!(
         col(&alpha, 0, 0),
         "one-updated",

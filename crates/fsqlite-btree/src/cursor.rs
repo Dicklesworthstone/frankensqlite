@@ -14214,7 +14214,8 @@ mod tests {
         let after_partial_balance = btree_leaf_reuse_snapshot();
         let after_partial_ops = btree_metrics_snapshot();
         assert_eq!(
-            after_partial_balance.balance_for_delete_calls - before_balance.balance_for_delete_calls,
+            after_partial_balance.balance_for_delete_calls
+                - before_balance.balance_for_delete_calls,
             0,
             "deleting non-emptying cells must defer rebalancing (zero balance_for_delete)"
         );

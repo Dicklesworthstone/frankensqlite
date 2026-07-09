@@ -68,8 +68,7 @@ impl IssueRecord {
     }
 
     fn has_acceptance_criteria(&self) -> bool {
-        !self.acceptance_criteria.trim().is_empty()
-            || has_acceptance_criteria(&self.full_text())
+        !self.acceptance_criteria.trim().is_empty() || has_acceptance_criteria(&self.full_text())
     }
 }
 
