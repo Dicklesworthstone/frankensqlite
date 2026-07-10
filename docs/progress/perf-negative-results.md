@@ -16009,3 +16009,34 @@ test is on the executed path, not merely linked into it.
   sha256 (both arms), the A/A null-control median for the exact harness+function, per-function
   self-time from a profile-verified frame, worker id, and cv. A reject lacking these is not
   durable evidence and a later agent is entitled to reopen it.
+
+## 2026-07-10 - BLOCKED: SIMD record serialization (bd-o023g) un-implementable under #![forbid(unsafe_code)]
+
+- Result type: NON-CANDIDATE / architectural blocker. No source changed. Selected as the top
+  ready in-lane PERF bead (bv triage; skipped WASM bd-hnzcr; write_single is cod's lane).
+- bd-o023g asks for AVX2 bulk varint encoding of INTEGER-only records. It cannot be written in
+  `crates/fsqlite-types/src/record.rs`: the workspace sets `unsafe_code = "forbid"` (Cargo.toml)
+  and only `fsqlite-vfs` / `fsqlite-c-api` override it. Both `core::arch::x86_64::_mm256_*`
+  intrinsics and `#[target_feature(enable="avx2")]` functions are `unsafe`, so the bead's
+  approach is prohibited here. This is the mechanical reason the repo has ZERO `_mm256_`
+  intrinsics and ZERO `#[target_feature(enable)]` fns (confirmed by rg across `crates/`).
+- The existing "SIMD" scaffolding is a scalar no-op: `classify_integer_block_simd(values)` is
+  `values.map(scalar_integer_encoding)` (record.rs:1286). The `avx2_available()` gate selects a
+  scalar path either way, and `nightly-simd` is enabled in no bench and not by default.
+- The safe route does not escape the ISA baseline: `core::simd::Simd<i64,4>` is safe and legal
+  under the unsafe-forbid, but portable SIMD lowers only to ENABLED target features. Per the
+  ISA baseline audit above, release-perf builds sse2-only, so `Simd<i64,4>` emits 2x SSE2, not
+  AVX2. Reaching AVX2 requires a whole-binary target-feature floor, which carries the
+  measurement-integrity trap already recorded (release stays portable opt-level=z; a
+  release-perf-only flag benchmarks a binary faster than ships).
+- Decision required (project-level, not a code task), recorded on bd-o023g: (a) core::simd +
+  nightly-simd + a documented target-feature floor on BOTH profiles; (b) a scoped unsafe
+  exception for fsqlite-types; or (c) close won't-do (SQLite core is scalar C, the comparison is
+  fair, and the DELETE hot path has zero SIMD frames, so ROI is confined to INTEGER-heavy INSERT
+  serialization).
+- Retry condition: only after a scope decision lands. Until then any AVX2 serialization attempt
+  in fsqlite-types fails to compile under `#![forbid(unsafe_code)]`.
+- Meta note for the ISA vein generally: profile-driven lever selection is additionally blocked
+  because `rch exec` returns bench/test TEXT but not the built binary, so fresh `perf` frame
+  data on current HEAD cannot be captured (bd-kbuck). Lever selection here rests on existing
+  ranked-frame artifacts, not a fresh profile.
