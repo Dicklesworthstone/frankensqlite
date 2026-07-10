@@ -1,0 +1,11 @@
+Fri Jul 10 15:07:19 UTC 2026
+label=fs-64
+engine=fsqlite
+rows=1280
+delete_count=64
+iters=40000
+target_cpu=2
+perf_cpus=0-1,3-9
+collector_timeout_status=124
+collector_postpass_forced_stop_after_target_exit=true
+perf_data_header_finalized=false

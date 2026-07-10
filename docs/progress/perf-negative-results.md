@@ -15793,3 +15793,41 @@ test is on the executed path, not merely linked into it.
   first across reps (or randomize slot order), which removes the ordering bias the null
   control just exposed. Until then, treat any ratio below ~4% at 64 ops as undecided, and
   always publish the null control beside the result.
+
+## 2026-07-10 - REJECT: exact prepared-DELETE matrix count and perf build-ID postpass
+
+- Result type: REJECTED MEASUREMENT SUBSTRATE. No optimization source lever
+  was present in the profiled binary, and no performance conclusion is drawn
+  from its unfinalized raw file.
+- Exact attempted envelope: FSQLite on `vmi1152480`, CPU 2, 1280 source rows,
+  64 sparse rowids, 40,000 measured transactions; each acknowledged perf
+  window contained only `BEGIN -> prepared DELETE x64 -> COMMIT`. Population,
+  three warmups, and restore INSERTs were disabled. The target stderr confirms
+  `engine=fsqlite mode=exact-gate delete_count=64`.
+- Numbers: the arm reached its 900-second guard under worker load and exited
+  124. Perf then spent more than 17 additional minutes spawning `addr2line`
+  from its build-ID cache pass. It was stopped after the target had exited.
+  The preserved remote raw file is 348,653,656 bytes, SHA-256
+  `f1870d97a9d4886e3d586f2a9e5a3e64c548e253bdc2d4e80128f957395fe5ae`;
+  its header retained `data size = 0`, so it is invalid for self-time.
+- Ledger-integrity reachability anchor: the immediately preceding valid capture
+  of this same exact boundary measured
+  `execute_prepared_direct_simple_delete` at 1.62% / 7,396 self samples and
+  `send_perf_control` at 0.62% / 2,639. It also measured the candidate-routing
+  leaders (`materialize_deletions` 8.41% / 40,028,
+  `cell_on_page_size_fast` 4.67% / 22,443,
+  `delete_rowid_with_reason` 3.00% / 14,190, and
+  `table_leaf_rowid_at` 2.39% / 11,315). Thus the benchmark is live, but this
+  row must never be used to reject production code because current-run
+  self-time did not finalize.
+- Evidence:
+  `tests/artifacts/perf/cod-fsq-write-single-exact-gate-20260710T1510Z/`.
+  Profiler source SHA-256
+  `814c2458007cca3ecf32c2c2f9ece283484580012fc242dbbc473a1853c42b23`;
+  binary SHA-256
+  `7c0050ae105b751e500112a82cb832b29fc8ec6ea208a561f6a5e6cd564314af`.
+- Retry condition: add `--no-buildid --no-buildid-cache`, pre-open balanced
+  control/ack descriptors, use `timeout --kill-after=15s`, and reduce the six
+  FSQLite/C SQLite arms to `5k/10k`, `1.25k/2.5k`, and `320/640` transactions
+  at 64/256/1024 deletes. Keep raw data remote and copy only finalized reports,
+  hashes, and metadata.

@@ -1,0 +1,52 @@
+Fri Jul 10 15:06:50 UTC 2026
+vmi1152480
+Linux vmi1152480 6.17.0-40-generic #40-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 19 16:42:13 UTC 2026 x86_64 GNU/Linux
+perf version 6.17.13
+7c0050ae105b751e500112a82cb832b29fc8ec6ea208a561f6a5e6cd564314af  /data/tmp/cod-fsq-write-single-exact-gate-20260710T1510Z/perf-update-delete-release-perf
+814c2458007cca3ecf32c2c2f9ece283484580012fc242dbbc473a1853c42b23  /data/projects/frankensqlite/crates/fsqlite-e2e/src/bin/perf_update_delete.rs
+/data/tmp/cod-fsq-write-single-exact-gate-20260710T1510Z/perf-update-delete-release-perf: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=c32cab727e45817ce730da98d0bbff4c455687b2, with debug_info, not stripped
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  10
+On-line CPU(s) list:                     0-9
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC Processor (with IBPB)
+CPU family:                              23
+Model:                                   1
+Thread(s) per core:                      1
+Core(s) per socket:                      10
+Socket(s):                               1
+Stepping:                                2
+BogoMIPS:                                6390.39
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm rep_good nopl xtopology cpuid extd_apicid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext ssbd ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 rdseed adx smap clflushopt sha_ni xsaveopt xsavec xgetbv1 arat
+Hypervisor vendor:                       KVM
+Virtualization type:                     full
+L1d cache:                               320 KiB (10 instances)
+L1i cache:                               640 KiB (10 instances)
+L2 cache:                                5 MiB (10 instances)
+L3 cache:                                8 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-9
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Mitigation; untrained return thunk; SMT disabled
+Vulnerability Spec rstack overflow:      Mitigation; SMT disabled
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; IBPB conditional; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1       774G  558G  217G  73% /

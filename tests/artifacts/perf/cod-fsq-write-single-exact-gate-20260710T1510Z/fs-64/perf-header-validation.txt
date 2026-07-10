@@ -1,0 +1,34 @@
+WARNING: The /data/tmp/cod-fsq-write-single-exact-gate-20260710T1510Z/fs-64/perf.data file's data size field is 0 which is unexpected.
+Was the 'perf record' command properly terminated?
+# ========
+# captured on    : Fri Jul 10 11:22:19 2026
+# header version : 1
+# data offset    : 568
+# data size      : 0
+# feat offset    : 568
+# hostname : ±DûÆ9a
+# os release : (null)
+# perf version : (null)
+# arch : (null)
+# nrcpus online : 0
+# nrcpus avail : 0
+# cpudesc : (null)
+# cpuid : AuthenticAMD,23,1,2
+# total memory : 0 kB
+# cmdline :
+# event desc: not available or unable to read
+# CPU_TOPOLOGY info available, use -I to display
+# NUMA_TOPOLOGY info available, use -I to display
+# pmu mappings: cpu = 4, breakpoint = 5, kprobe = 8, msr = 10, software = 1, tool = 4294967294, tracepoint = 2, uprobe = 9
+# CACHE info available, use -I to display
+# time of first sample : 0.000000
+# time of last sample : 0.000000
+# sample duration :      0.000 ms
+# MEM_TOPOLOGY info available, use -I to display
+# bpf_prog_info empty
+# btf info empty
+# cpu pmu capabilities: not available
+# HYBRID_TOPOLOGY info available, use -I to display
+# missing features: TRACING_DATA BRANCH_STACK GROUP_DESC AUXTRACE STAT CLOCKID DIR_FORMAT COMPRESSED CLOCK_DATA
+# ========
+#
