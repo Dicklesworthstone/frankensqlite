@@ -1,0 +1,5 @@
+prepared_delete_atlas_ab/paired/64
+                        time:   [103.34 µs 104.37 µs 106.34 µs]
+Found 1 outliers among 50 measurements (2.00%)
+  1 (2.00%) high severe
+PREPARED_DELETE_ATLAS_AB delete_count=64 n=50 original_median_ns=39470.852 packed_median_ns=43248.965 csqlite_median_ns=20647.886 packed_over_original=1.095719 original_over_csqlite=1.911617 packed_over_csqlite=2.094595 original_cv_pct=6.689 packed_cv_pct=6.572 csqlite_cv_pct=6.220

@@ -1,0 +1,9 @@
+Gnuplot not found, using plotters backend
+Benchmarking prepared_delete_atlas_ab/paired/64
+Benchmarking prepared_delete_atlas_ab/paired/64: Warming up for 5.0000 s
+Benchmarking prepared_delete_atlas_ab/paired/64: Collecting 50 samples in estimated 15.012 s (50k iterations)
+Benchmarking prepared_delete_atlas_ab/paired/64: Analyzing
+
+thread 'main' (1587830) panicked at crates/fsqlite-e2e/benches/operation_baseline_bench.rs:776:9:
+assertion failed: samples.len() >= PREPARED_DELETE_AB_SAMPLE_SIZE
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

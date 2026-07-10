@@ -15887,3 +15887,76 @@ test is on the executed path, not merely linked into it.
   `classify_integer_block_simd` or another autovectorizable loop carries non-trivial
   self-time (profile-verify first). It is a non-starter for write_single and for any
   memory-bound path. No source changed this pass.
+
+## 2026-07-10 - REJECT: ephemeral packed same-leaf DELETE atlas
+
+- Result type: REJECTED SOURCE LEVER. The candidate was manually unwound after
+  it lost the exact prepared-DELETE keep gate at all three required stream
+  sizes. No candidate source remains in the tree.
+- Ledger-first/profile routing: the exact
+  `BEGIN -> prepared sparse DELETEs -> COMMIT` profile ranked
+  `TableLeafDeleteRun::materialize_deletions` first at 8.41% / 40,028 self
+  samples, followed by `cell_on_page_size_fast` at 4.67% / 22,443,
+  `TableLeafDeleteRun::delete_rowid_with_reason` at 3.00% / 14,190, and
+  `TableLeafPayloadPatchRun::table_leaf_rowid_at` at 2.39% / 11,315.
+  Standalone materializer, admission-cache, rowid-search, and hot-arm-pruning
+  variants were already blocked. The May 9 compact-area-cache row explicitly
+  reopened this family only as a broader delete-run representation, so this
+  attempt used one such lever across the combined 18.47% representation path:
+  a guarded packed u64 rowid/cell-index atlas plus a 256-bit deletion bitmap
+  for compact, non-descending, overflow-free 4 KiB leaves with at most 256
+  cells, retaining the legacy fallback for every other page.
+- Touched during the rejected candidate:
+  `crates/fsqlite-btree/src/cell.rs`,
+  `crates/fsqlite-btree/src/cursor.rs`,
+  `crates/fsqlite-core/src/connection.rs`, and
+  `crates/fsqlite-e2e/benches/operation_baseline_bench.rs`. The production
+  selector and same-binary reference harness were removed manually after the
+  verdict; diffs for all four files are empty.
+- Correctness proof, always fail-closed through RCH:
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo test --profile release-perf -p fsqlite-btree test_packed_table_leaf_delete_atlas_matches_legacy_bytes_and_outcomes -- --nocapture`
+  passed 1 test with 488 filtered, and
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo test --profile release-perf -p fsqlite-core prepared_direct_delete_ -- --nocapture`
+  passed 6 unit plus 3 C-SQLite conformance tests. Both ran on `ovh-a`.
+- Honest A/B: one release-perf binary on worker `ovh-a`, SHA-256
+  `4e0cc65d1d08d09385f6f6b14442f25bd90d85eb54bfe237c9d63d937c110c5d`.
+  ORIG, packed, and C SQLite had separate warmed fixtures; every batch rotated
+  through all six arm orders. The returned duration covered only
+  `BEGIN -> prepared sparse DELETEs -> COMMIT`; restore INSERTs were outside.
+  Exact command:
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -p fsqlite-e2e --bench operation_baseline_bench -- prepared_delete_atlas_ab --noplot`.
+
+  | deletes | ORIG ns | packed ns | C SQLite ns | packed / ORIG | ORIG / C | packed / C | CV ORIG / packed / C |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 64 | 38,686.234 | 42,367.534 | 19,994.336 | 1.095158x | 1.934860x | 2.118977x | 1.360% / 0.832% / 1.015% |
+  | 256 | 145,356.700 | 160,383.766 | 76,073.080 | 1.103381x | 1.910751x | 2.108285x | 0.465% / 0.526% / 0.540% |
+  | 1024 | 567,864.024 | 627,787.659 | 298,535.206 | 1.105525x | 1.902168x | 2.102893x | 2.396% / 2.230% / 4.445% |
+
+- Ledger-integrity proof: a symbolized, unstripped release-perf build on the
+  same worker (SHA-256
+  `736c1c88890bfb63d018b4a2f56ef4244c33c216a9e1852353e977e2bc9e7003`)
+  recorded nonzero self-time for both arms in the 64-delete group:
+  shared `TableLeafDeleteRun::materialize_deletions` 3.84% / 959,
+  candidate `PackedTableLeafDeleteAtlas::try_from_entry` 1.93% / 481,
+  candidate physical-order sort 1.79% / 447, and legacy
+  `TableLeafPayloadPatchRun::table_leaf_rowid_at` 0.65% / 162 samples.
+  The profile-slowed run completed perf collection and finalized its raw data,
+  then exited 101 because it did not retain the timing runner's normal 50
+  callback batches; it is used only for reachability/self-time, never for the
+  timing verdict. Remote raw data is 210,753,600 bytes, SHA-256
+  `fa065e84386e28d27f5751297cdad1512a55f428c64935dc50a11cf6b8c5f4f4`.
+- Mechanism: constructing an ephemeral full-leaf atlas before the first delete
+  and sorting live cells back into physical order at materialization added
+  3.72% directly measured self-time. That front-loaded scan plus sort exceeded
+  the reparsing/search work it removed, yielding a flat 9.52%-10.55% loss as
+  the stream grew. This is not noise: every arm CV is below 5%.
+- Evidence:
+  `tests/artifacts/perf/cod-fsq-packed-atlas-reject-20260710T1611Z/`
+  contains the exact matrix, commands, source hashes, complete symbol table,
+  binary identity, and remote raw-data identity.
+- Do not retry an ephemeral packed DELETE atlas that rebuilds a complete leaf
+  index and sorts/compacts it at flush. Reconsider only as a persistent,
+  page-owned decoded representation that removes both the atlas build scan and
+  the physical-order sort, after a fresh exact-envelope profile proves those
+  two costs are absent. The next distinct eligible profiled vein is BEGIN
+  snapshot/schema-cookie cloning; it must be treated as a separate lever.

@@ -1,0 +1,10 @@
+worker=ovh-a
+profile=release-perf
+command=RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -p fsqlite-e2e --bench operation_baseline_bench -- prepared_delete_atlas_ab --noplot
+binary_sha256=4e0cc65d1d08d09385f6f6b14442f25bd90d85eb54bfe237c9d63d937c110c5d
+order_schedule=all six permutations of ORIG,PACKED,C_SQLITE
+timed_window=BEGIN -> prepared sparse DELETEs -> COMMIT
+restore=outside timed window
+PREPARED_DELETE_ATLAS_AB delete_count=64 n=50 original_median_ns=38686.234 packed_median_ns=42367.534 csqlite_median_ns=19994.336 packed_over_original=1.095158 original_over_csqlite=1.934860 packed_over_csqlite=2.118977 original_cv_pct=1.360 packed_cv_pct=0.832 csqlite_cv_pct=1.015
+PREPARED_DELETE_ATLAS_AB delete_count=256 n=50 original_median_ns=145356.700 packed_median_ns=160383.766 csqlite_median_ns=76073.080 packed_over_original=1.103381 original_over_csqlite=1.910751 packed_over_csqlite=2.108285 original_cv_pct=0.465 packed_cv_pct=0.526 csqlite_cv_pct=0.540
+PREPARED_DELETE_ATLAS_AB delete_count=1024 n=50 original_median_ns=567864.024 packed_median_ns=627787.659 csqlite_median_ns=298535.206 packed_over_original=1.105525 original_over_csqlite=1.902168 packed_over_csqlite=2.102893 original_cv_pct=2.396 packed_cv_pct=2.230 csqlite_cv_pct=4.445
