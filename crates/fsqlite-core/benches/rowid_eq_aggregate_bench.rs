@@ -99,6 +99,22 @@ fn time_nonagg_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     start.elapsed().as_nanos()
 }
 
+/// Rowid IN-list arm: `SELECT id, v WHERE id IN (a,b,c)`, one SeekRowid per value vs a
+/// `NOT INDEXED` full scan. Values vary. Exercises `codegen_select_rowid_in_scan`.
+fn time_rowid_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+    let hint = if not_indexed { " NOT INDEXED" } else { "" };
+    let start = Instant::now();
+    for j in 0..EXECS_PER_SAMPLE {
+        let a = 1 + ((base + j as i64) % ROWS);
+        let b = 1 + ((base + j as i64 + 7) % ROWS);
+        let c = 1 + ((base + j as i64 + 13) % ROWS);
+        let sql = format!("SELECT id, v FROM t{hint} WHERE id IN ({a}, {b}, {c})");
+        let rows = conn.query(black_box(&sql)).expect("query");
+        black_box(&rows);
+    }
+    start.elapsed().as_nanos()
+}
+
 fn median(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
     v[v.len() / 2]
@@ -240,5 +256,37 @@ fn main() {
         (mn_nb as f64) / (mn_na as f64),
         us(mn_na),
         us(mn_nb)
+    );
+
+    // Rowid IN-list arm: SELECT id,v WHERE id IN (a,b,c), SeekRowid per value vs scan.
+    black_box(time_rowid_in_arm(&conn, false, 0));
+    black_box(time_rowid_in_arm(&conn, true, 0));
+    let mut rid_seek = Vec::with_capacity(SAMPLES);
+    let mut rid_scan = Vec::with_capacity(SAMPLES);
+    let mut rid_na = Vec::with_capacity(SAMPLES);
+    let mut rid_nb = Vec::with_capacity(SAMPLES);
+    for s in 0..SAMPLES {
+        let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
+        rid_seek.push(time_rowid_in_arm(&conn, false, base));
+        rid_scan.push(time_rowid_in_arm(&conn, true, base));
+        rid_na.push(time_rowid_in_arm(&conn, false, base));
+        rid_nb.push(time_rowid_in_arm(&conn, false, base));
+    }
+    let mrid_seek = median(rid_seek);
+    let mrid_scan = median(rid_scan);
+    let mrid_na = median(rid_na);
+    let mrid_nb = median(rid_nb);
+    println!("--- rowid in-list: SELECT id,v WHERE id IN (a,b,c) ---");
+    println!("rowid in seek median = {:.3} us/query", us(mrid_seek));
+    println!("rowid in scan median = {:.3} us/query", us(mrid_scan));
+    println!(
+        "rowid in speedup (scan/seek) = {:.3}x",
+        (mrid_scan as f64) / (mrid_seek as f64)
+    );
+    println!(
+        "rowid in NULL control (seek/seek) = {:.3}x  [{:.3} vs {:.3} us/query]",
+        (mrid_nb as f64) / (mrid_na as f64),
+        us(mrid_na),
+        us(mrid_nb)
     );
 }

@@ -1905,18 +1905,63 @@ pub fn codegen_select(
     // integer-literal safe subset as the aggregate IN path; declined for ORDER BY (the seek
     // yields value-then-rowid order, which only happens to equal the sort order sometimes),
     // LIMIT, and DISTINCT to keep this first cut small.
-    let index_in = if is_aggregate
-        || !stmt.order_by.is_empty()
-        || stmt.limit.is_some()
-        || distinct != Distinctness::All
-        || !group_by.is_empty()
-        || having.is_some()
-        || table.without_rowid
-    {
-        None
+    let in_list_seek_allowed = !is_aggregate
+        && from_index_hint.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !table.without_rowid;
+    // bd-2dgf5: `WHERE <rowid> IN (<int literals>)` — one SeekRowid per distinct value.
+    let rowid_in = if in_list_seek_allowed {
+        extract_rowid_in_list_target(where_clause.as_deref(), table, table_alias)
     } else {
-        index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
+        None
     };
+    let index_in = if in_list_seek_allowed && rowid_in.is_none() {
+        index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
+    } else {
+        None
+    };
+
+    // bd-2dgf5: route a seekable integer IN-list BEFORE the planner directive. The connection
+    // emits a `FullTableScan` directive for `rowid IN (...)` (it does not model IN as a
+    // seekable access path), which would otherwise bypass these seeks. The gate is narrow
+    // (INTEGER-affinity + integer literals + IN, no ORDER BY / LIMIT / DISTINCT) and the seek
+    // is differential-proven bit-identical to SQLite, so preferring it over a full scan is
+    // always correct and strictly faster.
+    if let Some(values) = rowid_in {
+        return codegen_select_rowid_in_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            &values,
+        );
+    }
+    if let Some((idx_schema, values)) = index_in {
+        return codegen_select_index_in_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            &values,
+        );
+    }
 
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
@@ -2269,22 +2314,6 @@ pub fn codegen_select(
                 end_label,
             )
         }
-    } else if let Some((idx_schema, values)) = index_in {
-        // --- Index-seek SELECT over an integer IN-list (no ORDER BY / LIMIT / DISTINCT) ---
-        codegen_select_index_in_scan(
-            b,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            columns,
-            out_regs,
-            out_col_count,
-            done_label,
-            end_label,
-            idx_schema,
-            &values,
-        )
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
         // --- Aggregate query WITH GROUP BY ---
         codegen_select_group_by_aggregate(
@@ -2841,6 +2870,57 @@ fn codegen_select_index_in_scan(
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Codegen for `SELECT <cols> FROM t WHERE <rowid> IN (<int literals>)`.
+///
+/// bd-2dgf5. Rowid is unique, so each distinct value is a single `SeekRowid` — no index
+/// cursor, no duplicate-run loop. Values are ascending (matching C SQLite's IN order), and a
+/// `SeekRowid` miss skips to the next value. Integer-literal gate makes each seek exact. The
+/// caller gates out ORDER BY / LIMIT / DISTINCT / WITHOUT ROWID.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_rowid_in_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    values: &[i64],
+) -> Result<(), CodegenError> {
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    for &value in values {
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
+        let next_value = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            next_value,
+            P4::None,
+            0,
+        );
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+        b.resolve_label(next_value);
+    }
+    b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
@@ -18897,6 +18977,40 @@ fn extract_rowid_target_expr<'a>(
     None
 }
 
+/// The distinct integer values a `WHERE <rowid> IN (<int list>)` predicate can seek per value.
+///
+/// bd-2dgf5. Integer literals only (`SeekRowid` truncates via `to_integer()`, so `id = 2.5`
+/// would wrongly match rowid 2; negatives parse as unary-negate and decline), `IN` not
+/// `NOT IN`, non-empty. De-duplicated. Anything else declines to the scan.
+fn extract_rowid_in_list_target(
+    where_clause: Option<&Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<Vec<i64>> {
+    let Expr::In {
+        expr,
+        set: fsqlite_ast::InSet::List(values),
+        not: false,
+        ..
+    } = where_clause?
+    else {
+        return None;
+    };
+    if values.is_empty() || !is_rowid_expr(expr, Some(table), table_alias) {
+        return None;
+    }
+    let mut ints = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Expr::Literal(Literal::Integer(n), _) => ints.push(*n),
+            _ => return None,
+        }
+    }
+    ints.sort_unstable();
+    ints.dedup();
+    Some(ints)
+}
+
 fn extract_rowid_range_target<'a>(
     where_clause: Option<&'a Expr>,
     table: Option<&TableSchema>,
@@ -24762,12 +24876,58 @@ mod tests {
             "SELECT id FROM t WHERE k IN (2, 3.0)",
             "SELECT id FROM t WHERE k NOT IN (1, 2)",
             "SELECT id FROM t WHERE v IN (1, 2)",
+            "SELECT id FROM t NOT INDEXED WHERE k IN (1, 2)",
         ] {
             assert!(
                 bd_2dgf5_program(sql)
                     .iter()
                     .any(|op| op.opcode == Opcode::Rewind),
                 "`{sql}` must decline the non-aggregate IN-list seek (Rewind present)"
+            );
+        }
+    }
+
+    /// bd-2dgf5: `SELECT <cols> FROM t WHERE <rowid> IN (<int literals>)` does one `SeekRowid`
+    /// per distinct value and never full-scans; declines (Rewind-scans) for ORDER BY / LIMIT /
+    /// DISTINCT / non-integer or negative elements / NOT IN. Covered by `rowid_in_list_matches_sqlite`.
+    #[test]
+    fn bd_2dgf5_rowid_in_list_point_lookups() {
+        let seek_rowids = |sql: &str| -> usize {
+            bd_2dgf5_program(sql)
+                .iter()
+                .filter(|op| op.opcode == Opcode::SeekRowid)
+                .count()
+        };
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id IN (5, 10, 15)");
+        assert_eq!(
+            seek_rowids("SELECT id, v FROM t WHERE id IN (5, 10, 15)"),
+            3
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "id IN (5,10,15) must not full-scan"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "rowid IN uses SeekRowid, not an index SeekGE"
+        );
+        assert!(ops.iter().any(|op| op.opcode == Opcode::ResultRow));
+        assert_eq!(seek_rowids("SELECT id FROM t WHERE id IN (5, 5, 10)"), 2);
+
+        for sql in [
+            "SELECT id FROM t WHERE id IN (5, 10) ORDER BY id",
+            "SELECT id FROM t WHERE id IN (5, 10) LIMIT 1",
+            "SELECT DISTINCT id FROM t WHERE id IN (5, 10)",
+            "SELECT id FROM t WHERE id IN (2.0, 5)",
+            "SELECT id FROM t WHERE id IN (-5, 2)",
+            "SELECT id FROM t WHERE id NOT IN (5, 10)",
+            "SELECT id FROM t NOT INDEXED WHERE id IN (5, 10)",
+        ] {
+            assert!(
+                bd_2dgf5_program(sql)
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must decline the rowid IN-list seek (Rewind present)"
             );
         }
     }

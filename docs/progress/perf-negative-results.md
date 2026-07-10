@@ -16350,3 +16350,46 @@ test is on the executed path, not merely linked into it.
   DISTINCT variants, and rowid `id IN (list)` still scan (correct, unoptimized).
 - Provenance: worker hz1 (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the commit;
   binary sha256 unavailable (rch returns no binary; bd-kbuck).
+
+## 2026-07-10 - WIN: rowid IN-list point lookups + IN routed before the planner directive (bd-2dgf5)
+
+- Result type: KEPT. Semantic gate passed; landed. Includes a routing fix that also lifted the
+  already-landed non-aggregate secondary-index IN (85a29d83).
+- Profile-first: `SELECT id, v FROM t WHERE id IN (5,10,15)` (id INTEGER PRIMARY KEY) full-scanned
+  while C SQLite does `SEARCH INTEGER PRIMARY KEY`. Common (batch PK lookups). Rowid is unique, so
+  each distinct value is a single `SeekRowid` — no index cursor, no duplicate-run loop.
+- FALSE START, recorded because the median gate caught it: the first cut added the rowid IN branch
+  to the `codegen_select` else-if chain (after the planner-directive block). The A/B measured
+  0.996x — NO win. Diagnosis: the connection emits a `FullTableScan` planner directive for
+  `rowid IN (...)` (it does not model IN as a seekable access path), and the directive block
+  `return`s a full scan at codegen.rs before the else-if chain is reached. The secondary-index IN
+  fired only because the planner emits no such directive for it.
+- FIX: route a seekable integer IN-list (rowid or secondary index) BEFORE the directive block, via
+  an early return. Safe because the gate is narrow (INTEGER-affinity + integer literals + IN, no
+  ORDER BY / LIMIT / DISTINCT / hint) and the seek is differential-proven bit-identical, so it is
+  always correct and strictly faster than the full scan the directive would pick.
+- SECOND FALSE START, also caught by the gate: moving IN routing before the directive made the seek
+  ignore `NOT INDEXED` (the directive had been the thing honoring it), so the A/B's `NOT INDEXED`
+  scan arm ALSO seeked — every non-agg IN arm collapsed to ~1x and `NOT INDEXED` semantics were
+  violated. FIX: add `from_index_hint.is_none()` to the IN gate so `NOT INDEXED` / `INDEXED BY`
+  decline the seek. Pinned by opcode tests asserting `NOT INDEXED WHERE ... IN (...)` Rewind-scans.
+- SEMANTIC PROOF (hard gate): `rowid_in_list_matches_sqlite` runs 16 queries vs rusqlite (real C
+  SQLite). No-ORDER-BY as SETS (row order unspecified), ORDER BY / COUNT(*) exact. Covers dedup,
+  NULL, misses, negatives, projection, and every decline case. All 5 oracle tests (eq/range/agg-IN/
+  nonagg-IN/rowid-IN) still PASS after the routing change. No golden matches these shapes (golden
+  8/8 green); no re-bless. `bd_2dgf5_rowid_in_list_point_lookups` asserts one SeekRowid per distinct
+  value, no SeekGE, no Rewind, and a Rewind-scan for every decline (incl. NOT INDEXED).
+- A/B (release-perf via rch, worker `hz2`, seek vs scan interleaved, values varied, scan forced via
+  `NOT INDEXED` — now honored — and proven equal by the oracle). 20,000-row table, selective
+  3-value list, `SELECT id, v`:
+    rowid in seek median = 24.18 us/query
+    rowid in scan median = 4005.58 us/query
+    rowid in speedup (scan/seek) = 165.68x
+    rowid in NULL control (seek vs seek) = 0.779x  [9.7 vs 7.6 us/query]
+  Same binary, all arms firing after the fix: equality 84.9x, range 59.4x, aggregate IN 141.8x,
+  non-aggregate secondary IN 134.9x (up from 106x pre-fix — the directive was adding overhead),
+  rowid IN 165.7x. Null controls 0.78-0.94x; every effect is ~60-165x, far beyond the floor.
+- Correctness beyond the oracle: `cargo test -p fsqlite-vdbe --lib` 1035 passed; golden 8/8;
+  reachability 1/1; `-p fsqlite-core --lib` 3343 passed (the routing change touches the main SELECT
+  dispatch — no regression).
+- Provenance: worker hz2; `codegen.rs` sha256 in the commit; binary sha256 unavailable (bd-kbuck).

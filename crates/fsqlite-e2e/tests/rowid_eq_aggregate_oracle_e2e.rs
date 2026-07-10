@@ -329,3 +329,65 @@ fn index_in_list_nonaggregate_matches_sqlite() {
         );
     }
 }
+
+#[test]
+fn rowid_in_list_matches_sqlite() {
+    let mut schema =
+        vec!["CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL, s TEXT);".to_owned()];
+    // Gaps so some list values match nothing; negatives.
+    for (id, s) in [
+        (-5_i64, "a"),
+        (2, "b"),
+        (5, "c"),
+        (10, "d"),
+        (15, "e"),
+        (100, "f"),
+    ] {
+        schema.push(format!("INSERT INTO t VALUES ({id}, {id}, {id}.5, '{s}');"));
+    }
+    let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+    let (f, r) = setup(&schema_refs);
+
+    let sorted = |res: Result<Vec<Vec<String>>, String>| -> Result<Vec<Vec<String>>, String> {
+        res.map(|mut rows| {
+            rows.sort();
+            rows
+        })
+    };
+    // No ORDER BY -> set equality (row order unspecified).
+    let set_eq = [
+        "SELECT id, v FROM t WHERE id IN (5, 10, 15)",
+        "SELECT id FROM t WHERE id IN (10, 5)",
+        "SELECT id, s FROM t WHERE id IN (2)",
+        "SELECT id FROM t WHERE id IN (5, 5, 10)",
+        "SELECT id FROM t WHERE id IN (999, 1000)",
+        "SELECT id FROM t WHERE id IN (2, 999)",
+        "SELECT id FROM t WHERE id IN (-5, 2)",
+        "SELECT id FROM t WHERE id IN (2, NULL)",
+    ];
+    for sql in set_eq {
+        assert_eq!(
+            sorted(frank_rows(&f, sql)),
+            sorted(sqlite_rows(&r, sql)),
+            "rowid IN-list (row set) diverged from SQLite for `{sql}`"
+        );
+    }
+    // ORDER BY / declined -> exact.
+    let exact = [
+        "SELECT id FROM t WHERE id IN (15, 5, 10) ORDER BY id",
+        "SELECT id, v FROM t WHERE id IN (5, 10, 15) ORDER BY id DESC",
+        "SELECT id FROM t WHERE id IN (5, 10) ORDER BY id LIMIT 1",
+        "SELECT id FROM t WHERE id IN (2.0, 5) ORDER BY id",
+        "SELECT id FROM t WHERE id IN ('5', '10') ORDER BY id",
+        "SELECT id FROM t WHERE id NOT IN (5, 10) ORDER BY id",
+        "SELECT id FROM t WHERE id IN (5, 10) AND k < 8 ORDER BY id",
+        "SELECT COUNT(*) FROM t WHERE id IN (5, 10, 15)",
+    ];
+    for sql in exact {
+        assert_eq!(
+            frank_rows(&f, sql),
+            sqlite_rows(&r, sql),
+            "rowid IN-list (ordered/declined) diverged from SQLite for `{sql}`"
+        );
+    }
+}
