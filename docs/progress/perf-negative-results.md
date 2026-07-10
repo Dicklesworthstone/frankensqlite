@@ -36,6 +36,58 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-10 - Direct UPDATE/DELETE rowid parameter lookup fusion
+
+- Target: the remaining `write_single` DELETE tail in
+  `comprehensive-bench --quick --filter update-delete`, especially prepared
+  direct `DELETE FROM bench WHERE id = ?1` rows. Fresh same-worker profiling
+  at `ba91f13f` used `release-perf` binaries with frame pointers plus
+  `FSQLITE_BENCH_PROFILE_DML=1`, `perf stat`, flamegraph, and Criterion.
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`; the source patch was manually
+  unwound after measurement, leaving no retained source diff. The candidate
+  fused prepared rowid bind lookup and coercion for the common `?1` integer
+  path while preserving the existing affinity fallback for non-integer rowid
+  lookup values. This deliberately avoided the ledger-blocked retained
+  `TableLeafDeleteRun`, QF, memory-sync, microbatch-carry, and VDBE
+  single-opcode families.
+- Baseline/profile evidence:
+  `tests/artifacts/perf/cod-fsq-write-single-profile-20260710T014113Z/`
+  contains `baseline-update-delete.json`, `baseline-update-delete.stdout.log`,
+  `perf-stat-delete-10000x500-fsqlite.txt`, and
+  `flamegraph-delete-10000x500.svg`. The focused baseline reported
+  update-delete geomean `1.8388` and average ratio `2.1261`; DELETE rows were
+  `100/delete 5` F=`9.1 us`, `1000/delete 50` F=`34.3 us`, and
+  `10000/delete 500` F=`297.2 us`. The 10k DELETE profile attributed
+  `delete_rowid_ns=15110`, `delete_active_probe_ns=169299`,
+  `delete_seek_ns=94779`, and `delete_leaf_flush_ns=99279`. `perf stat -d -r 5`
+  on `perf-update-delete 10000 80 delete fsqlite standard` reported elapsed
+  `0.29262 s +- 1.22%`, IPC `2.36`, branch misses `0.93%`, and L1d miss rate
+  `2.52%`. Criterion `op_single_row_delete` measured C SQLite around
+  `13.843 us` versus FrankenSQLite around `726.50 us`.
+- Candidate evidence:
+  `candidate-rowid-param-update-delete.json`,
+  `candidate-rowid-param-update-delete.stdout.log`, and matching build logs in
+  the same artifact directory. Correctness probes passed before rejection:
+  `cargo fmt -p fsqlite-core --check` and remote
+  `cargo test -p fsqlite-core test_direct_simple_update_delete_rowid_lookup_rejects_prefix_coercion -- --nocapture --test-threads=1`
+  plus
+  `cargo test -p fsqlite-core test_prepared_direct_delete_profile_counts_fixed_costs_and_leaf_flush -- --nocapture --test-threads=1`.
+- Result: rejected. The intended micro-counter moved in the right direction on
+  the 10k DELETE row (`delete_rowid_ns 15110 -> 12520`), but end-to-end
+  FSQLite DELETE medians regressed across the focused rows:
+  `9.1 us -> 10.0 us`, `34.3 us -> 37.4 us`, and `297.2 us -> 360.0 us`.
+  The candidate also left the known dominant costs in the retained run and
+  page-state boundary (`delete_active_probe_ns`, `delete_seek_ns`,
+  `delete_leaf_flush_ns`) untouched, so the small rowid lookup win did not
+  clear the keep gate.
+- Do not retry standalone prepared rowid bind-lookup/coercion fusion for
+  direct UPDATE/DELETE. Reconsider rowid lookup only if a future profile shows
+  it dominating after the retained-run/page-state costs have been removed, and
+  require a same-window focused update-delete matrix plus full quick run to
+  improve FSQLite absolute medians for all DELETE rows without moving the
+  primary score backward.
+
 ## 2026-05-25 - VDBE `Opcode::FusedAppendInsert` hot-dispatch removal
 
 - Target: the `FusedAppendInsert` execution arm in
