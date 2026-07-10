@@ -7803,6 +7803,21 @@ mod tests {
                     // IS NULL / IS NOT NULL
                     1 => arb_expr(depth - 1).prop_map(|e| format!("{e} IS NULL")),
                     1 => arb_expr(depth - 1).prop_map(|e| format!("{e} IS NOT NULL")),
+                    // Single-token postfix null tests
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("{e} ISNULL")),
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("{e} NOTNULL")),
+                    // COLLATE (postfix)
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("{e} COLLATE nocase")),
+                    // UNPARENTHESIZED binary ops: exercise precedence and
+                    // associativity through the display round-trip (issue
+                    // #122: `a IS NULL = b IS NULL` must not regroup after
+                    // parse → display → re-parse).
+                    2 => (arb_expr(depth - 1), prop_oneof![
+                        Just("+"), Just("*"), Just("="), Just("<"),
+                        Just("AND"), Just("OR"), Just("||"), Just("IS"),
+                        Just("IS NOT"),
+                    ], arb_expr(depth - 1))
+                        .prop_map(|(l, op, r)| format!("{l} {op} {r}")),
                     // BETWEEN
                     1 => (arb_expr(depth - 1), arb_expr(0), arb_expr(0))
                         .prop_map(|(e, lo, hi)| format!("{e} BETWEEN {lo} AND {hi}")),

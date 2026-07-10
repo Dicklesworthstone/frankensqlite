@@ -561,17 +561,23 @@ impl Parser {
                         span,
                     });
                 }
-                if matches!(self.peek_kind(), TokenKind::KwNull) {
-                    let end = self.advance_token().span;
-                    let span = lhs.span().merge(end);
+                let rhs = self.parse_expr_bp(r_bp)?;
+                let span = lhs.span().merge(rhs.span());
+                // Upstream SQLite (binaryToUnaryIfNull in parse.y) folds
+                // `expr IS [NOT] expr` into a unary null-test only when the
+                // right operand, parsed at normal precedence, is the NULL
+                // literal. Parsing the RHS first — rather than greedily
+                // consuming a NULL token — keeps tighter-binding operators
+                // attached to NULL: `x IS NULL < 2` parses as
+                // `x IS (NULL < 2)`, matching C SQLite (verified against the
+                // sqlite3 CLI: `SELECT 1 IS NULL < 2` yields 0, not 1).
+                if matches!(rhs, Expr::Literal(Literal::Null, _)) {
                     return Ok(Expr::IsNull {
                         expr: Box::new(lhs),
                         not,
                         span,
                     });
                 }
-                let rhs = self.parse_expr_bp(r_bp)?;
-                let span = lhs.span().merge(rhs.span());
                 let op = if not { BinaryOp::IsNot } else { BinaryOp::Is };
                 Ok(Expr::BinaryOp {
                     left: Box::new(lhs),
@@ -1499,6 +1505,116 @@ mod tests {
         assert!(matches!(parse("NULL"), Expr::Literal(Literal::Null, _)));
         assert!(matches!(parse("TRUE"), Expr::Literal(Literal::True, _)));
         assert!(matches!(parse("FALSE"), Expr::Literal(Literal::False, _)));
+    }
+
+    // ── Issue #122: postfix null-test vs `=` precedence and round-trip ──
+
+    /// `a IS NULL = b IS NULL` (no parentheses) groups left-associatively:
+    /// `((a IS NULL) = b) IS NULL`. Verified against the C SQLite CLI:
+    /// `SELECT 200 IS NULL = 'ok' IS NULL` yields 0 (not 1), because the
+    /// null-test and `=` share one left-associative precedence level.
+    #[test]
+    fn test_isnull_eq_isnull_unparenthesized_left_associative() {
+        let expr = parse("a IS NULL = b IS NULL");
+        match &expr {
+            Expr::IsNull {
+                expr: inner,
+                not: false,
+                ..
+            } => match inner.as_ref() {
+                Expr::BinaryOp {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                    ..
+                } => {
+                    assert!(
+                        matches!(left.as_ref(), Expr::IsNull { not: false, .. }),
+                        "expected (a IS NULL) on the left, got {left:?}"
+                    );
+                    assert!(
+                        matches!(right.as_ref(), Expr::Column(..)),
+                        "expected bare column b on the right, got {right:?}"
+                    );
+                }
+                other => unreachable!("expected Eq inside IsNull, got {other:?}"),
+            },
+            other => unreachable!("expected IsNull(Eq(IsNull(a), b)), got {other:?}"),
+        }
+    }
+
+    /// `(a IS NULL) = (b IS NULL)` must parse as Eq of two null-tests, and
+    /// the display round-trip must preserve that grouping (issue #122: the
+    /// serializer used to strip these parentheses, silently inverting CHECK
+    /// constraints of the form `(a IS NULL) = (b IS NULL)`).
+    #[test]
+    fn test_isnull_eq_isnull_parenthesized_round_trip() {
+        let assert_shape = |expr: &Expr| match expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => {
+                assert!(
+                    matches!(left.as_ref(), Expr::IsNull { not: false, .. }),
+                    "expected IsNull on the left, got {left:?}"
+                );
+                assert!(
+                    matches!(right.as_ref(), Expr::IsNull { not: false, .. }),
+                    "expected IsNull on the right, got {right:?}"
+                );
+            }
+            other => unreachable!("expected Eq(IsNull, IsNull), got {other:?}"),
+        };
+        let expr = parse("(a IS NULL) = (b IS NULL)");
+        assert_shape(&expr);
+        let rendered = expr.to_string();
+        assert_eq!(rendered, "(a IS NULL) = (b IS NULL)");
+        let reparsed = parse(&rendered);
+        assert_shape(&reparsed);
+        assert_eq!(reparsed.to_string(), rendered, "round-trip not idempotent");
+    }
+
+    /// An operator binding tighter than IS attaches to the NULL literal, so
+    /// no null-test fold happens: `1 IS NULL < 2` is `1 IS (NULL < 2)`.
+    /// Verified against the C SQLite CLI: `SELECT 1 IS NULL < 2` yields 0
+    /// (`1 IS NULL` would give 0, then `0 < 2` would give 1).
+    #[test]
+    fn test_is_null_followed_by_tighter_operator_binds_to_null() {
+        let expr = parse("1 IS NULL < 2");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Is,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Lt,
+                        ..
+                    }
+                ),
+                "expected Lt(NULL, 2) on the right of IS, got {right:?}"
+            ),
+            other => unreachable!("expected Is(1, Lt(NULL, 2)), got {other:?}"),
+        }
+    }
+
+    /// `x IS (NULL)` folds to a null-test just like `x IS NULL`, matching
+    /// SQLite's binaryToUnaryIfNull (the fold keys on the resolved RHS
+    /// expression, not on the raw token).
+    #[test]
+    fn test_is_parenthesized_null_folds_to_isnull() {
+        assert!(matches!(
+            parse("x IS (NULL)"),
+            Expr::IsNull { not: false, .. }
+        ));
+        assert!(matches!(
+            parse("x IS NOT (NULL)"),
+            Expr::IsNull { not: true, .. }
+        ));
     }
 
     #[test]
