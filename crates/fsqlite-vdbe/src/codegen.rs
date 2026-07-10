@@ -8290,6 +8290,82 @@ fn codegen_select_minmax_rowid_seek(
 /// for rows rejected by `WHERE`. This body is row-source agnostic: it reads
 /// exclusively through `cursor`, so a full-table scan and an index-driven seek
 /// produce byte-identical accumulator state for the same set of rows.
+///
+/// Can every aggregate be fed from the index entry alone, with no table lookup?
+///
+/// bd-2dgf5. True when each aggregate is `COUNT(*)` (no argument), takes the
+/// rowid (available via `IdxRowid`), or takes the indexed column itself
+/// (available as index column 0). Anything that needs a general expression, a
+/// `FILTER`, extra arguments, a bare output column, or any other table column
+/// forces the table lookup. `index_table_col` is the ordinal, within
+/// `table.columns`, of the index's single key column.
+fn aggregate_seek_is_covering(agg_columns: &[AggColumn], index_table_col: usize) -> bool {
+    agg_columns.iter().all(|agg| {
+        // Sentinel entries for multi-aggregate wrappers emit nothing.
+        if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+            return true;
+        }
+        agg.bare_expr.is_none()
+            && agg.filter.is_none()
+            && agg.arg_expr.is_none()
+            && agg.extra_args.is_empty()
+            && (agg.num_args == 0 || agg.arg_is_rowid || agg.arg_col_index == Some(index_table_col))
+    })
+}
+
+/// Covering-index accumulate body: feeds `AggStep` straight from the index
+/// entry, so no table cursor is opened and no `SeekRowid` is emitted.
+///
+/// Only ever reached when [`aggregate_seek_is_covering`] holds, which is why
+/// this deliberately handles no expressions, no `FILTER`, and no extra
+/// arguments: those shapes take the table-lookup body instead. The `AggStep`
+/// opcode, its `distinct` flag, and its P4 are emitted identically to the
+/// table-lookup body, so accumulator state is byte-identical for the same rows.
+fn emit_aggregate_accumulate_body_covering(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    index_table_col: usize,
+    agg_columns: &[AggColumn],
+    accum_base: i32,
+) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+            continue;
+        }
+        let accum_reg = accum_base + i as i32;
+        let distinct_flag = i32::from(agg.distinct);
+        let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
+
+        if agg.num_args == 0 {
+            b.emit_op(Opcode::AggStep, distinct_flag, 0, accum_reg, agg_p4, 0);
+            continue;
+        }
+
+        let arg_base = b.alloc_regs(agg.num_args.max(1));
+        if agg.arg_is_rowid {
+            // The index entry carries the rowid; read it without touching the table.
+            b.emit_op(Opcode::IdxRowid, idx_cursor, arg_base, 0, P4::None, 0);
+        } else {
+            debug_assert_eq!(
+                agg.arg_col_index,
+                Some(index_table_col),
+                "covering aggregate seek must only read the indexed column"
+            );
+            b.emit_op(Opcode::Column, idx_cursor, 0, arg_base, P4::None, 0);
+        }
+        let num_args = u16::try_from(agg.num_args).unwrap_or_default();
+        b.emit_op(
+            Opcode::AggStep,
+            distinct_flag,
+            arg_base,
+            accum_reg,
+            agg_p4,
+            num_args,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_aggregate_accumulate_body(
     b: &mut ProgramBuilder,
@@ -8468,6 +8544,10 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
         .map(|idx| (idx, target_expr))
 }
 
+// Takes the same cursor / table / schema / label bundle as every other
+// `codegen_select_*` row-source emitter. Bundling those into a struct here alone
+// would fork the signature shape it shares with the scan emitter it falls back to.
+#[allow(clippy::too_many_arguments)]
 fn codegen_select_aggregate(
     b: &mut ProgramBuilder,
     cursor: i32,
@@ -8594,6 +8674,21 @@ fn codegen_select_aggregate(
         let scan_fallback = b.emit_label();
         let duplicate_run_done = b.emit_label();
 
+        // Can every aggregate read from the index entry alone? If so the table
+        // cursor is never opened and no SeekRowid is emitted, matching stock
+        // SQLite's "USING COVERING INDEX" plan for e.g. `COUNT(*)`/`SUM(rowid)`.
+        let index_table_col = idx_schema
+            .columns
+            .first()
+            .and_then(|name| {
+                table
+                    .columns
+                    .iter()
+                    .position(|col| col.name.eq_ignore_ascii_case(name))
+            })
+            .unwrap_or(usize::MAX);
+        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+
         // Probe key is [target, i64::MIN] so SeekGE anchors on the first entry
         // of the duplicate run in a non-unique index.
         let probe_key_regs = b.alloc_regs(2);
@@ -8623,14 +8718,16 @@ fn codegen_select_aggregate(
             0,
         );
 
-        b.emit_op(
-            Opcode::OpenRead,
-            cursor,
-            table.root_page,
-            0,
-            P4::Table(table.name.clone()),
-            0,
-        );
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
         b.emit_op(
             Opcode::OpenRead,
             idx_cursor,
@@ -8662,16 +8759,18 @@ fn codegen_select_aggregate(
 
         let idx_skip_label = b.emit_label();
         b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
-        let rowid_reg = b.alloc_reg();
-        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-        b.emit_jump_to_label(
-            Opcode::SeekRowid,
-            cursor,
-            rowid_reg,
-            idx_skip_label,
-            P4::None,
-            0,
-        );
+        if !covering {
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                idx_skip_label,
+                P4::None,
+                0,
+            );
+        }
 
         // No WHERE filter here, by construction: `extract_column_eq_target`
         // only matches when the *entire* WHERE clause is `col = <constant>`,
@@ -8680,15 +8779,25 @@ fn codegen_select_aggregate(
         // single `?`, misnumbering bound parameters. This mirrors
         // `codegen_select_index_equality_scan`, which likewise emits no filter
         // on its index path.
-        emit_aggregate_accumulate_body(
-            b,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            &agg_columns,
-            accum_base,
-        );
+        if covering {
+            emit_aggregate_accumulate_body_covering(
+                b,
+                idx_cursor,
+                index_table_col,
+                &agg_columns,
+                accum_base,
+            );
+        } else {
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                accum_base,
+            );
+        }
 
         b.resolve_label(idx_skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -22844,7 +22953,7 @@ mod tests {
     };
     use fsqlite_func::{FunctionRegistry, register_builtins};
     use fsqlite_parser::parse_first_statement_with_tail;
-    use fsqlite_types::opcode::{Opcode, P4};
+    use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
     use proptest::prelude::*;
     use proptest::{prop_oneof, proptest};
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -23954,6 +24063,156 @@ mod tests {
             span: Span::ZERO,
         };
         assert!(aggregate_index_eq_seek_target(Some(&range), &table, None).is_none());
+    }
+
+    /// Compile `sql` against [`bd_2dgf5_table`] and return the emitted opcodes.
+    fn bd_2dgf5_program(sql: &str) -> Vec<VdbeOp> {
+        let stmt = select_sql(sql);
+        let schema = vec![bd_2dgf5_table()];
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default())
+            .expect("bd-2dgf5 fixture SELECT should compile");
+        b.finish().expect("program should finish").ops().to_vec()
+    }
+
+    /// Index of the first instruction of the scan fallback.
+    ///
+    /// The fallback always opens the table and immediately rewinds it. The
+    /// *non-covering* seek also opens the table, but follows that with the index
+    /// `OpenRead`, never a `Rewind` — so "first `OpenRead` of the table" is not the
+    /// boundary, and using it silently yields an empty fast path.
+    fn bd_2dgf5_fallback_start(ops: &[VdbeOp]) -> usize {
+        ops.windows(2)
+            .position(|pair| {
+                pair[0].opcode == Opcode::OpenRead
+                    && matches!(&pair[0].p4, P4::Table(name) if name == "t")
+                    && pair[1].opcode == Opcode::Rewind
+            })
+            .unwrap_or(ops.len())
+    }
+
+    /// The seek fast path: everything the program runs before falling back to a scan.
+    fn bd_2dgf5_seek_fast_path(ops: &[VdbeOp]) -> &[VdbeOp] {
+        &ops[..bd_2dgf5_fallback_start(ops)]
+    }
+
+    /// bd-2dgf5: a covering aggregate seek must read the index entry and nothing
+    /// else — no table cursor, no `SeekRowid`.
+    ///
+    /// This asserts on the *emitted program*, not on `EXPLAIN QUERY PLAN` text.
+    /// EQP renders from the planner directive rather than from the program, and
+    /// the two diverge in both directions (bd-jyyae), so EQP can report a plan the
+    /// program never executes. Opcodes are the only ground truth here.
+    #[test]
+    fn bd_2dgf5_covering_aggregate_seek_omits_table_lookup() {
+        // COUNT(*) needs no column at all; SUM(id) reads the rowid, which the index
+        // entry carries via IdxRowid; SUM(k) reads the index key itself.
+        for sql in [
+            "SELECT COUNT(*) FROM t WHERE k = 2",
+            "SELECT SUM(id) FROM t WHERE k = 2",
+            "SELECT SUM(k) FROM t WHERE k = 2",
+            "SELECT MIN(id), MAX(id) FROM t WHERE k = 2",
+            "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            let fast_path = bd_2dgf5_seek_fast_path(&ops);
+
+            assert!(
+                fast_path.iter().any(|op| op.opcode == Opcode::SeekGE),
+                "`{sql}` must seek the index rather than scan"
+            );
+            assert!(
+                !fast_path.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "`{sql}` is covering: it must not look the row up in the table"
+            );
+            assert!(
+                !fast_path.iter().any(|op| op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name == "t")),
+                "`{sql}` is covering: it must not open the table cursor at all"
+            );
+            assert!(
+                fast_path.iter().any(|op| op.opcode == Opcode::AggStep),
+                "`{sql}` must still accumulate over the seeked run"
+            );
+        }
+    }
+
+    /// bd-2dgf5: an aggregate that needs a column the index does not carry must
+    /// keep the table lookup. `v` is not in `idx_t_k`, so `SUM(v)` still seeks the
+    /// index and then fetches the row.
+    ///
+    /// This is the negative half of the covering contract: without it, a bug that
+    /// declared everything covering would silently read `v` from the wrong cursor
+    /// and every assertion in the positive test would still pass.
+    #[test]
+    fn bd_2dgf5_non_covering_aggregate_seek_keeps_table_lookup() {
+        for sql in [
+            "SELECT SUM(v) FROM t WHERE k = 2",
+            "SELECT group_concat(v) FROM t WHERE k = 2",
+            "SELECT COUNT(*) FILTER (WHERE id > 100) FROM t WHERE k = 2",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            let fast_path = bd_2dgf5_seek_fast_path(&ops);
+
+            assert!(
+                fast_path.iter().any(|op| op.opcode == Opcode::SeekGE),
+                "`{sql}` should still seek the index"
+            );
+            assert!(
+                fast_path.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "`{sql}` needs a column the index does not carry, so it must \
+                 look the row up in the table"
+            );
+        }
+    }
+
+    /// bd-2dgf5: the seek body and the scan-fallback body must emit the *same*
+    /// `AggStep` sequence — same DISTINCT flag, same function P4, same argument
+    /// count. Only the instruction that loads the argument may differ
+    /// (`IdxRowid`/`Column idx` vs `Rowid`/`Column table`).
+    ///
+    /// Every seek program carries both bodies: the seek runs first, and the scan
+    /// fallback follows for the probe-matched-nothing case. They are emitted by two
+    /// different functions, so nothing but this test stops them from drifting — and
+    /// if they drift, the same query returns different answers depending on whether
+    /// the probe hit, which no value test on a populated table would catch.
+    #[test]
+    fn bd_2dgf5_seek_and_fallback_bodies_emit_identical_agg_steps() {
+        for sql in [
+            "SELECT COUNT(*) FROM t WHERE k = 2",
+            "SELECT SUM(id) FROM t WHERE k = 2",
+            "SELECT SUM(k) FROM t WHERE k = 2",
+            "SELECT COUNT(DISTINCT k) FROM t WHERE k = 2",
+            "SELECT MIN(id), MAX(id) FROM t WHERE k = 2",
+            "SELECT SUM(v) FROM t WHERE k = 2",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            let split = bd_2dgf5_fallback_start(&ops);
+            assert!(
+                split < ops.len(),
+                "`{sql}` should take the seek path and emit a scan fallback"
+            );
+
+            let agg_steps = |slice: &[VdbeOp]| -> Vec<(i32, P4, u16)> {
+                slice
+                    .iter()
+                    .filter(|op| op.opcode == Opcode::AggStep)
+                    .map(|op| (op.p1, op.p4.clone(), op.p5))
+                    .collect()
+            };
+            let seek_body = agg_steps(&ops[..split]);
+            let fallback_body = agg_steps(&ops[split..]);
+
+            assert!(
+                !seek_body.is_empty(),
+                "`{sql}` seek body must accumulate at least one aggregate"
+            );
+            assert_eq!(
+                seek_body, fallback_body,
+                "AggStep drifted between the seek body and the scan-fallback body \
+                 for `{sql}`"
+            );
+        }
     }
 
     fn opcode_sequence(prog: &crate::VdbeProgram) -> Vec<Opcode> {

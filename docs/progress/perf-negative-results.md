@@ -15377,3 +15377,88 @@ set: sessions found by
   work should profile the post-change envelope first; do not add a second
   resident-index structure or per-slot clear shortcut unless a new profile and
   all-size gate show a residual mechanism.
+
+## 2026-07-10 - WIN: covering-index aggregate seek (bd-2dgf5)
+
+- Result type: KEPT. Ratchet passed at every size; landed.
+- Candidate preflight: `sql_pipeline_candidate_preflight --operation AggStep
+  --direction other --benchmark vdbe_pipeline_execute --source-surface
+  codegen_select_aggregate --json` returned `verdict=allowed`, `matched_records=[]`.
+  Ledger grep for `covering` found no rejection; the 2026-07-09 bd-2dgf5 WIN entry
+  names covering-index aggregates as "the next lever".
+- Scope: single-group `SELECT <agg>(...) FROM t WHERE <indexed_col> = <const>` on a
+  rowid table with a plain single-column ascending index, where every aggregate can
+  be satisfied from the index entry alone: `COUNT(*)` (no argument), an argument that
+  is the rowid (available via `IdxRowid`), or the indexed column itself (index
+  column 0). `FILTER`, a general expression argument, extra arguments, a bare output
+  column, or any other table column force the existing table-lookup body.
+- Change: `aggregate_seek_is_covering()` decides; `emit_aggregate_accumulate_body_covering()`
+  feeds `AggStep` straight from the index cursor. The table cursor is never opened on
+  the seek path and no `SeekRowid` is emitted. The scan fallback (probe matched
+  nothing) still opens the table, so `saw_index_match_reg` is unaffected.
+  `index_for_column` already excludes WITHOUT ROWID tables, partial indexes, and
+  expression indexes, so covering inherits those guards.
+- A/B (release-perf, both arms pinned to the SAME core and interleaved within each
+  rep, marginal `= (T_N - T_1)/(N-1)`, median of 25, same DB; ORIG = `958b56f5`,
+  i.e. the non-covering seek landed in `ebc44c04`). Bound parameter VARIES across the
+  batch so the retained autocommit count/sum cache cannot serve the answer (bd-czzlp):
+
+    ops    ORIG(seek+lookup)  CAND(covering)  ratio    cv ORIG/CAND
+    64      164.36 us          150.85 us      1.090x   4.25% / 4.03%
+    256     128.34 us          114.74 us      1.119x   2.19% / 2.59%
+    1024    111.85 us          100.99 us      1.108x   1.87% / 1.76%
+
+  Faster at all three sizes with every cv under 5%. `SUM(id)` (covering via
+  `IdxRowid`) gives 1.061x / 1.085x / 1.104x.
+- CONTROL, and why the ratio is not binary layout: `SELECT SUM(v) FROM t WHERE k = ?`
+  emits a byte-identical program in both binaries. It measures 1.000x at 256 ops
+  (cv 2.50/2.09). Its 64- and 1024-op excursions (1.080x, 0.976x) both carry cv > 5
+  and are noise. At 64 ops the marginal estimator is noise-dominated because
+  `T_64 - T_1` is small; that size is the weakest of the three even when it passes.
+- SAME-BINARY cross-check (no cross-binary ratio involved, so worker/binary identity
+  cannot contribute). Inside ONE binary, `COUNT(*)` is covering in CAND while
+  `COUNT(v)` needs `v` and stays non-covering in BOTH binaries over the same 20 rows.
+  `delta := marginal(COUNT(v)) - marginal(COUNT(*))` isolates the table lookup:
+
+    ops    ORIG delta   CAND delta   lookups removed by covering
+    256     3.54 us      15.55 us     12.01 us
+    1024    4.08 us      14.63 us     10.55 us
+
+  The cross-binary gate puts the same quantity at 12.21 us (256) and 11.55 us (1024).
+  Two independent substrates agree within ~1 us. Sharper control: `COUNT(v)` is the
+  same program in both binaries and costs 132.21 vs 132.41 us (256).
+- MECHANISM: the win scales with matching rows, which binary layout cannot do.
+  On a dense fixture (`k = i % 5`, 400 matches/query instead of 20), the 1024-op row
+  (the only one with cv < 5: 1.93%/3.70%) is ORIG 345.91 us vs CAND 212.37 us =
+  1.629x. ORIG's marginal GROWS with matches (345.91) while CAND's stays flat
+  (212.37). Per removed lookup: 10.9/20 = 0.54 us at 20 matches, 133.5/400 = 0.33 us
+  at 400 matches.
+- vs C SQLite 3.46.1 on the same core: candidate 100.99-150.85 us vs 15.11-20.05 us.
+  The residual is NOT the access path — both engines now emit the same covering plan.
+  It is the ~65 us/statement parse/plan overhead (bd-5310l).
+- Correctness: 30/30 value parity vs C SQLite 3.46.1 (COUNT/SUM/AVG/MIN/MAX/TOTAL,
+  COUNT DISTINCT, SUM DISTINCT, group_concat, FILTER, `k = NULL`, no-match, negative,
+  affinity-skewed `k = '2'` and `k = 2.0`, reversed `2 = k`, unindexed column,
+  `NOT INDEXED`, `ORDER BY`, `MAX(id)-MIN(id)`, `COALESCE(MAX(id),0)`, AND residual).
+  `cargo test -p fsqlite-vdbe --lib` 1030 passed; `-p fsqlite-core --lib` 3341 passed.
+- EQP is now derived from the emitted program, not from a second copy of codegen's
+  gates (`explain::aggregate_index_seek_facts`). The obvious repair -- re-checking the
+  same conditions in the EQP path -- was written first and was WRONG: it declined the
+  seek for `... WHERE k = 2 ORDER BY 1`, a shape codegen seeks and C SQLite reports as
+  `SEARCH t USING COVERING INDEX idx_t_k (k=?)`. Text derived from a re-derivation of
+  a decision is the bd-jyyae bug, not a fix for it.
+- TRAP for the next agent: `SELECT COUNT(*) FROM t NOT INDEXED WHERE k = 2` never
+  reaches the aggregate body at all -- `codegen_select` routes it to
+  `codegen_select_count_star`, which emits no `AggStep`. Do not use `NOT INDEXED` as
+  the "table body" reference when comparing `AggStep` emission; compare the seek body
+  against the program's OWN scan-fallback body instead
+  (`bd_2dgf5_seek_and_fallback_bodies_emit_identical_agg_steps`).
+- TRAP 2: in the NON-covering seek the table `OpenRead` precedes `SeekGE`, so
+  "first `OpenRead` of the table" does not locate the scan fallback and a test using it
+  silently asserts over an empty slice. The fallback is the `OpenRead` immediately
+  followed by `Rewind`.
+- Evidence: `tests/artifacts/perf/cc-fsq-2dgf5-covering-aggregate-20260710T0830Z/`.
+- Do not retry widening the covering predicate to `FILTER` or to general expression
+  arguments without first proving the argument can be read from the index entry;
+  those shapes evaluate through `emit_expr` against the table cursor, and feeding them
+  an index cursor reads the wrong column with no test failure on a populated table.
