@@ -15960,3 +15960,52 @@ test is on the executed path, not merely linked into it.
   the physical-order sort, after a fresh exact-envelope profile proves those
   two costs are absent. The next distinct eligible profiled vein is BEGIN
   snapshot/schema-cookie cloning; it must be treated as a separate lever.
+
+## 2026-07-10 - PROVENANCE AUDIT of this ledger under the median gate (cc_fsq)
+
+- Scope: all 461 `##` entries. Classified: 415 REJECT, 32 NON-CANDIDATE, 4 WIN, 2 ANALYSIS,
+  8 other. This is an analysis pass; no source or prior row was modified.
+- PROVENANCE ROT (the frankenlibc/frankenredis pattern, now quantified for this repo):
+    REJECT rows with a binary sha256:        3  / 415  (0.7%)
+    REJECT rows with a null-control ratio:   1  / 415  (0.2%)
+    REJECT rows citing self-time:           31  / 415  (7.5%)
+    REJECT rows citing a worker id:         ~56 / 415
+  So >99% of rejections were decided with no A/A null control and >92% with no profiled
+  self-time. Per the measured harness floors (the bd-2dgf5 CLI A/A showed a ~2-4% ordering
+  bias at small stream sizes; cv<5 is unreachable here), any rejection decided on a sub-~5%
+  margin is UNDECIDED, not disproven: the "regression" that justified it may be entirely
+  inside that harness's (never-measured) noise floor.
+- IMPORTANT DISCIPLINE, shown with a counter-example so this audit is not over-read: a small
+  ratio in an entry is NOT itself grounds to reopen. The DECISIONAL metric must be inside the
+  floor. `2026-05-09 Same-leaf DELETE compactness admission hoist` (L5308) shows a 1.03/1.04x
+  DELETE figure, but its rejection was a REAL +74% UPDATE regression
+  (`100 rows/update 10 rows` 0.006673 -> 0.011592 ms). That is a valid reject; it stays.
+- REHABILITATION SHORTLIST (rejections whose DECISION is inside a plausible floor, or whose
+  retry condition is now met). None is claimed to reopen as a WIN; each is flagged UNDECIDED
+  and needs a same-binary interleaved A/B with an A/A null control and the median gate before
+  it is either landed or re-rejected with proper provenance.
+    * L4745 `Pager rolled-back-pages empty guard in get_page` — UNDECIDED. The change only
+      adds `if !rolled_back_pages.is_empty()` before a HashSet `.contains()`. Its rejection
+      cites `delete 500/10000 1.8293 -> 1.9062` (+4.2%) and geomean `1.3520 -> 1.3677`
+      (+1.2%). A branch that SKIPS work cannot cause a 4.2% delete regression; that is
+      harness noise. The rejection is not valid evidence. EV is low (an empty-HashSet lookup
+      is already ~O(1)), but the row should not read as "proven bad".
+    * L5231 `Pager freed_pages sorted membership` — RETRY CONDITION MET, real signal. Its own
+      artifacts show a genuine 1.09x on the isolated-1000x30000 DELETE workload
+      (1.237s +/-0.013 -> 1.136s +/-0.005; effect exceeds the spread). It was rejected only
+      for a small-transaction (100-row) tax from maintaining sorted order on every
+      insert/remove. The freed_pages membership scan under `get_page` is thus a CONFIRMED cost
+      on long DELETE transactions; a data structure that is O(1) for both membership and
+      insert/remove (e.g. a per-txn bitset/roaring set, not a sorted Vec) could capture the
+      1.09x without the short-transaction tax. This is a concrete reopenable direction.
+- CLEAN-VEIN CORRECTION for the current write_single target: `ShardedPageCache::clear`
+  (26.33% uprobe / 1.77% clean self-time, the top DELETE frame) is NOT unattempted — cod
+  landed a sparse touched-slot bitmap + `shards_dirty` shard-walk skip (c29ab92c) and is
+  actively iterating. Do not hand it off as fresh work.
+- HANDOFF: L4745 and L5231 are pager/write_single execution, which cod owns. Recorded here
+  and mirrored to cod rather than actioned from the cc lane. No lever landed from this audit;
+  its value is the durable provenance record and the two flagged UNDECIDED rows.
+- METHOD NOTE for future rejects (make this stop recurring): every REJECT must carry binary
+  sha256 (both arms), the A/A null-control median for the exact harness+function, per-function
+  self-time from a profile-verified frame, worker id, and cv. A reject lacking these is not
+  durable evidence and a later agent is entitled to reopen it.
