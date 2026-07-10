@@ -16040,3 +16040,45 @@ test is on the executed path, not merely linked into it.
   because `rch exec` returns bench/test TEXT but not the built binary, so fresh `perf` frame
   data on current HEAD cannot be captured (bd-kbuck). Lever selection here rests on existing
   ranked-frame artifacts, not a fresh profile.
+
+## 2026-07-10 - REJECT: branchless serial_type_for_integer (leading_zeros bucket)
+
+- Result type: REJECTED, not landed. Selected as a safe in-lane lever after bd-o023g
+  (AVX2 serialization) was found unsafe-blocked. Record serialization is a real hot path
+  (`try_serialize_prepared_direct_simple_insert_record` = 4.44% self-time in the write_single
+  INSERT frames), and `serial_type_for_integer` is called once per integer column per record.
+- Candidate: replace the six-way magnitude comparison chain in
+  `crates/fsqlite-types/src/serial_type.rs` with `bits = 64 - u.leading_zeros()` + an
+  arithmetic bucket. Proven byte-identical to the chain over all 34 threshold boundaries and
+  2,000,000 random i64 (Rust tests `serial_type_for_integer_branchless_matches_chain` and
+  `prop_serial_type_for_integer_branchless_equiv`, both passed remotely on worker hz2).
+- GOLDEN BYTECODE UNCHANGED, proven two ways: (1) `serial_type_for_integer` has ZERO callers
+  in `codegen.rs` — it runs at record-serialization time, not codegen time; (2) the production
+  function body was never modified (byte-identical to HEAD, sha256 of lines 85-111 =
+  64a9105d52c995fc210a187eb662e5d986cba61cc909fe1f2bfaff747b4a21f3 in both). The candidate
+  lived only in the bench.
+- SUBSTRATE: both arms in ONE bench binary and ONE `cargo bench` invocation
+  (`crates/fsqlite-vdbe/benches/serial_type_ab.rs`), each summing the classifier over the same
+  fixed 4096-element mixed-magnitude array, `black_box` on input and result. A NULL CONTROL
+  (`chain_null`, the identical baseline run a second time) measures the harness's
+  sequential-drift floor.
+- MEASUREMENT (release-perf via rch, worker `vmi1152480`, criterion 100 samples, warm-up 1s /
+  measure 5s; medians are the criterion point estimates):
+    chain       7.11 us   (CI [5.64, 9.53] — very noisy)
+    branchless  7.51 us   (CI [7.39, 7.66] — tight)
+    chain_null  6.10 us   (CI [5.60, 6.86])
+- NULL-CONTROL VERDICT (median gate; cv not used): chain vs chain_null = 7.11/6.10 = 1.166,
+  a ~16% floor between two runs of the SAME function. Any real effect must clear that. The
+  branchless median (7.51) is NOT below the baseline's own range [6.10, 7.11]; it is at or
+  above it. There is ZERO evidence of improvement and a weak signal of slight regression,
+  consistent with `leading_zeros` compiling to `bsr` + zero-fixup at the sse2 baseline
+  (no native `lzcnt` without a target-feature floor; see the 2026-07-10 ISA audit).
+- Result: rejected. No measurable win; harness null floor (~16%) exceeds any plausible effect.
+  Production untouched; candidate + bench reverted (left untracked, not committed).
+- Retry condition: reconsider only (a) on a pinned/quiet worker where the A/A null median sits
+  within a few percent of 1.00 (this remote harness does not), AND (b) after a documented
+  target-feature floor (x86-64-v2/v3) enables `lzcnt`, which is the only way `leading_zeros`
+  becomes a single cheap instruction. Absent both, the comparison chain is at least as fast.
+- Provenance: worker `vmi1152480`; source `serial_type_ab.rs` sha256
+  a7652424d8c339a0c2e3aa4f808c36e74b1a6b8e94a06bb4ce48cba979a8cab3. Binary sha256 unavailable
+  (rch does not return built binaries; bd-kbuck).
