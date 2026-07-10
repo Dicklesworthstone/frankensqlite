@@ -15023,3 +15023,45 @@ set: sessions found by
   as a standalone lever. Reconsider only if paired with broader column-read
   dispatch or code-layout reshaping that proves improvements at 64, 256, and
   1024 ops without dead code.
+
+## 2026-07-09 - Subquery/CTE benchmark rows are not measuring query execution
+
+- Scope: `comprehensive-bench --quick --filter subquery`, rows
+  `10000 rows / IN subquery` and `Recursive CTE (1..1000 SUM)`.
+- Result type: NON-CANDIDATE / measurement defect. No source was modified.
+- Finding: the reported wins ("72.43x faster" and "27.61x faster") do not
+  reflect query performance.
+  - The IN-subquery row measures a retained autocommit count/sum cache hit.
+    `measure()` prepares once and re-runs the identical statement against a
+    static in-memory DB, so FrankenSQLite returns a cached row in ~70 ns while
+    C SQLite re-executes in ~5.1 us. 70 ns cannot visit the 100 matching rows.
+  - The fsqlite side discards its result (`let _ = fs_stmt.query_row();`) while
+    the C side extracts an i64 (`|r| r.get(0)`). The fsqlite answer is never
+    validated and the C side pays an extraction the fsqlite side skips.
+  - The recursive-CTE row is served by the narrow
+    `recursive_cte_integer_series_sum_plan` pattern matcher (native integer
+    loop). COUNT instead of SUM, a second carried column, or an outer WHERE all
+    fall back to the general path, which the 2026-05-05 entry above measured at
+    1.16x-1.24x slower than C SQLite.
+- Counter-measurement (same query, same prebuilt `prod.db`, fresh prepare, CLI
+  batch mode, taskset-pinned, marginal `= (T_1000 - T_1)/999`, median of 5):
+  FrankenSQLite `2188 us/query` vs C SQLite `24.5 us/query`, i.e. FrankenSQLite
+  is **~89x slower**, not 72x faster. Per-statement CLI overhead baseline
+  (`SELECT 1;`) is `65 us` vs `1 us`, so execution alone is ~2123 us vs ~23.5 us.
+- Root cause: `EXPLAIN QUERY PLAN` shows C SQLite doing
+  `SEARCH products USING COVERING INDEX idx_prod_cat (category_id=?)` plus
+  `SEARCH categories USING INTEGER PRIMARY KEY (rowid<?)`, while FrankenSQLite
+  does `SCAN INDEX idx_prod_cat` plus `SCAN categories`. No index seek is
+  generated for `IN (subquery)`.
+- Do not cite these two benchmark rows as evidence of a subquery/CTE win, and
+  do not treat the subquery section as "done". Re-derive any README or CHANGELOG
+  claim sourced from them.
+- Retry condition for the benchmark itself: the row becomes trustworthy only
+  once (a) both engines extract and assert the same value, (b) parameters vary
+  between iterations so the retained count/sum cache cannot serve the answer,
+  and (c) at least one recursive-CTE row does not match the integer-series-sum
+  matcher.
+- Tracked as `bd-2dgf5` (planner index-seek gap, P0), `bd-czzlp` (benchmark
+  integrity, P0), `bd-5310l` (65x per-statement parse/plan overhead, P1).
+- Full write-up and reproduction:
+  `docs/progress/perf-baseline-subquery-cte-cc_fsq-20260709.md`.
