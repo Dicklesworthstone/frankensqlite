@@ -1727,13 +1727,18 @@ pub fn codegen_select(
         return codegen_grouped_inner_join_count_sum_select(b, &plan, ctx);
     }
 
-    let (table_name, table_alias, time_travel) = match &from_clause.source {
+    let (table_name, table_alias, time_travel, from_index_hint) = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table {
             name,
             alias,
             time_travel,
-            ..
-        } => (&name.name, alias.as_deref(), time_travel.as_ref()),
+            index_hint,
+        } => (
+            &name.name,
+            alias.as_deref(),
+            time_travel.as_ref(),
+            index_hint.as_ref(),
+        ),
         _ => {
             return Err(CodegenError::Unsupported(
                 "non-table FROM source".to_owned(),
@@ -1827,7 +1832,17 @@ pub fn codegen_select(
         && having.is_none()
         && !has_window_columns(columns)
         && from_clause.joins.is_empty()
-        && time_travel.is_none();
+        && time_travel.is_none()
+        // bd-2dgf5: `COUNT(*) FROM t WHERE col = <const>` on an indexed column is
+        // served far better by the aggregate index seek than by
+        // `codegen_select_count_star`, whose only indexed path
+        // (`extract_count_indexed_exists_target`) does not match a plain
+        // equality and so degrades to Rewind/Next over the whole table. Yield to
+        // `codegen_select_aggregate`, which drives AggStep from an index seek.
+        // Every other COUNT(*) shape keeps its specialized fast path.
+        && !(aggregate_index_eq_seek_allowed(from_index_hint)
+            && aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias)
+                .is_some());
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
     // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
@@ -2269,6 +2284,7 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
+            aggregate_index_eq_seek_allowed(from_index_hint),
         )
     } else if !stmt.order_by.is_empty() {
         if let Some(index_plan) = ctx
@@ -8268,114 +8284,22 @@ fn codegen_select_minmax_rowid_seek(
 /// [AggFinal per aggregate] → ResultRow → Close → Halt
 /// ```
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn codegen_select_aggregate(
+/// Emit the per-row accumulate body shared by every aggregate row source.
+///
+/// The caller positions `cursor` on a candidate row and supplies `skip_label`
+/// for rows rejected by `WHERE`. This body is row-source agnostic: it reads
+/// exclusively through `cursor`, so a full-table scan and an index-driven seek
+/// produce byte-identical accumulator state for the same set of rows.
+#[allow(clippy::too_many_arguments)]
+fn emit_aggregate_accumulate_body(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
-    columns: &[ResultColumn],
-    where_clause: Option<&Expr>,
-    having: Option<&Expr>,
-    out_regs: i32,
-    out_col_count: i32,
-    done_label: crate::Label,
-    end_label: crate::Label,
-) -> Result<(), CodegenError> {
-    // Resolve SELECT-list aliases referenced from HAVING (e.g.
-    // `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100`).
-    let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
-    let having = rewritten_having.as_ref();
-
-    if where_clause.is_none()
-        && having.is_none()
-        && let Some(plan) = simple_count_star_plus_sum_plan(columns, table, table_alias)
-    {
-        return codegen_select_count_star_plus_sum(
-            b, cursor, table, &plan, out_regs, done_label, end_label,
-        );
-    }
-
-    // Parse aggregate columns: extract function name, arg count, arg column index.
-    let mut agg_columns = parse_aggregate_columns(columns, table)?;
-
-    // Leaf-seek fast path for `MAX(rowid)` / `MIN(rowid)` with no WHERE/HAVING
-    // (this function is only reached when GROUP BY is empty). Stock SQLite
-    // special-cases the extremum of the INTEGER PRIMARY KEY as a single seek to
-    // the rightmost/leftmost leaf (O(log n)) instead of a full B-tree walk.
-    // The accumulate/finalize/wrapper machinery is reused verbatim so the
-    // produced result is bit-identical to the full-scan path; only the row that
-    // feeds AggStep changes (the single extremum row instead of every row).
-    if where_clause.is_none()
-        && having.is_none()
-        && let Some(seek) = minmax_rowid_seek_plan(&agg_columns)
-    {
-        return codegen_select_minmax_rowid_seek(
-            b,
-            cursor,
-            table,
-            &agg_columns,
-            seek,
-            out_regs,
-            out_col_count,
-            done_label,
-            end_label,
-        );
-    }
-
-    // Collect aggregates from the HAVING clause that are not in the SELECT list.
-    // Without this, HAVING-only aggregates (e.g. `HAVING SUM(x) > 10` when SUM(x)
-    // is not in SELECT) would never be accumulated and silently evaluate to 0.
-    let mut having_output_cols: Vec<GroupByOutputCol> = Vec::new();
-    if let Some(having_expr) = having {
-        collect_having_aggregates(
-            having_expr,
-            table,
-            &mut agg_columns,
-            &mut having_output_cols,
-        );
-    }
-
-    // Allocate one accumulator register per aggregate (SELECT + HAVING-only).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let total_agg_count = agg_columns.len() as i32;
-    let accum_base = b.alloc_regs(total_agg_count);
-
-    // Initialize accumulators to Null (required by AggStep protocol).
-    for i in 0..total_agg_count {
-        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
-    }
-
-    // Open table for reading.
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
-
-    // Rewind to first row; jump to finalize if table is empty.
-    let finalize_label = b.emit_label();
-    let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
-
-    // WHERE filter.
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        emit_where_filter(
-            b,
-            where_expr,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            skip_label,
-        );
-    }
-
-    // AggStep for each aggregate column.
+    agg_columns: &[AggColumn],
+    accum_base: i32,
+) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
         // Skip sentinel entries used for multi-aggregate wrappers.
@@ -8498,6 +8422,334 @@ fn codegen_select_aggregate(
             b.resolve_label(skip_lbl);
         }
     }
+}
+
+/// The index a `WHERE col = <constant>` aggregate can seek instead of scanning.
+///
+/// bd-2dgf5. Built on the same predicate the non-aggregate index-seek branch of
+/// [`codegen_select`] uses (`extract_column_eq_target` + `index_for_column`), so
+/// the seek visits exactly the row set that `SELECT * FROM t WHERE col = <const>`
+/// already visits. Restricted to a single ascending key term because the probe
+/// record is built as one key term + rowid.
+///
+/// Do NOT gate this on an affinity/collation pre-check by analogy with
+/// [`index_range_fast_path_is_safe`]. `cmp_p5` is `0x80 | comparison_affinity(..)`,
+/// and an `INTEGER` column compared against an integer literal carries a
+/// non-zero affinity, so such a gate rejects precisely the queries this seek
+/// exists to accelerate and degrades silently to a full scan with no test
+/// failure. See `resolved_index_range_comparison_carries_affinity_for_integer_column`.
+///
+/// Affinity skew is instead handled exactly as the non-aggregate path handles
+/// it: the `Ne` compare uses the index's own collation via
+/// [`direct_lookup_index_comparison_p4`], and a probe that matches nothing falls
+/// back to the full scan through `saw_index_match_reg` rather than trusting an
+/// empty result.
+///
+/// Shared by [`codegen_select_aggregate`] and by the `simple_count_star`
+/// suppression in [`codegen_select`], so the two cannot drift apart.
+/// Whether an explicit `INDEXED BY` / `NOT INDEXED` hint permits the aggregate
+/// index seek.
+///
+/// `NOT INDEXED` must force the scan, and `INDEXED BY <name>` names an index the
+/// seek does not consult, so both decline. Only an unhinted FROM source may seek.
+fn aggregate_index_eq_seek_allowed(index_hint: Option<&fsqlite_ast::IndexHint>) -> bool {
+    index_hint.is_none()
+}
+
+fn aggregate_index_eq_seek_target<'t, 'e>(
+    where_clause: Option<&'e Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, &'e Expr)> {
+    let (col_name, target_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
+    table
+        .index_for_column(&col_name)
+        .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))
+        .map(|idx| (idx, target_expr))
+}
+
+fn codegen_select_aggregate(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    having: Option<&Expr>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    allow_index_seek: bool,
+) -> Result<(), CodegenError> {
+    // Resolve SELECT-list aliases referenced from HAVING (e.g.
+    // `SELECT SUM(qty) AS total_qty ... HAVING total_qty > 100`).
+    let rewritten_having = having.map(|h| rewrite_having_select_aliases(h, columns, table));
+    let having = rewritten_having.as_ref();
+
+    if where_clause.is_none()
+        && having.is_none()
+        && let Some(plan) = simple_count_star_plus_sum_plan(columns, table, table_alias)
+    {
+        return codegen_select_count_star_plus_sum(
+            b, cursor, table, &plan, out_regs, done_label, end_label,
+        );
+    }
+
+    // Parse aggregate columns: extract function name, arg count, arg column index.
+    let mut agg_columns = parse_aggregate_columns(columns, table)?;
+
+    // Leaf-seek fast path for `MAX(rowid)` / `MIN(rowid)` with no WHERE/HAVING
+    // (this function is only reached when GROUP BY is empty). Stock SQLite
+    // special-cases the extremum of the INTEGER PRIMARY KEY as a single seek to
+    // the rightmost/leftmost leaf (O(log n)) instead of a full B-tree walk.
+    // The accumulate/finalize/wrapper machinery is reused verbatim so the
+    // produced result is bit-identical to the full-scan path; only the row that
+    // feeds AggStep changes (the single extremum row instead of every row).
+    if where_clause.is_none()
+        && having.is_none()
+        && let Some(seek) = minmax_rowid_seek_plan(&agg_columns)
+    {
+        return codegen_select_minmax_rowid_seek(
+            b,
+            cursor,
+            table,
+            &agg_columns,
+            seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
+
+    // Collect aggregates from the HAVING clause that are not in the SELECT list.
+    // Without this, HAVING-only aggregates (e.g. `HAVING SUM(x) > 10` when SUM(x)
+    // is not in SELECT) would never be accumulated and silently evaluate to 0.
+    let mut having_output_cols: Vec<GroupByOutputCol> = Vec::new();
+    if let Some(having_expr) = having {
+        collect_having_aggregates(
+            having_expr,
+            table,
+            &mut agg_columns,
+            &mut having_output_cols,
+        );
+    }
+
+    // Allocate one accumulator register per aggregate (SELECT + HAVING-only).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let total_agg_count = agg_columns.len() as i32;
+    let accum_base = b.alloc_regs(total_agg_count);
+
+    // Initialize accumulators to Null (required by AggStep protocol).
+    for i in 0..total_agg_count {
+        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
+    }
+
+    // bd-2dgf5: indexed-equality seek instead of a full table scan.
+    //
+    // `SELECT COUNT(*) FROM t WHERE k = ?` previously walked every row because
+    // every index access path was disabled for aggregates. When the WHERE
+    // clause is a single equality against a plain, ascending, single-key,
+    // rowid-table index, drive the accumulate body from an index seek over the
+    // duplicate run instead. Only the row source changes; the accumulate body
+    // and finalize sequence are emitted verbatim, so results are identical.
+    //
+    // `extract_column_eq_target` matches only when the *entire* WHERE clause is
+    // `col = <constant>`, so the seek enforces the whole predicate.
+    //
+    // The gate is deliberately identical to the non-aggregate index-seek gate in
+    // `codegen_select` (`index_eq` + `table.index_for_column`): the seek visits
+    // exactly the row set that `SELECT * FROM t WHERE col = <const>` already
+    // visits today, and the aggregate merely accumulates over it. That row-set
+    // parity, not a separate affinity analysis, is what makes this correct.
+    //
+    // Affinity skew is handled the way the non-aggregate path handles it: the
+    // `Ne` compare below uses the index own collation, and a probe that
+    // matches nothing falls back to the full scan via `saw_index_match_reg`
+    // rather than trusting an empty result. An affinity pre-check here would
+    // silently disable the seek (see `aggregate_index_eq_seek_target`).
+    //
+    // Additional aggregate-specific guards:
+    //   * HAVING is not supported on this path.
+    //   * A bare (non-aggregate) output column would expose *which* row the scan
+    //     happened to end on, so the row source must not change.
+    //   * Single ascending key term only; composite indexes fall back to the
+    //     scan (the probe record below is built for one key term + rowid).
+    let index_eq_seek = if allow_index_seek
+        && having.is_none()
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        aggregate_index_eq_seek_target(where_clause, table, table_alias)
+    } else {
+        None
+    };
+
+    let finalize_label = b.emit_label();
+    let where_placeholder_base = b.current_anon_placeholder();
+
+    if let Some((idx_schema, target_expr)) = index_eq_seek {
+        let idx_cursor = 1_i32;
+        let scan_fallback = b.emit_label();
+        let duplicate_run_done = b.emit_label();
+
+        // Probe key is [target, i64::MIN] so SeekGE anchors on the first entry
+        // of the duplicate run in a non-unique index.
+        let probe_key_regs = b.alloc_regs(2);
+        let min_rowid_reg = probe_key_regs + 1;
+        emit_expr(b, target_expr, probe_key_regs, None);
+        // `k = NULL` matches nothing; let the scan produce the empty result so
+        // the NULL semantics live in exactly one place.
+        b.emit_jump_to_label(
+            Opcode::IsNull,
+            probe_key_regs,
+            0,
+            scan_fallback,
+            P4::None,
+            0,
+        );
+
+        let saw_index_match_reg = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+        let probe_record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe_key_regs,
+            2,
+            probe_record_reg,
+            P4::None,
+            0,
+        );
+
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            idx_schema.root_page,
+            0,
+            P4::Index(idx_schema.name.clone()),
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_record_reg,
+            scan_fallback,
+            P4::None,
+            0,
+        );
+
+        let idx_loop_top = b.current_addr();
+        let idx_key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            probe_key_regs,
+            idx_key_reg,
+            duplicate_run_done,
+            direct_lookup_index_comparison_p4(idx_schema),
+            0x10,
+        );
+
+        let idx_skip_label = b.emit_label();
+        b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            idx_skip_label,
+            P4::None,
+            0,
+        );
+
+        // No WHERE filter here, by construction: `extract_column_eq_target`
+        // only matches when the *entire* WHERE clause is `col = <constant>`,
+        // and the SeekGE + Ne pair enforces exactly that predicate. Re-emitting
+        // the filter would also consume a second anonymous placeholder for a
+        // single `?`, misnumbering bound parameters. This mirrors
+        // `codegen_select_index_equality_scan`, which likewise emits no filter
+        // on its index path.
+        emit_aggregate_accumulate_body(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+        );
+
+        b.resolve_label(idx_skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+
+        b.resolve_label(duplicate_run_done);
+        b.emit_jump_to_label(
+            Opcode::If,
+            saw_index_match_reg,
+            0,
+            finalize_label,
+            P4::None,
+            0,
+        );
+
+        // No index match: fall through to the full scan. No AggStep ran, so the
+        // accumulators are still Null and the scan starts from a clean slate.
+        b.resolve_label(scan_fallback);
+        b.set_next_anon_placeholder(where_placeholder_base);
+    }
+
+    // Open table for reading.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // Rewind to first row; jump to finalize if table is empty.
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
+
+    // WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
+    }
+
+    // AggStep for each aggregate column.
+    emit_aggregate_accumulate_body(
+        b,
+        cursor,
+        table,
+        table_alias,
+        schema,
+        &agg_columns,
+        accum_base,
+    );
 
     // Skip label for WHERE-filtered rows.
     b.resolve_label(skip_label);
@@ -23577,6 +23829,131 @@ mod tests {
                 offset: Some(Expr::Literal(Literal::Integer(offset), Span::ZERO)),
             }),
         }
+    }
+
+    /// bd-2dgf5 regression fixture: `t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)`
+    /// with a single-column ascending index on `k`.
+    ///
+    /// `type_name` MUST be populated. `resolved_expr_affinity` reads `type_name`,
+    /// not `affinity`, so a fixture built purely from `ColumnInfo::basic` (which
+    /// leaves `type_name: None`) reports BLOB affinity and makes any affinity
+    /// assertion vacuously "clean" -- exactly how an earlier version of this
+    /// test hid the real behaviour and sent this investigation down a blind
+    /// alley.
+    fn bd_2dgf5_table() -> TableSchema {
+        let typed = |name: &str, affinity: char, is_ipk: bool, ty: &str| {
+            let mut col = ColumnInfo::basic(name, affinity, is_ipk);
+            col.type_name = Some(ty.to_owned());
+            col
+        };
+        TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                typed("id", 'D', true, "INTEGER"),
+                typed("k", 'D', false, "INTEGER"),
+                typed("v", 'B', false, "TEXT"),
+            ],
+            indexes: vec![IndexSchema {
+                name: "idx_t_k".to_owned(),
+                root_page: 3,
+                columns: vec!["k".to_owned()],
+                key_expressions: vec!["k".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: false,
+                key_collations: vec![],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    /// bd-2dgf5. `cmp_p5` is `0x80 | comparison_affinity(...)`. For an INTEGER
+    /// column compared against an integer literal no affinity conversion is
+    /// needed, so the low bits are clear and the affinity gate in
+    /// `aggregate_index_eq_seek_target` ADMITS the seek.
+    ///
+    /// This assertion is load-bearing: it is the reason the affinity gate can be
+    /// kept as cheap insurance against skewed comparisons (`k = '2'`) without
+    /// disabling the common indexed-integer-equality case. If it ever flips,
+    /// the aggregate index seek silently degrades to a full scan and the
+    /// bd-2dgf5 speedup disappears with no test failure elsewhere.
+    #[test]
+    fn resolved_index_range_comparison_carries_affinity_for_integer_column() {
+        let table = bd_2dgf5_table();
+        let schema = vec![table.clone()];
+        let target = Expr::Literal(Literal::Integer(2), Span::ZERO);
+
+        let comparison = resolved_index_range_comparison(&table, None, &schema, "k", &target);
+
+        assert_eq!(
+            comparison.cmp_p5 & 0x80,
+            0x80,
+            "the 0x80 bit is always set by ResolvedComparisonInfo::new"
+        );
+        assert_ne!(
+            comparison.cmp_p5 & !0x80,
+            0,
+            "an INTEGER column compared against an integer literal DOES carry a \
+             comparison affinity; gating the aggregate index seek on \
+             `(cmp_p5 & !0x80) == 0` therefore rejects exactly the case it was \
+             meant to accelerate, turning the seek into a silent no-op"
+        );
+    }
+
+    /// bd-2dgf5: the aggregate seek must engage for a plain single-column
+    /// ascending index and must decline everything it cannot probe with a
+    /// one-key-term + rowid record.
+    #[test]
+    fn aggregate_index_eq_seek_target_contract() {
+        let table = bd_2dgf5_table();
+        let two = Expr::Literal(Literal::Integer(2), Span::ZERO);
+
+        let indexed_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("k"), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Eq,
+            right: Box::new(two.clone()),
+            span: Span::ZERO,
+        };
+        let (idx, target) = aggregate_index_eq_seek_target(Some(&indexed_eq), &table, None)
+            .expect("indexed column equality must select the index seek");
+        assert_eq!(idx.name, "idx_t_k");
+        assert!(matches!(target, Expr::Literal(Literal::Integer(2), _)));
+
+        // Unindexed column: no seek.
+        let unindexed_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("v"), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Eq,
+            right: Box::new(two.clone()),
+            span: Span::ZERO,
+        };
+        assert!(aggregate_index_eq_seek_target(Some(&unindexed_eq), &table, None).is_none());
+
+        // Rowid / INTEGER PRIMARY KEY has no secondary index: no seek here.
+        let rowid_eq = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Eq,
+            right: Box::new(two.clone()),
+            span: Span::ZERO,
+        };
+        assert!(aggregate_index_eq_seek_target(Some(&rowid_eq), &table, None).is_none());
+
+        // No WHERE clause at all: no seek.
+        assert!(aggregate_index_eq_seek_target(None, &table, None).is_none());
+
+        // Non-equality predicate: no seek.
+        let range = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("k"), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Gt,
+            right: Box::new(two),
+            span: Span::ZERO,
+        };
+        assert!(aggregate_index_eq_seek_target(Some(&range), &table, None).is_none());
     }
 
     fn opcode_sequence(prog: &crate::VdbeProgram) -> Vec<Opcode> {

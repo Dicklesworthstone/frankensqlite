@@ -15065,3 +15065,57 @@ set: sessions found by
   integrity, P0), `bd-5310l` (65x per-statement parse/plan overhead, P1).
 - Full write-up and reproduction:
   `docs/progress/perf-baseline-subquery-cte-cc_fsq-20260709.md`.
+
+## 2026-07-09 - WIN: aggregate indexed-equality seek (bd-2dgf5)
+
+- Result type: KEPT. Ratchet passed at every size; landed.
+- Scope: `SELECT <agg>(...) FROM t WHERE <indexed_col> = <const>` on a rowid table
+  with a single-column ascending index. Includes `COUNT(*)`, which previously never
+  reached the aggregate path at all.
+- Root cause: aggregates bypassed every index access path. Three gates:
+  `connection.rs` `planner_select_directive_with_stats` returns None when a result
+  column contains an aggregate; `codegen.rs` forces `rowid_target`/`rowid_range`/
+  `index_range`/`index_eq` to None when `is_aggregate`; and `codegen_select`
+  intercepts `COUNT(*)` into `codegen_select_count_star`, whose only indexed path
+  (`extract_count_indexed_exists_target`) does not match a plain equality.
+  NOTE: the fix cannot live in the planner. Relaxing the planner gate makes the
+  directive consumers emit `ResultRow` instead of `AggStep` -> wrong results.
+- Change: `codegen_select_aggregate` gained an index-seek row source
+  (SeekGE + Ne over the duplicate run + IdxRowid + SeekRowid), sharing one
+  `emit_aggregate_accumulate_body()` with the scan so accumulate/finalize are
+  emitted verbatim. `saw_index_match_reg` falls back to the full scan when the
+  probe matches nothing. `simple_count_star` yields to this path when it applies.
+  `NOT INDEXED` / `INDEXED BY` decline the seek (`aggregate_index_eq_seek_allowed`).
+- A/B (release-perf, `taskset`-pinned, marginal `= (T_N - T_1)/(N-1)`, median of 7,
+  same binary and DB; ORIG = the scan this replaced, reproduced exactly via
+  `NOT INDEXED` on the same predicate and rows):
+
+    ops    ORIG(scan)   CAND(seek)   ratio
+    64      295 us       107 us      2.76x
+    256     281 us        94 us      2.99x
+    1024    274 us        88 us      3.11x
+
+  Monotonic in N, as expected when replacing an O(rows) scan with an O(matches)
+  seek. Keep-gate satisfied at all three sizes.
+- vs C SQLite on the same query: candidate marginal 88-107 us vs 16-21 us. The
+  residual is NOT the access path: ~65 us of every fsqlite statement is per-statement
+  parse/plan overhead (bd-5310l), and C SQLite additionally serves this shape from a
+  COVERING index with no table lookup. Covering-index aggregates are the next lever.
+- Correctness: 26/26 value parity vs C SQLite 3.46 (COUNT/SUM/AVG/MIN/MAX/TOTAL,
+  COUNT DISTINCT, SUM DISTINCT, group_concat, FILTER, `k = NULL`, no-match, negative,
+  affinity-skewed `k = '2'` and `k = 2.0`, `'2' = k`, unindexed column, unfiltered
+  COUNT(*), rowid equality, AND/OR/IN residuals, GROUP BY, correlated subquery bound,
+  HAVING). `cargo test -p fsqlite-vdbe --lib` 1027 passed; `-p fsqlite-core --lib`
+  3341 passed.
+- TRAP, recorded so nobody repeats it: gating this seek on an affinity/collation
+  pre-check by analogy with `index_range_fast_path_is_safe` silently disables it.
+  `cmp_p5` is `0x80 | comparison_affinity(..)`, and an INTEGER column vs an integer
+  literal carries a non-zero affinity. A first attempt shipped that gate, compiled,
+  passed every value test, and emitted an unchanged Rewind/Next program. Pinned by
+  `resolved_index_range_comparison_carries_affinity_for_integer_column`.
+  A second trap: a fixture built from `ColumnInfo::basic` leaves `type_name: None`,
+  so `resolved_expr_affinity` reports BLOB affinity and any affinity assertion passes
+  vacuously. `bd_2dgf5_table()` sets `type_name` for exactly this reason.
+- Do not validate index work with `EXPLAIN QUERY PLAN` text. EQP renders from the
+  planner directive, not the emitted program, and the two diverge in both directions
+  (bd-jyyae). Assert on `EXPLAIN` opcodes instead.
