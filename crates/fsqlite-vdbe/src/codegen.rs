@@ -1900,6 +1900,24 @@ pub fn codegen_select(
         extract_column_eq_target(where_clause.as_deref(), table, table_alias)
     };
 
+    // bd-2dgf5: non-aggregate `SELECT ... FROM t WHERE <int col> IN (<int literals>)` seeks
+    // the index once per distinct value instead of full-scanning. Same INTEGER-affinity +
+    // integer-literal safe subset as the aggregate IN path; declined for ORDER BY (the seek
+    // yields value-then-rowid order, which only happens to equal the sort order sometimes),
+    // LIMIT, and DISTINCT to keep this first cut small.
+    let index_in = if is_aggregate
+        || !stmt.order_by.is_empty()
+        || stmt.limit.is_some()
+        || distinct != Distinctness::All
+        || !group_by.is_empty()
+        || having.is_some()
+        || table.without_rowid
+    {
+        None
+    } else {
+        index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
+    };
+
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
@@ -2251,6 +2269,22 @@ pub fn codegen_select(
                 end_label,
             )
         }
+    } else if let Some((idx_schema, values)) = index_in {
+        // --- Index-seek SELECT over an integer IN-list (no ORDER BY / LIMIT / DISTINCT) ---
+        codegen_select_index_in_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            &values,
+        )
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
         // --- Aggregate query WITH GROUP BY ---
         codegen_select_group_by_aggregate(
@@ -2707,6 +2741,108 @@ fn codegen_select_index_equality_scan(
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     }
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Codegen for `SELECT <cols> FROM t WHERE <int col> IN (<int literals>)`.
+///
+/// bd-2dgf5. Seeks the index once per distinct value (ascending, matching C SQLite's
+/// value-then-rowid output order), does the table lookup, and emits `ResultRow`. Non-covering
+/// (always looks the row up). No scan fallback: the INTEGER-affinity + integer-literal +
+/// de-duplicated gate in [`index_integer_in_list_target`] makes each probe exact and the runs
+/// disjoint. The caller gates out ORDER BY / LIMIT / DISTINCT / WITHOUT ROWID.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_index_in_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    values: &[i64],
+) -> Result<(), CodegenError> {
+    let idx_cursor = 1_i32;
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+
+    for &value in values {
+        let probe_key_regs = b.alloc_regs(2);
+        b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
+        b.emit_op(
+            Opcode::Int64,
+            0,
+            probe_key_regs + 1,
+            0,
+            P4::Int64(i64::MIN),
+            0,
+        );
+        let probe_record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe_key_regs,
+            2,
+            probe_record_reg,
+            P4::None,
+            0,
+        );
+        let next_value = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_record_reg,
+            next_value,
+            P4::None,
+            0,
+        );
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let run_top = b.current_addr() as i32;
+        let idx_key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            probe_key_regs,
+            idx_key_reg,
+            next_value,
+            direct_lookup_index_comparison_p4(idx_schema),
+            0x10,
+        );
+
+        let skip_row = b.emit_label();
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+        b.resolve_label(skip_row);
+        b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
+        b.resolve_label(next_value);
+    }
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
 }
@@ -8556,7 +8692,7 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
 ///     `NOT IN`, non-empty list.
 /// Anything outside this (text/real/numeric column, a non-integer or non-literal element,
 /// `NOT IN`) declines and the aggregate keeps its full scan.
-fn aggregate_index_in_seek_target<'t>(
+fn index_integer_in_list_target<'t>(
     where_clause: Option<&Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
@@ -8604,7 +8740,7 @@ fn aggregate_index_in_seek_target<'t>(
 /// `idx_cursor` once); for each matching index entry it does `IdxRowid` + `SeekRowid` into
 /// the table and runs the shared accumulate body. A `SeekGE` miss or a first key that is not
 /// `value` skips straight to `next_value` (this value contributes nothing). No scan fallback:
-/// the INTEGER-affinity + integer-literal gate in [`aggregate_index_in_seek_target`] makes the
+/// the INTEGER-affinity + integer-literal gate in [`index_integer_in_list_target`] makes the
 /// probe exact, and de-duplicated values keep the runs disjoint.
 #[allow(clippy::too_many_arguments)]
 fn emit_aggregate_index_value_seek(
@@ -8859,7 +8995,7 @@ fn codegen_select_aggregate(
 
     // bd-2dgf5: seek an INTEGER-affinity index once per distinct value of a
     // `WHERE col IN (<int literals>)` instead of full-scanning. Narrowly gated so no
-    // per-value scan fallback is needed (see `aggregate_index_in_seek_target`).
+    // per-value scan fallback is needed (see `index_integer_in_list_target`).
     let index_in_seek = if allow_index_seek
         && having.is_none()
         && index_eq_seek.is_none()
@@ -8867,7 +9003,7 @@ fn codegen_select_aggregate(
         && rowid_range_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        aggregate_index_in_seek_target(where_clause, table, table_alias)
+        index_integer_in_list_target(where_clause, table, table_alias)
     } else {
         None
     };
@@ -24594,6 +24730,44 @@ mod tests {
                     .iter()
                     .any(|op| op.opcode == Opcode::Rewind),
                 "`{sql}` must decline the IN-list seek and scan (Rewind present)"
+            );
+        }
+    }
+
+    /// bd-2dgf5: non-aggregate `SELECT <cols> FROM t WHERE <int col> IN (<int literals>)`
+    /// seeks the index once per DISTINCT value and never full-scans; ORDER BY / LIMIT /
+    /// DISTINCT / a non-INTEGER column / NOT IN decline to the scan. Results are covered by
+    /// `index_in_list_nonaggregate_matches_sqlite`.
+    #[test]
+    fn bd_2dgf5_nonaggregate_in_list_seeks_per_distinct_value() {
+        let seeks = |sql: &str| -> usize {
+            bd_2dgf5_program(sql)
+                .iter()
+                .filter(|op| op.opcode == Opcode::SeekGE)
+                .count()
+        };
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE k IN (1, 2, 3)");
+        assert_eq!(seeks("SELECT id, v FROM t WHERE k IN (1, 2, 3)"), 3);
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "k IN (1,2,3) must not full-scan"
+        );
+        assert!(ops.iter().any(|op| op.opcode == Opcode::ResultRow));
+        assert_eq!(seeks("SELECT id FROM t WHERE k IN (2, 2)"), 1);
+
+        for sql in [
+            "SELECT id FROM t WHERE k IN (1, 2) ORDER BY id",
+            "SELECT id FROM t WHERE k IN (1, 2) LIMIT 3",
+            "SELECT DISTINCT id FROM t WHERE k IN (1, 2)",
+            "SELECT id FROM t WHERE k IN (2, 3.0)",
+            "SELECT id FROM t WHERE k NOT IN (1, 2)",
+            "SELECT id FROM t WHERE v IN (1, 2)",
+        ] {
+            assert!(
+                bd_2dgf5_program(sql)
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must decline the non-aggregate IN-list seek (Rewind present)"
             );
         }
     }

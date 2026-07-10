@@ -261,3 +261,71 @@ fn index_in_list_aggregate_matches_sqlite() {
         );
     }
 }
+
+#[test]
+fn index_in_list_nonaggregate_matches_sqlite() {
+    // k INTEGER (INTEGER affinity), indexed; duplicate k values and rowid gaps.
+    let mut schema = vec![
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL, s TEXT);".to_owned(),
+        "CREATE INDEX idx_t_k ON t(k);".to_owned(),
+    ];
+    for i in 1..=40_i64 {
+        schema.push(format!(
+            "INSERT INTO t VALUES ({i}, {}, {i}.5, 'r{i}');",
+            i % 5
+        ));
+    }
+    schema.push("INSERT INTO t VALUES (200, -3, 9.5, 'neg');".to_owned());
+    schema.push("INSERT INTO t VALUES (201, NULL, 10.5, 'nul');".to_owned());
+    let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+    let (f, r) = setup(&schema_refs);
+
+    // Without ORDER BY the row order is unspecified, so the contract is SET equality: sort
+    // both sides. (When fsqlite takes the seek and C SQLite seeks too, orders coincide; when
+    // fsqlite declines to a rowid scan they legitimately differ. Both are valid.)
+    let sorted = |res: Result<Vec<Vec<String>>, String>| -> Result<Vec<Vec<String>>, String> {
+        res.map(|mut rows| {
+            rows.sort();
+            rows
+        })
+    };
+    let set_eq = [
+        "SELECT id FROM t WHERE k IN (1, 2, 3)",
+        "SELECT id, k FROM t WHERE k IN (2, 1)",
+        "SELECT id, s FROM t WHERE k IN (0, 4)",
+        "SELECT id FROM t WHERE k IN (2)",
+        "SELECT id FROM t WHERE k IN (2, 2, 2)",
+        "SELECT id FROM t WHERE k IN (1, 1, 2, 2)",
+        "SELECT id FROM t WHERE k IN (99, 100)",
+        "SELECT id FROM t WHERE k IN (-3, 2)",
+        "SELECT id, v FROM t WHERE k IN (0, 1, 2, 3, 4)",
+        "SELECT id FROM t WHERE k IN (2, NULL)",
+    ];
+    for sql in set_eq {
+        assert_eq!(
+            sorted(frank_rows(&f, sql)),
+            sorted(sqlite_rows(&r, sql)),
+            "non-aggregate IN-list (row set) diverged from SQLite for `{sql}`"
+        );
+    }
+
+    // With ORDER BY (declines the seek) and the decline cases: still must match exactly.
+    let ordered_or_declined = [
+        "SELECT id FROM t WHERE k IN (1, 2, 3) ORDER BY id",
+        "SELECT id, k FROM t WHERE k IN (2, 1) ORDER BY id DESC",
+        "SELECT id FROM t WHERE k IN (1, 2) ORDER BY id LIMIT 3",
+        "SELECT DISTINCT k FROM t WHERE k IN (1, 2, 3) ORDER BY k",
+        "SELECT id FROM t WHERE k IN (2, 3.0) ORDER BY id",
+        "SELECT id FROM t WHERE k IN ('2', '3') ORDER BY id",
+        "SELECT id FROM t WHERE k NOT IN (1, 2) ORDER BY id",
+        "SELECT id FROM t WHERE k IN (1, 2) AND id < 20 ORDER BY id",
+        "SELECT s FROM t WHERE v IN (1, 2) ORDER BY id",
+    ];
+    for sql in ordered_or_declined {
+        assert_eq!(
+            frank_rows(&f, sql),
+            sqlite_rows(&r, sql),
+            "non-aggregate IN-list (ordered/declined) diverged from SQLite for `{sql}`"
+        );
+    }
+}

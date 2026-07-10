@@ -82,6 +82,23 @@ fn time_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     start.elapsed().as_nanos()
 }
 
+/// Non-aggregate IN-list arm: `SELECT id, v WHERE k IN (a,b,c)`, per-value index seek + row
+/// projection vs `NOT INDEXED` full-scan. Values vary. Distinct from the aggregate arm: this
+/// exercises the `codegen_select_index_in_scan` ResultRow path, not accumulate.
+fn time_nonagg_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+    let hint = if not_indexed { " NOT INDEXED" } else { "" };
+    let start = Instant::now();
+    for j in 0..EXECS_PER_SAMPLE {
+        let a = 1 + ((base + j as i64) % ROWS);
+        let b = 1 + ((base + j as i64 + 1) % ROWS);
+        let c = 1 + ((base + j as i64 + 2) % ROWS);
+        let sql = format!("SELECT id, v FROM t{hint} WHERE k IN ({a}, {b}, {c})");
+        let rows = conn.query(black_box(&sql)).expect("query");
+        black_box(&rows);
+    }
+    start.elapsed().as_nanos()
+}
+
 fn median(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
     v[v.len() / 2]
@@ -191,5 +208,37 @@ fn main() {
         (mi_nb as f64) / (mi_na as f64),
         us(mi_na),
         us(mi_nb)
+    );
+
+    // Non-aggregate IN-list arm: SELECT id,v WHERE k IN (a,b,c), seek+ResultRow vs scan.
+    black_box(time_nonagg_in_arm(&conn, false, 0));
+    black_box(time_nonagg_in_arm(&conn, true, 0));
+    let mut nseek = Vec::with_capacity(SAMPLES);
+    let mut nscan = Vec::with_capacity(SAMPLES);
+    let mut nnull_a = Vec::with_capacity(SAMPLES);
+    let mut nnull_b = Vec::with_capacity(SAMPLES);
+    for s in 0..SAMPLES {
+        let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
+        nseek.push(time_nonagg_in_arm(&conn, false, base));
+        nscan.push(time_nonagg_in_arm(&conn, true, base));
+        nnull_a.push(time_nonagg_in_arm(&conn, false, base));
+        nnull_b.push(time_nonagg_in_arm(&conn, false, base));
+    }
+    let mn_seek = median(nseek);
+    let mn_scan = median(nscan);
+    let mn_na = median(nnull_a);
+    let mn_nb = median(nnull_b);
+    println!("--- non-aggregate in-list: SELECT id,v WHERE k IN (a,b,c) ---");
+    println!("nonagg in seek median = {:.3} us/query", us(mn_seek));
+    println!("nonagg in scan median = {:.3} us/query", us(mn_scan));
+    println!(
+        "nonagg in speedup (scan/seek) = {:.3}x",
+        (mn_scan as f64) / (mn_seek as f64)
+    );
+    println!(
+        "nonagg in NULL control (seek/seek) = {:.3}x  [{:.3} vs {:.3} us/query]",
+        (mn_nb as f64) / (mn_na as f64),
+        us(mn_na),
+        us(mn_nb)
     );
 }

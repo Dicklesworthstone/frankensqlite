@@ -16308,3 +16308,45 @@ test is on the executed path, not merely linked into it.
   C SQLite uses. COUNT(*) IN already has its own path.
 - Provenance: worker vmi1149989 (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the
   commit; binary sha256 unavailable (rch returns no binary; bd-kbuck).
+
+## 2026-07-10 - WIN: non-aggregate index IN-list per-value seek (bd-2dgf5)
+
+- Result type: KEPT. Semantic gate (differential oracle vs C SQLite) passed; landed. Extends
+  the aggregate IN-list seek to the far more common `SELECT <cols> ... WHERE col IN (list)`.
+- Profile-first: `SELECT id FROM t WHERE k IN (1,2,3)` (k indexed) did a full TABLE scan
+  (OpenRead + Rewind + Next, no index use) while C SQLite covering-seeks per value. This is the
+  non-aggregate analogue of the aggregate IN gap (bd-jyyae also noted EQP lied here).
+- Change: shared `index_integer_in_list_target` (renamed from the aggregate helper) +
+  `codegen_select_index_in_scan`, routed from `codegen_select` between the index-equality and
+  full-scan branches. Per distinct value: SeekGE + Ne-run + IdxRowid + SeekRowid + column reads
+  + ResultRow. Non-covering (always table lookup). Same INTEGER-affinity + integer-literal +
+  de-dup safe subset, so no per-value fallback.
+- ORDER MATCHES C SQLite: values are sorted ascending and each run walks rowid order, so the
+  output is value-then-rowid — exactly C SQLite's IN-seek order. Declined for ORDER BY, LIMIT,
+  DISTINCT, GROUP BY/HAVING, WITHOUT ROWID (kept small; those fall back to the scan).
+- SEMANTIC PROOF (hard gate): `index_in_list_nonaggregate_matches_sqlite` runs 19 queries on
+  FrankenSQLite and rusqlite (real C SQLite). No-ORDER-BY queries are compared as SETS (their
+  row order is unspecified by SQL, and a declined case legitimately scans in rowid order while
+  C SQLite seeks in value order — both valid); ORDER BY queries are compared EXACTLY. Covers
+  dedup (`k IN (2,2,2)`), NULL-in-list, misses, negatives, projection, and every decline case
+  (ORDER BY, LIMIT with ORDER BY, DISTINCT, `2,3.0`, `'2','3'`, NOT IN, extra predicate,
+  TEXT-affinity column). PASSED on worker vmi1227854. No golden matches this shape (golden 8/8
+  green); no re-bless. `bd_2dgf5_nonaggregate_in_list_seeks_per_distinct_value` asserts the
+  emitted program seeks once per distinct value (3 for `(1,2,3)`, 1 for `(2,2)`), never Rewinds,
+  and Rewind-scans every decline shape.
+- A/B (release-perf via rch, worker `hz1`, seek vs scan interleaved per sample, IN values varied
+  per execution, scan forced via `NOT INDEXED` and proven equal by the oracle). 20,000-row
+  table, `k == id` (selective 3-value list), `SELECT id, v`:
+    nonagg in seek median = 61.84 us/query
+    nonagg in scan median = 6570.25 us/query
+    nonagg in speedup (scan/seek) = 106.25x
+    nonagg in NULL control (seek vs seek) = 0.923x  [28.2 vs 26.0 us/query]  (~8%)
+  The 106x effect is ~100x beyond the null floor — decisive. (Same binary this run: aggregate
+  IN 107.3x.) Mechanism: three index seeks + three row lookups vs a 20,000-row scan that also
+  evaluates 3-value membership per row.
+- Correctness beyond the oracle: `cargo test -p fsqlite-vdbe --lib` 1034 passed; golden 8/8;
+  reachability 1/1; `-p fsqlite-core --lib` 3343 passed.
+- FOLLOW-UP: non-INTEGER-affinity columns, non-integer / subquery IN lists, ORDER BY / LIMIT /
+  DISTINCT variants, and rowid `id IN (list)` still scan (correct, unoptimized).
+- Provenance: worker hz1 (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the commit;
+  binary sha256 unavailable (rch returns no binary; bd-kbuck).
