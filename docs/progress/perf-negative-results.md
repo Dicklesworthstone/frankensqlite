@@ -15594,3 +15594,155 @@ test is on the executed path, not merely linked into it.
 - Contrast, recorded so the distinction is usable: the `opcode_trace_enabled()` candidate
   above WAS the crossing-min pathology, caught before any edit, because the function has
   0.00% self-time and 0 frames in the envelope its gate would have measured.
+
+## 2026-07-10 - AUDIT v2 (exact dispatch counts): hot-arm stream matrix DOES reach the pruned arms
+
+- Supersedes the reasoning-only audit above. The crossing-min rule asks for a profile
+  proving the benchmark executes the function under test. Sampled self-time was not
+  obtainable (see BLOCKER below), so this uses the VDBE's exact per-opcode execution
+  counters instead, which are strictly stronger for the reachability question: they
+  count dispatches rather than estimating them from samples.
+- Method: `hot_arm_bench_streams_dispatch_their_opcodes` in
+  `crates/fsqlite-vdbe/tests/hot_arm_stream_reachability.rs`. It rebuilds the same programs
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs` builds, at the same
+  `EXECUTE_STAGE_OP_REPEATS = [64, 256, 1024]`, with the same
+  `set_vdbe_jit_enabled(false)`, then executes them with
+  `set_vdbe_metrics_enabled(true)` and reads `opcode_execution_totals`.
+  This matters because `ProgramBuilder::finish()` runs peephole fusion and a JIT
+  exists, so "the builder emitted N ops" does not imply "the interpreter dispatched
+  N ops".
+- Result (exact dynamic dispatch counts, not samples):
+
+    stream                              64 ops   256 ops   1024 ops
+    vdbe_pipeline_execute_add              64       256       1024
+    vdbe_pipeline_execute_zeroornull       64       256       1024
+
+  Every op emitted is dispatched. `FSQLITE_JIT_ENABLED` defaults to `false`, so the
+  interpreter arm the candidates removed is the arm the bench measures, in the same
+  configuration production uses.
+- Conclusion: the `Opcode::Add` and `Opcode::ZeroOrNull` hot-dispatch-removal rejects
+  are VALID. They are not the frankenredis/franken_whisper pathology. Both stay blocked.
+  Their A/B also regressed at every stream length, which independently proves execution:
+  deleting an arm that never runs cannot slow a benchmark.
+- HOW THE COUNTS WERE OBTAINED, stated because the test moved: the assertion first lived
+  in `engine.rs`'s test module, where it PASSED when run alone
+  (`cargo test -p fsqlite-vdbe --lib bd_kbuck`, remote worker hz2) and produced the exact
+  counts above. It then FAILED inside the full `--lib` suite. That failure was not a wrong
+  result: `set_vdbe_metrics_enabled` and the opcode counters are process-global, so every
+  concurrently executing test contributes to them and `reset_vdbe_metrics()` zeroes them
+  mid-measurement. It is the same defect as bd-948sd, reproduced by the very test written
+  to audit it. The assertion now lives in its own integration-test binary, one test per
+  process, where nothing else can touch the counters.
+- TRAP for anyone else asserting on VDBE metrics: they are PROCESS-GLOBAL. Any test that
+  enables them inside a multi-test binary both pollutes and is polluted. Put such a test
+  in its own `tests/` binary; a local `Mutex` is not enough, because it does not stop the
+  other tests in the binary from executing opcodes.
+- SCOPE LIMIT, stated so nobody over-reads this: `Opcode::MakeRecord`'s reject was NOT
+  measured on the 64/256/1024 stream matrix. It used `make_record_fixed_schema` in
+  `crates/fsqlite-vdbe/benches/make_record.rs` at 4/8/16/32 columns. This counter test
+  does not cover it, and it remains verified only by the effect-direction argument.
+  `FusedAppendInsert`, `ColumnSubstrPrefix` and `FusedLiteralResultRow` were rejected
+  before any source mutation (no cold interpreter arm exists to route through), so there
+  is no measurement to invalidate.
+- No row reopened. No lever recovered from this audit.
+
+## 2026-07-10 - BLOCKER: rch does not return built binaries, so HEAD-current profiling is impossible
+
+- `rch exec -- cargo build` succeeds remotely and then retrieves
+  `Custom CARGO_TARGET_DIR artifacts retrieved: 3 files, 507 bytes`. The binary itself
+  never lands. Verified with the prescribed unblock form
+  (`env -u CARGO_TARGET_DIR rch exec -- ... cargo build --profile release-perf
+  -p fsqlite-e2e --bin perf-update-delete`): exit 0, `[RCH] remote hz2 (501.4s)`, no
+  `Rewriting CARGO_TARGET_DIR` line (so the client env WAS clean), and no
+  `perf-update-delete` newer than 35 minutes anywhere under `target/` or
+  `/data/tmp/cargo-target/`.
+- `cargo bench` and `cargo test` are unaffected: they return their text results, which
+  is why the audit above uses an in-process counter assertion rather than `perf`.
+- Consequence for `bd-kbuck` / write_single: a DELETE-scoped, population-excluded,
+  HEAD-current frame table cannot be produced. The only unstripped `perf-update-delete`
+  available is the pre-`c29ab92c` copy under
+  `tests/artifacts/perf/cod-fsq-write-single-exact-small-20260710T0755Z/`, which cannot
+  attribute current code.
+- The keep-gate envelope was, however, pinned exactly by reading
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`: population + `COMMIT` happen
+  OUTSIDE the measured window; the window is `BEGIN` -> prepared
+  `DELETE FROM bench WHERE id = ?1` x mutation_count -> `COMMIT`, timed as
+  `begin_us` / `prepare_us` / `mutate_us` / `commit_us`. Of `perf-update-delete`'s four
+  modes, `isolated` matches that shape (single BEGIN, prepared delete loop, single
+  COMMIT). `rollback-isolated` does BEGIN/DELETE/ROLLBACK and therefore carries exactly
+  the rollback-reload frames that must be excluded; `standard` carries population INSERT
+  frames. Whoever unblocks the binary retrieval should profile `isolated` with a delayed
+  `perf record` start and then VERIFY the report contains no
+  `execute_prepared_direct_simple_insert` self-time before attributing anything.
+
+## 2026-07-10 - LEDGER-INTEGRITY CORRECTION: the exact five hot-arm rejects remain unverified, but irrelevant to write_single
+
+- This supersedes only the hot-arm reachability conclusions above. The exact
+  historical rows named by the current audit requirement are `Variable`
+  (ledger lines 475-501), `AddImm` (532-557), `Rowid` (14949-14970),
+  `IdxRowid` (14972-14994), and `Next | SorterNext` (15020-15041).
+- The two audits above instead cover `Add`, `ZeroOrNull`, `MakeRecord`, and
+  three fused opcodes that had no fallback candidate. The integration test
+  added alongside the second audit dynamically counts only `Add` and
+  `ZeroOrNull`. It does not establish reachability for any of the exact five.
+- The statement that a timing effect makes sampled self-time unnecessary is
+  superseded by the current ledger-integrity rule. Each exact-five row remains
+  UNVERIFIED until a symbolized release-perf profile records nonzero self-time
+  on that opcode arm's `engine.rs` source line at 64/256/1024. Their historical
+  ORIG/candidate timings also came from separate RCH invocations, so they are
+  routing context rather than fresh keep/reject proof under the current
+  one-binary rule.
+- This does not reopen single-opcode pruning for `write_single`. The clean
+  exact prepared DELETE capture recorded all `VdbeEngine` frames at
+  `0 / 0.00%` and `execute_prepared_direct_simple_delete` at 338 frames; the
+  current exact-gate calibration below again found zero VDBE frames in an
+  unrestricted symbol report. Prepared DELETE uses the direct BtCursor bypass.
+- Retry condition: revalidate an exact-five row only for a VDBE-executing
+  workload, profile-attribute nonzero arm self-time, then interleave ORIG and
+  candidate in one release-perf binary and one fail-closed RCH invocation.
+
+## 2026-07-10 - REJECT: overprovisioned exact-gate perf sample matrix
+
+- Result type: REJECTED MEASUREMENT SUBSTRATE / VALID FSQLITE-64 PROFILE. No
+  optimization source lever was mixed into this attempt.
+- The blocker above was resolved without a local build: the mandatory
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo build ...`
+  completed on `vmi1293453`, and the still-resident worker binary was copied
+  into a unique remote artifact directory. Cargo profile overrides retained
+  line tables and symbols; `file` reported `with debug_info, not stripped`.
+- Evidence:
+  `tests/artifacts/perf/cod-fsq-write-single-exact-gate-20260710T134618Z/`.
+  Source SHA-256 `c25b49f665c11de5db6ae4e94c0c3576934c927c80e35215424637aab4cf6e2d`;
+  binary SHA-256 `eba047ef0e225081b9da83f674d8ff8aab1dcccaeff179b1ca83e3008f2f80d5`;
+  worker `vmi1293453`, target CPU 2. Remote raw data SHA-256
+  `95a7aa00e44eaeff289dd1803c9c050f97b3701d73a4238d6d8ac46f9faf49c7`.
+- Exact envelope: one warmed connection and prepared DELETE, three warmup
+  transactions, then acknowledged perf enable around only
+  `BEGIN -> 64 sparse DELETEs -> COMMIT`; population and restore ran disabled.
+  An unrestricted symbol report found `0 frames / 0.00%` for VDBE execution,
+  direct INSERT population/restore, rollback, connection-open, and
+  `SharedMvccState::new` frames.
+- Calibration result: the first planned 400,000-iteration arm was stopped once
+  it had already produced 451K cycle samples, zero lost samples, 869.570 s of
+  sampled-span duration, and 7,510,844,800 bytes of DWARF data. Exit 15 records
+  the intentional sample-budget stop; C SQLite and the other sizes were not
+  started. This is substantially beyond what is needed to resolve a 0.10%
+  self-time cutoff.
+- Ranked FSQLite-64 self-time led with
+  `TableLeafDeleteRun::materialize_deletions` 8.41% / 40,028 samples,
+  `cell_on_page_size_fast` 4.67% / 22,443,
+  `TableLeafDeleteRun::delete_rowid_with_reason` 3.00% / 14,190,
+  `TableLeafPayloadPatchRun::table_leaf_rowid_at` 2.39% / 11,315, and
+  `malloc` 1.87% / 8,214. The complete >=0.10% table is in the artifact.
+  These leaders map to the already-blocked retained-run materialization,
+  compact-cell scan, search/admission, and page-publication allocation
+  families, so none was retried.
+- Ledger-integrity signal for the provisional allocation-elision vein:
+  `TransactionKind::pending_conflict_pages_conservative` has nonzero measured
+  self-time, 0.18% / 795 samples. This admits callsite attribution work; it
+  does not yet prove that `write_set_page_numbers()`'s Vec clone owns those
+  samples.
+- Retry condition: rerun the same six exact FSQLite/C SQLite arms at one tenth
+  the iteration counts (`40k/80k`, `10k/20k`, `2.5k/5k` for
+  64/256/1024). This keeps the exact boundary while avoiding timeout and disk
+  waste, and still targets tens of thousands of samples per arm.

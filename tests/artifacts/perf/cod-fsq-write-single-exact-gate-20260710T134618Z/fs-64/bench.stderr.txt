@@ -1,0 +1,1 @@
+perf-update-delete: rows=1280 iters=400000 which=delete engine=fsqlite mode=exact-gate (do_update=false do_delete=true update_count=128 delete_count=64)
