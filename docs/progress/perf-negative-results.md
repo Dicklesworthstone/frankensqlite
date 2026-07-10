@@ -16082,3 +16082,37 @@ test is on the executed path, not merely linked into it.
 - Provenance: worker `vmi1152480`; source `serial_type_ab.rs` sha256
   a7652424d8c339a0c2e3aa4f808c36e74b1a6b8e94a06bb4ce48cba979a8cab3. Binary sha256 unavailable
   (rch does not return built binaries; bd-kbuck).
+
+## 2026-07-10 - CONVERGENCE: the cc-lane "golden-unchanged runtime lever" search is exhausted
+
+- Not a candidate; a synthesis of a profile-first sweep, recorded so the next agent does not
+  re-tread. Constraint this pass: a RUNTIME lever that leaves emitted bytecode unchanged
+  (so codegen/planner levers, which change and re-bless golden snapshots, were out of scope).
+- Paths profiled (via existing benches + ranked-frame artifacts; fresh `perf` is blocked because
+  rch returns no binary, bd-kbuck):
+  * Record serialization (`serialize_record*`, make_record bench): already heavily optimized —
+    two-pass cached layouts, reusable-buffer variant, precomputed-header fast path, single-slot
+    specialization, stack arrays for <=16 slots, small-body append path. No safe lever left.
+  * `serial_type_for_integer`: branchless candidate REJECTED this session (no win vs a ~16%
+    remote null floor; see entry above).
+  * VDBE main dispatch loop (`engine.rs` execute loop, `vdbe_pipeline_execute` bench): the only
+    real per-instruction overhead is the `&ops[pc]` bounds check. Removing it needs
+    `get_unchecked` = `unsafe`, which `fsqlite-vdbe` forbids (`unsafe_code = "forbid"`). The
+    other per-op costs (cancellation check every 4096 ops; metrics/trace branches) are either
+    correctness-required or predictable-false and ~free.
+- ROOT STRUCTURAL BLOCKER: `#![forbid(unsafe_code)]` (overridden only in vfs/c-api) rules out the
+  entire class of low-level runtime perf levers — SIMD (bd-o023g), hot-loop bounds-check elision,
+  `get_unchecked` — in exactly the crates where the hot runtime paths live. This is a deliberate
+  design choice, not a bug; it means safe runtime micro-levers are the only ones available, and
+  those on the cc-owned paths are now either optimized or below the remote harness null floor.
+- The remaining live perf frontier is cod's: `ShardedPageCache::clear` + the freed_pages/get_page
+  membership scans on the write_single DELETE tail (the only category slower than C SQLite,
+  1.213x). Handed off with two reopenable rows (see the 2026-07-10 provenance audit).
+- WHERE cc-lane perf wins DO remain: CODEGEN/planner levers, which change emitted bytecode and
+  re-bless the golden snapshots. The 2026-07-10 covering-index aggregate seek (a6b1a262) is the
+  proof — a real, measured cc-lane win that necessarily changed bytecode. A "golden-unchanged"
+  constraint filters those out; lifting it (accepting a golden re-bless per win) reopens the lane.
+- Unblocks, in priority order: (1) rch binary retrieval → fresh `perf` profiling → real
+  frame-ranked lever selection; (2) a target-feature floor (x86-64-v2/v3) or a scoped unsafe
+  exception → SIMD/`lzcnt` levers; (3) allow codegen levers (with golden re-bless) → the covering
+  seek's proven vein. Absent these, the cc runtime-perf lane is at honest convergence.
