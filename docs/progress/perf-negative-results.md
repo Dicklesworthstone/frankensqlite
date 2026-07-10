@@ -15462,3 +15462,41 @@ set: sessions found by
   arguments without first proving the argument can be read from the index entry;
   those shapes evaluate through `emit_expr` against the table cursor, and feeding them
   an index cursor reads the wrong column with no test failure on a populated table.
+
+### Execution proof for the entry above (ledger-integrity requirement)
+
+Added 2026-07-10 in response to the crossing-min finding, where four REJECT rows were
+measured on a benchmark input that never reached the function under test (0.000%
+self-time). Every entry must show the benchmark actually executes the changed code.
+
+This entry is a WIN, and no REJECT row gated it: the preflight returned
+`verdict=allowed` with `matched_records=[]`, so no prior rejection was relied upon.
+
+The release binaries are `strip = true`, so symbol-level self-time is unavailable and
+`perf report` cannot attribute frames. Hardware counters answer the same question
+without symbols, because dead code retires no instructions. `perf stat -e instructions,
+L1-dcache-loads`, taskset-pinned, on the exact frozen ORIG/CAND binaries and the exact
+1024-query scripts used for the gate:
+
+    matches/query   ORIG instructions   CAND instructions   L1-dcache-loads ORIG/CAND
+    20               473,047,225         380,755,686         184,186,879 / 146,498,800
+    400            2,952,050,099       1,823,002,946         945,085,426 / 534,013,977
+
+Per-query instruction delta: 90,128 (20 matches) and 1,102,585 (400 matches). Fitting
+`delta(m) = a + b*m`:
+
+    b =  2,664 instructions per removed table lookup
+    a = 36,841 instructions per query for the table cursor that is no longer opened
+
+`b` is an independent estimate of the same quantity the wall clock measured: 2664
+instructions at ~3 GHz and IPC ~1.5 is ~0.59 us, against 0.54 us measured per removed
+lookup at 20 matches. Two instruments, one number.
+
+At 400 matches the covering path eliminates 38.2% of all retired instructions. A change
+that never executed would show a delta of ~0 at both densities, and could not produce a
+delta that scales with the number of matched rows.
+
+Independently, the emitted program was read out of each frozen binary with `EXPLAIN` on
+the same database used for the benchmark: ORIG emits `SeekGE IdxRowid SeekRowid AggStep`
+and CAND emits `SeekGE AggStep` for `SELECT COUNT(*) FROM t WHERE k = 2`. The code under
+test is on the executed path, not merely linked into it.
