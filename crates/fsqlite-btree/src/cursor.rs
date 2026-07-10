@@ -3748,6 +3748,32 @@ impl<P: PageReader> BtCursor<P> {
                 continue;
             }
 
+            // The fast path may only fire when the cursor's CURRENT stack is a
+            // full root-to-leaf path already ending at the cached leaf, so we
+            // can reposition within the top entry without discarding parent
+            // pointers. Rebuilding the stack as a bare leaf (the previous
+            // behavior) violated the structural-mutation invariant that
+            // `stack.len() == 1` means "the leaf IS the root":
+            // `balance_for_delete` silently skipped rebalancing (leaving
+            // emptied leaves attached to their parents — the bd-kwei8
+            // "database disk image is malformed" corruption under
+            // INSERT OR REPLACE churn) and `balance_for_insert` would push
+            // the true root down for a split that belongs to a non-root leaf.
+            let reusable_full_path = self.stack.len() > 1
+                && self
+                    .stack
+                    .first()
+                    .is_some_and(|bottom| bottom.page_no == self.root_page)
+                && self
+                    .stack
+                    .last()
+                    .is_some_and(|top| top.page_no == cached.page_no);
+            let root_is_leaf =
+                self.stack.len() == 1 && cached.page_no == self.root_page;
+            if !(reusable_full_path || root_is_leaf) {
+                continue;
+            }
+
             let entry = self.load_page(cx, cached.page_no)?;
             if !(entry.header.page_type.is_leaf() && entry.header.page_type.is_table()) {
                 continue;
@@ -3756,10 +3782,12 @@ impl<P: PageReader> BtCursor<P> {
             let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
             match result {
                 BinarySearchResult::Found(idx) => {
-                    self.stack.clear();
                     let mut entry = entry;
                     entry.cell_idx = idx;
-                    self.stack.push(entry);
+                    *self
+                        .stack
+                        .last_mut()
+                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))? = entry;
                     self.at_eof = false;
                     self.remember_table_seek(target_rowid, cached.page_no, idx);
                     self.record_point_witness(
@@ -3773,10 +3801,12 @@ impl<P: PageReader> BtCursor<P> {
                     return Ok(Some(SeekResult::Found));
                 }
                 BinarySearchResult::NotFound(idx) if idx < entry.header.cell_count && idx > 0 => {
-                    self.stack.clear();
                     let mut entry = entry;
                     entry.cell_idx = idx;
-                    self.stack.push(entry);
+                    *self
+                        .stack
+                        .last_mut()
+                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))? = entry;
                     self.at_eof = false;
                     self.remember_table_seek(target_rowid, cached.page_no, idx);
                     self.record_point_witness(
@@ -10342,6 +10372,52 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
             if cursor.at_eof || cursor.stack.is_empty() {
                 return Err(FrankenError::internal("cursor at EOF"));
+            }
+
+            // The caller's positioning seek may have gone through the table
+            // seek-cache fast path (`try_table_seek_cache`), which rebuilds
+            // the stack as just the landing leaf with no path from the root.
+            // Deleting from such a rootless stack silently disables
+            // `balance_for_delete` (its `depth <= 1` early-return means "the
+            // leaf IS the root"), the pre-delete anchor capture, and
+            // separator repair — so a leaf drained to zero cells stays
+            // referenced by its parent interior page, a shape stock SQLite
+            // rejects as "database disk image is malformed" (bd-kwei8; the
+            // INSERT OR REPLACE conflict path hits this because the failed
+            // insert's seek primes the cache and `native_replace_row`'s
+            // follow-up `table_move_to` then lands on the fast path).
+            // Rebuild the full root-to-leaf path before mutating anything;
+            // the seek cache was cleared above, so this re-seek descends
+            // from the root.
+            let rootless = cursor.stack.len() == 1
+                && cursor
+                    .stack
+                    .first()
+                    .is_some_and(|entry| entry.page_no != cursor.root_page);
+            if rootless {
+                let top_is_table_leaf = cursor.stack.first().is_some_and(|entry| {
+                    entry.header.page_type.is_leaf() && entry.header.page_type.is_table()
+                });
+                if cursor.is_table && top_is_table_leaf {
+                    let rowid = cursor.rowid(cx)?;
+                    let seek = cursor.table_seek(cx, rowid)?;
+                    if !seek.is_found() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "delete re-seek lost rowid {rowid} while rebuilding rootless cursor path"
+                            ),
+                        });
+                    }
+                } else {
+                    let key = cursor.payload(cx)?;
+                    let seek = cursor.index_seek(cx, &key)?;
+                    if !seek.is_found() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "delete re-seek lost index key while rebuilding rootless cursor path"
+                                .to_owned(),
+                        });
+                    }
+                }
             }
 
             let top = cursor
