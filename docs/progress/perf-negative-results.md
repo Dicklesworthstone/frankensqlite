@@ -88,6 +88,72 @@ retry condition so this preflight can emit actionable evidence.
   improve FSQLite absolute medians for all DELETE rows without moving the
   primary score backward.
 
+## 2026-07-10 - prepared DELETE frame-attribution boundary: top frames all blocked
+
+- Target: `bd-1dp9.6.2` / `write_single` prepared-DML DELETE tail. This pass
+  profiled before source mutation and did not retry the ledger-blocked
+  single-opcode hot-arm pruning or the already rejected rowid lookup fusion.
+- Coordination / tree state: `cc` owns `bd-2dgf5` planner aggregate work. This
+  pass intentionally avoided `crates/fsqlite-vdbe/src/codegen.rs` and the
+  aggregate/EQP edits currently present in `crates/fsqlite-core/src/connection.rs`.
+- Build/profile evidence:
+  `tests/artifacts/perf/cod-fsq-write-single-frames-20260710T043811Z/`.
+  The profiling binary was built with `release-perf`, line-table symbols,
+  frame pointers, and strip disabled. `perf record` plus `perf report
+  --stdio --no-children --sort symbol,dso --percent-limit 0.1` captured
+  same-host FSQLite and C SQLite frames. The raw `standard` profile was
+  rejected for mechanism selection because it was dominated by benchmark
+  population INSERT frames, so the DELETE-loop attribution used delayed
+  `isolated` and `sparse-isolated` profiles.
+- Same-host ratios from the profiling runs:
+  `perf-update-delete 10000 1000 delete fsqlite sparse-isolated` with delayed
+  perf reported FSQLite `1574 ns/delete`; the matching C SQLite run reported
+  `802 ns/delete` (`1.96x` slower). The contiguous isolated delayed run
+  reported FSQLite `832 ns/delete` and C SQLite `320 ns/delete` (`2.60x`
+  slower), but it overweights leaf-empty rebalance and is routing evidence only
+  for the page-state boundary.
+- Sparse DELETE ranked FSQLite self-time table, with C SQLite context from the
+  same host:
+  `__memmove_avx_unaligned_erms` `14.87%` (C `3.86%`),
+  `TransactionKind::get_page` `6.86%` (C page/cache analogues
+  `pcache1Fetch` `1.37%`, `getPageNormal` `0.64%`),
+  `TransactionKind::prefetch_page_hint` `6.59%` (no direct C analogue),
+  `_int_malloc` `3.47%` (C `_int_malloc` `4.08%`),
+  `TableLeafDeleteRun::materialize_deletions` `3.16%`,
+  `TableLeafPayloadPatchRun::table_leaf_rowid_at` `1.94%`,
+  `BtCursor::table_seek_for_insert` `1.62%`,
+  `TableLeafDeleteRun::delete_rowid_with_reason` `1.36%`,
+  `TransactionKind::write_page_data` `0.85%`,
+  and lower retained-run / page-cache frames down to the 0.1% cutoff in
+  `perf-fsqlite-delete-sparse-isolated-1000-delay3600-self.txt`.
+- Contiguous isolated cross-check ranked the same already-known boundary:
+  `TransactionKind::get_page` `41.03%`,
+  `TransactionKind::write_page_data` `8.26%`, `_int_malloc` `5.81%`,
+  `__memmove_avx_unaligned_erms` `4.47%`,
+  `TransactionKind::free_page` `3.89%`, and
+  `TableLeafDeleteRun::delete_rowid_with_reason` `3.23%`.
+- Internal sparse DML counters agree with the frame table:
+  `delete_seek_ns=362933022`, `delete_leaf_flush_ns=217396646`,
+  `delete_leaf_materialize=75502/185016658`,
+  `delete_active_probe_ns=135256403`, and `delete_physical_ns=65107114`
+  across 500000 prepared direct DELETE executions.
+- Result: rejected before source mutation / no eligible one-lever candidate.
+  The top sparse frame is the retained DELETE materialization/page-copy family,
+  already blocked by the sparse DELETE CPU profile, materializer threshold,
+  direct writer, borrowed-write publication, and PageData move rejects. The
+  next frames map to the blocked `TransactionKind::get_page` / page-state
+  family, the explicitly rejected private-memory prefetch skip, allocator
+  traffic under the same page-publication boundary, and retained-run seek /
+  search-hint families. Taking any of those as a standalone patch would violate
+  the recorded retry conditions.
+- Do not retry standalone DELETE materialization/page-copy, private-memory
+  prefetch skipping, `TransactionKind::get_page` page-state trimming, retained
+  leaf-run search/admission hints, or page-publication allocation elision from
+  this profile. Reconsider source work only as the broader transaction-local
+  DML mutation/read-view operator, or if a future same-host profile moves the
+  top self-time frame outside these blocked families and the candidate proves
+  CV-under-5 wins for all focused DELETE sizes in the same A/B window.
+
 ## 2026-05-25 - VDBE `Opcode::FusedAppendInsert` hot-dispatch removal
 
 - Target: the `FusedAppendInsert` execution arm in
