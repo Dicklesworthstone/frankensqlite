@@ -11,20 +11,25 @@
 //!   perf-update-delete 10000 250 delete fsqlite isolated
 //!   perf-update-delete 10000 250 delete fsqlite rollback-isolated
 //!   perf-update-delete 10000 250 delete fsqlite sparse-isolated
+//!   perf-update-delete 1280 1000 delete fsqlite exact-gate
 //!
 //! Arguments:
 //!   [rows]   Number of rows to pre-populate (default 10_000)
 //!   [iters]  Number of outer iterations for profiling (default 10)
 //!   [which]  "update" | "delete" | "both" (default "both")
 //!   [engine] "fsqlite" | "sqlite" | "compare" (default "fsqlite")
-//!   [mode]   "standard" | "isolated" | "rollback-isolated" | "sparse-isolated" (default "standard")
+//!   [mode]   "standard" | "isolated" | "rollback-isolated" | "sparse-isolated" | "exact-gate" (default "standard")
 //!
 //! Environment:
 //!   FSQLITE_BENCH_PROFILE_DML=1       Print fsqlite hot-path counters for each measured DML window.
+//!   FSQLITE_BENCH_PERF_CTL=<fifo>      Enable/disable an attached perf session around exact DML windows.
+//!   FSQLITE_BENCH_PERF_ACK=<fifo>      Wait for perf control acknowledgements before crossing each boundary.
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use fsqlite_core::connection::{
@@ -34,7 +39,10 @@ use fsqlite_core::connection::{
 
 const DEFAULT_ROWS: usize = 10_000;
 const DEFAULT_ITERS: usize = 10;
+const EXACT_GATE_WARMUP_ITERS: usize = 3;
 const PROFILE_DML_ENV: &str = "FSQLITE_BENCH_PROFILE_DML";
+const PERF_CTL_ENV: &str = "FSQLITE_BENCH_PERF_CTL";
+const PERF_ACK_ENV: &str = "FSQLITE_BENCH_PERF_ACK";
 const USAGE: &str = "\
 Usage:
   perf-update-delete                         # default: 10_000 rows, 10 iters, update+delete, fsqlite only
@@ -43,16 +51,19 @@ Usage:
   perf-update-delete 10000 250 delete fsqlite isolated
   perf-update-delete 10000 250 delete fsqlite rollback-isolated
   perf-update-delete 10000 250 delete fsqlite sparse-isolated
+  perf-update-delete 1280 1000 delete compare exact-gate
 
 Arguments:
   [rows]   Number of rows to pre-populate (default 10_000)
   [iters]  Number of outer iterations for profiling (default 10)
   [which]  \"update\" | \"delete\" | \"both\" (default \"both\")
   [engine] \"fsqlite\" | \"sqlite\" | \"compare\" (default \"fsqlite\")
-  [mode]   \"standard\" | \"isolated\" | \"rollback-isolated\" | \"sparse-isolated\" (default \"standard\")
+  [mode]   \"standard\" | \"isolated\" | \"rollback-isolated\" | \"sparse-isolated\" | \"exact-gate\" (default \"standard\")
 
 Environment:
-  FSQLITE_BENCH_PROFILE_DML=1       Print fsqlite hot-path counters for each measured DML window.";
+  FSQLITE_BENCH_PROFILE_DML=1       Print fsqlite hot-path counters for each measured DML window.
+  FSQLITE_BENCH_PERF_CTL=<fifo>      Enable/disable attached perf events around exact DML windows.
+  FSQLITE_BENCH_PERF_ACK=<fifo>      Wait for perf acknowledgements at both window boundaries.";
 const BENCH_CREATE_SQL: &str =
     "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
 const BENCH_INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))";
@@ -155,6 +166,7 @@ enum ProfileMode {
     Isolated,
     RollbackIsolated,
     SparseIsolated,
+    ExactGate,
 }
 
 impl ProfileMode {
@@ -164,8 +176,9 @@ impl ProfileMode {
             "isolated" => Ok(Self::Isolated),
             "rollback-isolated" => Ok(Self::RollbackIsolated),
             "sparse-isolated" => Ok(Self::SparseIsolated),
+            "exact-gate" => Ok(Self::ExactGate),
             other => Err(RunError::Usage(format!(
-                "invalid mode '{other}'; expected standard, isolated, rollback-isolated, or sparse-isolated"
+                "invalid mode '{other}'; expected standard, isolated, rollback-isolated, sparse-isolated, or exact-gate"
             ))),
         }
     }
@@ -178,6 +191,7 @@ impl fmt::Display for ProfileMode {
             Self::Isolated => f.write_str("isolated"),
             Self::RollbackIsolated => f.write_str("rollback-isolated"),
             Self::SparseIsolated => f.write_str("sparse-isolated"),
+            Self::ExactGate => f.write_str("exact-gate"),
         }
     }
 }
@@ -266,7 +280,7 @@ where
     };
     if let Some(extra) = args.next() {
         return Err(RunError::Usage(format!(
-            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated|rollback-isolated|sparse-isolated]"
+            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated|rollback-isolated|sparse-isolated|exact-gate]"
         )));
     }
     if iters == 0 {
@@ -274,7 +288,11 @@ where
             "iters must be greater than zero".to_string(),
         ));
     }
-
+    if profile_mode == ProfileMode::ExactGate && workload != WorkloadKind::Delete {
+        return Err(RunError::Usage(
+            "exact-gate mode requires the delete workload".to_string(),
+        ));
+    }
     Ok(BenchArgs {
         rows,
         iters,
@@ -417,12 +435,82 @@ struct TimingTotals {
     delete: u128,
 }
 
+struct PerfControl {
+    ctl: File,
+    ack: File,
+}
+
+impl PerfControl {
+    fn open(ctl_path: &str, ack_path: &str) -> Result<Self, String> {
+        let ctl = OpenOptions::new()
+            .write(true)
+            .open(ctl_path)
+            .map_err(|err| format!("open perf control FIFO {ctl_path}: {err}"))?;
+        let ack = OpenOptions::new()
+            .read(true)
+            .open(ack_path)
+            .map_err(|err| format!("open perf acknowledgement FIFO {ack_path}: {err}"))?;
+        Ok(Self { ctl, ack })
+    }
+
+    fn command(&mut self, command: &str) -> Result<(), String> {
+        writeln!(self.ctl, "{command}")
+            .map_err(|err| format!("write perf control command {command}: {err}"))?;
+        self.ctl
+            .flush()
+            .map_err(|err| format!("flush perf control command {command}: {err}"))?;
+
+        // perf writes the acknowledgement as a five-byte C string, including
+        // its trailing NUL. Consuming only through the newline leaves that NUL
+        // queued at the front of the next acknowledgement.
+        let mut ack = [0_u8; 5];
+        self.ack
+            .read_exact(&mut ack)
+            .map_err(|err| format!("read perf acknowledgement for {command}: {err}"))?;
+        if &ack != b"ack\n\0" {
+            return Err(format!(
+                "perf returned an unexpected acknowledgement for {command}: {ack:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn perf_control() -> Result<Option<&'static Mutex<PerfControl>>, RunError> {
+    static PERF_CONTROL: OnceLock<Result<Option<Mutex<PerfControl>>, String>> = OnceLock::new();
+    match PERF_CONTROL.get_or_init(|| {
+        let ctl_path = match std::env::var(PERF_CTL_ENV) {
+            Ok(path) => path,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(err) => return Err(format!("read {PERF_CTL_ENV}: {err}")),
+        };
+        let ack_path = std::env::var(PERF_ACK_ENV)
+            .map_err(|err| format!("read {PERF_ACK_ENV} while {PERF_CTL_ENV} is set: {err}"))?;
+        PerfControl::open(&ctl_path, &ack_path).map(|control| Some(Mutex::new(control)))
+    }) {
+        Ok(control) => Ok(control.as_ref()),
+        Err(message) => Err(RunError::Runtime(message.clone())),
+    }
+}
+
+fn send_perf_control(command: &str) -> Result<(), RunError> {
+    let Some(control) = perf_control()? else {
+        return Ok(());
+    };
+    control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .command(command)
+        .map_err(RunError::Runtime)
+}
+
 struct DmlProfileScope {
     state: Option<DmlProfileState>,
 }
 
 struct DmlProfileState {
-    previous_enabled: bool,
+    previous_enabled: Option<bool>,
+    perf_enabled: bool,
     label: DmlProfileLabel,
     started_at: Instant,
 }
@@ -492,38 +580,60 @@ impl fmt::Display for DmlProfileLabel {
 }
 
 impl DmlProfileScope {
-    fn start(label: DmlProfileLabel) -> Self {
-        if !dml_profile_enabled() {
-            return Self { state: None };
+    fn start(label: DmlProfileLabel) -> Result<Self, RunError> {
+        let profile_enabled = dml_profile_enabled();
+        let perf_enabled = perf_control()?.is_some();
+        if !profile_enabled && !perf_enabled {
+            return Ok(Self { state: None });
         }
 
-        let previous_enabled = hot_path_profile_enabled();
-        set_hot_path_profile_enabled(true);
-        reset_hot_path_profile();
+        let previous_enabled = if profile_enabled {
+            let previous_enabled = hot_path_profile_enabled();
+            set_hot_path_profile_enabled(true);
+            reset_hot_path_profile();
+            Some(previous_enabled)
+        } else {
+            None
+        };
+        if perf_enabled {
+            send_perf_control("enable")?;
+        }
 
-        Self {
+        Ok(Self {
             state: Some(DmlProfileState {
                 previous_enabled,
+                perf_enabled,
                 label,
                 started_at: Instant::now(),
             }),
-        }
+        })
     }
 
-    fn finish(mut self) {
+    fn finish(mut self) -> Result<(), RunError> {
         let Some(state) = self.state.take() else {
-            return;
+            return Ok(());
         };
 
+        if state.perf_enabled {
+            send_perf_control("disable")?;
+        }
         let elapsed_us = state.started_at.elapsed().as_secs_f64() * 1_000_000.0;
-        let profile = hot_path_profile_snapshot();
-        set_hot_path_profile_enabled(state.previous_enabled);
-        print_dml_profile(state.label, elapsed_us, &profile);
+        if let Some(previous_enabled) = state.previous_enabled {
+            let profile = hot_path_profile_snapshot();
+            set_hot_path_profile_enabled(previous_enabled);
+            print_dml_profile(state.label, elapsed_us, &profile);
+        }
+        Ok(())
     }
 
     fn restore(&mut self) {
         if let Some(state) = self.state.take() {
-            set_hot_path_profile_enabled(state.previous_enabled);
+            if state.perf_enabled {
+                let _ = send_perf_control("disable");
+            }
+            if let Some(previous_enabled) = state.previous_enabled {
+                set_hot_path_profile_enabled(previous_enabled);
+            }
         }
     }
 }
@@ -672,6 +782,9 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             ProfileMode::Isolated | ProfileMode::RollbackIsolated | ProfileMode::SparseIsolated => {
                 run_fsqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
             }
+            ProfileMode::ExactGate => {
+                run_fsqlite_exact_gate_benchmark(args, rows_i64, delete_count)?
+            }
         };
         print_engine_summary("fsqlite", args, update_count, delete_count, totals);
         fsqlite_totals = Some(totals);
@@ -684,6 +797,9 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             }
             ProfileMode::Isolated | ProfileMode::RollbackIsolated | ProfileMode::SparseIsolated => {
                 run_sqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
+            }
+            ProfileMode::ExactGate => {
+                run_sqlite_exact_gate_benchmark(args, rows_i64, delete_count)?
             }
         };
         print_engine_summary("sqlite", args, update_count, delete_count, totals);
@@ -739,7 +855,7 @@ fn run_fsqlite_benchmark(
                 DmlProfileOperation::Update,
                 iter,
                 args.rows,
-            ));
+            ))?;
             let t0 = Instant::now();
             for i in 0..update_count {
                 let id = i64::try_from(i).map_err(|_| {
@@ -755,7 +871,7 @@ fn run_fsqlite_benchmark(
             conn.execute("COMMIT")
                 .map_err(|err| RunError::Runtime(format!("commit update transaction: {err}")))?;
             total_update_ns += t0.elapsed().as_nanos();
-            profile.finish();
+            profile.finish()?;
         }
 
         if args.workload.do_delete() {
@@ -769,7 +885,7 @@ fn run_fsqlite_benchmark(
                 DmlProfileOperation::Delete,
                 iter,
                 args.rows,
-            ));
+            ))?;
             let t0 = Instant::now();
             for i in 0..delete_count {
                 let id = i64::try_from(i).map_err(|_| {
@@ -782,7 +898,7 @@ fn run_fsqlite_benchmark(
             conn.execute("COMMIT")
                 .map_err(|err| RunError::Runtime(format!("commit delete transaction: {err}")))?;
             total_delete_ns += t0.elapsed().as_nanos();
-            profile.finish();
+            profile.finish()?;
         }
 
         if iter == 0 {
@@ -794,6 +910,260 @@ fn run_fsqlite_benchmark(
         total: t_all.elapsed().as_nanos(),
         populate: total_populate_ns,
         update: total_update_ns,
+        delete: total_delete_ns,
+    })
+}
+
+/// Profile only the exact prepared-DELETE keep-gate envelope.
+///
+/// The connection and both prepared statements are reused across every sample,
+/// matching `comprehensive-bench`. Perf is enabled only for
+/// `BEGIN -> sparse prepared DELETEs -> COMMIT`; the restore transaction runs
+/// with events disabled, so neither fixture construction nor restore INSERTs
+/// enter the sample distribution.
+fn run_fsqlite_exact_gate_benchmark(
+    args: &BenchArgs,
+    rows_i64: i64,
+    delete_count: usize,
+) -> Result<TimingTotals, RunError> {
+    if delete_count == 0 || args.rows % 20 != 0 {
+        return Err(RunError::Usage(
+            "exact-gate rows must be a positive multiple of 20".to_string(),
+        ));
+    }
+
+    let t_all = Instant::now();
+    let conn = fsqlite::Connection::open(":memory:")
+        .map_err(|err| RunError::Runtime(format!("open exact-gate database: {err}")))?;
+    apply_benchmark_pragmas(&conn)?;
+    conn.execute(BENCH_CREATE_SQL)
+        .map_err(|err| RunError::Runtime(format!("create exact-gate table: {err}")))?;
+    conn.execute("BEGIN")
+        .map_err(|err| RunError::Runtime(format!("begin exact-gate population: {err}")))?;
+    let insert = conn
+        .prepare(BENCH_INSERT_SQL)
+        .map_err(|err| RunError::Runtime(format!("prepare exact-gate population: {err}")))?;
+    let populate_start = Instant::now();
+    for rowid in 0..rows_i64 {
+        insert
+            .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
+            .map_err(|err| RunError::Runtime(format!("populate exact-gate row {rowid}: {err}")))?;
+    }
+    conn.execute("COMMIT")
+        .map_err(|err| RunError::Runtime(format!("commit exact-gate population: {err}")))?;
+    let total_populate_ns = populate_start.elapsed().as_nanos();
+    drop(insert);
+
+    let delete = conn
+        .prepare("DELETE FROM bench WHERE id = ?1")
+        .map_err(|err| RunError::Runtime(format!("prepare exact-gate DELETE: {err}")))?;
+    let restore = conn
+        .prepare(BENCH_INSERT_SQL)
+        .map_err(|err| RunError::Runtime(format!("prepare exact-gate restore: {err}")))?;
+
+    let total_iters = args
+        .iters
+        .checked_add(EXACT_GATE_WARMUP_ITERS)
+        .ok_or_else(|| RunError::Usage("exact-gate iteration count overflowed".to_string()))?;
+    let mut total_delete_ns = 0_u128;
+    for iter in 0..total_iters {
+        let measured_iter = iter.checked_sub(EXACT_GATE_WARMUP_ITERS);
+        let profile = if let Some(sample_idx) = measured_iter {
+            DmlProfileScope::start(DmlProfileLabel::iter(
+                ProfileMode::ExactGate,
+                DmlProfileOperation::Delete,
+                sample_idx,
+                args.rows,
+            ))?
+        } else {
+            DmlProfileScope { state: None }
+        };
+        let delete_start = Instant::now();
+        conn.execute("BEGIN").map_err(|err| {
+            RunError::Runtime(format!("begin exact-gate DELETE iteration {iter}: {err}"))
+        })?;
+        for index in 0..delete_count {
+            let rowid = i64::try_from(index)
+                .map_err(|_| RunError::Usage("delete index must fit within i64".to_string()))?
+                * 20;
+            let affected = delete
+                .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
+                .map_err(|err| {
+                    RunError::Runtime(format!(
+                        "exact-gate DELETE iteration {iter} row {rowid}: {err}"
+                    ))
+                })?;
+            if affected != 1 {
+                return Err(RunError::Runtime(format!(
+                    "exact-gate DELETE iteration {iter} row {rowid} affected {affected} rows"
+                )));
+            }
+        }
+        conn.execute("COMMIT").map_err(|err| {
+            RunError::Runtime(format!("commit exact-gate DELETE iteration {iter}: {err}"))
+        })?;
+        if measured_iter.is_some() {
+            total_delete_ns = total_delete_ns.saturating_add(delete_start.elapsed().as_nanos());
+        }
+        profile.finish()?;
+
+        conn.execute("BEGIN").map_err(|err| {
+            RunError::Runtime(format!("begin exact-gate restore iteration {iter}: {err}"))
+        })?;
+        for index in 0..delete_count {
+            let rowid = i64::try_from(index)
+                .map_err(|_| RunError::Usage("restore index must fit within i64".to_string()))?
+                * 20;
+            let affected = restore
+                .execute_with_params(&[fsqlite::SqliteValue::Integer(rowid)])
+                .map_err(|err| {
+                    RunError::Runtime(format!(
+                        "exact-gate restore iteration {iter} row {rowid}: {err}"
+                    ))
+                })?;
+            if affected != 1 {
+                return Err(RunError::Runtime(format!(
+                    "exact-gate restore iteration {iter} row {rowid} affected {affected} rows"
+                )));
+            }
+        }
+        conn.execute("COMMIT").map_err(|err| {
+            RunError::Runtime(format!("commit exact-gate restore iteration {iter}: {err}"))
+        })?;
+    }
+
+    Ok(TimingTotals {
+        total: t_all.elapsed().as_nanos(),
+        populate: total_populate_ns,
+        update: 0,
+        delete: total_delete_ns,
+    })
+}
+
+/// Run C SQLite under the same prepared-DELETE envelope as the exact FSQLite gate.
+///
+/// Perf uses the same acknowledged control boundary, so the resulting profile
+/// excludes population and restore work for a same-host frame comparison.
+fn run_sqlite_exact_gate_benchmark(
+    args: &BenchArgs,
+    rows_i64: i64,
+    delete_count: usize,
+) -> Result<TimingTotals, RunError> {
+    if delete_count == 0 || args.rows % 20 != 0 {
+        return Err(RunError::Usage(
+            "exact-gate rows must be a positive multiple of 20".to_string(),
+        ));
+    }
+
+    let t_all = Instant::now();
+    let conn = rusqlite::Connection::open_in_memory()
+        .map_err(|err| RunError::Runtime(format!("open exact-gate C SQLite database: {err}")))?;
+    apply_csqlite_benchmark_pragmas(&conn)?;
+    conn.execute(BENCH_CREATE_SQL, [])
+        .map_err(|err| RunError::Runtime(format!("create exact-gate C SQLite table: {err}")))?;
+    conn.execute_batch("BEGIN")
+        .map_err(|err| RunError::Runtime(format!("begin exact-gate C SQLite population: {err}")))?;
+    let mut insert = conn.prepare(BENCH_INSERT_SQL).map_err(|err| {
+        RunError::Runtime(format!("prepare exact-gate C SQLite population: {err}"))
+    })?;
+    let populate_start = Instant::now();
+    for rowid in 0..rows_i64 {
+        insert.execute(rusqlite::params![rowid]).map_err(|err| {
+            RunError::Runtime(format!("populate exact-gate C SQLite row {rowid}: {err}"))
+        })?;
+    }
+    conn.execute_batch("COMMIT").map_err(|err| {
+        RunError::Runtime(format!("commit exact-gate C SQLite population: {err}"))
+    })?;
+    let total_populate_ns = populate_start.elapsed().as_nanos();
+    drop(insert);
+
+    let mut delete = conn
+        .prepare("DELETE FROM bench WHERE id = ?1")
+        .map_err(|err| RunError::Runtime(format!("prepare exact-gate C SQLite DELETE: {err}")))?;
+    let mut restore = conn
+        .prepare(BENCH_INSERT_SQL)
+        .map_err(|err| RunError::Runtime(format!("prepare exact-gate C SQLite restore: {err}")))?;
+
+    let total_iters = args
+        .iters
+        .checked_add(EXACT_GATE_WARMUP_ITERS)
+        .ok_or_else(|| RunError::Usage("exact-gate iteration count overflowed".to_string()))?;
+    let mut total_delete_ns = 0_u128;
+    for iter in 0..total_iters {
+        let measured_iter = iter.checked_sub(EXACT_GATE_WARMUP_ITERS);
+        let profile = if let Some(sample_idx) = measured_iter {
+            DmlProfileScope::start(DmlProfileLabel::iter(
+                ProfileMode::ExactGate,
+                DmlProfileOperation::Delete,
+                sample_idx,
+                args.rows,
+            ))?
+        } else {
+            DmlProfileScope { state: None }
+        };
+        let delete_start = Instant::now();
+        conn.execute_batch("BEGIN").map_err(|err| {
+            RunError::Runtime(format!(
+                "begin exact-gate C SQLite DELETE iteration {iter}: {err}"
+            ))
+        })?;
+        for index in 0..delete_count {
+            let rowid = i64::try_from(index)
+                .map_err(|_| RunError::Usage("delete index must fit within i64".to_string()))?
+                * 20;
+            let affected = delete.execute(rusqlite::params![rowid]).map_err(|err| {
+                RunError::Runtime(format!(
+                    "exact-gate C SQLite DELETE iteration {iter} row {rowid}: {err}"
+                ))
+            })?;
+            if affected != 1 {
+                return Err(RunError::Runtime(format!(
+                    "exact-gate C SQLite DELETE iteration {iter} row {rowid} affected {affected} rows"
+                )));
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|err| {
+            RunError::Runtime(format!(
+                "commit exact-gate C SQLite DELETE iteration {iter}: {err}"
+            ))
+        })?;
+        if measured_iter.is_some() {
+            total_delete_ns = total_delete_ns.saturating_add(delete_start.elapsed().as_nanos());
+        }
+        profile.finish()?;
+
+        conn.execute_batch("BEGIN").map_err(|err| {
+            RunError::Runtime(format!(
+                "begin exact-gate C SQLite restore iteration {iter}: {err}"
+            ))
+        })?;
+        for index in 0..delete_count {
+            let rowid = i64::try_from(index)
+                .map_err(|_| RunError::Usage("restore index must fit within i64".to_string()))?
+                * 20;
+            let affected = restore.execute(rusqlite::params![rowid]).map_err(|err| {
+                RunError::Runtime(format!(
+                    "exact-gate C SQLite restore iteration {iter} row {rowid}: {err}"
+                ))
+            })?;
+            if affected != 1 {
+                return Err(RunError::Runtime(format!(
+                    "exact-gate C SQLite restore iteration {iter} row {rowid} affected {affected} rows"
+                )));
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|err| {
+            RunError::Runtime(format!(
+                "commit exact-gate C SQLite restore iteration {iter}: {err}"
+            ))
+        })?;
+    }
+
+    Ok(TimingTotals {
+        total: t_all.elapsed().as_nanos(),
+        populate: total_populate_ns,
+        update: 0,
         delete: total_delete_ns,
     })
 }
@@ -840,7 +1210,7 @@ fn run_fsqlite_isolated_benchmark(
             DmlProfileOperation::Update,
             args.rows,
             args.iters,
-        ));
+        ))?;
         let t0 = Instant::now();
         for iter in 0..args.iters {
             let next_value = (iter as f64).mul_add(0.001, 999.99);
@@ -857,7 +1227,7 @@ fn run_fsqlite_isolated_benchmark(
             }
         }
         total_update_ns = t0.elapsed().as_nanos();
-        profile.finish();
+        profile.finish()?;
         conn.execute("ROLLBACK").map_err(|err| {
             RunError::Runtime(format!("rollback isolated update transaction: {err}"))
         })?;
@@ -879,7 +1249,7 @@ fn run_fsqlite_isolated_benchmark(
                     DmlProfileOperation::Delete,
                     iter,
                     args.rows,
-                ));
+                ))?;
                 let t0 = Instant::now();
                 for i in 0..delete_count {
                     let id = i64::try_from(i).map_err(|_| {
@@ -890,7 +1260,7 @@ fn run_fsqlite_isolated_benchmark(
                         .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
                 }
                 total_delete_ns += t0.elapsed().as_nanos();
-                profile.finish();
+                profile.finish()?;
                 conn.execute("ROLLBACK").map_err(|err| {
                     RunError::Runtime(format!(
                         "rollback rollback-isolated delete transaction {iter}: {err}"
@@ -909,7 +1279,7 @@ fn run_fsqlite_isolated_benchmark(
                 DmlProfileOperation::Delete,
                 args.rows,
                 args.iters,
-            ));
+            ))?;
             let t0 = Instant::now();
             for iter in 0..args.iters {
                 for i in 0..delete_count {
@@ -927,7 +1297,7 @@ fn run_fsqlite_isolated_benchmark(
                 }
             }
             total_delete_ns = t0.elapsed().as_nanos();
-            profile.finish();
+            profile.finish()?;
             conn.execute("COMMIT").map_err(|err| {
                 RunError::Runtime(format!("commit isolated delete transaction: {err}"))
             })?;
@@ -1372,6 +1742,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_accepts_exact_gate_mode() {
+        assert_eq!(
+            parse_args([
+                "1280".to_string(),
+                "3".to_string(),
+                "delete".to_string(),
+                "compare".to_string(),
+                "exact-gate".to_string(),
+            ])
+            .unwrap(),
+            BenchArgs {
+                rows: 1280,
+                iters: 3,
+                workload: WorkloadKind::Delete,
+                engine: EngineKind::Compare,
+                profile_mode: ProfileMode::ExactGate,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_non_delete_exact_gate_mode() {
+        let err = parse_args([
+            "1280".to_string(),
+            "3".to_string(),
+            "both".to_string(),
+            "fsqlite".to_string(),
+            "exact-gate".to_string(),
+        ])
+        .expect_err("exact-gate must not admit a non-delete workload");
+        assert_eq!(
+            err,
+            RunError::Usage("exact-gate mode requires the delete workload".to_string())
+        );
+    }
+
+    #[test]
     fn parse_args_rejects_invalid_engine() {
         let err = parse_args([
             "100".to_string(),
@@ -1401,7 +1808,7 @@ mod tests {
         assert_eq!(
             err,
             RunError::Usage(
-                "invalid mode 'bogus'; expected standard, isolated, rollback-isolated, or sparse-isolated".to_string()
+                "invalid mode 'bogus'; expected standard, isolated, rollback-isolated, sparse-isolated, or exact-gate".to_string()
             )
         );
     }
@@ -1492,6 +1899,22 @@ mod tests {
         assert!(
             result.is_ok(),
             "sparse-isolated delete workload failed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_benchmark_smoke_exact_gate_delete() {
+        let args = BenchArgs {
+            rows: 20,
+            iters: 2,
+            workload: WorkloadKind::Delete,
+            engine: EngineKind::Compare,
+            profile_mode: ProfileMode::ExactGate,
+        };
+        let result = run_benchmark(&args);
+        assert!(
+            result.is_ok(),
+            "exact-gate delete workload failed: {result:?}"
         );
     }
 }
