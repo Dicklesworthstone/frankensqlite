@@ -15249,3 +15249,131 @@ set: sessions found by
   removes a measured allocation from the 10000-row tail and proves
   CV-under-5 improvement at 100, 1000, and 10000 rows in the same-window
   update-delete matrix.
+
+## 2026-07-10 - WIN: packed sparse clear set for the single-connection page cache
+
+- Result type: KEPT. The prepared DELETE all-size gate, UPDATE guardrail, and
+  two broader quick-matrix ratchets all passed.
+- Target: `bd-1dp9.6.2` / `write_single`, specifically the prepared-DML DELETE
+  envelope (`BEGIN`, 5% sparse rowid deletes through one prepared statement,
+  `COMMIT`) at 100, 1000, and 10000 source rows.
+- Ledger-first routing: the 2026-07-07 frame-boundary entry blocks the leading
+  `memmove` / page-copy and materialization families, and the ledger also
+  blocks all five standalone single-opcode hot-arm pruning variants. The next
+  eligible profiled frame was therefore
+  `ShardedPageCache::clear`; no prior `FastPageArray` touched-slot/sparse-clear
+  attempt was present in this ledger.
+- Exact-envelope profile: on host `csd`, CPU 2, the existing
+  `release-perf` profiler binary ran 100000 standard iterations of the
+  100-row/5-delete shape for each engine. Period-1 uprobe boundary events gated
+  cycle samples into BEGIN and mutate-plus-COMMIT windows. Uprobes inflated
+  absolute elapsed time (`F=3220 ns/delete`, `C=1026 ns/delete`), so those
+  values are routing evidence only, not the A/B score.
+  - FrankenSQLite BEGIN: 3K cycle samples / `2314550540` period.
+    `ShardedPageCache::clear` ranked first at `609324292` period / `26.33%`.
+  - FrankenSQLite mutate-plus-COMMIT: 6K samples / `4880208401` period.
+    `memmove` ranked first at `534582583` / `10.95%`, followed by
+    `TableLeafDeleteRun::materialize_deletions` at `288076818` / `5.90%`.
+  - Across the two FrankenSQLite windows, `memmove` was about
+    `659705883/7194758941 = 9.17%` and remained ledger-blocked;
+    `ShardedPageCache::clear` was the next frame at
+    `609324292/7194758941 = 8.47%`.
+  - C SQLite mutate-plus-COMMIT: `1018890271` total period;
+    `sqlite3VdbeExec=10.76%`, `sqlite3BtreeTableMoveto=5.73%`,
+    `sqlite3VdbeHalt=4.15%`, `sqlite3BtreeDelete=3.48%`,
+    `sqlite3_step=2.61%`, parameter binding `=2.04%`, and
+    `memmove=2.03%`. The much smaller C BEGIN sample set was retained but not
+    used to rank the FrankenSQLite mechanism.
+- Full ranked frame tables (every self-time frame at or above 0.10% for both
+  engines and both gated phases), perf captures, and binary hashes:
+  `tests/artifacts/perf/cod-fsq-write-single-exact-small-20260710T0755Z/`.
+  The table is `ranked-frames-ge-0.1pct.txt`; the accepted captures are the
+  `*-v3.data` files.
+- Measurement setup rejections retained in the same artifact directory:
+  - `rollback-isolated` (`F=310`, `C=270 ns/delete`) was rejected for mechanism
+    selection because it profiles rollback/MemDB reload instead of the commit
+    tail.
+  - The first exact-envelope captures used PIE virtual addresses as file
+    offsets and recorded no boundary events.
+  - The `*-v2.data` captures used global `perf record -F`, which sampled the
+    uprobe markers instead of recording every boundary hit. They were rejected
+    for gating. The `*-v3.data` captures omit global `-F` and use period-1
+    markers.
+- One lever in `crates/fsqlite-pager/src/page_cache.rs`: `FastPageArray` now
+  keeps a packed `u64` touched-slot bitmap plus a compact list of nonzero word
+  indices. New residency sets one bit; remove/reinsert deliberately retains it
+  without duplicating the word index. `clear()` visits only listed words and
+  set bits, while `cold_reset()` releases all three sparse-index allocations.
+  This replaces the common 1024-slot `Vec<Option<_>>` scan with active-word and
+  set-bit traversal without changing cache visibility or eviction accounting.
+- Same-worker build proof: both binaries were `release-perf`, LTO,
+  `opt-level=3`, built on RCH worker `ovh-a`. ORIG binary SHA-256 was
+  `7b09946263749a4bcd15300df5e5973b178478bdf911877fc8f2ab23f94fbc5c`;
+  candidate was
+  `03f7959d8f59a08265e861d6d90324deb1a15ad8c933b6432171fbaaab140423`.
+  The ORIG/candidate `page_cache.rs` hashes were respectively
+  `d70e55376f0c5f44677e7f4c0f3b185de8dc1e8303b55fc5ac3f244254e3bec0`
+  and
+  `d537422569639d1a205a053336dc6dc0b68ee0c5b722d50596dd24b5e6f1c82e`;
+  the peer-owned `codegen.rs` hash was identically
+  `0ed76930f00e4af59515010d4ca7da57892489f68fdd34439963d5a9b6f88fd3`
+  in both builds. No other tracked source differed between snapshots.
+- Strict focused A/B: same `ovh-a` host, FIFO priority 50, CPU 2 pinned,
+  identical quick `update-delete` matrix. All retained runs live beside the
+  profile captures. The gate pair is
+  `cod-fsq-orig-sparse-clear-quick-3-rt.json` versus
+  `cod-fsq-paired-cand-sparse-clear-04.json`; every DELETE C/F CV is below 5%:
+
+  | source rows / deletes | ORIG C / F (us) | CAND C / F (us) | F change | F/C change | CV C/F orig -> cand |
+  |---:|---:|---:|---:|---:|---:|
+  | 100 / 5 | 1.874 / 7.745 | 1.833 / 6.753 | -12.81% | 4.133x -> 3.684x | 1.97/4.36% -> 2.93/3.80% |
+  | 1000 / 50 | 13.375 / 30.988 | 13.385 / 29.345 | -5.30% | 2.317x -> 2.192x | 1.38/4.31% -> 1.78/2.10% |
+  | 10000 / 500 | 141.867 / 279.275 | 143.049 / 270.789 | -3.04% | 1.969x -> 1.893x | 2.00/1.32% -> 2.79/0.41% |
+
+- UPDATE guardrail in the same gate pair also improved at every size:
+  FrankenSQLite `7.114 -> 5.841 us`, `30.337 -> 28.343 us`, and
+  `253.968 -> 250.511 us`. Five alternating runs per arm were retained; their
+  median-of-medians independently kept the DELETE sign at all sizes
+  (`8.075/31.410/275.528 us` ORIG versus
+  `6.753/29.615/272.893 us` candidate). The 100-row ORIG process-level CV was
+  9.81%, so this corroborating aggregate was not substituted for the strict
+  under-5 gate pair above.
+- Broader quick-matrix ratchet, two alternating runs per arm on the same host:
+  - Primary category-weighted score (lower is better):
+    ORIG `0.405470`, `0.417989`; candidate `0.402042`, `0.398954`.
+  - Overall geomean F/C: ORIG `0.286230`, `0.295093`; candidate
+    `0.285581`, `0.284983`.
+  - `write_single` geomean F/C: ORIG `1.417888`, `1.438015`; candidate
+    `1.406189`, `1.344697`.
+  Evidence: `cod-fsq-fullquick-{orig,cand}-sparse-clear-{01,02}.json` in the
+  artifact directory above.
+- Correctness/invariant proof: the sparse remove/reinsert/clear test asserts
+  unique touched-word tracking, zeroed words after clear, absence of the sparse
+  resident, and successful reuse after clear. The touched-bit lifecycle was
+  independently reviewed across insert, remove/remove-any, reinsert, clear,
+  and cold reset with no defect found.
+- UBS on the changed Rust file reported clean fmt/clippy/check/test-build
+  subchecks and no changed-code security/concurrency finding. Its nonzero
+  whole-file result was the existing test-only unwrap/panic/assert inventory;
+  the only changed-line warning was direct indexing whose bounds follow from
+  `ensure_capacity` and the touched-bit invariant exercised by the new test.
+- Workspace verification: RCH `cargo check --workspace --all-targets` passed
+  on `hz1`. RCH
+  `cargo test --profile release-perf -p fsqlite-core prepared_direct_delete_ -- --nocapture`
+  passed all 9 matching tests on `hz2` (6 pager-routing unit tests and 3
+  prepared-hit-rate integration tests); the focused
+  `test_fast_page_array_clear` unit test also passed on `ovh-a`.
+  `cargo fmt --check -p fsqlite-pager` passed. Full-workspace fmt
+  reached only two formatting diffs in peer-owned aggregate-index work in
+  `crates/fsqlite-vdbe/src/codegen.rs`, which this lane did not modify.
+  Workspace clippy compiled `fsqlite-pager` clean and then stopped on unrelated
+  existing debt: `clippy::int_plus_one` in
+  `crates/fsqlite-btree/src/balance.rs:3553` and nightly's `fetch_update`
+  deprecation in `fsqlite-mvcc` (`lifecycle.rs:965` and
+  `sketch_telemetry.rs:63`). Those clean tracked files belong to the existing
+  build-health follow-up `bd-jxvns`; this one-lever perf commit does not absorb
+  them.
+- Retry/follow-up: this exact packed touched-set lever is shipped. Future cache
+  work should profile the post-change envelope first; do not add a second
+  resident-index structure or per-slot clear shortcut unless a new profile and
+  all-size gate show a residual mechanism.

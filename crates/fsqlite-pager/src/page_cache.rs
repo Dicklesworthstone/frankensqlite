@@ -1333,6 +1333,15 @@ fn snapshot_cached_page(page_no: PageNumber, entry: &CachedPageEntry) -> PageCac
 struct FastPageArray {
     /// Pages indexed by `(pgno - 1)`. `None` = page not cached.
     pages: Vec<Option<CachedPageEntry>>,
+    /// Packed record of slots touched since the last clear.
+    ///
+    /// A removed page deliberately leaves its bit set. Re-inserting the same
+    /// page therefore cannot duplicate work in `touched_words`, while `clear`
+    /// can visit only slots that might still be resident instead of scanning
+    /// the full sparse `pages` allocation.
+    touched_slot_bits: Vec<u64>,
+    /// Indices of non-zero words in `touched_slot_bits`.
+    touched_words: Vec<usize>,
     /// Number of non-None entries (tracked for O(1) len()).
     count: usize,
     /// Round-robin cursor for arbitrary eviction scans.
@@ -1352,6 +1361,8 @@ impl FastPageArray {
     fn new() -> Self {
         Self {
             pages: Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY),
+            touched_slot_bits: Vec::new(),
+            touched_words: Vec::new(),
             count: 0,
             next_eviction_scan_start: 0,
             hits: 0,
@@ -1377,7 +1388,19 @@ impl FastPageArray {
                 .max(self.pages.len() * 2)
                 .max(FAST_ARRAY_INITIAL_CAPACITY);
             self.pages.resize_with(new_len, || None);
+            self.touched_slot_bits.resize(new_len.div_ceil(64), 0);
         }
+    }
+
+    #[inline]
+    fn note_touched_slot(&mut self, idx: usize) {
+        let word_idx = idx / 64;
+        let bit = 1_u64 << (idx % 64);
+        let word = &mut self.touched_slot_bits[word_idx];
+        if *word == 0 {
+            self.touched_words.push(word_idx);
+        }
+        *word |= bit;
     }
 
     /// Get a page from the array.
@@ -1432,6 +1455,7 @@ impl FastPageArray {
         let is_new = self.pages[idx].is_none();
         self.pages[idx] = Some(CachedPageEntry::new(buf));
         if is_new {
+            self.note_touched_slot(idx);
             if self.count == 0 {
                 self.next_eviction_scan_start = idx;
             }
@@ -1505,9 +1529,17 @@ impl FastPageArray {
         let removed = self.count;
         self.count = 0;
         self.next_eviction_scan_start = 0;
-        for slot in &mut self.pages {
-            let _ = slot.take();
+        for active_idx in 0..self.touched_words.len() {
+            let word_idx = self.touched_words[active_idx];
+            let mut word = std::mem::take(&mut self.touched_slot_bits[word_idx]);
+            while word != 0 {
+                let bit_idx = word.trailing_zeros() as usize;
+                let slot_idx = word_idx * 64 + bit_idx;
+                let _ = self.pages[slot_idx].take();
+                word &= word - 1;
+            }
         }
+        self.touched_words.clear();
         self.evictions = self.evictions.saturating_add(removed as u64);
         removed
     }
@@ -1518,6 +1550,8 @@ impl FastPageArray {
         self.count = 0;
         self.next_eviction_scan_start = 0;
         self.pages = Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY);
+        self.touched_slot_bits = Vec::new();
+        self.touched_words = Vec::new();
         self.evictions = self.evictions.saturating_add(removed as u64);
         removed
     }
@@ -6476,16 +6510,32 @@ mod tests {
     fn test_fast_page_array_clear() {
         let mut arr = FastPageArray::new();
         let pool = PageBufPool::new(PageSize::DEFAULT, 16);
+        let sparse_page = PageNumber::new(4096).unwrap();
 
         for i in 1..=10u32 {
             arr.insert(PageNumber::new(i).unwrap(), pool.acquire().unwrap());
         }
+        arr.insert(sparse_page, pool.acquire().unwrap());
+        assert!(arr.remove(PageNumber::new(5).unwrap()));
+        arr.insert(PageNumber::new(5).unwrap(), pool.acquire().unwrap());
 
-        assert_eq!(arr.len(), 10);
+        assert_eq!(arr.len(), 11);
+        assert_eq!(
+            arr.touched_words.len(),
+            2,
+            "bead_id={BEAD_FZR07} case=clear_tracks_sparse_words_once"
+        );
 
         let removed = arr.clear();
-        assert_eq!(removed, 10, "bead_id={BEAD_FZR07} case=clear_count");
+        assert_eq!(removed, 11, "bead_id={BEAD_FZR07} case=clear_count");
         assert_eq!(arr.len(), 0);
+        assert!(arr.touched_words.is_empty());
+        assert!(arr.touched_slot_bits.iter().all(|&word| word == 0));
+        assert!(!arr.contains(sparse_page));
+
+        arr.insert(sparse_page, pool.acquire().unwrap());
+        assert_eq!(arr.clear(), 1);
+        assert!(arr.touched_words.is_empty());
     }
 
     #[test]
