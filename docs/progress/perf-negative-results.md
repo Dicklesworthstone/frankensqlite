@@ -16116,3 +16116,55 @@ test is on the executed path, not merely linked into it.
   frame-ranked lever selection; (2) a target-feature floor (x86-64-v2/v3) or a scoped unsafe
   exception → SIMD/`lzcnt` levers; (3) allow codegen levers (with golden re-bless) → the covering
   seek's proven vein. Absent these, the cc runtime-perf lane is at honest convergence.
+
+## 2026-07-10 - WIN: rowid-equality aggregate seek (bd-2dgf5)
+
+- Result type: KEPT. Semantic gate (differential oracle vs C SQLite) passed; landed.
+  Authorized codegen lever: changes emitted bytecode; the hard gate is bit-identical results
+  vs reference SQLite, not bytecode identity.
+- Profile-first: on the frozen a6b1a262 binary, `EXPLAIN` showed `SELECT COUNT(*)/SUM(v) FROM t
+  WHERE id = <int>` (id INTEGER PRIMARY KEY) emitting `Rewind`/`Next` (full scan) while C SQLite
+  reports `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)`. Aggregates were gated out of the rowid
+  access path (`rowid_target = if is_aggregate { None }`), the exact analogue of the a6b1a262
+  secondary-index-equality gate.
+- Scope: `SELECT <agg>(...) FROM t WHERE <ipk> = <positive int literal>` routed through
+  `codegen_select_aggregate` (SUM/MIN/MAX/AVG/TOTAL/COUNT(col)/group_concat/COUNT DISTINCT).
+  Emits `OpenRead` + `SeekRowid` (miss jumps to finalize → COUNT=0/SUM=NULL) + the shared
+  accumulate body; the full scan is skipped via a `skip_scan` guard. No duplicate-run loop and
+  no scan fallback: rowid is unique and the seek is exact.
+- CORRECTNESS GATE (must decline anything not an exact rowid equality, else fall back to the
+  scan which handles it correctly): RHS must be `Expr::Literal(Literal::Integer(_))`.
+  `SeekRowid` coerces via `to_integer()`, so `id = 2.5` would truncate to 2 and wrongly match
+  rowid 2; `id = '2'` / a real / a bound param carry affinity; `id = -5` parses as unary-negate
+  (not an integer literal). All of these decline and scan. COUNT(*) is intercepted upstream by
+  `codegen_select_count_star` and is not on this path.
+- SEMANTIC PROOF (the hard gate): `crates/fsqlite-e2e/tests/rowid_eq_aggregate_oracle_e2e.rs`
+  runs 26 queries on both FrankenSQLite and rusqlite (real C SQLite) and asserts bit-identical
+  results — the seek shape, every aggregate kind, misses, negatives, i64 bounds, and every
+  decline case (`2.0`/`2.5`/`'2'`/NULL/`AND`/GROUP BY/HAVING/NOT INDEXED). PASSED on worker
+  vmi1149989. No golden bytecode snapshot matches this shape, so none changed (golden suite
+  8/8 green); no re-bless needed.
+- FIRES PROOF: `bd_2dgf5_rowid_equality_aggregate_seeks_single_row` (emitted-program opcodes)
+  asserts `SeekRowid` present + no `Rewind` for the seek shapes, and `Rewind` present for every
+  decline shape.
+- A/B (release-perf via rch, worker `vmi1149989`, seek vs scan interleaved WITHIN each sample,
+  literal varied per execution so the retained count/sum cache cannot serve it; scan arm forced
+  via `NOT INDEXED`, proven equal by the oracle). 20,000-row table, 64 execs/sample, 60 samples:
+    seek median = 26.28 us/query
+    scan median = 3170.56 us/query
+    speedup (scan/seek) = 120.66x
+    NULL control (seek vs seek) = 0.761x  [12.9 vs 9.8 us/query]
+  The null control is loose (~24%, a cache-ordering artifact: null seeks run after the scan has
+  warmed the page cache), but the 120x speedup is ~100x beyond the null range, so the median
+  gate is cleared overwhelmingly. Mechanism: the scan visits all 20,000 rows; the seek descends
+  the rowid b-tree once (~15 comparisons) and accumulates one row — O(n) -> O(log n).
+- Correctness beyond the oracle: `cargo test -p fsqlite-vdbe --lib` 1030 passed;
+  `-p fsqlite-core --lib` 3343 passed; golden 8/8; reachability 1/1.
+- FOLLOW-UP (not this lever): negative rowid literals (`id = -5`) and bound parameters
+  (`id = ?1`) still scan (correct, unoptimized). Handling unary-negate and params needs a
+  broader rowid-target extraction change; deferred to keep this lever's surface minimal.
+- Provenance: worker vmi1149989; `codegen.rs` sha256
+  9fee9b01c00f9b335bd7665fa6c8524dbda4756c263943fdc61dd090646d166e; oracle test
+  680a31d1c2688ae9b1662db79cceb8b4088f3054cf042cb8883b783b3fc4962e; bench
+  5f2f2477a3f3be2045fef4b9359fb7485c46da63f8711220afa7caa3821ae3ea. Binary sha256 unavailable
+  (rch returns no binary; bd-kbuck).

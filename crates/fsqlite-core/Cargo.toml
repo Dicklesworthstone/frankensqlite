@@ -101,3 +101,7 @@ harness = false
 [[bench]]
 name = "prepared_cache_hot_paths"
 harness = false
+
+[[bench]]
+name = "rowid_eq_aggregate_bench"
+harness = false

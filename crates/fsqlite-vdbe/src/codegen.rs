@@ -8666,8 +8666,35 @@ fn codegen_select_aggregate(
         None
     };
 
+    // bd-2dgf5: rowid-equality seek instead of a full table scan.
+    //
+    // `SELECT COUNT(*)/SUM(v) FROM t WHERE <ipk> = <int literal>` previously walked
+    // every row because aggregates were gated out of the rowid access path (a rowid
+    // point lookup is O(log n); the scan is O(n)). This is the rowid analogue of the
+    // secondary-index seek above and only fires when the seek is provably exact:
+    //   * The RHS must be an INTEGER literal. `SeekRowid` coerces its key via
+    //     `to_integer()`, so `id = 2.5` would truncate to 2 and wrongly match rowid 2,
+    //     and `id = '2'` / a real / a bound param carry affinity the scan handles
+    //     correctly. Everything but an integer literal falls back to the scan.
+    //   * Single-row: rowid is unique, so no duplicate-run loop and no scan fallback are
+    //     needed — a `SeekRowid` miss means zero matches, which finalizes to the same
+    //     COUNT=0 / SUM=NULL the empty scan would produce.
+    // Mutually exclusive with `index_eq_seek`: the INTEGER PRIMARY KEY is the table
+    // b-tree key, not a secondary index, so `extract_column_eq_target` never matches it.
+    let rowid_eq_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        extract_rowid_target_expr(where_clause, Some(table), table_alias)
+            .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
+    } else {
+        None
+    };
+
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
+    let mut skip_scan = false;
 
     if let Some((idx_schema, target_expr)) = index_eq_seek {
         let idx_cursor = 1_i32;
@@ -8819,54 +8846,90 @@ fn codegen_select_aggregate(
         // accumulators are still Null and the scan starts from a clean slate.
         b.resolve_label(scan_fallback);
         b.set_next_anon_placeholder(where_placeholder_base);
-    }
-
-    // Open table for reading.
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
-
-    // Rewind to first row; jump to finalize if table is empty.
-    let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
-
-    // WHERE filter.
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        emit_where_filter(
+    } else if let Some(rowid_rhs) = rowid_eq_seek {
+        // bd-2dgf5 rowid point lookup: seek the single row and accumulate it. A
+        // `SeekRowid` miss (or NULL / non-integer key) jumps straight to finalize, where
+        // the still-Null accumulators produce COUNT=0 / SUM=NULL — the exact empty-scan
+        // result. No duplicate-run loop and no scan fallback: rowid is unique and the
+        // integer-literal gate makes the seek exact, so the full scan is skipped.
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        let rowid_reg = b.alloc_reg();
+        emit_expr(b, rowid_rhs, rowid_reg, None);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            finalize_label,
+            P4::None,
+            0,
+        );
+        emit_aggregate_accumulate_body(
             b,
-            where_expr,
             cursor,
             table,
             table_alias,
             schema,
-            skip_label,
+            &agg_columns,
+            accum_base,
         );
+        skip_scan = true;
     }
 
-    // AggStep for each aggregate column.
-    emit_aggregate_accumulate_body(
-        b,
-        cursor,
-        table,
-        table_alias,
-        schema,
-        &agg_columns,
-        accum_base,
-    );
+    if !skip_scan {
+        // Open table for reading.
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
 
-    // Skip label for WHERE-filtered rows.
-    b.resolve_label(skip_label);
+        // Rewind to first row; jump to finalize if table is empty.
+        let loop_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
 
-    // Next: loop back to start of loop body (instruction after Rewind).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+        // WHERE filter.
+        let skip_label = b.emit_label();
+        if let Some(where_expr) = where_clause {
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
+            );
+        }
+
+        // AggStep for each aggregate column.
+        emit_aggregate_accumulate_body(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+        );
+
+        // Skip label for WHERE-filtered rows.
+        b.resolve_label(skip_label);
+
+        // Next: loop back to start of loop body (instruction after Rewind).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_body = (loop_start + 1) as i32;
+        b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+    }
 
     // Finalize: emit AggFinal for each aggregate.
     b.resolve_label(finalize_label);
@@ -24094,6 +24157,56 @@ mod tests {
     /// The seek fast path: everything the program runs before falling back to a scan.
     fn bd_2dgf5_seek_fast_path(ops: &[VdbeOp]) -> &[VdbeOp] {
         &ops[..bd_2dgf5_fallback_start(ops)]
+    }
+
+    /// bd-2dgf5: an aggregate over `<ipk> = <int literal>` must seek the single row by
+    /// rowid (`SeekRowid`) with no `Rewind`/`Next` table walk. The neighbouring shapes
+    /// that carry affinity or are not a bare rowid equality must decline the seek and
+    /// keep scanning, so the seek stays exact. Asserted on the emitted program because
+    /// EQP renders separately and can disagree (bd-jyyae); the differential oracle test
+    /// `rowid_eq_aggregate_matches_sqlite` covers the results.
+    #[test]
+    fn bd_2dgf5_rowid_equality_aggregate_seeks_single_row() {
+        // Scope: a POSITIVE integer literal on the rowid. `SUM`/`MIN`/`COUNT(col)` route
+        // through codegen_select_aggregate (COUNT(*) is intercepted elsewhere).
+        for sql in [
+            "SELECT SUM(v) FROM t WHERE id = 2",
+            "SELECT SUM(k) FROM t WHERE 2 = id",
+            "SELECT MIN(v) FROM t WHERE id = 2",
+            "SELECT COUNT(k) FROM t WHERE id = 100",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "`{sql}` must seek the row by rowid"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` is a unique rowid point lookup: it must not scan (no Rewind)"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::AggStep),
+                "`{sql}` must still accumulate the seeked row"
+            );
+        }
+
+        // Shapes the seek MUST decline — each must fall back to a Rewind/Next scan so the
+        // scan's correct semantics apply. `id = -5` parses as unary-negate over an integer
+        // literal (not `Literal::Integer`), so it declines too; optimizing negative rowids
+        // is a clean follow-up, and the differential oracle confirms the scan is correct.
+        for sql in [
+            "SELECT SUM(v) FROM t WHERE id = 2.5",
+            "SELECT SUM(v) FROM t WHERE id = '2'",
+            "SELECT SUM(v) FROM t WHERE id = -5",
+            "SELECT SUM(v) FROM t WHERE id = 2 AND k = 3",
+            "SELECT SUM(v) FROM t NOT INDEXED WHERE id = 2",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must decline the rowid seek and scan (Rewind present)"
+            );
+        }
     }
 
     /// bd-2dgf5: a covering aggregate seek must read the index entry and nothing
