@@ -15065,3 +15065,68 @@ set: sessions found by
   integrity, P0), `bd-5310l` (65x per-statement parse/plan overhead, P1).
 - Full write-up and reproduction:
   `docs/progress/perf-baseline-subquery-cte-cc_fsq-20260709.md`.
+
+## 2026-07-10 - prepared DELETE leaf-run Vec recycle after flush
+
+- Target: `bd-1dp9.6.2` / `write_single` prepared-DML DELETE tail. This was a
+  write-path allocation-elision lever, not a single-opcode hot-arm pruning
+  retry.
+- Candidate preflight: `sql_pipeline_candidate_preflight --operation VDBE
+  --direction other --benchmark vdbe_pipeline_execute --source-surface
+  execute_with_borrowed_bindings_internal --json` allowed the lane. A separate
+  rowid hot-dispatch preflight remained blocked by the existing rowid rejection.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+  The candidate changed `flush_pending_direct_delete_leaf_run` to store the
+  emptied `pending_direct_delete_leaf_runs` vector back into the connection
+  after a successful flush so repeated prepared DELETE batches could reuse the
+  allocation. The source patch was manually unwound after measurement rejected
+  it.
+- Profiling/routing evidence:
+  `tests/artifacts/perf/cod-fsq-t62-dispatch-20260710T0230Z/baseline-vdbe-stream-matrix.txt`
+  measured the 64/256/1024 stream matrix under `release-perf`. Medians:
+  `vdbe_pipeline_execute=0.997/5.373/32.278 us`,
+  `vdbe_pipeline_execute_variable=1.817/6.586/21.249 us`,
+  `vdbe_pipeline_execute_rowid=4.198/9.822/34.297 us`,
+  `vdbe_pipeline_execute_idx_rowid=5.377/10.094/42.332 us`,
+  `vdbe_pipeline_execute_next=47.670/157.210/1309.600 us`. This ranked
+  cursor advance as expensive, but the ledger blocks standalone hot-arm pruning,
+  so the attempted lever stayed in the prepared DELETE write path.
+- Perf-stat evidence:
+  `tests/artifacts/perf/cod-fsq-t62-dispatch-20260710T0230Z/perf-stat-delete-10000x500-fsqlite.txt`
+  on `/data/tmp/frankensqlite-cod-fsq-t62-target/release-perf/perf-update-delete
+  10000 80 delete fsqlite standard` collected hardware counters successfully:
+  `0.33456s +-1.58%`, `2.827B instructions`, `1.240B cycles`,
+  `1.16% branch-misses`, `2.45% L1d load-misses`. DML counters in
+  `perf-stat-delete-10000x500-fsqlite-run.txt` ranked the DELETE tail as
+  active leaf probe first, then seek / leaf flush / leaf search, with rowid
+  lookup much smaller.
+- Flamegraph evidence: attempted with `cargo flamegraph --profile release-perf
+  -p fsqlite-e2e --bin perf-update-delete -- 10000 80 delete fsqlite standard`,
+  but the command was stopped after it rebuilt `fsqlite-e2e` for several
+  minutes instead of sampling the already-built binary. Log:
+  `tests/artifacts/perf/cod-fsq-t62-dispatch-20260710T0230Z/flamegraph-delete-10000x500.log`.
+- A/B measurement proof:
+  baseline
+  `tests/artifacts/perf/cod-fsq-t62-dispatch-20260710T0230Z/baseline-update-delete.json`
+  and candidate
+  `tests/artifacts/perf/cod-fsq-t62-dispatch-20260710T0230Z/candidate-vec-recycle-update-delete.json`
+  were both `release-perf` quick `update-delete` runs on the same worker.
+  DELETE medians (`C ms`, `F ms`, `F/C`, `CV C/F`) were:
+  baseline 100 rows `0.002615 / 0.017684 / 6.763 / 4.66%/23.81%`,
+  candidate 100 rows `0.002174 / 0.009278 / 4.268 / 3.65%/2.24%`;
+  baseline 1000 rows `0.017863 / 0.043212 / 2.419 / 30.47%/17.65%`,
+  candidate 1000 rows `0.015219 / 0.034986 / 2.299 / 4.76%/3.32%`;
+  baseline 10000 rows `0.242639 / 0.390240 / 1.608 / 13.17%/18.60%`,
+  candidate 10000 rows `0.183338 / 0.387855 / 2.116 / 18.21%/15.00%`.
+- Result: rejected. Although the candidate lowered the FrankenSQLite median on
+  the two smaller DELETE rows and was roughly flat on the 10000-row F median,
+  it did not pass the all-size dominance/keep gate: the 10000-row comparator
+  ratio regressed to `2.116x` slower, the 10000-row CVs remained well above
+  the required 5% bound, and the report still had FrankenSQLite slower than C
+  SQLite on all three DELETE rows (`0/6` scenarios faster overall).
+- Do not retry successful-flush recycling of
+  `pending_direct_delete_leaf_runs` as a standalone prepared DELETE lever.
+  Reconsider only as part of a broader write-path allocation strategy that
+  removes a measured allocation from the 10000-row tail and proves
+  CV-under-5 improvement at 100, 1000, and 10000 rows in the same-window
+  update-delete matrix.
