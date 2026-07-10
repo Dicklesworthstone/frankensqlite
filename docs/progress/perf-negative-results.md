@@ -15839,3 +15839,51 @@ test is on the executed path, not merely linked into it.
   FSQLite/C SQLite arms to `5k/10k`, `1.25k/2.5k`, and `320/640` transactions
   at 64/256/1024 deletes. Keep raw data remote and copy only finalized reports,
   hashes, and metadata.
+
+## 2026-07-10 - ANALYSIS: release-perf emits SSE2 baseline on an AVX2 host — real, but NOT the write_single lever and NOT an unfair comparison
+
+- Requested ISA-baseline audit (two sibling repos found SSE2-on-AVX2 gaps). Findings, each
+  verified, not assumed:
+- COMPILE TARGET: no `target-cpu`/`target-feature`/`RUSTFLAGS` anywhere
+  (`Cargo.toml`, `.cargo/config.toml`, `rust-toolchain.toml` all clean). So `release-perf`
+  (which `inherits = "release"`) builds at the `x86_64-unknown-linux-gnu` default:
+  `rustc --print cfg` enables only `x87, fxsr, sse, sse2`. No AVX, AVX2, BMI2, FMA, POPCNT,
+  LZCNT. Autovectorization is therefore capped at 128-bit SSE2.
+- HOST: `/proc/cpuinfo` shows `avx avx2 bmi2 fma sse4_2`; `-C target-cpu=native` resolves to
+  `znver3` and enables avx2/bmi2/fma/sse4.2/etc. The keep-gate A/Bs run on this host
+  (bd-2dgf5 core 55; cod's exact-env profile "Host: csd"). So there is a real 128->256-bit
+  autovectorization headroom left on the table.
+- BUT fsqlite has NO hand-written AVX2 to "unlock": `rg '_mm256_'` and
+  `rg '#[target_feature(enable'` both return ZERO hits across `crates/`. The
+  `is_x86_feature_detected!("avx2")` calls in `vectorized.rs` and `record.rs` only pick a
+  telemetry LABEL (`simd_path_label`); the actual work (e.g.
+  `classify_integer_block_simd([i64;4])`) is plain Rust that relies entirely on LLVM
+  autovectorization. So the only effect of enabling AVX2 is wider autovectorized loops, not
+  activation of a dormant intrinsic path.
+- THE COMPARISON IS FAIR (this is NOT the sibling-repo pathology). The C reference is also
+  baseline: bundled rusqlite is compiled by `cc` with only
+  `LIBSQLITE3_FLAGS="-DSQLITE_ENABLE_MATH_FUNCTIONS"`, no `-march`; and SQLite core is
+  portable scalar C with no SIMD at all. So the gap is NOT "fsqlite SSE2 vs C AVX2" — C
+  gets no vector advantage. Enabling AVX2 would make fsqlite faster in ABSOLUTE terms; it
+  would not correct an unfair-comparison artifact, because there is none here.
+- NOT THE write_single LEVER. The exact prepared BEGIN-DELETE-COMMIT env has ZERO SIMD
+  frames (`grep -ic 'classify_integer|vectorized|simd|_mm'` on the ranked-frame table = 0).
+  It is memory/allocator/page-cache bound: `ShardedPageCache::clear`, `__memmove`,
+  `_int_malloc`, `malloc`, `ConcurrentRegistry::begin_concurrent`, `refresh_committed_state`.
+  `classify_integer_block_simd` lives on the INSERT/serialize path
+  (`crates/fsqlite-types/src/record.rs:1238`) and does not appear in the DELETE profile.
+  target-cpu cannot close the 1.213x DELETE gap.
+- MEASUREMENT-INTEGRITY TRAP for whoever pursues this: do NOT set `target-cpu` on
+  `release-perf` alone. `release` (distribution) is `opt-level="z"` and must stay portable,
+  so it would keep SSE2 while `release-perf` got AVX2 — the benchmark would then measure a
+  FASTER binary than ships, overstating real-world performance. Any target-cpu change must
+  either apply to both profiles or set a documented portability floor (x86-64-v2/v3) on both.
+- SUBSTRATE for a valid A/B here: target-cpu is a WHOLE-BINARY compile flag, so it CANNOT be
+  done as "both arms in one binary interleaved". The only correct form is two separately
+  built binaries, run same-core interleaved with a paired null control and the median gate —
+  the same shape used for the bd-2dgf5 covering-seek A/B. Record both binaries' sha256,
+  the null median, per-function self-time, worker/host id, and cv.
+- Retry condition: pursue only against a SERIALIZE/encode-heavy workload where
+  `classify_integer_block_simd` or another autovectorizable loop carries non-trivial
+  self-time (profile-verify first). It is a non-starter for write_single and for any
+  memory-bound path. No source changed this pass.
