@@ -15746,3 +15746,50 @@ test is on the executed path, not merely linked into it.
   the iteration counts (`40k/80k`, `10k/20k`, `2.5k/5k` for
   64/256/1024). This keeps the exact boundary while avoiding timeout and disk
   waste, and still targets tens of thousands of samples per arm.
+
+## 2026-07-10 - NULL CONTROL amends the bd-2dgf5 covering-seek WIN (harness noise floor)
+
+- Applies the franken_whisper rule retroactively to the 2026-07-10 covering-index
+  aggregate seek WIN above. The WIN STANDS, but its 64-op keep-gate figure was reported
+  against a harness that is not tight at that size. Recorded here rather than quietly.
+- A true A/A null control: the SAME binary registered as both arms, same interleaved
+  routine, same core, same reps. Binaries are byte-identical by construction:
+  `sha256(fsqlite_nullA) == sha256(fsqlite_nullB) ==`
+  `237c1996d439ffe9bb2b657aae5b2d6c58635b003411f61cab94d7c1695ddab4`.
+  `sha256(fsqlite_orig) = a25e8df45d92e707b6ab8f257938a4174416349bd34d870bda7d8c4adfe2854d`.
+  Host: local `csd`, `taskset` pinned (no rch worker; this A/B never ran on one).
+
+    null control                       64 ops           256 ops          1024 ops
+    CAND vs CAND, core 57, n=25   1.044x cv 3.0/4.7  1.018x cv 3.0/3.0  1.002x cv 1.6/1.1
+    CAND vs CAND, core 55, n=25   1.027x cv 5.7/5.0  1.033x cv 4.4/2.4  0.998x cv 2.0/1.9
+    ORIG vs ORIG, core 55, n=15   1.009x cv 3.6/4.1  1.020x cv 1.4/2.3  1.003x cv 1.1/0.8
+
+- Noise floor, and a real harness defect it exposed: the null ratio is systematically
+  ABOVE 1.000 at 64 and 256 ops with tight cv. That is not random noise, it is an
+  ORDERING BIAS. Within each rep the runner always executes the ORIG slot first, so that
+  slot pays the cold page-cache/file-cache warmup. The bias shrinks as the measured
+  window grows (4.4% -> 1.8% -> 0.2%), exactly as a fixed per-rep cost should.
+- Null-corrected lever ratios (gate ratio / same-core CAND-vs-CAND null):
+
+    ops    gate ratio   null    corrected   floor cv     verdict
+    64      1.090x     1.027x    1.061x     5.7% / 5.0%  HARNESS-LIMITED
+    256     1.119x     1.033x    1.083x     4.4% / 2.4%  above floor (~3x)
+    1024    1.108x     0.998x    1.110x     2.0% / 1.9%  above floor (~40x)
+
+- Verdict: at 64 ops the null control's cv exceeds the 5% bar, so that size is not fit to
+  decide the lever on its own and must not be quoted as a clean 1.090x. The lever is
+  decided at 256 and 1024, where the null is tight and the corrected effect is 8-11%.
+- The WIN does not rest on the timing harness alone. Three harness-independent instruments
+  agree, and none of them can be produced by ordering bias:
+  * SAME-BINARY delta (no cross-binary ratio at all): the removed table lookup costs
+    12.01 us at 256 ops and 10.55 us at 1024, vs 12.21/11.55 us from the cross-binary gate.
+  * `perf stat` retired instructions per arm (self-time proxy; binaries are stripped so
+    symbol self-time is unavailable): ORIG 473,047,225 vs CAND 380,755,686 at 20
+    matches/query, and 2,952,050,099 vs 1,823,002,946 at 400. Fit `delta(m) = a + b*m`
+    gives b = 2,664 instructions per removed lookup, a = 36,841 per query. At 400 matches
+    the lever removes 38.2% of all retired instructions.
+  * The win scales with matched rows (1.629x at 400 matches, cv 1.93/3.70).
+- HARNESS FIX required before the next timing A/B in this repo: alternate which arm runs
+  first across reps (or randomize slot order), which removes the ordering bias the null
+  control just exposed. Until then, treat any ratio below ~4% at 64 ops as undecided, and
+  always publish the null control beside the result.
