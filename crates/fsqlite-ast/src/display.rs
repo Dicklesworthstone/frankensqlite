@@ -236,14 +236,49 @@ pub fn write_qualified_name(
     write_ident(f, &name.name)
 }
 
-/// Write an expression, wrapping in parentheses if it is a binary or unary op.
-/// This ensures correct precedence round-trips through parse → display → re-parse
-/// and prevents operator merging (e.g. `--x` which becomes a line comment).
-fn write_paren_if_compound(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result {
-    if matches!(
-        expr,
-        crate::Expr::BinaryOp { .. } | crate::Expr::UnaryOp { .. }
-    ) {
+/// Write an expression appearing as the operand of an enclosing operator,
+/// wrapping it in parentheses unless it is self-delimiting.
+///
+/// An expression is self-delimiting when its rendering is bounded by fixed
+/// tokens that no adjacent operator can capture on re-parse (literals,
+/// identifiers, `CAST(...)`, `CASE ... END`, `(...)`-bracketed forms, ...).
+/// Every operator-bearing form — binary/unary operators, postfix
+/// `IS [NOT] NULL` / `COLLATE`, `BETWEEN` / `IN` / `LIKE`, JSON `->` / `->>`
+/// — must be parenthesized: otherwise precedence and associativity can
+/// regroup the expression when the rendered text is re-parsed. For example
+/// `(a IS NULL) = (b IS NULL)` rendered without parentheses is
+/// `a IS NULL = b IS NULL`, which re-parses as `((a IS NULL) = b) IS NULL`
+/// because the null-test and comparison operators share one left-associative
+/// precedence level in SQLite — a semantically different expression.
+/// Parenthesizing also prevents operator merging (e.g. `--x`, which would
+/// lex as a line comment).
+fn write_operand(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result {
+    let needs_parens = match expr {
+        // Operator-bearing forms: never safe to embed bare in an operand
+        // position; precedence on re-parse could regroup them.
+        crate::Expr::BinaryOp { .. }
+        | crate::Expr::UnaryOp { .. }
+        | crate::Expr::Between { .. }
+        | crate::Expr::In { .. }
+        | crate::Expr::Like { .. }
+        | crate::Expr::Collate { .. }
+        | crate::Expr::IsNull { .. }
+        | crate::Expr::JsonAccess { .. } => true,
+        // `NOT EXISTS (...)` starts with the low-precedence prefix operator
+        // NOT; plain `EXISTS (...)` is self-delimiting.
+        crate::Expr::Exists { not, .. } => *not,
+        // Self-delimiting forms.
+        crate::Expr::Literal(..)
+        | crate::Expr::Column(..)
+        | crate::Expr::Case { .. }
+        | crate::Expr::Cast { .. }
+        | crate::Expr::Subquery(..)
+        | crate::Expr::FunctionCall { .. }
+        | crate::Expr::Raise { .. }
+        | crate::Expr::RowValue(..)
+        | crate::Expr::Placeholder(..) => false,
+    };
+    if needs_parens {
         write!(f, "({expr})")
     } else {
         write!(f, "{expr}")
@@ -374,9 +409,9 @@ impl fmt::Display for Expr {
             Self::BinaryOp {
                 left, op, right, ..
             } => {
-                write_paren_if_compound(f, left)?;
+                write_operand(f, left)?;
                 write!(f, " {op} ")?;
-                write_paren_if_compound(f, right)
+                write_operand(f, right)
             }
             Self::UnaryOp { op, expr, .. } => {
                 if matches!(op, UnaryOp::Not) {
@@ -384,7 +419,7 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "{op}")?;
                 }
-                write_paren_if_compound(f, expr)
+                write_operand(f, expr)
             }
             Self::Between {
                 expr,
@@ -393,17 +428,17 @@ impl fmt::Display for Expr {
                 not,
                 ..
             } => {
-                write_paren_if_compound(f, expr)?;
+                write_operand(f, expr)?;
                 if *not {
                     f.write_str(" NOT")?;
                 }
                 f.write_str(" BETWEEN ")?;
-                write_paren_if_compound(f, low)?;
+                write_operand(f, low)?;
                 f.write_str(" AND ")?;
-                write_paren_if_compound(f, high)
+                write_operand(f, high)
             }
             Self::In { expr, set, not, .. } => {
-                write_paren_if_compound(f, expr)?;
+                write_operand(f, expr)?;
                 if *not {
                     f.write_str(" NOT")?;
                 }
@@ -426,15 +461,15 @@ impl fmt::Display for Expr {
                 not,
                 ..
             } => {
-                write_paren_if_compound(f, expr)?;
+                write_operand(f, expr)?;
                 if *not {
                     f.write_str(" NOT")?;
                 }
                 write!(f, " {op} ")?;
-                write_paren_if_compound(f, pattern)?;
+                write_operand(f, pattern)?;
                 if let Some(esc) = escape {
                     f.write_str(" ESCAPE ")?;
-                    write_paren_if_compound(f, esc)?;
+                    write_operand(f, esc)?;
                 }
                 Ok(())
             }
@@ -505,11 +540,11 @@ impl fmt::Display for Expr {
             Self::Collate {
                 expr, collation, ..
             } => {
-                write_paren_if_compound(f, expr)?;
+                write_operand(f, expr)?;
                 write!(f, " COLLATE {collation}")
             }
             Self::IsNull { expr, not, .. } => {
-                write_paren_if_compound(f, expr)?;
+                write_operand(f, expr)?;
                 if *not {
                     f.write_str(" IS NOT NULL")
                 } else {
@@ -529,12 +564,12 @@ impl fmt::Display for Expr {
             Self::JsonAccess {
                 expr, path, arrow, ..
             } => {
-                write_paren_if_compound(f, expr)?;
+                write_operand(f, expr)?;
                 match arrow {
                     JsonArrow::Arrow => f.write_str(" -> ")?,
                     JsonArrow::DoubleArrow => f.write_str(" ->> ")?,
                 }
-                write_paren_if_compound(f, path)
+                write_operand(f, path)
             }
             Self::RowValue(exprs, _) => {
                 f.write_str("(")?;
