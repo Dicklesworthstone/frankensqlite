@@ -51,6 +51,21 @@ fn time_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     start.elapsed().as_nanos()
 }
 
+/// Range arm: `SUM(v) WHERE id <= <upper>` over a selective upper bound. The bounded scan
+/// visits `[1, upper]` and stops; `NOT INDEXED` full-scans all `ROWS`. Upper varies per exec.
+fn time_range_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+    let hint = if not_indexed { " NOT INDEXED" } else { "" };
+    let start = Instant::now();
+    for j in 0..EXECS_PER_SAMPLE {
+        // Keep the range selective (~100 rows) so the bounded scan's early-exit dominates.
+        let upper = 50 + ((base + j as i64) % 100);
+        let sql = format!("SELECT SUM(v) FROM t{hint} WHERE id <= {upper}");
+        let rows = conn.query(black_box(&sql)).expect("query");
+        black_box(&rows);
+    }
+    start.elapsed().as_nanos()
+}
+
 fn median(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
     v[v.len() / 2]
@@ -96,5 +111,37 @@ fn main() {
         (m_nb as f64) / (m_na as f64),
         us(m_na),
         us(m_nb)
+    );
+
+    // Range arm: SUM(v) WHERE id <= <selective upper>, bounded scan vs NOT INDEXED scan.
+    black_box(time_range_arm(&conn, false, 0));
+    black_box(time_range_arm(&conn, true, 0));
+    let mut rseek = Vec::with_capacity(SAMPLES);
+    let mut rscan = Vec::with_capacity(SAMPLES);
+    let mut rnull_a = Vec::with_capacity(SAMPLES);
+    let mut rnull_b = Vec::with_capacity(SAMPLES);
+    for s in 0..SAMPLES {
+        let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
+        rseek.push(time_range_arm(&conn, false, base));
+        rscan.push(time_range_arm(&conn, true, base));
+        rnull_a.push(time_range_arm(&conn, false, base));
+        rnull_b.push(time_range_arm(&conn, false, base));
+    }
+    let mr_seek = median(rseek);
+    let mr_scan = median(rscan);
+    let mr_na = median(rnull_a);
+    let mr_nb = median(rnull_b);
+    println!("--- range: SUM(v) WHERE id <= <upper ~100> ---");
+    println!("range seek median = {:.3} us/query", us(mr_seek));
+    println!("range scan median = {:.3} us/query", us(mr_scan));
+    println!(
+        "range speedup (scan/seek) = {:.3}x",
+        (mr_scan as f64) / (mr_seek as f64)
+    );
+    println!(
+        "range NULL control (seek/seek) = {:.3}x  [{:.3} vs {:.3} us/query]",
+        (mr_nb as f64) / (mr_na as f64),
+        us(mr_na),
+        us(mr_nb)
     );
 }

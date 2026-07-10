@@ -8692,6 +8692,29 @@ fn codegen_select_aggregate(
         None
     };
 
+    // bd-2dgf5: rowid-range bounded scan instead of a full table scan.
+    //
+    // `SELECT SUM(v) FROM t WHERE <ipk> <= <const>` (and `<`, `>=`, `>`, `BETWEEN`)
+    // walked every row; a rowid range visits only `[lower, upper]` by positioning with
+    // `Seek*`/`Rewind` and stopping early once the cursor passes the upper bound. This
+    // reuses the *exact* extraction, safety gate, and bound-comparison helpers the
+    // oracle-tested non-aggregate `codegen_select_rowid_range_scan` uses
+    // (`extract_rowid_range_target` + `rowid_range_fast_path_is_safe` +
+    // `resolved_rowid_range_comparison`), so the aggregate inherits its affinity/collation
+    // correctness; only the per-row action changes (accumulate vs `ResultRow`). Ascending
+    // only — aggregates impose no order.
+    let rowid_range_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        extract_rowid_range_target(where_clause, Some(table), table_alias)
+            .and_then(|range| rowid_range_fast_path_is_safe(range).then_some(range))
+    } else {
+        None
+    };
+
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
@@ -8879,6 +8902,85 @@ fn codegen_select_aggregate(
             &agg_columns,
             accum_base,
         );
+        skip_scan = true;
+    } else if let Some(range) = rowid_range_seek {
+        // bd-2dgf5 rowid range: position at the lower bound (or start), accumulate, and
+        // stop early once the cursor rowid passes the upper bound. Mirrors the ascending
+        // path of `codegen_select_rowid_range_scan`; a NULL bound yields the empty result
+        // via a jump to finalize (still-Null accumulators → COUNT=0 / SUM=NULL).
+        let lower_reg = range.lower.map(|bound| {
+            let reg = b.alloc_reg();
+            emit_expr(b, bound.expr, reg, None);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+            reg
+        });
+        let upper_reg = range.upper.map(|bound| {
+            let reg = b.alloc_reg();
+            emit_expr(b, bound.expr, reg, None);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+            reg
+        });
+        let upper_comparison = range
+            .upper
+            .map(|bound| resolved_rowid_range_comparison(table, table_alias, schema, bound));
+
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        if let Some(bound) = range.lower {
+            let seek_opcode = if bound.inclusive {
+                Opcode::SeekGE
+            } else {
+                Opcode::SeekGT
+            };
+            b.emit_jump_to_label(
+                seek_opcode,
+                cursor,
+                lower_reg.expect("lower bound register exists when range.lower is set"),
+                finalize_label,
+                P4::None,
+                0,
+            );
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
+        }
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let range_loop_top = b.current_addr() as i32;
+        if let Some(bound) = range.upper {
+            let current_rowid_reg = b.alloc_reg();
+            let stop_opcode = if bound.inclusive {
+                Opcode::Gt
+            } else {
+                Opcode::Ge
+            };
+            b.emit_op(Opcode::Rowid, cursor, current_rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                stop_opcode,
+                upper_reg.expect("upper bound register exists when range.upper is set"),
+                current_rowid_reg,
+                finalize_label,
+                upper_comparison
+                    .as_ref()
+                    .map_or(P4::None, |c| c.collation_p4.clone()),
+                upper_comparison.as_ref().map_or(0, |c| c.cmp_p5),
+            );
+        }
+        emit_aggregate_accumulate_body(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+        );
+        b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
         skip_scan = true;
     }
 
@@ -24207,6 +24309,52 @@ mod tests {
                 "`{sql}` must decline the rowid seek and scan (Rewind present)"
             );
         }
+    }
+
+    /// bd-2dgf5: an aggregate over a rowid *range* must position with `SeekGE`/`SeekGT`
+    /// on a lower bound (not a full `Rewind` of every row), and an upper bound must add a
+    /// `Gt`/`Ge` early-exit. Results are covered by `rowid_range_aggregate_matches_sqlite`.
+    #[test]
+    fn bd_2dgf5_rowid_range_aggregate_positions_and_bounds() {
+        // Lower-bounded ranges seek to the start instead of rewinding.
+        for sql in [
+            "SELECT SUM(v) FROM t WHERE id >= 3",
+            "SELECT COUNT(k) FROM t WHERE id > 3",
+            "SELECT SUM(k) FROM t WHERE id BETWEEN 2 AND 5",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+                "`{sql}` must seek to the lower bound"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` has a lower bound: it must not rewind the whole table"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::AggStep),
+                "`{sql}` must still accumulate"
+            );
+        }
+        // Upper-bounded ranges early-exit once the cursor passes the bound.
+        for sql in [
+            "SELECT SUM(v) FROM t WHERE id <= 3",
+            "SELECT COUNT(*) FROM t WHERE id < 3",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.opcode, Opcode::Gt | Opcode::Ge)),
+                "`{sql}` must emit an upper-bound early-exit (Gt/Ge)"
+            );
+        }
+        // GROUP BY / extra predicates / NOT INDEXED must not take the lone-range path.
+        let grouped = bd_2dgf5_program("SELECT SUM(k) FROM t WHERE id <= 3 GROUP BY k");
+        assert!(
+            grouped.iter().any(|op| op.opcode == Opcode::Rewind),
+            "GROUP BY must not take the rowid-range aggregate path"
+        );
     }
 
     /// bd-2dgf5: a covering aggregate seek must read the index entry and nothing

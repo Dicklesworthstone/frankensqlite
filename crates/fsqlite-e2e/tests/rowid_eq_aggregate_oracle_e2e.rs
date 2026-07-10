@@ -131,3 +131,69 @@ fn rowid_eq_aggregate_matches_sqlite() {
         );
     }
 }
+
+#[test]
+fn rowid_range_aggregate_matches_sqlite() {
+    let mut schema =
+        vec!["CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL, s TEXT);".to_owned()];
+    let rows: [(i64, i64, f64, &str); 8] = [
+        (-5, 1, 1.5, "a"),
+        (-1, 2, 2.5, "b"),
+        (1, 3, 3.5, "c"),
+        (2, 3, 4.5, "d"),
+        (3, 4, 5.5, "e"),
+        (10, 4, 6.5, "f"),
+        (50, 5, 7.5, "g"),
+        (100, 5, 8.5, "z"),
+    ];
+    for (id, k, v, s) in rows {
+        schema.push(format!("INSERT INTO t VALUES ({id}, {k}, {v}, '{s}');"));
+    }
+    let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+    let (f, r) = setup(&schema_refs);
+
+    let queries = [
+        // Upper-bounded (early-exit) ranges, every aggregate kind.
+        "SELECT COUNT(*) FROM t WHERE id <= 3",
+        "SELECT SUM(v) FROM t WHERE id <= 3",
+        "SELECT SUM(k) FROM t WHERE id < 3",
+        "SELECT AVG(v) FROM t WHERE id <= 10",
+        "SELECT MIN(v), MAX(v) FROM t WHERE id <= 50",
+        "SELECT COUNT(k), SUM(k), group_concat(s) FROM t WHERE id <= 10",
+        "SELECT COUNT(DISTINCT k) FROM t WHERE id <= 50",
+        // Lower-bounded (seek-to-start) ranges.
+        "SELECT COUNT(*) FROM t WHERE id >= 3",
+        "SELECT SUM(v) FROM t WHERE id > 3",
+        "SELECT SUM(k) FROM t WHERE id >= 50",
+        // Both bounds (BETWEEN and explicit AND).
+        "SELECT COUNT(*) FROM t WHERE id BETWEEN 1 AND 50",
+        "SELECT SUM(v) FROM t WHERE id BETWEEN 2 AND 10",
+        "SELECT SUM(k) FROM t WHERE id > 1 AND id < 50",
+        "SELECT COUNT(*) FROM t WHERE id >= 2 AND id <= 3",
+        // Negatives and empty/edge ranges.
+        "SELECT COUNT(*) FROM t WHERE id <= -1",
+        "SELECT SUM(v) FROM t WHERE id >= -5",
+        "SELECT COUNT(*) FROM t WHERE id BETWEEN -5 AND 1",
+        "SELECT COUNT(*) FROM t WHERE id <= -999",
+        "SELECT COUNT(*) FROM t WHERE id >= 999",
+        "SELECT COUNT(*) FROM t WHERE id BETWEEN 4 AND 9",
+        // Non-integer / affinity bounds — must match whatever the safe path decides.
+        "SELECT COUNT(*) FROM t WHERE id <= 3.5",
+        "SELECT COUNT(*) FROM t WHERE id >= 2.5",
+        // Must NOT be optimized as a lone rowid range.
+        "SELECT SUM(k) FROM t WHERE id <= 50 GROUP BY k",
+        "SELECT COUNT(*) FROM t WHERE id <= 50 AND k = 4",
+        "SELECT COUNT(*) FROM t NOT INDEXED WHERE id <= 3",
+        // Non-aggregate control on the same predicate.
+        "SELECT id, v FROM t WHERE id BETWEEN 2 AND 10 ORDER BY id",
+    ];
+
+    for sql in queries {
+        let fr = frank_rows(&f, sql);
+        let sr = sqlite_rows(&r, sql);
+        assert_eq!(
+            fr, sr,
+            "rowid-range aggregate result diverged from SQLite for `{sql}`"
+        );
+    }
+}

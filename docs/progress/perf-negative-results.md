@@ -16168,3 +16168,93 @@ test is on the executed path, not merely linked into it.
   680a31d1c2688ae9b1662db79cceb8b4088f3054cf042cb8883b783b3fc4962e; bench
   5f2f2477a3f3be2045fef4b9359fb7485c46da63f8711220afa7caa3821ae3ea. Binary sha256 unavailable
   (rch returns no binary; bd-kbuck).
+
+## 2026-07-10 - NON-CANDIDATE: pager freed-page identity-hash membership is below the 64-delete median floor
+
+- Result type: PROFILE-CEILING REJECT. The proposed production
+  lever was a `PageNumberBuildHasher` identity-hashed membership companion for
+  `SimpleTransaction::freed_pages`, retaining the existing `Vec<PageNumber>` as the sole ordered
+  serialization/snapshot source. The pager patch and temporary exact benchmark were both
+  reverted byte-for-byte; this ledger entry is the only shipped change.
+- Profile-first routing: the clean, population-excluded current pager profile at
+  `tests/artifacts/perf/cod-fsq-write-single-exact-gate-20260710T134618Z/fs-64/`
+  measured the exact `BEGIN -> prepared sparse DELETE x64 -> COMMIT` window. Its complete flat
+  self-time table (`ranked-self-symbol-ge-0.1pct.txt`, 451K samples, zero lost) puts the entire
+  `TransactionKind::get_page` frame at only `0.80%` / 3,540 samples. The proposed membership
+  change can remove only a subset of that frame, so `0.80%` is a hard upper bound, not an
+  expected gain. `pager.rs` has not changed since that capture.
+- Fresh median/null substrate: temporarily added `pager_freed_membership` to the existing
+  `crates/fsqlite-e2e/benches/operation_baseline_bench.rs`. It times exactly
+  `BEGIN -> prepared sparse DELETEs -> COMMIT` for 64/256/1024 deletes; restore INSERTs run
+  outside the returned duration. Two identical warmed fixtures alternate order for 21 samples
+  and print an A/A median before Criterion measures the row.
+- Fail-closed remote baseline command:
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -p fsqlite-e2e --bench operation_baseline_bench -- pager_freed_membership --warm-up-time 1 --measurement-time 5 --sample-size 20 --noplot`.
+  Worker `ovh-a`; Criterion point estimates were `37.377 us`, `141.31 us`, and `565.25 us` for
+  64/256/1024. Across the emitted alternating A/A controls, the observed median-ratio ranges
+  were `[0.976589, 1.025490]`, `[0.988967, 1.010159]`, and `[0.995826, 1.006205]` respectively.
+  Thus the required 64-delete row has an observed ~4.9-point null span; eliminating the whole
+  0.80% `get_page` frame still cannot move a candidate median outside that range.
+- Decision: do not ship the hash companion. Under the required all-size median gate, this lever
+  is mechanically undecidable at 64 deletes and its affected self-time is below the measured
+  floor. This supersedes the provenance audit's reopenable long-transaction direction for the
+  current 64/256/1024 keep gate; the historical 1.09x isolated-1000x30000 signal remains valid
+  for a separately authorized long-only workload.
+- RCH routing evidence was not used for the verdict: a requested same-worker candidate run
+  (`RCH_WORKER=ovh-a`, strict remote) was silently routed to `vmi1264463`, took 20m00s to build,
+  and showed A/A ratios ranging roughly `0.85x..1.20x`. Cross-worker absolute times and that
+  noisy candidate run are invalid keep/reject evidence. No local Cargo fallback was attempted.
+- Behavior proof: production `crates/fsqlite-pager/src/pager.rs` was restored exactly to HEAD
+  (SHA-256 `5964ee2088f86b664555b2a30ed3e462f7f8f12e83a063e2c74c6977497b0f9e` and zero Git diff), as
+  was `operation_baseline_bench.rs` (SHA-256
+  `520b13d1ddfb37bca82eb1a4e33dfada59babbc4fd3742d7bb5bcd3815799ef3`). No planner/codegen file
+  or golden snapshot was touched by this lane; a docs-only shipped diff cannot alter emitted
+  bytecode or query results.
+- Retry condition: reconsider only when (a) a fresh exact 64-delete profile attributes more
+  affected self-time than the measured A/A range, or the null range is tightened below the
+  affected-frame ceiling; and (b) ORIG/candidate execute in one binary or RCH demonstrably
+  honors one same-worker route. A long-transaction-only gate may independently reopen the
+  historical 1.09x vein.
+
+## 2026-07-10 - WIN: rowid-range aggregate bounded scan (bd-2dgf5)
+
+- Result type: KEPT. Semantic gate (differential oracle vs C SQLite) passed; landed.
+  Follow-on to the rowid-equality seek above, same family.
+- Profile-first: `SELECT SUM(v)/MIN/COUNT(k) FROM t WHERE id <op> <const>` (id INTEGER
+  PRIMARY KEY; `<`, `<=`, `>`, `>=`, `BETWEEN`) full-scanned every row while C SQLite does a
+  bounded `SEARCH t USING INTEGER PRIMARY KEY (rowid<?)`. Aggregates were gated out of the
+  rowid range path (`rowid_range = if is_aggregate && !simple_count_star { None }`).
+- Change: `codegen_select_aggregate` gained an ascending rowid-range branch that positions
+  with `SeekGE`/`SeekGT` (lower bound) or `Rewind`, accumulates via the shared body, and
+  early-exits with `Gt`/`Ge` once the cursor rowid passes the upper bound. It REUSES the exact
+  extraction, safety gate, and bound-comparison helpers of the oracle-tested non-aggregate
+  `codegen_select_rowid_range_scan` (`extract_rowid_range_target` +
+  `rowid_range_fast_path_is_safe` + `resolved_rowid_range_comparison`), so it inherits that
+  path's affinity/collation correctness; only the per-row action changes (accumulate vs
+  `ResultRow`). A NULL bound jumps to finalize (empty result). Skips the full scan via the
+  same `skip_scan` guard as the equality path.
+- SEMANTIC PROOF (hard gate): `rowid_range_aggregate_matches_sqlite` runs 26 queries on
+  FrankenSQLite and rusqlite (real C SQLite), bit-identical — every operator, every aggregate
+  kind, both bounds/BETWEEN, negatives, empty ranges, non-integer bounds (`<= 3.5`, `>= 2.5`),
+  GROUP BY, extra predicates, NOT INDEXED, and a non-aggregate control. PASSED on worker
+  vmi1227854. No golden snapshot matches this shape (golden 8/8 green); no re-bless.
+- FIRES PROOF: `bd_2dgf5_rowid_range_aggregate_positions_and_bounds` asserts on the emitted
+  program that lower-bounded ranges `SeekGE`/`SeekGT` (no full `Rewind`), upper bounds add a
+  `Gt`/`Ge` early-exit, and GROUP BY declines the path.
+- A/B (release-perf via rch, worker `hz1`, seek vs scan interleaved per sample, upper bound
+  varied per execution so the count/sum cache cannot serve it, scan forced via `NOT INDEXED`
+  and proven equal by the oracle). 20,000-row table, selective upper bound (~100 rows),
+  64 execs/sample, 60 samples:
+    range seek median = 44.48 us/query
+    range scan median = 2301.60 us/query
+    range speedup (scan/seek) = 51.75x
+    range NULL control (seek vs seek) = 0.975x  [44.38 vs 43.26 us/query]  (~2.5%, tight)
+  The null is tight this run and the 51.75x effect is ~50x beyond it — decisive. (The equality
+  arm in the same binary measured 64.58x, null 0.920x.) Mechanism: the bounded scan visits
+  only `[lower, upper]` (~100 rows) and stops; the full scan walks all 20,000.
+- Correctness beyond the oracle: `cargo test -p fsqlite-vdbe --lib` 1032 passed;
+  `-p fsqlite-core --lib` 3343 passed; golden 8/8; reachability 1/1. (One unrelated storage-
+  cursor decode-cache test flaked once in the parallel run and passed on re-run and in
+  isolation — filed as bd-p3963, not caused by this change.)
+- Provenance: worker hz1 (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the commit;
+  binary sha256 unavailable (rch returns no binary; bd-kbuck).
