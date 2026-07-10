@@ -12,51 +12,53 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     48    0                        0 
+0     Init             0     50    0                        0 
 1     Transaction      0     0     0                        0 
 2     SorterOpen       1     1     0     (str)+             0 
 3     OpenRead         0     2     0     (tbl)docs          0 
-4     Rewind           0     39    0                        0 
+4     Rewind           0     41    0                        0 
 5     Column           0     1     4                        0 
-6     IsNull           4     31    0                        0 
-7     Once             0     24    0                        0 
+6     IsNull           4     33    0                        0 
+7     Once             0     25    0                        0 
 8     Integer          0     5     0                        0 
 9     OpenAutoindex    12295  1     0                        0 
 10    OpenRead         8199  3     0     (tbl)categories    0 
-11    Rewind           8199  23    0                        0 
+11    Rewind           8199  24    0                        0 
 12    Column           8199  1     6                        0 
 13    String8          0     7     0     (str)docs          0 
-14    IsNull           7     22    0                        0 
-15    Ne               7     22    6                        128
+14    IsNull           7     23    0                        0 
+15    Ne               7     23    6                        128
 16    Rowid            8199  6     0                        0 
-17    IsNull           6     21    0                        0 
-18    MakeRecord       6     1     7                        0 
-19    IdxInsert        12295  7     0                        0 
-20    Goto             0     22    0                        0 
-21    Integer          1     5     0                        0 
-22    Next             8199  12    0                        0 
-23    Close            8199  0     0                        0 
-24    MakeRecord       4     1     6                        0 
-25    Found            12295  29    6                        0 
-26    If               5     31    0                        0 
-27    Integer          0     3     0                        0 
-28    Goto             0     32    0                        0 
-29    Integer          1     3     0                        0 
-30    Goto             0     32    0                        0 
-31    Null             0     3     0                        0 
-32    IfNot            3     38    1                        0 
-33    Column           0     0     8                        0 
-34    Rowid            0     9     0                        0 
-35    Column           0     2     10                       0 
-36    MakeRecord       8     3     11                       0 
-37    SorterInsert     1     11    0                        0 
-38    Next             0     5     0                        0 
-39    Close            0     0     0                        0 
-40    SorterSort       1     46    0                        0 
-41    SorterData       1     12    0                        0 
-42    Column           1     1     1                        0 
-43    Column           1     2     2                        0 
-44    ResultRow        1     2     0                        0 
-45    SorterNext       1     41    0                        0 
-46    Close            1     0     0                        0 
-47    Halt             0     0     0                        0
+17    Affinity         6     1     0     (aff)C             0 
+18    IsNull           6     22    0                        0 
+19    MakeRecord       6     1     7                        0 
+20    IdxInsert        12295  7     0                        0 
+21    Goto             0     23    0                        0 
+22    Integer          1     5     0                        0 
+23    Next             8199  12    0                        0 
+24    Close            8199  0     0                        0 
+25    Affinity         4     1     0     (aff)C             0 
+26    MakeRecord       4     1     6                        0 
+27    Found            12295  31    6                        0 
+28    If               5     33    0                        0 
+29    Integer          0     3     0                        0 
+30    Goto             0     34    0                        0 
+31    Integer          1     3     0                        0 
+32    Goto             0     34    0                        0 
+33    Null             0     3     0                        0 
+34    IfNot            3     40    1                        0 
+35    Column           0     0     8                        0 
+36    Rowid            0     9     0                        0 
+37    Column           0     2     10                       0 
+38    MakeRecord       8     3     11                       0 
+39    SorterInsert     1     11    0                        0 
+40    Next             0     5     0                        0 
+41    Close            0     0     0                        0 
+42    SorterSort       1     48    0                        0 
+43    SorterData       1     12    0                        0 
+44    Column           1     1     1                        0 
+45    Column           1     2     2                        0 
+46    ResultRow        1     2     0                        0 
+47    SorterNext       1     43    0                        0 
+48    Close            1     0     0                        0 
+49    Halt             0     0     0                        0

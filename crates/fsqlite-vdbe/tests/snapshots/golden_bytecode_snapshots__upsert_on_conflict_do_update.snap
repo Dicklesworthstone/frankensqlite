@@ -70,7 +70,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 55    IdxInsert        2     31    0     (tbl)idx_docs_title  0 
 56    Goto             0     67    0                        0 
 57    MakeRecord       7     5     12    (aff)XDBBD         0 
-58    Insert           0     12    1     (tbl)docs          4 
+58    Insert           0     12    1     (tbl)docs          2 
 59    Copy             8     32    0                        0 
 60    Copy             1     33    0                        0 
 61    MakeRecord       32    2     34                       0 
