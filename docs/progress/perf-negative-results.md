@@ -16258,3 +16258,53 @@ test is on the executed path, not merely linked into it.
   isolation — filed as bd-p3963, not caused by this change.)
 - Provenance: worker hz1 (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the commit;
   binary sha256 unavailable (rch returns no binary; bd-kbuck).
+
+## 2026-07-10 - WIN: index IN-list aggregate per-value seek (bd-2dgf5)
+
+- Result type: KEPT. Semantic gate (differential oracle vs C SQLite) passed; landed. This is
+  the IN-family lever the bead title is about (the original ~89x class), for the safe
+  INTEGER-affinity subset.
+- Profile-first: `SELECT SUM(v)/COUNT(k) FROM t WHERE k IN (1,2,3)` (k indexed) did a full
+  TABLE scan (single OpenRead + Rewind + Next, no index use at all) while C SQLite seeks the
+  covering index per value. The aggregate path handled no IN.
+- Scope (narrow, so the per-value seek needs NO scan fallback): `col IN (<distinct int
+  literals>)`, `col` has INTEGER affinity, single-column ascending index, `IN` not `NOT IN`,
+  routed through `codegen_select_aggregate` (SUM/MIN/MAX/AVG/TOTAL/COUNT(col)/group_concat/
+  COUNT DISTINCT). COUNT(*) is intercepted upstream and keeps its own IN path.
+- CORRECTNESS ARGUMENT (why no fallback is safe): INTEGER affinity + integer-literal probe is
+  exact, so a `SeekGE` never falsely misses matches (the affinity coercion a scan would do is a
+  no-op). Values are de-duplicated at compile time, and distinct integers occupy disjoint
+  duplicate runs, so no two seeks double-count. NULL cannot appear in an all-integer-literal
+  list. Anything outside the subset (text/real/numeric column, a non-integer or non-literal
+  element, `NOT IN`) declines and the aggregate keeps its full scan.
+- Change: `aggregate_index_in_seek_target` extracts (index, distinct sorted i64 values);
+  `emit_aggregate_index_value_seek` emits one value's SeekGE + Ne-run + IdxRowid + SeekRowid +
+  shared accumulate body; `codegen_select_aggregate` opens the table+index once and calls it
+  per distinct value.
+- SEMANTIC PROOF (hard gate): `index_in_list_aggregate_matches_sqlite` runs 23 queries on
+  FrankenSQLite and rusqlite (real C SQLite), bit-identical — every aggregate kind, DEDUP
+  (`k IN (2,2,2)`, `k IN (1,1,2,2,3)`), NULL-in-list (`k IN (2,NULL)`), misses, negatives, and
+  every decline case (`k IN (2,3.0)`, `k IN ('2','3')`, `NOT IN`, extra predicate, GROUP BY,
+  NOT INDEXED) plus a non-aggregate control. PASSED on worker vmi1227854. No golden matches
+  this shape (golden 8/8 green); no re-bless. `bd_2dgf5_index_in_list_aggregate_seeks_per_distinct_value`
+  asserts the emitted program seeks once per distinct value (3 for `(1,2,3)`, 1 for `(2,2,2)`),
+  never Rewinds, and Rewind-scans every decline shape (including a TEXT-affinity column).
+- A/B (release-perf via rch, worker `vmi1149989`, seek vs scan interleaved per sample, IN
+  values varied per execution so the count/sum cache cannot serve it, scan forced via
+  `NOT INDEXED` and proven equal by the oracle). 20,000-row table, `k == id` (selective 3-value
+  list), 64 execs/sample, 60 samples:
+    in seek median = 44.47 us/query
+    in scan median = 6383.73 us/query
+    in speedup (scan/seek) = 143.55x
+    in NULL control (seek vs seek) = 0.840x  [29.0 vs 24.4 us/query]
+  Null is loose (~16%) but the 143x effect is ~170x beyond it — decisive. The IN scan is
+  costlier than a single-predicate scan (2.1 ms) because it evaluates 3-value membership per
+  row (6.4 ms), which is exactly the work the seek eliminates. (Same binary: equality 83.8x,
+  range 53.2x.)
+- Correctness beyond the oracle: `cargo test -p fsqlite-vdbe --lib` 1033 passed (incl. the
+  existing COUNT(*) IN-list tests, still green); golden 8/8; reachability 1/1.
+- FOLLOW-UP (not this lever): non-INTEGER-affinity columns and non-integer / subquery IN lists
+  still scan (correct, unoptimized) — they need the affinity-materialized ephemeral-index path
+  C SQLite uses. COUNT(*) IN already has its own path.
+- Provenance: worker vmi1149989 (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the
+  commit; binary sha256 unavailable (rch returns no binary; bd-kbuck).

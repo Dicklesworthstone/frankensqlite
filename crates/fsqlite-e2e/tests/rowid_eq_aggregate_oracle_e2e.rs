@@ -197,3 +197,67 @@ fn rowid_range_aggregate_matches_sqlite() {
         );
     }
 }
+
+#[test]
+fn index_in_list_aggregate_matches_sqlite() {
+    // k is INTEGER (INTEGER affinity) with a secondary index; v/s carry the aggregated data.
+    // Duplicate k values across rows so a per-value seek walks real duplicate runs, and gaps
+    // so some list values match nothing.
+    let mut schema = vec![
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL, s TEXT);".to_owned(),
+        "CREATE INDEX idx_t_k ON t(k);".to_owned(),
+    ];
+    for i in 1..=60_i64 {
+        schema.push(format!(
+            "INSERT INTO t VALUES ({i}, {}, {i}.5, 'r{i}');",
+            i % 7 // k in 0..6, several rows per value
+        ));
+    }
+    // A couple of negative-k and NULL-k rows for edge coverage.
+    schema.push("INSERT INTO t VALUES (200, -3, 9.5, 'neg');".to_owned());
+    schema.push("INSERT INTO t VALUES (201, NULL, 10.5, 'nul');".to_owned());
+    let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+    let (f, r) = setup(&schema_refs);
+
+    let queries = [
+        // Core IN-list seek shape, every aggregate kind.
+        "SELECT SUM(v) FROM t WHERE k IN (1, 2, 3)",
+        "SELECT COUNT(k) FROM t WHERE k IN (1, 2, 3)",
+        "SELECT AVG(v) FROM t WHERE k IN (2, 4)",
+        "SELECT MIN(v), MAX(v) FROM t WHERE k IN (0, 6)",
+        "SELECT TOTAL(id) FROM t WHERE k IN (1, 5)",
+        "SELECT COUNT(v), SUM(id), group_concat(s) FROM t WHERE k IN (2, 3)",
+        "SELECT COUNT(DISTINCT k) FROM t WHERE k IN (1, 2, 3)",
+        // Duplicates in the list MUST NOT double count (dedup correctness).
+        "SELECT SUM(v) FROM t WHERE k IN (2, 2, 2)",
+        "SELECT COUNT(k) FROM t WHERE k IN (1, 1, 2, 2, 3)",
+        // Single-element and all-values lists.
+        "SELECT SUM(v) FROM t WHERE k IN (2)",
+        "SELECT COUNT(*) FROM t WHERE k IN (0, 1, 2, 3, 4, 5, 6)",
+        // Values that match nothing, negatives, and mixes.
+        "SELECT COUNT(k) FROM t WHERE k IN (99, 100)",
+        "SELECT SUM(v) FROM t WHERE k IN (2, 999)",
+        "SELECT COUNT(k) FROM t WHERE k IN (-3, 2)",
+        "SELECT SUM(v) FROM t WHERE k IN (-3)",
+        // NULL in the list (never matches; must not error or over-count).
+        "SELECT COUNT(k) FROM t WHERE k IN (2, NULL)",
+        // Shapes the seek must decline but still answer correctly.
+        "SELECT COUNT(k) FROM t WHERE k IN (2, 3.0)",
+        "SELECT COUNT(k) FROM t WHERE k IN ('2', '3')",
+        "SELECT COUNT(k) FROM t WHERE k NOT IN (1, 2, 3)",
+        "SELECT SUM(v) FROM t WHERE k IN (1, 2) AND id < 30",
+        "SELECT SUM(v) FROM t WHERE k IN (1, 2) GROUP BY k",
+        "SELECT COUNT(k) FROM t NOT INDEXED WHERE k IN (1, 2, 3)",
+        // Non-aggregate control on the same predicate.
+        "SELECT id FROM t WHERE k IN (2, 3) ORDER BY id",
+    ];
+
+    for sql in queries {
+        let fr = frank_rows(&f, sql);
+        let sr = sqlite_rows(&r, sql);
+        assert_eq!(
+            fr, sr,
+            "IN-list aggregate result diverged from SQLite for `{sql}`"
+        );
+    }
+}

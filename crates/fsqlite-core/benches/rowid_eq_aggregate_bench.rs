@@ -26,14 +26,14 @@ fn setup() -> Connection {
         .expect("create");
     conn.execute("BEGIN;").expect("begin");
     for i in 1..=ROWS {
-        conn.execute(&format!(
-            "INSERT INTO t VALUES ({i}, {}, {}.5);",
-            i % 100,
-            i
-        ))
-        .expect("insert");
+        // k == id (unique, INTEGER affinity) so an IN-list of a few values is selective and
+        // has a secondary index to seek; the id-based equality/range arms are unaffected.
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {i}, {i}.5);"))
+            .expect("insert");
     }
     conn.execute("COMMIT;").expect("commit");
+    conn.execute("CREATE INDEX idx_t_k ON t(k);")
+        .expect("create index");
     conn
 }
 
@@ -60,6 +60,22 @@ fn time_range_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
         // Keep the range selective (~100 rows) so the bounded scan's early-exit dominates.
         let upper = 50 + ((base + j as i64) % 100);
         let sql = format!("SELECT SUM(v) FROM t{hint} WHERE id <= {upper}");
+        let rows = conn.query(black_box(&sql)).expect("query");
+        black_box(&rows);
+    }
+    start.elapsed().as_nanos()
+}
+
+/// IN-list arm: `SUM(v) WHERE k IN (a,b,c)` on the INTEGER index `idx_t_k`. The seek visits
+/// three duplicate runs of one row each; `NOT INDEXED` full-scans all `ROWS`. Values vary.
+fn time_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+    let hint = if not_indexed { " NOT INDEXED" } else { "" };
+    let start = Instant::now();
+    for j in 0..EXECS_PER_SAMPLE {
+        let a = 1 + ((base + j as i64) % ROWS);
+        let b = 1 + ((base + j as i64 + 1) % ROWS);
+        let c = 1 + ((base + j as i64 + 2) % ROWS);
+        let sql = format!("SELECT SUM(v) FROM t{hint} WHERE k IN ({a}, {b}, {c})");
         let rows = conn.query(black_box(&sql)).expect("query");
         black_box(&rows);
     }
@@ -143,5 +159,37 @@ fn main() {
         (mr_nb as f64) / (mr_na as f64),
         us(mr_na),
         us(mr_nb)
+    );
+
+    // IN-list arm: SUM(v) WHERE k IN (a,b,c), per-value index seek vs NOT INDEXED scan.
+    black_box(time_in_arm(&conn, false, 0));
+    black_box(time_in_arm(&conn, true, 0));
+    let mut iseek = Vec::with_capacity(SAMPLES);
+    let mut iscan = Vec::with_capacity(SAMPLES);
+    let mut inull_a = Vec::with_capacity(SAMPLES);
+    let mut inull_b = Vec::with_capacity(SAMPLES);
+    for s in 0..SAMPLES {
+        let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
+        iseek.push(time_in_arm(&conn, false, base));
+        iscan.push(time_in_arm(&conn, true, base));
+        inull_a.push(time_in_arm(&conn, false, base));
+        inull_b.push(time_in_arm(&conn, false, base));
+    }
+    let mi_seek = median(iseek);
+    let mi_scan = median(iscan);
+    let mi_na = median(inull_a);
+    let mi_nb = median(inull_b);
+    println!("--- in-list: SUM(v) WHERE k IN (a,b,c) ---");
+    println!("in seek median = {:.3} us/query", us(mi_seek));
+    println!("in scan median = {:.3} us/query", us(mi_scan));
+    println!(
+        "in speedup (scan/seek) = {:.3}x",
+        (mi_scan as f64) / (mi_seek as f64)
+    );
+    println!(
+        "in NULL control (seek/seek) = {:.3}x  [{:.3} vs {:.3} us/query]",
+        (mi_nb as f64) / (mi_na as f64),
+        us(mi_na),
+        us(mi_nb)
     );
 }
