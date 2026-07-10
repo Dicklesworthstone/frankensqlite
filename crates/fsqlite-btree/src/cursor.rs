@@ -3748,32 +3748,14 @@ impl<P: PageReader> BtCursor<P> {
                 continue;
             }
 
-            // The fast path may only fire when the cursor's CURRENT stack is a
-            // full root-to-leaf path already ending at the cached leaf, so we
-            // can reposition within the top entry without discarding parent
-            // pointers. Rebuilding the stack as a bare leaf (the previous
-            // behavior) violated the structural-mutation invariant that
-            // `stack.len() == 1` means "the leaf IS the root":
-            // `balance_for_delete` silently skipped rebalancing (leaving
-            // emptied leaves attached to their parents — the bd-kwei8
-            // "database disk image is malformed" corruption under
-            // INSERT OR REPLACE churn) and `balance_for_insert` would push
-            // the true root down for a split that belongs to a non-root leaf.
-            let reusable_full_path = self.stack.len() > 1
-                && self
-                    .stack
-                    .first()
-                    .is_some_and(|bottom| bottom.page_no == self.root_page)
-                && self
-                    .stack
-                    .last()
-                    .is_some_and(|top| top.page_no == cached.page_no);
-            let root_is_leaf =
-                self.stack.len() == 1 && cached.page_no == self.root_page;
-            if !(reusable_full_path || root_is_leaf) {
-                continue;
-            }
-
+            // NOTE (bd-kwei8): this fast path deliberately rebuilds the stack
+            // as JUST the landing leaf — no root-to-leaf path. That is fine
+            // for reads, but every structural mutation entry point must
+            // rebuild a full path first, because the balance machinery
+            // interprets `stack.len() == 1` as "the leaf IS the root"
+            // (`balance_for_delete` skips rebalancing; `balance_for_insert`
+            // pushes the true root down). See the rootless-stack guards in
+            // `delete` and `table_insert`.
             let entry = self.load_page(cx, cached.page_no)?;
             if !(entry.header.page_type.is_leaf() && entry.header.page_type.is_table()) {
                 continue;
@@ -3782,12 +3764,10 @@ impl<P: PageReader> BtCursor<P> {
             let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
             match result {
                 BinarySearchResult::Found(idx) => {
+                    self.stack.clear();
                     let mut entry = entry;
                     entry.cell_idx = idx;
-                    *self
-                        .stack
-                        .last_mut()
-                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))? = entry;
+                    self.stack.push(entry);
                     self.at_eof = false;
                     self.remember_table_seek(target_rowid, cached.page_no, idx);
                     self.record_point_witness(
@@ -3801,12 +3781,10 @@ impl<P: PageReader> BtCursor<P> {
                     return Ok(Some(SeekResult::Found));
                 }
                 BinarySearchResult::NotFound(idx) if idx < entry.header.cell_count && idx > 0 => {
+                    self.stack.clear();
                     let mut entry = entry;
                     entry.cell_idx = idx;
-                    *self
-                        .stack
-                        .last_mut()
-                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))? = entry;
+                    self.stack.push(entry);
                     self.at_eof = false;
                     self.remember_table_seek(target_rowid, cached.page_no, idx);
                     self.record_point_witness(
@@ -8369,6 +8347,33 @@ impl<P: PageWriter> BtCursor<P> {
     ) -> Result<()> {
         if self.stack.is_empty() && !self.seed_empty_root_leaf_cursor(cx)? {
             return Err(FrankenError::internal("cursor stack is empty"));
+        }
+
+        // The positioning seek may have landed via the table seek-cache fast
+        // path, which leaves a rootless single-entry stack (just the leaf,
+        // no path from the root). If this insert then splits the leaf,
+        // `balance_for_insert` interprets `stack.len() == 1` as "the leaf IS
+        // the root" and pushes the TRUE root down — the insert-side sibling
+        // of the bd-kwei8 delete corruption (emptied leaves left attached).
+        // Rebuild the full root-to-leaf path before mutating; clearing the
+        // seek cache first forces the re-seek to descend from the root. All
+        // table-insert entry points converge here, so this is the single
+        // choke point.
+        if self.stack.len() == 1
+            && self
+                .stack
+                .first()
+                .is_some_and(|entry| entry.page_no != self.root_page)
+        {
+            self.clear_seek_cache();
+            let reseek = self.table_seek_for_insert(cx, rowid)?;
+            if reseek.is_found() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "rowid {rowid} appeared during rootless-stack rebuild before table insert"
+                    ),
+                });
+            }
         }
 
         let insert_idx = {
