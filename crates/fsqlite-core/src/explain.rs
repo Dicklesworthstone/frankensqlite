@@ -229,6 +229,86 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
     rows
 }
 
+/// The index access path an aggregate program actually executes.
+///
+/// bd-2dgf5 / bd-jyyae.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateIndexSeek {
+    /// Name of the index the program seeks.
+    pub index_name: String,
+    /// True when the seek satisfies every aggregate from the index entry alone,
+    /// i.e. the program never looks the row up in the table.
+    pub covering: bool,
+}
+
+/// Read an aggregate's index access path off the *emitted program*.
+///
+/// bd-2dgf5 / bd-jyyae. `EXPLAIN QUERY PLAN` normally renders from the planner
+/// directive, and `planner_select_directive_with_stats` refuses to produce one for
+/// an aggregate — so an aggregate that seeks used to print `SCAN t`. The obvious
+/// repair, re-checking in the EQP path the same conditions codegen checked, is the
+/// bug bd-jyyae is about: the two copies drift, and then EQP confidently describes
+/// a plan the program never runs (it once reported `SEARCH` for an `IN (...)` whose
+/// program was a bare `Rewind`/`Next` scan).
+///
+/// So decide nothing here. An index cursor is SEARCHed exactly when a `Seek*`
+/// positions it, and the index is COVERING exactly when no `IdxRowid` on that cursor
+/// feeds a `SeekRowid` into the table. Both facts are properties of the opcodes.
+///
+/// Returns `None` unless the program is an aggregate (`AggStep`) driven by exactly
+/// one seeked index cursor; every other shape keeps the existing EQP rendering.
+#[must_use]
+pub fn aggregate_index_seek_facts(program: &VdbeProgram) -> Option<AggregateIndexSeek> {
+    let ops = program.ops();
+    if !ops.iter().any(|op| op.opcode == Opcode::AggStep) {
+        return None;
+    }
+
+    let mut index_name_by_cursor: HashMap<i32, &str> = HashMap::new();
+    for op in ops {
+        if op.opcode == Opcode::OpenRead
+            && let P4::Index(name) = &op.p4
+        {
+            index_name_by_cursor.insert(op.p1, name.as_str());
+        }
+    }
+
+    let mut seeked: Vec<i32> = Vec::new();
+    for op in ops {
+        let positions_index = matches!(
+            op.opcode,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+        ) && index_name_by_cursor.contains_key(&op.p1);
+        if positions_index && !seeked.contains(&op.p1) {
+            seeked.push(op.p1);
+        }
+    }
+    let [cursor] = seeked[..] else {
+        return None;
+    };
+
+    // A table lookup is an `IdxRowid` on the seeked cursor feeding a `SeekRowid`.
+    // Any other opcode in between breaks the pairing, exactly as in
+    // `explain_query_plan`'s covering-vs-non-covering annotation.
+    let mut rowid_from_seeked_cursor = false;
+    let mut table_lookup = false;
+    for op in ops {
+        match op.opcode {
+            Opcode::IdxRowid => rowid_from_seeked_cursor = op.p1 == cursor,
+            Opcode::SeekRowid => {
+                table_lookup |= rowid_from_seeked_cursor;
+                rowid_from_seeked_cursor = false;
+            }
+            _ => rowid_from_seeked_cursor = false,
+        }
+    }
+
+    Some(AggregateIndexSeek {
+        index_name: (*index_name_by_cursor.get(&cursor)?).to_owned(),
+        covering: !table_lookup,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

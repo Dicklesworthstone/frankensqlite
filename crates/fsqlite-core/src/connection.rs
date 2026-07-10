@@ -59734,6 +59734,18 @@ impl Connection {
 
                 let fallback_detail = first_source_eqp_detail_from_core(&select.body.select);
                 if let Ok(program) = self.compile_table_select(select) {
+                    // bd-2dgf5 / bd-jyyae: the planner produces no directive for an
+                    // aggregate, and the generic bytecode explain below cannot express
+                    // a seek at all — it renders every `OpenRead` as a `SCAN`. So an
+                    // aggregate served by the index seek printed `SCAN t` for a program
+                    // whose first act is `SeekGE`. Read the access path off the program.
+                    if let Some(seek) = crate::explain::aggregate_index_seek_facts(&program)
+                        && let Some(detail) =
+                            aggregate_index_seek_eqp_detail(select, &seek, &self.schema.borrow())
+                    {
+                        return vec![to_row(2, 0, 0, detail)];
+                    }
+
                     let explained = crate::explain::explain_query_plan(&program);
                     if !explained.is_empty() {
                         let has_source_detail = explained
@@ -81266,6 +81278,41 @@ fn first_source_eqp_detail_from_table_or_subquery(source: &TableOrSubquery) -> O
             first_source_eqp_detail_from_from_clause(from_clause)
         }
     }
+}
+
+/// `EXPLAIN QUERY PLAN` detail for an aggregate whose emitted program seeks an index.
+///
+/// bd-2dgf5 / bd-jyyae. The *decision* — SEARCH vs SCAN, COVERING vs not — arrives in
+/// `seek`, having been read off the opcodes the program will actually run. Only the
+/// names are resolved here: the displayed source comes from the FROM clause and the
+/// key column from the schema. Nothing in this function re-decides the access path,
+/// which is the whole point: a second copy of codegen's gates is exactly how EQP text
+/// and the emitted program drift apart.
+fn aggregate_index_seek_eqp_detail(
+    select: &SelectStatement,
+    seek: &crate::explain::AggregateIndexSeek,
+    schema: &[TableSchema],
+) -> Option<String> {
+    let SelectCore::Select { from, .. } = &select.body.select else {
+        return None;
+    };
+    let TableOrSubquery::Table { name, alias, .. } = &from.as_ref()?.source else {
+        return None;
+    };
+    let table = schema
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(&name.name))?;
+    let index = table
+        .indexes
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(&seek.index_name))?;
+    let key_column = index.columns.first()?;
+    let displayed = alias.as_deref().unwrap_or(&table.name);
+    let covering = if seek.covering { "COVERING " } else { "" };
+    Some(format!(
+        "SEARCH {displayed} USING {covering}INDEX {} ({key_column}=?)",
+        index.name
+    ))
 }
 
 fn first_source_eqp_detail_from_from_clause(from_clause: &FromClause) -> Option<String> {
@@ -160109,6 +160156,125 @@ mod pager_routing_tests {
                 "{} VDBE codegen conformance mismatches found",
                 mismatches.len()
             );
+        }
+    }
+
+    /// bd-2dgf5 fixture: the schema the C SQLite EQP strings below were captured on.
+    fn bd_2dgf5_conn() -> Connection {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_k ON t(k);").unwrap();
+        for i in 1..=200_i64 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {}, 'v{i}');", i % 10))
+                .unwrap();
+        }
+        conn
+    }
+
+    fn eqp_details(conn: &Connection, sql: &str) -> String {
+        conn.query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .into_iter()
+            .map(|row| match &row.values[3] {
+                SqliteValue::Text(detail) => detail.to_string(),
+                other => panic!("expected EQP detail text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// bd-2dgf5 proof (a): `EXPLAIN QUERY PLAN` parity with C SQLite 3.x.
+    ///
+    /// Expected strings are verbatim `sqlite3` 3.46.1 output on this exact schema
+    /// (`sqlite3 t.db "EXPLAIN QUERY PLAN <sql>"`, trailing tree glyphs stripped).
+    /// Note `ORDER BY 1`: C SQLite still reports the covering search, and a version
+    /// of this that re-derived codegen's gates in the EQP path declined the seek for
+    /// exactly that shape while the program went on seeking anyway.
+    #[test]
+    fn bd_2dgf5_explain_query_plan_matches_c_sqlite() {
+        let conn = bd_2dgf5_conn();
+        let expected = [
+            // Covering: nothing but the rowid and the indexed column is needed.
+            (
+                "SELECT COUNT(*) FROM t WHERE k = 2",
+                "SEARCH t USING COVERING INDEX idx_t_k (k=?)",
+            ),
+            (
+                "SELECT SUM(id) FROM t WHERE k = 2",
+                "SEARCH t USING COVERING INDEX idx_t_k (k=?)",
+            ),
+            (
+                "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
+                "SEARCH t USING COVERING INDEX idx_t_k (k=?)",
+            ),
+            // `v` is not in the index, so the row must be fetched: not covering.
+            (
+                "SELECT SUM(v) FROM t WHERE k = 2",
+                "SEARCH t USING INDEX idx_t_k (k=?)",
+            ),
+            // `NOT INDEXED` forbids the index, so both engines scan.
+            ("SELECT COUNT(*) FROM t NOT INDEXED WHERE k = 2", "SCAN t"),
+        ];
+
+        for (sql, want) in expected {
+            assert_eq!(
+                eqp_details(&conn, sql),
+                want,
+                "EQP text diverged from C SQLite 3.46.1 for `{sql}`"
+            );
+        }
+    }
+
+    /// bd-2dgf5 proof (b): EQP text must agree with the program it claims to describe.
+    ///
+    /// Proof (a) alone is not enough. EQP renders separately from codegen, so the text
+    /// can be right for a program that does something else entirely — that is bd-jyyae,
+    /// where EQP reported `SEARCH` for an `IN (...)` whose program was `Rewind`/`Next`
+    /// with no seek opcode at all. Pin the two together:
+    ///
+    ///   EQP says SEARCH   <=>  the program contains a Seek
+    ///   EQP says COVERING <=>  the program contains no SeekRowid
+    #[test]
+    fn bd_2dgf5_explain_query_plan_agrees_with_emitted_program() {
+        let conn = bd_2dgf5_conn();
+        let queries = [
+            "SELECT COUNT(*) FROM t WHERE k = 2",
+            "SELECT SUM(id) FROM t WHERE k = 2",
+            "SELECT SUM(k) FROM t WHERE k = 2",
+            "SELECT MIN(id), MAX(id) FROM t WHERE k = 2",
+            "SELECT COUNT(DISTINCT k) FROM t WHERE k = 2",
+            "SELECT SUM(v) FROM t WHERE k = 2",
+            "SELECT group_concat(v) FROM t WHERE k = 2",
+            "SELECT COUNT(*) FILTER (WHERE id > 100) FROM t WHERE k = 2",
+            "SELECT COUNT(*) FROM t WHERE k = 2 ORDER BY 1",
+            "SELECT COUNT(*) FROM t WHERE v = 'v7'",
+            "SELECT COUNT(*) FROM t WHERE id = 2",
+            "SELECT COUNT(*) FROM t",
+            "SELECT COUNT(*) FROM t NOT INDEXED WHERE k = 2",
+            "SELECT COUNT(*) FROM t WHERE k = 2 GROUP BY k",
+            "SELECT COUNT(*) FROM t WHERE k IN (1, 2)",
+        ];
+
+        for sql in queries {
+            let eqp = eqp_details(&conn, sql);
+            let ops = explain_opcodes(&conn, sql);
+            let has_seek = ops.iter().any(|op| op == "SeekGE");
+            let has_table_lookup = ops.iter().any(|op| op == "SeekRowid");
+
+            assert_eq!(
+                eqp.contains("SEARCH"),
+                has_seek,
+                "EQP/program divergence for `{sql}`: eqp={eqp:?} has_seek={has_seek}"
+            );
+            if eqp.contains("SEARCH") {
+                assert_eq!(
+                    eqp.contains("COVERING"),
+                    !has_table_lookup,
+                    "COVERING claim disagrees with SeekRowid presence for `{sql}`: \
+                     eqp={eqp:?} has_table_lookup={has_table_lookup}"
+                );
+            }
         }
     }
 
