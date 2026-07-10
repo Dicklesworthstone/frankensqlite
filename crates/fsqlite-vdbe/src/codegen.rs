@@ -8777,19 +8777,8 @@ fn index_integer_in_list_target<'t>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<i64>)> {
-    let Expr::In {
-        expr,
-        set: fsqlite_ast::InSet::List(values),
-        not: false,
-        ..
-    } = where_clause?
-    else {
-        return None;
-    };
-    if values.is_empty() {
-        return None;
-    }
-    let col_name = column_name(expr, table, table_alias)?;
+    let (column, ints) = column_int_list_from_predicate(where_clause, table, table_alias)?;
+    let col_name = column_name(column, table, table_alias)?;
     // INTEGER-affinity column only (see the no-fallback argument above).
     if table
         .column_index(&col_name)
@@ -8802,15 +8791,6 @@ fn index_integer_in_list_target<'t>(
     let idx = table
         .index_for_column(&col_name)
         .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
-    let mut ints = Vec::with_capacity(values.len());
-    for value in values {
-        match value {
-            Expr::Literal(Literal::Integer(n), _) => ints.push(*n),
-            _ => return None,
-        }
-    }
-    ints.sort_unstable();
-    ints.dedup();
     Some((idx, ints))
 }
 
@@ -18982,33 +18962,118 @@ fn extract_rowid_target_expr<'a>(
 /// bd-2dgf5. Integer literals only (`SeekRowid` truncates via `to_integer()`, so `id = 2.5`
 /// would wrongly match rowid 2; negatives parse as unary-negate and decline), `IN` not
 /// `NOT IN`, non-empty. De-duplicated. Anything else declines to the scan.
+/// Collect the leaves of a pure `OR` chain of `<expr> = <integer literal>` into `out`.
+///
+/// Returns false if any leaf is not `something = int` / `int = something`. The caller checks
+/// that every collected column expression is the SAME column, so `k = 2 OR j = 3` is rejected.
+/// Precedence is respected by the AST: `k = 2 OR k = 5 AND x` parses as `k = 2 OR (k = 5 AND x)`,
+/// whose right leaf is an `And` and fails here.
+fn collect_or_int_eq_leaves<'a>(expr: &'a Expr, out: &mut Vec<(&'a Expr, i64)>) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            op: fsqlite_ast::BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => collect_or_int_eq_leaves(left, out) && collect_or_int_eq_leaves(right, out),
+        Expr::BinaryOp {
+            op: fsqlite_ast::BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            if let Expr::Literal(Literal::Integer(n), _) = right.as_ref() {
+                out.push((left, *n));
+                true
+            } else if let Expr::Literal(Literal::Integer(n), _) = left.as_ref() {
+                out.push((right, *n));
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The column expression and distinct sorted integer values of a `WHERE col IN (<int list>)`
+/// OR a semantically equivalent `WHERE col = a OR col = b OR ...` predicate.
+///
+/// bd-2dgf5. Integer literals only (exact probe, no affinity coercion), same column across an
+/// OR chain, `IN` not `NOT IN`, non-empty. Values are de-duplicated, so `col = a OR col = a`
+/// and `IN (a, a)` both collapse to one seek, matching SQLite's set semantics.
+fn column_int_list_from_predicate<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'a Expr, Vec<i64>)> {
+    let expr = where_clause?;
+    let (column, mut ints): (&Expr, Vec<i64>) = if let Expr::In {
+        expr: column,
+        set: fsqlite_ast::InSet::List(values),
+        not: false,
+        ..
+    } = expr
+    {
+        if values.is_empty() {
+            return None;
+        }
+        let mut ints = Vec::with_capacity(values.len());
+        for value in values {
+            match value {
+                Expr::Literal(Literal::Integer(n), _) => ints.push(*n),
+                _ => return None,
+            }
+        }
+        (column.as_ref(), ints)
+    } else if matches!(
+        expr,
+        Expr::BinaryOp {
+            op: fsqlite_ast::BinaryOp::Or,
+            ..
+        }
+    ) {
+        // Only an actual OR chain normalizes here. A bare `col = <int>` is left to the
+        // existing rowid-equality / index-equality paths (which own its EQP shape); treating
+        // it as a one-element IN-list would re-route it and change its EXPLAIN output.
+        let mut leaves: Vec<(&Expr, i64)> = Vec::new();
+        if !collect_or_int_eq_leaves(expr, &mut leaves) || leaves.is_empty() {
+            return None;
+        }
+        // Same-column check, rowid-aware: `column_name` returns None for the rowid alias, so
+        // fold rowid refs to a single identity. This keeps `id = 2 OR id = 3` (and `id = 2 OR
+        // rowid = 3`, the same column) together while rejecting `k = 2 OR j = 3`.
+        let identity = |e: &Expr| -> Option<String> {
+            if is_rowid_expr(e, Some(table), table_alias) {
+                Some("\0rowid".to_owned())
+            } else {
+                column_name(e, table, table_alias)
+            }
+        };
+        let first_col = leaves[0].0;
+        let first_ident = identity(first_col)?;
+        for (col, _) in &leaves {
+            if identity(col).as_deref() != Some(first_ident.as_str()) {
+                return None;
+            }
+        }
+        let ints = leaves.iter().map(|(_, n)| *n).collect();
+        (first_col, ints)
+    } else {
+        return None;
+    };
+    ints.sort_unstable();
+    ints.dedup();
+    Some((column, ints))
+}
+
 fn extract_rowid_in_list_target(
     where_clause: Option<&Expr>,
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Option<Vec<i64>> {
-    let Expr::In {
-        expr,
-        set: fsqlite_ast::InSet::List(values),
-        not: false,
-        ..
-    } = where_clause?
-    else {
-        return None;
-    };
-    if values.is_empty() || !is_rowid_expr(expr, Some(table), table_alias) {
-        return None;
-    }
-    let mut ints = Vec::with_capacity(values.len());
-    for value in values {
-        match value {
-            Expr::Literal(Literal::Integer(n), _) => ints.push(*n),
-            _ => return None,
-        }
-    }
-    ints.sort_unstable();
-    ints.dedup();
-    Some(ints)
+    let (column, ints) = column_int_list_from_predicate(where_clause, table, table_alias)?;
+    is_rowid_expr(column, Some(table), table_alias).then_some(ints)
 }
 
 fn extract_rowid_range_target<'a>(
@@ -24928,6 +24993,55 @@ mod tests {
                     .iter()
                     .any(|op| op.opcode == Opcode::Rewind),
                 "`{sql}` must decline the rowid IN-list seek (Rewind present)"
+            );
+        }
+    }
+
+    /// bd-2dgf5: `col = a OR col = b OR ...` on one indexed column normalizes to the IN-list
+    /// seek (secondary index -> SeekGE per value; rowid -> SeekRowid per value). Mixed columns,
+    /// mixed operators, NOT IN, real literals, and AND-mixed precedence decline to the scan.
+    /// Results are covered by `or_of_equalities_matches_sqlite`.
+    #[test]
+    fn bd_2dgf5_or_of_equalities_normalizes_to_seek() {
+        // Secondary index (k): SeekGE per distinct value, no Rewind.
+        let ki = bd_2dgf5_program("SELECT id FROM t WHERE k = 2 OR k = 5");
+        assert_eq!(
+            ki.iter().filter(|op| op.opcode == Opcode::SeekGE).count(),
+            2,
+            "k = 2 OR k = 5 must seek per distinct value"
+        );
+        assert!(!ki.iter().any(|op| op.opcode == Opcode::Rewind));
+        // Duplicate values collapse.
+        assert_eq!(
+            bd_2dgf5_program("SELECT id FROM t WHERE k = 2 OR k = 2")
+                .iter()
+                .filter(|op| op.opcode == Opcode::SeekGE)
+                .count(),
+            1
+        );
+        // Rowid (id): SeekRowid per distinct value.
+        let ri = bd_2dgf5_program("SELECT id FROM t WHERE id = 2 OR id = 3");
+        assert_eq!(
+            ri.iter()
+                .filter(|op| op.opcode == Opcode::SeekRowid)
+                .count(),
+            2
+        );
+        assert!(!ri.iter().any(|op| op.opcode == Opcode::Rewind));
+
+        for sql in [
+            "SELECT id FROM t WHERE k = 2 OR v = 3",
+            "SELECT id FROM t WHERE k = 2 OR k > 5",
+            "SELECT id FROM t WHERE k = 2.0 OR k = 3",
+            "SELECT id FROM t WHERE k = 2 OR k = 3 AND id < 5",
+            "SELECT id FROM t WHERE k = 2 OR k = 3 ORDER BY id",
+            "SELECT id FROM t NOT INDEXED WHERE k = 2 OR k = 3",
+        ] {
+            assert!(
+                bd_2dgf5_program(sql)
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must decline OR normalization and scan (Rewind present)"
             );
         }
     }

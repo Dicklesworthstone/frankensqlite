@@ -331,6 +331,81 @@ fn index_in_list_nonaggregate_matches_sqlite() {
 }
 
 #[test]
+fn or_of_equalities_matches_sqlite() {
+    // OR-of-equalities on the same column normalizes to an IN-list seek. Cover secondary index
+    // (k), rowid (id), aggregate + non-aggregate, and every shape that must NOT normalize.
+    let mut schema = vec![
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, j INTEGER, v REAL);".to_owned(),
+        "CREATE INDEX idx_t_k ON t(k);".to_owned(),
+    ];
+    for i in 1..=40_i64 {
+        schema.push(format!(
+            "INSERT INTO t VALUES ({i}, {}, {}, {i}.5);",
+            i % 5,
+            i % 3
+        ));
+    }
+    let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+    let (f, r) = setup(&schema_refs);
+
+    // Aggregates and COUNT(*) are order-independent -> exact.
+    let exact = [
+        "SELECT SUM(v) FROM t WHERE k = 2 OR k = 3",
+        "SELECT COUNT(k) FROM t WHERE k = 1 OR k = 2 OR k = 4",
+        "SELECT SUM(v) FROM t WHERE k = 2 OR k = 2",
+        "SELECT SUM(v) FROM t WHERE id = 5 OR id = 10 OR id = 15",
+        "SELECT COUNT(*) FROM t WHERE id = 5 OR id = 10",
+        "SELECT SUM(v) FROM t WHERE 2 = k OR k = 3",
+        // Must NOT normalize (mixed columns / operators / NOT / real literal / precedence).
+        "SELECT COUNT(k) FROM t WHERE k = 2 OR j = 1",
+        "SELECT COUNT(k) FROM t WHERE k = 2 OR k > 3",
+        "SELECT COUNT(k) FROM t WHERE k = 2.0 OR k = 3",
+        "SELECT COUNT(k) FROM t WHERE k = 2 OR k = 3 AND j = 1",
+        "SELECT COUNT(k) FROM t WHERE NOT (k = 2 OR k = 3)",
+        "SELECT SUM(v) FROM t NOT INDEXED WHERE k = 2 OR k = 3",
+    ];
+    for sql in exact {
+        assert_eq!(
+            frank_rows(&f, sql),
+            sqlite_rows(&r, sql),
+            "OR-of-equalities aggregate diverged from SQLite for `{sql}`"
+        );
+    }
+
+    // Non-aggregate: no ORDER BY -> set equality; ORDER BY -> exact.
+    let sorted = |res: Result<Vec<Vec<String>>, String>| -> Result<Vec<Vec<String>>, String> {
+        res.map(|mut rows| {
+            rows.sort();
+            rows
+        })
+    };
+    let set_eq = [
+        "SELECT id FROM t WHERE k = 2 OR k = 3",
+        "SELECT id, v FROM t WHERE k = 1 OR k = 4",
+        "SELECT id FROM t WHERE id = 5 OR id = 10 OR id = 15",
+        "SELECT id FROM t WHERE k = 2 OR k = 2",
+    ];
+    for sql in set_eq {
+        assert_eq!(
+            sorted(frank_rows(&f, sql)),
+            sorted(sqlite_rows(&r, sql)),
+            "OR-of-equalities non-aggregate (set) diverged from SQLite for `{sql}`"
+        );
+    }
+    for sql in [
+        "SELECT id FROM t WHERE k = 2 OR k = 3 ORDER BY id",
+        "SELECT id FROM t WHERE id = 15 OR id = 5 OR id = 10 ORDER BY id",
+        "SELECT id FROM t WHERE k = 2 OR j = 1 ORDER BY id",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql),
+            sqlite_rows(&r, sql),
+            "OR-of-equalities non-aggregate (ordered) diverged from SQLite for `{sql}`"
+        );
+    }
+}
+
+#[test]
 fn rowid_in_list_matches_sqlite() {
     let mut schema =
         vec!["CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL, s TEXT);".to_owned()];

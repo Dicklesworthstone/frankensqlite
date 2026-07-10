@@ -115,6 +115,22 @@ fn time_rowid_in_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
     start.elapsed().as_nanos()
 }
 
+/// OR-of-equalities arm: `SELECT id, v WHERE k = a OR k = b OR k = c`, normalized to a
+/// per-value index seek vs a `NOT INDEXED` scan. Proves the OR->IN normalization fires.
+fn time_or_arm(conn: &Connection, not_indexed: bool, base: i64) -> u128 {
+    let hint = if not_indexed { " NOT INDEXED" } else { "" };
+    let start = Instant::now();
+    for j in 0..EXECS_PER_SAMPLE {
+        let a = 1 + ((base + j as i64) % ROWS);
+        let b = 1 + ((base + j as i64 + 1) % ROWS);
+        let c = 1 + ((base + j as i64 + 2) % ROWS);
+        let sql = format!("SELECT id, v FROM t{hint} WHERE k = {a} OR k = {b} OR k = {c}");
+        let rows = conn.query(black_box(&sql)).expect("query");
+        black_box(&rows);
+    }
+    start.elapsed().as_nanos()
+}
+
 fn median(mut v: Vec<u128>) -> u128 {
     v.sort_unstable();
     v[v.len() / 2]
@@ -288,5 +304,37 @@ fn main() {
         (mrid_nb as f64) / (mrid_na as f64),
         us(mrid_na),
         us(mrid_nb)
+    );
+
+    // OR-of-equalities arm.
+    black_box(time_or_arm(&conn, false, 0));
+    black_box(time_or_arm(&conn, true, 0));
+    let mut or_seek = Vec::with_capacity(SAMPLES);
+    let mut or_scan = Vec::with_capacity(SAMPLES);
+    let mut or_na = Vec::with_capacity(SAMPLES);
+    let mut or_nb = Vec::with_capacity(SAMPLES);
+    for s in 0..SAMPLES {
+        let base = (s as i64) * (EXECS_PER_SAMPLE as i64);
+        or_seek.push(time_or_arm(&conn, false, base));
+        or_scan.push(time_or_arm(&conn, true, base));
+        or_na.push(time_or_arm(&conn, false, base));
+        or_nb.push(time_or_arm(&conn, false, base));
+    }
+    let mor_seek = median(or_seek);
+    let mor_scan = median(or_scan);
+    let mor_na = median(or_na);
+    let mor_nb = median(or_nb);
+    println!("--- or-of-equalities: SELECT id,v WHERE k = a OR k = b OR k = c ---");
+    println!("or seek median = {:.3} us/query", us(mor_seek));
+    println!("or scan median = {:.3} us/query", us(mor_scan));
+    println!(
+        "or speedup (scan/seek) = {:.3}x",
+        (mor_scan as f64) / (mor_seek as f64)
+    );
+    println!(
+        "or NULL control (seek/seek) = {:.3}x  [{:.3} vs {:.3} us/query]",
+        (mor_nb as f64) / (mor_na as f64),
+        us(mor_na),
+        us(mor_nb)
     );
 }

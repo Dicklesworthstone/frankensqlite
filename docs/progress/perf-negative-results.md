@@ -16393,3 +16393,44 @@ test is on the executed path, not merely linked into it.
   reachability 1/1; `-p fsqlite-core --lib` 3343 passed (the routing change touches the main SELECT
   dispatch — no regression).
 - Provenance: worker hz2; `codegen.rs` sha256 in the commit; binary sha256 unavailable (bd-kbuck).
+
+## 2026-07-10 - WIN: OR-of-equalities normalized to the IN-list seek (bd-2dgf5)
+
+- Result type: KEPT. Semantic gate passed; landed. Reuses the entire IN-list seek machinery.
+- Profile-first: `SELECT id FROM t WHERE k = 2 OR k = 5` and `SUM(v) FROM t WHERE k = 2 OR k = 5`
+  full-scanned while C SQLite seeks the covering index. `col = a OR col = b OR ...` on one column
+  is semantically `col IN (a, b, ...)`.
+- Change: a shared `column_int_list_from_predicate` now recognizes BOTH `col IN (<int list>)` and
+  a pure `OR` chain of `col = <int literal>` on the same column, feeding the existing rowid and
+  secondary-index IN extractors. So OR-of-equalities gets the per-value seek for free across every
+  path already built (rowid + secondary index, aggregate + non-aggregate). Emits byte-identical
+  opcodes to the equivalent IN.
+- CORRECTNESS gate: integer literals only, same column across the chain (rowid-aware identity so
+  `id = 2 OR id = 3` folds together while `k = 2 OR j = 3` is rejected), `IN` not `NOT IN`,
+  dedup. Precedence is respected by the AST — `k = 2 OR k = 5 AND x` parses as
+  `k = 2 OR (k = 5 AND x)`, whose right leaf is an `And` and declines. `NOT (k=2 OR k=3)` declines.
+- SEMANTIC PROOF (hard gate): `or_of_equalities_matches_sqlite` runs 25 queries vs rusqlite (real
+  C SQLite) — secondary index + rowid, aggregate + non-aggregate, dedup (`k=2 OR k=2`), reversed
+  (`2 = k`), and every decline (mixed columns, mixed operators, real literal, AND-precedence,
+  `NOT (...)`, NOT INDEXED). No-ORDER-BY compared as sets, ORDER BY exact. All 6 oracle tests still
+  PASS. No golden matches these shapes (golden 8/8 green); no re-bless.
+  `bd_2dgf5_or_of_equalities_normalizes_to_seek` asserts 2 SeekGE for `k=2 OR k=5`, 2 SeekRowid for
+  `id=2 OR id=3`, dedup to 1 seek, and a Rewind-scan for every decline.
+- A/B (release-perf via rch, worker `ovh-a`, seek vs scan interleaved, values varied, scan forced
+  via `NOT INDEXED` and proven equal by the oracle). 20,000-row table, `k == id`, 3-term OR,
+  `SELECT id, v`:
+    or seek median = 47.29 us/query
+    or scan median = 4413.97 us/query
+    or speedup (scan/seek) = 93.33x
+    or NULL control (seek vs seek) = 0.941x  [20.1 vs 18.9 us/query]  (~6%, tight)
+  Decisive: 93x, ~90x beyond the null floor. Same program as the equivalent IN, as expected.
+- REGRESSION CAUGHT + FIXED by the full core suite (not the differential): the first cut let the
+  OR collector match a BARE `col = <int>` as a one-element list, re-routing `WHERE rowid = 2` /
+  `id = 2` off the existing equality path and changing its EXPLAIN output
+  (`test_explain_bytecode_fast_paths_match_sqlite_for_rowid_ipk_and_covering_index`). Fix: the OR
+  branch only fires when the top expr is actually an `Or`; a bare equality is left to the existing
+  rowid/index equality paths. Re-verified: core 3343 pass, all 6 oracle tests pass, golden 8/8.
+- Correctness beyond the oracle: `cargo test -p fsqlite-vdbe --lib` 1036 passed; golden 8/8;
+  reachability 1/1.
+- Provenance: worker ovh-a (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the commit;
+  binary sha256 unavailable (bd-kbuck).
