@@ -138804,12 +138804,21 @@ mod pager_routing_tests {
         // returning counter only records that RETURNING disqualifies the narrow
         // direct-BtCursor bypass; this proves the fall-through lands on VDBE
         // codegen (opcodes_executed_total > 0), so there is no 10-100x interpreted
-        // slowdown. (Global counters: any parallel-test noise can only ADD
-        // opcodes, so a > 0 assertion never fails spuriously on a true-codegen
-        // engine; it only guards against a regression to the interpreted path.)
+        // slowdown.
         // File-backed (not :memory:): the :memory: image executes through the
         // MemDatabase interpreter and records zero VDBE opcodes, so the routing
         // determination must use the real pager/VDBE storage path.
+        //
+        // bd-948sd: this test reads PROCESS-GLOBAL VDBE opcode counters, so it must
+        // hold the shared serializer for its whole body. An earlier version reasoned
+        // that "parallel-test noise can only ADD opcodes, so a > 0 assertion never
+        // fails spuriously". That is false: `reset_hot_path_profile()` calls
+        // `reset_vdbe_metrics()`, which ZEROES those counters, and it is invoked from
+        // every hot-path profile guard in this file. A concurrent test wiping the
+        // counters between the query and the snapshot made `select_opcodes == 0` and
+        // failed the sanity assertion. Noise subtracts, it does not only add.
+        let _serial = super::fsqlite_core_test_serializer();
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("returning_route.db");
         let conn = Connection::open(db_path.to_string_lossy().to_string()).unwrap();

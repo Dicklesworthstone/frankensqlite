@@ -15500,3 +15500,97 @@ Independently, the emitted program was read out of each frozen binary with `EXPL
 the same database used for the benchmark: ORIG emits `SeekGE IdxRowid SeekRowid AggStep`
 and CAND emits `SeekGE AggStep` for `SELECT COUNT(*) FROM t WHERE k = 2`. The code under
 test is on the executed path, not merely linked into it.
+
+## 2026-07-10 - INVALIDATION: the uprobe-captured write_single frame table must not route levers
+
+- Result type: LEDGER-INTEGRITY / MEASUREMENT DEFECT. No source was modified.
+- Scope: `tests/artifacts/perf/cod-fsq-write-single-exact-small-20260710T0755Z/ranked-frames-ge-0.1pct.txt`,
+  the ranked self-time table for the exact prepared BEGIN-DELETE-COMMIT envelope.
+- That capture used `perf` with period-1 uprobe boundary events. Its own header warns
+  "uprobes materially perturb absolute elapsed time; use frame distribution for routing
+  only". The distribution is ALSO perturbed, so it cannot route levers either.
+- Re-profiled the SAME binary
+  (`cod-fsq-write-single-exact-small-.../orig-perf-update-delete`, unstripped) in the
+  same envelope with plain `perf record -F 3999 --call-graph=fp`, no uprobes,
+  12,223 samples, `taskset -c 55`:
+
+    frame                                       uprobe capture   clean capture
+    <ShardedPageCache>::clear                       26.33%           1.77%
+    getenv (libc)                                    1.96%           0.72%
+    <ConcurrentRegistry>::begin_concurrent           3.51%          <0.30%
+    __memmove_avx_unaligned_erms                     5.41%           6.14%
+
+  `clear` is inflated ~15x by the instrumentation. Any lever chosen from that table is
+  chosen from noise. The 2026-07-10 `clear`-by-touched-slots work (c29ab92c) was routed
+  from it; that lever may still be sound on its own A/B, but the 26.33% figure that
+  motivated it is not real.
+- Clean flat self-time, exact envelope (`orig-perf-update-delete 100 20000 delete
+  fsqlite standard`), top frames >= 1.0%: `__memmove_avx_unaligned_erms 6.14%`,
+  `_int_malloc 5.05%`, `try_serialize_prepared_direct_simple_insert_record 4.44%`,
+  `cfree 2.50%`, `execute_prepared_direct_simple_insert 2.39%`, `malloc 1.88%`,
+  `ShardedPageCache::clear 1.77%`, `execute_prepared_with_params_after_background_status
+  1.53%`, `SharedMvccState::new 1.38%`, `malloc_consolidate 1.31%`,
+  `execute_precompiled_prepared_insert_fast 1.15%`, `eval_prepared_direct_simple_insert_expr
+  1.10%`, `ShardedPageCache::with_max_buffers_for_initial_pages 1.10%`.
+- CAVEAT on that table: it is still contaminated. `try_serialize_prepared_direct_simple_insert_record`,
+  `execute_prepared_direct_simple_insert`, `eval_prepared_direct_simple_insert_expr` and
+  `execute_precompiled_prepared_insert_fast` are benchmark POPULATION inserts, and
+  `SharedMvccState::new` / `default_function_registry` (0.94%) are per-iteration
+  connection construction. A DELETE-scoped capture needs `perf record --delay` started
+  after population, as the 2026-07-10 frame-boundary entry did.
+- Retry condition: before any write_single lever is selected, re-capture the envelope
+  WITHOUT uprobes and WITH a delayed start that excludes population, and quote the
+  self-time of the exact function to be changed.
+
+## 2026-07-10 - NON-CANDIDATE: caching `opcode_trace_enabled()` for the prepared DELETE tail
+
+- Result type: NON-CANDIDATE, killed by the execution check before any source edit.
+- Candidate shape: `crates/fsqlite-vdbe/src/engine.rs` `opcode_trace_enabled()` performs
+  an UNCACHED `std::env::var("FSQLITE_VDBE_TRACE_OPCODES")` on every call, and is called
+  from `reset_for_reuse_impl` — the prepared-statement reuse path. Every other env read
+  in this workspace is already behind a `OnceLock`
+  (`group_commit_trace_enabled`, `default_page_buffer_max_from_env`,
+  `dml_profile_enabled`). Hoisting it looked like a free ~4% win, because the uprobe
+  frame table showed `getenv` at 4.6% combined self-time.
+- EXECUTION CHECK (this is why it is a non-candidate). In the exact prepared
+  BEGIN-DELETE-COMMIT envelope, 12,223 clean samples:
+
+    reset_for_reuse            0 frames    0.00% self-time
+    opcode_trace_enabled       0 frames    0.00% self-time
+    VdbeEngine (any frame)     0 frames    0.00% self-time
+    total fsqlite_vdbe self-time                ~0.4%   (TableSchema/ColumnInfo clone+drop)
+    execute_prepared_direct_simple_delete     338 frames
+
+  The prepared DELETE does not enter the VDBE at all: it takes the direct BtCursor
+  bypass. `opcode_trace_enabled()` never executes in the keep-gate envelope, so caching
+  it cannot move that benchmark. The 0.72% of real `getenv` self-time is called from
+  `ConcurrentRegistry::begin_concurrent` <- `execute_begin`, not from the VDBE.
+- CONSEQUENCE FOR THE KEEP GATE: the `vdbe_pipeline_execute` 64/256/1024 stream matrix is
+  the WRONG gate for a write_single DELETE lever. It exercises the VDBE interpreter,
+  which contributes ~0.4% self-time to that envelope. A write_single lever must be gated
+  on the update-delete row matrix (100/1000/10000). Gating it on the stream matrix would
+  be gating on a path the workload does not take.
+- Do not retry `opcode_trace_enabled()` caching as a write_single lever. It remains a
+  legitimate (small) lever for VDBE-executing workloads: reconsider only against a
+  benchmark where `reset_for_reuse` has non-zero self-time, and quote that self-time.
+
+## 2026-07-10 - AUDIT: the five single-opcode hot-arm pruning rejects are NOT invalidated
+
+- Requested by the crossing-min ledger-integrity finding: verify each REJECT was measured
+  on an input that actually reaches the code under test.
+- `Opcode::ZeroOrNull`, `Opcode::Add`, `Opcode::MakeRecord`: these were true A/B runs,
+  each on a dedicated `vdbe_pipeline_execute_<opcode>` stream of the same opcode at 64,
+  256, and 1024. Removing the hot arm REGRESSED every stream length
+  (ZeroOrNull `2.2189 -> 2.8185 us` at 64; Add `16.913 -> 29.467 us` at 1024).
+  A non-null effect IS the execution proof: deleting code that never runs cannot make a
+  benchmark slower. Self-time need not be re-derived; the effect direction settles it.
+  These rejects stand. Still blocked.
+- `Opcode::FusedAppendInsert`, `Opcode::ColumnSubstrPrefix`, `Opcode::FusedLiteralResultRow`:
+  rejected BEFORE any source mutation, because no cold interpreter fallback exists for
+  those opcodes, so no byte-equivalent alternative route could be measured. These are
+  non-candidates, not measurements of dead code. They stand. Still blocked.
+- The crossing-min pathology is a NULL result on an input that misses the code. None of
+  these five/six are null results. No row is reopened.
+- Contrast, recorded so the distinction is usable: the `opcode_trace_enabled()` candidate
+  above WAS the crossing-min pathology, caught before any edit, because the function has
+  0.00% self-time and 0 frames in the envelope its gate would have measured.
