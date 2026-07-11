@@ -16434,3 +16434,36 @@ test is on the executed path, not merely linked into it.
   reachability 1/1.
 - Provenance: worker ovh-a (bench) / vmi1227854 (oracle); `codegen.rs` sha256 in the commit;
   binary sha256 unavailable (bd-kbuck).
+
+## 2026-07-10 - NON-WIN: covering secondary-index range is bypassed by the connection fast-path
+
+- Result type: reverted codegen change; NOT shipped as a win. Kept the differential correctness
+  test only. The median gate failed and the fix is connection-layer, not codegen.
+- Profile-first: `SELECT id FROM t WHERE k > 90` / `k BETWEEN a AND b` (k indexed) full-scans in
+  the connection while C SQLite does `SEARCH ... USING COVERING INDEX`. The codegen index-range
+  seek already works in default context (`test_codegen_select_with_index_range` asserts SeekGE),
+  so this is a routing decision above codegen, not a codegen gap.
+- Candidate: route a COVERING index range (all output, incl. rowid via IdxRowid, from the index —
+  so an index-only scan is always <= a full table scan, regression-free) before the planner
+  directive, mirroring the IN-list directive fix (b7533ea2). Compiled; differential passed 7/7.
+- MEDIAN GATE FAILED. A/B (worker vmi1264463, `SELECT id,k WHERE k BETWEEN a AND a+50`, ~51-row
+  selective range, seek vs `NOT INDEXED` scan interleaved): seek 9079 us vs scan 8942 us =
+  0.985x, null control 0.992x. Both arms ~9000 us -> the seek is NOT firing; both scan.
+- ROOT CAUSE (why the IN directive-fix pattern did not transfer): the connection classifies
+  `SELECT ... WHERE <secondary col> <range>` into a `PreparedQueryFastPath::SimpleFullTableScan`
+  direct fast path (`crates/fsqlite-core/src/connection.rs`, the `SimpleFullTableScan` return
+  ~line 29993) that BYPASSES VDBE codegen entirely — so no codegen routing, before or after the
+  planner directive, can ever fire. IN-list queries win because they are NOT classified into a
+  direct fast path and do reach codegen. The connection has a `SimpleRowidRangeScan` fast path
+  but no secondary-index-range one, so secondary-index ranges fall through to SimpleFullTableScan.
+- CONCLUSION: this is not a codegen-fixable lever. The real fix is a connection-layer
+  `SimpleIndexRangeScan` fast path (or declassifying covering secondary-index ranges from
+  SimpleFullTableScan so they reach the codegen index-range seek) — a larger, separate change in
+  the connection's prepared-query classifier, not the VDBE codegen.
+- Kept: `covering_index_range_matches_sqlite` (differential correctness coverage for range
+  predicates: >, <, BETWEEN, negatives, covering + non-covering, empty ranges, ORDER BY, NOT
+  INDEXED, DISTINCT — all bit-identical to C SQLite). Reverted: the codegen early-return and the
+  bench arm.
+- Retry condition: only after a connection-layer index-range fast path exists (or covering ranges
+  are routed to codegen). Then the codegen index-range seek is ready and the covering gate makes
+  it regression-free.

@@ -331,6 +331,78 @@ fn index_in_list_nonaggregate_matches_sqlite() {
 }
 
 #[test]
+fn covering_index_range_matches_sqlite() {
+    // k INTEGER, indexed. Covering (SELECT id / k -> index-only) vs non-covering (SELECT v).
+    let mut schema = vec![
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v REAL, w TEXT);".to_owned(),
+        "CREATE INDEX idx_t_k ON t(k);".to_owned(),
+    ];
+    for i in 1..=60_i64 {
+        schema.push(format!(
+            "INSERT INTO t VALUES ({i}, {}, {i}.5, 'r{i}');",
+            (i % 12) - 3 // k in -3..8, duplicates, negatives
+        ));
+    }
+    schema.push("INSERT INTO t VALUES (200, NULL, 9.5, 'nul');".to_owned());
+    let schema_refs: Vec<&str> = schema.iter().map(String::as_str).collect();
+    let (f, r) = setup(&schema_refs);
+
+    let sorted = |res: Result<Vec<Vec<String>>, String>| -> Result<Vec<Vec<String>>, String> {
+        res.map(|mut rows| {
+            rows.sort();
+            rows
+        })
+    };
+    // No ORDER BY -> set equality (row order unspecified).
+    let set_eq = [
+        // Covering (id = rowid via IdxRowid): lower / upper / both bounds.
+        "SELECT id FROM t WHERE k > 5",
+        "SELECT id FROM t WHERE k >= 5",
+        "SELECT id FROM t WHERE k < 0",
+        "SELECT id FROM t WHERE k <= 0",
+        "SELECT id FROM t WHERE k BETWEEN 2 AND 5",
+        "SELECT id FROM t WHERE k > 2 AND k < 6",
+        "SELECT id FROM t WHERE k > -3 AND k <= 0",
+        // Covering (indexed column itself).
+        "SELECT k FROM t WHERE k BETWEEN 1 AND 4",
+        "SELECT id, k FROM t WHERE k >= 6",
+        // Empty / edge ranges.
+        "SELECT id FROM t WHERE k > 999",
+        "SELECT id FROM t WHERE k < -999",
+        "SELECT id FROM t WHERE k BETWEEN 100 AND 200",
+        // Non-covering (v not in index) — declines to scan, must still match.
+        "SELECT v FROM t WHERE k > 5",
+        "SELECT id, v, w FROM t WHERE k BETWEEN 2 AND 5",
+        // Non-integer / affinity bounds — must match whatever the safe path decides.
+        "SELECT id FROM t WHERE k > 2.5",
+        "SELECT id FROM t WHERE k <= 3.0",
+    ];
+    for sql in set_eq {
+        assert_eq!(
+            sorted(frank_rows(&f, sql)),
+            sorted(sqlite_rows(&r, sql)),
+            "covering index range (row set) diverged from SQLite for `{sql}`"
+        );
+    }
+    // ORDER BY -> exact; NOT INDEXED / DISTINCT decline but must match.
+    let exact = [
+        "SELECT id FROM t WHERE k > 5 ORDER BY id",
+        "SELECT id, k FROM t WHERE k BETWEEN 2 AND 5 ORDER BY k, id",
+        "SELECT id FROM t WHERE k >= 6 ORDER BY id DESC",
+        "SELECT id FROM t NOT INDEXED WHERE k > 5 ORDER BY id",
+        "SELECT DISTINCT k FROM t WHERE k BETWEEN 1 AND 4 ORDER BY k",
+        "SELECT COUNT(*) FROM t WHERE k > 5",
+    ];
+    for sql in exact {
+        assert_eq!(
+            frank_rows(&f, sql),
+            sqlite_rows(&r, sql),
+            "covering index range (ordered/declined) diverged from SQLite for `{sql}`"
+        );
+    }
+}
+
+#[test]
 fn or_of_equalities_matches_sqlite() {
     // OR-of-equalities on the same column normalizes to an IN-list seek. Cover secondary index
     // (k), rowid (id), aggregate + non-aggregate, and every shape that must NOT normalize.
