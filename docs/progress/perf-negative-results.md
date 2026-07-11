@@ -17536,3 +17536,35 @@ test is on the executed path, not merely linked into it.
   and optimized. The remaining single-thread perf is systemic (MVCC read-path) or structural (JIT
   bd-lezm3, parallel SELECT bd-b434d, arena) or the deferred btree grow-in-place. The clean
   micro-lever era for this codebase is over; the next work is a chartered project.
+
+## 2026-07-11 - PROFILE (execute_body split): the biggest phase is cursor-open+seek (systemic MVCC/btree), row-processing is negligible, engine reuse already done (bd-5310l follow-on)
+
+- Result type: SURFACE / definitive characterization of execute_body (the biggest per-statement
+  phase, the residual gap vs C SQLite). New reliable diagnostic
+  `crates/fsqlite/tests/execute_body_split.rs` — runs in the `fsqlite` facade crate which has NO
+  criterion dev-dep, so it builds LIGHT and does not hit the cold-worker SSH timeouts that block
+  fsqlite-core/e2e release-perf builds.
+- METHOD: point-lookup HIT vs MISS vs `SELECT 1`, reading `execute_body_time_ns` from the hot-path
+  profile. MISS = cursor open + seek(not found); HIT = MISS + Column x2 + ResultRow + materialize;
+  `SELECT 1` = the non-table (expression) path.
+- FINDING (release-perf, 200k iters/case): `SELECT 1` execute_body = 2121 ns; point MISS = 4291 ns;
+  point HIT = 4660 ns; covering-id HIT = 4293 ns.
+  - HIT - MISS = **369 ns** -> the Column-read + Row-materialize work is NEGLIGIBLE (the VDBE Column
+    opcode's lazy column cache + direct-to-reg already did its job; the earlier storage CONVERGENCE
+    entry is confirmed empirically). No lever in row processing.
+  - point MISS = 4291 ns and is dominated by the cursor open + B-tree seek through MVCC/pager -
+    SYSTEMIC (the project's page-version-chain concurrency trade-off), byte-identical-RISKY, no clean
+    micro-lever.
+- ENGINE REUSE: already handled for the common TABLE-query path -
+  `execute_table_program_*` takes/returns `self.cached_vdbe_engine` (connection.rs ~5926/5956) and
+  `VdbeEngine` has `reset_for_reuse`. Only the NON-table expression path
+  (`execute_program_with_row_cap`, connection.rs ~81993) allocates a fresh `VdbeEngine` per call -
+  but that path serves only expression selects (SELECT <expr>), a narrow slice, so threading the
+  cached engine into it (a free-function refactor) is low-value. Noted, not pursued.
+- DEFINITIVE CONVERGENCE: front-end + storage + DML + execute_body profile-first audits are ALL now
+  complete and reliably measured. Every per-statement hot path is O(1) and optimized; the residual
+  single-thread latency vs C SQLite is the SYSTEMIC MVCC page-version-chain cursor/seek cost - the
+  concurrency design trade-off, not a bug. The clean, byte-identical micro-lever campaign is DONE
+  (4 wins shipped). Further single-thread perf requires a CHARTERED project: JIT (bd-lezm3),
+  parallel SELECT (bd-b434d), an AST/planner arena, or a dedicated MVCC read-path optimization -
+  none of which is a one-pass micro-lever, and the last is byte-identical-risky.
