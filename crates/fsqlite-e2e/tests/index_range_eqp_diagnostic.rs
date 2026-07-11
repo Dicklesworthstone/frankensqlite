@@ -193,5 +193,53 @@ fn diagnostic_index_range_plan_choice() {
         mc / ms,
         mn / ms,
     );
+
+    // bd-u6tbr placeholder A/B: the OLTP prepared-statement shape. Prepare once, bind varying
+    // bounds per exec so the seek's runtime Affinity coercion is exercised on the hot path.
+    let ph_seek = f
+        .prepare("SELECT id, k FROM t WHERE k BETWEEN ?1 AND ?2")
+        .unwrap();
+    let ph_scan = f
+        .prepare("SELECT id, k FROM t NOT INDEXED WHERE k BETWEEN ?1 AND ?2")
+        .unwrap();
+    let mut ph_seek_us = Vec::with_capacity(samples);
+    let mut ph_scan_us = Vec::with_capacity(samples);
+    let mut ph_null_us = Vec::with_capacity(samples);
+    for s in 0..samples {
+        let a = 100 + (s * 379) % 19000;
+        let params = [
+            SqliteValue::Integer(i64::try_from(a).unwrap()),
+            SqliteValue::Integer(i64::try_from(a + 50).unwrap()),
+        ];
+        let t = Instant::now();
+        for _ in 0..execs {
+            let _ = ph_seek.query_with_params(&params).unwrap();
+        }
+        ph_seek_us.push(t.elapsed().as_micros() as f64 / execs as f64);
+
+        let t = Instant::now();
+        for _ in 0..execs {
+            let _ = ph_scan.query_with_params(&params).unwrap();
+        }
+        ph_scan_us.push(t.elapsed().as_micros() as f64 / execs as f64);
+
+        let t = Instant::now();
+        for _ in 0..execs {
+            let _ = ph_seek.query_with_params(&params).unwrap();
+        }
+        ph_null_us.push(t.elapsed().as_micros() as f64 / execs as f64);
+    }
+    let pms = median(ph_seek_us);
+    let pmc = median(ph_scan_us);
+    let pmn = median(ph_null_us);
+    eprintln!(
+        "\n  Placeholder A/B (prepared, bind varying bounds, {samples}x{execs}):\n    \
+         seek (k BETWEEN ?1 AND ?2)      median = {pms:.2} us/query\n    \
+         scan (NOT INDEXED ?1 AND ?2)    median = {pmc:.2} us/query\n    \
+         speedup (scan/seek)             = {:.2}x\n    \
+         null control (seek vs seek)     = {:.3}x  [{pmn:.2} vs {pms:.2}]",
+        pmc / pms,
+        pmn / pms,
+    );
     eprintln!("=== end diagnostic ===\n");
 }

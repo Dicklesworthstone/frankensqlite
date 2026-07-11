@@ -3303,9 +3303,35 @@ fn codegen_select_index_range_scan(
         emit_limit_zero_guard(b, lim_r, done_label);
     }
 
+    // bd-u6tbr: coerce a runtime-typed bound (a placeholder) to the indexed column's affinity
+    // so the seek positions identically to the full-scan filter, which applies the comparison
+    // affinity. A numeric literal is already numeric, so it is left byte-identical (no Affinity
+    // op) — the coercion only matters for placeholders. Only numeric-affinity columns
+    // (INTEGER/REAL/NUMERIC) coerce; an untyped column needs none, and an expression index has no
+    // plain key column so `column_index` misses and no coercion is emitted (behaviour preserved).
+    // A coercing affinity ('C'/'D'/'E') is emitted only for a non-literal bound (a placeholder);
+    // a numeric literal is already numeric so its bytecode stays byte-identical.
+    let bound_affinity = idx_schema
+        .columns
+        .first()
+        .and_then(|name| table.column_index(name))
+        .map(|idx| table.columns[idx].affinity)
+        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E'));
     let lower_probe = index_range.lower.as_ref().map(|bound| {
         let base = b.alloc_regs(2);
         emit_expr(b, &bound.expr, base, None);
+        if let Some(aff) = bound_affinity
+            && !is_numeric_literal_bound(&bound.expr)
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                base,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
         b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
         b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
         (base, bound.clone())
@@ -3313,6 +3339,18 @@ fn codegen_select_index_range_scan(
     let upper_reg = index_range.upper.as_ref().map(|bound| {
         let reg = b.alloc_reg();
         emit_expr(b, &bound.expr, reg, None);
+        if let Some(aff) = bound_affinity
+            && !is_numeric_literal_bound(&bound.expr)
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
         b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
         reg
     });
@@ -3494,6 +3532,23 @@ fn is_numeric_literal_bound(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is a bind parameter (`?`, `?N`, `:name`, `@name`, `$name`). A placeholder's
+/// runtime value is unknown at compile time, so the range seek coerces it to the indexed
+/// column's affinity at execution ([`codegen_select_index_range_scan`]) rather than relying on
+/// a compile-time-numeric bound.
+fn is_placeholder_bound(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Placeholder(
+            fsqlite_ast::PlaceholderType::Numbered(_)
+                | fsqlite_ast::PlaceholderType::ColonNamed(_)
+                | fsqlite_ast::PlaceholderType::AtNamed(_)
+                | fsqlite_ast::PlaceholderType::DollarNamed(_),
+            _
+        )
+    )
+}
+
 /// Whether the index-range seek can position on `bound_expr` without changing which
 /// rows match relative to the equivalent full-scan filter.
 ///
@@ -3509,9 +3564,12 @@ fn is_numeric_literal_bound(expr: &Expr) -> bool {
 /// `resolved_index_range_comparison_carries_affinity_for_integer_column`); it is the same
 /// proven-safe subset the IN-list seek accepts by the integer argument.
 ///
-/// A placeholder or text/blob literal under NUMERIC affinity is deliberately NOT accepted:
-/// the coercion (text→number, or a runtime-typed placeholder) is not an identity there, so
-/// the seek could diverge from the filter. Those keep the scan.
+/// A placeholder under NUMERIC affinity is also accepted: `codegen_select_index_range_scan`
+/// emits an `Affinity` opcode that coerces the runtime bound to the indexed column's affinity
+/// before seeking, so the positioned rows match the filter for every bound type (a numeric bind
+/// is exact; a non-numeric text/blob bind coerces to a value that seeks empty, exactly as the
+/// filter's numeric comparison excludes it). A TEXT/blob *literal* under NUMERIC affinity still
+/// declines (kept narrow; those are rare and the correct scan is cheap enough).
 fn index_range_bound_is_seek_safe(
     table: &TableSchema,
     table_alias: Option<&str>,
@@ -3525,14 +3583,14 @@ fn index_range_bound_is_seek_safe(
         return false;
     }
     // `cmp_p5 & !0x80` is the comparison affinity (`combine_comparison_affinity`): `0` = no
-    // coercion (always seek-safe), `b'C'` = NUMERIC. NUMERIC coercion of a numeric literal is
-    // the identity, so the seek is exact; a TEXT affinity, or a non-literal (placeholder) under
-    // NUMERIC, is declined so the full-scan filter is kept.
+    // coercion (always seek-safe), `b'C'` = NUMERIC. Under NUMERIC a numeric literal is already
+    // numeric (identity) and a placeholder is coerced to the column affinity by the seek's
+    // Affinity op, so both are exact; a TEXT/blob literal is not coerced and is declined.
     let affinity = comparison.cmp_p5 & !0x80;
     if affinity == 0 {
         true
     } else if affinity == u16::from(b'C') {
-        is_numeric_literal_bound(bound_expr)
+        is_numeric_literal_bound(bound_expr) || is_placeholder_bound(bound_expr)
     } else {
         false
     }

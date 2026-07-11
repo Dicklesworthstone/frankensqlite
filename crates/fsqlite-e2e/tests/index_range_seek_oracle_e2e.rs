@@ -210,8 +210,9 @@ fn index_range_seek_matches_sqlite() {
 fn index_range_seek_emits_seek_for_numeric_literals() {
     let (f, _r) = setup();
 
-    // Accepted numeric-literal shapes must actually walk the index (IdxRowid), proving the
-    // optimization engages rather than silently full-scanning the table.
+    // Accepted shapes must actually walk the index (IdxRowid), proving the optimization engages
+    // rather than silently full-scanning. Includes bd-u6tbr placeholder bounds, which now seek
+    // via a runtime Affinity coercion (the last two).
     for sql in [
         "SELECT id FROM t WHERE k BETWEEN 5 AND 55",
         "SELECT id, k FROM t WHERE k > 5",
@@ -219,19 +220,32 @@ fn index_range_seek_emits_seek_for_numeric_literals() {
         "SELECT id FROM t WHERE k > 2.5",
         "SELECT id FROM t WHERE rr BETWEEN -1.0 AND 4.0",
         "SELECT id FROM t WHERE nn > 2.5",
+        "SELECT id FROM t WHERE k > ?1",
+        "SELECT id, k FROM t WHERE k BETWEEN ?1 AND ?2",
     ] {
         let ops = opcodes(&f, sql);
         assert!(
             uses_index(&ops),
-            "accepted numeric-literal range must seek the index for `{sql}`; ops = {ops:?}"
+            "accepted range must seek the index for `{sql}`; ops = {ops:?}"
         );
     }
 
-    // Declined shapes must keep the correct full scan (no index walk): a placeholder bound
-    // (runtime type unknown), NOT INDEXED, and a text literal on a numeric column.
+    // A placeholder bound that now seeks must carry an Affinity coercion op (so a runtime-typed
+    // bind is normalized to the column affinity before the seek).
     for sql in [
         "SELECT id FROM t WHERE k > ?1",
         "SELECT id, k FROM t WHERE k BETWEEN ?1 AND ?2",
+    ] {
+        let ops = opcodes(&f, sql);
+        assert!(
+            ops.iter().any(|o| o == "Affinity"),
+            "placeholder range must coerce the bound with an Affinity op for `{sql}`; ops = {ops:?}"
+        );
+    }
+
+    // Declined shapes keep the correct full scan (no index walk): NOT INDEXED, and a text literal
+    // on a numeric column (a literal is not coerced, so it stays a scan).
+    for sql in [
         "SELECT id FROM t NOT INDEXED WHERE k BETWEEN 2 AND 5",
         "SELECT id FROM t WHERE k > '3'",
     ] {
@@ -239,6 +253,122 @@ fn index_range_seek_emits_seek_for_numeric_literals() {
         assert!(
             !uses_index(&ops),
             "declined range must NOT seek (keeps the full scan) for `{sql}`; ops = {ops:?}"
+        );
+    }
+}
+
+fn frank_bound(conn: &Connection, sql: &str, params: &[SqliteValue]) -> Vec<Vec<String>> {
+    let stmt = conn
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("frank prepare `{sql}`: {e}"));
+    let rows = stmt
+        .query_with_params(params)
+        .unwrap_or_else(|e| panic!("frank bind `{sql}`: {e}"));
+    let mut out: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.values().iter().map(render_frank).collect())
+        .collect();
+    out.sort();
+    out
+}
+
+fn sqlite_bound(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[SqliteValue],
+) -> Vec<Vec<String>> {
+    let rp: Vec<rusqlite::types::Value> = params
+        .iter()
+        .map(|v| match v {
+            SqliteValue::Null => rusqlite::types::Value::Null,
+            SqliteValue::Integer(n) => rusqlite::types::Value::Integer(*n),
+            SqliteValue::Float(f) => rusqlite::types::Value::Real(*f),
+            SqliteValue::Text(s) => rusqlite::types::Value::Text(s.to_string()),
+            SqliteValue::Blob(b) => rusqlite::types::Value::Blob(b.to_vec()),
+        })
+        .collect();
+    let mut stmt = conn.prepare(sql).unwrap();
+    let n = stmt.column_count();
+    let mut out: Vec<Vec<String>> = stmt
+        .query_map(rusqlite::params_from_iter(rp), |row| {
+            let mut r = Vec::with_capacity(n);
+            for i in 0..n {
+                let v: rusqlite::types::Value = row.get_unwrap(i);
+                r.push(match v {
+                    rusqlite::types::Value::Null => "NULL".to_owned(),
+                    rusqlite::types::Value::Integer(x) => x.to_string(),
+                    rusqlite::types::Value::Real(fl) => format!("{fl}"),
+                    rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                    rusqlite::types::Value::Blob(b) => format!(
+                        "X'{}'",
+                        b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                    ),
+                });
+            }
+            Ok(r)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    out.sort();
+    out
+}
+
+/// bd-u6tbr: a placeholder-bound secondary-index range now seeks (runtime Affinity coercion of
+/// the bind to the column affinity). Every bind type — ints, reals, numeric-looking text,
+/// non-numeric text, empty text, blob, NULL — must stay bit-identical to the full-scan filter,
+/// including the empty-result edges (a non-numeric text/blob bind seeks nothing, exactly as the
+/// filter's numeric comparison excludes it).
+#[test]
+fn index_range_seek_placeholder_bounds_match_sqlite() {
+    let (f, r) = setup();
+    let vals = [
+        SqliteValue::Integer(0),
+        SqliteValue::Integer(5),
+        SqliteValue::Integer(-3),
+        SqliteValue::Float(2.5),
+        SqliteValue::Float(-1.5),
+        SqliteValue::Text("3".into()),
+        SqliteValue::Text("2.5".into()),
+        SqliteValue::Text("abc".into()),
+        SqliteValue::Text("".into()),
+        SqliteValue::Blob(vec![1, 2, 3].into()),
+        SqliteValue::Null,
+    ];
+    let one_param = [
+        "SELECT id FROM t WHERE k > ?1",
+        "SELECT id FROM t WHERE k >= ?1",
+        "SELECT id FROM t WHERE k < ?1",
+        "SELECT id FROM t WHERE k <= ?1",
+        "SELECT id, k FROM t WHERE k > ?1",
+        "SELECT id FROM t WHERE rr > ?1",
+        "SELECT id FROM t WHERE nn >= ?1",
+        "SELECT id, w FROM t WHERE k < ?1",
+    ];
+    for sql in one_param {
+        for v in &vals {
+            assert_eq!(
+                frank_bound(&f, sql, std::slice::from_ref(v)),
+                sqlite_bound(&r, sql, std::slice::from_ref(v)),
+                "placeholder range diverged for `{sql}` with param {v:?}"
+            );
+        }
+    }
+
+    let two_param: [(SqliteValue, SqliteValue); 6] = [
+        (SqliteValue::Integer(-2), SqliteValue::Integer(4)),
+        (SqliteValue::Float(-1.5), SqliteValue::Float(3.5)),
+        (SqliteValue::Text("1".into()), SqliteValue::Text("5".into())),
+        (SqliteValue::Integer(5), SqliteValue::Integer(2)), // empty (lo > hi)
+        (SqliteValue::Null, SqliteValue::Integer(5)),       // NULL bound -> empty
+        (SqliteValue::Text("abc".into()), SqliteValue::Integer(5)),
+    ];
+    for (a, b) in &two_param {
+        let sql = "SELECT id, k FROM t WHERE k BETWEEN ?1 AND ?2";
+        assert_eq!(
+            frank_bound(&f, sql, &[a.clone(), b.clone()]),
+            sqlite_bound(&r, sql, &[a.clone(), b.clone()]),
+            "placeholder BETWEEN diverged for params {a:?}, {b:?}"
         );
     }
 }

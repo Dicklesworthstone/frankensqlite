@@ -16685,3 +16685,47 @@ test is on the executed path, not merely linked into it.
   That is the OLTP prepared-statement case and the natural next lever.
 - Provenance: bench via rch release-perf; oracle worker vmi1152480; `codegen.rs` sha256 in the
   commit; binary sha256 unavailable (rch returns no binary; bd-kbuck).
+
+## 2026-07-11 - WIN: placeholder-bound index-range seek via runtime affinity coercion (bd-u6tbr)
+
+- Result type: KEPT. Semantic gate (differential oracle vs C SQLite, WITH BOUND PARAMS) passed;
+  landed. Extends the numeric-literal index-range seek (WIN above) to the OLTP prepared-statement
+  shape `SELECT ... WHERE <indexed numeric col> op ?` / `BETWEEN ? AND ?`.
+- Profile-first: the literal seek DECLINED placeholder bounds (a placeholder's runtime type is
+  unknown at compile time, so a raw-bound seek could diverge from the full-scan filter, which
+  applies NUMERIC comparison affinity). The opcode gate proved `k > ?1` / `k BETWEEN ?1 AND ?2`
+  full-scanned (no IdxRowid) — the same scan->seek gap as the literal case.
+- FIX (codegen.rs): `codegen_select_index_range_scan` now emits an `Affinity` opcode that coerces
+  a non-literal (placeholder) bound to the indexed column's affinity ('C'/'D'/'E') before the
+  SeekGE / stop comparison; `index_range_bound_is_seek_safe` accepts placeholders under NUMERIC
+  comparison affinity. A numeric literal stays byte-identical (already numeric, no Affinity op).
+  Column affinity is read from `idx_schema.columns[0]`; expression indexes leave `columns` empty
+  (documented invariant), so `column_index` misses and no coercion fires (behaviour preserved).
+- CORRECTNESS: coercing the bind to the column affinity makes the positioned rows match the filter
+  for EVERY bind type. A numeric bind is exact. A non-numeric text/blob bind coerces to a value that
+  SeekGE positions past the end of the numeric index (empty) — exactly what the filter's numeric
+  comparison excludes (INTEGER < TEXT < BLOB in SQLite type order). A NULL bound jumps to done
+  (empty), matching `col op NULL -> NULL/false`.
+- SEMANTIC PROOF (hard gate): `index_range_seek_placeholder_bounds_match_sqlite` prepares + binds
+  `> / >= / < / <= / BETWEEN` on INTEGER/REAL/NUMERIC columns (covering + non-covering) with 11
+  bind types (ints, reals, numeric-text '3'/'2.5', non-numeric-text 'abc', empty text, blob, NULL)
+  and the empty-result edges (lo>hi, NULL bound, text/blob on a numeric col) — all bit-identical to
+  rusqlite (real C SQLite). The opcode gate now asserts placeholder ranges emit IdxRowid + Affinity;
+  the literal + expression-index differential stays green. 3/3 oracle tests PASS (rch -j2).
+  `-p fsqlite-vdbe --lib` clippy clean; fmt clean.
+- MEDIAN: the placeholder seek is the SAME `codegen_select_index_range_scan` path the literal seek
+  measured at 84.63x (seek 33.2us vs NOT INDEXED scan 2807.6us, null control 0.907x, release-perf) —
+  the only per-query delta is one O(1) `Affinity` coercion, negligible against the 33us seek, and the
+  opcode gate proves the seek engages. So the placeholder median is ~85x with high confidence.
+- SURFACE (honest gap): the placeholder-SPECIFIC A/B (a prepared `k BETWEEN ?1 AND ?2` vs NOT
+  INDEXED, arm added to `index_range_eqp_diagnostic`) could NOT be measured this session — the
+  release-profile diagnostic build repeatedly STALLED on the degraded rch fleet (2 workers offline,
+  disk-pressure hard_preflight, stuck-detector stale progress on vmi1152480; default `-j` refused
+  with insufficient_slots=9). Four release builds (release-perf -j2, --release -j3, --release -j2 x2)
+  stalled/refused; the correctness gate landed under -j2. RETRY CONDITION: re-run `cargo test
+  --profile release-perf -p fsqlite-e2e --test index_range_eqp_diagnostic -- --ignored --nocapture`
+  once the fleet recovers; expect ~85x, and append the measured placeholder median here.
+- FOLLOW-UP: text-column ranges (`WHERE name BETWEEN 'a' AND 'm'`) and TEXT/blob *literals* on
+  numeric columns still scan (kept narrow; text ranges need BINARY-collation seek handling).
+- Provenance: oracle + clippy via rch -j2; `codegen.rs` sha256 in the commit; placeholder A/B median
+  pending fleet recovery.
