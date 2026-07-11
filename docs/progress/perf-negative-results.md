@@ -17465,3 +17465,39 @@ test is on the executed path, not merely linked into it.
   ~2% micro with uncertain direction; shipping it to pad the count would be gaming the median gate.
   The honest signal is that this lane is done — pivot to the storage/MVCC lane (fresh profile-first)
   or a structural refactor next.
+
+## 2026-07-11 - CONVERGENCE (storage lane): the per-statement execution hot paths are ALSO mature; the residual execute_body gap is systemic MVCC, not a micro-lever (bd-5310l follow-on)
+
+- Result type: SURFACE / convergence. Pivoted from the front-end to the storage/execution lane
+  (per the prior CONVERGENCE entry) and read the point-lookup hot path end to end. Every layer is
+  already well-optimized; no clean, byte-identical single lever is apparent from code inspection.
+- WHAT WAS EXAMINED (all in the point-lookup read path):
+  - B-tree seek (`fsqlite-btree` cursor): rowid comparison reads ONLY the rowid varint
+    (`read_table_leaf_rowid_at_offset`), not the full cell; adds a nearby-leaf reuse fast path
+    (`table_advance_to`) and interpolation search (`table_leaf_interpolation`). Optimized.
+  - Cell parsing (`fsqlite-btree` cell.rs): cached slots (`CachedCellSlot`), a `_fast` on-page-size
+    variant, and an existing `cell_parse_hot_paths` bench guarding it. Optimized.
+  - Record decode (`fsqlite-types` record.rs): specialized `parse_record_projected_column_offsets`,
+    `parse_record_column` (single column), `parse_record_header_prefix_into` — the decoder projects
+    only the needed columns/header prefix rather than decoding the whole record. Optimized.
+  - VDBE `Column` opcode (engine.rs): a LAZY COLUMN CACHE + `column_to_reg_direct` that writes
+    straight into the target register reusing the existing Text/Blob buffer capacity — no per-column
+    header re-parse (no O(K^2)/row), no alloc/dealloc cycle. Optimized.
+  - Per-statement `runtime_inputs` + the VDBE engine are cached/reused (see the prior CONVERGENCE
+    entry): `cached_vdbe_engine`, `cached_read_runtime_inputs_no_defaults`.
+- CONCLUSION: the residual ~14x execute_body gap vs C SQLite is NOT a series of clean micro-bugs —
+  it is SYSTEMIC, dominated by the MVCC page-level version-chain visibility overhead that is the
+  project's raison d'etre (concurrent writers). That is a DESIGN TRADE-OFF (single-thread latency for
+  write concurrency), byte-identical-RISKY to touch (visibility semantics), and out of scope for a
+  "one clean lever" pass.
+- SO: the profile-first micro-lever approach has reached its natural limit for ad-hoc single-thread
+  query latency. Further single-thread gains require one of: (a) a dedicated MVCC read-path
+  optimization (profile execute_body's sub-components — MVCC visibility vs pager fetch vs VM dispatch
+  vs Row materialization — needs fsqlite-core instrumentation + a fleet-WARM release-perf window; the
+  cold-worker SSH timeouts blocked this repeatedly); (b) a STRUCTURAL project — the open P0 beads
+  bd-lezm3 (Cranelift JIT for hot queries) or bd-b434d (morsel-parallel SELECT), or an AST/planner
+  arena. None is a 20-minute lever.
+- CAMPAIGN STATUS: bd-5310l shipped 4 byte-identical median-gated wins (premise correction;
+  schema-clone borrow 6.52x; planner-cache bypass 1.39x; interner retained_bytes 1.22x). The clean
+  front-end AND storage micro-levers are now both harvested. Recommend the next effort be a chartered
+  structural/MVCC project rather than another micro-lever sweep.
