@@ -467,7 +467,7 @@ fn interleave_ops(
                     let w = usize::from(worker);
                     if batch_idx < batches[w].len() {
                         any = true;
-                        for kind in batches[w][batch_idx].drain(..) {
+                        for kind in std::mem::take(&mut batches[w][batch_idx]) {
                             records.push(OpRecord {
                                 op_id,
                                 worker,

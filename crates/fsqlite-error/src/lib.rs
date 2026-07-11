@@ -271,7 +271,7 @@ pub enum FrankenError {
     /// `RAISE(FAIL, msg)` (and, semantically, `INSERT/UPDATE OR FAIL`): the
     /// current statement fails, but rows already changed earlier in the same
     /// statement are KEPT — no statement-level rollback. This differs from
-    /// `RAISE(ABORT)` (which surfaces as [`FunctionError`] and undoes the
+    /// `RAISE(ABORT)` (which surfaces as [`FrankenError::FunctionError`] and undoes the
     /// statement's prior rows) only in that the statement savepoint is released
     /// rather than rolled back, and an autocommit boundary commits rather than
     /// rolls back. The wire-visible message and error code match `FunctionError`.

@@ -51,9 +51,7 @@ fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 fn row_count(conn: &Connection, sql: &str) -> usize {
-    conn.query(sql)
-        .map(|r| r.iter().count())
-        .unwrap_or(usize::MAX)
+    conn.query(sql).map(|r| r.len()).unwrap_or(usize::MAX)
 }
 
 fn median(mut xs: Vec<f64>) -> f64 {

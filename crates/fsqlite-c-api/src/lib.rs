@@ -188,6 +188,10 @@ impl Sqlite3 {
     }
 
     fn release_statement(&self) {
+        // `try_update` is only stable since Rust 1.95, while this workspace's
+        // MSRV is 1.85. Keep the equivalent MSRV-safe operation until the
+        // workspace toolchain floor advances.
+        #[allow(deprecated)]
         let _ =
             self.active_statements
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {

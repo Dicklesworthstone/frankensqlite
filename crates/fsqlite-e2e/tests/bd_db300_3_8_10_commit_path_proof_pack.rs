@@ -337,12 +337,19 @@ fn p4_non_regression_throughput() {
     fconn
         .execute("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
+    let fstmt = fconn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
 
     let f_start = Instant::now();
     fconn.execute("BEGIN").unwrap();
     for i in 0..row_count {
         fconn
-            .execute(&format!("INSERT INTO p4 VALUES ({i}, {})", i * 7))
+            .execute_prepared_with_params(
+                &fstmt,
+                &[
+                    fsqlite_types::value::SqliteValue::Integer(i),
+                    fsqlite_types::value::SqliteValue::Integer(i * 7),
+                ],
+            )
             .unwrap();
     }
     fconn.execute("COMMIT").unwrap();
@@ -355,16 +362,12 @@ fn p4_non_regression_throughput() {
     cconn
         .execute_batch("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER);")
         .unwrap();
+    let mut cstmt = cconn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
 
     let c_start = Instant::now();
     cconn.execute_batch("BEGIN;").unwrap();
     for i in 0..row_count {
-        cconn
-            .execute(
-                "INSERT INTO p4 VALUES (?1, ?2)",
-                rusqlite::params![i, i * 7],
-            )
-            .unwrap();
+        cstmt.execute(rusqlite::params![i, i * 7]).unwrap();
     }
     cconn.execute_batch("COMMIT;").unwrap();
     let c_ns = c_start.elapsed().as_nanos() as u64;

@@ -17,6 +17,59 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.16] -- 2026-07-11 (UPSERT page-retirement corruption fix and complete workspace release)
+
+Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Fixed
+
+- **`INSERT ... ON CONFLICT DO UPDATE` no longer reopens a leaf page freed by
+  the same transaction** ([#123](https://github.com/Dicklesworthstone/frankensqlite/issues/123)).
+  A rootless cursor-path repair correctly descended from the root before
+  DELETE, but that descent repopulated the table-seek cache with the landing
+  leaf. If DELETE balancing then merged and freed that leaf, the successor
+  re-seek could reuse the stale cache entry and report that the page had been
+  freed twice. Insert balancing had the analogous stale-topology risk after a
+  split. Both structural balance choke points now discard topology-dependent
+  seek-cache anchors before their first write. A deterministic file-backed
+  regression reproduces the reported leaf geometry, closes FrankenSQLite,
+  reopens the database with stock SQLite, and requires all rows plus
+  `PRAGMA integrity_check = 'ok'`.
+- **INSERT OR REPLACE churn rebuilds rootless cursor stacks before structural
+  mutation** (bd-kwei8), preventing empty child leaves and stale parent links
+  from producing a database image rejected by stock SQLite.
+- Expression serialization preserves explicit grouping parentheses and folds
+  `IS NULL`/`IS NOT NULL` without changing precedence.
+- The C API's active-statement accounting remains warning-free on current
+  nightly while retaining the workspace's Rust 1.85 MSRV.
+
+### Security
+
+- Updated `crossbeam-epoch` to 0.9.20, fixing RUSTSEC-2026-0204 (invalid
+  pointer dereference while formatting an invalid/null epoch pointer).
+- Updated transitive `anyhow` to 1.0.103, fixing RUSTSEC-2026-0190
+  (`Error::downcast_mut` borrow-rule violation after adding context).
+
+### Performance
+
+- Aggregate and ordinary SELECT codegen now emits bounded index/rowid seeks
+  for equality, ranges, IN lists, and normalized OR-of-equalities, including
+  covering-index plans that avoid table lookups.
+- Numeric, text, placeholder-bound, and composite prefix-plus-range scans can
+  stream directly from indexes. Compatible `ORDER BY` shapes use the same
+  forward or reverse traversal (including deterministic rowid tie order)
+  without a sorter; unsupported collation/direction shapes still fall back.
+- Pager sparse-cache clearing touches only populated slots.
+
+### CI / Release
+
+- The crates.io release plan now contains all 25 publishable workspace crates,
+  including `fsqlite-cli`, `fsqlite-c-api`, and `fsqlite-wasm`. It derives the
+  public package set from Cargo metadata and fails before publishing if the
+  configured topological sequence is incomplete. The intentionally private
+  `fsqlite-e2e` and `fsqlite-harness` packages remain `publish = false`.
+
 ## [0.1.15] -- 2026-07-06 (FTS5 UPDATE on WITHOUT ROWID shadow tables)
 
 Full-workspace lockstep release (`0.1.14 -> 0.1.15`). Semver-compatible 0.1.x;

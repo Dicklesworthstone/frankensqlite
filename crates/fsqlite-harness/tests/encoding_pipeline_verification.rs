@@ -398,10 +398,10 @@ fn test_encoding_pipeline_stages() {
     let intermediate = matrix.solve(&rhs).expect("solve k=50");
     assert_eq!(intermediate.len(), params.l);
 
-    for i in 0..k {
+    for (i, expected) in source.iter().enumerate().take(k) {
         assert_eq!(
             reconstruct_source_from_symbols(&params, &intermediate, i),
-            source[i],
+            *expected,
             "bead_id={BEAD_ID} systematic i={i}"
         );
     }

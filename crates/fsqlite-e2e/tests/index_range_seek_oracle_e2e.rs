@@ -84,7 +84,7 @@ fn setup() -> (Connection, rusqlite::Connection) {
     ];
     for i in 1..=60_i64 {
         let k = (i % 12) - 3; // -3..8, duplicates, negatives
-        let rr = (i as f64) * 0.5 - 4.0; // negatives and fractional
+        let rr = (i as f64).mul_add(0.5, -4.0); // negatives and fractional
         let nn = if i % 2 == 0 {
             format!("{}", i - 20)
         } else {
@@ -398,10 +398,9 @@ fn index_range_seek_text_binary_matches_sqlite() {
         f.execute(&sql).unwrap();
         r.execute_batch(&sql).unwrap();
     }
-    for s in ["INSERT INTO t VALUES (100, NULL, NULL);"] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
+    let null_row = "INSERT INTO t VALUES (100, NULL, NULL);";
+    f.execute(null_row).unwrap();
+    r.execute_batch(null_row).unwrap();
 
     let sorted = |mut v: Vec<Vec<String>>| {
         v.sort();

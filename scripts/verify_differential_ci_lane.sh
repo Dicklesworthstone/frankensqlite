@@ -767,7 +767,7 @@ write_ci_report_json() {
         replay_command: $replay_command,
         sampled_passing_replays: $sampled_passing_replays,
         first_failure_replay_command: $first_failure_replay_command,
-        first_failure: if $diverged_cases == 0 then null else {
+        first_failure: (if $diverged_cases == 0 then null else {
           replay_command: $first_failure_replay_command,
           root_cause_domain: $first_failure_root_cause_domain,
           diagnostic_json_pointer: $first_failure_diagnostic_pointer,
@@ -781,7 +781,7 @@ write_ci_report_json() {
             if $first_failure_minimal_repro_pointer == "" then null else $first_failure_minimal_repro_pointer end
           ),
           artifact_entries: $first_failure_artifact_entries
-        } end
+        } end)
       }
     ' >"${REPORT_JSON}"
 }

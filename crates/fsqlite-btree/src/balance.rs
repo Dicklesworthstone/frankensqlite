@@ -3550,7 +3550,7 @@ mod tests {
                     // function's capacity guard, a both-halves-fit split; assert
                     // the index is also a non-empty split point.
                     assert!(
-                        idx >= 1 && idx <= count - 1,
+                        idx > 0 && idx < count,
                         "split index {idx} out of [1,{}] (count={count} payload={payload} \
                          mode={mode:?} insert_idx={insert_idx})",
                         count - 1
