@@ -820,6 +820,92 @@ fn multi_row_upsert_with_foreign_keys_uses_fallback_without_failing() {
     assert_eq!(rows, vec![(1, 15), (2, 7)]);
 }
 
+#[test]
+fn upsert_do_update_after_leaf_split_does_not_double_free_page() {
+    fn padded_json(len: usize) -> String {
+        format!("{{\"d\":\"{}\"}}", "x".repeat(len - 8))
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("upsert_leaf_split.db");
+    let db = db_path.to_str().unwrap();
+
+    {
+        let conn = Connection::open(db).unwrap();
+        conn.execute(
+            "CREATE TABLE tune(
+                kernel TEXT NOT NULL,
+                shape_class TEXT NOT NULL,
+                machine BLOB NOT NULL,
+                params TEXT NOT NULL,
+                measured TEXT NOT NULL,
+                PRIMARY KEY(kernel, shape_class, machine)
+            ) STRICT",
+        )
+        .unwrap();
+
+        let shape_class = format!("roofline-v6:1:run={}:op=1", "a".repeat(64));
+        let machine: std::sync::Arc<[u8]> = vec![0_u8; 40].into();
+        let kernels = ["simd-axpy-f64", "simd-dot-f64", "simd-sum-f64"];
+        let measured_lengths = [1_265_usize, 1_264, 1_265];
+        let insert = conn
+            .prepare(
+                "INSERT INTO tune(kernel, shape_class, machine, params, measured)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(kernel, shape_class, machine) DO NOTHING",
+            )
+            .unwrap();
+        for (kernel, measured_len) in kernels.iter().zip(measured_lengths) {
+            insert
+                .execute_with_params(&[
+                    SqliteValue::Text((*kernel).into()),
+                    SqliteValue::Text(shape_class.clone().into()),
+                    SqliteValue::Blob(std::sync::Arc::clone(&machine)),
+                    SqliteValue::Text(padded_json(574).into()),
+                    SqliteValue::Text(padded_json(measured_len).into()),
+                ])
+                .unwrap();
+        }
+
+        let update = conn
+            .prepare(
+                "INSERT INTO tune(kernel, shape_class, machine, params, measured)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(kernel, shape_class, machine)
+                 DO UPDATE SET params = excluded.params, measured = excluded.measured",
+            )
+            .unwrap();
+        assert_eq!(
+            update
+                .execute_with_params(&[
+                    SqliteValue::Text(kernels[0].into()),
+                    SqliteValue::Text(shape_class.into()),
+                    SqliteValue::Blob(machine),
+                    SqliteValue::Text(padded_json(574).into()),
+                    SqliteValue::Text("{}".into()),
+                ])
+                .unwrap(),
+            1
+        );
+
+        let rows = conn
+            .query("SELECT kernel, measured FROM tune ORDER BY kernel")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("{}".into())));
+    }
+
+    let stock = RusqliteConnection::open(&db_path).unwrap();
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let row_count: i64 = stock
+        .query_row("SELECT COUNT(*) FROM tune", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(row_count, 3);
+}
+
 // ===========================================================================
 // 11. RUSQLITE PARITY (golden tests)
 // ===========================================================================

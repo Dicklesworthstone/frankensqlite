@@ -6876,6 +6876,12 @@ impl<P: PageWriter> BtCursor<P> {
             return Err(FrankenError::internal("cursor stack empty during balance"));
         }
 
+        // A balance can split, merge, or free any leaf remembered by the
+        // table-seek cache. Invalidate those topology-dependent anchors before
+        // the first structural write so an error or a post-balance re-seek can
+        // never reload a page that this operation already retired.
+        self.clear_seek_cache();
+
         if depth == 1 {
             // Leaf is the root — push root down first.
             balance::balance_deeper(
@@ -7096,6 +7102,13 @@ impl<P: PageWriter> BtCursor<P> {
         if depth <= 1 {
             return Ok(());
         }
+
+        // The positioning seek immediately before DELETE may have populated
+        // the cache with the leaf that is about to be merged and freed. Clear
+        // it before balancing: DELETE's successor re-seek happens after this
+        // method returns and must descend through the new tree, not reload the
+        // retired leaf (GH-123 / bd-h1kvh).
+        self.clear_seek_cache();
 
         // K2 (bd-yywuv): this deferred rebalance fixup runs only when a leaf
         // empties, not per DELETE. Count it so tests can prove the deferral
