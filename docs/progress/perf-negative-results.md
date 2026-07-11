@@ -17596,3 +17596,27 @@ test is on the executed path, not merely linked into it.
   OPEN + one seek. No clean byte-identical micro-lever. The next real work is a chartered MVCC/storage
   cursor-path optimization (or a structural JIT/parallel project) - both require a correctness charter,
   not a one-pass lever. Reliable diagnostic: `crates/fsqlite/tests/execute_body_split.rs`.
+
+## 2026-07-11 - PROFILE DECOMPOSITION: the fixed cursor-open cost includes a per-page 4KB Vec COPY (`read_page -> Option<Vec<u8>>`); fixing it is a broad pager zero-copy refactor, not a micro-lever (bd-5310l)
+
+- Result type: SURFACE / decomposition of the ~2170 ns fixed cursor-open cost isolated in the prior
+  entry. Read `open_storage_cursor` (engine.rs ~14964) + the pager trait.
+- FINDING: the pager `read_page` trait method (`fsqlite-pager/src/traits.rs:260`) returns
+  `Result<Option<Vec<u8>>>` — an OWNED, freshly-allocated 4 KiB `Vec<u8>` COPY on every page access.
+  The cursor-open reads the root page this way, and each seek page-access copies again. That is a
+  concrete per-page alloc+memcpy (~200-300 ns/page) inside the fixed cursor-open+seek cost. (Consistent
+  with the depth-independence: a 5000-row seek touches only ~1 interior + 1 leaf page here, so the
+  copy count barely differs from the 1-row table.) The rest of the open (`BtreePageHeader::parse`,
+  page-layout compute, `StorageCursor` construction, `derive_execution_cx`) is individually small.
+- WHY NOT A CLEAN LEVER: eliminating the copy means returning the cached page as a shared reference /
+  `Arc<[u8]>` from the pager instead of an owned `Vec` — changing the `read_page` trait signature and
+  EVERY impl + caller, having the B-tree cursor hold a shared/borrowed page, and copy-on-write on the
+  write path. Broad blast radius across `fsqlite-pager` + `fsqlite-btree` + the read paths;
+  correctness-sensitive (page lifetime/invalidation). A chartered "zero-copy pager pages" project, not
+  a one-pass byte-identical micro-lever. Confirmed NOT already in flight (recent pager commits are
+  durability/snapshot/FCW work, not zero-copy).
+- NET: this is the single most concrete, actionable structural target the whole bd-5310l audit
+  surfaced — a pager Arc/zero-copy-pages refactor would cut the per-page copy out of every read
+  (cursor-open + seek + scan). Recommended as the next CHARTERED perf project (with a correctness gate:
+  the returned pages must be immutable-shared, writers must COW). Still not a micro-lever; the clean
+  byte-identical single-lever campaign remains complete at 4 shipped wins.
