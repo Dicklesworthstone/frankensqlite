@@ -658,6 +658,130 @@ fn index_range_seek_composite_prefix_matches_sqlite() {
         )),
         "composite ORDER BY + LIMIT must seek"
     );
+
+    // bd-6x9z0 follow-up: composite DESC. `WHERE a = v AND b <range> ORDER BY b DESC, id DESC`
+    // (composite keyset "most recent first" pagination) streams off a reverse index walk with no
+    // sorter — the exact `(b DESC, id DESC)` order must match C SQLite.
+    for sql in [
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b DESC, id DESC",
+        "SELECT id, b FROM t WHERE a = 2 AND b >= 0 ORDER BY b DESC, id DESC",
+        "SELECT id, b FROM t WHERE a = 2 AND b < 8 ORDER BY b DESC, id DESC", // exclusive upper -> SeekLT
+        "SELECT id, b FROM t WHERE a = 2 AND b <= 8 ORDER BY b DESC, id DESC", // inclusive upper -> SeekLE
+        "SELECT id, b FROM t WHERE a = 1 AND b BETWEEN -3 AND 8 ORDER BY b DESC, id DESC",
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 AND b < 12 ORDER BY b DESC, id DESC",
+        "SELECT id, b FROM t WHERE a = 1 AND b > -3 ORDER BY b DESC, id DESC LIMIT 3",
+        "SELECT id, b FROM t WHERE a = 1 AND b >= -3 ORDER BY b DESC, id DESC LIMIT 2 OFFSET 1",
+        "SELECT b FROM t WHERE a = 1 AND b > -3 ORDER BY b DESC, id DESC", // covering b
+        "SELECT id, c FROM t WHERE a = 2 AND b > 2 ORDER BY b DESC, id DESC", // non-covering (c -> table)
+        "SELECT id FROM t WHERE a = -1 AND b >= 0 ORDER BY b DESC, id DESC",  // negative prefix
+        "SELECT id FROM t WHERE a = 2 AND b > 999 ORDER BY b DESC, id DESC",  // empty range
+        "SELECT id FROM t WHERE a = 99 AND b > 0 ORDER BY b DESC, id DESC",   // prefix miss
+        "SELECT id, c FROM t WHERE a = 1 AND b = 2 AND c > 'a' ORDER BY c DESC, id DESC", // multi-eq-prefix, idx_abc
+        // Deterministic declines (mixed direction / rowid-first) -> sorter, still bit-identical.
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b DESC, id ASC",
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY id DESC, b DESC",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "composite DESC diverged for `{sql}`"
+        );
+    }
+    // Bare `ORDER BY b DESC` on the non-unique idx_ab is tie-ambiguous (declines to the sorter);
+    // set comparison — both must return the same rows.
+    assert_eq!(
+        sorted(
+            frank_rows(
+                &f,
+                "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b DESC"
+            )
+            .unwrap()
+        ),
+        sorted(
+            sqlite_rows(
+                &r,
+                "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b DESC"
+            )
+            .unwrap()
+        ),
+        "composite bare DESC row set diverged"
+    );
+    // Placeholder binds on the prefix + range in DESC (affinity-coerced).
+    for bnd in [
+        vec![SqliteValue::Integer(2), SqliteValue::Integer(0)],
+        vec![SqliteValue::Integer(1), SqliteValue::Integer(-3)],
+        vec![SqliteValue::Integer(2), SqliteValue::Text("3".into())],
+    ] {
+        let sql = "SELECT id, b FROM t WHERE a = ?1 AND b > ?2 ORDER BY b DESC, id DESC";
+        assert_eq!(
+            frank_bound(&f, sql, &bnd),
+            sqlite_bound(&r, sql, &bnd),
+            "composite DESC placeholder diverged for {bnd:?}"
+        );
+    }
+    // Opcode gate: composite DESC reverse-walks (Prev) with no sorter, still seeks (IdxRowid), and
+    // never full-scans (no Rewind); exclusive upper anchors with SeekLT.
+    let dops = opcodes(
+        &f,
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b DESC, id DESC",
+    );
+    assert!(
+        !dops.iter().any(|o| o.starts_with("Sorter")),
+        "composite DESC must avoid the sorter; ops = {dops:?}"
+    );
+    assert!(
+        dops.iter().any(|o| o == "Prev"),
+        "composite DESC must reverse-walk (Prev); ops = {dops:?}"
+    );
+    assert!(
+        dops.iter().any(|o| o == "IdxRowid"),
+        "composite DESC must seek; ops = {dops:?}"
+    );
+    assert!(
+        !dops.iter().any(|o| o == "Rewind"),
+        "composite DESC must not full-scan; ops = {dops:?}"
+    );
+    assert!(
+        opcodes(
+            &f,
+            "SELECT id FROM t WHERE a = 2 AND b < 8 ORDER BY b DESC, id DESC"
+        )
+        .iter()
+        .any(|o| o == "SeekLT"),
+        "composite DESC with an exclusive upper bound must SeekLT"
+    );
+
+    // Composite DESC on a UNIQUE index: within the a-block each b is unique, so a bare
+    // `ORDER BY b DESC` is already a total order and streams off the reverse walk with no sorter.
+    for s in [
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);",
+        "CREATE UNIQUE INDEX idx_u_ab ON u(a, b);",
+        "INSERT INTO u VALUES (1,7,10),(2,7,20),(3,7,30),(4,8,5),(5,7,NULL);",
+    ] {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+    for sql in [
+        "SELECT id, b FROM u WHERE a = 7 AND b > 5 ORDER BY b DESC",
+        "SELECT id, b FROM u WHERE a = 7 AND b BETWEEN 10 AND 30 ORDER BY b DESC",
+        "SELECT id, b FROM u WHERE a = 7 AND b > 5 ORDER BY b DESC LIMIT 2",
+        "SELECT id, b FROM u WHERE a = 7 AND b >= 10 ORDER BY b DESC, id DESC",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "composite unique DESC diverged for `{sql}`"
+        );
+    }
+    assert!(
+        !opcodes(
+            &f,
+            "SELECT id, b FROM u WHERE a = 7 AND b > 5 ORDER BY b DESC"
+        )
+        .iter()
+        .any(|o| o.starts_with("Sorter")),
+        "composite unique bare DESC must avoid the sorter"
+    );
 }
 
 /// bd-wimmv follow-up: a single-column indexed range with a deterministic `ORDER BY <col>, id`

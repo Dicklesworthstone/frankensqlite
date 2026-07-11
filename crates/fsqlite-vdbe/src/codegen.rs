@@ -1999,26 +1999,50 @@ pub fn codegen_select(
     // bd-zqkrp follow-up: the seek emits rows in `(range_col, rowid)` order, so it satisfies an
     // `ORDER BY <trailing range col> ASC` (when that column is the last key term) without a sorter —
     // and LIMIT/OFFSET streams straight off the seek. An empty ORDER BY always qualifies.
-    if let Some(composite) = composite_prefix_range
-        && (stmt.order_by.is_empty()
-            || composite_order_by_satisfied(&composite, &stmt.order_by, table, table_alias))
-    {
-        return codegen_select_composite_index_prefix_range_scan(
-            b,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            columns,
-            stmt.limit.as_ref(),
-            out_regs,
-            out_col_count,
-            done_label,
-            end_label,
-            composite.index,
-            &composite.prefix_exprs,
-            &composite.range,
-        );
+    if let Some(composite) = composite_prefix_range {
+        if stmt.order_by.is_empty()
+            || composite_order_by_satisfied(&composite, &stmt.order_by, table, table_alias)
+        {
+            return codegen_select_composite_index_prefix_range_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                columns,
+                stmt.limit.as_ref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                composite.index,
+                &composite.prefix_exprs,
+                &composite.range,
+            );
+        }
+        // bd-6x9z0 follow-up: composite DESC. `WHERE a = v AND b <range> ORDER BY b DESC, id DESC`
+        // (composite keyset "most recent first" pagination) streams off a reverse index walk with NO
+        // sorter — the composite mirror of the single-column DESC range seek. Only the deterministic
+        // `range_col DESC[, id DESC]` order (or a bare `range_col DESC` on a UNIQUE index) qualifies;
+        // any other order falls through to the sorter.
+        if composite_order_by_satisfied_desc(&composite, &stmt.order_by, table, table_alias) {
+            return codegen_select_composite_index_prefix_range_scan_desc(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                columns,
+                stmt.limit.as_ref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                composite.index,
+                &composite.prefix_exprs,
+                &composite.range,
+            );
+        }
     }
 
     // bd-ln7dp: reverse (DESC) single-column range seek. `WHERE col <range> ORDER BY col DESC, id
@@ -4070,6 +4094,270 @@ fn codegen_select_composite_index_prefix_range_scan(
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = loop_top as i32;
     b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Composite-index equality-prefix + trailing-range seek in DESCENDING order
+/// (`WHERE a = 5 AND b <range> ORDER BY b DESC, id DESC` on `index(a, b)`). The reverse mirror of
+/// [`codegen_select_composite_index_prefix_range_scan`], and the composite analogue of
+/// [`codegen_select_index_range_scan_desc`].
+///
+/// It anchors at the HIGH end of the `a == 5` block and walks down with `Prev`:
+/// * inclusive upper (`b <= up`): `SeekLE [prefix.., up]` — the last entry with `(prefix.., b) <=
+///   (prefix.., up)`;
+/// * exclusive upper (`b < up`): `SeekLT [prefix.., up]` — the last entry `< (prefix.., up)`;
+/// * no upper bound: `SeekLE [prefix..]` (a partial key) — the last entry in the `prefix` block.
+///
+/// A single `IdxLE`/`IdxLT` on `[prefix.., lower]` (`P5 = prefix_len + 1`) at the loop top ends the
+/// walk: it fires when the equality prefix drops below `prefix` (left the block downward), when the
+/// trailing key crosses the lower bound (`IdxLE` for exclusive `>`, `IdxLT` for inclusive `>=`), or
+/// when a NULL trailing key is reached (NULLs sit at the block bottom and never satisfy a range).
+/// When there is no lower bound the probe holds NULL in the trailing slot and `IdxLE` stops exactly
+/// at the NULL region / prefix change. Streams `(range_col DESC, rowid DESC)` with no sorter; the
+/// range column is guaranteed to be the last key term by `composite_order_by_satisfied_desc`.
+/// Rowid tables only (WITHOUT ROWID is declined at detection).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_composite_index_prefix_range_scan_desc(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    prefix_exprs: &[&Expr],
+    range: &ColumnRangeTarget<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let prefix_len = prefix_exprs.len();
+    let key_terms = idx_schema.key_term_count();
+    let range_pos = prefix_len;
+
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
+    // Coercing affinity ('C'/'D'/'E'/'B') of each key column, or None (untyped -> no coercion).
+    let key_affinities: Vec<Option<char>> = (0..key_terms)
+        .map(|pos| {
+            idx_schema
+                .columns
+                .get(pos)
+                .and_then(|name| table.column_index(name))
+                .map(|i| table.columns[i].affinity)
+                .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'))
+        })
+        .collect();
+
+    // Emit the equality-prefix values into `reg` (coercing affinity), jumping to `done` on NULL
+    // (an `= NULL` prefix matches nothing). Emitted once for the anchor and once for the stop probe.
+    let emit_prefix = |b: &mut ProgramBuilder, base: i32| {
+        for (pos, expr) in prefix_exprs.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let reg = base + pos as i32;
+            emit_expr(b, expr, reg, None);
+            if let Some(aff) = key_affinities[pos]
+                && !bound_matches_affinity(aff, expr)
+            {
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
+            }
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        }
+    };
+
+    // Anchor probe: [prefix.., upper] when there is an upper bound, else [prefix..] (partial key).
+    let has_upper = range.upper.is_some();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let anchor_fields = prefix_len as i32 + i32::from(has_upper);
+    let anchor_base = b.alloc_regs(anchor_fields);
+    emit_prefix(b, anchor_base);
+    let anchor_seek_op = if let Some(upper) = range.upper.as_ref() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let reg = anchor_base + range_pos as i32;
+        emit_expr(b, upper.expr(), reg, None);
+        if let Some(aff) = key_affinities[range_pos]
+            && !bound_matches_affinity(aff, upper.expr())
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        // Inclusive upper: last entry <= (prefix.., up). Exclusive: last entry < (prefix.., up).
+        if upper.inclusive {
+            Opcode::SeekLE
+        } else {
+            Opcode::SeekLT
+        }
+    } else {
+        // No upper bound: the partial key [prefix..] positions at the last entry of the block.
+        Opcode::SeekLE
+    };
+    let anchor_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        anchor_base,
+        anchor_fields,
+        anchor_rec,
+        P4::None,
+        0,
+    );
+
+    // Stop probe: [prefix.., lower-or-NULL] (prefix_len + 1 == key_terms fields).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let stop_base = b.alloc_regs(key_terms as i32);
+    emit_prefix(b, stop_base);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let stop_range_reg = stop_base + range_pos as i32;
+    let lower_inclusive = if let Some(lower) = range.lower.as_ref() {
+        emit_expr(b, lower.expr(), stop_range_reg, None);
+        if let Some(aff) = key_affinities[range_pos]
+            && !bound_matches_affinity(aff, lower.expr())
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                stop_range_reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, stop_range_reg, 0, done_label, P4::None, 0);
+        Some(lower.inclusive)
+    } else {
+        b.emit_op(Opcode::Null, 0, stop_range_reg, 0, P4::None, 0);
+        None
+    };
+    let stop_rec = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::MakeRecord,
+        stop_base,
+        key_terms as i32,
+        stop_rec,
+        P4::None,
+        0,
+    );
+    // Inclusive lower (`b >= lo`): stop when idx_key < [prefix.., lo] (IdxLT). Exclusive (`b > lo`)
+    // or no lower bound (NULL trailing slot): stop when idx_key <= [prefix.., lo/NULL] (IdxLE) —
+    // which for a real trailing key only fires below `lo`, and for the NULL slot only fires at the
+    // NULL region / prefix change.
+    let stop_op = if lower_inclusive == Some(true) {
+        Opcode::IdxLT
+    } else {
+        Opcode::IdxLE
+    };
+
+    let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table_lookup = covering_output.is_none();
+    if needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(
+        anchor_seek_op,
+        idx_cursor,
+        anchor_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
+
+    // Prefix change / lower bound / NULL trailing key: one op ends the reverse walk.
+    #[allow(clippy::cast_possible_truncation)]
+    b.emit_jump_to_label(
+        stop_op,
+        idx_cursor,
+        stop_rec,
+        done_label,
+        P4::None,
+        (prefix_len + 1) as u16,
+    );
+
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+    if let Some(cov) = &covering_output {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Prev, idx_cursor, loop_body, 0, P4::None, 0);
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
@@ -20568,6 +20856,29 @@ fn composite_order_by_satisfied(
             table_alias,
             comp.index.is_unique,
             false,
+        )
+}
+
+/// Whether a composite prefix+range seek can satisfy `order_by` in DESCENDING order without a
+/// sorter. Same shape as [`composite_order_by_satisfied`] but for the reverse walk: the range
+/// column must be the last key term (so the reverse index stream is exactly `(range_col DESC,
+/// rowid DESC)`), and the order must be the deterministic `range_col DESC[, id DESC]` — or a bare
+/// `range_col DESC` when the index is UNIQUE (no ties within the range).
+fn composite_order_by_satisfied_desc(
+    comp: &CompositePrefixRange<'_>,
+    order_by: &[OrderingTerm],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let prefix_len = comp.prefix_exprs.len();
+    prefix_len + 1 == comp.index.key_term_count()
+        && range_order_by_is_deterministic(
+            &comp.index.columns[prefix_len],
+            order_by,
+            table,
+            table_alias,
+            comp.index.is_unique,
+            true,
         )
 }
 

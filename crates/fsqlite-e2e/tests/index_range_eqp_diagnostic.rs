@@ -243,3 +243,105 @@ fn diagnostic_index_range_plan_choice() {
     );
     eprintln!("=== end diagnostic ===\n");
 }
+
+/// bd-6x9z0 follow-up A/B: composite DESC (`WHERE a = v AND b <range> ORDER BY b DESC, id DESC`)
+/// streams off a reverse index walk with NO sorter, seeking only the `a == v` block. The scan arm
+/// (`NOT INDEXED`) must full-scan every row, filter, AND sort. The win is two-fold: fewer row
+/// visits (the a-block, not the whole table) and no O(n log n) sorter. Median us/query; null
+/// control (seek vs seek) is the sequential-drift floor.
+#[test]
+#[ignore = "diagnostic/A-B bench; run explicitly under --profile release-perf"]
+fn diagnostic_composite_desc_order_by() {
+    let f = Connection::open(":memory:").expect("open frank");
+    f.execute("CREATE TABLE ct (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, w TEXT);")
+        .unwrap();
+    f.execute("CREATE INDEX idx_ct_ab ON ct(a, b);").unwrap();
+    // 40 distinct `a` values (~500 rows each); `b` spread across [0,1000) per row.
+    let n_a = 40i64;
+    for i in 1..=20_000_i64 {
+        let a = i % n_a;
+        let b = (i * 7) % 1000;
+        f.execute(&format!("INSERT INTO ct VALUES ({i}, {a}, {b}, 'r{i}');"))
+            .unwrap();
+    }
+
+    // Bytecode lens: the seek arm must reverse-walk (Prev) with no sorter; the scan arm sorts.
+    let seek_ops = opcodes(
+        &f,
+        "SELECT id, b FROM ct WHERE a = 7 AND b > 500 ORDER BY b DESC, id DESC",
+    );
+    let scan_ops = opcodes(
+        &f,
+        "SELECT id, b FROM ct NOT INDEXED WHERE a = 7 AND b > 500 ORDER BY b DESC, id DESC",
+    );
+    eprintln!("\n=== bd-6x9z0 composite-DESC diagnostic (20000 rows, 40 a-blocks) ===");
+    eprintln!(
+        "  seek arm: Prev={}, Sorter={}, IdxRowid={}\n  scan arm: Rewind={}, Sorter={}",
+        seek_ops.iter().any(|o| o == "Prev"),
+        seek_ops.iter().any(|o| o.starts_with("Sorter")),
+        seek_ops.iter().any(|o| o == "IdxRowid"),
+        scan_ops.iter().any(|o| o == "Rewind"),
+        scan_ops.iter().any(|o| o.starts_with("Sorter")),
+    );
+
+    let samples = 60usize;
+    let execs = 40usize;
+    // Correctness sanity (the oracle test is the real gate): both arms return the same rows.
+    assert_eq!(
+        row_count(
+            &f,
+            "SELECT id, b FROM ct WHERE a = 7 AND b > 500 ORDER BY b DESC, id DESC"
+        ),
+        row_count(
+            &f,
+            "SELECT id, b FROM ct NOT INDEXED WHERE a = 7 AND b > 500 ORDER BY b DESC, id DESC"
+        ),
+        "composite-DESC seek and scan arms must return identical row counts"
+    );
+
+    let mut seek_us = Vec::with_capacity(samples);
+    let mut scan_us = Vec::with_capacity(samples);
+    let mut null_us = Vec::with_capacity(samples);
+    for s in 0..samples {
+        let si = i64::try_from(s).unwrap();
+        let av = si % n_a;
+        let lo = 200 + (si * 13) % 500; // vary bounds per sample
+        let seek_sql =
+            format!("SELECT id, b FROM ct WHERE a = {av} AND b > {lo} ORDER BY b DESC, id DESC");
+        let scan_sql = format!(
+            "SELECT id, b FROM ct NOT INDEXED WHERE a = {av} AND b > {lo} ORDER BY b DESC, id DESC"
+        );
+
+        let t = Instant::now();
+        for _ in 0..execs {
+            let _ = f.query(&seek_sql).unwrap();
+        }
+        seek_us.push(t.elapsed().as_micros() as f64 / execs as f64);
+
+        let t = Instant::now();
+        for _ in 0..execs {
+            let _ = f.query(&scan_sql).unwrap();
+        }
+        scan_us.push(t.elapsed().as_micros() as f64 / execs as f64);
+
+        let t = Instant::now();
+        for _ in 0..execs {
+            let _ = f.query(&seek_sql).unwrap();
+        }
+        null_us.push(t.elapsed().as_micros() as f64 / execs as f64);
+    }
+
+    let ms = median(seek_us);
+    let mc = median(scan_us);
+    let mn = median(null_us);
+    eprintln!(
+        "\n  Composite-DESC A/B ({samples} samples x {execs} execs, varied a-block + bound):\n    \
+         seek (a=v AND b>lo ORDER BY b DESC, id DESC)   median = {ms:.2} us/query\n    \
+         scan (NOT INDEXED, same, + sorter)             median = {mc:.2} us/query\n    \
+         speedup (scan/seek)                            = {:.2}x\n    \
+         null control (seek vs seek)                    = {:.3}x  [{mn:.2} vs {ms:.2}]",
+        mc / ms,
+        mn / ms,
+    );
+    eprintln!("=== end composite-DESC diagnostic ===\n");
+}

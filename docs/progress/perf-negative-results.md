@@ -16942,3 +16942,58 @@ test is on the executed path, not merely linked into it.
 - FOLLOW-UP: composite DESC (`WHERE a = v AND b <range> ORDER BY b DESC, id DESC`); DESC on a unique
   index (bare `ORDER BY col DESC`); NOCASE/RTRIM collation-aware seeks.
 - Provenance: oracle via rch -j3 (worker per queue); clippy via rch -j3; codegen.rs sha256 in commit.
+
+## 2026-07-11 - WIN: composite DESC prefix+range seek, no sorter (bd-xoy1l)
+
+- Result type: KEPT. Differential gate (vs C SQLite 3.46.1) PASSED (8/8 oracle tests, rch -j3 on
+  ovh-b); A/B MEASURED under release-perf: **9.85x** (scan/seek), null control 0.997x. Shipped.
+  Completes the reverse-pagination family: `WHERE a = v AND b <range> ORDER BY b DESC, id DESC` on
+  `index(a, b)` (composite keyset "most recent first") now streams off a reverse index walk with NO
+  sorter — the composite mirror of the single-column DESC seek (bd-6x9z0).
+- Profile-first: the composite prefix+range seek (bd-zqkrp) and its ORDER-BY-via-index follow-up
+  (bd-wimmv) only claimed ASCENDING order; a DESC order matched NEITHER the composite ASC path
+  (`descending: false` hardcoded in `composite_order_by_satisfied`) NOR the single-column DESC path
+  (`key_term_count() == 1` only, but a composite index has >= 2), so `... ORDER BY b DESC, id DESC`
+  fell through to a full scan + sorter. Confirmed the gap in codegen routing; `EXPLAIN` on real
+  SQLite 3.46.1 confirmed the canonical plan is a partial-key `SeekLE` anchor + reverse `Prev` walk
+  bounded by `IdxLE`, with no sorter.
+- FIX (codegen.rs): new `codegen_select_composite_index_prefix_range_scan_desc` (reverse mirror of
+  the ASC composite seek) + `composite_order_by_satisfied_desc` (accepts `range_col DESC[, id DESC]`,
+  or a bare `range_col DESC` on a UNIQUE index, via the shared `range_order_by_is_deterministic` with
+  `descending = true`). It anchors at the HIGH end of the `a==v` block — `SeekLE [prefix.., up]`
+  (inclusive upper), `SeekLT [prefix.., up]` (exclusive upper), or `SeekLE [prefix..]` (partial key,
+  no upper) — and walks down with `Prev`, ending with a SINGLE `IdxLE`/`IdxLT [prefix.., lower]`
+  (P5 = prefix_len + 1) that fires on prefix-change OR lower-cross (`IdxLE` for exclusive `>`,
+  `IdxLT` for inclusive `>=`) OR a NULL trailing key (NULL slot when there is no lower bound).
+  Placeholder/text bounds are affinity-coerced per key column (reuses bd-u6tbr/bd-v79yz). Routed
+  alongside the ASC composite branch, before the planner directive.
+- CORRECTNESS: detection declines DESC key-term indexes, so the index is all-ascending and (order-by
+  gate) the range column is the LAST key term — thus within the `a==v` block the reverse `Prev` walk
+  emits exactly `(range_col DESC, rowid DESC)`, the unique total order for `ORDER BY b DESC, id DESC`.
+  The VM's partial-key `SeekLE` (compares over the probe's field count) plus `compare_index_key_values`
+  (prefix-equal -> the SHORTER key is LESS, cursor.rs:4447) position the anchor at the block's LAST
+  entry; verified by reading the btree cursor + the SeekLE equal-run skip in engine.rs. The single
+  `IdxLE`/`IdxLT` (P5 = prefix_len+1) collapses prefix-boundary + lower-bound + NULL-key termination
+  into one op — NULLs sort at the block bottom and (NULL <= lower / == NULL slot) always fire there.
+- SEMANTIC PROOF (hard gate): `index_range_seek_composite_prefix_matches_sqlite` extended — `b DESC,
+  id DESC` across >, >=, <, <=, BETWEEN, two-sided; LIMIT and LIMIT/OFFSET; covering + non-covering
+  (c -> table lookup); negative prefix; empty range; prefix miss; multi-eq-prefix on idx_abc
+  (`a=? AND b=? AND c>'a' ORDER BY c DESC, id DESC`); placeholder binds (int/text on prefix + range);
+  deterministic declines (`b DESC, id ASC`; `id DESC, b DESC` -> sorter, still bit-identical); bare
+  `b DESC` on the non-unique idx_ab as a set; and a UNIQUE composite index where bare `b DESC` streams
+  with no sorter — all bit-identical to rusqlite. Opcode gate: DESC emits `Prev` + `IdxRowid`, no
+  `Sorter*`, no `Rewind`; exclusive upper uses `SeekLT`. 8/8 oracle tests pass first build;
+  `-p fsqlite-vdbe --lib` clippy clean; fmt clean.
+- MEDIAN (release-perf, 60 samples x 40 execs; 20000 rows across 40 a-blocks; varied a-block + bound):
+  seek `a=v AND b>lo ORDER BY b DESC, id DESC` = 403.05 us/query; NOT INDEXED scan + sorter =
+  3969.93 us/query; speedup **9.85x**; null control (seek vs seek) 0.997x [401.88 vs 403.05] — the
+  win clears the ~1.0x drift floor decisively. Two-fold win: seeks only the a-block (not the whole
+  table) AND eliminates the O(n log n) sorter + its temp b-tree. New A/B arm:
+  `diagnostic_composite_desc_order_by` in `index_range_eqp_diagnostic.rs`.
+- FOLLOW-UP: composite DESC where the range col is NOT the last key term; NOCASE/RTRIM collation-aware
+  seeks; WITHOUT ROWID; indexes with DESC-declared key terms.
+- Provenance: oracle via rch -j3 (ovh-b, 7m29s compile); A/B via rch `--profile release-perf` (ovh-b,
+  20m05s compile); clippy via rch -j3 (vmi1227854, clean); fmt clean; codegen.rs sha256 in the commit.
+- FLEET NOTE: the fleet recovered to 8-9/12 healthy, 36-41/76 slots free this session, so the A/B
+  median that the immediately-prior range-seek levers had to defer ("pending fleet recovery") was
+  finally measurable directly.
