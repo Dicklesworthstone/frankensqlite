@@ -7378,11 +7378,6 @@ impl<P: PageWriter> BtCursor<P> {
 
         self.pager.write_page_data(cx, page_no, page_data)?;
 
-        // Free the OLD overflow chain since we are discarding the old cell.
-        if let Some(first) = old_overflow {
-            self.free_overflow_chain(cx, first)?;
-        }
-
         // Now we must insert `new_cell` at `cell_idx`, which will trigger a structural rebalance.
         let balance_result = self.balance_for_insert(cx, &new_cell, cell_idx);
         if balance_result.is_err() {
@@ -7391,6 +7386,14 @@ impl<P: PageWriter> BtCursor<P> {
             }
         }
         balance_result?;
+
+        // The old separator remains the authoritative owner of its overflow
+        // chain until the structural replacement succeeds. Retiring that
+        // chain before `balance_for_insert` commits would let an error return
+        // with pages freed while the old cell is still the rollback source.
+        if let Some(first) = old_overflow {
+            self.free_overflow_chain(cx, first)?;
+        }
 
         Ok(true)
     }
@@ -13919,6 +13922,120 @@ mod tests {
                 .entry_count,
             expected.len(),
             "index invariant harness should count the same logical entries as the scan"
+        );
+    }
+
+    #[test]
+    fn test_replace_interior_overflow_is_not_freed_before_balance_succeeds() {
+        const INDEX_USABLE: u32 = 512;
+
+        let root = pn(2);
+        let cx = Cx::new();
+        let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+        let mut builder = BtCursor::new(store, root, INDEX_USABLE, false);
+
+        let (replacement_len, replacement_local_len) = (1_usize..=4_096)
+            .map(|payload_len| {
+                let payload_size = u32::try_from(payload_len).unwrap();
+                let local_len = usize::try_from(cell::local_payload_size(
+                    payload_size,
+                    INDEX_USABLE,
+                    BtreePageType::InteriorIndex,
+                ))
+                .unwrap();
+                let mut varint = [0_u8; 9];
+                let varint_len = write_varint(&mut varint, u64::from(payload_size));
+                let overflow_pointer_len = if local_len < payload_len { 4 } else { 0 };
+                let on_page_len = 4 + varint_len + local_len + overflow_pointer_len;
+                (payload_len, local_len, on_page_len)
+            })
+            .max_by_key(|&(_, _, on_page_len)| on_page_len)
+            .map(|(payload_len, local_len, _)| (payload_len, local_len))
+            .unwrap();
+
+        // Build a deterministic, validly encoded root with nine minimal-local
+        // overflow cells. Nine 49-byte cells leave only 41 free bytes; after
+        // removing one separator there are still only 90 bytes available, less
+        // than the maximally sized replacement above. This guarantees the
+        // balance path without relying on organically produced tree density.
+        let mut encoded_cells = Vec::new();
+        let mut target = None;
+        for key_idx in 0_u32..9 {
+            let mut key = vec![0x40_u8; 200];
+            key[..4].copy_from_slice(&key_idx.to_be_bytes());
+            let local_len = usize::try_from(cell::local_payload_size(
+                u32::try_from(key.len()).unwrap(),
+                INDEX_USABLE,
+                BtreePageType::InteriorIndex,
+            ))
+            .unwrap();
+            let overflow_head = builder
+                .write_overflow_chain_for_insert(&cx, &key[local_len..])
+                .unwrap();
+
+            let mut encoded = Vec::new();
+            encoded.extend_from_slice(&pn(10_000 + key_idx).get().to_be_bytes());
+            let mut varint = [0_u8; 9];
+            let varint_len = write_varint(&mut varint, u64::try_from(key.len()).unwrap());
+            encoded.extend_from_slice(&varint[..varint_len]);
+            encoded.extend_from_slice(&key[..local_len]);
+            encoded.extend_from_slice(&overflow_head.get().to_be_bytes());
+            if key_idx == 4 {
+                target = Some((key.clone(), overflow_head));
+            }
+            encoded_cells.push(encoded);
+        }
+
+        let mut root_bytes = vec![0_u8; usize::try_from(INDEX_USABLE).unwrap()];
+        let mut content_offset = root_bytes.len();
+        let mut cell_pointers = Vec::with_capacity(encoded_cells.len());
+        for encoded in &encoded_cells {
+            content_offset = content_offset.checked_sub(encoded.len()).unwrap();
+            root_bytes[content_offset..content_offset + encoded.len()].copy_from_slice(encoded);
+            cell_pointers.push(u16::try_from(content_offset).unwrap());
+        }
+        let root_header = BtreePageHeader {
+            page_type: BtreePageType::InteriorIndex,
+            first_freeblock: 0,
+            cell_count: u16::try_from(cell_pointers.len()).unwrap(),
+            cell_content_offset: u32::try_from(content_offset).unwrap(),
+            fragmented_free_bytes: 0,
+            right_child: Some(pn(20_000)),
+        };
+        root_header.write(&mut root_bytes, 0);
+        cell::write_cell_pointers(&mut root_bytes, 0, &root_header, &cell_pointers);
+        builder.pager.pages.insert(root.get(), root_bytes);
+
+        let (old_key, old_overflow_head) = target.unwrap();
+        let base_store = builder.pager;
+        assert!(base_store.pages.contains_key(&old_overflow_head.get()));
+        let shared = Rc::new(RefCell::new(base_store));
+
+        let overflow_payload_len = replacement_len - replacement_local_len;
+        let new_overflow_pages =
+            overflow_payload_len.div_ceil(usize::try_from(INDEX_USABLE).unwrap() - 4);
+        // Replacement writes: N new-overflow pages, the old-cell-free page,
+        // then the first structural balance write. Fail that balance write.
+        let fail_on_write = new_overflow_pages + 2;
+        let failing = FailingOverflowStore::new(Rc::clone(&shared), fail_on_write);
+        let mut cursor = BtCursor::new(failing, root, INDEX_USABLE, false);
+        assert!(cursor.index_move_to(&cx, &old_key).unwrap().is_found());
+        assert!(
+            !cursor.stack.last().unwrap().header.page_type.is_leaf(),
+            "fixture key must resolve to an interior separator"
+        );
+
+        let replacement = vec![0xA5; replacement_len];
+        let error = cursor
+            .replace_interior_cell(&cx, &replacement)
+            .expect_err("the injected first balance write must fail");
+        assert!(
+            matches!(error, FrankenError::Internal(ref message) if message == "injected write failure"),
+            "expected the injected balance failure, got {error:?}"
+        );
+        assert!(
+            shared.borrow().pages.contains_key(&old_overflow_head.get()),
+            "the old separator must retain ownership of its overflow chain until balance succeeds"
         );
     }
 
