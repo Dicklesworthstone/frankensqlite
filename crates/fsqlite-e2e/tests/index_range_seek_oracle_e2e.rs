@@ -171,7 +171,7 @@ fn index_range_seek_matches_sqlite() {
         // affinity but not a numeric literal -> scan), NOT INDEXED, DISTINCT.
         "SELECT id FROM t WHERE k > '3'",
         "SELECT id FROM t NOT INDEXED WHERE k BETWEEN 2 AND 5",
-        // TEXT column range (TEXT comparison affinity -> declines to a scan; still exact).
+        // TEXT column range on a BINARY-collated index (bd-xiojw): now seeks; must stay exact.
         "SELECT id FROM t WHERE w > 'r05'",
         "SELECT id FROM t WHERE w BETWEEN 'r03' AND 'r08'",
         // Expression-index range with NEGATED numeric literal bounds (broadened extraction).
@@ -371,4 +371,92 @@ fn index_range_seek_placeholder_bounds_match_sqlite() {
             "placeholder BETWEEN diverged for params {a:?}, {b:?}"
         );
     }
+}
+
+/// bd-xiojw: a text-literal range on a BINARY-collated text index now seeks (no coercion —
+/// text-vs-text under `P4::None` is the index's own BINARY order). A NOCASE-collated index, or a
+/// non-text-literal bound, still scans. All bit-identical to C SQLite.
+#[test]
+fn index_range_seek_text_binary_matches_sqlite() {
+    let f = Connection::open(":memory:").expect("open frank");
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    let schema = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, w TEXT, wc TEXT COLLATE NOCASE);",
+        "CREATE INDEX idx_w ON t(w);",
+        "CREATE INDEX idx_wc ON t(wc);",
+    ];
+    for s in schema {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+    // Mixed case so BINARY vs NOCASE ordering actually differs.
+    let words = [
+        "Apple", "apple", "Banana", "banana", "Cherry", "cherry", "Date", "date", "eGG", "fig",
+    ];
+    for (i, w) in words.iter().enumerate() {
+        let sql = format!("INSERT INTO t VALUES ({}, '{w}', '{w}');", i + 1);
+        f.execute(&sql).unwrap();
+        r.execute_batch(&sql).unwrap();
+    }
+    for s in ["INSERT INTO t VALUES (100, NULL, NULL);"] {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+
+    let sorted = |mut v: Vec<Vec<String>>| {
+        v.sort();
+        v
+    };
+    let cmp = |sql: &str| {
+        assert_eq!(
+            sorted(frank_rows(&f, sql).unwrap()),
+            sorted(sqlite_rows(&r, sql).unwrap()),
+            "text range diverged for `{sql}`"
+        );
+    };
+    for sql in [
+        // BINARY (idx_w) text literals — now seek.
+        "SELECT id FROM t WHERE w > 'Cherry'",
+        "SELECT id FROM t WHERE w >= 'banana'",
+        "SELECT id FROM t WHERE w < 'Date'",
+        "SELECT id FROM t WHERE w BETWEEN 'B' AND 'd'",
+        "SELECT id, w FROM t WHERE w > 'a'",
+        "SELECT id FROM t WHERE w > 'zzz'",             // empty
+        "SELECT id FROM t WHERE w BETWEEN 'z' AND 'a'", // empty (lo > hi)
+        // NOCASE (idx_wc) — must decline the BINARY seek but stay correct.
+        "SELECT id FROM t WHERE wc > 'cherry'",
+        "SELECT id FROM t WHERE wc BETWEEN 'b' AND 'd'",
+        // Non-text-literal bound on a text column -> decline, still correct.
+        "SELECT id FROM t WHERE w > 5",
+    ] {
+        cmp(sql);
+    }
+    for sql in [
+        "SELECT id, w FROM t WHERE w > 'Cherry' ORDER BY w, id",
+        "SELECT id, wc FROM t WHERE wc > 'cherry' ORDER BY wc, id",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "ordered text range diverged for `{sql}`"
+        );
+    }
+
+    // Opcode gate: BINARY text-literal ranges seek (IdxRowid); NOCASE and numeric-on-text scan.
+    assert!(
+        uses_index(&opcodes(&f, "SELECT id FROM t WHERE w > 'Cherry'")),
+        "BINARY text range must seek"
+    );
+    assert!(
+        uses_index(&opcodes(&f, "SELECT id FROM t WHERE w BETWEEN 'B' AND 'd'")),
+        "BINARY text BETWEEN must seek"
+    );
+    assert!(
+        !uses_index(&opcodes(&f, "SELECT id FROM t WHERE wc > 'cherry'")),
+        "NOCASE text range must NOT seek (collation != BINARY)"
+    );
+    assert!(
+        !uses_index(&opcodes(&f, "SELECT id FROM t WHERE w > 5")),
+        "numeric literal on a text column must NOT seek"
+    );
 }

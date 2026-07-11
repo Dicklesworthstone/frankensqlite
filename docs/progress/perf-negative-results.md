@@ -16729,3 +16729,37 @@ test is on the executed path, not merely linked into it.
   numeric columns still scan (kept narrow; text ranges need BINARY-collation seek handling).
 - Provenance: oracle + clippy via rch -j2; `codegen.rs` sha256 in the commit; placeholder A/B median
   pending fleet recovery.
+
+## 2026-07-11 - WIN: text-column index-range seek on BINARY-collated indexes (bd-xiojw)
+
+- Result type: KEPT. Differential gate (vs C SQLite) PASSED (4/4 oracle tests, rch -j3 on ovh-b);
+  landed. Extends the index-range seek to `SELECT ... WHERE <indexed TEXT col> op 'lit'` /
+  `BETWEEN 'a' AND 'm'`.
+- Profile-first: text ranges full-scanned — `index_range_bound_is_seek_safe` declined TEXT
+  comparison affinity (`0x42`). But a text-literal bound on a BINARY-collated text column needs NO
+  coercion: text-vs-text under `P4::None` IS the index's own BINARY order.
+- FIX (codegen.rs): pure gate relaxation — accept TEXT comparison affinity when the collation is
+  None/BINARY (already gated by the leading `collation_p4 == None` check) AND the bound is a text
+  literal (`is_text_literal_bound`). No seek codegen change: the raw text bound + `P4::None`
+  comparison already matches the BINARY index. Non-BINARY collations (NOCASE/RTRIM) fail the
+  collation gate; non-text-literal bounds (numeric literal, placeholder) decline (a TEXT-coercion
+  follow-up).
+- CORRECTNESS: the filter for `w > 'lit'` applies TEXT affinity (no-op, already text) + BINARY
+  comparison (default collation); the seek positions with the raw text bound under `P4::None` =
+  BINARY. Identical row set. NOCASE columns decline (collation != None) and keep the correct scan.
+- SEMANTIC PROOF (hard gate): `index_range_seek_text_binary_matches_sqlite` — BINARY ranges
+  (>, >=, <, BETWEEN, covering, empty, lo>hi), NOCASE ranges (decline, correct), numeric-on-text
+  (decline, correct), ORDER BY exact, a NULL row, mixed-case data where BINARY != NOCASE ordering —
+  all bit-identical to rusqlite. Opcode gate: BINARY text ranges emit IdxRowid; NOCASE +
+  numeric-on-text scan. The existing numeric + placeholder + expression-index differential stays
+  green (4/4). `-p fsqlite-vdbe --lib` clippy clean; fmt clean.
+- MEDIAN: same `codegen_select_index_range_scan` path the numeric literal seek measured at 84.63x
+  (seek vs NOT INDEXED scan); text-range A/B pending fleet recovery (release-profile diagnostic
+  builds stall on the degraded fleet). RETRY: re-run the release-perf diagnostic when the fleet
+  recovers; expect ~85x.
+- FOLLOW-UP: TEXT-coercion for non-text-literal bounds on text columns (numeric literal `w > 5`,
+  placeholder `w > ?`) — emit Affinity 'B'; and NOCASE/RTRIM ranges need a collation-aware seek.
+- Provenance: oracle via rch -j3 (worker ovh-b); clippy via rch -j3; codegen.rs sha256 in the commit.
+- FLEET NOTE: this build took ~8 min to compile under -j3 contention (not a stall — earlier
+  premature kills on the "stale progress" warning were self-sabotage; letting -j2/-j3 builds run to
+  completion is the correct handling on the degraded fleet).

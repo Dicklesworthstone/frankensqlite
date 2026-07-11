@@ -3549,6 +3549,13 @@ fn is_placeholder_bound(expr: &Expr) -> bool {
     )
 }
 
+/// Whether `expr` is a text string literal. A text literal compared against a BINARY-collated
+/// text column needs no coercion — it is already text, and the seek's default `P4::None`
+/// comparison is BINARY (the index's own order) — so the range seek is exact.
+fn is_text_literal_bound(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Literal::String(_), _))
+}
+
 /// Whether the index-range seek can position on `bound_expr` without changing which
 /// rows match relative to the equivalent full-scan filter.
 ///
@@ -3570,6 +3577,11 @@ fn is_placeholder_bound(expr: &Expr) -> bool {
 /// is exact; a non-numeric text/blob bind coerces to a value that seeks empty, exactly as the
 /// filter's numeric comparison excludes it). A TEXT/blob *literal* under NUMERIC affinity still
 /// declines (kept narrow; those are rare and the correct scan is cheap enough).
+///
+/// A TEXT-literal bound on a BINARY-collated text column (TEXT comparison affinity, with the
+/// collation gated to None/BINARY above) is accepted with no coercion — text-vs-text under
+/// `P4::None` is the index's own BINARY order, so it visits exactly the filter's rows. Non-BINARY
+/// collations (NOCASE/RTRIM) and non-text-literal bounds (numeric literal, placeholder) decline.
 fn index_range_bound_is_seek_safe(
     table: &TableSchema,
     table_alias: Option<&str>,
@@ -3583,14 +3595,19 @@ fn index_range_bound_is_seek_safe(
         return false;
     }
     // `cmp_p5 & !0x80` is the comparison affinity (`combine_comparison_affinity`): `0` = no
-    // coercion (always seek-safe), `b'C'` = NUMERIC. Under NUMERIC a numeric literal is already
-    // numeric (identity) and a placeholder is coerced to the column affinity by the seek's
-    // Affinity op, so both are exact; a TEXT/blob literal is not coerced and is declined.
+    // coercion (always seek-safe), `b'C'` = NUMERIC, `b'B'` = TEXT. Under NUMERIC a numeric
+    // literal is already numeric (identity) and a placeholder is coerced to the column affinity
+    // by the seek's Affinity op. Under TEXT (a text column, collation gated to BINARY above) a
+    // text literal is already text and the seek's `P4::None` compare IS BINARY, so it is exact;
+    // a non-text-literal under TEXT (numeric literal, placeholder) would need a TEXT coercion and
+    // is declined.
     let affinity = comparison.cmp_p5 & !0x80;
     if affinity == 0 {
         true
     } else if affinity == u16::from(b'C') {
         is_numeric_literal_bound(bound_expr) || is_placeholder_bound(bound_expr)
+    } else if affinity == u16::from(b'B') {
+        is_text_literal_bound(bound_expr)
     } else {
         false
     }
