@@ -399,6 +399,18 @@ thread_local! {
     // even when the borrow fast path would apply, so an A/B harness can measure the clone cost
     // (clone arm vs borrow arm) within a single build. Off by default; zero cost when off.
     static FSQLITE_FORCE_SCHEMA_CLONE_BENCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    // bd-5310l: set while `compile_with_cache` is fronting a compile (i.e. the compiled-PROGRAM
+    // cache is already keying this SQL). On this path the separate planner-directive cache is
+    // redundant, so `compile_table_select` bypasses it and computes the directive directly (saving
+    // the `to_string` cache-key derivation + lookup + insert). Direct callers of
+    // `compile_table_select` (join/subquery/view paths, unit tests) do NOT set this, so they keep the
+    // planner cache. Save/restore semantics handle the reentrant sqlite_stat1 self.query().
+    static FSQLITE_PROGRAM_CACHE_FRONTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    // bd-5310l benchmark knob: force the planner-directive cache path even when fronted, so the A/B
+    // harness can measure bypass vs cache within one build. Off by default; zero cost when off.
+    static FSQLITE_FORCE_PLANNER_CACHE_BENCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Force the per-compile schema deep-clone path on the current thread (bd-5310l bench A/B only).
@@ -407,6 +419,30 @@ thread_local! {
 /// path, so the clone cost can be measured against the fast path in one process.
 pub fn set_force_schema_clone_bench(enabled: bool) {
     FSQLITE_FORCE_SCHEMA_CLONE_BENCH.with(|c| c.set(enabled));
+}
+
+/// Force the planner-directive cache path even when fronted (bd-5310l bench A/B only).
+///
+/// When `true`, `compile_table_select` uses the planner-directive cache instead of the direct
+/// bypass, so the bypass win can be measured against the cache path in one process.
+pub fn set_force_planner_cache_bench(enabled: bool) {
+    FSQLITE_FORCE_PLANNER_CACHE_BENCH.with(|c| c.set(enabled));
+}
+
+/// RAII guard that marks the current thread as inside a `compile_with_cache` (program-cache-fronted)
+/// compile, restoring the previous value on drop so reentrant compiles (e.g. the `sqlite_stat1`
+/// query) nest correctly.
+struct ProgramCacheFrontedGuard(bool);
+impl ProgramCacheFrontedGuard {
+    fn enter() -> Self {
+        let prev = FSQLITE_PROGRAM_CACHE_FRONTED.with(|c| c.replace(true));
+        Self(prev)
+    }
+}
+impl Drop for ProgramCacheFrontedGuard {
+    fn drop(&mut self) {
+        FSQLITE_PROGRAM_CACHE_FRONTED.with(|c| c.set(self.0));
+    }
 }
 
 /// Test-only hook fired inside `execute_commit_with_cx` for a concurrent commit,
@@ -464,6 +500,10 @@ static FSQLITE_COMPILE_CANONICAL_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_PLANNER_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_CODEGEN_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_FINISH_NS: AtomicU64 = AtomicU64::new(0);
+// bd-5310l planner-dispatch sub-split: `to_string` (planner cache key derivation) and the actual
+// `planner_select_directive_with_stats` compute, isolated from the surrounding cache machinery.
+static FSQLITE_COMPILE_TO_STRING_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PLAN_COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
 // bd-6eyrg.1: Fast-path vs slow-path execution counters.
 static FSQLITE_FAST_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SLOW_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
@@ -1106,6 +1146,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMPILE_PLANNER_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILE_CODEGEN_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILE_FINISH_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_TO_STRING_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PLAN_COMPUTE_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FAST_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SLOW_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_BACKGROUND_STATUS_TIME_NS.store(0, AtomicOrdering::Relaxed);
@@ -1280,6 +1322,17 @@ pub fn reset_hot_path_profile() {
     reset_pager_commit_profile();
     reset_record_profile();
     reset_vdbe_metrics();
+}
+
+/// Planner-dispatch sub-timings in ns (bd-5310l), accumulated while profiling is enabled.
+///
+/// Order: `[to_string (cache-key derivation), plan_compute (directive selection)]`.
+#[must_use]
+pub fn planner_dispatch_ns() -> [u64; 2] {
+    [
+        FSQLITE_COMPILE_TO_STRING_NS.load(AtomicOrdering::Relaxed),
+        FSQLITE_PLAN_COMPUTE_NS.load(AtomicOrdering::Relaxed),
+    ]
 }
 
 /// Compile sub-phase timings in ns (bd-5310l), accumulated while profiling is enabled.
@@ -22439,7 +22492,15 @@ impl Connection {
             FSQLITE_STATEMENT_FIRST_HIT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let start = Instant::now();
-        let program = match compile_fn(self) {
+        // bd-5310l: the compiled-program cache is active and now keys this SQL, so the separate
+        // planner-directive cache is redundant on this path — signal `compile_table_select` to
+        // bypass it. (Not set on the `bypass_compiled_cache` path above, where the planner cache is
+        // the only reuse.)
+        let program = {
+            let _fronted = ProgramCacheFrontedGuard::enter();
+            compile_fn(self)
+        };
+        let program = match program {
             Ok(program) => program,
             Err(error) => {
                 let compile_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -49979,7 +50040,9 @@ impl Connection {
         } else {
             Some(&stat1_row_counts)
         };
+        let pc = hot_path_profile_enabled().then(Instant::now);
         let directive = Self::planner_select_directive_with_stats(select, schema, stat1_arg);
+        record_hot_path_duration(&FSQLITE_PLAN_COMPUTE_NS, pc);
         self.insert_planner_directive_cache(key, canonical_sql, feature_flags, directive.clone());
         directive
     }
@@ -50132,13 +50195,33 @@ impl Connection {
         let prof = hot_path_profile_enabled();
         let feature_flags = PlannerFeatureFlags::default();
         let t = prof.then(Instant::now);
-        let canonical_sql = canonical_select.to_string();
-        let planner_select_directive = self.planner_select_directive_with_cache(
-            canonical_select,
-            &canonical_sql,
-            feature_flags,
-            schema,
-        );
+        // bd-5310l: when the compiled-program cache is fronting this compile (the ad-hoc
+        // query()/execute() path), it already keys this exact SQL, so the separate planner-directive
+        // cache is redundant. Compute the directive directly — same inputs, same
+        // `planner_select_directive_with_stats` -> byte-identical directive -> byte-identical program
+        // — and skip the `to_string` cache-key derivation + lookup + insert. Direct callers of
+        // `compile_table_select` (fronted flag unset) still use the cache.
+        let bypass_planner_cache = FSQLITE_PROGRAM_CACHE_FRONTED.with(std::cell::Cell::get)
+            && !FSQLITE_FORCE_PLANNER_CACHE_BENCH.with(std::cell::Cell::get);
+        let planner_select_directive = if bypass_planner_cache {
+            let stat1_row_counts = self.sqlite_stat1_row_counts();
+            let stat1_arg = (!stat1_row_counts.is_empty()).then_some(&stat1_row_counts);
+            let pc = prof.then(Instant::now);
+            let directive =
+                Self::planner_select_directive_with_stats(canonical_select, schema, stat1_arg);
+            record_hot_path_duration(&FSQLITE_PLAN_COMPUTE_NS, pc);
+            directive
+        } else {
+            let ts = prof.then(Instant::now);
+            let canonical_sql = canonical_select.to_string();
+            record_hot_path_duration(&FSQLITE_COMPILE_TO_STRING_NS, ts);
+            self.planner_select_directive_with_cache(
+                canonical_select,
+                &canonical_sql,
+                feature_flags,
+                schema,
+            )
+        };
         record_hot_path_duration(&FSQLITE_COMPILE_PLANNER_NS, t);
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
@@ -151421,15 +151504,16 @@ mod pager_routing_tests {
 
         let select = parse_select_statement("SELECT val FROM plan_analyze WHERE val = ?1");
         conn.compile_table_select(&select).unwrap();
-        // Two directive entries: one for the user query plus one for the
-        // internal `SELECT tbl, idx, stat FROM sqlite_stat1` query that the
-        // planner runs (via `sqlite_stat1_row_counts`) to consult ANALYZE
-        // statistics. Both share the per-connection directive cache, and
-        // caching the repeated stats query is the intended optimization.
-        assert_eq!(conn.planner_directive_cache_len(), 2);
+        // One directive entry: the user query. This is a DIRECT `compile_table_select` call (not
+        // fronted by the compiled-program cache), so it uses the planner-directive cache. The
+        // internal `SELECT tbl, idx, stat FROM sqlite_stat1` query the planner runs (via
+        // `sqlite_stat1_row_counts`) goes through `query()` -> `compile_with_cache`, so it IS
+        // program-cache-fronted and bypasses the directive cache (bd-5310l) — its plan is reused via
+        // the compiled-program cache instead, not a separate directive entry.
+        assert_eq!(conn.planner_directive_cache_len(), 1);
 
         conn.execute("ANALYZE plan_analyze;").unwrap();
-        // ANALYZE must invalidate every cached directive (user + stats query).
+        // ANALYZE must invalidate every cached directive (the user query directive).
         assert_eq!(conn.planner_directive_cache_len(), 0);
     }
 

@@ -17307,3 +17307,48 @@ test is on the executed path, not merely linked into it.
   sites (stale-snapshot risk), so it needs an audit first.
 - Provenance: correctness via rch -j3 (fsqlite-core --lib, 3343 pass); A/B via rch `--profile
   release-perf` (vmi1149989); clippy + fmt clean; connection.rs sha256 in the commit.
+
+## 2026-07-11 - WIN: bypass the redundant planner-directive cache when the program cache fronts the compile (bd-5310l)
+
+- Result type: KEPT. Correctness gate PASSED (fsqlite-core `--lib`: 3343 pass / 0 fail after one
+  test-expectation update; incl. the planner-cache tests). Median A/B MEASURED under release-perf:
+  **1.39x compile speedup** on the ad-hoc path, null control 0.989x. Byte-identical SQL output by
+  construction. Shipped. This REVIVES the planner-cache lever the prior REJECT entry blocked, via a
+  refinement that resolves the blocker.
+- Profile-first: after the schema-clone lever, the planner-directive step was the dominant remaining
+  compile sub-phase. Its cost is `canonical_select.to_string()` (the cache key, ~0.83us measured) +
+  key hash + lookup + `insert`'s second `sql.to_owned()` copy — i.e. the CACHE MACHINERY, ~1.8us
+  total. The prior REJECT blocked removing it because `compile_table_select` has ~15 direct callers +
+  unit tests that rely on the directive cache.
+- THE REFINEMENT (resolves the blocker): the directive cache is only redundant when the
+  compiled-PROGRAM cache is already keying this SQL — i.e. the ad-hoc `query()/execute()` path via
+  `compile_with_cache`. A thread-local `FSQLITE_PROGRAM_CACHE_FRONTED` (RAII guard set by
+  `compile_with_cache` on its active-cache miss path, NOT the `bypass_compiled_cache` path) lets
+  `compile_table_select` bypass the directive cache ONLY there. The ~15 DIRECT callers + the unit
+  tests do not set the flag, so they keep the directive cache unchanged.
+- FIX (connection.rs): `compile_canonical_select_with_schema` — when fronted (and a bench force-flag
+  is off), compute the directive directly via `sqlite_stat1_row_counts()` +
+  `planner_select_directive_with_stats(...)` (the exact cache-MISS computation) and skip the
+  `to_string` + `planner_select_directive_with_cache` lookup/insert. Guard uses save/restore so the
+  reentrant `sqlite_stat1` `self.query()` nests correctly (and its own `STAT1_LOAD_IN_PROGRESS` guard
+  prevents recursion).
+- CORRECTNESS (byte-identical SQL output): the bypass computes the SAME
+  `planner_select_directive_with_stats(select, schema, stat1)` the cache-miss path caches, so the
+  directive is identical inputs->identical output. Even where a cache HIT would return a directive
+  computed against slightly older stats, a planner directive only chooses an ACCESS PATH — every
+  valid plan returns the identical row set — so query RESULTS are byte-identical regardless. One test
+  (`test_planner_directive_cache_invalidated_by_analyze`) asserted the internal `SELECT ... FROM
+  sqlite_stat1` query's directive is separately cached (len==2); it now goes through the fronted
+  bypass and its plan is reused via the PROGRAM cache instead (len==1) — a benign cache-layer move, no
+  results change, no perf regression (the stats query's program is still cached). Test updated to the
+  new expectation. 3343 lib tests pass.
+- MEDIAN (release-perf, 40 samples x 400 unique compiles/arm, within-build via
+  `set_force_planner_cache_bench`): CACHE arm compile median 6460 ns/stmt (to_string sub 827 ns) vs
+  BYPASS arm 4635 ns/stmt = **1.39x**; null control (bypass vs bypass) 0.989x [4583 vs 4635]; cache
+  cost eliminated ~1825 ns/stmt. Stacks with the schema-clone lever on the ad-hoc compile-miss path.
+  New A/B: `planner_cache_bypass_compile_ab` in `adhoc_parse_plan_profile.rs`; new sub-timers
+  `planner_dispatch_ns()` = `[to_string, plan_compute]`.
+- FOLLOW-UP: the remaining planner cost is `plan_compute` itself (index-info clones in
+  `planner_select_directive_with_stats` — `index.columns.clone()` etc. per index) and the parse phase.
+- Provenance: correctness via rch -j3 (fsqlite-core --lib); A/B via rch `--profile release-perf`;
+  clippy + fmt clean; connection.rs sha256 in the commit.

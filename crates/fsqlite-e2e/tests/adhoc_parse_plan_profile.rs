@@ -19,8 +19,9 @@ use std::time::Instant;
 
 use fsqlite::Connection;
 use fsqlite_core::connection::{
-    HotPathProfileSnapshot, compile_subphase_ns, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_force_schema_clone_bench, set_hot_path_profile_enabled,
+    HotPathProfileSnapshot, compile_subphase_ns, hot_path_profile_snapshot, planner_dispatch_ns,
+    reset_hot_path_profile, set_force_planner_cache_bench, set_force_schema_clone_bench,
+    set_hot_path_profile_enabled,
 };
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -118,6 +119,7 @@ fn profile_unique_sql(conn: &Connection) {
     let wall_ns = t.elapsed().as_nanos();
     let snap = hot_path_profile_snapshot();
     let sub = compile_subphase_ns();
+    let pd = planner_dispatch_ns();
     reset_hot_path_profile();
     set_hot_path_profile_enabled(false);
     report(
@@ -136,6 +138,13 @@ fn profile_unique_sql(conn: &Connection) {
         sub[2] as f64 / nf,
         sub[3] as f64 / nf,
         sub[4] as f64 / nf,
+    );
+    eprintln!(
+        "  PLANNER dispatch split (ns/stmt): to_string={:.1}  plan_compute={:.1}  \
+         cache_machinery={:.1}",
+        pd[0] as f64 / nf,
+        pd[1] as f64 / nf,
+        (sub[2] as f64 - pd[0] as f64 - pd[1] as f64) / nf,
     );
 }
 
@@ -171,7 +180,7 @@ fn schema_clone_vs_borrow_compile_ab() {
     let k = 400usize;
     // Globally-unique literal so every compile is a genuine cache MISS (never repeats a shape+literal).
     let mut lit = 1_000_000_i64;
-    let mut run = |force: bool, lit: &mut i64| -> (f64, f64) {
+    let run = |force: bool, lit: &mut i64| -> (f64, f64) {
         set_force_schema_clone_bench(force);
         set_hot_path_profile_enabled(true);
         reset_hot_path_profile();
@@ -226,6 +235,79 @@ fn schema_clone_vs_borrow_compile_ab() {
         mc - mb,
     );
     eprintln!("########## end schema clone-vs-borrow A/B ##########\n");
+}
+
+/// bd-5310l A/B: the planner-directive cache path vs the fronted bypass, measured WITHIN one build
+/// via `set_force_planner_cache_bench`. On the ad-hoc `query()` path the compiled-program cache
+/// fronts each compile, so the planner-directive cache is redundant; the bypass computes the
+/// directive directly and skips the `to_string` cache-key derivation + lookup + insert. Each arm
+/// compiles DISTINCT unique-literal SQL (compile cache always misses); CACHE arm forces the cache,
+/// BYPASS arm takes the fast path, null control re-runs BYPASS. Gate on median(cache)/median(bypass).
+#[test]
+#[ignore = "A/B bench; run explicitly under --profile release-perf"]
+fn planner_cache_bypass_compile_ab() {
+    let conn = Connection::open(":memory:").expect("open frank");
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, k INTEGER);")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_k ON t(k);").unwrap();
+    for i in 1..=500_i64 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i}', {});", i % 50))
+            .unwrap();
+    }
+
+    let samples = 40usize;
+    let k = 400usize;
+    let mut lit = 1_000_000_i64;
+    let run = |force_cache: bool, lit: &mut i64| -> (f64, f64) {
+        set_force_planner_cache_bench(force_cache);
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+        for _ in 0..k {
+            *lit += 1;
+            let sql = format!("SELECT id, v FROM t WHERE id = {lit}");
+            let _ = conn.query(&sql).unwrap();
+        }
+        let snap = hot_path_profile_snapshot();
+        let pd = planner_dispatch_ns();
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(false);
+        let kf = k as f64;
+        // (total compile ns/stmt, to_string sub-timer ns/stmt — nonzero only on the cache arm)
+        (snap.parser.compile_time_ns as f64 / kf, pd[0] as f64 / kf)
+    };
+
+    let mut cache_ns = Vec::new();
+    let mut cache_ts = Vec::new();
+    let mut bypass_ns = Vec::new();
+    let mut null_ns = Vec::new();
+    for _ in 0..samples {
+        let (c, cts) = run(true, &mut lit);
+        cache_ns.push(c);
+        cache_ts.push(cts);
+        let (b, _) = run(false, &mut lit);
+        bypass_ns.push(b);
+        let (n, _) = run(false, &mut lit);
+        null_ns.push(n);
+    }
+    set_force_planner_cache_bench(false);
+
+    let mc = median(cache_ns);
+    let mb = median(bypass_ns);
+    let mn = median(null_ns);
+    eprintln!("\n########## bd-5310l planner-cache bypass compile A/B ##########");
+    eprintln!(
+        "  {samples} samples x {k} unique compiles/arm:\n    \
+         CACHE arm  compile median = {mc:9.1} ns/stmt   (to_string sub = {:.1} ns)\n    \
+         BYPASS arm compile median = {mb:9.1} ns/stmt\n    \
+         speedup (cache/bypass)    = {:.3}x\n    \
+         null control (bypass vs bypass) = {:.3}x  [{mn:.1} vs {mb:.1}]\n    \
+         cache cost eliminated     = {:.1} ns/stmt",
+        median(cache_ts),
+        mc / mb,
+        mn / mb,
+        mc - mb,
+    );
+    eprintln!("########## end planner-cache bypass A/B ##########\n");
 }
 
 #[test]
