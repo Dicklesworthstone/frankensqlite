@@ -6281,14 +6281,35 @@ fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
     }
 }
 
-fn constant_positive_limit_without_offset(limit_clause: &LimitClause) -> Option<usize> {
-    if limit_clause.offset.is_some() {
-        return None;
-    }
-    match &limit_clause.limit {
-        Expr::Literal(Literal::Integer(limit), _) if *limit > 0 => usize::try_from(*limit).ok(),
-        _ => None,
-    }
+/// Maximum `LIMIT + OFFSET` for which the bounded top-N sorter is applied when an OFFSET is present.
+/// The sorter is a sorted `Vec` (O(N) insert), so a very large top-N retention (deep pagination on a
+/// large table) would regress vs a full sort; beyond this we fall back to the full sort (unchanged).
+/// Typical pagination stays well under it. bd-5310l.
+const MAX_TOP_N_BOUND_WITH_OFFSET: usize = 1024;
+
+/// Tightest bounded top-N sorter retention for `LIMIT <l> [OFFSET <o>]`.
+///
+/// The sorter need only keep the `l + o` best rows because pass 2 skips `o` then emits `l` — the
+/// retained set is byte-identical to a full sort followed by the same LIMIT/OFFSET. A bare
+/// `LIMIT <l>` returns exactly `l` (unchanged, uncapped). When an OFFSET is present, both must be
+/// constant non-negative integer literals and `l + o <= MAX_TOP_N_BOUND_WITH_OFFSET`; otherwise
+/// `None` (full sort). bd-5310l.
+fn constant_positive_top_n_bound(limit_clause: &LimitClause) -> Option<usize> {
+    let limit = match &limit_clause.limit {
+        Expr::Literal(Literal::Integer(limit), _) if *limit > 0 => usize::try_from(*limit).ok()?,
+        _ => return None,
+    };
+    let Some(offset_expr) = limit_clause.offset.as_ref() else {
+        return Some(limit);
+    };
+    let offset = match offset_expr {
+        Expr::Literal(Literal::Integer(offset), _) if *offset >= 0 => {
+            usize::try_from(*offset).ok()?
+        }
+        _ => return None,
+    };
+    let bound = limit.checked_add(offset)?;
+    (bound <= MAX_TOP_N_BOUND_WITH_OFFSET).then_some(bound)
 }
 
 /// Emit a guard that jumps to `done_label` when the LIMIT register is zero.
@@ -6332,7 +6353,7 @@ fn codegen_select_ordered_scan(
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
     let top_n_limit = if distinct == Distinctness::All {
-        limit_clause.and_then(constant_positive_limit_without_offset)
+        limit_clause.and_then(constant_positive_top_n_bound)
     } else {
         None
     };

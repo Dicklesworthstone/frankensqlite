@@ -17620,3 +17620,36 @@ test is on the executed path, not merely linked into it.
   (cursor-open + seek + scan). Recommended as the next CHARTERED perf project (with a correctness gate:
   the returned pages must be immutable-shared, writers must COW). Still not a micro-lever; the clean
   byte-identical single-lever campaign remains complete at 4 shipped wins.
+
+## 2026-07-11 - WIN: `ORDER BY … LIMIT l OFFSET o` bounds the top-N sorter to `l+o` retained rows (was a FULL sort) — 2.4–2.9× on paginated sorts, byte-exact (bd-sorter-limit-offset-bound-yasx5)
+
+- Result type: WIN / shipped. A fresh codegen lever under bd-5310l, found by profiling the sorter
+  lane (`sorter_limit_profile.rs`).
+- THE MISS: the bounded top-N sorter (SorterOpen p3 = `top_n_limit`, engine keeps only the N best via
+  sorted-Vec insert) was applied ONLY to a bare `LIMIT <l>` with NO offset
+  (`constant_positive_limit_without_offset` bailed the moment an OFFSET was present). So the very
+  common pagination shape `ORDER BY x LIMIT 10 OFFSET 100` fell to a FULL sort of the whole result
+  then a pass-2 truncate — O(n log n) + n rows of sorter memory, when only the top `l+o` are ever
+  emitted.
+- THE LEVER (one function): replaced it with `constant_positive_top_n_bound`, which returns the
+  tightest retention: bare `LIMIT l` → `l` (unchanged); `LIMIT l OFFSET o` → `l + o` when both are
+  constant non-negative integer literals and `l + o <= MAX_TOP_N_BOUND_WITH_OFFSET` (=1024). Pass 2
+  already skips `o` (IfPos) then emits `l` (DecrJumpZero), so retaining exactly the `l+o` best rows is
+  byte-identical to a full sort followed by the same OFFSET/LIMIT. Only the call site in
+  `codegen_select_ordered_scan` changed.
+- THE CAP (why 1024): the sorter is a sorted `Vec` with O(N) insert, so a very large retention (deep
+  pagination on a big result — `OFFSET 100000`) would regress vs a plain full sort. Beyond the cap we
+  return `None` → the unchanged full-sort path. Typical UI pagination stays far under it.
+- BYTE-EXACT GATE (`crates/fsqlite/tests/sorter_limit_offset_oracle.rs`, PASS): 13 cases vs C SQLite
+  (rusqlite) on a 2002-row tie-heavy table (50 distinct `v`, +2 NULL rows), deterministic
+  `ORDER BY v, id` — bounded, at-the-cap (l+o=1024), over-cap (1025, 5010 → full-sort fallback),
+  ASC/DESC, multi-key, NULLs, LIMIT 0 — all bit-identical. Plus an OPCODE gate: `SorterOpen` p3 = 110
+  for `LIMIT 10 OFFSET 100`, 0 (unbounded) for the over-cap `OFFSET 5000`, 10 for bare `LIMIT 10`.
+- NO-REGRESSION: `fsqlite-vdbe --lib` sorter suite 25/25 pass (incl. `test_sorter_top_n_limit_*`).
+- MEDIAN (release-perf, 2000 iters, 10k-row unindexed `ORDER BY v`): FULL sort 14.81 ms;
+  `LIMIT 10 OFFSET 100` (bounded) 5.11 ms = **2.90×**; `LIMIT 10 OFFSET 500` (bounded) 6.11 ms =
+  **2.42×**; `LIMIT 10 OFFSET 5000` (over cap) 11.56 ms = 1.28× (correctly the full-sort fallback).
+  Bounded pagination now costs ≈ a bare `LIMIT` (4.84 ms), not a full sort.
+- clippy `-p fsqlite-vdbe --lib -p fsqlite --tests` clean; fmt clean.
+- NET: the 5th shipped byte-exact codegen win in this series (after the index-driven ORDER BY
+  eliminations). Diagnostic retained: `sorter_limit_profile.rs`.
