@@ -17501,3 +17501,38 @@ test is on the executed path, not merely linked into it.
   schema-clone borrow 6.52x; planner-cache bypass 1.39x; interner retained_bytes 1.22x). The clean
   front-end AND storage micro-levers are now both harvested. Recommend the next effort be a chartered
   structural/MVCC project rather than another micro-lever sweep.
+
+## 2026-07-11 - PROFILE (DML lane): no O(n^2); INSERT/DELETE/same-width-UPDATE are all O(1) and fast; growing-record UPDATE is inherent delete+insert (bd-5310l follow-on)
+
+- Result type: SURFACE / profile-first audit of the bulk DML path (the bead's OTHER gap: 10000
+  INSERTs in one txn = 11.5s vs sqlite3 39ms ~295x). New reusable diagnostic:
+  `crates/fsqlite-e2e/tests/bulk_insert_scaling.rs` (bucketed ns/op detects O(n^2) vs constant
+  overhead; prepared arms isolate storage execute from compile-miss).
+- FINDING (dev build, 20000 ops/txn, ns/op per 2000-op bucket — the SCALING PATTERN is what matters,
+  not the unoptimized-dev absolute ns):
+  - PREPARED INSERT: FLAT ~4000 ns/insert (slightly DECREASING as it warms). O(1). No pathology.
+  - AD-HOC unique INSERT: FLAT ~34000 ns/insert — dominated by the UNIQUE-SQL compile-miss (the same
+    front-end cost the 4 shipped levers already attacked), not the storage insert. O(1).
+  - PREPARED DELETE by PK: FLAT ~2900 ns/delete. O(1). Fast.
+  - PREPARED same-width UPDATE by PK: FLAT ~2000-2500 ns/update — AS FAST AS DELETE. The in-place
+    overwrite fast path (`table_overwrite_current_payload_same_size_no_overflow`) engages.
+  - PREPARED growing-record UPDATE by PK (a: 0 -> multi-byte): ~7000-15000 ns/update — ~3-5x the
+    same-width update. This is NOT a bug: a size-CHANGING record cannot overwrite in place, so it
+    goes delete + `table_insert_prechecked_absent` (which already reuses the cursor position to avoid
+    a second root-to-leaf seek). SQLite does the same delete+insert for size-changing updates.
+- CONCLUSION: the DML fast paths are mature/optimized — O(1) per op, no O(n^2), append-hint inserts,
+  in-place same-size overwrite, prechecked re-insert, Cow subquery resolution, borrowed schema in
+  `compile_table_insert`. The ~295x the bead saw is CONSTANT per-op overhead (compile-miss for ad-hoc
+  + the systemic MVCC/pager storage cost + CLI I/O), not a per-op pathology, and the compile-miss half
+  is exactly what the 4 shipped levers reduced.
+- ONLY candidate lever found (deferred, NOT a clean quick lever): a B-tree "grow-in-place-if-fits"
+  path — when a growing record still fits the page's free space, defragment + resize the cell in place
+  instead of delete+insert (what SQLite does). Real byte-identical win for growing-record UPDATE
+  workloads (counters crossing byte boundaries, text append), bounded to the `fsqlite-btree` cursor
+  (reliably measurable), but it is correctness-sensitive page-layout manipulation — a dedicated
+  chartered btree task, not a one-pass micro-lever.
+- CROSS-LANE CONVERGENCE: front-end (parse/compile/dispatch) + storage (btree/record/column) + DML
+  (insert/update/delete) profile-first audits are ALL complete; every per-statement hot path is O(1)
+  and optimized. The remaining single-thread perf is systemic (MVCC read-path) or structural (JIT
+  bd-lezm3, parallel SELECT bd-b434d, arena) or the deferred btree grow-in-place. The clean
+  micro-lever era for this codebase is over; the next work is a chartered project.
