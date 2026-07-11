@@ -17568,3 +17568,31 @@ test is on the executed path, not merely linked into it.
   (4 wins shipped). Further single-thread perf requires a CHARTERED project: JIT (bd-lezm3),
   parallel SELECT (bd-b434d), an AST/planner arena, or a dedicated MVCC read-path optimization -
   none of which is a one-pass micro-lever, and the last is byte-identical-risky.
+
+## 2026-07-11 - PROFILE REFINEMENT: the residual execute_body cost is a FIXED per-op cursor-open+seek (tree-depth-INDEPENDENT), = the MVCC/pager cursor abstraction price, not seek-descent (bd-5310l)
+
+- Result type: SURFACE / refinement of the execute_body characterization. Extended
+  `execute_body_split.rs` with a 1-row table so a point MISS isolates the FIXED cursor-open cost from
+  the per-level B-tree descent.
+- FINDING (release-perf, slower worker so absolute ns ~2x the prior run, but the COMPARISON holds):
+  `SELECT 1` execute_body 5050 ns; MISS on a 1-ROW table 9534 ns; MISS on a 5000-ROW table 9591 ns;
+  HIT 11884 ns. The 1-row and 5000-row MISS are within ~0.6% of each other -> B-tree DESCENT DEPTH IS
+  IRRELEVANT. The ~4484 ns (MISS - SELECT 1) is a FIXED per-statement cursor-open + seek-setup cost,
+  independent of tree size; the descent (interior->leaf page accesses) is effectively free (pager-cached,
+  cheap comparisons).
+- WHAT THIS RULES IN/OUT:
+  - NOT the seek descent / per-page MVCC version-chain walk (that would scale with depth; it does not).
+  - NOT cursor RETENTION across statements: C SQLite also opens+seeks per separate statement (no
+    cross-statement read-cursor retention) yet does it in ~0.5us; fsqlite's ~4.5us is ~9x. So the gap
+    is the PER-OPERATION cost of fsqlite's layered cursor (StorageCursor -> BtCursor -> pager -> MVCC
+    visibility + txn cx setup), not a missing reuse. (`open_storage_cursor` already reuses a retained
+    cursor when cursor_id+root match, and `reset_for_reuse_ex(retain_cursors=true)` exists for the DML
+    fast lanes.)
+  - IT IS the fixed abstraction/setup cost of opening a page-version-chain-backed cursor and doing one
+    seek: the price of the MVCC design. Reducing it means flattening/optimizing the MVCC+pager cursor
+    open path - byte-identical-RISKY (visibility/cursor semantics), a deep chartered storage effort.
+- BOTTOM LINE (unchanged, now sharper): the ~9x single-thread execute_body gap vs C SQLite is the
+  per-operation MVCC/pager cursor abstraction overhead, tree-depth-independent, dominated by cursor
+  OPEN + one seek. No clean byte-identical micro-lever. The next real work is a chartered MVCC/storage
+  cursor-path optimization (or a structural JIT/parallel project) - both require a correctness charter,
+  not a one-pass lever. Reliable diagnostic: `crates/fsqlite/tests/execute_body_split.rs`.

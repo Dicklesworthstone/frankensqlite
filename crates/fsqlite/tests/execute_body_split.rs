@@ -47,11 +47,20 @@ fn execute_body_hit_vs_miss() {
         ))
         .unwrap();
     }
+    // Tiny 1-row table: a MISS here does cursor-open + a ~1-level seek, isolating the fixed
+    // cursor-open cost from the per-level B-tree descent that the 5000-row MISS pays.
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO s VALUES (1, 'only');").unwrap();
     let n = 200_000u64;
     let cases = [
         ("SELECT 1 (no cursor)", "SELECT 1"),
         (
-            "point MISS (id absent)",
+            "MISS tiny table (1 row)",
+            "SELECT id, v FROM s WHERE id = 9999999",
+        ),
+        (
+            "point MISS (5000 rows)",
             "SELECT id, v FROM t WHERE id = 9999999",
         ),
         (
