@@ -74,10 +74,9 @@ fn sorter_top_n(conn: &Connection, sql: &str) -> Option<i64> {
 fn ordered_limit_offset_bounded_matches_sqlite() {
     let f = Connection::open(":memory:").expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
-    for s in ["CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, k INTEGER);"] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
+    let create = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, k INTEGER);";
+    f.execute(create).unwrap();
+    r.execute_batch(create).unwrap();
     // Tie-heavy v (only 50 distinct values across 2000 rows) so the bounded top-N tie handling is
     // exercised; ORDER BY v, id gives a deterministic total order (id is unique).
     for i in 1..=2000_i64 {

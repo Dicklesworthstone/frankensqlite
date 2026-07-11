@@ -30455,7 +30455,11 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_index_range_with_numeric_affinity_falls_back() {
+    fn test_codegen_select_index_range_with_numeric_affinity_uses_index() {
+        // bd-u6tbr enabled the placeholder-bound numeric-affinity range seek: the bound is coerced
+        // to the column's affinity ('D') so the seek positions identically to the WHERE comparison,
+        // making the index-range fast path byte-exact (differential oracle: index_range_seek_oracle_e2e).
+        // (Was previously asserted to "fall back" to a full scan; bd-u6tbr made that assertion stale.)
         let stmt = simple_select(
             &["n"],
             "t",
@@ -30472,14 +30476,20 @@ mod tests {
         let ops = prog.ops();
 
         assert!(
-            ops.iter()
-                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
-            "typed numeric range should stay on the generic full-scan path until seek semantics match WHERE coercion"
+            ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_n")),
+            "numeric-affinity placeholder range should use the index-range seek (bd-u6tbr)"
         );
         assert!(
-            !ops.iter().any(|op| op.opcode == Opcode::OpenRead
-                && matches!(&op.p4, P4::Index(name) if name == "idx_t_n")),
-            "unsafe affinity semantics should not use the index-range fast path"
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "the index-range seek must not fall back to a full table scan (Rewind on cursor 0)"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Affinity
+                    && matches!(&op.p4, P4::Affinity(a) if a == "D")),
+            "the placeholder bound should be coerced to the column's numeric affinity before the seek"
         );
     }
 
