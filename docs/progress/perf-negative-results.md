@@ -36,6 +36,73 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-11 - HOLD: composite-DESC probe decode is below the remote median floor
+
+- Target at baseline `93b4d2b9`: the freshly reachable prepared composite-DESC
+  runtime loop landed by
+  `57d71d0e`: `IdxLE`/`IdxLT -> Column/IdxRowid/ResultRow -> Prev` for
+  a prepared `a = ?1 AND b > ?2` query ordered by `b DESC, id DESC`. Planner
+  and codegen remained peer-owned and untouched. The screened
+  one-lever candidate would have cached the decoded `IdxLE`/`IdxLT` P3 probe in
+  the storage cursor, with an exact `Arc<[u8]>` identity key, so repeated rows
+  would not reparse an immutable bound record.
+- Profile-first evidence: a temporary in-place Criterion arm put its 20,000-row
+  fixture and statement preparation outside the timed closure. The symbolized
+  build completed strictly remotely on `ovh-b` via `RCH_REQUIRE_REMOTE=1 env
+  -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -j3 -p
+  fsqlite-e2e --bench operation_baseline_bench --no-run`; no local Cargo
+  command or fallback ran. The frozen baseline binary SHA-256 was
+  `60cec96f98966192e4793f7f35d7768523590d4c177ce3c0a51be5608e6e58af`.
+- The CPU-2 `cycles:u` capture on `ovh-b` retained 63,954 samples over the full
+  process and zero lost. The final Criterion profile-time slice
+  `16816658.5..16816688.9` excluded fixture construction and retained 30K
+  query-loop samples. In that slice, all `parse_record_into` work was `6.40%`
+  self-time, but caller attribution split it into required current-index-record
+  decoding (`4.76%`) and only `1.25%` directly under the `IdxLE`/`IdxLT`
+  interpreter arm. The next independent candidates were smaller:
+  `index_collations_for_cursor` plus `index_desc_flags_for_cursor` were 0.43%
+  plus 0.28%, while `BtCursor::advance_prev` plus `CursorBackend::prev` were
+  0.43% plus 0.13%. Raw remote evidence:
+  `/data/projects/frankensqlite-cod-vdbe-runtime-20260711T1200Z/.rch-target-ovh-b-pool-8564f8763366286edd3f03492c0cac40/op-composite-desc-seek-93b4d2b9.perf.data`,
+  SHA-256 `185a327c081dc9ebd1fda467c10894830951848db2d12331e89611ced3475169`.
+- Median gate: the same frozen binary, worker, CPU, exact benchmark, 3-second
+  warmup, 10-second measurement, and 60 samples produced these retrieved
+  Criterion `median` estimates:
+
+  | A/A run | median | median 95% interval | interval span / median |
+  |---|---:|---:|---:|
+  | baseline 1 | `462428.941 ns` | `[452496.066, 468760.879] ns` | `3.517%` |
+  | baseline 2 | `506059.637 ns` | `[491427.065, 525994.322] ns` | `6.831%` |
+
+  The second/first median ratio was `1.094351x` (`9.435%` drift). Even deleting
+  the entire measured target-probe decode frame could save at most `1.25%`, so
+  the candidate cannot clear either interval span or the same-binary A/A floor
+  on this substrate. Its detectability-adjusted opportunity score is below the
+  required `Impact * Confidence / Effort >= 2.0` threshold.
+- Result: frontier hold before production mutation. The temporary benchmark arm
+  was manually removed and its file restored byte-for-byte to HEAD (SHA-256
+  `520b13d1ddfb37bca82eb1a4e33dfada59babbc4fd3742d7bb5bcd3815799ef3`).
+  B-tree, pager, VDBE runtime, planner, codegen, tests, snapshots, and golden
+  files did not change. `engine.rs` remains SHA-256
+  `a21a109b1a0a2aa7ca501c5819c2e02b0ff8c03de59040e0e1b291e555918884`,
+  so emitted bytecode and SQL result behavior are unchanged by this hold.
+- Correctness proof stayed fail-closed remote-only. On `vmi1156319`,
+  `cargo test --profile release-perf -j3 -p fsqlite-vdbe --test
+  golden_bytecode_snapshots -- --test-threads=1` passed all 8 golden families.
+  Two release-perf attempts at the exact result oracle then hit RCH's 1,800-second
+  SSH timeout (`RCH-E104`) while the fleet reported degraded posture (9/12
+  workers healthy); RCH explicitly refused local fallback both times. The same
+  exact oracle, built without release LTO but still via `RCH_REQUIRE_REMOTE=1
+  env -u CARGO_TARGET_DIR rch exec -- cargo test`, completed on `vmi1227854`:
+  `index_range_seek_composite_prefix_matches_sqlite` passed 1/1 with 0 failures
+  and 7 tests filtered out. No local Cargo command ran.
+- Retry only with a one-binary interleaved current/candidate/null median gate
+  whose null floor is below `1.25%`, or when a fresh profile moves direct probe
+  decoding above the median floor. The exact safe candidate is a per-storage-
+  cursor strong `Arc<[u8]>` identity cache that invalidates on every alternate
+  target-buffer decode and installs identity only after successful parsing; do
+  not substitute register-number, raw-pointer, or hash-only keys.
+
 ## 2026-07-11 - NON-CANDIDATE: post-reset runtime/storage profiles expose only closed commit families
 
 - Target: one fresh profile-ranked lever in B-tree, pager, or VDBE runtime
