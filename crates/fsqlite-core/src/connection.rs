@@ -123352,6 +123352,7 @@ mod transaction_lifecycle_tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("drop-skip-checkpoint.db");
         let db_str = db_path.to_string_lossy().to_string();
+        let wal_path = std::path::PathBuf::from(format!("{db_str}-wal"));
 
         let conn = Connection::open(&db_str).unwrap();
         conn.execute("PRAGMA journal_mode=WAL;").unwrap();
@@ -123359,12 +123360,27 @@ mod transaction_lifecycle_tests {
         conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
         conn.execute("INSERT INTO t VALUES (42)").unwrap();
 
-        fsqlite_wal::GLOBAL_WAL_METRICS.reset();
-        drop(conn);
+        let database_len_before_drop = std::fs::metadata(&db_path).unwrap().len();
+        let wal_len_before_drop = std::fs::metadata(&wal_path).unwrap().len();
         assert_eq!(
-            fsqlite_wal::GLOBAL_WAL_METRICS.snapshot().checkpoint_count,
-            0,
-            "Drop must not force a passive checkpoint"
+            database_len_before_drop,
+            u64::from(PageSize::DEFAULT.get()),
+            "the table root must still live only in the WAL before Drop"
+        );
+        assert!(
+            wal_len_before_drop > 0,
+            "committed state must remain in a non-empty WAL before Drop"
+        );
+        drop(conn);
+
+        assert_eq!(
+            std::fs::metadata(&db_path).unwrap().len(),
+            database_len_before_drop,
+            "Drop must not backfill the new table root into the main database"
+        );
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() >= wal_len_before_drop,
+            "Drop may flush retained commits, but must not remove the WAL needed for recovery"
         );
 
         let reopened = Connection::open(&db_str).unwrap();
