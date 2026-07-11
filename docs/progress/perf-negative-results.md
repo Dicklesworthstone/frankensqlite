@@ -36,6 +36,68 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-11 - SURFACE: prepared ORDER BY/LIMIT bypasses the assigned runtime/storage lane
+
+- Target at `d9e9b811`: find one fresh, output-identical lever in B-tree,
+  pager, or VDBE runtime while planner/codegen and the peer-active
+  `connection.rs` work remained out of scope. The requested
+  `docs/NEGATIVE_EVIDENCE.md` path does not exist in this repository, so this
+  authoritative ledger was the negative-evidence gate. `bv --robot-triage`
+  completed with data hash `6f290f9d4cb8ec2a`; its best scoped pager item,
+  `bd-wee9a`, is the already-ledgered architectural Phase-A mutex redesign,
+  not a safe one-lever microchange. The fresh real-SQL substrate was the
+  prepared `read_order_limit_10/frankensqlite` arm: 1,000 scanned rows,
+  runtime ORDER BY/LIMIT, only 10 output rows, and fixture plus preparation
+  outside the timed closure.
+- Strict remote build: RCH reported degraded posture (9/12 workers healthy,
+  48/76 slots available), which was surfaced before the build. With local
+  fallback forbidden, `RCH_WORKER=ovh-b RCH_REQUIRE_REMOTE=1 env -u
+  CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -j3 -p
+  fsqlite-e2e --bench read_heavy_bench --no-run` completed on `ovh-b` in
+  23m23s. The symbolized, unstripped frozen binary was
+  `/data/projects/frankensqlite-cod-next-20260711T1609Z/.rch-target-ovh-b-pool-8844b7ced20b668182808f6bbabe4b57/read_heavy_bench-baseline-d9e9b811`,
+  SHA-256 `3d0b2618d5b1fa274a6258a374f1b816218399d585eabf7644c383fca5ec6465`.
+- Median gate: two paired runs used that exact binary, worker, CPU 2, 50
+  samples, 3-second warmup, and 10-second measurement. Values are retrieved
+  Criterion median estimates and 95% median intervals:
+
+  | round | arm | median | median 95% interval | interval span / median |
+  |---|---|---:|---:|---:|
+  | A1 | FSQLite | `62993.056 ns` | `[62641.758, 63721.940] ns` | `1.715%` |
+  | A2 | FSQLite | `62405.263 ns` | `[62245.138, 62594.424] ns` | `0.560%` |
+  | A1 | C SQLite null | `252302.891 ns` | `[251704.115, 253277.200] ns` | `0.623%` |
+  | A2 | C SQLite null | `268227.568 ns` | `[267322.552, 270040.138] ns` | `1.013%` |
+
+  FSQLite A/A drift was `0.942%`; the paired C SQLite null drift was
+  `6.312%`, establishing the conservative substrate floor before any candidate.
+- Profile-first attribution: the CPU-2 `cycles:u`, 999 Hz, frame-pointer
+  capture retained 30,763 full-process samples. The final query-loop slice
+  `16827787.221352..16827817.221352` retained 29K samples with zero lost.
+  Raw evidence:
+  `/data/projects/frankensqlite-cod-next-20260711T1609Z/.rch-target-ovh-b-pool-8844b7ced20b668182808f6bbabe4b57/read_order_limit_10-frankensqlite-d9e9b811.perf.data`,
+  SHA-256 `fee9486d8673885b2f1096ac41085f63379a504667b5b5fc1f578a5d515ae3e7`.
+  Query-slice self-time was `34.48%` in `SqliteValue::cmp`, `20.47%` in
+  `memmove` under the prepared-query fast path, `20.02%` in
+  `Connection::insert_prepared_order_by_limit_winner`, `18.97%` in
+  `Connection::try_execute_prepared_query_fast_path`, and `4.80%` in
+  `SqliteValue` drop glue. No B-tree, pager, or VDBE-runtime symbol reached
+  the `0.10%` reporting threshold: the timed query bypasses the assigned lane.
+- Result: surfaced before production mutation. The only measurable lever is
+  in the peer-active core fast path, while every assigned-layer opportunity
+  has a zero measured ceiling on this workload and therefore cannot clear the
+  `6.312%` median/null floor. No source, benchmark, test, snapshot, or golden
+  file changed. VDBE engine, B-tree cursor, pager, and the benchmark remained
+  byte-identical at SHA-256 `a21a109b1a0a2aa7ca501c5819c2e02b0ff8c03de59040e0e1b291e555918884`,
+  `4f28e9daf03d749e6c11ea9cf36ab1bb7bd271c86fc19d1882c98316ac3bcd38`,
+  `5964ee2088f86b664555b2a30ed3e462f7f8f12e83a063e2c74c6977497b0f9e`,
+  and `dc0b8fedbb282406e6fde653db55d33fdccbe3d73367cff1441925333934bd2c`.
+  No local Cargo command or fallback ran.
+- Retry only with a prepared benchmark whose symbolized timed loop proves
+  nonzero B-tree/pager/VDBE reachability above its paired median/null floor,
+  or after a separate assignment opens the core ORDER-BY/LIMIT winner
+  container and the peer's `connection.rs` work has landed. A core retry must
+  preserve comparator semantics, ties, row ordering, and exact result bytes.
+
 ## 2026-07-11 - HOLD: composite-DESC probe decode is below the remote median floor
 
 - Target at baseline `93b4d2b9`: the freshly reachable prepared composite-DESC
