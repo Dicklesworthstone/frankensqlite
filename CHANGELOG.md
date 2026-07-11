@@ -43,6 +43,10 @@ no breaking API changes.
   `IS NULL`/`IS NOT NULL` without changing precedence.
 - The C API's active-statement accounting remains warning-free on current
   nightly while retaining the workspace's Rust 1.85 MSRV.
+- Windows WAL shared-memory mappings now retain their explicitly shared
+  backing across handles and region growth. This restores cross-handle write
+  visibility after `ShmRegion::clone()` became a deliberate deep-copy API and
+  prevents resized mappings from diverging into detached heap buffers.
 
 ### Security
 

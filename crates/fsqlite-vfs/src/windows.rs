@@ -1029,11 +1029,13 @@ impl VfsFile for WindowsFile {
                 let mut state = shm_state
                     .lock()
                     .map_err(|_| lock_poisoned("windows shm state"))?;
-                let existing = state.regions.get(&region).cloned().ok_or_else(|| {
-                    FrankenError::CannotOpen {
+                let existing = state
+                    .regions
+                    .get(&region)
+                    .map(ShmRegion::share)
+                    .ok_or_else(|| FrankenError::CannotOpen {
                         path: self.shm_path.clone(),
-                    }
-                })?;
+                    })?;
                 if existing.len() < size_usize {
                     return Err(FrankenError::LockFailed {
                         detail: format!(
@@ -1083,7 +1085,7 @@ impl VfsFile for WindowsFile {
                     vacant.insert(ShmRegion::new(size_usize))
                 }
             };
-            region_ref.clone()
+            region_ref.share()
         };
 
         debug!(
