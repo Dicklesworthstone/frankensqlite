@@ -39,12 +39,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Full closure of version-carrying dependencies of the `fsqlite`
-          # crate, in topological (normal-dependency) order. Every crate here
-          # must be published for `fsqlite-core`/`fsqlite` to be installable
-          # at the new version — the previous 6-crate list only worked while
-          # the remaining crates had been published manually at the same
-          # version.
+          # Every publishable workspace crate, in topological
+          # (normal-dependency) order. Keep the user-facing CLI, C API, and
+          # WASM packages in the release set too; otherwise a tag can report
+          # success while those public packages remain on an older version.
           crates=(
             fsqlite-error
             fsqlite-types
@@ -68,6 +66,9 @@ jobs:
             fsqlite-ext-misc
             fsqlite-core
             fsqlite
+            fsqlite-cli
+            fsqlite-c-api
+            fsqlite-wasm
           )
 
           version="${TAG_NAME#v}"
@@ -77,6 +78,22 @@ jobs:
           fi
 
           cargo metadata --no-deps --format-version 1 > /tmp/cargo-metadata.json
+
+          mapfile -t publishable_crates < <(
+            jq -r '
+              .packages[]
+              | select(.publish == null or (.publish | length) > 0)
+              | .name
+            ' /tmp/cargo-metadata.json | sort
+          )
+          mapfile -t configured_crates < <(printf '%s\n' "${crates[@]}" | sort)
+          if ! diff -u \
+            <(printf '%s\n' "${publishable_crates[@]}") \
+            <(printf '%s\n' "${configured_crates[@]}"); then
+            echo "Publish sequence must contain every publishable workspace crate exactly once." >&2
+            exit 1
+          fi
+
           for crate in "${crates[@]}"; do
             crate_version="$(jq -r --arg crate "${crate}" '.packages[] | select(.name == $crate) | .version' /tmp/cargo-metadata.json)"
             if [[ -z "${crate_version}" || "${crate_version}" == "null" ]]; then
