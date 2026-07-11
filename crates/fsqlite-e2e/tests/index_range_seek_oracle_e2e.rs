@@ -459,4 +459,56 @@ fn index_range_seek_text_binary_matches_sqlite() {
         !uses_index(&opcodes(&f, "SELECT id FROM t WHERE w > 5")),
         "numeric literal on a text column must NOT seek"
     );
+
+    // A placeholder bound on a BINARY text column now seeks via a runtime Affinity 'B' coercion;
+    // every bind type must stay bit-identical to the full-scan filter (a numeric bind becomes its
+    // text form; a blob seeks past the text keys, empty, exactly as the filter excludes it).
+    let cmp_bound = |sql: &str, params: &[SqliteValue]| {
+        assert_eq!(
+            frank_bound(&f, sql, params),
+            sqlite_bound(&r, sql, params),
+            "text placeholder range diverged for `{sql}` with {params:?}"
+        );
+    };
+    let binds = [
+        SqliteValue::Text("Cherry".into()),
+        SqliteValue::Text("cherry".into()),
+        SqliteValue::Text("B".into()),
+        SqliteValue::Text("".into()),
+        SqliteValue::Integer(5),
+        SqliteValue::Float(2.5),
+        SqliteValue::Blob(vec![0x62, 0x62].into()),
+        SqliteValue::Null,
+    ];
+    for sql in [
+        "SELECT id FROM t WHERE w > ?1",
+        "SELECT id FROM t WHERE w >= ?1",
+        "SELECT id FROM t WHERE w < ?1",
+        "SELECT id, w FROM t WHERE w <= ?1",
+        // NOCASE column with a placeholder: declines the BINARY seek, still correct.
+        "SELECT id FROM t WHERE wc > ?1",
+    ] {
+        for b in &binds {
+            cmp_bound(sql, std::slice::from_ref(b));
+        }
+    }
+    cmp_bound(
+        "SELECT id, w FROM t WHERE w BETWEEN ?1 AND ?2",
+        &[SqliteValue::Text("B".into()), SqliteValue::Text("d".into())],
+    );
+
+    // Opcode gate: BINARY text placeholder seeks (IdxRowid + Affinity); NOCASE placeholder scans.
+    let ph_ops = opcodes(&f, "SELECT id FROM t WHERE w > ?1");
+    assert!(
+        uses_index(&ph_ops),
+        "BINARY text placeholder range must seek"
+    );
+    assert!(
+        ph_ops.iter().any(|o| o == "Affinity"),
+        "text placeholder must carry an Affinity coercion; ops = {ph_ops:?}"
+    );
+    assert!(
+        !uses_index(&opcodes(&f, "SELECT id FROM t WHERE wc > ?1")),
+        "NOCASE text placeholder must NOT seek"
+    );
 }

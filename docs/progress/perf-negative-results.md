@@ -16763,3 +16763,32 @@ test is on the executed path, not merely linked into it.
 - FLEET NOTE: this build took ~8 min to compile under -j3 contention (not a stall — earlier
   premature kills on the "stale progress" warning were self-sabotage; letting -j2/-j3 builds run to
   completion is the correct handling on the degraded fleet).
+
+## 2026-07-11 - WIN: text-placeholder index-range seek via Affinity 'B' coercion (bd-v79yz)
+
+- Result type: KEPT. Differential gate (vs C SQLite, WITH BOUND PARAMS) PASSED (4/4 oracle tests,
+  rch -j3); landed. Symmetric completion of the range-seek family — placeholder bounds on a
+  BINARY-collated TEXT column (`SELECT ... WHERE <text col> op ?` / `BETWEEN ? AND ?`) now seek,
+  mirroring the numeric-placeholder lever (bd-u6tbr).
+- Profile-first: bd-xiojw shipped text-LITERAL BINARY ranges; a placeholder still declined (its
+  runtime type is unknown, so a raw-bound seek could diverge from the filter's TEXT coercion).
+- FIX (codegen.rs): `bound_affinity` now includes `'B'` (TEXT); a new `bound_matches_affinity`
+  generalizes the Affinity-skip (numeric literal for a numeric column, text literal for a text
+  column — both already in the column's class, so no coercion); the TEXT gate branch accepts a
+  text literal OR a placeholder. `codegen_select_index_range_scan` emits `Affinity 'B'` on a
+  placeholder bound before the seek. The gate still requires collation None/BINARY, so the coerced
+  probe and the seek's `P4::None` comparison agree; NOCASE/RTRIM columns still decline.
+- CORRECTNESS: TEXT affinity coerces a numeric/text bind to its text form (matching the filter's
+  TEXT comparison affinity) and leaves a blob a blob — SeekGE positions a blob past the text keys
+  (empty), exactly as the filter's `text < blob` excludes it; NULL jumps to done (empty).
+- SEMANTIC PROOF (hard gate): `index_range_seek_text_binary_matches_sqlite` extended — placeholder
+  binds of text, mixed-case text, empty text, integer, real, blob, and NULL on `> / >= / < / <= /
+  BETWEEN`, plus a NOCASE-column placeholder that must decline — all bit-identical to rusqlite.
+  Opcode gate: a BINARY text placeholder emits IdxRowid + Affinity; a NOCASE placeholder scans.
+  4/4 oracle tests pass; the numeric literal + placeholder + text-literal + expression-index
+  differential stays green.
+- MEDIAN: same `codegen_select_index_range_scan` seek path measured at 84.63x; A/B pending fleet
+  recovery.
+- FOLLOW-UP: NOCASE/RTRIM collation-aware range seeks; composite index prefix+range; ORDER-BY-via-index.
+- Provenance: oracle via rch -j3 (worker vmi1149989, ~8 min compile); clippy via rch -j3;
+  codegen.rs sha256 in the commit.

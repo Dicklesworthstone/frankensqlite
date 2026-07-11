@@ -3303,25 +3303,25 @@ fn codegen_select_index_range_scan(
         emit_limit_zero_guard(b, lim_r, done_label);
     }
 
-    // bd-u6tbr: coerce a runtime-typed bound (a placeholder) to the indexed column's affinity
-    // so the seek positions identically to the full-scan filter, which applies the comparison
-    // affinity. A numeric literal is already numeric, so it is left byte-identical (no Affinity
-    // op) — the coercion only matters for placeholders. Only numeric-affinity columns
-    // (INTEGER/REAL/NUMERIC) coerce; an untyped column needs none, and an expression index has no
-    // plain key column so `column_index` misses and no coercion is emitted (behaviour preserved).
-    // A coercing affinity ('C'/'D'/'E') is emitted only for a non-literal bound (a placeholder);
-    // a numeric literal is already numeric so its bytecode stays byte-identical.
+    // bd-u6tbr / bd-xiojw follow-up: coerce a runtime-typed bound (a placeholder) to the indexed
+    // column's affinity so the seek positions identically to the full-scan filter, which applies
+    // the comparison affinity. A literal already in the column's affinity class is left
+    // byte-identical (no Affinity op) — the coercion only matters for placeholders. Numeric
+    // ('C'/'D'/'E') and BINARY-text ('B') columns coerce; an untyped column needs none, and an
+    // expression index has no plain key column so `column_index` misses and no coercion is emitted
+    // (behaviour preserved). For a 'B' column the gate only accepts the seek when the collation is
+    // BINARY (`P4::None`), so the coerced probe and the seek's BINARY comparison agree.
     let bound_affinity = idx_schema
         .columns
         .first()
         .and_then(|name| table.column_index(name))
         .map(|idx| table.columns[idx].affinity)
-        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E'));
+        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
     let lower_probe = index_range.lower.as_ref().map(|bound| {
         let base = b.alloc_regs(2);
         emit_expr(b, &bound.expr, base, None);
         if let Some(aff) = bound_affinity
-            && !is_numeric_literal_bound(&bound.expr)
+            && !bound_matches_affinity(aff, &bound.expr)
         {
             b.emit_op(
                 Opcode::Affinity,
@@ -3340,7 +3340,7 @@ fn codegen_select_index_range_scan(
         let reg = b.alloc_reg();
         emit_expr(b, &bound.expr, reg, None);
         if let Some(aff) = bound_affinity
-            && !is_numeric_literal_bound(&bound.expr)
+            && !bound_matches_affinity(aff, &bound.expr)
         {
             b.emit_op(
                 Opcode::Affinity,
@@ -3556,6 +3556,19 @@ fn is_text_literal_bound(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(Literal::String(_), _))
 }
 
+/// Whether `expr` is a literal already in the seek column's affinity class, so the seek's
+/// runtime `Affinity` coercion would be a no-op and can be skipped (keeping the bytecode
+/// byte-identical for literals). Numeric-affinity columns match a numeric literal; a TEXT column
+/// matches a text literal. A placeholder is never a match — its runtime type is unknown, so it is
+/// always coerced.
+fn bound_matches_affinity(affinity: char, expr: &Expr) -> bool {
+    match affinity {
+        'C' | 'D' | 'E' => is_numeric_literal_bound(expr),
+        'B' => is_text_literal_bound(expr),
+        _ => false,
+    }
+}
+
 /// Whether the index-range seek can position on `bound_expr` without changing which
 /// rows match relative to the equivalent full-scan filter.
 ///
@@ -3578,10 +3591,13 @@ fn is_text_literal_bound(expr: &Expr) -> bool {
 /// filter's numeric comparison excludes it). A TEXT/blob *literal* under NUMERIC affinity still
 /// declines (kept narrow; those are rare and the correct scan is cheap enough).
 ///
-/// A TEXT-literal bound on a BINARY-collated text column (TEXT comparison affinity, with the
-/// collation gated to None/BINARY above) is accepted with no coercion — text-vs-text under
-/// `P4::None` is the index's own BINARY order, so it visits exactly the filter's rows. Non-BINARY
-/// collations (NOCASE/RTRIM) and non-text-literal bounds (numeric literal, placeholder) decline.
+/// A text literal OR a placeholder on a BINARY-collated text column (TEXT comparison affinity,
+/// with the collation gated to None/BINARY above) is accepted. A text literal is already text and
+/// text-vs-text under `P4::None` is the index's own BINARY order (no coercion); a placeholder is
+/// coerced to TEXT by the seek's Affinity op, so any bind type positions to match the filter (a
+/// numeric/text bind becomes its text form; a blob stays a blob and seeks past the text keys,
+/// empty, exactly as the filter excludes it). Non-BINARY collations (NOCASE/RTRIM) and a
+/// numeric/blob *literal* on a text column still decline.
 fn index_range_bound_is_seek_safe(
     table: &TableSchema,
     table_alias: Option<&str>,
@@ -3607,7 +3623,7 @@ fn index_range_bound_is_seek_safe(
     } else if affinity == u16::from(b'C') {
         is_numeric_literal_bound(bound_expr) || is_placeholder_bound(bound_expr)
     } else if affinity == u16::from(b'B') {
-        is_text_literal_bound(bound_expr)
+        is_text_literal_bound(bound_expr) || is_placeholder_bound(bound_expr)
     } else {
         false
     }
