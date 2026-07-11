@@ -509,6 +509,42 @@ fn manual_hot_path_profile_mutex() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Re-run the current metrics assertion as the only test in a child process.
+///
+/// Hot-path profiling is intentionally process-global. The profile mutex
+/// serializes the tests which inspect those counters, but ordinary sibling
+/// tests can still execute FrankenSQLite statements while profiling is
+/// enabled and contaminate an exact-count snapshot. An exact one-test child
+/// provides a genuinely private metrics process.
+fn run_hot_path_test_in_isolated_process() -> bool {
+    const CHILD_TEST_ENV: &str = "FSQLITE_OPERATION_BASELINE_HOT_PATH_TEST_CHILD";
+
+    let current_thread = std::thread::current();
+    let test_name = current_thread
+        .name()
+        .expect("the Rust test harness should name every test thread");
+    if std::env::var(CHILD_TEST_ENV).as_deref() == Ok(test_name) {
+        return false;
+    }
+
+    let status = std::process::Command::new(
+        std::env::current_exe().expect("the current test executable should be available"),
+    )
+    .arg("--exact")
+    .arg(test_name)
+    .arg("--test-threads=1")
+    .arg("--nocapture")
+    .env(CHILD_TEST_ENV, test_name)
+    .status()
+    .expect("the isolated hot-path test process should start");
+
+    assert!(
+        status.success(),
+        "isolated hot-path test {test_name} failed with {status}"
+    );
+    true
+}
+
 struct ManualHotPathProfileGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
@@ -1766,6 +1802,10 @@ fn manual_perf_probe_prepare_cache_reuse_vs_unique_sql_variants() {
 
 #[test]
 fn record_decode_cache_repeated_column_reads_reduce_record_decodes_per_row() {
+    if run_hot_path_test_in_isolated_process() {
+        return;
+    }
+
     const ITERATIONS: usize = 2_000;
     const REPEATED_COLUMN_SQL: &str =
         "SELECT data, data, data, data, data FROM bench WHERE id = 1;";
@@ -1799,6 +1839,10 @@ fn record_decode_cache_repeated_column_reads_reduce_record_decodes_per_row() {
 
 #[test]
 fn record_decode_cache_multi_row_repeated_columns_hold_one_decode_per_row() {
+    if run_hot_path_test_in_isolated_process() {
+        return;
+    }
+
     const ITERATIONS: usize = 250;
     const MULTI_ROW_SQL: &str =
         "SELECT id, data, data, data FROM bench WHERE id BETWEEN 1 AND 16 ORDER BY id;";
