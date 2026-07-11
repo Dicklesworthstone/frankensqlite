@@ -60,6 +60,9 @@ fn record_memory_add(bytes: u64) {
 
 fn record_memory_sub(bytes: u64) {
     // Saturating to avoid underflow if reset races with deallocation.
+    // MSRV-safe: `try_update` is only stable since 1.95 (workspace MSRV is 1.85), so keep the
+    // deprecated-on-nightly `fetch_update` and silence the deprecation.
+    #[allow(deprecated)]
     let _ = FSQLITE_SKETCH_MEMORY_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(bytes))
     });

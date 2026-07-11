@@ -960,6 +960,10 @@ impl TransactionManager {
         // Update EWMA with α=0.125 (1/8): new = old * 7/8 + sample * 1/8.
         // Fixed-point × 256 to avoid floating point.
         let sample_x256 = chain_len.min(1024) as u64 * 256;
+        // `fetch_update` is deprecated on newer toolchains in favour of `try_update`, but
+        // `try_update` is only stable since 1.95 and the workspace MSRV is 1.85 — so keep the
+        // MSRV-safe method and silence the deprecation until the MSRV moves up.
+        #[allow(deprecated)]
         let _ = self
             .chain_ewma_x256
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
