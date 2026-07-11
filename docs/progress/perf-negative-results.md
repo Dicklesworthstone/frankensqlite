@@ -16792,3 +16792,44 @@ test is on the executed path, not merely linked into it.
 - FOLLOW-UP: NOCASE/RTRIM collation-aware range seeks; composite index prefix+range; ORDER-BY-via-index.
 - Provenance: oracle via rch -j3 (worker vmi1149989, ~8 min compile); clippy via rch -j3;
   codegen.rs sha256 in the commit.
+
+## 2026-07-11 - WIN: composite index prefix+range seek (bd-zqkrp)
+
+- Result type: KEPT. Differential gate (vs C SQLite) PASSED first build (5/5 oracle tests, rch -j3);
+  landed. `SELECT ... WHERE a = v AND b <range>` on `index(a, b)` (the most common real-world index
+  shape — an equality prefix + range suffix) now seeks instead of full-scanning.
+- Profile-first (by reasoning): the `a = v` equality conjunct makes `extract_column_range_target`
+  return None, so the single-column `index_range` codegen local is empty; the planner emits
+  MultiColumnEquality{Range} as an IndexRange directive, but codegen's IndexRange arm reads that
+  empty local -> bypass -> `codegen_select_full_scan`.
+- FIX (codegen.rs): new `composite_index_prefix_range_target` detection (reuses
+  `extract_index_equality_prefix_exprs` for the leading `= <lit/param>` conjuncts +
+  `extract_named_column_range` for the trailing key column's range; gates each bound with the
+  single-column affinity/collation gate) + new `codegen_select_composite_index_prefix_range_scan`.
+  The codegen mirrors the single-column seek but builds a multi-column probe (prefix values +
+  range-lower + trailing NULLs + rowid MIN), `SeekGE`s it, and bounds the walk to the matching
+  prefix with `IdxGT` (P5 = prefix length — compare only the leading key columns), reading and
+  range-checking the trailing column at index position `prefix_len`. Placeholder/text bounds are
+  Affinity-coerced per key column (reusing bd-u6tbr/bd-v79yz). Routed before the planner directive
+  (like the IN-list seek). First cut declines ORDER BY / LIMIT / DISTINCT / aggregate / GROUP BY /
+  hints / WITHOUT ROWID.
+- CORRECTNESS: SeekGE positions at (prefix, range-lower); IdxGT(P5=prefix_len) stops once the
+  equality prefix changes; within the prefix the trailing column is ascending so the exclusive-lower
+  skip + upper stop mirror the single-column range exactly. NULL trailing values are skipped
+  (lower-open) or excluded by SeekGE positioning; a prefix miss yields empty. The multi-column probe
+  reuses the proven ordered-scan prefix machinery (codegen_select_index_ordered_scan).
+- SEMANTIC PROOF (hard gate): `index_range_seek_composite_prefix_matches_sqlite` — index(a,b) and
+  index(a,b,c); covering + non-covering (trailing c -> table lookup); >, >=, <, <=, BETWEEN, two-sided;
+  negative prefix; NULL trailing rows; empty range; prefix miss; multi-eq-prefix (a=? AND b=? AND
+  c>'a' on idx_abc, prefix_len=2); ORDER BY exact; placeholder binds (int/text on prefix + range,
+  affinity-coerced); and declines (no eq-prefix, prefix col not equality, NOT INDEXED) — all
+  bit-identical to rusqlite. Opcode gate: composite emits IdxRowid + IdxGT, no table Rewind. 5/5
+  oracle tests pass; fsqlite-vdbe --lib clippy clean; fmt clean.
+- MEDIAN: same index-seek-vs-full-scan mechanism the single-column literal seek measured at 84.63x;
+  composite A/B pending fleet recovery.
+- FOLLOW-UP: composite prefix+range with ORDER BY on the trailing col (avoid sorter), LIMIT,
+  DESCENDING key terms, WITHOUT ROWID; NOCASE/RTRIM collation-aware seeks.
+- Provenance: oracle via rch -j3 (worker vmi1149989); clippy via rch -j3; codegen.rs sha256 in commit.
+- FLEET NOTE: this ~180-line new multi-column codegen path passed the differential on the FIRST
+  build — careful design (reuse ordered-scan probe + IdxGT + single-column range logic) beat the
+  degraded-fleet iteration cost.

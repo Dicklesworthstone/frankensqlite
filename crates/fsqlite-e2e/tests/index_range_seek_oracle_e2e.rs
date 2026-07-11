@@ -512,3 +512,111 @@ fn index_range_seek_text_binary_matches_sqlite() {
         "NOCASE text placeholder must NOT seek"
     );
 }
+
+/// bd-zqkrp: a composite-index equality-prefix + trailing-range seek (`WHERE a = 2 AND b > 5` on
+/// `index(a, b)`) now seeks instead of full-scanning. Bit-identical to C SQLite across covering /
+/// non-covering, negatives, NULL trailing, one-sided/empty ranges, prefix miss, multi-eq-prefix
+/// (idx on (a,b,c)), ORDER BY, placeholders, and declines.
+#[test]
+fn index_range_seek_composite_prefix_matches_sqlite() {
+    let f = Connection::open(":memory:").expect("open frank");
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    for s in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT);",
+        "CREATE INDEX idx_ab ON t(a, b);",
+        "CREATE INDEX idx_abc ON t(a, b, c);",
+    ] {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+    let mut id = 1_i64;
+    for a in [-1_i64, 0, 1, 2] {
+        for b in [-3_i64, 0, 2, 5, 8, 12] {
+            let sql = format!(
+                "INSERT INTO t VALUES ({id}, {a}, {b}, 'c{}');",
+                (a + b).rem_euclid(5)
+            );
+            f.execute(&sql).unwrap();
+            r.execute_batch(&sql).unwrap();
+            id += 1;
+        }
+    }
+    for a in [1_i64, 2] {
+        let sql = format!("INSERT INTO t VALUES ({id}, {a}, NULL, 'n');");
+        f.execute(&sql).unwrap();
+        r.execute_batch(&sql).unwrap();
+        id += 1;
+    }
+
+    let sorted = |mut v: Vec<Vec<String>>| {
+        v.sort();
+        v
+    };
+    let cmp = |sql: &str| {
+        assert_eq!(
+            sorted(frank_rows(&f, sql).unwrap()),
+            sorted(sqlite_rows(&r, sql).unwrap()),
+            "composite range diverged for `{sql}`"
+        );
+    };
+    for sql in [
+        "SELECT id FROM t WHERE a = 2 AND b > 5",
+        "SELECT id, a, b FROM t WHERE a = 2 AND b >= 5",
+        "SELECT id FROM t WHERE a = 2 AND b < 8",
+        "SELECT id FROM t WHERE a = 2 AND b <= 8",
+        "SELECT id FROM t WHERE a = 2 AND b BETWEEN 0 AND 8",
+        "SELECT id FROM t WHERE a = 2 AND b > 0 AND b < 12",
+        "SELECT b FROM t WHERE a = 1 AND b > -3", // covering b
+        "SELECT id FROM t WHERE a = -1 AND b >= 0", // negative prefix
+        "SELECT id FROM t WHERE a = 2 AND b > 999", // empty range
+        "SELECT id FROM t WHERE a = 99 AND b > 0", // prefix miss
+        "SELECT id, c FROM t WHERE a = 2 AND b > 2", // non-covering (c -> table lookup)
+        "SELECT id FROM t WHERE a = 1 AND b = 2 AND c > 'a'", // multi-eq-prefix on idx_abc
+        // Declines that must still be correct.
+        "SELECT id FROM t WHERE b > 5",           // no equality prefix
+        "SELECT id FROM t WHERE a > 1 AND b > 0", // prefix col not equality
+        "SELECT id FROM t NOT INDEXED WHERE a = 2 AND b > 5",
+    ] {
+        cmp(sql);
+    }
+    for sql in [
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id",
+        "SELECT id FROM t WHERE a = 1 AND b BETWEEN -3 AND 8 ORDER BY id",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "composite ordered diverged for `{sql}`"
+        );
+    }
+
+    // Opcode gate: composite prefix+range seeks (IdxRowid + IdxGT prefix bound, no table Rewind).
+    let ops = opcodes(&f, "SELECT id FROM t WHERE a = 2 AND b > 5");
+    assert!(
+        ops.iter().any(|o| o == "IdxRowid"),
+        "composite must seek; ops = {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|o| o == "IdxGT"),
+        "composite must bound the prefix with IdxGT; ops = {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|o| o == "Rewind"),
+        "composite must not full-scan; ops = {ops:?}"
+    );
+
+    // Placeholder binds on the prefix and the range (affinity-coerced).
+    for bnd in [
+        vec![SqliteValue::Integer(2), SqliteValue::Integer(5)],
+        vec![SqliteValue::Integer(1), SqliteValue::Integer(-3)],
+        vec![SqliteValue::Integer(2), SqliteValue::Text("3".into())],
+        vec![SqliteValue::Integer(99), SqliteValue::Integer(0)],
+    ] {
+        let sql = "SELECT id, b FROM t WHERE a = ?1 AND b > ?2";
+        assert_eq!(
+            frank_bound(&f, sql, &bnd),
+            sqlite_bound(&r, sql, &bnd),
+            "composite placeholder diverged for {bnd:?}"
+        );
+    }
+}

@@ -1963,6 +1963,45 @@ pub fn codegen_select(
         );
     }
 
+    // bd-zqkrp: route a composite equality-prefix + trailing-range seek (`WHERE a = v AND b <range>`
+    // on `index(a, b)`) BEFORE the planner directive. The planner reports this as an IndexRange
+    // directive, but the single-column `index_range` local below is None for this shape, so the
+    // directive bypasses to a full scan. The seek is affinity-coerced and differential-proven
+    // bit-identical, so preferring it is always correct and strictly faster. First cut declines
+    // ORDER BY / LIMIT / DISTINCT / aggregate / GROUP BY / hints / WITHOUT ROWID.
+    let composite_prefix_range = if !is_aggregate
+        && time_travel.is_none()
+        && from_index_hint.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !table.without_rowid
+    {
+        composite_index_prefix_range_target(where_clause.as_deref(), table, table_alias, schema)
+    } else {
+        None
+    };
+    if let Some(composite) = composite_prefix_range {
+        return codegen_select_composite_index_prefix_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            None,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            composite.index,
+            &composite.prefix_exprs,
+            &composite.range,
+        );
+    }
+
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
@@ -3510,6 +3549,255 @@ fn codegen_select_index_range_scan(
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
 
+    Ok(())
+}
+
+/// Composite-index equality-prefix + trailing-range seek (`WHERE a = 5 AND b > 10` on
+/// `index(a, b)`). Mirrors [`codegen_select_index_range_scan`] but builds a multi-column probe
+/// (prefix values + range lower) and bounds the walk to the matching prefix with `IdxGT`
+/// (`P5` = prefix length), reading and range-checking the trailing key column at index position
+/// `prefix_len`. Placeholder/text bounds are coerced to each key column's affinity like the
+/// single-column path. Rowid tables only (WITHOUT ROWID is declined at detection).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_composite_index_prefix_range_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    prefix_exprs: &[&Expr],
+    range: &ColumnRangeTarget<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let prefix_len = prefix_exprs.len();
+    let key_terms = idx_schema.key_term_count();
+    let range_pos = prefix_len;
+
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
+    // Coercing affinity ('C'/'D'/'E'/'B') of each key column, or None (untyped -> no coercion).
+    let key_affinities: Vec<Option<char>> = (0..key_terms)
+        .map(|pos| {
+            idx_schema
+                .columns
+                .get(pos)
+                .and_then(|name| table.column_index(name))
+                .map(|i| table.columns[i].affinity)
+                .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'))
+        })
+        .collect();
+
+    // Probe record: [prefix..., range-lower-or-NULL, trailing NULLs, rowid = MIN].
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let probe = b.alloc_regs(key_terms as i32 + 1);
+    for (pos, expr) in prefix_exprs.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let reg = probe + pos as i32;
+        emit_expr(b, expr, reg, None);
+        if let Some(aff) = key_affinities[pos]
+            && !bound_matches_affinity(aff, expr)
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let range_reg = probe + range_pos as i32;
+    let lower_inclusive = if let Some(lower) = range.lower.as_ref() {
+        emit_expr(b, lower.expr(), range_reg, None);
+        if let Some(aff) = key_affinities[range_pos]
+            && !bound_matches_affinity(aff, lower.expr())
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                range_reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, range_reg, 0, done_label, P4::None, 0);
+        Some(lower.inclusive)
+    } else {
+        b.emit_op(Opcode::Null, 0, range_reg, 0, P4::None, 0);
+        None
+    };
+    for pos in (range_pos + 1)..key_terms {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let reg = probe + pos as i32;
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let rowid_sentinel = probe + key_terms as i32;
+    b.emit_op(Opcode::Int64, 0, rowid_sentinel, 0, P4::Int64(i64::MIN), 0);
+    let probe_rec = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::MakeRecord,
+        probe,
+        key_terms as i32 + 1,
+        probe_rec,
+        P4::None,
+        0,
+    );
+
+    let upper = range.upper.as_ref().map(|u| {
+        let reg = b.alloc_reg();
+        emit_expr(b, u.expr(), reg, None);
+        if let Some(aff) = key_affinities[range_pos]
+            && !bound_matches_affinity(aff, u.expr())
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        (reg, u.inclusive)
+    });
+
+    let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table_lookup = covering_output.is_none();
+    if needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
+
+    // Stop once the equality prefix changes (`IdxGT` compares only the first `prefix_len` columns).
+    #[allow(clippy::cast_possible_truncation)]
+    b.emit_jump_to_label(
+        Opcode::IdxGT,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        prefix_len as u16,
+    );
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let range_key_reg = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::Column,
+        idx_cursor,
+        range_pos as i32,
+        range_key_reg,
+        P4::None,
+        0,
+    );
+    if range.lower.is_none() {
+        b.emit_jump_to_label(Opcode::IsNull, range_key_reg, 0, skip_label, P4::None, 0);
+    }
+    if lower_inclusive == Some(false) {
+        b.emit_jump_to_label(
+            Opcode::Le,
+            range_reg,
+            range_key_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+    if let Some((up_reg, up_inclusive)) = upper {
+        let stop = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
+        b.emit_jump_to_label(stop, up_reg, range_key_reg, done_label, P4::None, 0);
+    }
+
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+    if let Some(cov) = &covering_output {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
     Ok(())
 }
 
@@ -19814,6 +20102,129 @@ fn extract_column_range_target<'a>(
     } else {
         None
     }
+}
+
+/// Extract the range bounds on a specific named column from the conjuncts of `where_expr`,
+/// ignoring every other conjunct — so a composite `a = 5 AND b > 10` yields the `b` range even
+/// though `a = 5` is not a range term. Returns `None` if the column has no range term, or a
+/// conflicting duplicate bound.
+fn extract_named_column_range<'a>(
+    where_expr: &'a Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    column: &str,
+) -> Option<ColumnRangeTarget<'a>> {
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    let mut target = ColumnRangeTarget::default();
+    for term in conjuncts {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                if let Some((col, slot, bound)) =
+                    extract_column_range_bound(left, *op, right, table, table_alias)
+                    && col.eq_ignore_ascii_case(column)
+                {
+                    match slot {
+                        ColumnRangeSlot::Lower => {
+                            if target.lower.is_some() {
+                                return None;
+                            }
+                            target.lower = Some(bound);
+                        }
+                        ColumnRangeSlot::Upper => {
+                            if target.upper.is_some() {
+                                return None;
+                            }
+                            target.upper = Some(bound);
+                        }
+                    }
+                }
+            }
+            Expr::Between {
+                expr: operand,
+                low,
+                high,
+                not: false,
+                ..
+            } if is_index_range_constant(low)
+                && is_index_range_constant(high)
+                && column_name(operand, table, table_alias)
+                    .is_some_and(|c| c.eq_ignore_ascii_case(column)) =>
+            {
+                if target.lower.is_some() || target.upper.is_some() {
+                    return None;
+                }
+                target.lower = Some(borrowed_column_range_bound(low, true));
+                target.upper = Some(borrowed_column_range_bound(high, true));
+            }
+            _ => {}
+        }
+    }
+    (target.lower.is_some() || target.upper.is_some()).then_some(target)
+}
+
+/// A composite-index seek target: an equality prefix on the leading key columns plus a range on
+/// the next key column (`WHERE a = 5 AND b > 10` on `index(a, b)`).
+struct CompositePrefixRange<'a> {
+    index: &'a IndexSchema,
+    prefix_exprs: Vec<&'a Expr>,
+    range: ColumnRangeTarget<'a>,
+}
+
+/// Detect a composite-index equality-prefix + trailing-range seek. Requires a plain ascending
+/// composite index whose leading columns are all pinned by `= <lit/param>` conjuncts and whose
+/// next column has a range; the prefix and range bounds must be seek-safe (same affinity/collation
+/// gate as the single-column range seek). Declines WITHOUT ROWID (PK-suffix probe not handled here).
+fn composite_index_prefix_range_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+) -> Option<CompositePrefixRange<'a>> {
+    if table.without_rowid {
+        return None;
+    }
+    let where_expr = where_clause?;
+    for index in &table.indexes {
+        let key_terms = index.key_term_count();
+        if key_terms < 2
+            || index.columns.len() != key_terms
+            || (0..key_terms).any(|i| index.key_term_descending(i))
+        {
+            continue;
+        }
+        let prefix_exprs =
+            extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
+        let prefix_len = prefix_exprs.len();
+        if prefix_len == 0 || prefix_len >= key_terms {
+            continue;
+        }
+        let range_column = &index.columns[prefix_len];
+        let Some(range) = extract_named_column_range(where_expr, table, table_alias, range_column)
+        else {
+            continue;
+        };
+        if !index_range_fast_path_is_safe(table, table_alias, schema, range_column, &range) {
+            continue;
+        }
+        let prefix_ok = index.columns[..prefix_len]
+            .iter()
+            .zip(prefix_exprs.iter())
+            .all(|(col, expr)| {
+                index_range_bound_is_seek_safe(table, table_alias, schema, col, expr)
+            });
+        if !prefix_ok {
+            continue;
+        }
+        return Some(CompositePrefixRange {
+            index,
+            prefix_exprs,
+            range,
+        });
+    }
+    None
 }
 
 fn borrowed_column_range_bound(expr: &Expr, inclusive: bool) -> ColumnRangeBound<'_> {
