@@ -17068,3 +17068,57 @@ test is on the executed path, not merely linked into it.
 - FLEET NOTE: the fleet recovered to 8-9/12 healthy, 36-41/76 slots free this session, so the A/B
   median that the immediately-prior range-seek levers had to defer ("pending fleet recovery") was
   finally measurable directly.
+
+## 2026-07-11 - SURFACE / PREMISE CORRECTION: bd-5310l "parse+plan is the hotspot" is WRONG; the compile-miss cost is dominated by the PLANNER, not codegen (profile-first)
+
+- Result type: SURFACE (no lever shipped this pass). Rigorous profile-first phase split of the
+  per-statement ad-hoc overhead, run under release-perf via the new reusable harness
+  `crates/fsqlite-e2e/tests/adhoc_parse_plan_profile.rs` + new gated compile sub-timers in
+  connection.rs (`compile_subphase_ns()`). Corrects the premise of P1 bead bd-5310l and ranks the
+  hotspot so the NEXT lever targets the real dominant phase instead of guessing.
+- METHOD: enable `set_hot_path_profile_enabled`, run each workload in a tight loop, read
+  `hot_path_profile_snapshot()` per-phase NS timers; `gap = wall - sum(instrumented phases)`.
+  Two regimes: REPEATED identical SQL (parse+compile caches warm) and UNIQUE SQL (both caches miss
+  every statement — the bead's actual migration/ad-hoc-shell scenario).
+- FINDING 1 (premise correction): parse and compile are FULLY CACHED (0 ns) for repeated SQL. The
+  bead's framing "per-statement parse+plan overhead" is FALSE for any workload that repeats a
+  statement shape via the exact same text — the parse cache (SQL-hash keyed) and compiled-program
+  cache (compile_with_cache) both hit. Do NOT chase "parse+plan optimization" for repeated SQL.
+- FINDING 2 (phase ranking, cache-HIT / repeated SQL, release-perf; two workers, relative split is
+  stable): a rowid point lookup `SELECT id,v FROM t WHERE id=777` costs ~6.4-18us wall, of which
+  EXECUTE_BODY is 74-78% (~4.7-14us) and an un-instrumented dispatch GAP is ~1.5-3.8us; parse and
+  compile are 0. `SELECT 1` is ~3.7-9us wall (execute_body ~59-65%). The indexed-range read is
+  dominated (97%) by real execution (many rows) — not a front-end cost.
+- FINDING 3 (phase ranking, cache-MISS / UNIQUE SQL — the bead's real scenario): wall ~19-47us;
+  splits: parse ~1.4-4.4us, COMPILE ~6.8-16.6us, execute ~4.7-14us. Compile is the largest CLEANLY
+  byte-identical-attackable phase (its output bytecode is unchanged by any speedup).
+- FINDING 4 (compile sub-split — the decisive result, cache-miss unique SQL, small 2-table schema):
+  PLANNER directive = 40% of compile (~2.7us), canonicalize+`to_string` (cache-key derivation) = 19%
+  (~1.3us), CODEGEN = only 8% (~0.57us), schema clone = 7% (~0.49us), builder.finish = 6% (~0.39us).
+  CODEGEN IS FAST; the compile cost is the PLANNER plus the AST re-serialization for the planner
+  cache key. (Schema clone is small for a 2-table schema but is O(total schema) and would grow on a
+  many-table "prod.db".)
+- NEXT LEVER (identified, not yet shipped — byte-identical, needs careful impl + gate): the planner
+  directive cache (`planner_select_directive_with_cache`) has exactly ONE production call site
+  (`compile_table_select`, itself only reached on a compiled-program-cache MISS). For unique-literal
+  SQL it therefore MISSES every statement yet still pays `canonical_select.to_string()` + key hash +
+  lookup + insert; and any entry it inserts is shadowed by the program cache on exact re-compile. Its
+  only residual value is sharing a directive across raw-SQL variants that canonicalize identically
+  (whitespace/case/placeholder-form) — marginal. A byte-identical lever: bypass or cheapen this cache
+  on the compile-miss path (or hash the canonical AST structurally instead of allocating+serializing
+  a String). RISKS to gate against: collision-safety of the key, the canonicalization-variant sharing,
+  and the planner-cache unit tests (connection.rs ~151296+). Second target: shave the planner's own
+  ~2.7us directive computation (`planner_select_directive_with_stats`) for trivial point/range shapes.
+- BYTE-IDENTICAL GATE for the follow-up: assert the compiled `VdbeProgram` bytes are unchanged
+  before/after across a differential corpus (the strongest possible gate — compile speedups must not
+  alter a single emitted opcode), plus the existing e2e oracle suite; then A/B the compile-miss median
+  via `adhoc_parse_plan_profile` (already emits `COMPILE sub-split`).
+- Provenance: harness + sub-timers via rch release-perf (ovh-b / vmi1156319, ~20-30min cold builds);
+  fsqlite-core --lib clippy clean (rch -j3); fmt clean. Reusable: re-run
+  `cargo test --profile release-perf -p fsqlite-e2e --test adhoc_parse_plan_profile -- --ignored --nocapture`.
+- WHY SURFACE not SHIP: profile-first localized the hotspot to the planner + AST-reserialization, but
+  every clean-looking byte-identical lever there carries a correctness subtlety (cache collision-safety,
+  canonicalization-variant sharing, unit-test coupling) that a responsible ship must gate carefully;
+  that exceeded this pass's remaining build budget (8 remote builds spent). Shipping a rushed planner
+  change risked a non-win or a correctness regression. The infra added here makes the follow-up a
+  measured, low-risk change.

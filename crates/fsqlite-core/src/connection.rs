@@ -441,6 +441,14 @@ static FSQLITE_PREPARED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PLANNER_DIRECTIVE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+// bd-5310l: compile (plan+codegen) sub-phase timers for `compile_table_select`, to pinpoint
+// which part of the ~16.6us compile-miss cost dominates (schema clone vs canonicalize/to_string
+// vs planner directive vs codegen vs builder.finish). Gated by `hot_path_profile_enabled()`.
+static FSQLITE_COMPILE_SCHEMA_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILE_CANONICAL_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILE_PLANNER_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILE_CODEGEN_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILE_FINISH_NS: AtomicU64 = AtomicU64::new(0);
 // bd-6eyrg.1: Fast-path vs slow-path execution counters.
 static FSQLITE_FAST_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SLOW_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
@@ -1078,6 +1086,11 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PLANNER_DIRECTIVE_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PLANNER_DIRECTIVE_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_SCHEMA_CLONE_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_CANONICAL_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_PLANNER_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_CODEGEN_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_FINISH_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FAST_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SLOW_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_BACKGROUND_STATUS_TIME_NS.store(0, AtomicOrdering::Relaxed);
@@ -1255,6 +1268,19 @@ pub fn reset_hot_path_profile() {
 }
 
 #[must_use]
+/// bd-5310l compile sub-phase timings (ns, accumulated while profiling is enabled):
+/// `[schema_clone, canonicalize+to_string, planner_directive, codegen, builder.finish]`.
+#[must_use]
+pub fn compile_subphase_ns() -> [u64; 5] {
+    [
+        FSQLITE_COMPILE_SCHEMA_CLONE_NS.load(AtomicOrdering::Relaxed),
+        FSQLITE_COMPILE_CANONICAL_NS.load(AtomicOrdering::Relaxed),
+        FSQLITE_COMPILE_PLANNER_NS.load(AtomicOrdering::Relaxed),
+        FSQLITE_COMPILE_CODEGEN_NS.load(AtomicOrdering::Relaxed),
+        FSQLITE_COMPILE_FINISH_NS.load(AtomicOrdering::Relaxed),
+    ]
+}
+
 pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
     let page_buffer_pool = page_buffer_pool_metrics_snapshot();
     HotPathProfileSnapshot {
@@ -50040,27 +50066,34 @@ impl Connection {
 
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
+        let prof = hot_path_profile_enabled();
+        let t = prof.then(Instant::now);
         let mut canonical_select = canonicalize_select_placeholders(select)?;
         // bd-l2si0: expand row-value (tuple) comparisons into scalar boolean
         // expressions before codegen, which otherwise collapses them to false.
         rewrite_row_value_comparisons_in_select(&mut canonical_select);
         let canonical_sql = canonical_select.to_string();
+        record_hot_path_duration(&FSQLITE_COMPILE_CANONICAL_NS, t);
         let feature_flags = PlannerFeatureFlags::default();
         // The planner may consult sqlite_stat1 through `self.query()`, which can
         // refresh the active transaction image and mutate `self.schema`. Do not
         // hold a RefCell borrow across that reentrant path.
+        let t = prof.then(Instant::now);
         let mut schema = self.schema.borrow().clone();
         // bd-wjrs0: when a TEMP table shadows a same-named main table, the
         // visible `schema` entry is the TEMP one. An explicit `main.<name>`
         // reference must still reach the shadowed main table, so swap it back
         // into this per-statement snapshot.
         self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
+        record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
+        let t = prof.then(Instant::now);
         let planner_select_directive = self.planner_select_directive_with_cache(
             &canonical_select,
             &canonical_sql,
             feature_flags,
             &schema,
         );
+        record_hot_path_duration(&FSQLITE_COMPILE_PLANNER_NS, t);
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
@@ -50073,11 +50106,16 @@ impl Connection {
         // AggStep/AggFinal instead of PureFunc for registered aggregates.
         let extra_agg = self.extra_aggregate_names();
         fsqlite_vdbe::codegen::set_extra_aggregate_names(extra_agg);
+        let t = prof.then(Instant::now);
         let result = codegen_select(&mut builder, &canonical_select, &schema, &ctx)
             .map_err(codegen_error_to_franken);
+        record_hot_path_duration(&FSQLITE_COMPILE_CODEGEN_NS, t);
         fsqlite_vdbe::codegen::clear_extra_aggregate_names();
         result?;
-        builder.finish()
+        let t = prof.then(Instant::now);
+        let program = builder.finish();
+        record_hot_path_duration(&FSQLITE_COMPILE_FINISH_NS, t);
+        program
     }
 
     fn lookup_differential_view(&self, view_name: &str) -> Result<ViewDef> {
