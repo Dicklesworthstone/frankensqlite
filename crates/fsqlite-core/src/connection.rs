@@ -118358,6 +118358,104 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_planning_tracks_free_only_conservative_surface() {
+        use fsqlite_pager::TransactionMode;
+
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+        let page_size = conn.pager.page_size().as_usize();
+
+        let (first_freed, second_freed) = {
+            let mut seed = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let first = seed.allocate_page(&cx).unwrap();
+            let second = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, first, &vec![0x31; page_size]).unwrap();
+            seed.write_page(&cx, second, &vec![0x32; page_size])
+                .unwrap();
+            seed.commit(&cx).unwrap();
+            (first, second)
+        };
+
+        let prepare_free_only_surface = || {
+            conn.execute("BEGIN CONCURRENT;").unwrap();
+            let session_id = conn
+                .concurrent_session_id
+                .borrow()
+                .expect("BEGIN CONCURRENT should register a session");
+            let surface = {
+                let mut txn_guard = conn.active_txn.borrow_mut();
+                let txn = txn_guard
+                    .as_mut()
+                    .expect("concurrent transaction should keep an active pager handle");
+                txn.free_page(&cx, first_freed).unwrap();
+                txn.free_page(&cx, second_freed).unwrap();
+                assert!(
+                    txn.write_set_page_numbers().is_empty(),
+                    "the regression requires a genuinely free-only pager transaction"
+                );
+                txn.pending_conflict_pages_conservative()
+            };
+            assert_eq!(
+                surface,
+                vec![PageNumber::ONE, first_freed, second_freed],
+                "lock-free commit planning must carry freed pages and the shared freelist metadata token"
+            );
+            (session_id, surface)
+        };
+
+        let (first_session, first_surface) = prepare_free_only_surface();
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            conn.track_pending_conflict_pages_with_registry(
+                &registry,
+                first_session,
+                &first_surface,
+            )
+            .unwrap();
+            let handle = registry
+                .get(first_session)
+                .expect("first free-only session should remain active");
+            for page in &first_surface {
+                assert!(
+                    handle.tracks_write_conflict_page(*page),
+                    "commit planning must track free-only conflict page {page}"
+                );
+                assert!(
+                    handle.held_locks().contains(page),
+                    "commit planning must lock free-only conflict page {page}"
+                );
+            }
+        }
+        conn.execute("ROLLBACK;").unwrap();
+
+        let (second_session, second_surface) = prepare_free_only_surface();
+        let snapshot_high = {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            registry
+                .get(second_session)
+                .expect("second free-only session should remain active")
+                .snapshot()
+                .high
+        };
+        conn.concurrent_commit_index
+            .update(first_freed, snapshot_high.next());
+        let conflict = {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            conn.track_pending_conflict_pages_with_registry(
+                &registry,
+                second_session,
+                &second_surface,
+            )
+            .expect_err("a newer freed-page publication must fail first-committer-wins")
+        };
+        assert!(
+            matches!(conflict, FrankenError::BusySnapshot { .. }),
+            "free-only FCW conflict must fail with BusySnapshot, got {conflict:?}"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
     fn test_commit_planning_ignores_synthetic_page_one_for_disjoint_concurrent_growth_writers() {
         let _serial = super::fsqlite_core_test_serializer();
         use fsqlite_pager::{JournalMode, TransactionMode};

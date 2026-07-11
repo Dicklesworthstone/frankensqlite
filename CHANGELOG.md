@@ -61,6 +61,25 @@ lossy values.
   or an externally constructed overflowing bound. Empty half-open intervals no
   longer manufacture a rowid below their start
   ([#126](https://github.com/Dicklesworthstone/frankensqlite/issues/126)).
+- Interior-index separator replacement now retains the old overflow chain until
+  structural balancing succeeds. A deterministic packed-page fault-injection
+  regression forces the first balance write to fail and proves the rollback
+  source still owns its overflow pages
+  ([#127](https://github.com/Dicklesworthstone/frankensqlite/issues/127)).
+- Concurrent first-committer-wins planning now treats its lock-free conflict
+  estimate as a correctness-preserving superset: free-only transactions carry
+  every explicitly freed page plus a shared page-1 freelist metadata token.
+  Core-layer regressions prove those pages are locked and a newer freed-page
+  publication aborts with `BusySnapshot`
+  ([#128](https://github.com/Dicklesworthstone/frankensqlite/issues/128)).
+- Transaction-local page images are authoritative for the lifetime of a pager
+  handle. Re-reading a page after another transaction commits can no longer
+  consult a shared latest-image cache first and silently combine two snapshots
+  ([#129](https://github.com/Dicklesworthstone/frankensqlite/issues/129)).
+- Successful local commits now advance both the aggregate commit clock and its
+  cached rollback-journal/WAL identity components. The next transaction no
+  longer mistakes the pager's own commit for an external composition change or
+  discards valid publication, cache, and volatile-freelist state.
 
 ### Security
 
