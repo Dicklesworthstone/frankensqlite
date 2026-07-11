@@ -16546,6 +16546,12 @@ test is on the executed path, not merely linked into it.
 
 ## 2026-07-10 - NON-WIN: covering secondary-index range is bypassed by the connection fast-path
 
+- CORRECTION (2026-07-11, bd-zq6dp): the root cause below is WRONG. Secondary-index ranges do
+  NOT hit the connection `SimpleFullTableScan` fast path (that only fires for `SELECT * WHERE
+  <none>`; a range has a WHERE clause and reaches VDBE codegen). The real cause was a codegen
+  affinity pre-gate (`index_range_fast_path_is_safe`) that rejected every numeric column, so the
+  seek never fired even though the directive/EQP said `SEARCH USING INDEX`. Fixed and shipped as
+  a WIN — see "2026-07-11 - WIN: secondary-index range seek engages for numeric columns" below.
 - Result type: reverted codegen change; NOT shipped as a win. Kept the differential correctness
   test only. The median gate failed and the fix is connection-layer, not codegen.
 - Profile-first: `SELECT id FROM t WHERE k > 90` / `k BETWEEN a AND b` (k indexed) full-scans in
@@ -16576,3 +16582,62 @@ test is on the executed path, not merely linked into it.
 - Retry condition: only after a connection-layer index-range fast path exists (or covering ranges
   are routed to codegen). Then the codegen index-range seek is ready and the covering gate makes
   it regression-free.
+
+## 2026-07-11 - WIN: secondary-index range seek engages for numeric columns (bd-zq6dp)
+
+- Result type: KEPT. Semantic gate (differential oracle vs C SQLite) passed; landed.
+  CORRECTS the 2026-07-10 "NON-WIN: covering secondary-index range" root cause above: the full
+  scan was NOT a connection `SimpleFullTableScan` bypass. That fast path only fires for
+  `SELECT * ... WHERE <none>` (connection.rs ~29992 requires `where_clause.is_none()`); a
+  secondary-index range has a WHERE clause, so it reaches VDBE codegen. The real cause was a
+  codegen affinity pre-gate that silently declined the seek.
+- Profile-first (bytecode, decisive): `SELECT id,k FROM t WHERE k BETWEEN 5 AND 55` (k indexed,
+  20000 rows) emitted `Rewind`+`Column`+`Next` — a full table scan, 0 Seek opcodes, 0 IdxRowid —
+  even though EQP claimed `SEARCH t USING INDEX idx_t_k (k range)`. EQP is derived from the
+  planner directive; codegen silently ignored it. (Corollary: EQP is NOT faithful to execution —
+  the rowid-range control shows `SCAN t` in EQP yet codegen bounded-seeks it. Trust the bytecode.)
+- ROOT CAUSE: `index_range_fast_path_is_safe` gated the non-aggregate index-range seek on
+  `(cmp_p5 & !0x80) == 0`. An INTEGER/REAL/NUMERIC column compared against a literal carries a
+  NUMERIC comparison affinity (`0x43` = `b'C'`), so the gate rejected EVERY numeric-column range
+  -> the `index_range` codegen local = None -> both the directive's `IndexRange` arm (which also
+  reads that local, codegen.rs ~2164) and the default path fell through to
+  `codegen_select_full_scan`. Documented as a known silent no-op by the existing test
+  `resolved_index_range_comparison_carries_affinity_for_integer_column`.
+- FIX (codegen.rs): accept the seek when the carried comparison affinity is NUMERIC AND the bound
+  is a numeric literal (integer/real, incl. a unary-negated literal) — NUMERIC coercion of an
+  already-numeric literal is the identity, so the index seek visits exactly the rows the full-scan
+  filter would (the same proven-safe subset the IN-list seek accepts by the integer argument).
+  Placeholders and text/blob literals still decline (their coercion is text->number / runtime-typed,
+  not an identity). Also broadened `is_index_range_constant` to recognize a negated numeric literal
+  (`-8` parses as `UnaryOp(Negate, Literal)`) so `... BETWEEN -8 AND 0` is extractable; safety is
+  still enforced downstream by `index_range_fast_path_is_safe` / `is_numeric_literal_bound`.
+- SEMANTIC PROOF (hard gate): `index_range_seek_matches_sqlite` runs ~40 queries on FrankenSQLite
+  and rusqlite (real C SQLite), bit-identical: INTEGER/REAL/NUMERIC covering + non-covering ranges,
+  real bounds on an integer column (`k > 2.5`, `k <= 3.0`), negatives, NULL rows, empty ranges,
+  ORDER BY / DISTINCT / LIMIT, expression-index ranges with negated bounds (`k - 5 BETWEEN -8 AND
+  0`), COUNT(*), and every decline (placeholder, NOT INDEXED, text literal on a numeric column,
+  TEXT column). No-ORDER-BY compared as sets, ORDER BY exact. `index_range_seek_emits_seek_for_
+  numeric_literals` asserts the accepted shapes emit `IdxRowid` (index walk, incl. one-sided upper
+  `k < 0` and REAL/NUMERIC columns) and every decline keeps the full scan. Both PASS. No golden
+  snapshot matches these shapes (vdbe goldens 8/8 green); no re-bless.
+- A/B (release-perf via rch, seek vs `NOT INDEXED` scan interleaved per sample, bounds varied per
+  sample so no per-statement cache serves a repeat, scan forced via NOT INDEXED, correctness
+  cross-checked by the oracle above). 20000-row table, k==id, 51-row selective range,
+  `SELECT id, k`, 60 samples x 40 execs:
+    seek median  = 33.17 us/query
+    scan median  = 2807.55 us/query
+    speedup (scan/seek) = 84.63x
+    null control (seek vs seek) = 0.907x  [30.07 vs 33.17]  (~9% floor)
+  DECISIVE: the 84.6x effect is ~90x beyond the null floor. Bytecode confirms the fix: the seek arm
+  now emits `SeekGE, Column, IdxRowid, ResultRow, Next` (covering, 0 Rewind) vs the old `Rewind`.
+- Correctness beyond the oracle: `-p fsqlite-vdbe -p fsqlite-core --lib` green except the 2 known
+  HotPathProfileSnapshot global-metrics races (pass 1339/0 when `pager_routing_tests` runs
+  `--test-threads=1`; unrelated — those assert a direct rowid query_row counter, a connection fast
+  path this codegen change never touches). `-p fsqlite-vdbe --tests` (incl. golden bytecode 8/8)
+  green. 7 existing bd-2dgf5 oracle tests green (incl. `covering_index_range_matches_sqlite`).
+- FOLLOW-UP (not this lever): placeholder-bound numeric ranges (`k BETWEEN ?1 AND ?2`) still scan
+  — a runtime-typed placeholder needs the seek to apply the column's comparison affinity to the
+  bound at execution (like the equality path's index-collation compare), not a compile-time gate.
+  That is the OLTP prepared-statement case and the natural next lever.
+- Provenance: bench via rch release-perf; oracle worker vmi1152480; `codegen.rs` sha256 in the
+  commit; binary sha256 unavailable (rch returns no binary; bd-kbuck).

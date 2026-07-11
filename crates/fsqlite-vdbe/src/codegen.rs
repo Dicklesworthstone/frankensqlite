@@ -3475,6 +3475,69 @@ fn codegen_select_index_range_scan(
     Ok(())
 }
 
+/// Whether `expr` is a compile-time numeric literal — an integer/real literal, with
+/// an optional leading unary minus. NUMERIC affinity is the identity on these, which
+/// is what lets [`index_range_bound_is_seek_safe`] accept them under NUMERIC
+/// comparison affinity without changing which rows match.
+fn is_numeric_literal_bound(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::Integer(_) | Literal::Float(_), _) => true,
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => matches!(
+            expr.as_ref(),
+            Expr::Literal(Literal::Integer(_) | Literal::Float(_), _)
+        ),
+        _ => false,
+    }
+}
+
+/// Whether the index-range seek can position on `bound_expr` without changing which
+/// rows match relative to the equivalent full-scan filter.
+///
+/// The seek compares the raw bound value against the index's (already affinity-applied)
+/// key entries, so it is exact only when the comparison affinity the full-scan filter
+/// WOULD apply is a no-op on this bound. Two cases qualify. First, no comparison affinity
+/// (`cmp_p5 & !0x80 == 0`) — e.g. an untyped/BLOB column, or two operands already in the
+/// same affinity class — is always safe. Second, NUMERIC affinity (`'C'`) against a numeric
+/// literal (integer/real, incl. a negated literal): coercing an already-numeric value with
+/// NUMERIC affinity is the identity, so the seek visits exactly the filter's rows. That
+/// second case is the common `WHERE <int/real col> BETWEEN 5 AND 55` shape that the plain
+/// `cmp_p5 == 0` gate silently rejected into a full scan (see
+/// `resolved_index_range_comparison_carries_affinity_for_integer_column`); it is the same
+/// proven-safe subset the IN-list seek accepts by the integer argument.
+///
+/// A placeholder or text/blob literal under NUMERIC affinity is deliberately NOT accepted:
+/// the coercion (text→number, or a runtime-typed placeholder) is not an identity there, so
+/// the seek could diverge from the filter. Those keep the scan.
+fn index_range_bound_is_seek_safe(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    column_name: &str,
+    bound_expr: &Expr,
+) -> bool {
+    let comparison =
+        resolved_index_range_comparison(table, table_alias, schema, column_name, bound_expr);
+    if !matches!(comparison.collation_p4, P4::None) {
+        return false;
+    }
+    // `cmp_p5 & !0x80` is the comparison affinity (`combine_comparison_affinity`): `0` = no
+    // coercion (always seek-safe), `b'C'` = NUMERIC. NUMERIC coercion of a numeric literal is
+    // the identity, so the seek is exact; a TEXT affinity, or a non-literal (placeholder) under
+    // NUMERIC, is declined so the full-scan filter is kept.
+    let affinity = comparison.cmp_p5 & !0x80;
+    if affinity == 0 {
+        true
+    } else if affinity == u16::from(b'C') {
+        is_numeric_literal_bound(bound_expr)
+    } else {
+        false
+    }
+}
+
 fn index_range_fast_path_is_safe(
     table: &TableSchema,
     table_alias: Option<&str>,
@@ -3486,14 +3549,7 @@ fn index_range_fast_path_is_safe(
         .into_iter()
         .flatten()
         .all(|bound| {
-            let comparison = resolved_index_range_comparison(
-                table,
-                table_alias,
-                schema,
-                column_name,
-                bound.expr(),
-            );
-            (comparison.cmp_p5 & !0x80) == 0 && matches!(comparison.collation_p4, P4::None)
+            index_range_bound_is_seek_safe(table, table_alias, schema, column_name, bound.expr())
         })
 }
 
@@ -8770,6 +8826,7 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
 ///     can visit the same duplicate run (double count). Distinct integers are disjoint runs.
 ///   * single ascending key term (the probe record is one key term + rowid), `IN` not
 ///     `NOT IN`, non-empty list.
+///
 /// Anything outside this (text/real/numeric column, a non-integer or non-literal element,
 /// `NOT IN`) declines and the aggregate keeps its full scan.
 fn index_integer_in_list_target<'t>(
@@ -18918,7 +18975,12 @@ fn is_rowid_range_constant(expr: &Expr) -> bool {
 }
 
 fn is_index_range_constant(expr: &Expr) -> bool {
-    is_rowid_range_constant(expr)
+    // A negative numeric literal parses as `UnaryOp(Negate, Literal(..))`, which
+    // `is_rowid_range_constant` does not recognize. Accept it here so a range bound like
+    // `rr BETWEEN -1.0 AND 4.0` is extracted; `index_range_fast_path_is_safe` still gates
+    // whether the extracted range is seek-safe (and `is_numeric_literal_bound` mirrors this
+    // negated-literal shape), so broadening extraction cannot admit an unsafe seek.
+    is_rowid_range_constant(expr) || is_numeric_literal_bound(expr)
 }
 
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
