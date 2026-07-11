@@ -17653,3 +17653,44 @@ test is on the executed path, not merely linked into it.
 - clippy `-p fsqlite-vdbe --lib -p fsqlite --tests` clean; fmt clean.
 - NET: the 5th shipped byte-exact codegen win in this series (after the index-driven ORDER BY
   eliminations). Diagnostic retained: `sorter_limit_profile.rs`.
+
+## 2026-07-11 - WIN: `MIN(col)`/`MAX(col)` on a secondary-indexed column resolves to ONE index seek (was an O(n) scan) — ~860–980× byte-exact (bd-minmax-index-seek-lvmjx)
+
+- Result type: WIN / shipped. A fresh codegen lever under bd-5310l, found by profiling the aggregate
+  lane (`minmax_index_profile.rs`).
+- THE MISS: the MIN/MAX leaf-seek fast path (`minmax_rowid_seek_plan` / `codegen_select_minmax_rowid_seek`)
+  fired ONLY for MIN/MAX over the **rowid** (`arg_is_rowid`). `SELECT MIN(v)`/`MAX(v)` where `v` carries
+  a secondary index still full-scanned the table and ran a per-row running aggregate — the classic SQLite
+  "MIN/MAX via index" optimization was absent for non-rowid columns. Profile (20k rows, release-perf):
+  `MIN(v)` INT-indexed 3.85 ms vs `MIN(id)` rowid 4.7 µs (826×) — and `MIN(v)` == `MIN(u)` unindexed
+  (3.85 ms ≈ 4.19 ms): the index was ignored.
+- THE LEVER: `minmax_index_seek_plan` detects a single `MIN(col)`/`MAX(col)` (no WHERE/HAVING/GROUP BY;
+  mirrors the rowid guards — no DISTINCT/FILTER/bare column/multi-aggregate/extra args; one plain-column
+  arg) whose column carries a **single-column, ASC, collation-matched** index
+  (`single_column_index_for_column_with_collation`). `codegen_select_minmax_index_seek` then opens ONLY
+  the index cursor and feeds exactly one row through the SAME AggStep/AggFinal/wrapper sequence:
+  - MAX → `Last` (the maximum; NULLs sort first, so a NULL there means all-NULL → MAX = NULL).
+  - MIN → `Rewind` + a NULL-skip walk (`NotNull`→accumulate, else `Next`) to the first non-NULL entry
+    (min() ignores NULLs; all-NULL/empty leaves the accumulator NULL → MIN = NULL).
+  The index stores column 0 with the table's affinity already applied, so the read value is the identical
+  SqliteValue a scan would feed; index order equals the MIN/MAX comparison order because the collation is
+  matched — hence bit-identical. DESC / differently-collated / WITHOUT ROWID indexes decline to the scan.
+  Gated on `allow_index_seek` (opens an index cursor).
+- BYTE-EXACT GATE (`crates/fsqlite/tests/minmax_index_oracle.rs`, PASS): 24 queries vs rusqlite/C SQLite
+  on a 400-row table with leading NULLs (ids 1–5) + mixed-sign INT / TEXT / REAL / NOCASE-collated TEXT /
+  DESC-indexed / unindexed columns, `COALESCE(MIN/MAX,…)` wrappers, `COLLATE BINARY` override on a NOCASE
+  column, plus a 50-row all-NULL table and an empty table — all bit-identical. Opcode gate: ASC-indexed
+  and NOCASE-matched MIN/MAX use the index seek; unindexed, DESC-indexed, and BINARY-vs-NOCASE-mismatched
+  correctly decline to the scan.
+- NO-REGRESSION: `fsqlite-vdbe --lib` = 1035 pass / 1 fail; the single failure
+  (`test_codegen_select_index_range_with_numeric_affinity_falls_back`) is PRE-EXISTING — it fails
+  identically on origin/main with this change stashed (proven), a stale assertion left by bd-u6tbr
+  (845923b7) which enabled the placeholder-bound numeric-affinity index range. This lever adds ZERO new
+  failures. Aggregate suite 14/14 pass.
+- MEDIAN (release-perf, 20k rows, 5000 iters): `MIN(v)` 3.85 ms → 4.46 µs (**863×**); `MAX(v)` 3.89 ms →
+  3.95 µs (**984×**); `MIN(w)` TEXT 4.79 ms → 4.99 µs (**960×**); `MAX(w)` 4.67 ms → 4.76 µs (**981×**).
+  Unindexed `MIN(u)`/`MAX(u)` unchanged at ~4.05 ms (correctly still scans). Indexed MIN/MAX now cost the
+  same order as the rowid seek.
+- clippy clean on the change (codegen + minmax_index_oracle); fmt clean.
+- NET: the 6th shipped byte-exact codegen win in this series, and the largest single-query speedup
+  (~900×). Diagnostic retained: `minmax_index_profile.rs`.
