@@ -36,6 +36,77 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-11 - NON-CANDIDATE: post-reset runtime/storage profiles expose only closed commit families
+
+- Target: one fresh profile-ranked lever in B-tree, pager, or VDBE runtime
+  after the retained-sizing reset. Planner and codegen remained peer-owned and
+  out of scope. All Cargo commands were fail-closed remote-only through RCH;
+  the comparable benchmark and profile runs were pinned to `vmi1293453`, and
+  Criterion `median` estimates were the decision gate.
+- The first routing probe, `op_range_scan_100/frankensqlite`, measured
+  `4606.371 ns` median with 95% interval `[4501.849, 4791.015] ns`. The valid
+  66,716-sample, zero-loss profile
+  `/data/tmp/cod-fsq-runtime-range-fb5e6d6f-20260711T1042Z.perf.data`
+  attributed `20.91%` self-time to `SqliteValue::to_vec` and `18.42%` to
+  `row_from_memdb_row_values`, both below
+  `Connection::try_execute_prepared_query_fast_path`. That workload is
+  dominated by core result materialization rather than the assigned storage
+  surface, so it was discarded before source mutation.
+- The replacement pure-pager `vdbe_pipeline_commit` substrate at
+  `fb5e6d6f`, on the same worker, produced these retrieved Criterion medians:
+
+  | dirty pages | median | median 95% interval |
+  |---:|---:|---:|
+  | 2 | `15441.717 ns` | `[15211.524, 15720.921] ns` |
+  | 8 | `21163.778 ns` | `[20837.297, 21580.909] ns` |
+  | 32 | `43763.446 ns` | `[43213.928, 44901.086] ns` |
+
+- Same-revision commit-phase attribution passed remotely and reported two
+  commits with `phase_sum_ns=38117`: Phase A `9504 ns` (`24.9%`), MemoryVFS
+  flush `15053 ns` (`39.5%`), cache finish `7200 ns` (`18.9%`), Phase-C
+  metadata `4486 ns` (`11.8%`), publish `1432 ns` (`3.8%`), file size
+  `362 ns` (`0.9%`), and unlock `80 ns` (`0.2%`). The symbolized 32-page
+  capture
+  `/data/tmp/cod-fsq-pager-commit32-fb5e6d6f-20260711T1121Z.perf.data`
+  retained 12,270 samples with zero loss. Its commit subtree put
+  `flush_write_set_to_db_file_batch` at `21.30%` of all cycles and committed
+  publication at `8.11%`; the remaining Phase-A helpers were small:
+  `drain_unstaged_allocated_pages` `0.57%` and
+  `ensure_page_one_in_write_set` `0.14%`. The shared staged-page insertion
+  helper was at most `2.90%` inclusive across both untimed fixture setup and
+  commit, so it is not a commit-only removable ceiling.
+- Opportunity result: every large assigned-surface family is already closed.
+  Memory flush maps to the `Memory VFS write-page-batch no-allocation screen`;
+  cache/publication maps to the committed-cache direct-insertion, cache
+  clean-mark, and direct-page publication rejects; the obvious Phase-A
+  shortcut maps to `Normal private-memory page-1 commit skip`, which strongly
+  regressed its focused matrix. The remaining individual helpers do not clear
+  the median interval, while the per-pager Phase-A serialization cliff is the
+  architectural `bd-wee9a` redesign rather than a safe one-lever change.
+- Correctness proof on then-current `e042d2b9` passed remotely with compile
+  parallelism limited only to satisfy fleet admission: `RCH_REQUIRE_REMOTE=1
+  env -u CARGO_TARGET_DIR rch exec -- cargo test --profile release-perf -j3
+  -p fsqlite-vdbe --test golden_bytecode_snapshots -- --test-threads=1`
+  passed all 8 golden families, and the same fail-closed command shape for
+  `-p fsqlite-e2e --test dml_update_delete_oracle_e2e -- --nocapture
+  --test-threads=1` passed all 16 SQLite-differential result scenarios. During
+  that remote run, `origin/main` advanced to `57d71d0e` only in peer-owned
+  codegen, its range-seek oracles, Beads, and this ledger; that separate
+  codegen change is not attributed to this runtime/storage proof.
+- Result: no eligible `Impact * Confidence / Effort >= 2.0` candidate was
+  exposed, so no production, benchmark, planner, codegen, snapshot, or golden
+  file changed. The profiled pager, B-tree cursor, and VDBE runtime engine are
+  byte-identical from `fb5e6d6f` through landing base `57d71d0e` (SHA-256
+  `5964ee2088f86b664555b2a30ed3e462f7f8f12e83a063e2c74c6977497b0f9e`,
+  `147ebac72b6d7d1802d6ffe4fe9e1cf318075b3a335e07346559f90384589376`,
+  and `a21a109b1a0a2aa7ca501c5819c2e02b0ff8c03de59040e0e1b291e555918884`).
+  No local Cargo command or fallback was attempted.
+- Retry only when a fresh assigned-surface profile exposes an unblocked
+  function whose removable self-time exceeds the median interval at every
+  required dirty-page size. Core result-materialization work requires a
+  separately assigned lane; the Phase-A concurrency cliff requires its
+  existing architectural task, not another standalone page-1 or vector trim.
+
 ## 2026-07-11 - NON-CANDIDATE: in-memory commit file-size round trip is below the median floor
 
 - Target: a fresh pager/VDBE-runtime follow-up after the prepared-DELETE
