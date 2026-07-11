@@ -17390,3 +17390,39 @@ test is on the executed path, not merely linked into it.
 - NEXT (better ROI than plan_compute): the PARSE phase (~1.4-4.4us, byte-identical-safe — same AST),
   which is a self-contained target in `fsqlite-parser`; profile it first. The IndexInfo-borrow refactor
   is filed as a deferred structural project, not a lever.
+
+## 2026-07-11 - WIN: incremental interner `retained_bytes` (drop the per-parse O(entries) fold) (bd-5310l)
+
+- Result type: KEPT. Correctness gate PASSED (fsqlite-parser `--lib`: 513 pass / 0 fail, incl. a new
+  `interner_incremental_bytes_equals_fold` unit test proving the running sum == the fold). Median A/B
+  MEASURED under release-perf: **1.22x parse speedup** on a warm interner, null control 0.998x.
+  Byte-identical. Shipped.
+- Profile-first: split the parse phase into LEX (`Lexer::tokenize`) vs PARSE (recursive-descent AST
+  build) via a new `fsqlite-parser` microbench (`parse_phase_profile.rs`) — both are meaningful and
+  the lexer/parser are already well-optimized (byte-based keyword lookup with a common fast path,
+  `hashbrown` interner, scratch reuse). The one clear inefficiency: the identifier interner RETAINS
+  entries across parses (only resets past 256 entries / 16KB), and `prepare_for_next_parse` calls
+  `retained_bytes()` on EVERY parse — which FOLDS over every interned entry (`values.iter().fold(sum
+  of len)`), i.e. O(entries) per parse. A warm interner (a real connection accumulates every table/
+  column name it has seen, up to the 256 cap) pays that scan on every statement.
+- FIX (lexer.rs): maintain `interned_bytes: usize` incrementally — `+= value.len()` on each new
+  `intern`, `= 0` on `reset` (entries are only added or bulk-cleared, so the running sum is exactly
+  the fold) — and have `retained_bytes()` return `capacity*size + interned_bytes` in O(1). A
+  thread-local `set_force_interner_scan_bench` reinstates the fold for the within-build A/B.
+- CORRECTNESS (byte-identical): only the retained-bytes COMPUTATION changes; the interned `Arc<str>`
+  set and every produced AST are untouched, and the running sum equals the fold for every intern/
+  reset sequence (unit-tested), so the reset-threshold behaviour is identical. All 3 `retained_bytes`
+  callers (the hot `prepare_for_next_parse`, the scratch-metrics path in parser.rs, and the
+  connection-level scratch metric) get the same value. 513 lib tests pass unchanged.
+- MEDIAN (release-perf, 40 samples x 5000 parses/arm, ~240-entry warm interner, within-build via
+  `set_force_interner_scan_bench`): SCAN arm (O(entries) fold) parse median 2024 ns/stmt vs INCR arm
+  (O(1) sum) 1658 ns/stmt = **1.22x**; null control (incr vs incr) 0.998x [1655 vs 1658]; ~367 ns
+  fold cost eliminated per parse. The win SCALES with interner warmth (≈0 on a cold/tiny interner,
+  ~367 ns near the 256-entry cap — i.e. real apps with many distinct identifiers). New A/B +
+  lex/parse split: `parse_phase_profile.rs`.
+- FOLLOW-UP: the remaining parse cost is inherent tokenization per-token work + AST allocation (an
+  arena would help but is a large structural change); the redundant common+full keyword lookup for
+  non-keyword identifiers is a micro-opt (uncertain median).
+- Provenance: correctness via rch -j3 (fsqlite-parser --lib, 513 pass); A/B via rch `--profile
+  release-perf` (vmi1149989); clippy + fmt clean. (Small crate -> builds fast; NOT fleet-blocked,
+  unlike the fsqlite-e2e/core profiles.)

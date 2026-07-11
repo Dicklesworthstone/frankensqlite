@@ -128,10 +128,31 @@ pub fn reset_tokenize_metrics() {
 const MAX_RETAINED_IDENTIFIER_INTERNER_ENTRIES: usize = 256;
 const MAX_RETAINED_IDENTIFIER_INTERNER_BYTES: usize = 16 * 1024;
 
+thread_local! {
+    /// bd-5310l benchmark knob: force `retained_bytes` to recompute via the O(entries) fold instead
+    /// of the incremental running sum, so an A/B harness can measure the fold cost within one build.
+    /// Off by default; zero cost when off.
+    static FSQLITE_FORCE_INTERNER_SCAN_BENCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Force the O(entries) `retained_bytes` fold on the current thread (bd-5310l bench A/B only).
+///
+/// When `true`, the interner recomputes its retained byte count by scanning every entry instead of
+/// using the incrementally-maintained sum, so the two can be compared in one process.
+pub fn set_force_interner_scan_bench(enabled: bool) {
+    FSQLITE_FORCE_INTERNER_SCAN_BENCH.with(|c| c.set(enabled));
+}
+
 /// SQL lexer that produces a stream of tokens from source text.
 #[derive(Debug, Default)]
 pub(crate) struct IdentifierInterner {
     values: HashSet<Arc<str>>,
+    /// bd-5310l: running sum of `value.len()` over all interned entries, kept incrementally so
+    /// `retained_bytes` (called on EVERY parse by `prepare_for_next_parse`) is O(1) instead of an
+    /// O(entries) fold. Entries are only added (`intern`) or bulk-cleared (`reset`), so the running
+    /// sum stays exactly equal to the fold. Byte-identical: only the threshold computation changes.
+    interned_bytes: usize,
 }
 
 impl IdentifierInterner {
@@ -143,18 +164,26 @@ impl IdentifierInterner {
         let interned: Arc<str> = Arc::from(value);
         let inserted = Arc::clone(&interned);
         self.values.insert(interned);
+        self.interned_bytes = self.interned_bytes.saturating_add(value.len());
         inserted
     }
 
     pub(crate) fn reset(&mut self) {
         self.values = HashSet::new();
+        self.interned_bytes = 0;
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        let interned_value_bytes = self
-            .values
-            .iter()
-            .fold(0usize, |sum, value| sum.saturating_add(value.len()));
+        // bd-5310l: use the incrementally-maintained `interned_bytes` (O(1)) rather than folding
+        // over every entry (O(entries)) on the per-parse hot path. A bench force-flag reinstates the
+        // fold so the two can be A/B-compared within one build.
+        let interned_value_bytes = if FSQLITE_FORCE_INTERNER_SCAN_BENCH.with(std::cell::Cell::get) {
+            self.values
+                .iter()
+                .fold(0usize, |sum, value| sum.saturating_add(value.len()))
+        } else {
+            self.interned_bytes
+        };
         self.values
             .capacity()
             .saturating_mul(std::mem::size_of::<Arc<str>>())
@@ -1121,6 +1150,31 @@ const fn hex_digit(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interner_incremental_bytes_equals_fold() {
+        // bd-5310l: the incrementally-maintained `interned_bytes` must exactly equal the O(N) fold
+        // over entries, for every intern/reset sequence, so `retained_bytes` (and thus the
+        // reset-threshold behaviour) is byte-identical whichever path computes it.
+        let mut interner = IdentifierInterner::default();
+        for v in ["alpha", "beta", "gamma", "alpha", "delta", "beta"] {
+            interner.intern(v);
+        }
+        // Deduped distinct set {alpha(5), beta(4), gamma(5), delta(5)} -> 19 bytes.
+        assert_eq!(interner.interned_bytes, 19);
+        set_force_interner_scan_bench(false);
+        let incremental = interner.retained_bytes();
+        set_force_interner_scan_bench(true);
+        let folded = interner.retained_bytes();
+        set_force_interner_scan_bench(false);
+        assert_eq!(
+            incremental, folded,
+            "incremental retained_bytes must equal the O(N) fold"
+        );
+        interner.reset();
+        assert_eq!(interner.interned_bytes, 0);
+        assert_eq!(interner.retained_bytes(), 0);
+    }
 
     fn lex(src: &str) -> Vec<Token> {
         Lexer::tokenize(src)

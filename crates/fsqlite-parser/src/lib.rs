@@ -11,7 +11,8 @@ pub mod token;
 
 pub use lexer::{
     Lexer, TokenizeDurationSecondsHistogram, TokenizeMetricsSnapshot, reset_tokenize_metrics,
-    set_tokenize_metrics_enabled, tokenize_metrics_enabled, tokenize_metrics_snapshot,
+    set_force_interner_scan_bench, set_tokenize_metrics_enabled, tokenize_metrics_enabled,
+    tokenize_metrics_snapshot,
 };
 pub use parser::{
     ParseError, ParseMetricsSnapshot, Parser, StatementParseScratch,
