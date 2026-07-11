@@ -36863,8 +36863,10 @@ impl Connection {
             self.flush_retained_autocommit_txn(cx)?;
             return Ok(());
         }
-        // bd-3qeu9.4: Use conservative conflict estimate to avoid redundant
-        // PagerInner Mutex acquisition (same fix as execute_commit_with_cx).
+        // Use the pager's lock-free conservative conflict surface here. Pager
+        // implementations must include explicit writes plus any freed pages and
+        // a shared metadata conflict token needed to serialize commit-time
+        // freelist/header synthesis.
         let pending_conflict_pages = if is_concurrent_txn && txn_has_pending_writes {
             txn.pending_conflict_pages_conservative()
         } else {
@@ -44868,17 +44870,11 @@ impl Connection {
             let txn_has_pending_writes = txn_guard
                 .as_ref()
                 .is_some_and(|txn| txn.has_pending_writes());
-            // bd-3qeu9.4: Use conservative conflict page estimate that does NOT
-            // acquire the PagerInner Mutex.  The previous call to
-            // `txn.pending_conflict_pages()` took inner.lock() here — a redundant
-            // third Mutex acquisition per concurrent commit (the same Mutex is
-            // taken again in Phase A and Phase C).  The conservative estimate
-            // returns write_pages_sorted directly — the user-written pages.
-            // This omits synthesized freelist trunk pages that the precise path
-            // would include, but Phase A serializes freelist reconciliation under
-            // inner.lock() independently, so trunk conflicts do not affect
-            // correctness.  For INSERT-heavy benchmarks without freelist churn
-            // the two sets are identical.
+            // Use the pager's lock-free conservative conflict surface. This
+            // avoids a redundant PagerInner lock acquisition while preserving
+            // FCW correctness: pager implementations include their explicit
+            // writes, freed pages, and a shared metadata conflict token whenever
+            // commit-time freelist/header synthesis can mutate additional pages.
             let pending_conflict_pages = if is_concurrent_txn && txn_has_pending_writes {
                 txn_guard
                     .as_ref()

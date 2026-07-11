@@ -753,20 +753,20 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         self.pending_commit_pages()
     }
 
-    /// Conservative conflict page estimate that does NOT acquire the pager
-    /// inner lock (bd-3qeu9.4).
+    /// Lock-free conservative conflict estimate for commit planning
+    /// (bd-3qeu9.4).
     ///
-    /// Returns the write-set pages directly — the user-written pages without
-    /// synthesized freelist trunk pages that `pending_conflict_pages()` would
-    /// add when the freelist is dirty.  This is NOT a strict superset: it
-    /// omits trunk pages.  However, Phase A serializes freelist reconciliation
-    /// under `inner.lock()` independently, so trunk-page conflicts do not
-    /// affect commit correctness.  For INSERT-heavy workloads without
-    /// freelist churn the two sets are identical.
+    /// Implementations whose commits can mutate pages outside their explicit
+    /// write set (for example, freed pages or freelist metadata) must override
+    /// this method with a correctness-preserving superset. A shared metadata
+    /// page may be used as the conflict token when enumerating every synthesized
+    /// metadata page would require the pager-inner lock. The default is suitable
+    /// only for implementations whose entire mutation surface is represented by
+    /// `write_set_page_numbers()`.
     ///
-    /// This avoids a redundant `inner.lock()` acquisition on the commit
-    /// hot-path.  The precise set (with freelist/page-1 refinement) is still
-    /// available via `pending_conflict_pages()` when needed.
+    /// This avoids a redundant pager-inner lock acquisition on the commit hot
+    /// path. The precise set remains available via `pending_conflict_pages()`
+    /// when callers need exact commit-time page synthesis.
     fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
         self.write_set_page_numbers()
     }
