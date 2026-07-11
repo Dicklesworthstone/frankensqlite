@@ -1893,6 +1893,7 @@ pub fn codegen_select(
                         table,
                         table_alias,
                         idx.is_unique,
+                        false,
                     )
                 {
                     return None;
@@ -2017,6 +2018,62 @@ pub fn codegen_select(
             composite.index,
             &composite.prefix_exprs,
             &composite.range,
+        );
+    }
+
+    // bd-ln7dp: reverse (DESC) single-column range seek. `WHERE col <range> ORDER BY col DESC, id
+    // DESC` (keyset "most recent first" pagination) streams in `(col DESC, rowid DESC)` order off a
+    // reverse index walk (SeekLE/Last + Prev) — no sorter, and LIMIT/OFFSET stream off it. Routed
+    // before the directive (which would otherwise pick the ascending seek). Declines aggregate /
+    // GROUP BY / DISTINCT / hints / WITHOUT ROWID and any order other than `col DESC[, id DESC]`.
+    let index_range_desc = if !is_aggregate
+        && time_travel.is_none()
+        && from_index_hint.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !table.without_rowid
+        && !stmt.order_by.is_empty()
+    {
+        extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
+            |(col_name, range)| {
+                let idx = table
+                    .index_for_column(&col_name)
+                    .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+                if !range_order_by_is_deterministic(
+                    &col_name,
+                    &stmt.order_by,
+                    table,
+                    table_alias,
+                    idx.is_unique,
+                    true,
+                ) {
+                    return None;
+                }
+                if !index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range) {
+                    return None;
+                }
+                Some((idx, range))
+            },
+        )
+    } else {
+        None
+    };
+    if let Some((idx_schema, range)) = index_range_desc {
+        return codegen_select_index_range_scan_desc(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            &range,
         );
     }
 
@@ -3567,6 +3624,211 @@ fn codegen_select_index_range_scan(
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
 
+    Ok(())
+}
+
+/// Reverse (DESC) single-column index-range seek: `WHERE col <range> ORDER BY col DESC, id DESC`.
+/// The mirror of [`codegen_select_index_range_scan`] — it positions at the HIGH end of the range
+/// (`SeekLE(upper)` with a MAX rowid sentinel, or `Last` when there is no upper bound), walks down
+/// with `Prev`, and stops at the LOWER bound (or at the NULL region at the index bottom when there
+/// is no lower bound). Emits rows in `(col DESC, rowid DESC)` order — exactly what the reverse index
+/// walk produces for `ORDER BY col DESC, id DESC`, so it is bit-identical without a sorter. Rowid
+/// tables only (WITHOUT ROWID declined at detection).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_index_range_scan_desc(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    range: &ColumnRangeTarget<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
+    let bound_affinity = idx_schema
+        .columns
+        .first()
+        .and_then(|name| table.column_index(name))
+        .map(|idx| table.columns[idx].affinity)
+        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
+
+    // Upper bound anchors the seek (position at the high end); rowid sentinel MAX so `SeekLE`
+    // lands on the LAST entry with `col == upper`.
+    let upper_probe = range.upper.as_ref().map(|bound| {
+        let base = b.alloc_regs(2);
+        emit_expr(b, bound.expr(), base, None);
+        if let Some(aff) = bound_affinity
+            && !bound_matches_affinity(aff, bound.expr())
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                base,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MAX), 0);
+        (base, bound.inclusive)
+    });
+    // Lower bound is the stop (walking down).
+    let lower_reg = range.lower.as_ref().map(|bound| {
+        let reg = b.alloc_reg();
+        emit_expr(b, bound.expr(), reg, None);
+        if let Some(aff) = bound_affinity
+            && !bound_matches_affinity(aff, bound.expr())
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Affinity(aff.to_string()),
+                0,
+            );
+        }
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        (reg, bound.inclusive)
+    });
+    let current_key_reg = b.alloc_reg();
+
+    let covering_output = if table.without_rowid {
+        None
+    } else {
+        resolve_covering_output_sources(columns, table, table_alias, idx_schema)
+    };
+    let needs_table_lookup = covering_output.is_none();
+    if needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+
+    if let Some((upper_base, _)) = upper_probe.as_ref() {
+        let probe_record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            *upper_base,
+            2,
+            probe_record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekLE,
+            idx_cursor,
+            probe_record_reg,
+            done_label,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_jump_to_label(Opcode::Last, idx_cursor, 0, done_label, P4::None, 0);
+    }
+
+    let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
+
+    b.emit_op(Opcode::Column, idx_cursor, 0, current_key_reg, P4::None, 0);
+    // NULLs sit at the bottom of the index and never satisfy a range predicate, but the reverse walk
+    // descends into them — a lower-bound stop like `current < lower` yields NULL (not true) on a NULL
+    // key, so it would NOT fire. Stop unconditionally once a NULL key is reached; every entry below
+    // it is also NULL.
+    b.emit_jump_to_label(Opcode::IsNull, current_key_reg, 0, done_label, P4::None, 0);
+    // Lower stop (walking down): `current < lower` (inclusive `>=`) or `current <= lower`
+    // (exclusive `>`) ends the scan.
+    if let Some((lreg, inclusive)) = lower_reg {
+        let stop = if inclusive { Opcode::Lt } else { Opcode::Le };
+        b.emit_jump_to_label(stop, lreg, current_key_reg, done_label, P4::None, 0);
+    }
+    // Exclusive upper: `SeekLE` may land on `col == upper`; skip those (only at the very top).
+    if let Some((upper_base, inclusive)) = upper_probe.as_ref()
+        && !*inclusive
+    {
+        b.emit_jump_to_label(
+            Opcode::Ge,
+            *upper_base,
+            current_key_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+    if let Some(cov) = &covering_output {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Prev, idx_cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
     Ok(())
 }
 
@@ -20261,12 +20523,15 @@ fn range_order_by_is_deterministic(
     table: &TableSchema,
     table_alias: Option<&str>,
     index_is_unique: bool,
+    descending: bool,
 ) -> bool {
-    let ascending = |term: &OrderingTerm| {
-        term.nulls.is_none() && !matches!(term.direction, Some(SortDirection::Desc))
+    // Every term must sort in the walk's direction (ascending seek: no DESC; reverse seek: all DESC)
+    // with no NULLS clause.
+    let dir_ok = |term: &OrderingTerm| {
+        term.nulls.is_none() && matches!(term.direction, Some(SortDirection::Desc)) == descending
     };
     let is_range_col = |term: &OrderingTerm| {
-        ascending(term)
+        dir_ok(term)
             && matches!(
                 resolve_column_ref(&term.expr, table, table_alias),
                 Some(SortKeySource::Column(idx))
@@ -20274,7 +20539,7 @@ fn range_order_by_is_deterministic(
             )
     };
     let is_rowid = |term: &OrderingTerm| {
-        ascending(term)
+        dir_ok(term)
             && matches!(
                 resolve_column_ref(&term.expr, table, table_alias),
                 Some(SortKeySource::Rowid)
@@ -20302,6 +20567,7 @@ fn composite_order_by_satisfied(
             table,
             table_alias,
             comp.index.is_unique,
+            false,
         )
 }
 

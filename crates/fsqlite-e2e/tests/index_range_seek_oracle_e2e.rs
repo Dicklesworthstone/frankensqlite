@@ -767,3 +767,77 @@ fn index_range_seek_unique_bare_order_by_matches_sqlite() {
         "unique bare ORDER BY must range-seek (SeekGE); ops = {ops:?}"
     );
 }
+
+/// bd-ln7dp: reverse (DESC) single-column range seek. `WHERE col <range> ORDER BY col DESC, id DESC`
+/// (keyset "most recent first" pagination) streams in `(col DESC, rowid DESC)` order off a reverse
+/// index walk (SeekLE/Last + Prev) with no sorter. Bit-identical to C SQLite across bounds, LIMIT/
+/// OFFSET, covering/non-covering, NULL handling, empty ranges, and declines.
+#[test]
+fn index_range_seek_desc_matches_sqlite() {
+    let (f, r) = setup();
+    for sql in [
+        "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC, id DESC",
+        "SELECT id, k FROM t WHERE k <= 5 ORDER BY k DESC, id DESC",
+        "SELECT id, k FROM t WHERE k > 2 ORDER BY k DESC, id DESC",
+        "SELECT id, k FROM t WHERE k >= 2 ORDER BY k DESC, id DESC",
+        "SELECT id, k FROM t WHERE k BETWEEN 0 AND 6 ORDER BY k DESC, id DESC",
+        "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC, id DESC LIMIT 3",
+        "SELECT id, k FROM t WHERE k > -2 ORDER BY k DESC, id DESC LIMIT 4 OFFSET 2",
+        "SELECT k FROM t WHERE k >= -3 ORDER BY k DESC, id DESC", // covering k
+        "SELECT id, rr FROM t WHERE rr < 3 ORDER BY rr DESC, id DESC",
+        "SELECT id FROM t WHERE w < 'r10' ORDER BY w DESC, id DESC", // text BINARY
+        "SELECT id, w FROM t WHERE k > 3 ORDER BY k DESC, id DESC", // non-covering (w -> table lookup)
+        "SELECT id FROM t WHERE k > 999 ORDER BY k DESC, id DESC",  // empty
+        // Deterministic declines (mixed direction / rowid-first) -> sorter, still bit-identical.
+        "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC, id ASC",
+        "SELECT id, k FROM t WHERE k < 5 ORDER BY id DESC, k DESC",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "desc range diverged for `{sql}`"
+        );
+    }
+    // Bare `ORDER BY k DESC` (non-unique) is tie-ambiguous (declines to the sorter); set comparison.
+    let sorted = |mut v: Vec<Vec<String>>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(frank_rows(&f, "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC").unwrap()),
+        sorted(sqlite_rows(&r, "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC").unwrap()),
+        "bare DESC row set diverged"
+    );
+    // Opcode gate: DESC reverse-walks (Prev) with no sorter; upper-bounded uses SeekLE, otherwise Last.
+    let ops_u = opcodes(
+        &f,
+        "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC, id DESC",
+    );
+    assert!(
+        !ops_u.iter().any(|o| o.starts_with("Sorter")),
+        "DESC must avoid the sorter; ops = {ops_u:?}"
+    );
+    assert!(
+        ops_u.iter().any(|o| o == "Prev"),
+        "DESC must reverse-walk (Prev); ops = {ops_u:?}"
+    );
+    assert!(
+        ops_u.iter().any(|o| o == "SeekLE"),
+        "DESC with an upper bound must SeekLE; ops = {ops_u:?}"
+    );
+    let ops_l = opcodes(
+        &f,
+        "SELECT id, k FROM t WHERE k > 2 ORDER BY k DESC, id DESC",
+    );
+    assert!(
+        ops_l.iter().any(|o| o == "Last"),
+        "DESC with no upper bound must start at Last; ops = {ops_l:?}"
+    );
+    assert!(
+        uses_index(&opcodes(
+            &f,
+            "SELECT id, k FROM t WHERE k < 5 ORDER BY k DESC, id DESC LIMIT 3"
+        )),
+        "DESC + LIMIT must seek"
+    );
+}

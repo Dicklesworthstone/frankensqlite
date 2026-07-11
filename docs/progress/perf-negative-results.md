@@ -16909,3 +16909,36 @@ test is on the executed path, not merely linked into it.
 - FOLLOW-UP: DESC reverse seek (`ORDER BY col DESC, id DESC` via SeekLE/Last + Prev); NOCASE/RTRIM
   collation-aware seeks; multi-column equality direct probe.
 - Provenance: oracle via rch -j3; clippy via rch -j3; codegen.rs sha256 in the commit.
+
+## 2026-07-11 - WIN: DESC reverse single-column range seek, no sorter (bd-6x9z0)
+
+- Result type: KEPT. Differential gate PASSED (8/8 oracle tests, rch -j3; one bug caught + fixed
+  before landing); shipped. `WHERE col <range> ORDER BY col DESC, id DESC [LIMIT n [OFFSET m]]` —
+  keyset "most recent first" pagination (feeds/timelines) — now streams off a reverse index walk
+  with NO sorter, where it previously sorted.
+- Profile-first: the ascending range+ORDER BY levers only handled ascending order; a DESC order fell
+  to the sorter (the ordered-scan bails on rowid order terms, and the range seek was ascending-only).
+- FIX (codegen.rs): new `codegen_select_index_range_scan_desc` — the mirror of the ascending seek.
+  It positions at the HIGH end of the range (`SeekLE(upper)` with a MAX rowid sentinel so it lands on
+  the last `col == upper` dup, or `Last` when there is no upper bound), walks down with `Prev`, and
+  stops at the LOWER bound; it emits `(col DESC, rowid DESC)` — exactly the reverse index order, so
+  `ORDER BY col DESC, id DESC` is bit-identical without a sorter. `range_order_by_is_deterministic`
+  gained a `descending` flag (shared with the ascending path). Routed before the planner directive
+  (which would pick the ascending seek). Declines aggregate/GROUP BY/DISTINCT/hints/WITHOUT ROWID and
+  any order other than `col DESC[, id DESC]` (a bare non-unique `ORDER BY col DESC` stays a sorter).
+- BUG the differential CAUGHT (why the hard gate matters): a lower-bounded DESC walk (`k >= -3`)
+  descends into the NULL region at the index bottom, and the lower-bound stop `Lt(lower, NULL)` yields
+  NULL (does not fire), so the NULL-key row leaked in. Fixed with an UNCONDITIONAL `IsNull -> done`
+  (NULLs never satisfy a range and are always at the bottom, so the reverse walk always stops there).
+  7/8 → 8/8 after the fix.
+- SEMANTIC PROOF (hard gate): `index_range_seek_desc_matches_sqlite` — INTEGER/REAL/TEXT columns;
+  `>, >=, <, <=, BETWEEN`; LIMIT and LIMIT/OFFSET; covering + non-covering; a NULL row; empty ranges;
+  deterministic declines (mixed direction `DESC, id ASC`; rowid-first `id DESC, k DESC`); bare
+  `ORDER BY k DESC` as a set (declines to sorter) — all bit-identical to rusqlite. Opcode gate: the
+  DESC seek reverse-walks (`Prev`) with no `Sorter*` op, uses `SeekLE` with an upper bound and `Last`
+  without, and `IdxRowid`. 8/8 oracle tests pass; fsqlite-vdbe --lib clippy clean.
+- MEDIAN: eliminates the O(n log n) sorter + temp b-tree for reverse pagination AND seeks to the
+  range (visits only matching rows). A/B pending fleet.
+- FOLLOW-UP: composite DESC (`WHERE a = v AND b <range> ORDER BY b DESC, id DESC`); DESC on a unique
+  index (bare `ORDER BY col DESC`); NOCASE/RTRIM collation-aware seeks.
+- Provenance: oracle via rch -j3 (worker per queue); clippy via rch -j3; codegen.rs sha256 in commit.
