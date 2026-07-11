@@ -12,13 +12,21 @@
 //! pays on every statement. `gap = wall_clock - sum(instrumented phases)` is the
 //! un-instrumented setup overhead (tracing gates, clones, dispatch bookkeeping).
 
+// ns/count -> f64 for medians; precision loss is irrelevant to a timing ratio.
+#![allow(clippy::cast_precision_loss)]
+
 use std::time::Instant;
 
 use fsqlite::Connection;
 use fsqlite_core::connection::{
     HotPathProfileSnapshot, compile_subphase_ns, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled,
+    set_force_schema_clone_bench, set_hot_path_profile_enabled,
 };
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
 
 fn ns_per(total_ns: u64, n: u64) -> f64 {
     total_ns as f64 / n as f64
@@ -129,6 +137,95 @@ fn profile_unique_sql(conn: &Connection) {
         sub[3] as f64 / nf,
         sub[4] as f64 / nf,
     );
+}
+
+/// bd-5310l A/B: the per-compile defensive schema deep-clone vs the borrow fast path, measured
+/// WITHIN one build via `set_force_schema_clone_bench`. A large schema (many tables/indexes) makes
+/// the O(total-schema) clone dominate. Each arm compiles DISTINCT unique-literal SQL of the same
+/// shape (so the compile cache always misses and the compared work is identical modulo the literal);
+/// the clone arm forces the clone, the borrow arm takes the fast path, and a null control re-runs the
+/// borrow arm to expose the sequential-drift floor. Gate on median(clone)/median(borrow).
+#[test]
+#[ignore = "A/B bench; run explicitly under --profile release-perf"]
+fn schema_clone_vs_borrow_compile_ab() {
+    let conn = Connection::open(":memory:").expect("open frank");
+    // Large schema: 40 tables x (6 cols + 2 indexes) — the deep clone copies ALL of it per compile.
+    for tb in 0..40 {
+        conn.execute(&format!(
+            "CREATE TABLE big{tb} (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT, d REAL, e INTEGER);"
+        ))
+        .unwrap();
+        conn.execute(&format!("CREATE INDEX ix_big{tb}_b ON big{tb}(b);"))
+            .unwrap();
+        conn.execute(&format!("CREATE INDEX ix_big{tb}_c ON big{tb}(c);"))
+            .unwrap();
+    }
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+        .unwrap();
+    for i in 1..=500_i64 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i}');"))
+            .unwrap();
+    }
+
+    let samples = 40usize;
+    let k = 400usize;
+    // Globally-unique literal so every compile is a genuine cache MISS (never repeats a shape+literal).
+    let mut lit = 1_000_000_i64;
+    let mut run = |force: bool, lit: &mut i64| -> (f64, f64) {
+        set_force_schema_clone_bench(force);
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+        for _ in 0..k {
+            *lit += 1;
+            let sql = format!("SELECT id, v FROM t WHERE id = {lit}");
+            let _ = conn.query(&sql).unwrap();
+        }
+        let snap = hot_path_profile_snapshot();
+        let sub = compile_subphase_ns();
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(false);
+        let kf = k as f64;
+        // (total compile ns/stmt, schema_clone sub-timer ns/stmt)
+        (snap.parser.compile_time_ns as f64 / kf, sub[0] as f64 / kf)
+    };
+
+    let mut clone_ns = Vec::new();
+    let mut clone_sub = Vec::new();
+    let mut borrow_ns = Vec::new();
+    let mut borrow_sub = Vec::new();
+    let mut null_ns = Vec::new();
+    for _ in 0..samples {
+        let (c, cs) = run(true, &mut lit);
+        clone_ns.push(c);
+        clone_sub.push(cs);
+        let (b, bs) = run(false, &mut lit);
+        borrow_ns.push(b);
+        borrow_sub.push(bs);
+        let (n, _) = run(false, &mut lit);
+        null_ns.push(n);
+    }
+    set_force_schema_clone_bench(false);
+
+    let mc = median(clone_ns);
+    let mb = median(borrow_ns);
+    let mn = median(null_ns);
+    eprintln!(
+        "\n########## bd-5310l schema clone-vs-borrow compile A/B (40-table schema) ##########"
+    );
+    eprintln!(
+        "  {samples} samples x {k} unique compiles/arm:\n    \
+         CLONE arm  compile median = {mc:9.1} ns/stmt   (schema_clone sub = {:.1} ns)\n    \
+         BORROW arm compile median = {mb:9.1} ns/stmt   (schema_clone sub = {:.1} ns)\n    \
+         speedup (clone/borrow)    = {:.3}x\n    \
+         null control (borrow vs borrow) = {:.3}x  [{mn:.1} vs {mb:.1}]\n    \
+         clone cost eliminated     = {:.1} ns/stmt",
+        median(clone_sub),
+        median(borrow_sub),
+        mc / mb,
+        mn / mb,
+        mc - mb,
+    );
+    eprintln!("########## end schema clone-vs-borrow A/B ##########\n");
 }
 
 #[test]

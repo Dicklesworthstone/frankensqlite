@@ -17189,3 +17189,59 @@ test is on the executed path, not merely linked into it.
   that exceeded this pass's remaining build budget (8 remote builds spent). Shipping a rushed planner
   change risked a non-win or a correctness regression. The infra added here makes the follow-up a
   measured, low-risk change.
+
+## 2026-07-11 - REJECT: planner-directive-cache bypass on the compile path (bd-5310l)
+
+- Result type: REJECTED before benching (correctness blocker found). The prior SURFACE entry proposed
+  bypassing/cheapening the planner-directive cache in `compile_table_select` on the theory it has one
+  production caller and is redundant with the compiled-program cache. That theory is WRONG.
+- BLOCKER: `compile_table_select` has ~15 DIRECT call sites (not all behind `compile_with_cache`) —
+  e.g. join/subquery/view compile paths at connection.rs 12293/50331/53151/55027/59675/... — where the
+  program cache does NOT intervene, so the planner-directive cache provides genuine reuse. And unit
+  tests explicitly assert it: `test_planner_directive_cache_hits_on_repeated_compile_table_select`
+  (connection.rs ~151259) requires the 2nd `compile_table_select` of the same select to HIT the
+  directive cache; another asserts it POPULATES the cache. Bypassing it fails these tests and regresses
+  the direct callers. Dropping only the `to_string()` key derivation is also unsafe (the key is used for
+  collision-safe equality; a structural hash risks a collision -> wrong directive reused -> NOT
+  byte-identical). RETRY CONDITION: none without redesigning the cache-key/equality contract and the
+  direct-caller reuse semantics — not worth it for the ~1.3us `to_string` on the compile-miss path.
+
+## 2026-07-11 - WIN: skip the per-compile defensive schema deep-clone when no stat1 / no shadow (bd-5310l)
+
+- Result type: KEPT. Correctness gate PASSED (fsqlite-core `--lib`: 3343 passed / 0 failed, incl. the
+  planner-cache tests and all compile/SELECT tests, and NO RefCell borrow-conflict panic). Median A/B
+  MEASURED under release-perf: **6.52x compile speedup** on a 40-table schema, null control 0.983x.
+  Byte-identical BY CONSTRUCTION. Shipped. This is the real bd-5310l compile lever the profile pointed
+  to (the planner-cache bypass above being blocked).
+- Profile-first: the compile sub-split (prior SURFACE entry) showed the planner is the dominant compile
+  sub-phase, but the schema clone — `self.schema.borrow().clone()` — is O(total schema) and only ~7% on
+  a 2-table test yet UNBOUNDED on a many-table "prod.db" (the bead's stated fixture). It is a purely
+  DEFENSIVE deep clone: the planner may reenter `self.query()` (and mutate `self.schema`) ONLY via
+  `sqlite_stat1_row_counts()`, which early-returns without any `self.query()` when `sqlite_stat1` does
+  not exist (no ANALYZE — the common case). The per-statement shadowed-main substitution is the only
+  other reason to own the schema, and it is a proven no-op when `shadowed_main_tables` is empty.
+- FIX (connection.rs): `compile_table_select` now borrows `self.schema` directly (NO clone) when
+  `sqlite_stat1_root_page().is_none()` AND `shadowed_main_tables` is empty (and a bench-only force flag
+  is off); it deep-clones + substitutes only otherwise. The planner+codegen tail is factored into
+  `compile_canonical_select_with_schema(&self, canonical_select, schema: &[TableSchema])`, called with
+  either the borrow or the owned clone. Safe to hold the `Ref` across the tail because on the fast path
+  the planner's only reentrant path (`sqlite_stat1`) is absent and codegen /
+  `planner_select_directive_with_stats` are non-`&self` (free/associated) — verified, and confirmed by
+  0 borrow panics across 3343 lib tests + 48k borrow-path compiles in the A/B.
+- CORRECTNESS (byte-identical by construction): the borrow path is taken ONLY when a clone would have
+  produced `self.schema.clone()` followed by a no-op `apply_shadowed_main_substitution` (empty shadow
+  map early-returns). So the `&[TableSchema]` handed to the planner + codegen is the same data either
+  way -> identical directive -> identical emitted `VdbeProgram`. No result can change; the 3343 lib
+  tests (all statement types) pass unchanged.
+- MEDIAN (release-perf, 40 samples x 400 unique compiles/arm, 40-table schema; within-build A/B via
+  `set_force_schema_clone_bench`): CLONE arm compile median 40127 ns/stmt (schema_clone sub 21044 ns)
+  vs BORROW arm 6151 ns/stmt (schema_clone sub 27 ns) = **6.52x**; null control (borrow vs borrow)
+  0.983x [6049 vs 6151]; clone cost eliminated ~34 us/stmt. The win scales with schema size (≈0 on a
+  1-2 table DB, large on a many-table prod.db). New A/B: `schema_clone_vs_borrow_compile_ab` in
+  `adhoc_parse_plan_profile.rs`.
+- FOLLOW-UP: parse phase (~1.4-4.4us, byte-identical-safe) and the planner's own directive computation
+  (~2.7us) remain; schema-clone still paid when ANALYZE has been run (stat1 present) — a cookie-safe
+  `Rc` snapshot could cover that but the schema_cookie does not track all 31 `self.schema` mutation
+  sites (stale-snapshot risk), so it needs an audit first.
+- Provenance: correctness via rch -j3 (fsqlite-core --lib, 3343 pass); A/B via rch `--profile
+  release-perf` (vmi1149989); clippy + fmt clean; connection.rs sha256 in the commit.

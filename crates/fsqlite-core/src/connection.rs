@@ -394,6 +394,21 @@ thread_local! {
 
 }
 
+thread_local! {
+    // bd-5310l benchmark knob: force the defensive schema deep-clone in `compile_table_select`
+    // even when the borrow fast path would apply, so an A/B harness can measure the clone cost
+    // (clone arm vs borrow arm) within a single build. Off by default; zero cost when off.
+    static FSQLITE_FORCE_SCHEMA_CLONE_BENCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Force the per-compile schema deep-clone path on the current thread (bd-5310l bench A/B only).
+///
+/// When `true`, `compile_table_select` always clones the schema instead of taking the borrow fast
+/// path, so the clone cost can be measured against the fast path in one process.
+pub fn set_force_schema_clone_bench(enabled: bool) {
+    FSQLITE_FORCE_SCHEMA_CLONE_BENCH.with(|c| c.set(enabled));
+}
+
 /// Test-only hook fired inside `execute_commit_with_cx` for a concurrent commit,
 /// at the precise point AFTER the physical pager write has landed but BEFORE the
 /// commit is published into the shared `CommitIndex`. This is the exact
@@ -1267,8 +1282,9 @@ pub fn reset_hot_path_profile() {
     reset_vdbe_metrics();
 }
 
-/// bd-5310l compile sub-phase timings (ns, accumulated while profiling is enabled):
-/// `[schema_clone, canonicalize+to_string, planner_directive, codegen, builder.finish]`.
+/// Compile sub-phase timings in ns (bd-5310l), accumulated while profiling is enabled.
+///
+/// Order: `[schema_clone, canonicalize+to_string, planner_directive, codegen, builder.finish]`.
 #[must_use]
 pub fn compile_subphase_ns() -> [u64; 5] {
     [
@@ -50071,26 +50087,57 @@ impl Connection {
         // bd-l2si0: expand row-value (tuple) comparisons into scalar boolean
         // expressions before codegen, which otherwise collapses them to false.
         rewrite_row_value_comparisons_in_select(&mut canonical_select);
-        let canonical_sql = canonical_select.to_string();
         record_hot_path_duration(&FSQLITE_COMPILE_CANONICAL_NS, t);
+
+        // bd-5310l: the whole schema is deep-cloned per compile ONLY as a defensive snapshot,
+        // because the planner may consult `sqlite_stat1` through a reentrant `self.query()` that can
+        // mutate `self.schema` while we hold a reference to it. That reentrancy happens iff
+        // `sqlite_stat1` actually exists (ANALYZE was run); `sqlite_stat1_row_counts()` early-returns
+        // without any `self.query()` otherwise. And the per-statement shadowed-main substitution
+        // needs an owned, mutable schema. So when neither applies — the common case (no ANALYZE, no
+        // TEMP shadowing) — borrow `self.schema` directly and skip the O(total-schema) deep clone.
+        // The schema data fed to the planner + codegen is identical either way, so the emitted
+        // program is byte-for-byte unchanged.
+        let needs_owned_schema = FSQLITE_FORCE_SCHEMA_CLONE_BENCH.with(std::cell::Cell::get)
+            || self.sqlite_stat1_root_page().is_some()
+            || !self.shadowed_main_tables.borrow().is_empty();
+        if needs_owned_schema {
+            let t = prof.then(Instant::now);
+            let mut schema = self.schema.borrow().clone();
+            // bd-wjrs0: when a TEMP table shadows a same-named main table, the visible `schema`
+            // entry is the TEMP one. An explicit `main.<name>` reference must still reach the
+            // shadowed main table, so swap it back into this per-statement snapshot.
+            self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
+            record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
+            self.compile_canonical_select_with_schema(&canonical_select, &schema)
+        } else {
+            let t = prof.then(Instant::now);
+            let schema = self.schema.borrow();
+            record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
+            self.compile_canonical_select_with_schema(&canonical_select, &schema)
+        }
+    }
+
+    /// Shared tail of `compile_table_select`: plan the directive and emit the program.
+    ///
+    /// Runs against an already-resolved schema slice (borrowed on the fast path, owned when a
+    /// defensive clone / shadowed-main substitution was required); byte-identical regardless of how
+    /// `schema` was obtained. Must not itself mutate `self.schema` (the fast path passes a live
+    /// `Ref`); the planner reaches `self.query()` only via `sqlite_stat1`, which is absent there.
+    fn compile_canonical_select_with_schema(
+        &self,
+        canonical_select: &SelectStatement,
+        schema: &[TableSchema],
+    ) -> Result<VdbeProgram> {
+        let prof = hot_path_profile_enabled();
         let feature_flags = PlannerFeatureFlags::default();
-        // The planner may consult sqlite_stat1 through `self.query()`, which can
-        // refresh the active transaction image and mutate `self.schema`. Do not
-        // hold a RefCell borrow across that reentrant path.
         let t = prof.then(Instant::now);
-        let mut schema = self.schema.borrow().clone();
-        // bd-wjrs0: when a TEMP table shadows a same-named main table, the
-        // visible `schema` entry is the TEMP one. An explicit `main.<name>`
-        // reference must still reach the shadowed main table, so swap it back
-        // into this per-statement snapshot.
-        self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
-        record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
-        let t = prof.then(Instant::now);
+        let canonical_sql = canonical_select.to_string();
         let planner_select_directive = self.planner_select_directive_with_cache(
-            &canonical_select,
+            canonical_select,
             &canonical_sql,
             feature_flags,
-            &schema,
+            schema,
         );
         record_hot_path_duration(&FSQLITE_COMPILE_PLANNER_NS, t);
         let mut builder = ProgramBuilder::new();
@@ -50106,7 +50153,7 @@ impl Connection {
         let extra_agg = self.extra_aggregate_names();
         fsqlite_vdbe::codegen::set_extra_aggregate_names(extra_agg);
         let t = prof.then(Instant::now);
-        let result = codegen_select(&mut builder, &canonical_select, &schema, &ctx)
+        let result = codegen_select(&mut builder, canonical_select, schema, &ctx)
             .map_err(codegen_error_to_franken);
         record_hot_path_duration(&FSQLITE_COMPILE_CODEGEN_NS, t);
         fsqlite_vdbe::codegen::clear_extra_aggregate_names();
