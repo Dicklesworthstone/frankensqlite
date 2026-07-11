@@ -16887,3 +16887,25 @@ test is on the executed path, not merely linked into it.
   rows, vs the ordered-scan which Rewinds and visits the whole index filtering). A/B pending fleet.
 - FOLLOW-UP: provably-deterministic bare `ORDER BY col` (unique index); DESC reverse seek.
 - Provenance: oracle via rch -j3; clippy via rch -j3; codegen.rs sha256 in the commit.
+
+## 2026-07-11 - WIN: bare ORDER BY on a UNIQUE index streams off the range seek (bd-s0snu)
+
+- Result type: KEPT. Differential gate PASSED (7/7 oracle tests, rch -j3); landed. `WHERE <unique
+  indexed col> <range> ORDER BY <col> [LIMIT n]` now streams off the range seek without a sorter.
+- Profile-first: the single-column/composite ORDER BY levers (bd-ss48y/bd-wimmv) only claimed the
+  deterministic 2-term `ORDER BY col, rowid` because a bare `ORDER BY col` is tie-ambiguous on a
+  non-unique index. But on a UNIQUE index there are no ties within a range (each `col` occurs once;
+  the range excludes NULLs), so bare `ORDER BY col` is already a total order — bit-identical to every
+  plan. That case was still going to the sorter.
+- FIX (codegen.rs): `range_order_by_is_deterministic` gains an `index_is_unique` flag — it accepts a
+  1-term `ORDER BY col` when the index is UNIQUE, plus the existing 2-term `ORDER BY col, <rowid>`.
+  The single-column gate is reordered to fetch the index first (for `is_unique`); composite passes
+  `comp.index.is_unique`. A bare `ORDER BY col` on a NON-unique index still declines to the sorter.
+- SEMANTIC PROOF (hard gate): `index_range_seek_unique_bare_order_by_matches_sqlite` — UNIQUE index
+  bare `ORDER BY uu` (+ BETWEEN, + LIMIT) exact; non-unique `ORDER BY gg, id` (2-term) still seeks
+  exact; non-unique bare `ORDER BY gg` as a set (declines to sorter); opcode gate: the unique bare
+  ORDER BY emits no `Sorter*` op and range-seeks (SeekGE). 7/7 oracle tests pass; clippy clean.
+- MEDIAN: eliminates the sorter for unique-column range pagination (same class of win as bd-ss48y).
+- FOLLOW-UP: DESC reverse seek (`ORDER BY col DESC, id DESC` via SeekLE/Last + Prev); NOCASE/RTRIM
+  collation-aware seeks; multi-column equality direct probe.
+- Provenance: oracle via rch -j3; clippy via rch -j3; codegen.rs sha256 in the commit.

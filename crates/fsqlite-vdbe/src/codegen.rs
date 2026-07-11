@@ -1879,16 +1879,20 @@ pub fn codegen_select(
     } else {
         extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
             |(col_name, range)| {
-                // bd-wimmv follow-up: the single-column range seek streams in `(col, rowid)` order
-                // (the index is single-key here), so it satisfies a deterministic
-                // `ORDER BY col, <rowid>` without a sorter — otherwise `ORDER BY col, id` falls to a
-                // sorter (the ordered-scan bails on rowid order terms). Any other ORDER BY declines.
+                let idx = table
+                    .index_for_column(&col_name)
+                    .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+                // bd-wimmv/bd-ss48y follow-up: the single-column range seek streams in `(col, rowid)`
+                // order (single-key index), so it satisfies a deterministic `ORDER BY col, <rowid>`
+                // (or bare `ORDER BY col` when the index is UNIQUE — no ties) without a sorter —
+                // otherwise it falls to a sorter. Any other ORDER BY declines.
                 if !stmt.order_by.is_empty()
                     && !range_order_by_is_deterministic(
                         &col_name,
                         &stmt.order_by,
                         table,
                         table_alias,
+                        idx.is_unique,
                     )
                 {
                     return None;
@@ -1896,10 +1900,7 @@ pub fn codegen_select(
                 if !index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range) {
                     return None;
                 }
-                table
-                    .index_for_column(&col_name)
-                    .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))
-                    .map(|idx| (col_name, idx, range))
+                Some((col_name, idx, range))
             },
         )
     };
@@ -20244,23 +20245,22 @@ fn composite_index_prefix_range_target<'a>(
     None
 }
 
-/// Whether the composite seek's natural row order satisfies `order_by` without a sorter. The seek
-/// walks the index in `(prefix..., range_col, rowid)` order; when the range column is the LAST key
-/// term, that is exactly `(range_col, rowid)` within the fixed prefix — the same order C SQLite's
-/// index walk produces for `ORDER BY <range_col> ASC`, so the result is bit-identical (no sorter).
-/// A trailing key column after the range column, a DESC/NULLS clause, or an order term that is not
-/// the range column declines (the sorter is kept).
 /// Whether an index-range seek that streams in `(range_col, rowid)` order satisfies `order_by`
-/// bit-identically. A bare `ORDER BY range_col` is tie-ambiguous (a different plan may order
-/// equal-`range_col` rows differently, so it is NOT guaranteed bit-identical to C SQLite) and is
-/// left to the sorter. Only the fully-deterministic `ORDER BY range_col, <rowid/ipk>` — a unique
-/// total order every plan agrees on — is claimed. Shared by the single-column and composite range
-/// seeks (both walk the index in `(range_col, rowid)` order when `range_col` is the last key term).
+/// bit-identically (ascending). Two forms qualify. First, `ORDER BY range_col, <rowid/ipk>` is a
+/// unique total order every plan agrees on, so it is always safe. Second, a bare `ORDER BY
+/// range_col` qualifies only when the index is UNIQUE: a unique index has no ties within the range
+/// (each `range_col` value occurs once, and the range excludes NULLs), so ordering by `range_col`
+/// alone is already a total order and is bit-identical to every plan. A bare `ORDER BY range_col`
+/// on a NON-unique index is tie-ambiguous (a different plan may order equal-`range_col` rows
+/// differently) and is left to the sorter; DESC/NULLS clauses decline. Shared by the single-column
+/// and composite range seeks (both stream `(range_col, rowid)` when `range_col` is the last key
+/// term).
 fn range_order_by_is_deterministic(
     range_col: &str,
     order_by: &[OrderingTerm],
     table: &TableSchema,
     table_alias: Option<&str>,
+    index_is_unique: bool,
 ) -> bool {
     let ascending = |term: &OrderingTerm| {
         term.nulls.is_none() && !matches!(term.direction, Some(SortDirection::Desc))
@@ -20280,7 +20280,11 @@ fn range_order_by_is_deterministic(
                 Some(SortKeySource::Rowid)
             )
     };
-    matches!(order_by, [t0, t1] if is_range_col(t0) && is_rowid(t1))
+    match order_by {
+        [t0] => index_is_unique && is_range_col(t0),
+        [t0, t1] => is_range_col(t0) && is_rowid(t1),
+        _ => false,
+    }
 }
 
 fn composite_order_by_satisfied(
@@ -20297,6 +20301,7 @@ fn composite_order_by_satisfied(
             order_by,
             table,
             table_alias,
+            comp.index.is_unique,
         )
 }
 

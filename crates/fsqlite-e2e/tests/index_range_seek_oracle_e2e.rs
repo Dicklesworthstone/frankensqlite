@@ -707,3 +707,63 @@ fn index_range_seek_single_col_order_by_matches_sqlite() {
         "single-col ORDER BY + LIMIT must seek"
     );
 }
+
+/// bd-ss48y follow-up: on a UNIQUE index there are no ties within a range, so a bare `ORDER BY col`
+/// is already a total order — the range seek streams it (no sorter), bit-identical. On a non-unique
+/// index a bare `ORDER BY col` is tie-ambiguous and still declines to the sorter.
+#[test]
+fn index_range_seek_unique_bare_order_by_matches_sqlite() {
+    let f = Connection::open(":memory:").expect("open frank");
+    let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+    for s in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, uu INTEGER, gg INTEGER);",
+        "CREATE UNIQUE INDEX idx_uu ON t(uu);",
+        "CREATE INDEX idx_gg ON t(gg);",
+    ] {
+        f.execute(s).unwrap();
+        r.execute_batch(s).unwrap();
+    }
+    for i in 1..=40_i64 {
+        let uu = i * 3 - 60; // unique, spans negatives
+        let gg = (i % 8) - 3; // duplicates
+        let sql = format!("INSERT INTO t VALUES ({i}, {uu}, {gg});");
+        f.execute(&sql).unwrap();
+        r.execute_batch(&sql).unwrap();
+    }
+    for sql in [
+        // UNIQUE index: bare ORDER BY uu is a total order (no ties) -> streams off the seek.
+        "SELECT id, uu FROM t WHERE uu > 0 ORDER BY uu",
+        "SELECT id, uu FROM t WHERE uu BETWEEN -30 AND 30 ORDER BY uu",
+        "SELECT id, uu FROM t WHERE uu > 0 ORDER BY uu LIMIT 5",
+        "SELECT uu FROM t WHERE uu >= -10 ORDER BY uu",
+        "SELECT id, uu FROM t WHERE uu > 0 ORDER BY uu, id",
+        // Non-unique index: the deterministic 2-term ORDER BY gg, id still seeks.
+        "SELECT id, gg FROM t WHERE gg > 0 ORDER BY gg, id",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "unique bare order-by diverged for `{sql}`"
+        );
+    }
+    // Bare `ORDER BY gg` on the non-unique index is tie-ambiguous (declines to the sorter); set.
+    let sorted = |mut v: Vec<Vec<String>>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(frank_rows(&f, "SELECT id, gg FROM t WHERE gg > 0 ORDER BY gg").unwrap()),
+        sorted(sqlite_rows(&r, "SELECT id, gg FROM t WHERE gg > 0 ORDER BY gg").unwrap()),
+        "non-unique bare ORDER BY row set diverged"
+    );
+    // The unique bare ORDER BY range-seeks (SeekGE) and streams without a sorter.
+    let ops = opcodes(&f, "SELECT id, uu FROM t WHERE uu > 0 ORDER BY uu");
+    assert!(
+        !ops.iter().any(|o| o.starts_with("Sorter")),
+        "unique bare ORDER BY must avoid the sorter; ops = {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|o| o == "SeekGE"),
+        "unique bare ORDER BY must range-seek (SeekGE); ops = {ops:?}"
+    );
+}
