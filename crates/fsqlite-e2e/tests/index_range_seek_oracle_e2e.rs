@@ -659,3 +659,51 @@ fn index_range_seek_composite_prefix_matches_sqlite() {
         "composite ORDER BY + LIMIT must seek"
     );
 }
+
+/// bd-wimmv follow-up: a single-column indexed range with a deterministic `ORDER BY <col>, id`
+/// streams off the range seek in `(col, rowid)` order — no sorter — where it previously fell to a
+/// sorter (the ordered-scan bails on rowid order terms). LIMIT/OFFSET stream too. Bit-identical.
+#[test]
+fn index_range_seek_single_col_order_by_matches_sqlite() {
+    let (f, r) = setup();
+    for sql in [
+        "SELECT id, k FROM t WHERE k > 5 ORDER BY k, id",
+        "SELECT id, k FROM t WHERE k BETWEEN 2 AND 8 ORDER BY k, id",
+        "SELECT id, k FROM t WHERE k > 0 ORDER BY k, id LIMIT 3",
+        "SELECT id, k FROM t WHERE k >= 1 ORDER BY k, id LIMIT 4 OFFSET 2",
+        "SELECT id, rr FROM t WHERE rr > 0 ORDER BY rr, id",
+        "SELECT id FROM t WHERE w > 'r05' ORDER BY w, id",
+        // Deterministic declines (fall back to the sorter, still bit-identical).
+        "SELECT id, k FROM t WHERE k > 5 ORDER BY k DESC, id",
+        "SELECT id, k FROM t WHERE k > 5 ORDER BY id, k",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "single-col range order-by diverged for `{sql}`"
+        );
+    }
+    // Bare `ORDER BY k` is tie-ambiguous (declines to the sorter); compare as a set.
+    let sorted = |mut v: Vec<Vec<String>>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(frank_rows(&f, "SELECT id, k FROM t WHERE k > 5 ORDER BY k").unwrap()),
+        sorted(sqlite_rows(&r, "SELECT id, k FROM t WHERE k > 5 ORDER BY k").unwrap()),
+        "bare single-col ORDER BY row set diverged"
+    );
+    // The satisfied ORDER BY streams from the seek without a sorter.
+    let sorts = |sql: &str| opcodes(&f, sql).iter().any(|o| o.starts_with("Sorter"));
+    assert!(
+        !sorts("SELECT id, k FROM t WHERE k > 5 ORDER BY k, id"),
+        "single-col ORDER BY <col>, id must avoid the sorter"
+    );
+    assert!(
+        uses_index(&opcodes(
+            &f,
+            "SELECT id, k FROM t WHERE k > 5 ORDER BY k, id LIMIT 3"
+        )),
+        "single-col ORDER BY + LIMIT must seek"
+    );
+}

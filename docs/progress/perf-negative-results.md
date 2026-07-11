@@ -16860,3 +16860,30 @@ test is on the executed path, not merely linked into it.
 - FOLLOW-UP: bare `ORDER BY range_col` when it IS provably deterministic (unique index / no ties);
   DESC ordering (reverse seek); composite ORDER BY on a non-last range col; WITHOUT ROWID.
 - Provenance: oracle via rch -j3; clippy via rch -j3; codegen.rs sha256 in the commit.
+
+## 2026-07-11 - WIN: single-column range + deterministic ORDER BY, no sorter (bd-ss48y)
+
+- Result type: KEPT. Differential gate PASSED (6/6 oracle tests, rch -j3); landed. `WHERE <indexed
+  col> <range> ORDER BY <col>, id [LIMIT n [OFFSET m]]` — single-column time-series pagination, one
+  of the most common OLTP shapes — now streams straight off the range seek with NO sorter.
+- Profile-first: `resolve_order_by_index_plan` returns None when an ORDER BY term resolves to the
+  rowid (codegen.rs ~19227), so `WHERE k > 5 ORDER BY k, id` fell to a sorter — even though the
+  single-column range seek already emits `(col, rowid)` order (the index is single-key here).
+- FIX (codegen.rs): relaxed the `index_range` gate so a deterministic `ORDER BY <col>, <rowid/ipk>`
+  no longer forces `index_range = None`; the existing directive/default routing to
+  `codegen_select_index_range_scan` then fires and streams in order, and LIMIT/OFFSET stream off it.
+  Shares `range_order_by_is_deterministic` with the composite ORDER BY lever (bd-wimmv) — refactored
+  out of `composite_order_by_satisfied`. Bare `ORDER BY col` (tie-ambiguous) still declines to the
+  sorter (not guaranteed bit-identical).
+- CORRECTNESS: the single-column `index_range` only ever uses a single-key index (`key_term_count()
+  == 1`), so the seek stream is exactly `(col, rowid)` = the unique total order for `ORDER BY col,
+  id` — bit-identical regardless of plan. The routing preempts the sorter branch (the range seek
+  returns before `!order_by.is_empty()` is reached), as the composite ORDER BY lever already proved.
+- SEMANTIC PROOF (hard gate): `index_range_seek_single_col_order_by_matches_sqlite` — INTEGER/REAL/
+  TEXT columns; `ORDER BY col, id` (+ LIMIT, + LIMIT/OFFSET) exact; deterministic declines (`col
+  DESC, id`; `id, col`) exact; bare `ORDER BY col` as a set; opcode gate: no `Sorter*` op, IdxRowid
+  present, ORDER BY + LIMIT seeks. 6/6 oracle tests pass first build; fsqlite-vdbe --lib clippy clean.
+- MEDIAN: eliminates the O(n log n) sorter + temp b-tree AND seeks to the range (visits only matching
+  rows, vs the ordered-scan which Rewinds and visits the whole index filtering). A/B pending fleet.
+- FOLLOW-UP: provably-deterministic bare `ORDER BY col` (unique index); DESC reverse seek.
+- Provenance: oracle via rch -j3; clippy via rch -j3; codegen.rs sha256 in the commit.

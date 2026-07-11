@@ -1871,7 +1871,6 @@ pub fn codegen_select(
     };
     let index_range = if is_aggregate
         || time_travel.is_some()
-        || !stmt.order_by.is_empty()
         || distinct != Distinctness::All
         || !group_by.is_empty()
         || having.is_some()
@@ -1880,6 +1879,20 @@ pub fn codegen_select(
     } else {
         extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
             |(col_name, range)| {
+                // bd-wimmv follow-up: the single-column range seek streams in `(col, rowid)` order
+                // (the index is single-key here), so it satisfies a deterministic
+                // `ORDER BY col, <rowid>` without a sorter — otherwise `ORDER BY col, id` falls to a
+                // sorter (the ordered-scan bails on rowid order terms). Any other ORDER BY declines.
+                if !stmt.order_by.is_empty()
+                    && !range_order_by_is_deterministic(
+                        &col_name,
+                        &stmt.order_by,
+                        table,
+                        table_alias,
+                    )
+                {
+                    return None;
+                }
                 if !index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range) {
                     return None;
                 }
@@ -20237,17 +20250,18 @@ fn composite_index_prefix_range_target<'a>(
 /// index walk produces for `ORDER BY <range_col> ASC`, so the result is bit-identical (no sorter).
 /// A trailing key column after the range column, a DESC/NULLS clause, or an order term that is not
 /// the range column declines (the sorter is kept).
-fn composite_order_by_satisfied(
-    comp: &CompositePrefixRange<'_>,
+/// Whether an index-range seek that streams in `(range_col, rowid)` order satisfies `order_by`
+/// bit-identically. A bare `ORDER BY range_col` is tie-ambiguous (a different plan may order
+/// equal-`range_col` rows differently, so it is NOT guaranteed bit-identical to C SQLite) and is
+/// left to the sorter. Only the fully-deterministic `ORDER BY range_col, <rowid/ipk>` — a unique
+/// total order every plan agrees on — is claimed. Shared by the single-column and composite range
+/// seeks (both walk the index in `(range_col, rowid)` order when `range_col` is the last key term).
+fn range_order_by_is_deterministic(
+    range_col: &str,
     order_by: &[OrderingTerm],
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> bool {
-    let prefix_len = comp.prefix_exprs.len();
-    if prefix_len + 1 != comp.index.key_term_count() {
-        return false;
-    }
-    let range_col = &comp.index.columns[prefix_len];
     let ascending = |term: &OrderingTerm| {
         term.nulls.is_none() && !matches!(term.direction, Some(SortDirection::Desc))
     };
@@ -20266,11 +20280,24 @@ fn composite_order_by_satisfied(
                 Some(SortKeySource::Rowid)
             )
     };
-    // The seek streams in `(range_col, rowid)` order. A bare `ORDER BY range_col` is tie-ambiguous
-    // (a different plan may order equal-`range_col` rows differently, so it is NOT guaranteed
-    // bit-identical to C SQLite) and is left to the sorter. Only the fully-deterministic
-    // `ORDER BY range_col, <rowid/ipk>` — a unique total order every plan agrees on — is claimed.
     matches!(order_by, [t0, t1] if is_range_col(t0) && is_rowid(t1))
+}
+
+fn composite_order_by_satisfied(
+    comp: &CompositePrefixRange<'_>,
+    order_by: &[OrderingTerm],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let prefix_len = comp.prefix_exprs.len();
+    // The range column must be the LAST key term so the seek's stream is exactly `(range_col, rowid)`.
+    prefix_len + 1 == comp.index.key_term_count()
+        && range_order_by_is_deterministic(
+            &comp.index.columns[prefix_len],
+            order_by,
+            table,
+            table_alias,
+        )
 }
 
 fn borrowed_column_range_bound(expr: &Expr, inclusive: bool) -> ColumnRangeBound<'_> {
