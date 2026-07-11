@@ -36,6 +36,54 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-10 - retained multi-delete adjacent-offset cell sizing
+
+- Target: the prepared sparse-DELETE tail routed from
+  `tests/artifacts/perf/cod-fsq-write-single-exact-gate-20260710T134618Z/`,
+  where `TableLeafDeleteRun::materialize_deletions` measured 8.41% self-time
+  and `cell_on_page_size_fast` measured 4.67%. The one-lever candidate extended
+  the already-kept eager-delete adjacent-offset sizing technique to the
+  retained, non-descending multi-delete materializer. It retained original
+  cell boundaries while sorting by physical offset, derived cell sizes from
+  adjacent offsets, and skipped deleted sentinels during the final copy instead
+  of reparsing each survivor.
+- Touched during the rejected attempt:
+  `crates/fsqlite-btree/src/cursor.rs` and a temporary same-binary gate in
+  `crates/fsqlite-e2e/benches/operation_baseline_bench.rs`. Both changes were
+  manually unwound after the verdict and restored byte-for-byte to their
+  pre-candidate blobs. No planner, codegen, or golden snapshot file was
+  touched; the landed change is docs-only.
+- Behavior proof, fail-closed through RCH: the focused differential test
+  `test_retained_delete_adjacent_sizes_match_legacy_bytes_on_non_descending_leaf`
+  passed on worker `hz2`, proving byte-identical final leaf images and unchanged
+  survivor results against the legacy materializer:
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo test --profile release-perf -p fsqlite-btree test_retained_delete_adjacent_sizes_match_legacy_bytes_on_non_descending_leaf -- --nocapture`.
+- Median gate: one `release-perf` binary on worker `hz2` measured original,
+  candidate, and balanced A/A null arms over 50 callbacks per row, with 5 s
+  warmup and 15 s measurement. Each duration covered the prepared sparse-DELETE
+  transaction. Exact command:
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench --profile release-perf -p fsqlite-e2e --bench operation_baseline_bench -- '^retained_delete_adjacent_size_ab/' --warm-up-time 5 --measurement-time 15 --sample-size 50 --output-format bencher --noplot`.
+
+  | deletes | candidate / original median | A/A null range | verdict |
+  |---:|---:|---:|:---|
+  | 64 | 1.094409x | [0.989358, 1.018108] | reject |
+  | 256 | 1.093727x | [0.968445, 1.035688] | reject |
+  | 1024 | 1.106327x | [0.859995, 1.099173] | reject |
+
+- Result: rejected. The candidate regressed the median by 9.37%-10.63% and sat
+  above the observed null ceiling at every required size. The byte-image proof
+  establishes correctness, but the adjacent-boundary bookkeeping does not
+  repay the removed cell-size parsing on this retained-run workload. Because
+  the shipped diff is docs-only, emitted bytecode and query results are
+  unchanged.
+- Do not retry adjacent-offset sizing as a standalone retained multi-delete
+  materialization lever. Reconsider only if a page-owned or incrementally
+  maintained physical-boundary representation removes the added bookkeeping,
+  or a fresh exact-envelope profile shows materially greater
+  `cell_on_page_size_fast` self-time and a new design eliminates it without an
+  added full-leaf sort. Any retry must again clear the same-binary all-size
+  median gate outside its measured A/A null range.
+
 ## 2026-07-10 - Direct UPDATE/DELETE rowid parameter lookup fusion
 
 - Target: the remaining `write_single` DELETE tail in
