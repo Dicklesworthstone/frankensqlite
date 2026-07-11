@@ -85,23 +85,41 @@ impl FreelistTrunk {
     }
 
     /// Serialize this trunk page into a page-sized buffer.
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn write(&self, page: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] when the destination is too small
+    /// for a trunk header or when the leaf list exceeds its capacity. A
+    /// serializer must never silently discard free-page accounting.
+    pub fn write(&self, page: &mut [u8]) -> Result<()> {
         if page.len() < 8 {
-            return;
+            return Err(FrankenError::OutOfRange {
+                what: "freelist trunk page size".to_owned(),
+                value: format!("{} bytes (minimum 8)", page.len()),
+            });
+        }
+
+        let max_entries = page.len() / 4 - 2;
+        let count = u32::try_from(self.leaf_pages.len()).map_err(|_| FrankenError::OutOfRange {
+            what: "freelist trunk leaf count".to_owned(),
+            value: format!("{} entries", self.leaf_pages.len()),
+        })?;
+        if self.leaf_pages.len() > max_entries {
+            return Err(FrankenError::OutOfRange {
+                what: "freelist trunk leaf count".to_owned(),
+                value: format!("{count} entries (capacity {max_entries})"),
+            });
         }
 
         let next = self.next_trunk.map_or(0u32, PageNumber::get);
         page[0..4].copy_from_slice(&next.to_be_bytes());
-
-        let max_entries = (page.len() as u32 / 4).saturating_sub(2);
-        let count = (self.leaf_pages.len() as u32).min(max_entries);
         page[4..8].copy_from_slice(&count.to_be_bytes());
 
-        for (i, &pgno) in self.leaf_pages.iter().take(count as usize).enumerate() {
+        for (i, &pgno) in self.leaf_pages.iter().enumerate() {
             let offset = 8 + i * 4;
             page[offset..offset + 4].copy_from_slice(&pgno.get().to_be_bytes());
         }
+        Ok(())
     }
 }
 
@@ -478,7 +496,7 @@ mod tests {
         };
 
         let mut page = vec![0u8; 4096];
-        trunk.write(&mut page);
+        trunk.write(&mut page).unwrap();
 
         let parsed = FreelistTrunk::parse(&page).unwrap();
         assert_eq!(parsed.next_trunk.unwrap().get(), 10);
@@ -496,7 +514,7 @@ mod tests {
         };
 
         let mut page = vec![0u8; 4096];
-        trunk.write(&mut page);
+        trunk.write(&mut page).unwrap();
 
         let parsed = FreelistTrunk::parse(&page).unwrap();
         assert!(parsed.next_trunk.is_none());
@@ -511,7 +529,7 @@ mod tests {
         };
 
         let mut page = vec![0u8; 4096];
-        trunk.write(&mut page);
+        trunk.write(&mut page).unwrap();
 
         let parsed = FreelistTrunk::parse(&page).unwrap();
         assert!(parsed.next_trunk.is_none());
@@ -523,6 +541,39 @@ mod tests {
         let page = vec![0u8; 4];
         let result = FreelistTrunk::parse(&page);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_trunk_write_must_not_silently_drop_overflow_leaves() {
+        let trunk = FreelistTrunk {
+            next_trunk: None,
+            leaf_pages: vec![
+                PageNumber::new(10).unwrap(),
+                PageNumber::new(20).unwrap(),
+                PageNumber::new(30).unwrap(),
+            ],
+        };
+        let mut page = vec![0xCC; 16];
+
+        let error = trunk
+            .write(&mut page)
+            .expect_err("a 16-byte trunk can hold only two leaf entries");
+        assert!(
+            matches!(error, FrankenError::OutOfRange { .. }),
+            "expected a typed capacity error, got {error}"
+        );
+        assert_eq!(
+            page,
+            vec![0xCC; 16],
+            "a rejected serialization must leave its destination untouched"
+        );
+
+        let mut short_page = vec![0xDD; 7];
+        assert!(matches!(
+            trunk.write(&mut short_page),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+        assert_eq!(short_page, vec![0xDD; 7]);
     }
 
     #[test]
@@ -690,7 +741,7 @@ mod tests {
             ],
         };
         let mut page = vec![0u8; 4096];
-        trunk.write(&mut page);
+        trunk.write(&mut page).unwrap();
         pages.insert(3, page);
 
         let result = read_freelist(Some(PageNumber::new(3).unwrap()), &mut |pgno| {
@@ -719,7 +770,7 @@ mod tests {
             leaf_pages: vec![PageNumber::new(9).unwrap()],
         };
         let mut page2 = vec![0u8; 4096];
-        trunk2.write(&mut page2);
+        trunk2.write(&mut page2).unwrap();
         pages.insert(8, page2);
 
         let trunk1 = FreelistTrunk {
@@ -727,7 +778,7 @@ mod tests {
             leaf_pages: vec![PageNumber::new(5).unwrap(), PageNumber::new(6).unwrap()],
         };
         let mut page1 = vec![0u8; 4096];
-        trunk1.write(&mut page1);
+        trunk1.write(&mut page1).unwrap();
         pages.insert(3, page1);
 
         let result = read_freelist(Some(PageNumber::new(3).unwrap()), &mut |pgno| {

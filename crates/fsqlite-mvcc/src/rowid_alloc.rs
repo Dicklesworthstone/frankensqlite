@@ -143,10 +143,12 @@ pub struct RangeReservation {
 }
 
 impl RangeReservation {
-    /// The last rowid in the range (inclusive).
+    /// The last rowid in the range (inclusive), or `None` when the range is
+    /// empty or its externally supplied bounds overflow the RowId domain.
     #[must_use]
-    pub fn end_rowid_inclusive(&self) -> RowId {
-        RowId::new(self.start_rowid.get() + i64::from(self.count) - 1)
+    pub fn end_rowid_inclusive(&self) -> Option<RowId> {
+        let offset = i64::from(self.count.checked_sub(1)?);
+        self.start_rowid.get().checked_add(offset).map(RowId::new)
     }
 }
 
@@ -681,7 +683,7 @@ mod tests {
         let range = alloc.reserve_range(k, 64).unwrap();
         assert_eq!(range.start_rowid.get(), 101);
         assert_eq!(range.count, 64);
-        assert_eq!(range.end_rowid_inclusive().get(), 164);
+        assert_eq!(range.end_rowid_inclusive().unwrap().get(), 164);
 
         // Build a local cache and allocate from it.
         let mut cache = LocalRowIdCache::new(range, k);
@@ -856,6 +858,29 @@ mod tests {
         // Allocator position unchanged.
         let next = alloc.allocate_one(k).unwrap();
         assert_eq!(next.get(), 1);
+    }
+
+    #[test]
+    fn test_zero_count_range_end_rowid_must_not_underflow() {
+        let empty = RangeReservation {
+            start_rowid: RowId::new(1),
+            count: 0,
+        };
+        assert_eq!(
+            empty.end_rowid_inclusive(),
+            None,
+            "an empty half-open interval has no inclusive endpoint"
+        );
+
+        let overflowing = RangeReservation {
+            start_rowid: RowId::new(i64::MAX),
+            count: 2,
+        };
+        assert_eq!(
+            overflowing.end_rowid_inclusive(),
+            None,
+            "externally constructed invalid bounds must not overflow"
+        );
     }
 
     // ── Additional: test_bump_explicit_no_retreat ──

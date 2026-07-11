@@ -6458,14 +6458,12 @@ pub struct SimpleTransaction<V: Vfs> {
     committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
     /// Shared connection counter for single-connection fast path.
     shared_connection_count: Option<Arc<AtomicUsize>>,
-    /// Visible commit sequence at snapshot capture. Uses `Cell` for interior
-    /// mutability so `get_page` (which takes `&self`) can refresh the snapshot
-    /// when encountering pages beyond the current db_size boundary.
+    /// Visible commit sequence at snapshot capture. This remains fixed during
+    /// reads; transaction-owned commit paths may advance it after publishing
+    /// their own writes.
     published_visible_commit_seq: Cell<CommitSeq>,
     /// Database size at snapshot capture. Used for MVCC visibility: pages
-    /// beyond this bound didn't exist when this snapshot was taken. Uses
-    /// `Cell` so the snapshot can be refreshed during reads when concurrent
-    /// writers commit new pages.
+    /// beyond this bound didn't exist when this snapshot was taken.
     published_db_size: Cell<u32>,
     write_set: PagePageMap<StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
@@ -8815,11 +8813,10 @@ where
         }
 
         // MVCC db_size guard: pages beyond the transaction's snapshot db_size
-        // did not exist when this snapshot was taken. Instead of immediately
-        // returning BusySnapshot, we refresh the snapshot to see if concurrent
-        // commits have advanced the db_size to include this page. This allows
-        // read-only transactions to observe newly-committed pages without
-        // requiring a full transaction restart.
+        // did not exist when this snapshot was taken. A transaction handle is
+        // bound to one coherent snapshot for its lifetime, so a later commit
+        // must never expand this boundary in-place. Callers that need the
+        // latest state must begin a new transaction at the statement boundary.
         //
         // Exception: pages allocated by THIS transaction (in allocated_from_eof
         // or allocated_from_freelist) are allowed even if beyond published_db_size.
@@ -8828,48 +8825,27 @@ where
                 || self.allocated_from_freelist.contains(&page_no)
                 || self.page_lease.contains(&page_no);
             if !page_allocated_by_this_txn {
-                // Snapshot refresh + retry: check if a newer snapshot includes this page.
-                let fresh_snapshot = self.published.snapshot();
-                if page_no.get() <= fresh_snapshot.db_size {
-                    // The page now exists in a more recent snapshot. Advance our
-                    // snapshot boundary to include it and continue with the read.
-                    tracing::trace!(
-                        target: "fsqlite.snapshot_publication",
-                        trace_id = cx.trace_id(),
-                        run_id = "pager-publication",
-                        scenario_id = "snapshot_refresh_success",
-                        page_no = page_no.get(),
-                        old_db_size = self.published_db_size.get(),
-                        new_db_size = fresh_snapshot.db_size,
-                        old_commit_seq = self.published_visible_commit_seq.get().get(),
-                        new_commit_seq = fresh_snapshot.visible_commit_seq.get(),
-                        "refreshed snapshot to include requested page"
-                    );
-                    self.published_db_size.set(fresh_snapshot.db_size);
-                    self.published_visible_commit_seq
-                        .set(fresh_snapshot.visible_commit_seq);
-                    // Fall through to continue with the read using the refreshed snapshot
-                } else {
-                    // Page is still beyond the latest snapshot — genuinely doesn't exist yet.
-                    tracing::trace!(
-                        target: "fsqlite.snapshot_publication",
-                        trace_id = cx.trace_id(),
-                        run_id = "pager-publication",
-                        scenario_id = "page_beyond_snapshot_db_size",
-                        page_no = page_no.get(),
-                        published_db_size = self.published_db_size.get(),
-                        latest_db_size = fresh_snapshot.db_size,
-                        "page beyond transaction's snapshot db_size (even after refresh)"
-                    );
-                    return Err(FrankenError::BusySnapshot {
-                        conflicting_pages: format!(
-                            "page {} > snapshot db_size {} (latest: {})",
-                            page_no.get(),
-                            self.published_db_size.get(),
-                            fresh_snapshot.db_size
-                        ),
-                    });
-                }
+                let latest_snapshot = self.published.snapshot();
+                tracing::trace!(
+                    target: "fsqlite.snapshot_publication",
+                    trace_id = cx.trace_id(),
+                    run_id = "pager-publication",
+                    scenario_id = "page_beyond_fixed_snapshot_db_size",
+                    page_no = page_no.get(),
+                    published_db_size = self.published_db_size.get(),
+                    latest_db_size = latest_snapshot.db_size,
+                    published_commit_seq = self.published_visible_commit_seq.get().get(),
+                    latest_commit_seq = latest_snapshot.visible_commit_seq.get(),
+                    "refused to advance a transaction's fixed snapshot"
+                );
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: format!(
+                        "page {} > snapshot db_size {} (latest: {})",
+                        page_no.get(),
+                        self.published_db_size.get(),
+                        latest_snapshot.db_size
+                    ),
+                });
             }
         }
 
@@ -20537,6 +20513,49 @@ mod tests {
             "bead_id={BEAD_ID} case=immediate_allocate_must_not_reuse_snapshot_pinned_global_freelist_pages"
         );
         writer.rollback(&cx).unwrap();
+        reader.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_reader_snapshot_must_not_refresh_on_new_page_access() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let baseline_page = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, baseline_page, &vec![0x11; ps])
+            .unwrap();
+        seed.commit(&cx).unwrap();
+
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let captured_db_size = reader.published_db_size.get();
+        let captured_commit_seq = reader.published_visible_commit_seq.get();
+        assert_eq!(captured_db_size, baseline_page.get());
+
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let later_page = writer.allocate_page(&cx).unwrap();
+        writer.write_page(&cx, later_page, &vec![0xAA; ps]).unwrap();
+        writer.commit(&cx).unwrap();
+        assert!(later_page.get() > captured_db_size);
+
+        let error = reader
+            .get_page(&cx, later_page)
+            .expect_err("a reader must not observe a page committed after its snapshot");
+        assert!(
+            matches!(error, FrankenError::BusySnapshot { .. }),
+            "expected a fixed-snapshot refusal, got {error}"
+        );
+        assert_eq!(
+            reader.published_db_size.get(),
+            captured_db_size,
+            "get_page must not expand the reader's captured db_size"
+        );
+        assert_eq!(
+            reader.published_visible_commit_seq.get(),
+            captured_commit_seq,
+            "get_page must not advance the reader's captured commit sequence"
+        );
         reader.commit(&cx).unwrap();
     }
 

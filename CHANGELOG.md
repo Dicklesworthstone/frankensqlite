@@ -20,7 +20,8 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 ## [0.1.16] -- 2026-07-11 (UPSERT page-retirement corruption fix and complete workspace release)
 
 Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
-no breaking API changes.
+two low-level helper APIs now expose failure explicitly instead of fabricating
+lossy values.
 
 ### Fixed
 
@@ -47,6 +48,19 @@ no breaking API changes.
   backing across handles and region growth. This restores cross-handle write
   visibility after `ShmRegion::clone()` became a deliberate deep-copy API and
   prevents resized mappings from diverging into detached heap buffers.
+- **Pager transaction handles retain a coherent begin-time snapshot when the
+  database grows concurrently** ([#124](https://github.com/Dicklesworthstone/frankensqlite/issues/124)).
+  Accessing a page beyond the captured database size now returns
+  `BusySnapshot`; it never advances the handle's database-size and commit-sequence
+  bounds in place or mixes pre- and post-BEGIN page images.
+- `FreelistTrunk::write` now returns a typed error for undersized destination
+  pages or leaf vectors that exceed the trunk's capacity, and leaves the
+  destination untouched on failure instead of silently truncating free-page
+  accounting ([#125](https://github.com/Dicklesworthstone/frankensqlite/issues/125)).
+- `RangeReservation::end_rowid_inclusive` now returns `None` for an empty range
+  or an externally constructed overflowing bound. Empty half-open intervals no
+  longer manufacture a rowid below their start
+  ([#126](https://github.com/Dicklesworthstone/frankensqlite/issues/126)).
 
 ### Security
 
