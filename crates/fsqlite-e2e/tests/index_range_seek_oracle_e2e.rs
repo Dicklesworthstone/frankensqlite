@@ -619,4 +619,43 @@ fn index_range_seek_composite_prefix_matches_sqlite() {
             "composite placeholder diverged for {bnd:?}"
         );
     }
+
+    // bd-zqkrp ORDER-BY-via-index: `ORDER BY <range col>, id` is the deterministic (range_col, rowid)
+    // total order the seek streams — no sorter — and LIMIT/OFFSET stream straight off it.
+    for sql in [
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id",
+        "SELECT id, b FROM t WHERE a = 1 AND b BETWEEN -3 AND 12 ORDER BY b, id",
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id LIMIT 2",
+        "SELECT id, b FROM t WHERE a = 1 AND b >= -3 ORDER BY b, id LIMIT 3 OFFSET 1",
+        // Deterministic declines (fall back to the sorter, still bit-identical).
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b DESC, id",
+        "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY id, b",
+    ] {
+        assert_eq!(
+            frank_rows(&f, sql).unwrap(),
+            sqlite_rows(&r, sql).unwrap(),
+            "composite order-by-via-index diverged for `{sql}`"
+        );
+    }
+    // Bare `ORDER BY b` is tie-ambiguous (declines to the sorter); compare as a set — both must
+    // return the same rows, and both must be b-ascending.
+    assert_eq!(
+        sorted(frank_rows(&f, "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b").unwrap()),
+        sorted(sqlite_rows(&r, "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b").unwrap()),
+        "composite bare ORDER BY row set diverged"
+    );
+
+    // The satisfied ORDER BY streams from the seek without a sorter.
+    let sorts = |sql: &str| opcodes(&f, sql).iter().any(|o| o.starts_with("Sorter"));
+    assert!(
+        !sorts("SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id"),
+        "composite ORDER BY <range col>, id must avoid the sorter"
+    );
+    assert!(
+        uses_index(&opcodes(
+            &f,
+            "SELECT id, b FROM t WHERE a = 2 AND b > 0 ORDER BY b, id LIMIT 2"
+        )),
+        "composite ORDER BY + LIMIT must seek"
+    );
 }

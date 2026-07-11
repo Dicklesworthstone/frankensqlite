@@ -16833,3 +16833,30 @@ test is on the executed path, not merely linked into it.
 - FLEET NOTE: this ~180-line new multi-column codegen path passed the differential on the FIRST
   build — careful design (reuse ordered-scan probe + IdxGT + single-column range logic) beat the
   degraded-fleet iteration cost.
+
+## 2026-07-11 - WIN: composite ORDER-BY-via-index, no sorter (bd-wimmv)
+
+- Result type: KEPT. Differential gate PASSED (5/5 oracle tests, rch -j3); landed. Follow-up to the
+  composite prefix+range seek (bd-zqkrp): `WHERE a = v AND b <range> ORDER BY b, id [LIMIT n [OFFSET
+  m]]` — the composite pagination pattern — now streams straight off the seek with NO sorter.
+- Profile-first: the composite seek already emits rows in `(range_col, rowid)` order (it walks the
+  index), but the first cut declined ORDER BY, so `... ORDER BY b, id` fell through to a full scan +
+  sorter. Confirmed gap.
+- FIX (codegen.rs): `composite_order_by_satisfied` — accept the seek for ORDER BY when the range
+  column is the LAST key term (so the seek's `(range_col, rowid)` stream is the unique total order)
+  and the order is `range_col ASC[, rowid/ipk ASC]`. The gate now allows a satisfied ORDER BY and
+  LIMIT/OFFSET (the composite codegen already streams both); the early return preempts the sorter.
+- CORRECTNESS / why 2-term only: a bare `ORDER BY range_col` is tie-ambiguous — a different plan may
+  order equal-`range_col` rows differently, so it is NOT guaranteed bit-identical to C SQLite and is
+  deliberately LEFT TO THE SORTER. Only `ORDER BY range_col, <rowid/ipk>` is claimed: a unique total
+  order every plan (index walk or stable sort) agrees on, which the seek produces exactly.
+- SEMANTIC PROOF (hard gate): `index_range_seek_composite_prefix_matches_sqlite` extended —
+  `ORDER BY b, id` (+ LIMIT, + LIMIT/OFFSET) exact; deterministic declines (`b DESC, id`; `id, b`)
+  exact; bare `ORDER BY b` compared as a set (tie-ambiguous, declines to sorter); opcode gate: the
+  satisfied ORDER BY emits NO `Sorter*` op and still IdxRowid, and ORDER BY + LIMIT seeks. 5/5 oracle
+  tests pass; fsqlite-vdbe --lib clippy clean.
+- MEDIAN: avoids the O(n log n) sorter + its temp b-tree for the ordered range; the seek streams in
+  order. A/B pending fleet recovery.
+- FOLLOW-UP: bare `ORDER BY range_col` when it IS provably deterministic (unique index / no ties);
+  DESC ordering (reverse seek); composite ORDER BY on a non-last range col; WITHOUT ROWID.
+- Provenance: oracle via rch -j3; clippy via rch -j3; codegen.rs sha256 in the commit.
