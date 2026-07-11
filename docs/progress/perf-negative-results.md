@@ -36,6 +36,50 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-11 - NON-CANDIDATE: in-memory commit file-size round trip is below the median floor
+
+- Target: a fresh pager/VDBE-runtime follow-up after the prepared-DELETE
+  storage convergence below. Normal `SimpleTransaction::commit` calls
+  `db_file.file_size(cx)` during Phase C even for `MemoryVfs`, while
+  `commit_and_retain` already derives the same committed byte size as
+  `db_size * page_size`. The screened one-lever candidate would have applied
+  that existing in-memory derivation to normal commit without touching
+  planner, codegen, emitted bytecode, or SQL result handling.
+- Profile-first evidence: fail-closed remote command
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo test
+  --profile release-perf -p fsqlite-e2e --test
+  bd_hjkbr4_c1_ledger_verification l4_commit_profile_proportional --
+  --nocapture --test-threads=1` ran on `vmi1293453`. Across two in-memory
+  commits, the pager profile reported `phase_sum_ns=43925` and only
+  `file_size_time_ns=150`: `75 ns/commit` on average, or `0.342%` of the
+  instrumented phase sum. The pager source did not change between profiled
+  `cacf7539` and current `99c3f8a4`; its SHA-256 remained
+  `5964ee2088f86b664555b2a30ed3e462f7f8f12e83a063e2c74c6977497b0f9e`.
+- Median substrate: current `99c3f8a4`, same worker, strict remote only:
+  `RCH_WORKER=vmi1293453 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch
+  exec -- cargo bench --profile release-perf -p fsqlite-vdbe --bench
+  pipeline_stages -- '^vdbe_pipeline_commit/' --warm-up-time 3
+  --measurement-time 10 --sample-size 50 --noplot`. The values below are the
+  retrieved Criterion `median` estimates, not the console slope estimates.
+
+  | dirty pages | median | median 95% interval | interval span / median | maximum possible removal / median |
+  |---:|---:|---:|---:|---:|
+  | 2 | `14059.753 ns` | `[13808.652, 14262.324] ns` | `3.23%` | `0.53%` observed-average; `1.07%` even charging the full two-call `150 ns` to one commit |
+  | 8 | `21807.997 ns` | `[21281.565, 22109.186] ns` | `3.80%` | `0.34%` observed-average; `0.69%` at the conservative `150 ns` ceiling |
+  | 32 | `47947.715 ns` | `[46542.562, 49761.565] ns` | `6.71%` | `0.16%` observed-average; `0.31%` at the conservative `150 ns` ceiling |
+
+- Result: surfaced before source mutation. Even deleting the entire measured
+  file-size phase cannot clear the current median interval at any required
+  dirty-page size; replacing it with arithmetic would save less than that
+  theoretical ceiling. No pager, B-tree, VDBE, benchmark, snapshot, or golden
+  file changed, so emitted bytecode and query results are byte-for-byte the
+  current `main` behavior. No local Cargo command or fallback was attempted.
+- Retry only if a fresh commit-phase profile moves `file_size_time_ns` above
+  the measured median/null floor on every required size, or a quieter
+  one-binary A/A substrate resolves a sub-percent effect. Do not implement
+  in-memory file-size derivation as a standalone performance patch from the
+  current evidence.
+
 ## 2026-07-11 - runtime/storage prepared-DELETE convergence after the retained-sizing reset
 
 - Target: the remaining `write_single` prepared sparse-DELETE tail, restricted
