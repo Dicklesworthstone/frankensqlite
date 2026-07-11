@@ -3337,25 +3337,39 @@ mod tests {
             .parent()
             .and_then(Path::parent)
             .unwrap();
-        if let Ok(campaign) = load_beads_benchmark_campaign(workspace_root) {
-            validate_beads_benchmark_campaign(&campaign, workspace_root).unwrap();
-            assert_eq!(campaign.campaign_id, "bd-db300.1.2");
-            assert_eq!(campaign.matrix_rows.len(), 9);
+        let campaign = load_beads_benchmark_campaign(workspace_root)
+            .expect("the tracked benchmark campaign manifest should load");
 
-            let mut fixture_ids: Vec<_> = campaign
-                .fixtures
-                .iter()
-                .map(|fixture| fixture.fixture_id.as_str())
-                .collect();
-            fixture_ids.sort_unstable();
+        let present_working_copies = campaign
+            .fixtures
+            .iter()
+            .filter(|fixture| workspace_root.join(&fixture.working_copy_relpath).is_file())
+            .count();
+        if present_working_copies != 0 {
             assert_eq!(
-                fixture_ids,
-                vec!["frankensearch", "frankensqlite", "frankentui"]
+                present_working_copies,
+                campaign.fixtures.len(),
+                "the optional local benchmark corpus must be either complete or absent"
             );
-
-            let cells = expand_beads_benchmark_campaign(&campaign);
-            assert_eq!(cells.len(), 216);
+            validate_beads_benchmark_campaign(&campaign, workspace_root).unwrap();
         }
+
+        assert_eq!(campaign.campaign_id, "bd-db300.1.2");
+        assert_eq!(campaign.matrix_rows.len(), 9);
+
+        let mut fixture_ids: Vec<_> = campaign
+            .fixtures
+            .iter()
+            .map(|fixture| fixture.fixture_id.as_str())
+            .collect();
+        fixture_ids.sort_unstable();
+        assert_eq!(
+            fixture_ids,
+            vec!["frankensearch", "frankensqlite", "frankentui"]
+        );
+
+        let cells = expand_beads_benchmark_campaign(&campaign);
+        assert_eq!(cells.len(), 216);
     }
 
     #[test]
