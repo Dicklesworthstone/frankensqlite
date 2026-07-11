@@ -8860,8 +8860,13 @@ mod tests {
         cache.with_page(p1, |data| assert_eq!(data[0], 0x11));
         cache.with_page(p2, |data| assert_eq!(data[0], 0x22));
 
-        let shard_dist = cache.shard_distribution();
-        let total_in_shards: usize = shard_dist.iter().sum();
+        assert_eq!(cache.len(), 2, "fast array must retain both pages");
+        assert_eq!(
+            cache.flat_slots.len(),
+            0,
+            "single-connection fast path must bypass flat slots"
+        );
+        let total_in_shards: usize = cache.shards.iter().map(|shard| shard.lock().len()).sum();
         assert_eq!(
             total_in_shards, 0,
             "single-connection fast path should not populate overflow shards"

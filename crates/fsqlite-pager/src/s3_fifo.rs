@@ -2691,13 +2691,25 @@ mod tests {
         let _ = fifo.insert(pg(1));
         assert_eq!(fifo.resident_len(), 1);
 
-        let _ = fifo.insert(pg(2));
+        let events = fifo.insert(pg(2));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            S3FifoEvent::EvictedFromSmallToGhost(page_id) if *page_id == pg(1)
+        )));
+        assert_eq!(fifo.resident_len(), 1);
+        assert_eq!(fifo.ghost_len(), 1);
+
+        let events = fifo.insert(pg(1));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            S3FifoEvent::GhostReadmission(page_id) if *page_id == pg(1)
+        )));
         assert_eq!(fifo.resident_len(), 2);
         assert_eq!(fifo.ghost_len(), 0);
 
         let _ = fifo.insert(pg(3));
-        assert!(fifo.resident_len() <= 2);
-        assert!(fifo.ghost_len() >= 1);
+        assert_eq!(fifo.resident_len(), 2);
+        assert_eq!(fifo.ghost_len(), 1);
     }
 
     #[test]

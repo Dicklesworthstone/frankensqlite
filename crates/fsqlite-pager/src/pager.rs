@@ -1847,6 +1847,33 @@ impl<F: VfsFile> PagerInner<F> {
         ))
     }
 
+    /// Record a commit performed through this pager in both the aggregate
+    /// commit clock and the durable-identity components cached by the next
+    /// committed-state probe.
+    ///
+    /// The component update is essential even though `commit_seq` already
+    /// advances here.  External WAL checkpoints are detected by changes in
+    /// the `(base change counter, WAL generation, visible WAL commits)`
+    /// composition when their sum stays constant.  If a local commit advances
+    /// only the sum, the next `begin` mistakes that same commit for an external
+    /// composition change and unnecessarily discards cache, publication, and
+    /// volatile freelist state.
+    fn record_local_commit(&mut self) {
+        self.commit_seq = self.commit_seq.next();
+        if self.journal_mode == JournalMode::Wal {
+            self.committed_wal_visible_commit_count = self
+                .committed_wal_visible_commit_count
+                .checked_add(1)
+                .expect("visible WAL commit count overflow after 2^64 commits");
+        } else {
+            // The SQLite header stores a wrapping u32 change counter.  Keep
+            // the cached base identical to the bytes written at commit time.
+            self.committed_db_change_counter = self.commit_seq.get() & u64::from(u32::MAX);
+            self.committed_wal_generation = None;
+            self.committed_wal_visible_commit_count = 0;
+        }
+    }
+
     /// Refresh connection-local pager metadata from the latest committed state.
     ///
     /// Reports whether WAL snapshot setup was performed during the refresh and
@@ -8849,17 +8876,16 @@ where
             }
         }
 
-        let single_connection_fast_path = self.single_connection_fast_path_enabled();
-        if single_connection_fast_path
-            && let Some(cached) = self.txn_read_cache.borrow().get(&page_no)
-        {
-            // A retained single-connection writer owns the authoritative
-            // committed image for its own pages. Reuse that transaction-local
-            // cache before touching shared publication/cache state so
-            // metadata-only retained commits avoid stale or copy-heavy
-            // shared-cache round-trips on the next statement.
+        // A transaction that has already observed a page owns that exact
+        // snapshot image for the rest of its lifetime.  Consult the local
+        // cache before every shared publication/cache source; otherwise a
+        // concurrent commit can replace those global latest-image planes and
+        // make a re-read return different bytes even though this handle's
+        // visible commit sequence remains fixed (GH #129).
+        if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
             return Ok(cached.clone());
         }
+        let single_connection_fast_path = self.single_connection_fast_path_enabled();
         let trace_read_start =
             tracing::enabled!(target: "fsqlite.snapshot_publication", tracing::Level::TRACE)
                 .then(Instant::now);
@@ -8886,7 +8912,11 @@ where
                             }),
                         "resolved zero-filled page from published metadata"
                     );
-                    return Ok(PageData::from_vec(vec![0_u8; self.pool.page_size()]));
+                    let page = PageData::from_vec(vec![0_u8; self.pool.page_size()]);
+                    self.txn_read_cache
+                        .borrow_mut()
+                        .insert(page_no, page.clone());
+                    return Ok(page);
                 }
                 self.published.record_retry();
                 if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
@@ -8917,6 +8947,9 @@ where
                             }),
                         "served page from published snapshot"
                     );
+                    self.txn_read_cache
+                        .borrow_mut()
+                        .insert(page_no, page.clone());
                     return Ok(page);
                 }
                 self.published.record_retry();
@@ -8940,17 +8973,11 @@ where
             // bd-perf (V1.2): Use get_shared to get PageData directly,
             // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
             if let Some(page_data) = self.cache.get_shared(page_no) {
+                self.txn_read_cache
+                    .borrow_mut()
+                    .insert(page_no, page_data.clone());
                 return Ok(page_data);
             }
-        }
-
-        // Per-transaction read cache: pages previously read via inner.write()
-        // are cached here. At 16 threads with constant commits, the published
-        // snapshot fast path above is defeated (commit_seq constantly advances),
-        // causing EVERY page read to hit inner.lock(). This cache eliminates
-        // ~99% of those lock acquisitions for repeated B-tree traversals.
-        if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
-            return Ok(cached.clone());
         }
 
         // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
@@ -9586,7 +9613,7 @@ where
             // advanced past those page numbers; dropping them here creates
             // permanent in-process holes that later commits can expose as
             // "Page N: never used" once page_count grows past the gap.
-            inner.commit_seq = inner.commit_seq.next();
+            inner.record_local_commit();
             let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
             if let Ok(file_size) = inner.db_file.file_size(cx) {
                 inner.committed_db_file_size_bytes = file_size;
@@ -9980,7 +10007,7 @@ where
             // smaller than a peer's just-committed extent.
             inner.db_size = inner.db_size.max(committed_db_size);
             // Keep volatile EOF lease pages in memory; see commit() Phase C1.
-            inner.commit_seq = inner.commit_seq.next();
+            inner.record_local_commit();
             // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
             if self.vfs.is_memory() {
                 inner.committed_db_file_size_bytes =
@@ -10081,6 +10108,40 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.predicted_conflict_pages_with_inner(&inner))
+    }
+
+    fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
+        let mut pages = Vec::with_capacity(
+            self.write_pages_sorted
+                .len()
+                .saturating_add(self.freed_pages.len())
+                .saturating_add(1),
+        );
+        pages.extend(self.write_pages_sorted.iter().copied());
+        pages.extend(self.freed_pages.iter().copied());
+
+        // A free at or below the transaction's begin snapshot necessarily
+        // rewrites durable freelist metadata.  Locally allocated pages can
+        // also become durable frees when another staged page advances this
+        // transaction's eventual page-count high-water mark, so include that
+        // lock-free local bound as well.  Page 1 is the shared FCW token that
+        // makes disjoint free-only transactions conflict without consulting
+        // PagerInner to predict exact trunk-page synthesis.
+        let published_db_size = self.published_db_size.get();
+        let durable_bound = self
+            .max_live_written_page()
+            .map_or(published_db_size, |page| published_db_size.max(page.get()));
+        if self
+            .freed_pages
+            .iter()
+            .any(|page| page.get() <= durable_bound)
+        {
+            pages.push(PageNumber::ONE);
+        }
+
+        pages.sort_unstable();
+        pages.dedup();
+        pages
     }
 
     fn write_set_page_numbers(&self) -> Vec<PageNumber> {
@@ -20068,6 +20129,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_local_commit_synchronizes_durable_identity_without_self_invalidation() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = writer.allocate_page(&cx).unwrap();
+        writer.write_page(&cx, page, &vec![0xAB; ps]).unwrap();
+        writer.commit(&cx).unwrap();
+
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.committed_db_change_counter,
+                inner.commit_seq.get() & u64::from(u32::MAX),
+                "a rollback-journal commit must update the cached durable identity"
+            );
+        }
+
+        let cache_before_begin = pager.cache_metrics_snapshot().unwrap();
+        let published_before_begin = pager.published_snapshot();
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let cache_after_begin = pager.cache_metrics_snapshot().unwrap();
+        let published_after_begin = pager.published_snapshot();
+
+        assert_eq!(
+            cache_after_begin, cache_before_begin,
+            "the next begin must not invalidate cache state for this pager's own commit"
+        );
+        assert_eq!(
+            published_after_begin.visible_commit_seq,
+            published_before_begin.visible_commit_seq
+        );
+        assert_eq!(
+            published_after_begin.db_size,
+            published_before_begin.db_size
+        );
+        assert_eq!(
+            published_after_begin.page_set_size, published_before_begin.page_set_size,
+            "the next begin must not clear published pages for this pager's own commit"
+        );
+        assert!(
+            pager.published.try_get_page(page).is_some(),
+            "the next begin must retain the locally committed published image"
+        );
+        assert_eq!(reader.get_page(&cx, page).unwrap().as_ref()[0], 0xAB);
+        reader.commit(&cx).unwrap();
+    }
+
     // ── 5A.1: Page 1 initialization tests (bd-2yy6) ───────────────────
 
     const BEAD_5A1: &str = "bd-2yy6";
@@ -20560,6 +20671,55 @@ mod tests {
     }
 
     #[test]
+    fn test_reader_must_not_observe_mixed_snapshot_after_concurrent_commit() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let baseline_page = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, baseline_page, &vec![0x11; ps])
+            .unwrap();
+        seed.commit(&cx).unwrap();
+
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, baseline_page).unwrap().as_ref()[0],
+            0x11,
+            "reader must establish the baseline image before the concurrent commit"
+        );
+        let captured_db_size = reader.published_db_size.get();
+        let captured_commit_seq = reader.published_visible_commit_seq.get();
+
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        writer
+            .write_page(&cx, baseline_page, &vec![0xEE; ps])
+            .unwrap();
+        let later_page = writer.allocate_page(&cx).unwrap();
+        writer.write_page(&cx, later_page, &vec![0xAA; ps]).unwrap();
+        writer.commit(&cx).unwrap();
+
+        let error = reader
+            .get_page(&cx, later_page)
+            .expect_err("a post-snapshot page must not refresh the reader");
+        assert!(
+            matches!(error, FrankenError::BusySnapshot { .. }),
+            "expected a fixed-snapshot refusal, got {error}"
+        );
+        assert_eq!(
+            reader.get_page(&cx, baseline_page).unwrap().as_ref()[0],
+            0x11,
+            "reader must keep the already-observed baseline image after rejecting a post-snapshot page"
+        );
+        assert_eq!(reader.published_db_size.get(), captured_db_size);
+        assert_eq!(
+            reader.published_visible_commit_seq.get(),
+            captured_commit_seq
+        );
+        reader.commit(&cx).unwrap();
+    }
+
+    #[test]
     fn test_commit_keeps_beyond_db_size_freelist_entries_volatile_only() {
         let (pager, _) = test_pager();
         let cx = Cx::new();
@@ -20730,8 +20890,8 @@ mod tests {
                 "bead_id={BEAD_ID} case=future_db_size_commit_still_rewrites_page_one"
             );
             assert!(
-                predicted.contains(&p4),
-                "bead_id={BEAD_ID} case=future_db_size_commit_includes_new_trunk_page"
+                predicted.contains(&p6),
+                "bead_id={BEAD_ID} case=future_db_size_commit_includes_descending_freelist_trunk"
             );
             assert!(
                 predicted.contains(&p7),
@@ -20757,8 +20917,8 @@ mod tests {
         );
         assert_eq!(
             hdr.freelist_trunk,
-            p4.get(),
-            "bead_id={BEAD_ID} case=future_db_size_commit_uses_first_newly_freed_page_as_trunk"
+            p6.get(),
+            "bead_id={BEAD_ID} case=future_db_size_commit_uses_descending_freelist_head_as_trunk"
         );
         txn_ro.commit(&cx).unwrap();
 
@@ -22687,24 +22847,43 @@ mod tests {
         pager.reset_cache_metrics().unwrap();
         let read_before = read_surface_snapshot(&pager);
         let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let mut logical_reads = 0_u64;
+        let mut unique_pages = std::collections::BTreeSet::new();
         for idx in 0..200usize {
             // Five hot accesses plus two cold accesses per round.
             for h in hot {
                 let _ = txn2.get_page(&cx, *h).unwrap();
+                logical_reads += 1;
+                unique_pages.insert(h.get());
             }
             // 2 cold accesses (rotating through cold pages).
             let cold_idx = (idx * 2) % 45;
-            let _ = txn2.get_page(&cx, pages[5 + cold_idx]).unwrap();
-            let _ = txn2.get_page(&cx, pages[5 + (cold_idx + 1) % 45]).unwrap();
+            let first_cold = pages[5 + cold_idx];
+            let second_cold = pages[5 + (cold_idx + 1) % 45];
+            let _ = txn2.get_page(&cx, first_cold).unwrap();
+            let _ = txn2.get_page(&cx, second_cold).unwrap();
+            logical_reads += 2;
+            unique_pages.insert(first_cold.get());
+            unique_pages.insert(second_cold.get());
         }
         drop(txn2);
 
         let read_after = read_surface_snapshot(&pager);
-        let total = observed_read_total(read_before, read_after);
+        let shared_plane_reads = observed_read_total(read_before, read_after);
         let expected_total_reads = u64::try_from((hot.len() + 2) * 200).unwrap();
         assert_eq!(
-            total, expected_total_reads,
-            "bead_id={BEAD_E2E} case=hot_cold_total_accesses"
+            logical_reads, expected_total_reads,
+            "bead_id={BEAD_E2E} case=hot_cold_logical_accesses"
+        );
+        assert_eq!(
+            unique_pages.len(),
+            pages.len(),
+            "bead_id={BEAD_E2E} case=hot_cold_workload_coverage"
+        );
+        assert_eq!(
+            shared_plane_reads,
+            u64::try_from(unique_pages.len()).unwrap(),
+            "bead_id={BEAD_E2E} case=hot_cold_unique_shared_accesses"
         );
         // Hot pages should achieve high hit rate after first access.
         let hit_rate = observed_read_hit_rate_percent(read_before, read_after);
@@ -22740,9 +22919,11 @@ mod tests {
         let read_before = read_surface_snapshot(&pager);
         let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
         let mut idx: usize = 0;
+        let mut unique_pages = std::collections::BTreeSet::new();
         for _ in 0..200 {
             idx = (13 * idx + 7) % 100;
             let p = pages[idx];
+            unique_pages.insert(p.get());
             let data = txn2.get_page(&cx, p).unwrap();
             let stored_pgno = u32::from_le_bytes(data.as_ref()[..4].try_into().unwrap());
             assert_eq!(
@@ -22753,10 +22934,17 @@ mod tests {
         }
 
         let read_after = read_surface_snapshot(&pager);
-        let total = observed_read_total(read_before, read_after);
-        assert!(total > 0, "bead_id={BEAD_E2E} case=random_total_accesses");
-
-        assert_eq!(total, 200, "bead_id={BEAD_E2E} case=random_total_accesses");
+        let shared_plane_reads = observed_read_total(read_before, read_after);
+        assert_eq!(
+            unique_pages.len(),
+            20,
+            "bead_id={BEAD_E2E} case=random_lcg_cycle_coverage"
+        );
+        assert_eq!(
+            shared_plane_reads,
+            u64::try_from(unique_pages.len()).unwrap(),
+            "bead_id={BEAD_E2E} case=random_unique_shared_accesses"
+        );
         // With 100 pages and 256-page cache, everything fits → high hit rate.
         let hit_rate = observed_read_hit_rate_percent(read_before, read_after);
         assert!(
@@ -25848,6 +26036,36 @@ mod tests {
             "idempotent rollback journal-mode confirmation should not require a mode switch"
         );
 
+        txn.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_conservative_conflict_pages_include_free_only_freelist_surface() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = seed.allocate_page(&cx).unwrap();
+        let p3 = seed.allocate_page(&cx).unwrap();
+        let p4 = seed.allocate_page(&cx).unwrap();
+        seed.write_page(&cx, p2, &vec![0x22; ps]).unwrap();
+        seed.write_page(&cx, p3, &vec![0x33; ps]).unwrap();
+        seed.write_page(&cx, p4, &vec![0x44; ps]).unwrap();
+        seed.commit(&cx).unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        txn.free_page(&cx, p2).unwrap();
+        txn.free_page(&cx, p3).unwrap();
+
+        let precise = txn.pending_conflict_pages().unwrap();
+        let conservative = txn.pending_conflict_pages_conservative();
+        assert!(precise.contains(&p2) && precise.contains(&p3));
+        assert_eq!(
+            conservative,
+            vec![PageNumber::ONE, p2, p3],
+            "free-only FCW planning must include both freed pages and the shared page-1 freelist token; precise={precise:?}"
+        );
         txn.rollback(&cx).unwrap();
     }
 
