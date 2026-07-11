@@ -2737,6 +2737,43 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Re-run the current hot-path test as the only test in a child process.
+    ///
+    /// The parser, VDBE, B-tree, connection, and WAL profiling counters are
+    /// intentionally process-global. A mutex can serialize the tests which
+    /// inspect them, but it cannot stop ordinary sibling tests from updating
+    /// those counters while a capture has temporarily enabled profiling. The
+    /// one-test child gives each exact-count assertion a genuinely private
+    /// metrics process while the parent-side mutex prevents a child stampede.
+    fn run_hot_path_test_in_isolated_process() -> bool {
+        const CHILD_TEST_ENV: &str = "FSQLITE_E2E_HOT_PATH_TEST_CHILD";
+
+        let current_thread = std::thread::current();
+        let test_name = current_thread
+            .name()
+            .expect("the Rust test harness should name every test thread");
+        if std::env::var(CHILD_TEST_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the current test executable should be available"),
+        )
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--test-threads=1")
+        .arg("--nocapture")
+        .env(CHILD_TEST_ENV, test_name)
+        .status()
+        .expect("the isolated hot-path test process should start");
+
+        assert!(
+            status.success(),
+            "isolated hot-path test {test_name} failed with {status}"
+        );
+        true
+    }
+
     struct ConnectionHotPathProfileGuard {
         was_enabled: bool,
     }
@@ -2783,6 +2820,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_collects_inline_hot_path_profile() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let _profile_guard = ConnectionHotPathProfileGuard::new();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 11, 1, 8);
         let config = FsqliteExecConfig {
@@ -2810,6 +2850,9 @@ mod tests {
     #[test]
     fn hot_path_metrics_capture_resets_wal_globals_before_snapshotting() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         GLOBAL_WAL_METRICS.record_frame_write(4096);
         GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(3, 120);
         GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(5, 7, 11, true, 13, 17, 19, 23, 29, 0);
@@ -2824,6 +2867,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_excludes_setup_from_connection_hot_path_counters() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let _profile_guard = ConnectionHotPathProfileGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("setup-profile.db");
@@ -3263,6 +3309,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_prepared_dml_uses_direct_insert_fast_lane_for_repeated_inserts() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let _profile_guard = ConnectionHotPathProfileGuard::new();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 17, 1, 20);
         let config = FsqliteExecConfig {
@@ -3287,6 +3336,9 @@ mod tests {
     #[test]
     fn file_backed_hot_path_profile_captures_wal_commit_path_split() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("wal-commit-path-profile.db");
         let oplog = preset_commutative_inserts_disjoint_keys("wal-commit-path", 29, 1, 8);
@@ -3324,6 +3376,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_repeated_selects() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let repeated_reads = (0_u64..20)
             .map(|op_id| OpRecord {
                 op_id: op_id + 2,
@@ -3393,6 +3448,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_selects() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let repeated_reads = (0_u64..20)
             .map(|op_id| {
                 let id = 1 + i64::try_from(op_id % 2).unwrap();
@@ -3483,6 +3541,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_deletes() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let repeated_deletes = (0_u64..20)
             .map(|op_id| {
                 let id = i64::try_from(op_id).unwrap() + 1;
@@ -3566,6 +3627,9 @@ mod tests {
     #[test]
     fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_updates() {
         let _guard = hot_path_test_guard();
+        if run_hot_path_test_in_isolated_process() {
+            return;
+        }
         let repeated_updates = (0_u64..20)
             .map(|op_id| {
                 let id = i64::try_from(op_id % 10).unwrap() + 1;
