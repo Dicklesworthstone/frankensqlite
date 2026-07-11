@@ -36,6 +36,67 @@ new kept, rejected, or non-candidate record, include the date, benchmark or
 artifact path, Beads comment or issue reference, touched source surface, and the
 retry condition so this preflight can emit actionable evidence.
 
+## 2026-07-11 - runtime/storage prepared-DELETE convergence after the retained-sizing reset
+
+- Target: the remaining `write_single` prepared sparse-DELETE tail, restricted
+  to `fsqlite-btree`, `fsqlite-pager`, and VDBE runtime. Planner and codegen
+  remained peer-owned and out of scope. The required contract was one
+  profile-ranked lever, unchanged emitted bytecode and query results, and an
+  all-size 64/256/1024 median gate through fail-closed remote RCH only.
+- Profile provenance: the latest valid exact-boundary capture is
+  `tests/artifacts/perf/cod-fsq-write-single-exact-gate-20260710T134618Z/fs-64/ranked-self-symbol-ge-0.1pct.txt`.
+  It contains 451K cycle samples with zero lost and measures only
+  `BEGIN -> 64 sparse prepared DELETEs -> COMMIT`; population, restore INSERTs,
+  connection construction, rollback, and VDBE execution have zero frames. The
+  later `cod-fsq-write-single-exact-gate-20260710T1510Z` raw file retained
+  `data size = 0` and is invalid for routing. No B-tree or pager production
+  commit follows the valid capture: the last relevant landed change is the
+  already-measured sparse page-cache clear keep, `c29ab92c`.
+- Ranked storage disposition at current `main` (`46caaa9f`):
+
+  | exact-envelope frame | self-time | disposition |
+  |---|---:|---|
+  | `TableLeafDeleteRun::materialize_deletions` | 8.41% | closed: the ephemeral packed atlas lost the one-binary median gate by 9.52%-10.55% at 64/256/1024, and the compact live-span/threshold/direct-writer families were already rejected |
+  | `cell_on_page_size_fast` | 4.67% | closed by the immediately preceding adjacent-offset sizing attempt, which regressed medians by 9.37%-10.63% at all three sizes |
+  | `TableLeafDeleteRun::delete_rowid_with_reason` | 3.00% | closed: dense-slot, monotone-floor, next-cell, duplicate-check, positioned-admission, and cancellation/search variants are already rejected |
+  | `TableLeafPayloadPatchRun::table_leaf_rowid_at` | 2.39% | same search/representation family; the packed atlas combined this path with materialization and still regressed every required size |
+  | `malloc` | 1.87% | no isolated ownership; retained-run allocation reuse and the broader packed representations did not pass the end-to-end gate |
+  | `BtCursor::load_page` / `table_seek_for_insert` | 0.89% / 0.86% | retained cursor, seek-hint, cursor-stack-resume, and root-descent reuse variants are already rejected |
+  | `TransactionKind::get_page` | 0.80% | closed by the freed-page membership profile ceiling below |
+  | `PageBufPool::acquire` | 0.73% | below the measured 64-delete median floor; prior pool-capacity work did not reduce allocation misses |
+  | `ShardedPageCache::clear` | 0.67% | the sparse touched-slot implementation is already shipped in `c29ab92c`; its ledger entry requires a fresh post-change profile before any second cache index |
+  | transaction-start snapshot/schema clones | about 0.89% combined | outside the assigned B-tree/pager/VDBE surface and still below the 64-delete median floor; a full snapshot remains the rollback/savepoint correctness source |
+  | all VDBE execution | 0.00% | not on this workload: prepared DELETE takes the direct `BtCursor` path |
+
+- Median detectability boundary: the fresh exact-envelope A/A substrate from
+  the `pager_freed_membership` screen measured ratio ranges
+  `[0.976589, 1.025490]`, `[0.988967, 1.010159]`, and
+  `[0.995826, 1.006205]` at 64/256/1024 deletes. The whole `get_page` frame is
+  only 0.80%, `PageBufPool::acquire` is 0.73%, and the next prefetch/write-page
+  frames are smaller still. Even deleting any one of those frames completely
+  cannot clear the required 64-delete median range. The only frames large
+  enough to be decidable are the B-tree representation/search families above,
+  and every qualifying one is closed by a same-envelope rejection.
+- Opportunity matrix: retained-run representation scores below threshold
+  (`impact=5`, `confidence=1`, `effort=5`, score `1.0`) after two independent
+  broader designs regressed all sizes; search/admission scores `1.5`
+  (`3*1/2`) after repeated no-wins; pager tail work scores `0.5` (`1*1/2`)
+  because its whole-frame ceiling is below the median floor; VDBE scores `0.0`
+  because it has no dynamic reachability. No eligible candidate clears the
+  required `Impact * Confidence / Effort >= 2.0` precondition.
+- Result: surfaced before source mutation. No Cargo command was needed after
+  the profile/ledger gate rejected every candidate, so there was no local build
+  or fallback. No B-tree, pager, VDBE, planner, codegen, benchmark, test, or
+  golden file changed; this docs-only record cannot alter emitted bytecode or
+  query results.
+- Retry only when a fresh population-excluded exact-boundary profile on newer
+  storage code moves an unblocked frame above the measured 64-delete median
+  floor, or when a materially different retained-run representation removes
+  the combined materialization/search work without the full-leaf bookkeeping
+  and sort costs that made both July 10 broader attempts regress. Any retry must
+  again use one remote-built binary, interleaved original/candidate/A/A arms,
+  and median verdicts at all three sizes.
+
 ## 2026-07-10 - retained multi-delete adjacent-offset cell sizing
 
 - Target: the prepared sparse-DELETE tail routed from
