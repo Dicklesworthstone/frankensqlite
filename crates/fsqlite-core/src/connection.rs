@@ -1267,7 +1267,6 @@ pub fn reset_hot_path_profile() {
     reset_vdbe_metrics();
 }
 
-#[must_use]
 /// bd-5310l compile sub-phase timings (ns, accumulated while profiling is enabled):
 /// `[schema_clone, canonicalize+to_string, planner_directive, codegen, builder.finish]`.
 #[must_use]
