@@ -17352,3 +17352,41 @@ test is on the executed path, not merely linked into it.
   `planner_select_directive_with_stats` — `index.columns.clone()` etc. per index) and the parse phase.
 - Provenance: correctness via rch -j3 (fsqlite-core --lib); A/B via rch `--profile release-perf`;
   clippy + fmt clean; connection.rs sha256 in the commit.
+
+## 2026-07-11 - SURFACE / DEFER: plan_compute index-info clones require borrowing the public IndexInfo struct — not a clean single lever (bd-5310l)
+
+- Result type: SURFACE (no lever shipped; measurement fleet-blocked, and the clean lever needs a broad
+  refactor). Investigated the remaining planner cost `plan_compute`
+  (`planner_select_directive_with_stats`) per the frontier from the planner-cache-bypass WIN.
+- WHAT plan_compute does (connection.rs ~49731-49786): builds `PlannerTableStats` (1 `table.name`
+  clone) + a `Vec<PlannerIndexInfo>` cloning, for EVERY index on the table, `index.name`,
+  `table.name`, and `index.columns` (a `Vec<String>`) — plus, for EXPRESSION indexes only, a
+  `fsqlite_parser::expr::parse_expr` per `key_expressions` entry per compile — then `decompose_where`
+  + `best_access_path_with_hints`.
+- WHY the clones cannot be skipped (byte-identical constraint): `best_access_path_internal`
+  (fsqlite-planner/src/lib.rs:1763) ITERATES EVERY index (`for idx in indexes`) to test usability for
+  a cheaper path, even after short-circuiting the initial `best` to `RowidLookup` for a rowid point
+  lookup. So the `&[IndexInfo]` is genuinely consumed; pre-filtering or skipping index construction
+  would change which paths are considered -> a potentially different directive -> different bytecode.
+  The clones are load-bearing.
+- WHY it is NOT a clean single lever: the only byte-identical way to remove the clones is to make
+  `IndexInfo` (and `TableStats`) BORROW the schema data (`&str`, `&[String]`) instead of owning it.
+  But `IndexInfo` is a PUBLIC struct in `fsqlite-planner` consumed throughout the cost model
+  (`best_access_path_internal`, `analyze_index_usability`, `analyze_skip_scan_candidate`,
+  `where_terms_imply_predicate`, adaptive/cracking hints, `AccessPath` construction). Threading a
+  lifetime through it is a broad, high-blast-radius refactor of the planner crate — a project, not a
+  one-lever change — and the cost model is ALREADY allocation-optimized (its own comments: "allocation-
+  and syscall-free on the per-compile hot loop", equality/range short-circuits).
+- PAYOFF is modest and index-count-scaled: for a typical 1-3 index table the clones are ~a few hundred
+  ns/compile; even on an index-heavy table (~10 indexes) it is ~1us, and there the unavoidable
+  cost-model iteration scales too. Not worth a broad public-API refactor + its regression surface.
+- NARROW alternative (also declined here): cache the parsed expression-index `key_expressions`
+  (avoid `parse_expr` per compile) — byte-identical and clean, but only helps EXPRESSION indexes
+  (rare), so it is not a measurable median win on typical workloads.
+- FLEET BLOCKER: could not obtain a clean `plan_compute` median this pass — the release-perf profile
+  build landed on cold-cache workers 3x and the full rebuild + 550k-statement run exceeded rch's
+  1800s SSH timeout (the UNIQUE-SQL block with the `plan_compute` split never printed). The
+  `planner_dispatch_ns()` sub-timer is in place for the measurement once the fleet warms.
+- NEXT (better ROI than plan_compute): the PARSE phase (~1.4-4.4us, byte-identical-safe — same AST),
+  which is a self-contained target in `fsqlite-parser`; profile it first. The IndexInfo-borrow refactor
+  is filed as a deferred structural project, not a lever.
