@@ -17426,3 +17426,42 @@ test is on the executed path, not merely linked into it.
 - Provenance: correctness via rch -j3 (fsqlite-parser --lib, 513 pass); A/B via rch `--profile
   release-perf` (vmi1149989); clippy + fmt clean. (Small crate -> builds fast; NOT fleet-blocked,
   unlike the fsqlite-e2e/core profiles.)
+
+## 2026-07-11 - CONVERGENCE: the ad-hoc query FRONT-END clean-lever search is harvested; remaining perf is structural or in the storage/MVCC hot path (bd-5310l)
+
+- Result type: SURFACE / convergence (no lever; profile-first confirmed no clean single lever remains
+  in the reliably-measurable front-end). Closes the bd-5310l ad-hoc-SQL campaign that corrected the
+  bead's premise and shipped 4 byte-identical wins.
+- SHIPPED this campaign (all byte-identical, all median-gated): (1) premise correction — parse+compile
+  are CACHED for repeated SQL, the cost is UNIQUE-SQL compile-miss; (2) skip the per-compile schema
+  deep-clone when no stat1/no shadow — 6.52x compile on a 40-table schema; (3) bypass the planner-
+  directive cache when the program cache fronts the compile — 1.39x compile on the ad-hoc path;
+  (4) incremental interner `retained_bytes` (drop the per-parse O(entries) fold) — 1.22x parse on a
+  warm interner. Deferred: plan_compute (IndexInfo-borrow refactor).
+- PARSE phase — confirmed WELL-OPTIMIZED this pass, no clean lever left: token access is
+  reference-based (`peek`/`current` return `&TokenKind`, `check` compares discriminants — no per-token
+  clones); keyword recognition is byte-based with a common fast-path; the identifier interner is
+  `hashbrown` + scratch-reused + (now) O(1) `retained_bytes`. The residual parse cost is inherent
+  recursive-descent AST-node allocation — an ARENA would help but is a large structural refactor, not
+  a single lever. (The common+full keyword-lookup double-work for non-keyword identifiers is a
+  micro-opt, ~2% of parse with uncertain direction — not pursued.)
+- EXECUTE_BODY (~4.7-14us/point-lookup, the biggest single phase) — confirmed the cheap wins are
+  ALREADY taken: the VDBE engine is reused across statements (`cached_vdbe_engine`), and the
+  per-statement `runtime_inputs` are cached on the read path
+  (`table_execution_metadata` cache + `cached_read_runtime_inputs_no_defaults`, returned as a
+  cheap mostly-empty clone). The residual cost is the INHERENT VM-dispatch + MVCC page-visibility +
+  B-tree seek + pager page-access storage hot path — byte-identical-RISKY to touch (visibility /
+  cursor semantics) and a deep storage-layer effort, NOT a quick front-end lever.
+- CONVERGENCE: the profile-first-accessible clean, byte-identical single levers on the ad-hoc query
+  FRONT-END (parse -> compile -> dispatch) are harvested. The remaining perf frontier is either
+  STRUCTURAL (AST arena; borrow the public `IndexInfo`/`TableStats` in the planner — both deferred
+  multi-file projects) or in the STORAGE / MVCC / B-tree hot path (a dedicated pass, not a front-end
+  lever). Candidate storage-lane beads for that pass: bd-4cldv (UPDATE/DELETE cursor reuse — eliminate
+  re-seek per modification), bd-8q9po (software prefetch / cache-line opt in B-tree descent), bd-l6xxu
+  (single-thread DML). Those need their own profile-first + a fleet-warm release-perf window (the
+  fsqlite-core/e2e release-perf builds SSH-time-out on cold-cache workers; fsqlite-parser-sized crates
+  do not).
+- WHY SURFACE not a 5th ship: the only remaining front-end candidate (keyword-lookup redundancy) is a
+  ~2% micro with uncertain direction; shipping it to pad the count would be gaming the median gate.
+  The honest signal is that this lane is done — pivot to the storage/MVCC lane (fresh profile-first)
+  or a structural refactor next.
