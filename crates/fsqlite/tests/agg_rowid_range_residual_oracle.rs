@@ -106,4 +106,15 @@ fn agg_rowid_range_residual_matches_sqlite() {
         has_op(&f, "SELECT SUM(x) FROM t WHERE id > 500 AND x = 5", "SeekGT"),
         "SUM rowid range + residual must seek the range (SeekGT)"
     );
+    // A bound parameter in the RESIDUAL is fine (literal rowid bound -> probe emits no placeholders, so
+    // the residual filter numbers `?` exactly as the scan path). The seek fires.
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE id > 500 AND x = ?", "SeekGT"),
+        "rowid range (literal bound) + parameterized residual must still seek the range"
+    );
+    // A parameterized rowid BOUND declines (the probe must be a literal).
+    assert!(
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE id > ? AND x = 5", "SeekGT"),
+        "a parameterized rowid bound must decline (probe must be a literal)"
+    );
 }

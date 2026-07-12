@@ -18460,3 +18460,14 @@ test is on the executed path, not merely linked into it.
   prefix/range bounds decline. No-reg: agg_index_range, agg_rowid_range_residual byte-exact.
 - PROCESS NOTE: shipped via a persistent retry-until-slot loop (~28 attempts) that caught an intermittent
   rch window; the pool was saturated across the prior 3-4 turns.
+
+### follow-up (same session): parameterized residual extended to the rowid-range path (bd-agg-param-residual)
+
+- Completes the parameterized-residual work across all three seek paths. `extract_rowid_range_residual_target`
+  now drops the whole-WHERE `expr_has_placeholder` guard and instead requires the extracted rowid BOUNDS to
+  be integer literals (`is_rowid_range_constant` accepts placeholders, so this literal-bound check is what
+  keeps the probe placeholder-free). A `?` may then appear only in the residual, numbered by the filter
+  exactly as the scan path. `COUNT(*)/SUM WHERE id > 100 AND x = ?` now seeks; `id > ? AND x = 5` declines.
+- GATE: `agg_rowid_range_residual_oracle` — literal byte-exact battery unchanged; opcode gates that
+  `id > 500 AND x = ?` SeekGTs and a parameterized rowid bound declines. No-reg: agg_leading_eq_residual,
+  agg_index_range byte-exact.

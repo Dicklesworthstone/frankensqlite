@@ -22197,9 +22197,6 @@ fn extract_rowid_range_residual_target<'a>(
     if let Some(range) = extract_rowid_range_target(where_clause, Some(table), table_alias) {
         return rowid_range_fast_path_is_safe(range).then_some((range, false));
     }
-    if expr_has_placeholder(expr) {
-        return None;
-    }
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(expr, &mut conjuncts);
     let mut target = RowidRangeTarget::default();
@@ -22249,6 +22246,16 @@ fn extract_rowid_range_residual_target<'a>(
         }
     }
     if target.lower.is_none() && target.upper.is_none() {
+        return None;
+    }
+    // The seek probe emits the bound values, so require integer-LITERAL bounds: then it emits no
+    // anonymous placeholders and a `?` can appear only in the residual, where the filter numbers it
+    // identically to the scan path (bd-agg-param-residual). A placeholder bound (`id > ?`) declines.
+    let literal_bound = |b: &Option<RowidRangeBound<'a>>| {
+        b.as_ref()
+            .is_none_or(|bound| matches!(bound.expr, Expr::Literal(Literal::Integer(_), _)))
+    };
+    if !literal_bound(&target.lower) || !literal_bound(&target.upper) {
         return None;
     }
     rowid_range_fast_path_is_safe(target).then_some((target, true))
