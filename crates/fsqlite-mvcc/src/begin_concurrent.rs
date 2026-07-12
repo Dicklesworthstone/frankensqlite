@@ -3747,7 +3747,7 @@ mod tests {
     use crate::lifecycle::MvccError;
     use crate::observability::{
         conflict_heat_telemetry_snapshot, reset_conflict_heat_telemetry,
-        set_conflict_heat_telemetry_enabled,
+        set_conflict_heat_telemetry_enabled, set_conflict_heat_test_capture_enabled,
     };
     use crate::ssi_validation::{ActiveTxnView, SsiAbortReason};
 
@@ -4150,6 +4150,7 @@ mod tests {
     impl Drop for ConflictHeatTelemetryGuard {
         fn drop(&mut self) {
             set_conflict_heat_telemetry_enabled(false);
+            set_conflict_heat_test_capture_enabled(false);
             reset_conflict_heat_telemetry();
             fsqlite_btree::reset_conflict_topology_policy_state();
             fsqlite_btree::set_conflict_topology_policy_mode(
@@ -4164,6 +4165,7 @@ mod tests {
         fsqlite_btree::set_conflict_topology_policy_mode(
             fsqlite_btree::ConflictTopologyPolicyMode::Enforced,
         );
+        set_conflict_heat_test_capture_enabled(true);
         set_conflict_heat_telemetry_enabled(true);
         ConflictHeatTelemetryGuard
     }

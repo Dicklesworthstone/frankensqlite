@@ -9,6 +9,8 @@
 //! never acquire page locks or block writers.
 
 use fsqlite_types::sync_primitives::{Instant, Mutex};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -437,6 +439,16 @@ static CONFLICT_HEAT_TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
 static CONFLICT_HEAT_STATE: LazyLock<Mutex<ConflictHeatState>> =
     LazyLock::new(|| Mutex::new(ConflictHeatState::default()));
 
+// Unit tests share this process-global telemetry sink while the Rust test
+// harness executes unrelated MVCC workloads in parallel. Restrict recording
+// to the test thread that explicitly owns the capture window so those
+// workloads cannot pollute an exact telemetry assertion. Production builds
+// retain the process-wide opt-in behavior above.
+#[cfg(test)]
+thread_local! {
+    static CONFLICT_HEAT_TEST_CAPTURE_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Direction of an observed SSI overlap edge relative to the committing
 /// transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -601,6 +613,26 @@ pub fn conflict_heat_telemetry_enabled() -> bool {
     CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+pub(crate) fn set_conflict_heat_test_capture_enabled(enabled: bool) {
+    CONFLICT_HEAT_TEST_CAPTURE_ENABLED.set(enabled);
+}
+
+fn conflict_heat_recording_enabled() -> bool {
+    if !CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    #[cfg(test)]
+    {
+        CONFLICT_HEAT_TEST_CAPTURE_ENABLED.get()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 /// Reset conflict heat telemetry state.
 pub fn reset_conflict_heat_telemetry() {
     *CONFLICT_HEAT_STATE.lock() = ConflictHeatState::default();
@@ -608,7 +640,7 @@ pub fn reset_conflict_heat_telemetry() {
 
 /// Record one conflict heat observation.
 pub fn record_conflict_heat_observation(observation: &ConflictHeatObservation<'_>) {
-    if !CONFLICT_HEAT_TELEMETRY_ENABLED.load(Ordering::Relaxed) {
+    if !conflict_heat_recording_enabled() {
         return;
     }
     record_conflict_heat_observation_slow(observation);
