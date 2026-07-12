@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::channel::mpsc::{RecvError, SendError};
-use asupersync::channel::session;
 use asupersync::cx::Cx;
+use asupersync::obligation::graded::{ObligationToken, SendPermit};
 use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 use commit_pipeline::{
@@ -236,11 +236,13 @@ fn test_fifo_ordering_under_contention() {
 
 #[test]
 #[should_panic(expected = "[ASUP-E103] Cannot create obligation token in root region")]
-fn test_tracked_sender_rejects_root_region_permit() {
-    // A fresh runtime deterministically yields its root context. Reusing the
-    // process-global test runtime here makes the region depend on whichever
-    // parallel test most recently drove it, turning this root-region contract
-    // into a race between ASUP-E103 and the permit drop bomb (ASUP-E101).
+fn test_send_permit_obligation_rejects_root_region() {
+    // Exercise the invariant directly instead of going through
+    // session::TrackedSender. The latter deliberately substitutes a synthetic
+    // region when asupersync's `test-internals` feature is enabled, and Cargo
+    // workspace feature unification can enable that path for this harness.
+    // ObligationToken::reserve is the production boundary that must reject the
+    // root region regardless of which test-only features the workspace enables.
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .expect("fresh test runtime should build");
@@ -252,9 +254,7 @@ fn test_tracked_sender_rejects_root_region_permit() {
         0,
         "a fresh runtime must install its root region"
     );
-    let (tracked_sender, _receiver) = session::tracked_channel::<CommitRequest>(4);
-    let permit = block_on(tracked_sender.reserve(&cx)).expect("tracked reserve should succeed");
-    drop(permit);
+    let _permit = ObligationToken::<SendPermit>::reserve("root-region send permit", cx.region_id());
 }
 
 #[test]
