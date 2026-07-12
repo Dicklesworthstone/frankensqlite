@@ -563,11 +563,10 @@ impl Parser {
                 }
                 let rhs = self.parse_expr_bp(r_bp)?;
                 let span = lhs.span().merge(rhs.span());
-                // Upstream SQLite (binaryToUnaryIfNull in parse.y) folds
-                // `expr IS [NOT] expr` into a unary null-test only when the
-                // right operand, parsed at normal precedence, is the NULL
-                // literal. Parsing the RHS first — rather than greedily
-                // consuming a NULL token — keeps tighter-binding operators
+                // SQLite folds `expr IS [NOT] expr` into a unary null-test
+                // only when the right operand, parsed at normal precedence,
+                // is the NULL literal. Parsing the RHS first — rather than
+                // greedily consuming a NULL token — keeps tighter-binding operators
                 // attached to NULL: `x IS NULL < 2` parses as
                 // `x IS (NULL < 2)`, matching C SQLite (verified against the
                 // sqlite3 CLI: `SELECT 1 IS NULL < 2` yields 0, not 1).
