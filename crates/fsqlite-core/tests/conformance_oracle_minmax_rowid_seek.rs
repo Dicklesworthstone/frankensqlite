@@ -256,14 +256,18 @@ fn minmax_rowid_seek_does_not_fire_when_unsafe() {
         "MAX(id) WHERE ... must still scan/filter; got:\n{where_dis}"
     );
 
-    // MAX over a non-rowid column must not use the rowid leaf seek.
+    // MAX over a non-rowid column must not use the rowid leaf seek.  It may,
+    // however, use the dedicated secondary index and seek directly to that
+    // index's rightmost leaf.
     let nonrowid_dis = fconn
         .prepare("SELECT MAX(ts) FROM messages")
         .unwrap()
         .explain();
     assert!(
-        nonrowid_dis.contains("Next"),
-        "MAX(ts) (non-rowid) must not take the rowid leaf-seek path; got:\n{nonrowid_dis}"
+        nonrowid_dis.contains("(idx)idx_ts")
+            && nonrowid_dis.contains("Last")
+            && !nonrowid_dis.contains("Next"),
+        "MAX(ts) (non-rowid) must use its secondary-index leaf seek, not the rowid path; got:\n{nonrowid_dis}"
     );
 
     // Differential correctness for the unsafe-but-must-match shapes.
