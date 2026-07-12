@@ -9442,6 +9442,42 @@ struct MinMaxIndexSeek {
     descending: bool,
 }
 
+/// Find an index whose extremum-of-`col_name` sits at one end of the index (index column 0), returning
+/// it with its leading-term direction (`true` = DESC).
+///
+/// A single-column ASC collation-matched index is preferred (allows NOCASE); otherwise a BINARY-only
+/// fallback accepts a composite index whose leading term is `col_name` (ASC or DESC) or a single-column
+/// DESC index. BINARY-only there avoids the collation-tie representative ambiguity a non-BINARY leading
+/// term would introduce among the extremum's duplicate run. Shared by the single- and pair-seek plans.
+fn find_minmax_leading_index<'t>(
+    table: &'t TableSchema,
+    col_name: &str,
+    collation: Option<&str>,
+) -> Option<(&'t IndexSchema, bool)> {
+    table
+        .single_column_index_for_column_with_collation(col_name, collation)
+        .map(|idx| (idx, false))
+        .or_else(|| {
+            if collation.is_some_and(|c| !c.eq_ignore_ascii_case("BINARY")) || table.without_rowid {
+                return None;
+            }
+            table.indexes.iter().find_map(|idx| {
+                let leads = idx.supports_direct_column_lookup()
+                    && idx
+                        .columns
+                        .first()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                    && idx
+                        .key_term_collation(0)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+                // Composite leading (any direction), or a single-column DESC index (single-column ASC
+                // is handled above).
+                let usable = leads && (idx.key_term_count() >= 2 || idx.key_term_descending(0));
+                usable.then(|| (idx, idx.key_term_descending(0)))
+            })
+        })
+}
+
 /// Detect `SELECT MIN(col)` / `SELECT MAX(col)` (no WHERE/HAVING/GROUP BY) where `col` carries a
 /// single-column ASC index whose collation matches the aggregate comparison.
 ///
@@ -9479,40 +9515,68 @@ fn minmax_index_seek_plan(
         _ => return None,
     };
     let col_name = table.columns.get(agg.arg_col_index?)?.name.as_str();
-    let (idx, descending) = table
-        .single_column_index_for_column_with_collation(col_name, agg.collation.as_deref())
-        .map(|idx| (idx, false))
-        .or_else(|| {
-            // BINARY-only fallback: a composite index whose LEADING key term is the aggregate column
-            // (ASC or DESC), or a single-column DESC index. The extremum is still at one end of the
-            // index (index column 0); the seek direction follows the term's sort. BINARY-only to
-            // avoid the collation-tie representative ambiguity a non-BINARY leading term would
-            // introduce among the extremum's duplicate run.
-            if agg
-                .collation
-                .as_deref()
-                .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
-                || table.without_rowid
-            {
-                return None;
-            }
-            table.indexes.iter().find_map(|idx| {
-                let leads = idx.supports_direct_column_lookup()
-                    && idx
-                        .columns
-                        .first()
-                        .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
-                    && idx
-                        .key_term_collation(0)
-                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
-                // Composite leading (any direction), or a single-column DESC index (single-column ASC
-                // is handled above).
-                let usable = leads && (idx.key_term_count() >= 2 || idx.key_term_descending(0));
-                usable.then(|| (idx, idx.key_term_descending(0)))
-            })
-        })?;
+    let (idx, descending) = find_minmax_leading_index(table, col_name, agg.collation.as_deref())?;
     Some(MinMaxIndexSeek {
         is_max,
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+        descending,
+    })
+}
+
+/// `SELECT MIN(col), MAX(col)` (in either order) over the SAME indexed `col` — resolvable by two seeks
+/// to the two ends of the index instead of a full scan.
+struct MinMaxPairSeek {
+    /// SELECT-list position (register offset) of the `MIN` output and the `MAX` output.
+    min_out_col: i32,
+    max_out_col: i32,
+    index_name: String,
+    index_root: i32,
+    /// `true` when the leading index term is DESC (the extremum ends and NULL region flip).
+    descending: bool,
+}
+
+/// Detect `SELECT MIN(col), MAX(col)` / `SELECT MAX(col), MIN(col)` (no WHERE/HAVING/GROUP BY) over the
+/// same indexed column — both extrema are at the two ends of the index, so two seeks replace the scan.
+///
+/// Mirrors the single-seek guards for BOTH aggregates (plain-column arg; no DISTINCT/FILTER/bare/
+/// multi/extra; no scalar wrapper — kept simple), requires the same column and matching collation, and
+/// reuses [`find_minmax_leading_index`]. Byte-identical: each end feeds its own accumulator exactly as
+/// the single-seek path would.
+fn minmax_pair_seek_plan(agg_columns: &[AggColumn], table: &TableSchema) -> Option<MinMaxPairSeek> {
+    let [a0, a1] = agg_columns else {
+        return None;
+    };
+    for agg in [a0, a1] {
+        if agg.arg_is_rowid
+            || agg.distinct
+            || agg.filter.is_some()
+            || agg.hidden
+            || agg.bare_expr.is_some()
+            || agg.arg_expr.is_some()
+            || agg.wrapper_expr.is_some()
+            || !agg.multi_agg_indices.is_empty()
+            || !agg.extra_args.is_empty()
+            || agg.num_args != 1
+        {
+            return None;
+        }
+    }
+    // One MIN and one MAX (either SELECT order), over the same column and matching collation.
+    let (min_out_col, max_out_col) = match (a0.name.as_str(), a1.name.as_str()) {
+        ("MIN", "MAX") => (0, 1),
+        ("MAX", "MIN") => (1, 0),
+        _ => return None,
+    };
+    let col = a0.arg_col_index?;
+    if a1.arg_col_index? != col || a0.collation != a1.collation {
+        return None;
+    }
+    let col_name = table.columns.get(col)?.name.as_str();
+    let (idx, descending) = find_minmax_leading_index(table, col_name, a0.collation.as_deref())?;
+    Some(MinMaxPairSeek {
+        min_out_col,
+        max_out_col,
         index_name: idx.name.clone(),
         index_root: idx.root_page,
         descending,
@@ -9804,6 +9868,120 @@ fn codegen_select_minmax_index_seek(
     }
     if let Some(wrapper) = &agg.wrapper_expr {
         emit_agg_wrapper(b, wrapper, out_regs);
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit `SELECT MIN(col), MAX(col)` over one indexed column as TWO seeks to the two index ends — the
+/// MIN end (skipping its NULL region) and the MAX end — instead of a full scan. The cursor is
+/// repositioned by the MAX seek, so the two are independent; each feeds its own accumulator exactly as
+/// the single-seek path, then both finalize into their SELECT-order output registers. bd-minmax-pair-seek.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_minmax_pair_seek(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    agg_columns: &[AggColumn],
+    seek: &MinMaxPairSeek,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let min_agg = &agg_columns[seek.min_out_col as usize];
+    let max_agg = &agg_columns[seek.max_out_col as usize];
+    let min_out = out_regs + seek.min_out_col;
+    let max_out = out_regs + seek.max_out_col;
+
+    let accum_min = b.alloc_reg();
+    let accum_max = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, accum_min, 0, P4::None, 0);
+    b.emit_op(Opcode::Null, 0, accum_max, 0, P4::None, 0);
+
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        seek.index_root,
+        0,
+        P4::Index(seek.index_name.clone()),
+        0,
+    );
+
+    let arg_reg = b.alloc_reg();
+
+    // MIN: from the min end, skip the NULL region toward the values (ASC → Rewind+Next; DESC → Last+Prev).
+    let (min_end, skip_op) = if seek.descending {
+        (Opcode::Last, Opcode::Prev)
+    } else {
+        (Opcode::Rewind, Opcode::Next)
+    };
+    let after_min = b.emit_label();
+    b.emit_jump_to_label(min_end, idx_cursor, 0, after_min, P4::None, 0);
+    let min_loop = b.current_addr();
+    let feed_min = b.emit_label();
+    b.emit_op(Opcode::Column, idx_cursor, 0, arg_reg, P4::None, 0);
+    b.emit_jump_to_label(Opcode::NotNull, arg_reg, 0, feed_min, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let min_body = min_loop as i32;
+    b.emit_op(skip_op, idx_cursor, min_body, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, after_min, P4::None, 0);
+    b.resolve_label(feed_min);
+    b.emit_op(
+        Opcode::AggStep,
+        0,
+        arg_reg,
+        accum_min,
+        agg_func_p4(&min_agg.name, min_agg.collation.as_ref()),
+        1,
+    );
+    b.resolve_label(after_min);
+
+    // MAX: single seek to the max end (ASC → Last; DESC → Rewind). Repositions the cursor.
+    let max_end = if seek.descending {
+        Opcode::Rewind
+    } else {
+        Opcode::Last
+    };
+    let after_max = b.emit_label();
+    b.emit_jump_to_label(max_end, idx_cursor, 0, after_max, P4::None, 0);
+    b.emit_op(Opcode::Column, idx_cursor, 0, arg_reg, P4::None, 0);
+    b.emit_op(
+        Opcode::AggStep,
+        0,
+        arg_reg,
+        accum_max,
+        agg_func_p4(&max_agg.name, max_agg.collation.as_ref()),
+        1,
+    );
+    b.resolve_label(after_max);
+
+    // Finalize both into their SELECT-order output registers.
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_min,
+        min_agg.num_args,
+        0,
+        P4::FuncName(min_agg.name.clone()),
+        0,
+    );
+    if accum_min != min_out {
+        b.emit_op(Opcode::Copy, accum_min, min_out, 0, P4::None, 0);
+    }
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_max,
+        max_agg.num_args,
+        0,
+        P4::FuncName(max_agg.name.clone()),
+        0,
+    );
+    if accum_max != max_out {
+        b.emit_op(Opcode::Copy, accum_max, max_out, 0, P4::None, 0);
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
 
@@ -10440,6 +10618,25 @@ fn codegen_select_aggregate(
         && let Some(seek) = minmax_index_seek_plan(&agg_columns, table)
     {
         return codegen_select_minmax_index_seek(
+            b,
+            cursor,
+            &agg_columns,
+            &seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
+
+    // `SELECT MIN(col), MAX(col)` over one indexed column: two seeks (one per index end) instead of a
+    // scan. Byte-identical; gated on `allow_index_seek`. bd-minmax-pair-seek.
+    if allow_index_seek
+        && where_clause.is_none()
+        && having.is_none()
+        && let Some(seek) = minmax_pair_seek_plan(&agg_columns, table)
+    {
+        return codegen_select_minmax_pair_seek(
             b,
             cursor,
             &agg_columns,

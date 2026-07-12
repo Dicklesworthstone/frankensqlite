@@ -17912,3 +17912,24 @@ test is on the executed path, not merely linked into it.
 - NEXT: fix the correctness gap first (bd-orderby-nonunique-tie-divergence) — either decline index-order
   streaming when the ORDER BY is not fully determined, or reproduce C SQLite's tie order — then the
   top-k-per-group sorter-elimination becomes a safe perf lever on top of it.
+
+## 2026-07-12 - WIN: SELECT MIN(col), MAX(col) over one indexed column → two index-end seeks, not a full scan — ~681× byte-exact (bd-minmax-pair-seek)
+
+- Result type: WIN / shipped. A common range query (`SELECT MIN(x), MAX(x)` — sliders/histograms/bounds).
+- THE MISS: the single-aggregate MIN/MAX-via-index seek guards on `[agg]` (exactly one aggregate), so
+  `SELECT MIN(col), MAX(col)` (or `MAX, MIN`) declined to a full scan — though BOTH extrema sit at the
+  two ends of the index.
+- THE LEVER: `minmax_pair_seek_plan` detects exactly one MIN + one MAX (either SELECT order) over the
+  SAME indexed column (same guards as the single seek; same collation; no scalar wrapper). Extracted the
+  index resolution into a shared `find_minmax_leading_index` (single-column ASC collation-matched, or the
+  BINARY composite-leading / single-column-DESC fallback). `codegen_select_minmax_pair_seek` opens the
+  index once and does TWO seeks on the one cursor — the MIN end (skipping its NULL region) and the MAX end
+  (which repositions the cursor, so the seeks are independent) — feeding two accumulators exactly as the
+  single-seek path, then finalizing each into its SELECT-order output register. Byte-identical.
+- BYTE-EXACT GATE (`minmax_pair_oracle.rs`, PASS): vs rusqlite/C SQLite — MIN,MAX and MAX,MIN over ASC and
+  DESC single-column indexes, a leading `col`-NULL region (MIN skips), all-NULL and empty tables, and an
+  unindexed control (declines to the scan) — all bit-identical. Opcode gate: the indexed pair emits `Last`
+  (an index-end seek); the unindexed control does not.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
+- MEDIAN (release-perf, 20k rows): `SELECT MIN(v), MAX(v)` 11.3 ms (scan) → 16.6 µs (~681×). Diagnostic:
+  minmax_pair_profile.rs.
