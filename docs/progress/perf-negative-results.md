@@ -18003,3 +18003,24 @@ test is on the executed path, not merely linked into it.
 - SCOPE: this fixes the AGGREGATE eq-seek. The non-aggregate path (`SELECT … WHERE col=? LIMIT 1` /
   EXISTS, codegen_select) has the same fallback and the same exact-seek opportunity — a follow-up.
   Diagnostic: eq_seek_exact_profile.rs.
+
+## 2026-07-12 - WIN: non-aggregate `WHERE col=<absent int>` skips the O(n) fallback scan (exact seek) — completes bd-eq-seek-fallback-zero-match
+
+- Result type: WIN / shipped. The follow-up to the aggregate exact-seek win: `codegen_select_index_
+  equality_scan` (the `SELECT … WHERE col=? [LIMIT n]` / EXISTS-subquery path) had the same full-scan
+  fallback on a 0-match seek, so an absent-key lookup / existence check cost O(n).
+- THE LEVER: same gate as the aggregate path — a single-column ASC INTEGER-affinity index probed by an
+  integer literal makes a 0-match authoritative (`exact_seek`). The `SeekGE` miss and the post-run branch
+  now route to `fast_path_done_label` (the empty result) instead of `full_scan_fallback`. Non-exact
+  indexes (multi-term, DESC, non-integer literal, non-'D' affinity) keep the fallback unchanged.
+- BYTE-EXACT GATE (`eq_seek_nonagg_exact_oracle.rs`, PASS): vs rusqlite/C SQLite on a MIXED-type INTEGER
+  column (int/real/text present) — ABSENT keys (`SELECT id … = empty`, EXISTS → 0, LIMIT 1 → empty),
+  EXISTING keys (EXISTS → 1, deterministic ORDER BY), and the non-exact cases (TEXT column, real literal)
+  that keep the fallback — all bit-identical.
+- NO-REGRESSION: `fsqlite-vdbe --lib` **1043/0 serially**. (Parallel runs flaked on two different global-
+  counter pager-metrics tests — `..._zero_extend_metrics`, `..._decode_cache_hits_...` — which snapshot
+  process-wide atomic counters and assert exact deltas; a different one fails each parallel run,
+  independent of this codegen change. Serial `--test-threads=1` is clean.) clippy clean; fmt clean.
+- PERF: same seek-miss→finalize skip as the aggregate exact-seek win (measured ~660×: 3.4 ms scan → ~5 µs
+  seek). The before is the O(n) fallback scan; the after is O(log n). Diagnostic: eq_seek_nonagg_profile.rs.
+- bd-eq-seek-fallback-zero-match now COMPLETE (aggregate + non-aggregate).

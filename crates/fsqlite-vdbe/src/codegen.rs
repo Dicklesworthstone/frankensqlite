@@ -2701,6 +2701,26 @@ fn codegen_select_index_equality_scan(
         b.emit_label()
     };
 
+    // Exact seek (single-column ASC INTEGER-affinity index probed by an integer literal): the index's
+    // storage-class order matches the WHERE comparison's, so a 0-match seek is authoritative and the
+    // full-scan fallback (an affinity safety net) is unnecessary — an absent key then produces the empty
+    // result directly, making `WHERE col=<absent> LIMIT 1` / EXISTS O(log n) not O(n). Non-exact indexes
+    // keep the fallback. bd-eq-seek-fallback-zero-match.
+    let exact_seek = idx_schema.key_term_count() == 1
+        && !idx_schema.key_term_descending(0)
+        && matches!(target_expr, Expr::Literal(Literal::Integer(_), _))
+        && idx_schema
+            .columns
+            .first()
+            .and_then(|name| table.column_index(name))
+            .and_then(|i| table.columns.get(i))
+            .is_some_and(|c| c.affinity == 'D');
+    let seek_miss_label = if exact_seek {
+        fast_path_done_label
+    } else {
+        full_scan_fallback
+    };
+
     if let Some(lim_r) = limit_reg {
         emit_limit_zero_guard(b, lim_r, fast_path_done_label);
     }
@@ -2763,7 +2783,7 @@ fn codegen_select_index_equality_scan(
         Opcode::SeekGE,
         idx_cursor,
         probe_record_reg,
-        full_scan_fallback,
+        seek_miss_label,
         P4::None,
         0,
     );
@@ -2858,7 +2878,8 @@ fn codegen_select_index_equality_scan(
         P4::None,
         0,
     );
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, full_scan_fallback, P4::None, 0);
+    // Exact seek: 0 matches is authoritative → the empty result, not the O(n) fallback scan.
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, seek_miss_label, P4::None, 0);
 
     b.resolve_label(full_scan_fallback);
     if !needs_table_lookup {
