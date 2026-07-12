@@ -1105,8 +1105,8 @@ mod tests {
 
     #[test]
     fn mid_checkpoint_crash_produces_partial_backfill() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
+        static LOCK: crate::fault_hooks::FaultInjectionSessionLock =
+            crate::fault_hooks::FaultInjectionSessionLock::new();
         let _guard = LOCK.lock().unwrap();
 
         let cx = test_cx();

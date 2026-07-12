@@ -19,7 +19,6 @@
 //! | H9   | F9: crash between header rewrite and truncate | N committed, then reset | 0 frames (salt mismatch) | DB state = last checkpoint |
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
@@ -32,8 +31,9 @@ use fsqlite_wal::{WalFile, WalSalts};
 const PAGE_SIZE: u32 = 4096;
 const BEAD_ID: &str = "bd-db300.7.2.3";
 
-/// Serialization guard — fault hooks use global state.
-static RECOVERY_TEST_LOCK: Mutex<()> = Mutex::new(());
+/// Shared, panic-safe ownership guard for process-global fault hooks.
+static RECOVERY_TEST_LOCK: fault_hooks::FaultInjectionSessionLock =
+    fault_hooks::FaultInjectionSessionLock::new();
 
 fn test_cx() -> Cx {
     Cx::new()

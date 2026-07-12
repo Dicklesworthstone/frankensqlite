@@ -1473,7 +1473,6 @@ impl<F: VfsFile> WalFile<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::time::Instant;
 
     use fsqlite_types::flags::VfsOpenFlags;
@@ -1483,10 +1482,9 @@ mod tests {
 
     use super::*;
 
-    /// Serialization guard for fault-injection tests that use global hook state.
-    /// Fault hooks use a process-wide `LazyLock<Mutex<...>>`, so concurrent
-    /// tests that arm/fire/clear hooks would interfere with each other.
-    static FAULT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared, panic-safe ownership guard for process-global fault hooks.
+    static FAULT_TEST_LOCK: crate::fault_hooks::FaultInjectionSessionLock =
+        crate::fault_hooks::FaultInjectionSessionLock::new();
 
     const PAGE_SIZE: u32 = 4096;
     const TRACK_C_SCRATCH_BENCH_BEAD_ID: &str = "bd-db300.3.4.3";

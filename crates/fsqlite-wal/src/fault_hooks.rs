@@ -1,7 +1,14 @@
 //! Targeted fault hooks for batched WAL append and sync verification.
+//!
+//! Hooks are process-global unless the caller holds a
+//! [`FaultInjectionSession`]. A session serializes fault-injection scenarios,
+//! scopes armed hooks to the owning thread, and clears all hook state on drop.
+//! This prevents unrelated concurrent work from stealing a one-shot hook while
+//! preserving the original process-global behavior for unscoped callers.
 
 use std::mem;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, LockResult, Mutex, MutexGuard};
+use std::thread::{self, ThreadId};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::flags::SyncFlags;
@@ -58,6 +65,97 @@ struct WalFaultHookState {
 static WAL_FAULT_HOOK_STATE: LazyLock<Mutex<WalFaultHookState>> =
     LazyLock::new(|| Mutex::new(WalFaultHookState::default()));
 
+static FAULT_INJECTION_SESSION_LOCK: Mutex<()> = Mutex::new(());
+static FAULT_INJECTION_SESSION_OWNER: LazyLock<Mutex<Option<ThreadId>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Shared lock for deterministic fault-injection scenarios.
+///
+/// Every test or harness that arms process-global hooks should acquire this
+/// lock before configuring the scenario. The returned session is deliberately
+/// not transferable between threads: the synchronous WAL operation under test
+/// must run on the same thread that acquired it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FaultInjectionSessionLock;
+
+impl FaultInjectionSessionLock {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Acquire exclusive ownership of the process-global fault hooks.
+    ///
+    /// Poisoning is recovered internally because the RAII session resets all
+    /// hook state before returning. `LockResult` is retained so this type can
+    /// replace existing `Mutex<()>` test guards without bespoke wrappers.
+    pub fn lock(&self) -> LockResult<FaultInjectionSession> {
+        let guard = FAULT_INJECTION_SESSION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = thread::current().id();
+
+        {
+            let mut active_owner = FAULT_INJECTION_SESSION_OWNER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            debug_assert!(
+                active_owner.is_none(),
+                "fault session lock held while another owner is registered"
+            );
+            *active_owner = Some(owner);
+        }
+
+        clear();
+        clear_crash_boundary();
+
+        Ok(FaultInjectionSession {
+            _guard: guard,
+            owner,
+        })
+    }
+}
+
+/// RAII ownership of all process-global WAL fault hooks.
+///
+/// While this value is alive, hook checks on non-owner threads are no-ops.
+/// Dropping it clears both hook families, including during panic unwinding.
+#[must_use = "dropping the session immediately removes fault-hook isolation"]
+pub struct FaultInjectionSession {
+    _guard: MutexGuard<'static, ()>,
+    owner: ThreadId,
+}
+
+impl std::fmt::Debug for FaultInjectionSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultInjectionSession")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for FaultInjectionSession {
+    fn drop(&mut self) {
+        clear();
+        clear_crash_boundary();
+
+        let mut active_owner = FAULT_INJECTION_SESSION_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active_owner = None;
+    }
+}
+
+fn fault_hook_applies_to_current_thread() -> bool {
+    let active_owner = FAULT_INJECTION_SESSION_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *active_owner {
+        Some(owner) => owner == thread::current().id(),
+        None => true,
+    }
+}
+
 pub fn clear() {
     let mut state = WAL_FAULT_HOOK_STATE
         .lock()
@@ -101,6 +199,10 @@ pub(crate) fn maybe_inject_append_busy(
     frame_count_before: usize,
     submitted_frames: usize,
 ) -> Result<()> {
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
+
     let mut state = WAL_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -128,6 +230,10 @@ pub(crate) fn maybe_inject_after_append(
     frame_count_before: usize,
     appended_frames: usize,
 ) -> Result<()> {
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
+
     let mut state = WAL_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -142,6 +248,10 @@ pub(crate) fn maybe_inject_after_append(
 }
 
 pub(crate) fn maybe_inject_sync_failure(frame_count_before: usize, flags: SyncFlags) -> Result<()> {
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
+
     let mut state = WAL_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -203,6 +313,10 @@ pub(crate) fn maybe_inject_crash_header_truncate(
     old_frame_count: usize,
     new_checkpoint_seq: u32,
 ) -> Result<()> {
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
+
     let mut state = WAL_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -316,6 +430,10 @@ pub fn disarm_crash_boundary() {
 /// Check whether the given boundary is armed and fire if so.
 /// Returns `Err` with a fault injection error if the boundary fires.
 pub fn maybe_inject_crash_at(boundary: CrashBoundary, detail: &str) -> Result<()> {
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
+
     let mut state = CRASH_BOUNDARY_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -375,10 +493,35 @@ pub fn clear_crash_boundary() {
 mod tests {
     use super::*;
 
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    static TEST_GUARD: FaultInjectionSessionLock = FaultInjectionSessionLock::new();
 
     fn arm(point: &str) -> FaultHookArm {
         FaultHookArm::new(format!("test-{point}"), format!("scenario-{point}"), "unit")
+    }
+
+    #[test]
+    fn scoped_session_prevents_other_threads_from_stealing_hooks() {
+        let _g = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arm_crash_boundary(CrashBoundary::BeforeWalFrameAppend, arm("owned"));
+
+        let unrelated_result = std::thread::spawn(|| {
+            maybe_inject_crash_at(CrashBoundary::BeforeWalFrameAppend, "unrelated-thread")
+        })
+        .join()
+        .expect("unrelated thread should not panic");
+        assert!(
+            unrelated_result.is_ok(),
+            "a non-owner thread must not consume the armed hook"
+        );
+
+        let owner_result =
+            maybe_inject_crash_at(CrashBoundary::BeforeWalFrameAppend, "owner-thread");
+        assert!(
+            owner_result.is_err(),
+            "the owner thread must still observe its armed hook"
+        );
     }
 
     #[test]
