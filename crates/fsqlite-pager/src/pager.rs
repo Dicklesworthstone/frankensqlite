@@ -13,13 +13,14 @@ use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::PageCacheEfficiencySnapshot;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{
     BTreePageHeader, CommitSeq, DATABASE_HEADER_MAGIC, DATABASE_HEADER_SIZE, DatabaseHeader,
     DatabaseHeaderError, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,

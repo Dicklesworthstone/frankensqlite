@@ -33,6 +33,9 @@ xxhash-rust = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 parking_lot = { workspace = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = { workspace = true }
+
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 proptest = { workspace = true }

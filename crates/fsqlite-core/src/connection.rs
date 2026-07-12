@@ -46,7 +46,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 #[cfg(feature = "diagnostic-pragmas")]
 use serde_json::json;
@@ -134,6 +134,7 @@ use fsqlite_types::serial_type::{
     serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
     varint_len, write_varint,
 };
+use fsqlite_types::sync_primitives::{Instant, SystemTime};
 use fsqlite_types::value::{
     SqlLikeFastPathKind, SqlLikeFastPathMatcher, SqliteValue, classify_sql_like_fast_path,
     format_sqlite_float, sql_like_cased,
@@ -24020,7 +24021,7 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if native_join_dispatch {
                         let elapsed_ns =
@@ -24105,9 +24106,7 @@ impl Connection {
                         derived_storage_log_select
                             .map(|source| (source, "derived_source_flattened_vdbe_storage_cursors"))
                     };
-                    let vdbe_storage_started = vdbe_storage_log_select
-                        .is_some()
-                        .then(std::time::Instant::now);
+                    let vdbe_storage_started = vdbe_storage_log_select.is_some().then(Instant::now);
                     let (mut rows, _, _) = self.execute_table_program_with_cx(
                         program,
                         params,
@@ -84940,8 +84939,6 @@ fn emit_literal(builder: &mut ProgramBuilder, literal: &Literal, target_reg: i32
 }
 
 fn current_utc_literal_text(literal: &Literal) -> String {
-    use std::time::SystemTime;
-
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()

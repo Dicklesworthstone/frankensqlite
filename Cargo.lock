@@ -1403,6 +1403,7 @@ dependencies = [
  "simdutf8",
  "smallvec",
  "tracing",
+ "web-time",
  "xxhash-rust",
 ]
 

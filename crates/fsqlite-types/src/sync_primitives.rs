@@ -235,105 +235,17 @@ mod wasm_sync {
 pub use wasm_sync::{Condvar, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ---------------------------------------------------------------------------
-// Time polyfill — Instant / Duration
+// Time polyfill — Instant / SystemTime / Duration
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use std::time::{Duration, Instant};
+pub use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(target_arch = "wasm32")]
 pub use std::time::Duration;
 
 #[cfg(target_arch = "wasm32")]
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Monotonic instant polyfill for wasm32.
-///
-/// On `wasm32-unknown-unknown` there is no reliable host-independent
-/// monotonic clock without a JavaScript runtime. We therefore expose a small
-/// deterministic pseudo-clock that advances one millisecond on each `now()`
-/// call. This preserves ordering/arithmetic semantics used by timeout and
-/// observability code without introducing JS host dependencies.
-#[cfg(target_arch = "wasm32")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Instant(Duration);
-
-#[cfg(target_arch = "wasm32")]
-static WASM_INSTANT_TICKS_MS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_arch = "wasm32")]
-impl Instant {
-    pub fn now() -> Self {
-        Self(Duration::from_millis(
-            WASM_INSTANT_TICKS_MS.fetch_add(1, Ordering::Relaxed),
-        ))
-    }
-
-    pub fn elapsed(&self) -> Duration {
-        Self::now().saturating_duration_since(*self)
-    }
-
-    pub fn duration_since(self, earlier: Self) -> Duration {
-        self.0.checked_sub(earlier.0).unwrap_or(Duration::ZERO)
-    }
-
-    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
-        self.duration_since(earlier)
-    }
-
-    pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
-        self.0.checked_sub(earlier.0)
-    }
-
-    pub fn checked_add(self, duration: Duration) -> Option<Self> {
-        self.0.checked_add(duration).map(Self)
-    }
-
-    pub fn checked_sub(self, duration: Duration) -> Option<Self> {
-        self.0.checked_sub(duration).map(Self)
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl std::ops::Add<Duration> for Instant {
-    type Output = Self;
-
-    fn add(self, rhs: Duration) -> Self::Output {
-        Self(self.0 + rhs)
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl std::ops::AddAssign<Duration> for Instant {
-    fn add_assign(&mut self, rhs: Duration) {
-        self.0 += rhs;
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl std::ops::Sub<Duration> for Instant {
-    type Output = Self;
-
-    fn sub(self, rhs: Duration) -> Self::Output {
-        Self(self.0.checked_sub(rhs).unwrap_or(Duration::ZERO))
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl std::ops::SubAssign<Duration> for Instant {
-    fn sub_assign(&mut self, rhs: Duration) {
-        self.0 = self.0.checked_sub(rhs).unwrap_or(Duration::ZERO);
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl std::ops::Sub<Self> for Instant {
-    type Output = Duration;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        self.duration_since(rhs)
-    }
-}
+pub use web_time::{Instant, SystemTime};
 
 // ---------------------------------------------------------------------------
 // Thread ID polyfill
