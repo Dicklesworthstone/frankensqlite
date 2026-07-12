@@ -6171,6 +6171,49 @@ mod tests {
     // -----------------------------------------------------------------------
 
     const BEAD_3WOP3_2: &str = "bd-3wop3.2";
+    const SHARDED_CACHE_PERF_REPLAY: &str = "cargo test --profile release-perf -p \
+        fsqlite-pager page_cache::tests::test_sharded_cache_throughput_vs_single -- \
+        --exact --nocapture --test-threads=1";
+
+    fn measure_single_cache_insert_read(iterations: u32) -> Duration {
+        let mut cache = PageCache::new(PageSize::DEFAULT);
+        let mut checksum = 0_u8;
+        let started = Instant::now();
+        for i in 1..=iterations {
+            let page_no = PageNumber::new(i).unwrap();
+            let value = u8::try_from(i & 0xff).unwrap();
+            cache.insert_fresh(page_no).unwrap()[0] = value;
+            checksum ^= black_box(cache.get(page_no).unwrap()[0]);
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn measure_sharded_cache_insert_read(iterations: u32) -> Duration {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let mut checksum = 0_u8;
+        let started = Instant::now();
+        for i in 1..=iterations {
+            let page_no = PageNumber::new(i).unwrap();
+            let value = u8::try_from(i & 0xff).unwrap();
+            cache.insert_fresh(page_no, |data| data[0] = value).unwrap();
+            checksum ^= black_box(cache.with_page(page_no, |data| data[0]).unwrap());
+        }
+        black_box(checksum);
+        started.elapsed()
+    }
+
+    fn median_ratio(ratios: &mut [f64]) -> f64 {
+        assert!(!ratios.is_empty(), "median requires at least one ratio");
+        ratios.sort_by(f64::total_cmp);
+        ratios[ratios.len() / 2]
+    }
+
+    #[test]
+    fn test_sharded_cache_perf_median_uses_middle_sample() {
+        let mut ratios = [9.0, 1.0, 7.0, 3.0, 5.0];
+        assert_eq!(median_ratio(&mut ratios), 5.0);
+    }
 
     #[test]
     fn test_sharded_cache_basic_operations() {
@@ -6666,46 +6709,61 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "production performance gate; replay with --profile release-perf"
+    )]
     fn test_sharded_cache_throughput_vs_single() {
-        // Compare throughput of sharded vs non-sharded cache.
-        // This is a smoke test to ensure sharding doesn't regress single-threaded perf.
-        use std::time::Instant;
+        // This is a production-profile gate, not a debug-build timing smoke
+        // test. Warm both paths, alternate their order to cancel sequential
+        // drift, and gate on the median paired ratio so one scheduler outlier
+        // cannot make an otherwise healthy full-workspace run fail.
+        const ITERATIONS: u32 = 10_000;
+        const SAMPLE_COUNT: usize = 11;
 
-        let iterations = 10_000;
+        let _ = measure_single_cache_insert_read(ITERATIONS);
+        let _ = measure_sharded_cache_insert_read(ITERATIONS);
 
-        // Non-sharded (baseline)
-        let mut single = PageCache::new(PageSize::DEFAULT);
-        let start = Instant::now();
-        for i in 1..=iterations {
-            let pn = PageNumber::new(i).unwrap();
-            single.insert_fresh(pn).unwrap();
-            let _ = single.get(pn);
+        let mut evidence = Vec::with_capacity(SAMPLE_COUNT);
+        let mut ratios = Vec::with_capacity(SAMPLE_COUNT);
+        for sample in 0..SAMPLE_COUNT {
+            let (single_elapsed, sharded_elapsed, order) = if sample % 2 == 0 {
+                (
+                    measure_single_cache_insert_read(ITERATIONS),
+                    measure_sharded_cache_insert_read(ITERATIONS),
+                    "single_first",
+                )
+            } else {
+                let sharded_elapsed = measure_sharded_cache_insert_read(ITERATIONS);
+                let single_elapsed = measure_single_cache_insert_read(ITERATIONS);
+                (single_elapsed, sharded_elapsed, "sharded_first")
+            };
+            let ratio =
+                sharded_elapsed.as_secs_f64() / single_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+            evidence.push((sample, order, single_elapsed, sharded_elapsed, ratio));
+            ratios.push(ratio);
         }
-        let single_elapsed = start.elapsed();
+        let ratio_median = median_ratio(&mut ratios);
 
-        // Sharded
-        let sharded = ShardedPageCache::new(PageSize::DEFAULT);
-        let start = Instant::now();
-        for i in 1..=iterations {
-            let pn = PageNumber::new(i).unwrap();
-            sharded.insert_fresh(pn, |_| {}).unwrap();
-            sharded.with_page(pn, |_| {});
+        for (sample, order, single_elapsed, sharded_elapsed, ratio) in &evidence {
+            eprintln!(
+                "bead_id={BEAD_3WOP3_2} sample={sample} order={order} \
+                 throughput_ratio={ratio:.2}x single={single_elapsed:?} \
+                 sharded={sharded_elapsed:?}"
+            );
         }
-        let sharded_elapsed = start.elapsed();
-
-        // Sharded should not be more than 3x slower in single-threaded case
-        // (overhead from locking + callback indirection)
-        let ratio = sharded_elapsed.as_nanos() as f64 / single_elapsed.as_nanos() as f64;
-        assert!(
-            ratio < 3.0,
-            "bead_id={BEAD_3WOP3_2} case=throughput_overhead \
-             sharded cache is {ratio:.2}x slower than single (max 3x allowed)"
+        eprintln!(
+            "bead_id={BEAD_3WOP3_2} median_throughput_ratio={ratio_median:.2}x \
+             samples={SAMPLE_COUNT} iterations={ITERATIONS} replay={SHARDED_CACHE_PERF_REPLAY}"
         );
 
-        eprintln!(
-            "bead_id={BEAD_3WOP3_2} throughput_ratio={ratio:.2}x \
-             single={:?} sharded={:?}",
-            single_elapsed, sharded_elapsed
+        // Preserve the original production budget: locking and callback
+        // indirection may cost at most 3x the non-sharded path.
+        assert!(
+            ratio_median < 3.0,
+            "bead_id={BEAD_3WOP3_2} case=throughput_overhead \
+             sharded cache median is {ratio_median:.2}x slower than single \
+             (max 3x allowed); evidence={evidence:?}; replay={SHARDED_CACHE_PERF_REPLAY}"
         );
     }
 
