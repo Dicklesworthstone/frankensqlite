@@ -1833,16 +1833,17 @@ pub fn codegen_select(
         && !has_window_columns(columns)
         && from_clause.joins.is_empty()
         && time_travel.is_none()
-        // bd-2dgf5: `COUNT(*) FROM t WHERE col = <const>` on an indexed column is
-        // served far better by the aggregate index seek than by
+        // bd-2dgf5: `COUNT(*) FROM t WHERE col = <const>` (equality) or `col IN (<int list>)` on an
+        // indexed column is served far better by the aggregate index seek than by
         // `codegen_select_count_star`, whose only indexed path
-        // (`extract_count_indexed_exists_target`) does not match a plain
-        // equality and so degrades to Rewind/Next over the whole table. Yield to
-        // `codegen_select_aggregate`, which drives AggStep from an index seek.
-        // Every other COUNT(*) shape keeps its specialized fast path.
+        // (`extract_count_indexed_exists_target`) does not match a plain equality or an IN-list and so
+        // degrades to Rewind/Next over the whole table. Yield to `codegen_select_aggregate`, which drives
+        // AggStep from an index seek (`index_eq_seek` / `index_in_seek`). Every other COUNT(*) shape keeps
+        // its specialized fast path.
         && !(aggregate_index_eq_seek_allowed(from_index_hint)
-            && aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias)
-                .is_some());
+            && (aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias).is_some()
+                || index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
+                    .is_some()));
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
     // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
@@ -10878,9 +10879,22 @@ fn index_integer_in_list_target<'t>(
     {
         return None;
     }
-    let idx = table
-        .index_for_column(&col_name)
-        .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+    // Find a single-column ascending index on the column. `index_for_column` returns the FIRST index
+    // whose LEADING column matches, which may be a *composite* `(col, …)` index that shadows a usable
+    // single-column one listed after it — filtering that result would then decline even though a
+    // single-column index exists. Search all indexes instead. (A composite index is not usable here: the
+    // `[value, i64::MIN]` probe's floor is the rowid for a single-column index but the *second key
+    // column* for a composite one, so a NULL second column — which sorts before `i64::MIN` — would be
+    // skipped. That needs a prefix probe; tracked as bd-in-list-composite-prefix-probe.)
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    })?;
     Some((idx, ints))
 }
 

@@ -18132,39 +18132,40 @@ test is on the executed path, not merely linked into it.
   generalized function) re-run byte-exact.
 - PERF: `COUNT(*)/SUM(x) WHERE a=? AND b=?` full table scan → O(log n + matches) block seek.
 
-## 2026-07-12 - BLOCKED/REVERTED (unverifiable — shared-pool saturation): COUNT(*)/SUM WHERE a IN (list) does not seek when a composite idx_ab shadows idx_a (bd-2dgf5 follow-up)
+## 2026-07-12 - WIN (shipped): COUNT(*) WHERE a IN (list) seeks the index (bd-2dgf5 follow-up) — real cause was COUNT(*) routing, not index selection
 
-- Result type: REVERTED to green. A fix was implemented and looks correct, but could NOT be gated
-  byte-exact because the rch remote pool was saturated by ~6 concurrent agents (`insufficient_slots=7`)
-  for the whole turn; per method (no local builds, byte-exact HARD GATE required before commit) an
-  unverifiable change is not shippable, so `crates/fsqlite-vdbe/src/codegen.rs` was reverted.
-- GAP (real, confirmed by `next_gap_probe` EXPLAIN): `SELECT COUNT(*) FROM t WHERE a IN (3,7,11)`
-  full-scans (`seek=false, rewind=true`) on a table with BOTH `idx_ab (a,b)` and `idx_a (a)`, even though
-  the aggregate IN-list seek (`index_integer_in_list_target` + `emit_aggregate_index_value_seek`, bd-2dgf5)
-  exists and is wired in at codegen ~11581.
-- ROOT-CAUSE HYPOTHESIS: `index_integer_in_list_target` selected the index via `table.index_for_column(col)`
-  — which returns the FIRST index whose LEADING column matches — then `.filter(|idx| idx.key_term_count()
-  == 1)`. With `idx_ab` declared first, `index_for_column` returns composite `idx_ab`, the single-term
-  filter rejects it, and the usable single-column `idx_a` (listed after) is never tried → decline → scan.
-- ATTEMPTED FIX (reverted): replace `index_for_column(...).filter(...)` with a search over ALL
-  `table.indexes` for a single-column ascending direct-lookup index on the column. Logic verified airtight
-  on paper (idx_ab skipped by `key_term_count()==1`; idx_a matched); the consumption branch at ~11581
-  provably emits `SeekGE` when detection returns `Some`. Yet a first remote gate run still failed the
-  `SeekGE` opcode assertion (byte-exact comparisons all PASSED — scan is also correct). Two live theories,
-  UNRESOLVED because the confirming rebuild never got a worker: (a) a stale rch source-sync so the tested
-  binary lacked the edit; (b) a real-schema value differs from the model (`allow_index_seek` derives only
-  from `from_index_hint` = true here, so not that; affinity INTEGER→'D' confirmed via `type_to_affinity`).
-- COMPOSITE-INDEX CAVEAT (why the fix targets only single-column idx_a): the `[value, i64::MIN]` probe's
-  second field lines up with a composite's second key column `b`; a `b IS NULL` row sorts BEFORE `i64::MIN`
-  in index order, so `SeekGE` would SKIP it — dropping `a=value, b=NULL` rows. Seeking a composite leading
-  column needs a 1-field prefix probe `[value]`; charted as bd-in-list-composite-prefix-probe (P2).
-- RETRY CONDITION: when the rch pool has free workers, re-apply the ~15-line detection change (recorded
-  above) + `in_list_shadowed_index_oracle` (byte-exact incl. `b IS NULL`) + the two-table `in_list_diag`
-  (table A only-idx_a vs table B idx_ab+idx_a) in ONE build; if table B still shows `seek=false`, the
-  cause is (b) not (a) → investigate `column_int_list_from_predicate` / parser `In` shape on the real AST.
-- NEXT-LEVER MAP (from `next_gap_probe`, still-SCAN shapes worth a focused turn): `COUNT(*) WHERE a=? AND
+- Result type: WIN / shipped. Gap (confirmed by EXPLAIN + a two-table diag): `SELECT COUNT(*) FROM t
+  WHERE a IN (3,7,11)` full-scanned even on a table with a plain single-column `idx_a` — while
+  `SUM(x) WHERE a IN (list)` on the SAME table already seeked.
+- REAL ROOT CAUSE (the diag's table-A-scans result overturned last turn's index-selection hypothesis):
+  `COUNT(*)` is routed by `simple_count_star` (codegen.rs ~1827) to `codegen_select_count_star`, whose
+  only indexed path (`extract_count_indexed_exists_target`) matches neither a plain equality nor an
+  IN-list, so it degrades to Rewind/Next. The `simple_count_star` guard already YIELDS to
+  `codegen_select_aggregate` (which has the IN-list seek `index_in_seek` at ~11581) for the equality case
+  (`aggregate_index_eq_seek_target.is_some()`), but NOT for the IN-list case. `SUM(x)` is never
+  `simple_count_star`, so it always reached the aggregate path and seeked — which is why the seek
+  machinery looked wired-in but `COUNT(*)` still scanned.
+- FIX 1 (the lever): extend the `simple_count_star` yield to also fire when
+  `index_integer_in_list_target(...).is_some()`, so `COUNT(*) WHERE a IN (int list)` routes to the
+  seeking aggregate path. Byte-exact: same matched rows, AggStep-counted instead of scan-counted.
+- FIX 2 (index selection, from last turn, now correct-and-relevant): `index_integer_in_list_target`
+  searches ALL `table.indexes` for a single-column ascending index on the column instead of
+  `index_for_column(col).filter(key_term_count()==1)` — the latter returns a composite `idx_ab` that
+  shadows a usable `idx_a` declared after it, then rejects it. Needed for the composite-shadow schema.
+- COMPOSITE-INDEX CAVEAT (still declined, tracked as bd-in-list-composite-prefix-probe P2): the
+  `[value, i64::MIN]` probe's floor aligns with a composite's 2nd key column `b`; a `b IS NULL` row sorts
+  BEFORE `i64::MIN`, so `SeekGE` would skip it — dropping `a=value, b=NULL` rows. Composite leading-column
+  seek needs a 1-field prefix probe `[value]`; out of scope here (only single-column indexes are used).
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `in_list_shadowed_index_oracle` PASS on TWO schemas
+  (single `idx_a`; composite `idx_ab` declared first shadowing `idx_a`) — COUNT(*)/SUM(x) over
+  present/absent/duplicate list values, COALESCE, and rows with `b IS NULL`. Opcode gate: BOTH COUNT(*)
+  and SUM(x) emit `SeekGE` on each schema. No-reg: `agg_composite_full_eq`, `agg_composite_leading_eq`,
+  `eq_seek_exact` all byte-exact (the `simple_count_star` yield only fires on an INTEGER-indexed IN-list,
+  so other COUNT(*) shapes are untouched).
+- PERF: `COUNT(*) WHERE a IN (list)` full scan → per-value O(log n + matches) index seek.
+- NEXT-LEVER MAP (from `next_gap_probe`, still-SCAN shapes for a focused turn): `COUNT(*) WHERE a=? AND
   b>?` (aggregate composite prefix-eq + range on last term); `COUNT(*) WHERE a BETWEEN lo AND hi` (aggregate
   two-sided range on a secondary index); `MIN(b) WHERE a=? AND b>?`; `COUNT(*) WHERE a=? AND x=?` (leading
   eq + residual filter); `EXISTS(SELECT 1 WHERE a=? AND b=?)` (composite existence, seek=false rewind=false);
-  `a, COUNT(*) GROUP BY a` (grouped aggregate via ordered index — larger). Already SEEK (good): `s='k3'`
-  text eq, `AVG(x) WHERE a=?`, `... a=? AND b=? LIMIT 1`.
+  `a, COUNT(*) GROUP BY a` (grouped aggregate via ordered index — larger). NB: `codegen_select_count_star`
+  also lacks the composite prefix-range / range paths — the same "yield to aggregate" trick may apply.
