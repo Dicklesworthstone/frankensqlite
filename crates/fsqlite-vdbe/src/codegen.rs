@@ -1850,6 +1850,13 @@ pub fn codegen_select(
                     table_alias,
                     schema,
                 )
+                .is_some()
+                || composite_index_prefix_range_target(
+                    where_clause.as_deref(),
+                    table,
+                    table_alias,
+                    schema,
+                )
                 .is_some()));
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
@@ -11336,6 +11343,25 @@ fn codegen_select_aggregate(
         None
     };
 
+    // Seek + bounded walk over a composite index for `WHERE a = v AND b <range>` (equality prefix +
+    // trailing range). Reuses the now residual-safe `composite_index_prefix_range_target`
+    // (bd-zqkrp-residual-drop); mirrors the non-aggregate
+    // `codegen_select_composite_index_prefix_range_scan`. The demoted full-equality case (`a=? AND
+    // b=?`) is claimed by the earlier `index_eq_seek`, so this only sees genuine ranges.
+    let composite_prefix_range_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_range_seek.is_none()
+        && index_in_seek.is_none()
+        && index_range_seek.is_none()
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        composite_index_prefix_range_target(where_clause, table, table_alias, schema)
+    } else {
+        None
+    };
+
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
@@ -11800,6 +11826,179 @@ fn codegen_select_aggregate(
                 P4::None,
                 0,
             );
+        }
+
+        if covering {
+            emit_aggregate_accumulate_body_covering(
+                b,
+                idx_cursor,
+                index_table_col,
+                &agg_columns,
+                accum_base,
+            );
+        } else {
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                accum_base,
+            );
+        }
+
+        b.resolve_label(skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_body = loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
+        skip_scan = true;
+    } else if let Some(comp) = composite_prefix_range_seek {
+        // bd-agg-composite-prefix-range: seek the `a = v` block bounded by the range on the next key
+        // column and accumulate. Mirrors `codegen_select_composite_index_prefix_range_scan`: `IdxGT`
+        // on the `prefix_len`-column prefix ends the run, the range bound checks skip/stop within it.
+        // Covering when the aggregates read only the leading (pinned) column or are COUNT(*)/SUM(rowid).
+        let idx_schema = comp.index;
+        let prefix_exprs = &comp.prefix_exprs;
+        let range = &comp.range;
+        let idx_cursor = 1_i32;
+        let key_terms = idx_schema.key_term_count();
+        let prefix_len = prefix_exprs.len();
+        let range_pos = prefix_len;
+
+        let index_table_col = idx_schema
+            .columns
+            .first()
+            .and_then(|name| table.column_index(name))
+            .unwrap_or(usize::MAX);
+        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+
+        let key_affinities: Vec<Option<char>> = (0..key_terms)
+            .map(|pos| {
+                idx_schema
+                    .columns
+                    .get(pos)
+                    .and_then(|name| table.column_index(name))
+                    .map(|i| table.columns[i].affinity)
+                    .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'))
+            })
+            .collect();
+
+        // Probe record: [prefix..., range-lower-or-NULL, trailing NULLs, rowid = MIN].
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let probe = b.alloc_regs(key_terms as i32 + 1);
+        for (pos, expr) in prefix_exprs.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let reg = probe + pos as i32;
+            emit_expr(b, expr, reg, None);
+            if let Some(aff) = key_affinities[pos]
+                && !bound_matches_affinity(aff, expr)
+            {
+                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+            }
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let range_reg = probe + range_pos as i32;
+        let lower_inclusive = if let Some(lower) = range.lower.as_ref() {
+            emit_expr(b, lower.expr(), range_reg, None);
+            if let Some(aff) = key_affinities[range_pos]
+                && !bound_matches_affinity(aff, lower.expr())
+            {
+                b.emit_op(Opcode::Affinity, range_reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+            }
+            b.emit_jump_to_label(Opcode::IsNull, range_reg, 0, finalize_label, P4::None, 0);
+            Some(lower.inclusive)
+        } else {
+            b.emit_op(Opcode::Null, 0, range_reg, 0, P4::None, 0);
+            None
+        };
+        for pos in (range_pos + 1)..key_terms {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let reg = probe + pos as i32;
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let rowid_sentinel = probe + key_terms as i32;
+        b.emit_op(Opcode::Int64, 0, rowid_sentinel, 0, P4::Int64(i64::MIN), 0);
+        let probe_rec = b.alloc_reg();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe,
+            key_terms as i32 + 1,
+            probe_rec,
+            P4::None,
+            0,
+        );
+
+        let upper = range.upper.as_ref().map(|u| {
+            let reg = b.alloc_reg();
+            emit_expr(b, u.expr(), reg, None);
+            if let Some(aff) = key_affinities[range_pos]
+                && !bound_matches_affinity(aff, u.expr())
+            {
+                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+            }
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+            (reg, u.inclusive)
+        });
+
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            idx_schema.root_page,
+            0,
+            P4::Index(idx_schema.name.clone()),
+            0,
+        );
+        b.emit_jump_to_label(Opcode::SeekGE, idx_cursor, probe_rec, finalize_label, P4::None, 0);
+
+        let loop_top = b.current_addr();
+        let skip_label = b.emit_label();
+        // Stop once the equality prefix changes (`IdxGT` compares only the first `prefix_len` columns).
+        #[allow(clippy::cast_possible_truncation)]
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            idx_cursor,
+            probe_rec,
+            finalize_label,
+            P4::None,
+            prefix_len as u16,
+        );
+
+        let range_key_reg = b.alloc_reg();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::Column,
+            idx_cursor,
+            range_pos as i32,
+            range_key_reg,
+            P4::None,
+            0,
+        );
+        if range.lower.is_none() {
+            b.emit_jump_to_label(Opcode::IsNull, range_key_reg, 0, skip_label, P4::None, 0);
+        }
+        if lower_inclusive == Some(false) {
+            b.emit_jump_to_label(Opcode::Le, range_reg, range_key_reg, skip_label, P4::None, 0);
+        }
+        if let Some((up_reg, up_inclusive)) = upper {
+            let stop = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
+            b.emit_jump_to_label(stop, up_reg, range_key_reg, finalize_label, P4::None, 0);
         }
 
         if covering {

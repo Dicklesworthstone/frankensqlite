@@ -18234,3 +18234,24 @@ test is on the executed path, not merely linked into it.
   case does NOT (declined). No-reg: composite_eq_seek, agg_composite_full_eq, agg_index_range byte-exact.
 - NB: bd-zqkrp-residual-drop filed. This unblocks a future composite prefix-range AGGREGATE lever — the
   now-guarded detection is residual-safe to reuse.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM(...) WHERE a=v AND b <range> seeks the composite block (bd-agg-composite-prefix-range)
+
+- Result type: WIN / shipped. Unblocked by the preceding residual-drop fix: `COUNT(*)/SUM(...) FROM t
+  WHERE a = v AND b <range>` on `index(a,b)` full-scanned; now it seeks the `a = v` block bounded by the
+  range on `b`.
+- FIX: (1) new `composite_prefix_range_seek` branch in `codegen_select_aggregate` mirroring the
+  non-aggregate `codegen_select_composite_index_prefix_range_scan` — probe `[prefix.., range-lower-or-
+  NULL, trailing NULLs, MIN-rowid]`, SeekGE anchor, `IdxGT` (P5=prefix_len) ends the run when the prefix
+  changes, `Le`/`Gt`/`Ge` range guards within it; COVERING (via `aggregate_seek_is_covering`) when the
+  aggregates read only the leading pinned column or are COUNT(*)/SUM(rowid). (2) reuses the now
+  residual-safe `composite_index_prefix_range_target` detection (bd-zqkrp-residual-drop guard), so a
+  residual `... AND c=k` declines to the correct scan. (3) `simple_count_star` yield extended so COUNT(*)
+  reaches the seeking path.
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_composite_prefix_range_oracle` PASS — all range
+  operators on `b` (`>`,`>=`,`<`,`<=`,`BETWEEN`, reversed operands), both aggregates, NULL `b`, empty
+  ranges (→ COUNT=0/SUM=NULL), COALESCE, mixed storage classes, and the residual-predicate DECLINE.
+  Opcode gates: SeekGE + IdxGT fire; COUNT(*)/SUM(leading col) covering (no SeekRowid), SUM(b) not;
+  residual case declines (no IdxGT). No-reg: agg_index_range, composite_eq_seek,
+  composite_prefix_range_residual byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a=v AND b<range>` full scan → O(log n + matches) block seek.
