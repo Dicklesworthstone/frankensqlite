@@ -10823,18 +10823,30 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
-) -> Option<(&'t IndexSchema, &'e Expr)> {
-    let (col_name, target_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
-    // `index_for_column` already requires a rowid-table index whose LEADING column is `col_name`, so a
-    // composite `(col, …)` index works too: the `[col, i64::MIN]` probe anchors at the first `(col, *)`
-    // entry and the `Ne` on index column 0 stops at the end of the `col=?` run — the same block the
-    // single-column seek walks. Only the ASC-leading requirement remains (a DESC leading term flips the
-    // anchor). This lets `COUNT(*)/SUM(x) WHERE col=?` seek the block when `col` has only a composite
-    // index (was a full scan).
-    table
-        .index_for_column(&col_name)
-        .filter(|idx| !idx.key_term_descending(0))
-        .map(|idx| (idx, target_expr))
+) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
+    // The seek walks the block pinned by an equality PREFIX of an ASC index (`WHERE a=?` on `(a,b)`, or
+    // `WHERE a=? AND b=?` on `(a,b)`) — the `[prefix.., i64::MIN]` probe anchors at the first matching
+    // entry and a per-term `Ne` stops at the end of the run. It applies no residual filter, so it is
+    // only correct when the WHERE is EXACTLY the pinned equalities: `conjunct_count == prefix_len`
+    // declines a query with a leftover predicate the seek can't enforce (e.g. `a=? AND b=?` against a
+    // shorter `(a)` index would drop `b=?`), letting a fuller index win.
+    let where_expr = where_clause?;
+    if table.without_rowid {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    for index in &table.indexes {
+        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+            continue;
+        }
+        let prefix = extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
+        if prefix.is_empty() || prefix.len() != conjuncts.len() {
+            continue;
+        }
+        return Some((index, prefix));
+    }
+    None
 }
 
 /// The index and distinct integer values a `WHERE <col> IN (<int list>)` aggregate can
@@ -11253,10 +11265,12 @@ fn codegen_select_aggregate(
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
 
-    if let Some((idx_schema, target_expr)) = index_eq_seek {
+    if let Some((idx_schema, prefix_exprs)) = index_eq_seek {
         let idx_cursor = 1_i32;
         let scan_fallback = b.emit_label();
         let duplicate_run_done = b.emit_label();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let prefix_len = prefix_exprs.len() as i32;
 
         // Can every aggregate read from the index entry alone? If so the table
         // cursor is never opened and no SeekRowid is emitted, matching stock
@@ -11273,37 +11287,38 @@ fn codegen_select_aggregate(
             .unwrap_or(usize::MAX);
         let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
 
-        // INTEGER-affinity column + integer literal ⇒ the seek is EXACT: the index's storage-class
-        // order matches the WHERE comparison's, so a 0-match seek is authoritative and the full-scan
-        // fallback (an affinity safety net for mixed-type columns) is unnecessary. A miss then finalizes
-        // to the empty-aggregate result (COUNT=0 / SUM=NULL) directly — making a lookup of an absent key
-        // O(log n), not the O(n) fallback scan. (Non-exact columns keep the fallback.) bd-eq-seek-fallback-zero-match.
-        let exact_seek = matches!(target_expr, Expr::Literal(Literal::Integer(_), _))
-            && table
-                .columns
-                .get(index_table_col)
-                .is_some_and(|c| c.affinity == 'D');
+        // Every pinned key column is INTEGER-affinity + integer literal ⇒ the seek is EXACT (the index's
+        // storage-class order matches the WHERE comparison), so a 0-match seek is authoritative and the
+        // full-scan fallback (an affinity safety net for mixed-type columns) is unnecessary: a miss
+        // finalizes to the empty-aggregate result (COUNT=0 / SUM=NULL) directly, making an absent-key
+        // lookup O(log n) not the O(n) fallback scan. (Non-exact keeps the fallback.) bd-eq-seek-fallback-zero-match.
+        let exact_seek = prefix_exprs.iter().enumerate().all(|(i, e)| {
+            matches!(e, Expr::Literal(Literal::Integer(_), _))
+                && idx_schema
+                    .columns
+                    .get(i)
+                    .and_then(|name| table.column_index(name))
+                    .and_then(|ci| table.columns.get(ci))
+                    .is_some_and(|c| c.affinity == 'D')
+        });
         let seek_miss_label = if exact_seek {
             finalize_label
         } else {
             scan_fallback
         };
 
-        // Probe key is [target, i64::MIN] so SeekGE anchors on the first entry
-        // of the duplicate run in a non-unique index.
-        let probe_key_regs = b.alloc_regs(2);
-        let min_rowid_reg = probe_key_regs + 1;
-        emit_expr(b, target_expr, probe_key_regs, None);
-        // `k = NULL` matches nothing; let the scan produce the empty result so
-        // the NULL semantics live in exactly one place.
-        b.emit_jump_to_label(
-            Opcode::IsNull,
-            probe_key_regs,
-            0,
-            scan_fallback,
-            P4::None,
-            0,
-        );
+        // Probe key is [prefix.., i64::MIN] so SeekGE anchors on the first entry of the pinned block in
+        // a non-unique index.
+        let probe_key_regs = b.alloc_regs(prefix_len + 1);
+        let min_rowid_reg = probe_key_regs + prefix_len;
+        for (i, expr) in prefix_exprs.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let reg = probe_key_regs + i as i32;
+            emit_expr(b, expr, reg, None);
+            // `col = NULL` matches nothing; let the scan produce the empty result so the NULL semantics
+            // live in exactly one place.
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, seek_miss_label, P4::None, 0);
+        }
 
         let saw_index_match_reg = b.alloc_reg();
         b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
@@ -11312,7 +11327,7 @@ fn codegen_select_aggregate(
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            2,
+            prefix_len + 1,
             probe_record_reg,
             P4::None,
             0,
@@ -11347,15 +11362,25 @@ fn codegen_select_aggregate(
 
         let idx_loop_top = b.current_addr();
         let idx_key_reg = b.alloc_reg();
-        b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
-        b.emit_jump_to_label(
-            Opcode::Ne,
-            probe_key_regs,
-            idx_key_reg,
-            duplicate_run_done,
-            direct_lookup_index_comparison_p4(idx_schema),
-            0x10,
-        );
+        // End the pinned run as soon as any prefix column differs from the probe. `0x10` (JUMPIFNULL):
+        // a NULL index key also ends the run — it can't equal the non-NULL probe value.
+        for i in 0..prefix_exprs.len() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let col = i as i32;
+            b.emit_op(Opcode::Column, idx_cursor, col, idx_key_reg, P4::None, 0);
+            let coll = idx_schema
+                .key_term_collation(i)
+                .filter(|c| !c.eq_ignore_ascii_case("BINARY"))
+                .map_or(P4::None, |c| P4::Collation(c.to_owned()));
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                probe_key_regs + col,
+                idx_key_reg,
+                duplicate_run_done,
+                coll,
+                0x10,
+            );
+        }
 
         let idx_skip_label = b.emit_label();
         b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
@@ -27227,10 +27252,11 @@ mod tests {
             right: Box::new(two.clone()),
             span: Span::ZERO,
         };
-        let (idx, target) = aggregate_index_eq_seek_target(Some(&indexed_eq), &table, None)
+        let (idx, targets) = aggregate_index_eq_seek_target(Some(&indexed_eq), &table, None)
             .expect("indexed column equality must select the index seek");
         assert_eq!(idx.name, "idx_t_k");
-        assert!(matches!(target, Expr::Literal(Literal::Integer(2), _)));
+        assert_eq!(targets.len(), 1);
+        assert!(matches!(targets[0], Expr::Literal(Literal::Integer(2), _)));
 
         // Unindexed column: no seek.
         let unindexed_eq = Expr::BinaryOp {

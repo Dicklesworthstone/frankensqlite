@@ -18106,3 +18106,28 @@ test is on the executed path, not merely linked into it.
   scan and C SQLite also produce — so it is byte-exact (no ORDER-BY tie ambiguity here).
 - IMPACT: common shape (count/sum matching a composite key); full scan → O(log n + matches). Charted as
   bd-agg-composite-full-eq for a focused turn.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM(x) WHERE a=? AND b=? on a composite (a,b) index seeks the block (bd-agg-composite-full-eq)
+
+- Result type: WIN / shipped. Chose route (a) from the teed-up NEGATIVE above but WITHOUT a separate
+  codegen path — `aggregate_index_eq_seek_target` and its inline codegen (~11268) were GENERALIZED from a
+  single-column eq to an N-column equality prefix. Detection now returns `(&IndexSchema, Vec<&Expr>)` via
+  `extract_index_equality_prefix_exprs` (the same prefix extractor the non-agg composite-eq path uses) and
+  is gated by `prefix.len() == conjunct_count` — the exact residual-drop guard that keeps a shorter index
+  from swallowing a `a=? AND b=?` query it can't enforce. The single-column leading-eq case is preserved
+  bit-for-bit (a 1-conjunct query yields a 1-element prefix → identical probe `[a, MIN]` + single `Ne`).
+- MECHANISM: probe `[prefix.., i64::MIN]` (N key values + rowid floor) → `SeekGE` anchors at the first
+  `(a,b,*)` of the pinned block; the run is stopped by a per-term loop of `Column i` + `Ne(probe[i],
+  key[i], run_done, per-term-collation, 0x10)` — NOT `IdxGT` (IdxGT would fire immediately since the
+  probe's `i64::MIN` rowid sorts below every real rowid). Each term carries its index key term's collation
+  (BINARY → P4::None). The EXACT fallback-skip (`bd-eq-seek-fallback-zero-match`) generalizes: when every
+  prefix column is INTEGER affinity + integer literal the seek is exact, so a 0-match finalizes directly
+  (COUNT=0 / SUM=NULL) with no O(n) safety scan; a non-exact prefix keeps the scan fallback.
+- HARD GATE (byte-exact vs C SQLite 3.46.1 / rusqlite): `agg_composite_full_eq_oracle` PASS — COUNT(*)
+  and SUM(x) over duplicate `(a,b)` runs, reversed conjunct order, absent keys (→ COUNT=0/SUM=NULL),
+  COALESCE wrapper, MIN/MAX riding the same block, and the 3-term `a=? AND b=? AND x=?` DECLINE (the
+  2-col index must not drop `x=?`). Opcode gate: the 2-term eq emits `SeekGE`.
+- NO-REGRESSION: clippy `-p fsqlite-vdbe --lib --tests` clean (remote); the `aggregate_index_eq_seek`
+  contract unit test updated to the Vec return and passes; `agg_composite_leading_eq_oracle` (same
+  generalized function) re-run byte-exact.
+- PERF: `COUNT(*)/SUM(x) WHERE a=? AND b=?` full table scan → O(log n + matches) block seek.
