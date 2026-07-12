@@ -9486,6 +9486,110 @@ fn minmax_index_seek_plan(
     })
 }
 
+/// A single `MIN(b)`/`MAX(b)` over the SECOND key term of a composite index, constrained by
+/// `WHERE <first-term> = <const>` — resolvable by one prefix seek to the extremum of the group.
+struct MinMaxPrefixSeek<'e> {
+    /// `true` = `MAX` (last entry of the `a=?` block); `false` = `MIN` (first non-NULL `b` in it).
+    is_max: bool,
+    index_name: String,
+    index_root: i32,
+    /// Affinity to coerce the `a` probe to (`'C'|'D'|'E'|'B'`), or `None` (untyped → no coercion).
+    a_affinity: Option<char>,
+    /// Collation for the `a`-block verify comparison (index key term 0), `None` for BINARY.
+    a_collation: Option<String>,
+    /// The `WHERE a = <const>` right-hand side (a literal or placeholder).
+    a_target: &'e Expr,
+}
+
+/// Detect `SELECT MIN(b)/MAX(b) FROM t WHERE a = <const>` where a composite index `(a, b, …)` has
+/// `a` as key term 0 and `b` as key term 1 (both ASC, `b`'s collation matching the aggregate).
+///
+/// The extremum of `b` within the `a=?` group is then a single prefix seek — `SeekLE([a])` lands on
+/// the last entry of the block (its max `b`), `SeekGE([a])` on the first (walk past leading `b`-NULLs
+/// for min) — instead of scanning the whole group. Mirrors the plain-MIN/MAX guards (one output
+/// aggregate; no DISTINCT/FILTER/bare/multi/extra; a single plain-column arg). Byte-identical: `b` is
+/// read from the index (same affinity-applied value a scan sees) and the index order equals the
+/// MIN/MAX comparison order. A DESC term, a collation mismatch, or WITHOUT ROWID declines to the scan.
+/// bd-minmax-prefix-seek.
+fn minmax_prefix_seek_plan<'e>(
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_clause: Option<&'e Expr>,
+) -> Option<MinMaxPrefixSeek<'e>> {
+    let [agg] = agg_columns else {
+        return None;
+    };
+    if agg.arg_is_rowid
+        || agg.distinct
+        || agg.filter.is_some()
+        || agg.hidden
+        || agg.bare_expr.is_some()
+        || agg.arg_expr.is_some()
+        || !agg.multi_agg_indices.is_empty()
+        || !agg.extra_args.is_empty()
+        || agg.num_args != 1
+    {
+        return None;
+    }
+    if table.without_rowid {
+        return None;
+    }
+    let is_max = match agg.name.as_str() {
+        "MIN" => false,
+        "MAX" => true,
+        _ => return None,
+    };
+    let b_col_name = table.columns.get(agg.arg_col_index?)?.name.clone();
+    // BINARY `b` only: under a non-BINARY collation (e.g. NOCASE) collation-equal values can be
+    // byte-different, so the index's tie representative (chosen by rowid) may differ from the scan's
+    // MIN/MAX representative — not byte-identical. Such shapes decline to the group scan.
+    if agg
+        .collation
+        .as_deref()
+        .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+    let (a_col_name, a_target) = extract_column_eq_target(where_clause, table, table_alias)?;
+    if a_col_name.eq_ignore_ascii_case(&b_col_name) {
+        return None;
+    }
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() >= 2
+            && !idx.key_term_descending(0)
+            && !idx.key_term_descending(1)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&a_col_name))
+            && idx
+                .columns
+                .get(1)
+                .is_some_and(|c| c.eq_ignore_ascii_case(&b_col_name))
+            && idx
+                .key_term_collation(1)
+                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+    })?;
+    let a_affinity = table
+        .column_index(&a_col_name)
+        .map(|i| table.columns[i].affinity)
+        .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
+    let a_collation = idx
+        .key_term_collation(0)
+        .filter(|c| !c.eq_ignore_ascii_case("BINARY"))
+        .map(str::to_owned);
+    Some(MinMaxPrefixSeek {
+        is_max,
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+        a_affinity,
+        a_collation,
+        a_target,
+    })
+}
+
 /// Emit the `MAX(rowid)` / `MIN(rowid)` leaf-seek fast path.
 ///
 /// Instead of `Rewind` + AggStep-per-row + `Next` (an O(n) walk), this seeks a
@@ -9641,6 +9745,170 @@ fn codegen_select_minmax_index_seek(
         0,
     );
 
+    if accum_reg != out_regs {
+        b.emit_op(Opcode::Copy, accum_reg, out_regs, 0, P4::None, 0);
+    }
+    if let Some(wrapper) = &agg.wrapper_expr {
+        emit_agg_wrapper(b, wrapper, out_regs);
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit the composite-prefix `MIN(b)`/`MAX(b) WHERE a = <const>` seek: one seek to the extremum of
+/// `b` within the `a=?` block of a `(a, b, …)` index, instead of scanning the whole group.
+///
+/// The `a` probe (a partial 1-field key) is coerced to `a`'s affinity, then:
+/// - MAX → `SeekLE([a])` lands on the LAST entry of the block; its `b` (index column 1) is the maximum
+///   (NULLs sort first, so a NULL there means the whole block's `b` is NULL → MAX = NULL).
+/// - MIN → `SeekGE([a])` lands on the FIRST entry; a bounded walk skips leading `b`-NULLs (stopping if
+///   `a` changes) to the first non-NULL `b` — the minimum (all-NULL/empty block → MIN = NULL).
+///
+/// After the seek a verify (`Ne a, target` with JUMPIFNULL) drops to finalize when the block is empty
+/// (`SeekLE`/`SeekGE` landed outside it), leaving the accumulator NULL. The single extremum `b` feeds
+/// the same `AggStep`/`AggFinal`/wrapper sequence the scan uses, so the result is bit-identical. Only
+/// the index cursor is opened (`b` is covered). bd-minmax-prefix-seek.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_minmax_prefix_seek(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    agg_columns: &[AggColumn],
+    seek: &MinMaxPrefixSeek,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    const JUMPIFNULL: u16 = 0x10; // Ne also jumps when either operand is NULL.
+
+    let agg = &agg_columns[0];
+    let accum_reg = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, accum_reg, 0, P4::None, 0);
+
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        seek.index_root,
+        0,
+        P4::Index(seek.index_name.clone()),
+        0,
+    );
+
+    let finalize_label = b.emit_label();
+
+    // Emit the `a=` target, coerce to `a`'s affinity, and treat `a = NULL` as an empty match.
+    let a_reg = b.alloc_reg();
+    emit_expr(b, seek.a_target, a_reg, None);
+    if let Some(aff) = seek.a_affinity
+        && !bound_matches_affinity(aff, seek.a_target)
+    {
+        b.emit_op(
+            Opcode::Affinity,
+            a_reg,
+            1,
+            0,
+            P4::Affinity(aff.to_string()),
+            0,
+        );
+    }
+    b.emit_jump_to_label(Opcode::IsNull, a_reg, 0, finalize_label, P4::None, 0);
+
+    // Partial 1-field probe key [a] for the prefix seek.
+    let probe_rec = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, a_reg, 1, probe_rec, P4::None, 0);
+
+    let a_coll = || {
+        seek.a_collation
+            .as_deref()
+            .map_or(P4::None, |c| P4::Collation(c.to_owned()))
+    };
+    let cur_a_reg = b.alloc_reg();
+    let b_reg = b.alloc_reg();
+    let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
+
+    if seek.is_max {
+        // MAX: last entry of the `a=?` block.
+        b.emit_jump_to_label(
+            Opcode::SeekLE,
+            idx_cursor,
+            probe_rec,
+            finalize_label,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_a_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            cur_a_reg,
+            a_reg,
+            finalize_label,
+            a_coll(),
+            JUMPIFNULL,
+        );
+        b.emit_op(Opcode::Column, idx_cursor, 1, b_reg, P4::None, 0);
+        // fall through to the shared AggStep with `b_reg` = the max `b`.
+    } else {
+        // MIN: first entry of the block, then skip leading `b`-NULLs within it.
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_rec,
+            finalize_label,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_a_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            cur_a_reg,
+            a_reg,
+            finalize_label,
+            a_coll(),
+            JUMPIFNULL,
+        );
+
+        let min_loop = b.current_addr();
+        b.emit_op(Opcode::Column, idx_cursor, 1, b_reg, P4::None, 0);
+        let min_found = b.emit_label();
+        b.emit_jump_to_label(Opcode::NotNull, b_reg, 0, min_found, P4::None, 0);
+        // `b` is NULL: advance; on EOF fall through to finalize.
+        let min_advance = b.emit_label();
+        b.emit_jump_to_label(Opcode::Next, idx_cursor, 0, min_advance, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        b.resolve_label(min_advance);
+        // Left the `a=?` block? then every `b` in it was NULL -> MIN = NULL.
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_a_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            cur_a_reg,
+            a_reg,
+            finalize_label,
+            a_coll(),
+            JUMPIFNULL,
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(Opcode::Goto, 0, min_loop as i32, 0, P4::None, 0);
+        b.resolve_label(min_found);
+        // fall through to the shared AggStep with `b_reg` = the min `b`.
+    }
+
+    // Feed the single extremum `b` (the finalize jumps above skip this, leaving the accumulator NULL).
+    b.emit_op(Opcode::AggStep, 0, b_reg, accum_reg, agg_p4, 1);
+
+    b.resolve_label(finalize_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_reg,
+        agg.num_args,
+        0,
+        P4::FuncName(agg.name.clone()),
+        0,
+    );
     if accum_reg != out_regs {
         b.emit_op(Opcode::Copy, accum_reg, out_regs, 0, P4::None, 0);
     }
@@ -10118,6 +10386,25 @@ fn codegen_select_aggregate(
         && let Some(seek) = minmax_index_seek_plan(&agg_columns, table)
     {
         return codegen_select_minmax_index_seek(
+            b,
+            cursor,
+            &agg_columns,
+            &seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
+
+    // Composite-prefix analogue: `SELECT MIN(b)/MAX(b) FROM t WHERE a = <const>` on a (a,b,…) index
+    // seeks to the extremum of `b` within the `a=?` block (one seek) instead of scanning the whole
+    // group (~800x on a large group). Byte-identical; gated on `allow_index_seek`. bd-minmax-prefix-seek.
+    if allow_index_seek
+        && having.is_none()
+        && let Some(seek) = minmax_prefix_seek_plan(&agg_columns, table, table_alias, where_clause)
+    {
+        return codegen_select_minmax_prefix_seek(
             b,
             cursor,
             &agg_columns,

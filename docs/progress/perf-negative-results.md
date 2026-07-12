@@ -17760,3 +17760,37 @@ test is on the executed path, not merely linked into it.
 - WHY SURFACED not shipped this pass: profiled and charted with a clear implementation path, but the
   composite-prefix positioning + affinity/collation + empty-group/NULL surface is a fresh focused
   effort; teed up as bd-minmax-prefix-seek-4fuo6 rather than started deep in a long session.
+
+## 2026-07-11 - WIN: MAX(b)/MIN(b) WHERE a=? on a composite (a,b) index seeks the prefix extremum, not a group scan — ~9× (MAX) / ~297× (MIN) byte-exact (bd-minmax-prefix-seek-4fuo6)
+
+- Result type: WIN / shipped. The lever charted in the prior SURFACE entry, now implemented and gated.
+  Extends bd-minmax-index-seek to the composite-prefix `WHERE a=?` case.
+- THE MISS: `aggregate_index_eq_seek_target` requires `key_term_count()==1`, so `SELECT MAX(b)/MIN(b)
+  FROM t WHERE a=?` on a `(a,b,…)` index seeks the `a=?` group then SCANS it (accumulating like
+  COUNT/SUM). The extremum of `b` within `a=?` is a single index entry.
+- THE LEVER: `minmax_prefix_seek_plan` detects a single `MIN(b)/MAX(b)` (plain-column arg, no
+  DISTINCT/FILTER/bare/multi/extra) with `WHERE a=<const>` and a composite index whose term 0 is `a`
+  and term 1 is `b` (both ASC; BINARY `b` collation). `codegen_select_minmax_prefix_seek` opens only
+  the (covering) index and, using a partial 1-field probe `[a]` coerced to `a`'s affinity:
+  - MAX → `SeekLE([a])` lands on the LAST entry of the block; a `Ne a,target` (JUMPIFNULL) verify drops
+    to finalize when the block is empty; else `Column 1` = max `b` feeds the shared single-row AggStep.
+  - MIN → `SeekGE([a])` lands on the FIRST entry; a bounded walk skips leading `b`-NULLs (`NotNull`→feed,
+    else `Next`, stopping when `a` changes) to the first non-NULL `b`. Empty/all-NULL → NULL.
+  Byte-identical: `b` is read from the index (same affinity-applied value the scan sees) and the block
+  order equals the MIN/MAX comparison order.
+- BINARY-ONLY `b` (correctness): the first oracle run caught `MAX(c)` (NOCASE `c`) diverging — under a
+  non-BINARY collation, collation-equal values can be byte-different, so the index's tie representative
+  (by rowid) may differ from the scan's MIN/MAX representative. Restricted to BINARY `b`; NOCASE/other
+  collations decline to the group scan. (`a` may carry any collation — it's the exact-eq prefix.)
+- BYTE-EXACT GATE (`crates/fsqlite/tests/minmax_prefix_oracle.rs`, PASS): vs rusqlite/C SQLite —
+  INT/TEXT(BINARY)/REAL `b`, a group with leading `b`-NULLs (MIN skips), an all-NULL-`b` group and an
+  absent group (both → NULL), boundary `a` (first/last/below/above), the COALESCE wrapper, and the
+  decline cases (DESC term / NOCASE term / single-column index) — all bit-identical. Opcode gate:
+  MAX→SeekLE, MIN→SeekGE, both covering (no SeekRowid); DESC/NOCASE decline; single-col → SeekRowid.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1036/0. clippy clean; fmt clean.
+- MEDIAN (release-perf, 20k rows, 20 groups of ~1000): `MAX(b) WHERE a=7` 3.79 ms → 270 µs (~14×; ~9×
+  vs the same-run COUNT/SUM group scan at 2.45 ms); `MIN(b) WHERE a=7` 3.88 ms → 8.3 µs (~297× vs the
+  group scan). (MAX's 270 µs vs MIN's 8 µs is a SeekLE-partial-key positioning cost, noted; still a
+  large win.)
+- NET: the 3rd shipped byte-exact codegen win this session, extending the MIN/MAX-via-index family to
+  the composite `WHERE a=?` prefix. Diagnostic retained: minmax_prefix_profile.rs.
