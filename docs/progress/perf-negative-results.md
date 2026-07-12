@@ -17886,3 +17886,29 @@ test is on the executed path, not merely linked into it.
   3.46 ms (~144×) — and ~11× faster than the ASC-second-term MAX (270 µs, which pays the O(block) SeekLE
   walk). So a `(a, b DESC)` index makes MAX-per-group both correct and O(log n). Diagnostic:
   minmax_prefix_desc_profile.rs.
+
+## 2026-07-12 - NEGATIVE/SURFACE: WHERE a=? ORDER BY b (non-unique, no tiebreaker) streaming diverges from C SQLite on ties → the "top-k per group, no sorter" perf lever is byte-exact-unsafe (bd-orderby-nonunique-tie-divergence)
+
+- Result type: NEGATIVE (perf lever blocked) + a surfaced correctness gap. Found by profile-first probing
+  the very common top-k-per-group shape `SELECT ... WHERE a=? ORDER BY b [DESC] LIMIT k` on a composite
+  `(a,b)` index (`where_eq_orderby_limit_probe.rs`, retained as the repro).
+- THE PROBE (main @ 75f0c581, no local changes):
+  - `... ORDER BY b DESC LIMIT k` → byte-matches C SQLite but uses a SORTER (SorterOpen) — a tempting
+    "stream it off `(a, b DESC)`, no sorter" perf opportunity.
+  - `... ORDER BY b ASC LIMIT k` → STREAMS off the `(a,b)` index (no sorter) and DIVERGES from C SQLite:
+    `ORDER BY b ASC LIMIT 1` → frank `(93,1)` vs C SQLite `(293,1)` (both are `a=5,b=1`); `LIMIT 3` →
+    frank `[(93,1),(293,1),(29,3)]` vs C SQLite `[(293,1),(93,1),(229,3)]` (different tie order AND a
+    different 3rd row). frank emits ties in index (rowid-ASC) order; C SQLite picks a different
+    representative/order.
+- WHY IT MATTERS: bare `ORDER BY b` with a non-unique `b` and no trailing unique key has
+  implementation-defined tie order, but the campaign's HARD GATE is byte-identical to C SQLite — so this
+  is a latent gate violation in the *already-shipped* composite-ORDER-BY-via-index streaming (a different
+  codegen path from this session's `minmax_*` work). A deterministic differential oracle using
+  `ORDER BY b, id` would not have caught it.
+- WHY THE PERF LEVER IS UNSAFE: streaming the DESC case off `(a, b DESC)` (to drop its sorter) would emit
+  ties in index order — exactly what the ASC case already gets WRONG vs C SQLite. So "top-k per group, no
+  sorter" cannot be shipped byte-exact for a non-unique ORDER BY column without first matching C SQLite's
+  tie order (or restricting to a fully-determined ORDER BY, e.g. a trailing unique key / rowid).
+- NEXT: fix the correctness gap first (bd-orderby-nonunique-tie-divergence) — either decline index-order
+  streaming when the ORDER BY is not fully determined, or reproduce C SQLite's tie order — then the
+  top-k-per-group sorter-elimination becomes a safe perf lever on top of it.
