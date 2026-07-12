@@ -2355,7 +2355,10 @@ mod tests {
         }
     }
 
-    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    fn with_tracing_capture<F, R>(
+        _capture_guard: &crate::test_support::TracingCaptureGuard,
+        f: F,
+    ) -> (R, String)
     where
         F: FnOnce() -> R,
     {
@@ -2406,7 +2409,8 @@ mod tests {
 
         let before = crate::observability::mvcc_snapshot_metrics_snapshot();
         let mut reader = m.begin(BeginKind::Deferred).unwrap();
-        let (read, logs) = with_tracing_capture(|| m.read_page(&mut reader, pgno));
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let (read, logs) = with_tracing_capture(&capture_guard, || m.read_page(&mut reader, pgno));
         assert!(read.is_some());
 
         let after = crate::observability::mvcc_snapshot_metrics_snapshot();
@@ -6238,7 +6242,8 @@ mod tests {
         // T1 reads (A,B)=(50,50), writes A=-40 (withdraw 90).
         // T2 reads (A,B)=(50,50), writes B=-40 (withdraw 90).
         // Under SSI: one must abort.
-        let ((), logs) = with_tracing_capture(|| {
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let ((), logs) = with_tracing_capture(&capture_guard, || {
             let m = mgr();
             assert!(m.ssi_enabled(), "SSI must be enabled by default");
 
@@ -6311,7 +6316,8 @@ mod tests {
 
     #[test]
     fn test_write_skew_sum_constraint_serializable_off_allows_anomaly() {
-        let ((), logs) = with_tracing_capture(|| {
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let ((), logs) = with_tracing_capture(&capture_guard, || {
             let mut m = mgr();
             m.set_ssi_enabled(false);
             assert!(!m.ssi_enabled());
@@ -6664,7 +6670,7 @@ mod tests {
 
     #[test]
     fn test_version_guard_pinned_at_begin() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let txn = mgr.begin(BeginKind::Concurrent).unwrap();
         assert!(
             txn.has_version_guard(),
@@ -6675,10 +6681,10 @@ mod tests {
 
     #[test]
     fn test_version_guard_unpinned_on_commit() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
         assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
-        let _ = mgr.commit(&mut txn);
+        mgr.commit(&mut txn).expect("commit should succeed");
         assert!(
             !txn.has_version_guard(),
             "VersionGuard must be unpinned after commit"
@@ -6688,7 +6694,7 @@ mod tests {
 
     #[test]
     fn test_version_guard_unpinned_on_abort() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
         assert_eq!(mgr.version_guard_registry().active_guard_count(), 1);
         mgr.abort(&mut txn);
@@ -6701,7 +6707,7 @@ mod tests {
 
     #[test]
     fn test_version_guard_pinned_for_all_begin_kinds() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
 
         // Concurrent
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
@@ -6723,7 +6729,7 @@ mod tests {
 
     #[test]
     fn test_multiple_concurrent_txns_pin_separate_guards() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let txn1 = mgr.begin(BeginKind::Concurrent).unwrap();
         let txn2 = mgr.begin(BeginKind::Concurrent).unwrap();
         let txn3 = mgr.begin(BeginKind::Concurrent).unwrap();
@@ -6757,7 +6763,7 @@ mod tests {
 
     #[test]
     fn test_version_guard_defer_retire_returns_true_when_pinned() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let txn = mgr.begin(BeginKind::Concurrent).unwrap();
         // Defer a simple value through the guard.
         let result = txn.defer_retire_version(vec![1_u8, 2, 3]);
@@ -6769,7 +6775,7 @@ mod tests {
 
     #[test]
     fn test_publish_write_set_keeps_superseded_version_visible_until_gc() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let pgno = PageNumber::new(6_001).expect("valid page number");
 
         let mut txn1 = mgr.begin(BeginKind::Concurrent).unwrap();
@@ -6889,7 +6895,6 @@ mod tests {
 
     #[test]
     fn test_version_guard_deferred_value_freed_after_unpin() {
-        use crossbeam_epoch as epoch;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         #[derive(Clone)]
@@ -6900,7 +6905,7 @@ mod tests {
             }
         }
 
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
         let drop_count = Arc::new(AtomicUsize::new(0));
 
@@ -6909,15 +6914,14 @@ mod tests {
         assert_eq!(drop_count.load(AtomicOrdering::SeqCst), 0);
 
         // Commit (which unpins the guard and flushes).
-        let _ = mgr.commit(&mut txn);
+        mgr.commit(&mut txn).expect("commit should succeed");
 
         // Drive epoch advancement to trigger deferred drops. Under parallel
         // test load, grace-period completion can take longer than a fixed
         // small iteration count, so poll until a bounded deadline.
         let deadline = Instant::now() + Duration::from_secs(2);
         while drop_count.load(AtomicOrdering::SeqCst) == 0 && Instant::now() < deadline {
-            let g = epoch::pin();
-            g.flush();
+            mgr.version_guard_registry().flush_reclamation();
             std::thread::yield_now();
         }
 
@@ -6930,7 +6934,6 @@ mod tests {
 
     #[test]
     fn test_version_guard_deferred_value_freed_after_abort() {
-        use crossbeam_epoch as epoch;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         #[derive(Clone)]
@@ -6941,7 +6944,7 @@ mod tests {
             }
         }
 
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
         let drop_count = Arc::new(AtomicUsize::new(0));
 
@@ -6957,8 +6960,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while drop_count.load(AtomicOrdering::SeqCst) == 0 && Instant::now() < deadline {
-            let g = epoch::pin();
-            g.flush();
+            mgr.version_guard_registry().flush_reclamation();
             std::thread::yield_now();
         }
 
@@ -7771,7 +7773,7 @@ mod tests {
 
     #[test]
     fn test_version_guard_registry_accessor() {
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let registry = mgr.version_guard_registry();
         assert_eq!(registry.active_guard_count(), 0);
     }
@@ -11606,7 +11608,7 @@ mod tests {
     #[test]
     fn test_cell_log_accessor() {
         // C4 test: cell_log() accessor should work
-        let mgr = TransactionManager::new(PageSize::new(4096).unwrap());
+        let mgr = mgr();
         let cell_log = mgr.cell_log();
 
         // Just verify we can access it (it's a &CellVisibilityLog)

@@ -854,7 +854,10 @@ mod tests {
         }
     }
 
-    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    fn with_tracing_capture<F, R>(
+        _capture_guard: &crate::test_support::TracingCaptureGuard,
+        f: F,
+    ) -> (R, String)
     where
         F: FnOnce() -> R,
     {
@@ -1099,7 +1102,8 @@ mod tests {
     #[test]
     fn test_coordinator_lease_logging_includes_timestamps() {
         let coord = WriteCoordinator::new(CoordinatorMode::Native);
-        let ((), logs) = with_tracing_capture(|| {
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let ((), logs) = with_tracing_capture(&capture_guard, || {
             assert!(coord.acquire_lease(100, 55));
             assert!(coord.release_lease(100));
         });
@@ -1154,7 +1158,8 @@ mod tests {
         };
 
         let second = compat_request(2, &[42]);
-        let (resp, logs) = with_tracing_capture(|| coord.compat_commit(&second));
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let (resp, logs) = with_tracing_capture(&capture_guard, || coord.compat_commit(&second));
         assert_eq!(
             resp,
             CompatCommitResponse::Conflict {

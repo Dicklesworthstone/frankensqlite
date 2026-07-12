@@ -1392,7 +1392,10 @@ mod tests {
         }
     }
 
-    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    fn with_tracing_capture<F, R>(
+        _capture_guard: &crate::test_support::TracingCaptureGuard,
+        f: F,
+    ) -> (R, String)
     where
         F: FnOnce() -> R,
     {
@@ -1585,7 +1588,8 @@ mod tests {
         let table = SharedPageLockTable::new(TEST_CAP);
         assert_eq!(table.try_acquire(7, 11), AcquireResult::Acquired);
 
-        let (result, logs) = with_tracing_capture(|| table.try_acquire(7, 22));
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let (result, logs) = with_tracing_capture(&capture_guard, || table.try_acquire(7, 22));
         assert_eq!(result, AcquireResult::Busy { holder: 11 });
         assert!(logs.contains("lock_intent=\"exclusive\""));
         assert!(logs.contains("requester_txn_id=22"));
@@ -1597,7 +1601,8 @@ mod tests {
     fn test_rebuild_lease_logs_pid_birth_and_expiry() {
         let table = SharedPageLockTable::new(TEST_CAP);
 
-        let ((), logs) = with_tracing_capture(|| {
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let ((), logs) = with_tracing_capture(&capture_guard, || {
             table
                 .acquire_rebuild_lease(1234, 5678, 100)
                 .expect("lease acquisition must succeed");

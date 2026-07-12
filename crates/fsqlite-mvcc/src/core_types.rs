@@ -3202,7 +3202,10 @@ mod tests {
         }
     }
 
-    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    fn with_tracing_capture<F, R>(
+        _capture_guard: &crate::test_support::TracingCaptureGuard,
+        f: F,
+    ) -> (R, String)
     where
         F: FnOnce() -> R,
     {
@@ -3257,7 +3260,8 @@ mod tests {
         slot.pid_birth.store(9_999, Ordering::Release);
         slot.begin_seq.store(50, Ordering::Release);
 
-        let ((), logs) = with_tracing_capture(|| {
+        let capture_guard = crate::test_support::tracing_capture_guard();
+        let ((), logs) = with_tracing_capture(&capture_guard, || {
             let stats =
                 cleanup_orphaned_slots(std::slice::from_ref(&slot), 100, |_, _| false, |_| {});
             assert_eq!(stats.orphans_found, 1);

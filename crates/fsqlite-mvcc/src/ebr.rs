@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_epoch::{self as epoch, Guard};
+use crossbeam_epoch::{Collector, Guard, LocalHandle};
 use fsqlite_types::sync_primitives::Mutex;
 use serde::Serialize;
 
@@ -284,6 +284,10 @@ struct ReaderPinState {
 /// integration slice; cardinality is bounded by active transactions.
 #[derive(Debug)]
 pub struct VersionGuardRegistry {
+    /// Reclamation domain for this MVCC registry. Separate databases/stores
+    /// must not delay one another's grace periods through Crossbeam's
+    /// process-global default collector.
+    collector: Collector,
     stale_reader: StaleReaderConfig,
     next_guard_id: AtomicU64,
     global_epoch: AtomicU64,
@@ -295,6 +299,7 @@ impl VersionGuardRegistry {
     #[must_use]
     pub fn new(stale_reader: StaleReaderConfig) -> Self {
         Self {
+            collector: Collector::new(),
             stale_reader,
             next_guard_id: AtomicU64::new(1),
             global_epoch: AtomicU64::new(0),
@@ -340,6 +345,15 @@ impl VersionGuardRegistry {
             }
         }
         observed
+    }
+
+    /// Prompt this registry's private Crossbeam collector to advance and
+    /// flush locally deferred retirements.
+    #[cfg(test)]
+    pub(crate) fn flush_reclamation(&self) {
+        let handle = self.collector.register();
+        let guard = handle.pin();
+        guard.flush();
     }
 
     /// Minimum pinned epoch among currently active guards.
@@ -527,10 +541,13 @@ impl Default for VersionGuardRegistry {
 /// currently pinned readers have unpinned.
 #[derive(Debug)]
 pub struct VersionGuard {
+    // Field order is deliberate: the Guard must unpin before its LocalHandle
+    // unregisters, and both must drop before the registry-owned Collector.
+    guard: Guard,
+    _epoch_handle: LocalHandle,
     registry: Arc<VersionGuardRegistry>,
     guard_id: u64,
     pinned_at: Instant,
-    guard: Guard,
 }
 
 impl VersionGuard {
@@ -539,7 +556,8 @@ impl VersionGuard {
     pub fn pin(registry: Arc<VersionGuardRegistry>) -> Self {
         let pinned_at = Instant::now();
         let guard_id = registry.register_guard(pinned_at);
-        let guard = epoch::pin();
+        let epoch_handle = registry.collector.register();
+        let guard = epoch_handle.pin();
         let active_count = registry.active_guard_count() as u64;
         GLOBAL_EBR_METRICS.record_guard_pinned(active_count);
         tracing::trace!(
@@ -549,10 +567,11 @@ impl VersionGuard {
             "epoch guard pinned"
         );
         Self {
+            guard,
+            _epoch_handle: epoch_handle,
             registry,
             guard_id,
             pinned_at,
-            guard,
         }
     }
 
@@ -712,7 +731,8 @@ impl VersionGuardTicket {
     /// past the current epoch.
     pub fn defer_retire<T: Send + 'static>(&self, retired: T) {
         GLOBAL_EBR_METRICS.record_retirement_deferred();
-        let guard = epoch::pin();
+        let handle = self.registry.collector.register();
+        let guard = handle.pin();
         guard.defer(move || drop(retired));
         guard.flush();
     }
@@ -723,7 +743,8 @@ impl VersionGuardTicket {
         F: FnOnce() -> R + Send + 'static,
     {
         GLOBAL_EBR_METRICS.record_retirement_deferred();
-        let guard = epoch::pin();
+        let handle = self.registry.collector.register();
+        let guard = handle.pin();
         guard.defer(retire);
         guard.flush();
     }
@@ -1002,7 +1023,6 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crossbeam_epoch as epoch;
     use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
     use super::{
@@ -1123,8 +1143,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while dropped.load(Ordering::SeqCst) < 1 && Instant::now() < deadline {
-            let flush_guard = epoch::pin();
-            flush_guard.flush();
+            registry.flush_reclamation();
             thread::yield_now();
             thread::sleep(Duration::from_micros(50));
         }
@@ -1134,6 +1153,34 @@ mod tests {
             1,
             "deferred retirement should reclaim after guard drop"
         );
+    }
+
+    #[test]
+    fn independent_registries_do_not_cross_block_reclamation() {
+        let blocking_registry = Arc::new(VersionGuardRegistry::default());
+        let reclaiming_registry = Arc::new(VersionGuardRegistry::default());
+        let blocker = VersionGuard::pin(blocking_registry);
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        {
+            let guard = VersionGuard::pin(Arc::clone(&reclaiming_registry));
+            guard.defer_retire(DropCounter(Arc::clone(&dropped)));
+            guard.flush();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dropped.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            reclaiming_registry.flush_reclamation();
+            thread::yield_now();
+            thread::sleep(Duration::from_micros(50));
+        }
+
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "a pinned reader in another registry must not delay this registry's reclamation"
+        );
+        drop(blocker);
     }
 
     proptest! {
@@ -1161,8 +1208,7 @@ mod tests {
 
             let deadline = Instant::now() + Duration::from_secs(2);
             while dropped.load(Ordering::SeqCst) < expected && Instant::now() < deadline {
-                let flush_guard = epoch::pin();
-                flush_guard.flush();
+                registry.flush_reclamation();
                 thread::yield_now();
                 thread::sleep(Duration::from_micros(50));
             }
@@ -1198,8 +1244,7 @@ mod tests {
 
             let deadline = Instant::now() + Duration::from_secs(2);
             while dropped.load(Ordering::SeqCst) < expected && Instant::now() < deadline {
-                let flush_guard = epoch::pin();
-                flush_guard.flush();
+                registry.flush_reclamation();
                 thread::yield_now();
                 thread::sleep(Duration::from_micros(50));
             }

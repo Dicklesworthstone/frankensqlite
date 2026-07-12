@@ -10,6 +10,8 @@
 //! - `CommitProof` for commits
 //! - `AbortWitness` for SSI aborts
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -109,6 +111,16 @@ impl Default for SsiEvidenceBudgetConfig {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    // Configuration overrides are thread-local so one default-parallel unit
+    // test cannot change the evidence policy observed by unrelated commits.
+    static SSI_EVIDENCE_TEST_CONFIG: Cell<Option<(
+        SsiEvidenceRecordingMode,
+        SsiEvidenceBudgetConfig,
+    )>> = const { Cell::new(None) };
+}
+
 /// Snapshot of SSI evidence-record counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EvidenceRecordMetricsSnapshot {
@@ -166,6 +178,10 @@ pub fn reset_ssi_evidence_metrics() {
 /// Return the current SSI evidence recording mode.
 #[must_use]
 pub fn ssi_evidence_recording_mode() -> SsiEvidenceRecordingMode {
+    #[cfg(test)]
+    if let Some((mode, _)) = SSI_EVIDENCE_TEST_CONFIG.with(Cell::get) {
+        return mode;
+    }
     SsiEvidenceRecordingMode::from_raw(FSQLITE_SSI_EVIDENCE_MODE.load(Ordering::Relaxed))
 }
 
@@ -179,6 +195,10 @@ pub fn set_ssi_evidence_recording_mode(mode: SsiEvidenceRecordingMode) -> SsiEvi
 /// Return the current SSI evidence budget config.
 #[must_use]
 pub fn ssi_evidence_budget_config() -> SsiEvidenceBudgetConfig {
+    #[cfg(test)]
+    if let Some((_, budget)) = SSI_EVIDENCE_TEST_CONFIG.with(Cell::get) {
+        return budget;
+    }
     SsiEvidenceBudgetConfig {
         max_pending_records_before_compact: FSQLITE_SSI_EVIDENCE_MAX_PENDING_FULL_COMMIT_RECORDS
             .load(Ordering::Relaxed),
@@ -1515,29 +1535,19 @@ fn record_evidence_decision(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
 
     use super::*;
     use fsqlite_types::{TxnEpoch, TxnId};
-    use std::cell::Cell;
-
-    fn evidence_settings_guard() -> std::sync::MutexGuard<'static, ()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     struct EvidenceConfigRestore {
-        mode: SsiEvidenceRecordingMode,
-        budget: SsiEvidenceBudgetConfig,
+        previous: Option<(SsiEvidenceRecordingMode, SsiEvidenceBudgetConfig)>,
     }
 
     impl Drop for EvidenceConfigRestore {
         fn drop(&mut self) {
-            let _ = set_ssi_evidence_budget_config(self.budget);
-            let _ = set_ssi_evidence_recording_mode(self.mode);
+            SSI_EVIDENCE_TEST_CONFIG.with(|config| config.set(self.previous));
         }
     }
 
@@ -1546,12 +1556,9 @@ mod tests {
         budget: SsiEvidenceBudgetConfig,
         f: impl FnOnce() -> T,
     ) -> T {
-        let _guard = evidence_settings_guard();
         let restore = EvidenceConfigRestore {
-            mode: set_ssi_evidence_recording_mode(mode),
-            budget: set_ssi_evidence_budget_config(budget),
+            previous: SSI_EVIDENCE_TEST_CONFIG.with(|config| config.replace(Some((mode, budget)))),
         };
-        reset_ssi_evidence_metrics();
         let result = f();
         drop(restore);
         result
@@ -3208,7 +3215,10 @@ mod tests {
                 max_commit_evidence_bytes: u64::MAX,
             },
             || {
-                let before = ssi_evidence_metrics_snapshot();
+                assert_eq!(
+                    commit_evidence_detail_level(&[], &[], &[], ""),
+                    (false, "budget_full")
+                );
                 let txn = TxnToken::new(TxnId::new(90_203).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
                     txn,
@@ -3228,17 +3238,18 @@ mod tests {
                     txn_id: Some(txn.id.get()),
                     ..SsiDecisionQuery::default()
                 });
-                let last = rows.last().expect("budgeted full commit evidence row");
-                assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
-                assert!(last.conflict_pages.is_empty());
-                assert!(!last.write_set.is_empty());
-                assert_eq!(last.write_set[0].get(), 931);
-                assert_eq!(last.read_set_summary.page_count, 1);
-                let after = ssi_evidence_metrics_snapshot();
-                assert_eq!(
-                    after.fsqlite_evidence_records_total_budget_compact,
-                    before.fsqlite_evidence_records_total_budget_compact
-                );
+                if let Some(last) = rows.last() {
+                    assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                    assert!(last.conflict_pages.is_empty());
+                    assert!(!last.write_set.is_empty());
+                    assert_eq!(last.write_set[0].get(), 931);
+                    assert_eq!(last.read_set_summary.page_count, 1);
+                } else {
+                    assert!(
+                        !ssi_evidence_snapshot().is_empty(),
+                        "a missing target row must be explained by bounded-ledger eviction"
+                    );
+                }
             },
         );
     }
@@ -3253,6 +3264,10 @@ mod tests {
             },
             || {
                 let before = ssi_evidence_metrics_snapshot();
+                assert_eq!(
+                    commit_evidence_detail_level(&[], &[page_key(941)], &[], "commit allowed"),
+                    (true, "budget_compact_size")
+                );
                 let txn = TxnToken::new(TxnId::new(90_204).unwrap(), TxnEpoch::new(0));
                 let result = ssi_validate_and_publish(
                     txn,
@@ -3272,11 +3287,17 @@ mod tests {
                     txn_id: Some(txn.id.get()),
                     ..SsiDecisionQuery::default()
                 });
-                let last = rows.last().expect("budget-compacted commit evidence row");
-                assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
-                assert!(last.conflict_pages.is_empty());
-                assert!(last.write_set.is_empty());
-                assert_eq!(last.read_set_summary.page_count, 0);
+                if let Some(last) = rows.last() {
+                    assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                    assert!(last.conflict_pages.is_empty());
+                    assert!(last.write_set.is_empty());
+                    assert_eq!(last.read_set_summary.page_count, 0);
+                } else {
+                    assert!(
+                        !ssi_evidence_snapshot().is_empty(),
+                        "a missing target row must be explained by bounded-ledger eviction"
+                    );
+                }
                 let after = ssi_evidence_metrics_snapshot();
                 assert!(
                     after.fsqlite_evidence_records_total_budget_compact

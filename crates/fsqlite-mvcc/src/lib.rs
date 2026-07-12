@@ -68,6 +68,28 @@ pub mod write_coordinator;
 pub mod writer_routing_telemetry;
 pub mod xor_delta;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    // `tracing` callsite-interest caching is process-global, even when a test
+    // installs a thread-local subscriber with `with_default`. Serializing only
+    // the tests that capture tracing output prevents concurrent subscriber
+    // registration/drop from making a capture intermittently miss events.
+    static TRACING_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct TracingCaptureGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn tracing_capture_guard() -> TracingCaptureGuard {
+        let lock = TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TracingCaptureGuard { _lock: lock }
+    }
+}
+
 /// Reader-visible MVCC metadata classes that participate in Track E3's
 /// publication-plane design.
 ///

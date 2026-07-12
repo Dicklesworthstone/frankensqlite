@@ -22,6 +22,14 @@ use crate::conflict_model::mix64;
 /// Total estimated memory held by active sketch instances (bytes).
 static FSQLITE_SKETCH_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// Monotonic allocation/free totals make the Drop accounting test immune to
+// unrelated sketches being created or destroyed by parallel unit tests. They
+// are test-only so the production metrics surface remains unchanged.
+#[cfg(test)]
+static FSQLITE_SKETCH_TEST_ALLOCATED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static FSQLITE_SKETCH_TEST_FREED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Total number of sketch estimate queries served (cardinality, frequency, etc.).
 static FSQLITE_SKETCH_ESTIMATES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -56,6 +64,8 @@ pub fn reset_sketch_telemetry_metrics() {
 
 fn record_memory_add(bytes: u64) {
     FSQLITE_SKETCH_MEMORY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    #[cfg(test)]
+    FSQLITE_SKETCH_TEST_ALLOCATED_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn record_memory_sub(bytes: u64) {
@@ -66,6 +76,8 @@ fn record_memory_sub(bytes: u64) {
     let _ = FSQLITE_SKETCH_MEMORY_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(bytes))
     });
+    #[cfg(test)]
+    FSQLITE_SKETCH_TEST_FREED_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn record_observation() {
@@ -1360,31 +1372,33 @@ mod tests {
 
     #[test]
     fn test_memory_tracking_on_drop() {
-        // Delta-based: snapshot before, create sketch, verify increase, drop,
-        // verify gauge returns to the previous level.
-        let before = sketch_telemetry_metrics();
-
-        {
-            let _cms = CountMinSketch::new(&CountMinSketchConfig {
-                width: 128,
-                depth: 2,
-                seed: 0,
-            });
-            let during = sketch_telemetry_metrics();
-            assert!(
-                during.fsqlite_sketch_memory_bytes > before.fsqlite_sketch_memory_bytes,
-                "memory gauge should increase after allocation"
-            );
-        }
-
-        // After drop, memory gauge should return to the level before allocation.
-        let after = sketch_telemetry_metrics();
-        assert_eq!(
-            after.fsqlite_sketch_memory_bytes, before.fsqlite_sketch_memory_bytes,
-            "memory gauge should return to pre-allocation level after drop"
+        // The live gauge is process-global, so another parallel test may
+        // allocate or free a sketch between any two snapshots. Assert against
+        // monotonic event totals instead: unrelated events can only increase
+        // the observed delta and therefore cannot mask this instance's exact
+        // allocation/free contribution.
+        let allocated_before = FSQLITE_SKETCH_TEST_ALLOCATED_BYTES_TOTAL.load(Ordering::Relaxed);
+        let cms = CountMinSketch::new(&CountMinSketchConfig {
+            width: 128,
+            depth: 2,
+            seed: 0,
+        });
+        let own_bytes = cms.memory_bytes() as u64;
+        let allocated_after = FSQLITE_SKETCH_TEST_ALLOCATED_BYTES_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            allocated_after.saturating_sub(allocated_before) >= own_bytes,
+            "allocation accounting must include this sketch's {own_bytes} bytes"
         );
 
-        println!("[PASS] memory tracking on drop: gauge returns to pre-allocation level");
+        let freed_before = FSQLITE_SKETCH_TEST_FREED_BYTES_TOTAL.load(Ordering::Relaxed);
+        drop(cms);
+        let freed_after = FSQLITE_SKETCH_TEST_FREED_BYTES_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            freed_after.saturating_sub(freed_before) >= own_bytes,
+            "drop accounting must release this sketch's {own_bytes} bytes"
+        );
+
+        println!("[PASS] memory tracking on drop: allocation and free events accounted");
     }
 
     // -- Sliding Window Histogram tests --
