@@ -18202,3 +18202,13 @@ test is on the executed path, not merely linked into it.
 - GATE: `agg_index_range_oracle` extended — byte-exact `SUM(a)` (covering) cases, and opcode gates that
   COUNT(*)/SUM(indexed) emit NO `SeekRowid` while SUM(non-indexed) does. No-reg: agg_composite_full_eq,
   eq_seek_exact byte-exact.
+
+### follow-up (same turn as IN-list seek): covering IN-list walk for COUNT(*)/SUM(indexed col)
+
+- `emit_aggregate_index_value_seek` (the per-value IN-list seek) now takes the COVERING path (same
+  `aggregate_seek_is_covering` + `emit_aggregate_accumulate_body_covering` helpers) when every aggregate
+  reads only the indexed column or is COUNT(*)/SUM(rowid): no `IdxRowid`/`SeekRowid`, no table cursor.
+  Byte-exact. Completes the covering treatment across all three aggregate seek paths (eq / range / IN).
+- GATE: `in_list_shadowed_index_oracle` extended — byte-exact covering `SUM(a)`, plus opcode gates that
+  COUNT(*)/SUM(indexed) emit NO `SeekRowid` on both the single-idx and composite-shadow schemas while
+  SUM(non-indexed) does. No-reg: agg_index_range, agg_composite_full_eq byte-exact.

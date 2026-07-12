@@ -10932,12 +10932,12 @@ fn aggregate_index_range_seek_target<'t, 'e>(
 
 /// Emit one value's index seek + duplicate-run accumulate for the aggregate IN-list path.
 ///
-/// bd-2dgf5. Non-covering: opens no cursor itself (the caller opens `table_cursor` and
-/// `idx_cursor` once); for each matching index entry it does `IdxRowid` + `SeekRowid` into
-/// the table and runs the shared accumulate body. A `SeekGE` miss or a first key that is not
-/// `value` skips straight to `next_value` (this value contributes nothing). No scan fallback:
-/// the INTEGER-affinity + integer-literal gate in [`index_integer_in_list_target`] makes the
-/// probe exact, and de-duplicated values keep the runs disjoint.
+/// bd-2dgf5. Opens no cursor itself (the caller opens `idx_cursor`, and `table_cursor` when not
+/// covering). A `SeekGE` miss or a first key that is not `value` skips straight to `next_value` (this
+/// value contributes nothing). No scan fallback: the INTEGER-affinity + integer-literal gate in
+/// [`index_integer_in_list_target`] makes the probe exact, and de-duplicated values keep the runs
+/// disjoint. When `covering`, the aggregates read only the indexed column (or are COUNT(*)/SUM(rowid))
+/// so each entry accumulates straight from the index — no `IdxRowid`/`SeekRowid` and no table cursor.
 #[allow(clippy::too_many_arguments)]
 fn emit_aggregate_index_value_seek(
     b: &mut ProgramBuilder,
@@ -10950,6 +10950,8 @@ fn emit_aggregate_index_value_seek(
     agg_columns: &[AggColumn],
     accum_base: i32,
     value: i64,
+    covering: bool,
+    index_table_col: usize,
 ) {
     let probe_key_regs = b.alloc_regs(2);
     b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
@@ -10993,27 +10995,37 @@ fn emit_aggregate_index_value_seek(
         0x10,
     );
 
-    let skip_row = b.emit_label();
-    let rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-    b.emit_jump_to_label(
-        Opcode::SeekRowid,
-        table_cursor,
-        rowid_reg,
-        skip_row,
-        P4::None,
-        0,
-    );
-    emit_aggregate_accumulate_body(
-        b,
-        table_cursor,
-        table,
-        table_alias,
-        schema,
-        agg_columns,
-        accum_base,
-    );
-    b.resolve_label(skip_row);
+    if covering {
+        emit_aggregate_accumulate_body_covering(
+            b,
+            idx_cursor,
+            index_table_col,
+            agg_columns,
+            accum_base,
+        );
+    } else {
+        let skip_row = b.emit_label();
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            table_cursor,
+            rowid_reg,
+            skip_row,
+            P4::None,
+            0,
+        );
+        emit_aggregate_accumulate_body(
+            b,
+            table_cursor,
+            table,
+            table_alias,
+            schema,
+            agg_columns,
+            accum_base,
+        );
+        b.resolve_label(skip_row);
+    }
     b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
     b.resolve_label(next_value);
 }
@@ -11626,18 +11638,27 @@ fn codegen_select_aggregate(
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
         skip_scan = true;
     } else if let Some((idx_schema, values)) = index_in_seek {
-        // bd-2dgf5 IN-list: open the table + index once, then seek each distinct value's
-        // duplicate run and accumulate its rows. INTEGER-affinity + integer-literal values
-        // make each probe exact and the runs disjoint, so no scan fallback is needed.
+        // bd-2dgf5 IN-list: open the index (and the table only when not covering), then seek each
+        // distinct value's duplicate run and accumulate its rows. INTEGER-affinity + integer-literal
+        // values make each probe exact and the runs disjoint, so no scan fallback is needed. Covering
+        // when every aggregate reads only the indexed column or is COUNT(*)/SUM(rowid).
         let idx_cursor = 1_i32;
-        b.emit_op(
-            Opcode::OpenRead,
-            cursor,
-            table.root_page,
-            0,
-            P4::Table(table.name.clone()),
-            0,
-        );
+        let index_table_col = idx_schema
+            .columns
+            .first()
+            .and_then(|name| table.column_index(name))
+            .unwrap_or(usize::MAX);
+        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
         b.emit_op(
             Opcode::OpenRead,
             idx_cursor,
@@ -11658,6 +11679,8 @@ fn codegen_select_aggregate(
                 &agg_columns,
                 accum_base,
                 value,
+                covering,
+                index_table_col,
             );
         }
         skip_scan = true;
