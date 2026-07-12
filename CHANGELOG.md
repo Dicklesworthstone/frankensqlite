@@ -96,6 +96,22 @@ lossy values.
   overflow, or freelist reference, while an unreferenced lock-byte page is no
   longer misreported as corruption; every neighboring page still requires an
   owner ([#133](https://github.com/Dicklesworthstone/frankensqlite/issues/133)).
+- Composite index aggregate seeks no longer drop residual predicates after an
+  equality prefix or prefix-plus-range constraint. Integer, text, and bound
+  parameter residuals are evaluated for every candidate row, preserving
+  `COUNT`/`SUM` correctness while retaining the bounded seek plan.
+- `MIN`/`MAX` over the trailing term of a composite index now seeks with a true
+  partial equality-prefix key. It no longer fabricates an integer sentinel
+  that skips the NULL region on ascending indexes or points at the wrong
+  physical edge on descending indexes; ASC/DESC, NULL-only, absent-prefix,
+  boundary, wrapper, empty-table, and `COUNT` controls are oracle-gated.
+- WASM uses browser-backed monotonic and wall-clock time instead of calling
+  unsupported `std::time` clocks or advancing a synthetic per-call tick. This
+  fixes time-travel snapshot capture and `CURRENT_TIMESTAMP` in real browser
+  runtimes.
+- Write-existing VFS opens are strictly non-creating, and open handles expose a
+  stable file identity so pager/runtime layers can distinguish backing files
+  without weakening create-vs-open semantics.
 
 ### Security
 
@@ -125,6 +141,14 @@ lossy values.
 - The MVCC concurrent-writer Criterion benchmark now releases its validation
   guard before abort cleanup re-locks the same session. `cargo test
   --workspace --all-targets` no longer self-deadlocks in the benchmark harness.
+- MVCC reclamation registries now own independent epoch collectors, and
+  process-global tracing, telemetry, SSI evidence, logical-clock, pager-profile,
+  and runtime-obligation tests isolate their mutable state. The default-parallel
+  MVCC suite and release gates are deterministic instead of cross-blocking or
+  consuming another test's observations.
+- The WASM workflow executes the binding suite in headless Chrome in addition
+  to host tests and wasm32 compilation, so browser-only runtime panics are
+  release-blocking.
 
 ## [0.1.15] -- 2026-07-06 (FTS5 UPDATE on WITHOUT ROWID shadow tables)
 
