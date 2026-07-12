@@ -11711,7 +11711,14 @@ fn codegen_select_aggregate(
             if let Some(aff) = bound_affinity
                 && !bound_matches_affinity(aff, bound.expr())
             {
-                b.emit_op(Opcode::Affinity, base, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    base,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, base, 0, finalize_label, P4::None, 0);
             b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
@@ -11723,14 +11730,23 @@ fn codegen_select_aggregate(
             if let Some(aff) = bound_affinity
                 && !bound_matches_affinity(aff, bound.expr())
             {
-                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
             (reg, bound.inclusive)
         });
         // A register holding the current key, needed to test an exclusive lower bound or any upper bound.
         let current_key_reg = (upper_reg.is_some()
-            || lower_probe.as_ref().is_some_and(|(_, inclusive)| !inclusive))
+            || lower_probe
+                .as_ref()
+                .is_some_and(|(_, inclusive)| !inclusive))
         .then(|| b.alloc_reg());
 
         if !covering {
@@ -11754,7 +11770,14 @@ fn codegen_select_aggregate(
 
         if let Some((lower_reg, _)) = lower_probe.as_ref() {
             let probe_record_reg = b.alloc_reg();
-            b.emit_op(Opcode::MakeRecord, *lower_reg, 2, probe_record_reg, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                *lower_reg,
+                2,
+                probe_record_reg,
+                P4::None,
+                0,
+            );
             b.emit_jump_to_label(
                 Opcode::SeekGE,
                 idx_cursor,
@@ -11813,7 +11836,14 @@ fn codegen_select_aggregate(
         } else {
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
             emit_aggregate_accumulate_body(
                 b,
                 cursor,

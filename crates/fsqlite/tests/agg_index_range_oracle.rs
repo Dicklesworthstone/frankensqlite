@@ -83,7 +83,12 @@ fn agg_index_range_matches_sqlite() {
         r.execute_batch(&stmt).unwrap();
     }
     // Mixed storage classes in the indexed column (real + text stay off-integer under INTEGER affinity).
-    for (id, val) in [(9001, "7.5"), (9002, "250.25"), (9003, "'apple'"), (9004, "'zzz'")] {
+    for (id, val) in [
+        (9001, "7.5"),
+        (9002, "250.25"),
+        (9003, "'apple'"),
+        (9004, "'zzz'"),
+    ] {
         let stmt = format!("INSERT INTO t VALUES ({id}, {val}, 0);");
         f.execute(&stmt).unwrap();
         r.execute_batch(&stmt).unwrap();
