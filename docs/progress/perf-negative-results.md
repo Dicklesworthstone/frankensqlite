@@ -18391,3 +18391,11 @@ test is on the executed path, not merely linked into it.
   opcode gate.
 - RETRY CONDITION: when rch has a free worker, re-apply the ~20-line detection change + oracle cases,
   gate byte-exact + no-reg, commit. Low risk (proven range+residual codegen; detection-only change).
+
+### bd-agg-text-range-residual — retry attempt blocked again (2026-07-12, rch RCH-E410)
+
+- Re-applied the detection change + oracle cases; the gate could not run — the rch remote pool first
+  returned `insufficient_slots`, then RCH-E410 dependency-preflight failures (remote workers missing
+  committed source entrypoints, e.g. `agg_composite_full_eq_oracle.rs`). rch is degraded for verification
+  this turn; per method (byte-exact gate before commit, never build local) the change stays reverted /
+  uncommitted. Re-apply + gate when rch is healthy — the change and safety argument are recorded above.
