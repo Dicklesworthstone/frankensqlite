@@ -19945,7 +19945,10 @@ fn resolve_order_by_index_plan(
         return None;
     }
 
-    let mut direction: Option<SortDirection> = None;
+    // Keep the direction and effective collation attached to each resolved
+    // column.  An equality-constrained index prefix is removed per candidate
+    // index below, so its (irrelevant) direction must not constrain the
+    // variable suffix.
     let mut order_columns = Vec::with_capacity(order_by.len());
 
     for term in order_by {
@@ -19953,13 +19956,6 @@ fn resolve_order_by_index_plan(
             return None;
         }
         let term_direction = term.direction.unwrap_or(SortDirection::Asc);
-        if let Some(existing) = direction {
-            if existing != term_direction {
-                return None;
-            }
-        } else {
-            direction = Some(term_direction);
-        }
 
         let resolved_expr = resolve_order_by_output_expr(&term.expr, columns).unwrap_or(&term.expr);
 
@@ -19974,10 +19970,13 @@ fn resolve_order_by_index_plan(
         if table.resolves_to_hidden_rowid(&col_ref.column) {
             return None;
         }
-        order_columns.push(col_ref.column.clone());
+        order_columns.push((
+            col_ref.column.to_string(),
+            term_direction,
+            column_collation(resolved_expr, table, table_alias),
+        ));
     }
 
-    let descending = direction == Some(SortDirection::Desc);
     let mut best_plan: Option<OrderByIndexPlan> = None;
 
     for index in &table.indexes {
@@ -19987,24 +19986,73 @@ fn resolve_order_by_index_plan(
 
         let equality_prefix_len =
             extract_index_equality_prefix_exprs(index, table, table_alias, where_clause).len();
-        if equality_prefix_len + order_columns.len() > index.key_term_count() {
+
+        // Equality probes and ORDER BY must agree with the index's collation.
+        // In particular, a NOCASE index cannot prove that a BINARY equality
+        // prefix is constant (or vice versa).
+        if (0..equality_prefix_len).any(|key_pos| {
+            let Some(column_idx) = table.column_index(&index.columns[key_pos]) else {
+                return true;
+            };
+            !collation_names_equivalent(
+                table.columns[column_idx].collation.as_deref(),
+                index.key_term_collation(key_pos),
+            )
+        }) {
             continue;
         }
 
-        if equality_prefix_len > 0 {
-            if descending {
-                continue;
-            }
-            if (equality_prefix_len..(equality_prefix_len + order_columns.len()))
-                .any(|key_pos| index.key_term_descending(key_pos))
-            {
-                continue;
-            }
+        // ORDER BY terms that repeat the leading equality-constrained index
+        // columns are constants within this query scope.  Consume only the
+        // exact leading sequence; this deliberately declines reordered,
+        // duplicate, COLLATE-wrapped, or otherwise non-obvious forms.
+        let fixed_order_prefix_len = order_columns
+            .iter()
+            .zip(index.columns.iter().take(equality_prefix_len))
+            .enumerate()
+            .take_while(|(key_pos, ((order_col, _, order_collation), index_col))| {
+                order_col.eq_ignore_ascii_case(index_col)
+                    && collation_names_equivalent(
+                        *order_collation,
+                        index.key_term_collation(*key_pos),
+                    )
+            })
+            .count();
+        let variable_order = &order_columns[fixed_order_prefix_len..];
+
+        if equality_prefix_len + variable_order.len() > index.key_term_count() {
+            continue;
         }
 
-        let matches_order_columns = order_columns.iter().enumerate().all(|(offset, order_col)| {
-            index.columns[equality_prefix_len + offset].eq_ignore_ascii_case(order_col)
-        });
+        let direction = variable_order.first().map(|(_, direction, _)| *direction);
+        if variable_order
+            .iter()
+            .any(|(_, term_direction, _)| Some(*term_direction) != direction)
+        {
+            continue;
+        }
+        let descending = direction == Some(SortDirection::Desc);
+
+        if equality_prefix_len > 0 && descending {
+            // The generic bounded-prefix emitter currently walks forward.
+            // Composite prefix+range DESC queries use their dedicated reverse
+            // seek path before reaching this resolver.
+            continue;
+        }
+
+        let matches_order_columns =
+            variable_order
+                .iter()
+                .enumerate()
+                .all(|(offset, (order_col, _, order_collation))| {
+                    let key_pos = equality_prefix_len + offset;
+                    !index.key_term_descending(key_pos)
+                        && index.columns[key_pos].eq_ignore_ascii_case(order_col)
+                        && collation_names_equivalent(
+                            *order_collation,
+                            index.key_term_collation(key_pos),
+                        )
+                });
         if !matches_order_columns {
             continue;
         }
@@ -21023,6 +21071,37 @@ fn range_order_by_is_deterministic(
     }
 }
 
+/// Count leading ORDER BY terms that merely repeat equality-constrained
+/// leading index columns.
+///
+/// Only direct column references in exact index-prefix order qualify.  A
+/// COLLATE wrapper, explicit NULLS ordering, qualifier from another query
+/// scope, or collation mismatch stops consumption.  Direction is intentionally
+/// ignored: every qualifying row has the same value under the same collation,
+/// so ASC versus DESC cannot change their order.
+fn fixed_order_by_equality_prefix_len(
+    index: &IndexSchema,
+    equality_prefix_len: usize,
+    order_by: &[OrderingTerm],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> usize {
+    order_by
+        .iter()
+        .zip(index.columns.iter().take(equality_prefix_len))
+        .enumerate()
+        .take_while(|(key_pos, (term, index_col))| {
+            term.nulls.is_none()
+                && column_name(&term.expr, table, table_alias)
+                    .is_some_and(|order_col| order_col.eq_ignore_ascii_case(index_col))
+                && collation_names_equivalent(
+                    column_collation(&term.expr, table, table_alias),
+                    index.key_term_collation(*key_pos),
+                )
+        })
+        .count()
+}
+
 fn composite_order_by_satisfied(
     comp: &CompositePrefixRange<'_>,
     order_by: &[OrderingTerm],
@@ -21030,11 +21109,13 @@ fn composite_order_by_satisfied(
     table_alias: Option<&str>,
 ) -> bool {
     let prefix_len = comp.prefix_exprs.len();
+    let fixed_order_prefix_len =
+        fixed_order_by_equality_prefix_len(comp.index, prefix_len, order_by, table, table_alias);
     // The range column must be the LAST key term so the seek's stream is exactly `(range_col, rowid)`.
     prefix_len + 1 == comp.index.key_term_count()
         && range_order_by_is_deterministic(
             &comp.index.columns[prefix_len],
-            order_by,
+            &order_by[fixed_order_prefix_len..],
             table,
             table_alias,
             comp.index.is_unique,
@@ -21054,10 +21135,12 @@ fn composite_order_by_satisfied_desc(
     table_alias: Option<&str>,
 ) -> bool {
     let prefix_len = comp.prefix_exprs.len();
+    let fixed_order_prefix_len =
+        fixed_order_by_equality_prefix_len(comp.index, prefix_len, order_by, table, table_alias);
     prefix_len + 1 == comp.index.key_term_count()
         && range_order_by_is_deterministic(
             &comp.index.columns[prefix_len],
-            order_by,
+            &order_by[fixed_order_prefix_len..],
             table,
             table_alias,
             comp.index.is_unique,
@@ -29860,6 +29943,73 @@ mod tests {
         }]
     }
 
+    fn test_schema_with_three_column_composite_index() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "events".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("tenant_id", 'D', false),
+                ColumnInfo::basic("stream_id", 'D', false),
+                ColumnInfo::basic("sequence", 'D', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "sqlite_autoindex_events_1".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    "tenant_id".to_owned(),
+                    "stream_id".to_owned(),
+                    "sequence".to_owned(),
+                ],
+                key_expressions: vec![
+                    "tenant_id".to_owned(),
+                    "stream_id".to_owned(),
+                    "sequence".to_owned(),
+                ],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn test_schema_with_collated_composite_prefix_index() -> Vec<TableSchema> {
+        let mut tenant = ColumnInfo::basic("tenant", 'B', false);
+        tenant.collation = Some("NOCASE".to_owned());
+        vec![TableSchema {
+            name: "collated_events".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                tenant,
+                ColumnInfo::basic("sequence", 'D', false),
+            ],
+            indexes: vec![IndexSchema {
+                name: "sqlite_autoindex_collated_events_1".to_owned(),
+                root_page: 3,
+                columns: vec!["tenant".to_owned(), "sequence".to_owned()],
+                key_expressions: vec!["tenant".to_owned(), "sequence".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: true,
+                key_collations: vec![Some("NOCASE".to_owned()), None],
+                conflict_action: None,
+            }],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     #[test]
     fn test_codegen_select_with_composite_index_prefix_equality_anchors_full_key() {
         let schema = test_schema_with_composite_prefix_index();
@@ -31108,6 +31258,251 @@ mod tests {
         assert_eq!(
             sorter_count, 0,
             "index-assisted ORDER BY should bypass sorter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_order_by_repeated_equality_prefix_uses_composite_range_seek() {
+        let stmt = select_sql(
+            "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0) \
+             FROM messages AS m \
+             WHERE m.conversation_id = ?1 AND m.idx > ?2 \
+             ORDER BY m.conversation_id, m.idx \
+             LIMIT ?3",
+        );
+        let schema = test_schema_with_composite_prefix_index();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "sqlite_autoindex_messages_1")
+            }),
+            "repeated fixed ORDER BY prefix should retain the composite index: {:?}",
+            prog.ops()
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "composite index plan should seek directly to the requested range: {:?}",
+            prog.ops()
+        );
+        assert!(
+            !prog.ops().iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "repeated equality-constrained ORDER BY prefix must not force a temp sorter: {:?}",
+            prog.ops()
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::DecrJumpZero),
+            "parameterized LIMIT should stop the streaming index scan"
+        );
+    }
+
+    #[test]
+    fn test_codegen_order_by_repeated_equality_prefix_without_range_uses_bounded_index() {
+        let stmt = select_sql(
+            "SELECT m.idx FROM messages AS m \
+             WHERE m.conversation_id = ?1 \
+             ORDER BY m.conversation_id, m.idx \
+             LIMIT ?2",
+        );
+        let schema = test_schema_with_composite_prefix_index();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "fixed prefix should anchor the ordered index scan: {:?}",
+            prog.ops()
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| { matches!(op.opcode, Opcode::Rewind | Opcode::SorterOpen) }),
+            "fixed-prefix ORDER BY should neither rewind the full index nor sort: {:?}",
+            prog.ops()
+        );
+    }
+
+    #[test]
+    fn test_codegen_order_by_fixed_prefix_direction_does_not_constrain_suffix() {
+        let stmt = select_sql(
+            "SELECT m.idx FROM messages AS m \
+             WHERE m.conversation_id = ?1 \
+             ORDER BY m.conversation_id DESC, m.idx ASC",
+        );
+        let schema = test_schema_with_composite_prefix_index();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "direction on a fixed value must not reject the ascending suffix"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "fixed-prefix direction should be elided before direction matching"
+        );
+    }
+
+    #[test]
+    fn test_codegen_order_by_multiple_repeated_equality_prefixes_uses_index() {
+        let stmt = select_sql(
+            "SELECT e.sequence FROM events AS e \
+             WHERE e.tenant_id = ?1 AND e.stream_id = ?2 \
+             ORDER BY e.tenant_id, e.stream_id, e.sequence \
+             LIMIT ?3",
+        );
+        let schema = test_schema_with_three_column_composite_index();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let prefix_boundary = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::IdxGT)
+            .expect("two-column equality prefix should bound the index walk");
+        assert_eq!(prefix_boundary.p5, 2);
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "both fixed ORDER BY terms should be removed before matching sequence"
+        );
+    }
+
+    #[test]
+    fn test_codegen_order_by_repeated_prefix_desc_range_uses_reverse_seek() {
+        let stmt = select_sql(
+            "SELECT m.idx FROM messages AS m \
+             WHERE m.conversation_id = ?1 AND m.idx < ?2 \
+             ORDER BY m.conversation_id DESC, m.idx DESC \
+             LIMIT ?3",
+        );
+        let schema = test_schema_with_composite_prefix_index();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekLE | Opcode::SeekLT)),
+            "DESC suffix should use the dedicated reverse composite seek: {:?}",
+            prog.ops()
+        );
+        assert!(prog.ops().iter().any(|op| op.opcode == Opcode::Prev));
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "fixed DESC prefix should not force a sorter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_order_by_prefix_elision_requires_matching_collation() {
+        let compatible = select_sql(
+            "SELECT sequence FROM collated_events \
+             WHERE tenant = ?1 \
+             ORDER BY tenant, sequence",
+        );
+        let incompatible = select_sql(
+            "SELECT sequence FROM collated_events \
+             WHERE tenant = ?1 \
+             ORDER BY tenant COLLATE BINARY, sequence",
+        );
+        let schema = test_schema_with_collated_composite_prefix_index();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+
+        let mut compatible_builder = ProgramBuilder::new();
+        codegen_select(&mut compatible_builder, &compatible, &schema, &ctx).unwrap();
+        let compatible_program = compatible_builder.finish().unwrap();
+        assert!(
+            !compatible_program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::SorterOpen),
+            "matching NOCASE semantics should permit prefix elision"
+        );
+
+        let mut incompatible_builder = ProgramBuilder::new();
+        codegen_select(&mut incompatible_builder, &incompatible, &schema, &ctx).unwrap();
+        let incompatible_program = incompatible_builder.finish().unwrap();
+        assert!(
+            incompatible_program
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::SorterOpen),
+            "BINARY ORDER BY must not be treated as constant under NOCASE equality"
+        );
+    }
+
+    #[test]
+    fn test_resolve_order_by_prefix_does_not_borrow_equality_from_other_scope() {
+        let stmt = select_sql(
+            "SELECT m.idx FROM messages AS m \
+             WHERE outer_scope.conversation_id = ?1 \
+             ORDER BY m.idx",
+        );
+        let SelectCore::Select {
+            columns,
+            where_clause,
+            ..
+        } = &stmt.body.select
+        else {
+            unreachable!("test query should parse as a SELECT core");
+        };
+        let schema = test_schema_with_composite_prefix_index();
+
+        assert!(
+            resolve_order_by_index_plan(
+                &schema[0],
+                Some("m"),
+                columns,
+                where_clause.as_deref(),
+                &stmt.order_by,
+                Distinctness::All,
+            )
+            .is_none(),
+            "a qualified equality from another scope must not pin this index prefix"
         );
     }
 

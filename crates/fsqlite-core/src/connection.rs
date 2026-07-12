@@ -161125,6 +161125,133 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_order_by_repeated_equality_prefix_matches_sqlite_with_parameterized_limit() {
+        const LOW_PAGE_BUFFER_MAX: usize = 16;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repeated-order-prefix.db");
+        let mut setup_conn = rusqlite::Connection::open(&db_path).unwrap();
+        setup_conn
+            .execute_batch(
+                "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                UNIQUE(conversation_id, idx)
+            );
+            INSERT INTO messages VALUES
+                (1, 7, 0, 'zero'),
+                (2, 7, 1, 'one'),
+                (3, 7, 2, 'éclair'),
+                (4, 7, 3, 'four'),
+                (5, 8, 8, 'other conversation');",
+            )
+            .unwrap();
+
+        // Make a full-table projection materially larger than the deliberately
+        // tiny pager pool.  The target conversation stays small, so the correct
+        // composite seek reads only its index/table pages while the old
+        // scan+sort plan must visit every overflow payload.
+        let payload = "x".repeat(8 * 1024);
+        let transaction = setup_conn.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO messages(id, conversation_id, idx, content)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .unwrap();
+            let mut id = 6_i64;
+            for conversation_id in 1_i64..=64 {
+                if conversation_id == 7 {
+                    continue;
+                }
+                for idx in 0_i64..8 {
+                    insert
+                        .execute(rusqlite::params![id, conversation_id, idx, &payload])
+                        .unwrap();
+                    id += 1;
+                }
+            }
+        }
+        transaction.commit().unwrap();
+        drop(setup_conn);
+
+        let database_bytes = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            database_bytes > (LOW_PAGE_BUFFER_MAX as u64) * 4096 * 10,
+            "fixture must be far larger than the configured page-buffer ceiling"
+        );
+
+        let mut env = ConnectionEnv::default();
+        env.set_page_buffer_max(LOW_PAGE_BUFFER_MAX);
+        let fconn = Connection::open_with_env(db_path.to_string_lossy().into_owned(), env).unwrap();
+        let rconn = rusqlite::Connection::open(&db_path).unwrap();
+
+        let sql = "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+                   FROM messages AS m
+                   WHERE m.conversation_id = ?1 AND m.idx > ?2
+                   ORDER BY m.conversation_id, m.idx
+                   LIMIT ?3";
+        let params = [
+            SqliteValue::Integer(7),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(2),
+        ];
+
+        let frank_rows = fconn
+            .prepare(sql)
+            .unwrap()
+            .query_with_params(&params)
+            .unwrap()
+            .iter()
+            .map(|row| match row.values() {
+                [SqliteValue::Integer(idx), SqliteValue::Integer(bytes)] => (*idx, *bytes),
+                values => panic!("unexpected FrankenSQLite row: {values:?}"),
+            })
+            .collect::<Vec<_>>();
+        let mut sqlite_stmt = rconn.prepare(sql).unwrap();
+        let sqlite_rows = sqlite_stmt
+            .query_map(rusqlite::params![7_i64, 0_i64, 2_i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(frank_rows, sqlite_rows);
+        assert_eq!(frank_rows, vec![(1, 3), (2, 7)]);
+
+        let prepared = fconn.prepare(sql).unwrap();
+        let ops = prepared.program.ops();
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "sqlite_autoindex_messages_1")
+            }),
+            "expected the UNIQUE(conversation_id, idx) autoindex: {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "expected a composite range seek: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "parameterized LIMIT query must not allocate a temp sorter: {ops:?}"
+        );
+    }
+
+    #[test]
     fn test_order_by_primary_key_limit_uses_storage_index_path() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
