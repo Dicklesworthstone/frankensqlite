@@ -18255,3 +18255,22 @@ test is on the executed path, not merely linked into it.
   residual case declines (no IdxGT). No-reg: agg_index_range, composite_eq_seek,
   composite_prefix_range_residual byte-exact.
 - PERF: `COUNT(*)/SUM WHERE a=v AND b<range>` full scan → O(log n + matches) block seek.
+
+## 2026-07-12 - WIN (shipped): covering seek generalized to ANY index key column, not just the leading one (bd-agg-covering-any-key)
+
+- Result type: WIN / shipped. Found via gap_probe2: `SUM(b)/MIN(b)/MAX(b) WHERE a=v AND b<range` on
+  `index(a,b)` SEEKED (composite prefix-range) but were NON-covering — opening the table and doing a
+  `SeekRowid` per row to read `b`, even though `b` is a key column right there in the index entry.
+- ROOT CAUSE: `aggregate_seek_is_covering` / `emit_aggregate_accumulate_body_covering` only recognized
+  the LEADING index column (index column 0). Any aggregate reading a non-leading key column forced the
+  table lookup.
+- FIX: generalize both helpers to accept the `IndexSchema` + `TableSchema` and a new
+  `index_key_position_of` mapping (table-column ordinal → index key position). Covering now holds when
+  every aggregate reads ANY of the index's key columns (or is COUNT(*)/SUM(rowid)); the covering body
+  reads `Column idx_cursor, <key position>` for each. All four seek paths (eq / range / IN / composite
+  prefix-range) share the change. Byte-exact: key-column values live in the index entry verbatim.
+- GATE: `agg_composite_prefix_range_oracle` extended — byte-exact SUM(b)/MIN(b)/MAX(b) covering cases;
+  opcode gates that SUM(b) (key col) has NO SeekRowid while SUM(c) (non-key) does. No-reg: agg_index_range,
+  in_list_shadowed_index, agg_composite_full_eq, eq_seek_exact byte-exact (their SUM(non-indexed) stay
+  non-covering, SUM(indexed)/COUNT(*) stay covering).
+- PERF: aggregates over a non-leading index key column now skip one SeekRowid per matched row.

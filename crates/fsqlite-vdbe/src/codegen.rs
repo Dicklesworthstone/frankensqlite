@@ -10595,13 +10595,27 @@ fn codegen_select_minmax_prefix_seek(
 ///
 /// Can every aggregate be fed from the index entry alone, with no table lookup?
 ///
-/// bd-2dgf5. True when each aggregate is `COUNT(*)` (no argument), takes the
-/// rowid (available via `IdxRowid`), or takes the indexed column itself
-/// (available as index column 0). Anything that needs a general expression, a
-/// `FILTER`, extra arguments, a bare output column, or any other table column
-/// forces the table lookup. `index_table_col` is the ordinal, within
-/// `table.columns`, of the index's single key column.
-fn aggregate_seek_is_covering(agg_columns: &[AggColumn], index_table_col: usize) -> bool {
+/// The position (within the index's key columns) of the table column ordinal `table_col`, if that
+/// column is one of the index's key columns. Reading `Column idx_cursor, <this>` yields the value
+/// without a table lookup. Only plain (non-expression) key columns match, which is exactly what the
+/// direct-lookup indexes these seeks use carry.
+fn index_key_position_of(index: &IndexSchema, table: &TableSchema, table_col: usize) -> Option<i32> {
+    index
+        .columns
+        .iter()
+        .position(|name| table.column_index(name) == Some(table_col))
+        .and_then(|p| i32::try_from(p).ok())
+}
+
+/// bd-2dgf5. True when each aggregate is `COUNT(*)` (no argument), takes the rowid (available via
+/// `IdxRowid`), or takes ANY of the index's key columns (available directly from the index entry —
+/// not just the leading column). Anything that needs a general expression, a `FILTER`, extra
+/// arguments, a bare output column, or a non-key table column forces the table lookup.
+fn aggregate_seek_is_covering(
+    agg_columns: &[AggColumn],
+    index: &IndexSchema,
+    table: &TableSchema,
+) -> bool {
     agg_columns.iter().all(|agg| {
         // Sentinel entries for multi-aggregate wrappers emit nothing.
         if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
@@ -10611,7 +10625,11 @@ fn aggregate_seek_is_covering(agg_columns: &[AggColumn], index_table_col: usize)
             && agg.filter.is_none()
             && agg.arg_expr.is_none()
             && agg.extra_args.is_empty()
-            && (agg.num_args == 0 || agg.arg_is_rowid || agg.arg_col_index == Some(index_table_col))
+            && (agg.num_args == 0
+                || agg.arg_is_rowid
+                || agg
+                    .arg_col_index
+                    .is_some_and(|c| index_key_position_of(index, table, c).is_some()))
     })
 }
 
@@ -10626,7 +10644,8 @@ fn aggregate_seek_is_covering(agg_columns: &[AggColumn], index_table_col: usize)
 fn emit_aggregate_accumulate_body_covering(
     b: &mut ProgramBuilder,
     idx_cursor: i32,
-    index_table_col: usize,
+    index: &IndexSchema,
+    table: &TableSchema,
     agg_columns: &[AggColumn],
     accum_base: i32,
 ) {
@@ -10649,12 +10668,11 @@ fn emit_aggregate_accumulate_body_covering(
             // The index entry carries the rowid; read it without touching the table.
             b.emit_op(Opcode::IdxRowid, idx_cursor, arg_base, 0, P4::None, 0);
         } else {
-            debug_assert_eq!(
-                agg.arg_col_index,
-                Some(index_table_col),
-                "covering aggregate seek must only read the indexed column"
-            );
-            b.emit_op(Opcode::Column, idx_cursor, 0, arg_base, P4::None, 0);
+            let key_pos = agg
+                .arg_col_index
+                .and_then(|c| index_key_position_of(index, table, c))
+                .expect("covering aggregate seek must read one of the index's key columns");
+            b.emit_op(Opcode::Column, idx_cursor, key_pos, arg_base, P4::None, 0);
         }
         let num_args = u16::try_from(agg.num_args).unwrap_or_default();
         b.emit_op(
@@ -10958,7 +10976,6 @@ fn emit_aggregate_index_value_seek(
     accum_base: i32,
     value: i64,
     covering: bool,
-    index_table_col: usize,
 ) {
     let probe_key_regs = b.alloc_regs(2);
     b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
@@ -11006,7 +11023,8 @@ fn emit_aggregate_index_value_seek(
         emit_aggregate_accumulate_body_covering(
             b,
             idx_cursor,
-            index_table_col,
+            idx_schema,
+            table,
             agg_columns,
             accum_base,
         );
@@ -11376,17 +11394,7 @@ fn codegen_select_aggregate(
         // Can every aggregate read from the index entry alone? If so the table
         // cursor is never opened and no SeekRowid is emitted, matching stock
         // SQLite's "USING COVERING INDEX" plan for e.g. `COUNT(*)`/`SUM(rowid)`.
-        let index_table_col = idx_schema
-            .columns
-            .first()
-            .and_then(|name| {
-                table
-                    .columns
-                    .iter()
-                    .position(|col| col.name.eq_ignore_ascii_case(name))
-            })
-            .unwrap_or(usize::MAX);
-        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+        let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
 
         // Every pinned key column is INTEGER-affinity + integer literal ⇒ the seek is EXACT (the index's
         // storage-class order matches the WHERE comparison), so a 0-match seek is authoritative and the
@@ -11509,7 +11517,8 @@ fn codegen_select_aggregate(
             emit_aggregate_accumulate_body_covering(
                 b,
                 idx_cursor,
-                index_table_col,
+                idx_schema,
+                table,
                 &agg_columns,
                 accum_base,
             );
@@ -11669,12 +11678,7 @@ fn codegen_select_aggregate(
         // values make each probe exact and the runs disjoint, so no scan fallback is needed. Covering
         // when every aggregate reads only the indexed column or is COUNT(*)/SUM(rowid).
         let idx_cursor = 1_i32;
-        let index_table_col = idx_schema
-            .columns
-            .first()
-            .and_then(|name| table.column_index(name))
-            .unwrap_or(usize::MAX);
-        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+        let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
         if !covering {
             b.emit_op(
                 Opcode::OpenRead,
@@ -11706,7 +11710,6 @@ fn codegen_select_aggregate(
                 accum_base,
                 value,
                 covering,
-                index_table_col,
             );
         }
         skip_scan = true;
@@ -11718,12 +11721,7 @@ fn codegen_select_aggregate(
         // reads only the indexed column (or is COUNT(*)/SUM(rowid)) the walk is COVERING — the table
         // cursor is never opened and no `SeekRowid` is emitted (SQLite's "USING COVERING INDEX" plan).
         let idx_cursor = 1_i32;
-        let index_table_col = idx_schema
-            .columns
-            .first()
-            .and_then(|name| table.column_index(name))
-            .unwrap_or(usize::MAX);
-        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+        let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
         let bound_affinity = idx_schema
             .columns
             .first()
@@ -11832,7 +11830,8 @@ fn codegen_select_aggregate(
             emit_aggregate_accumulate_body_covering(
                 b,
                 idx_cursor,
-                index_table_col,
+                idx_schema,
+                table,
                 &agg_columns,
                 accum_base,
             );
@@ -11869,12 +11868,7 @@ fn codegen_select_aggregate(
         let prefix_len = prefix_exprs.len();
         let range_pos = prefix_len;
 
-        let index_table_col = idx_schema
-            .columns
-            .first()
-            .and_then(|name| table.column_index(name))
-            .unwrap_or(usize::MAX);
-        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
+        let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
 
         let key_affinities: Vec<Option<char>> = (0..key_terms)
             .map(|pos| {
@@ -12005,7 +11999,8 @@ fn codegen_select_aggregate(
             emit_aggregate_accumulate_body_covering(
                 b,
                 idx_cursor,
-                index_table_col,
+                idx_schema,
+                table,
                 &agg_columns,
                 accum_base,
             );

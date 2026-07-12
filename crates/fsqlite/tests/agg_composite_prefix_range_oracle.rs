@@ -114,8 +114,11 @@ fn agg_composite_prefix_range_matches_sqlite() {
         "SELECT COUNT(*) FROM t WHERE a = 999 AND b > 0",
         "SELECT SUM(c) FROM t WHERE a = 5 AND b > 100000",
         "SELECT COALESCE(SUM(c), -1) FROM t WHERE a = 5 AND b > 100000",
-        // Covering SUM of the pinned leading column.
+        // Covering SUM of the pinned leading column, and of the range column (both are key columns).
         "SELECT SUM(a) FROM t WHERE a = 5 AND b > 10",
+        "SELECT SUM(b) FROM t WHERE a = 5 AND b > 10",
+        "SELECT MIN(b) FROM t WHERE a = 5 AND b > 10",
+        "SELECT MAX(b) FROM t WHERE a = 5 AND b BETWEEN 0 AND 40",
         // Residual on a NON-key column: `c = 1` must NOT be dropped (declines to a correct scan).
         "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10 AND c = 1",
         "SELECT SUM(c) FROM t WHERE a = 3 AND b BETWEEN 0 AND 50 AND c = 2",
@@ -143,8 +146,13 @@ fn agg_composite_prefix_range_matches_sqlite() {
         "SUM(leading col) composite prefix+range must be covering (no SeekRowid)"
     );
     assert!(
-        has_op(&f, "SELECT SUM(b) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
-        "SUM(range col b) must open the table (SeekRowid)"
+        !has_op(&f, "SELECT SUM(b) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
+        "SUM(range col b) is a KEY column -> covering (no SeekRowid)"
+    );
+    // A SUM of a NON-key column still needs the table lookup.
+    assert!(
+        has_op(&f, "SELECT SUM(c) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
+        "SUM(non-key col c) must open the table (SeekRowid)"
     );
     // Residual declines the seek (no IdxGT), falling to a scan that enforces c.
     assert!(
