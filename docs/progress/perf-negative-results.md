@@ -18296,3 +18296,13 @@ test is on the executed path, not merely linked into it.
 - PERF: `COUNT(*)/SUM WHERE a=<int> AND <residual>` full scan → O(log n + block) seek + per-row filter.
 - FOLLOW-UP: the placeholder-free restriction is conservative; a general `?`-safe version needs the
   prefix probe to consume placeholders in textual order (charted mentally, not yet a bead).
+
+### follow-up (same session): leading-eq + residual extended to TEXT prefixes
+
+- `aggregate_index_prefix_literal_residual_target` now also accepts a TEXT-affinity ('B') leading column
+  pinned by a text literal when the index key collation is BINARY: `COUNT(*)/SUM WHERE s = 'k3' AND
+  <residual>` seeks the `s='k3'` block. Safe by the same superset argument — a text literal vs a TEXT
+  column indexed BINARY seeks without an affinity/collation miss, and the residual filter (which re-applies
+  the whole WHERE, prefix included) narrows to exact. Non-BINARY index collation still declines.
+- GATE: `agg_leading_eq_residual_oracle` extended with `s='k3' AND x=5` (byte-exact, present/absent, SUM,
+  SeekGE opcode gate). No-reg: eq_seek_exact, agg_composite_full_eq byte-exact.

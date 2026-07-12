@@ -59,9 +59,10 @@ fn agg_leading_eq_residual_matches_sqlite() {
     let f = Connection::open(":memory:").expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     for stmt in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER, y INTEGER);",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, x INTEGER, y INTEGER, s TEXT);",
         "CREATE INDEX idx_ab ON t(a, b);",
         "CREATE INDEX idx_a ON t(a);",
+        "CREATE INDEX idx_s ON t(s);", // BINARY collation (default)
     ] {
         f.execute(stmt).unwrap();
         r.execute_batch(stmt).unwrap();
@@ -71,7 +72,7 @@ fn agg_leading_eq_residual_matches_sqlite() {
         let b = i % 7;
         let x = i % 10;
         let y = i % 3;
-        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {x}, {y});");
+        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {x}, {y}, 'k{}');", i % 6);
         f.execute(&stmt).unwrap();
         r.execute_batch(&stmt).unwrap();
     }
@@ -103,14 +104,22 @@ fn agg_leading_eq_residual_matches_sqlite() {
         "SELECT COALESCE(SUM(x), -1) FROM t WHERE a = 999 AND x = 5",
         // MIN/MAX riding the same seek.
         "SELECT MIN(x), MAX(x) FROM t WHERE a = 7 AND x > 2",
+        // TEXT prefix (BINARY-indexed) + residual — text literal vs TEXT column seeks exactly.
+        "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5",
+        "SELECT SUM(x) FROM t WHERE s = 'k3' AND x > 2",
+        "SELECT COUNT(*) FROM t WHERE s = 'nope' AND x = 5",
     ] {
         cmp(sql);
     }
 
-    // Opcode gate: an all-literal WHERE seeks the prefix.
+    // Opcode gate: an all-literal WHERE seeks the prefix (integer and text prefixes both).
     assert!(
         has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = 5", "SeekGE"),
         "leading eq + literal residual must seek the prefix (SeekGE)"
+    );
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5", "SeekGE"),
+        "TEXT leading eq + literal residual must seek the prefix (SeekGE)"
     );
     // A bound parameter anywhere in the WHERE declines the seek (re-emitting it per row could
     // mis-number the parameter), falling to a scan that binds it correctly.

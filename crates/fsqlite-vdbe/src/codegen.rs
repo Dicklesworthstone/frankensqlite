@@ -11005,14 +11005,26 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
         if prefix.is_empty() || prefix.len() >= conjuncts.len() {
             continue;
         }
+        // The seek probe must land on a SUPERSET of the matching rows (the residual filter re-applies
+        // the whole WHERE and narrows to exact). An integer literal vs an INTEGER column, or a text
+        // literal vs a TEXT column indexed BINARY, both seek without an affinity/collation miss.
         let exact = prefix.iter().enumerate().all(|(i, e)| {
-            matches!(e, Expr::Literal(Literal::Integer(_), _))
-                && index
-                    .columns
-                    .get(i)
-                    .and_then(|name| table.column_index(name))
-                    .and_then(|ci| table.columns.get(ci))
-                    .is_some_and(|c| c.affinity == 'D')
+            let affinity = index
+                .columns
+                .get(i)
+                .and_then(|name| table.column_index(name))
+                .and_then(|ci| table.columns.get(ci))
+                .map(|c| c.affinity);
+            match e {
+                Expr::Literal(Literal::Integer(_), _) => affinity == Some('D'),
+                Expr::Literal(Literal::String(_), _) => {
+                    affinity == Some('B')
+                        && index
+                            .key_term_collation(i)
+                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                }
+                _ => false,
+            }
         });
         if !exact {
             continue;
