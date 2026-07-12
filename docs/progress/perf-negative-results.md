@@ -17736,3 +17736,27 @@ test is on the executed path, not merely linked into it.
   `SeekGT` on an index cursor with a 2-field `[value, MAX]` record probe advances past the run (vs
   landing back on it -> the loop suspect), then re-gate with the (retained-in-git-history) oracle. The
   emit-on-change walk is a dead end (systemic cursor cost). Diagnostic retained: distinct_groupby_profile.rs.
+
+## 2026-07-11 - SURFACE (teed-up next lever): MAX(b)/MIN(b) WHERE a=? on a composite (a,b) index scans the whole a=? group instead of seeking the prefix extremum — ~800x available (bd-minmax-prefix-seek-4fuo6)
+
+- Result type: SURFACE / profiled gap, charted as the next lever. Diagnostic:
+  `crates/fsqlite/tests/minmax_prefix_profile.rs` (retained).
+- THE GAP: `aggregate_index_eq_seek_target` (codegen.rs:9916) requires `key_term_count() == 1`, so
+  `SELECT MAX(b)/MIN(b) FROM t WHERE a = ?` on a COMPOSITE `(a,b)` index does NOT take the extremum
+  shortcut — it seeks to the `a=?` prefix then SCANS the whole group, accumulating like COUNT/SUM.
+- PROFILE (release-perf, 20k rows, 20 distinct a → ~1000 rows/group): `MAX(b) WHERE a=7` 3.79 ms ≈
+  `MIN(b) WHERE a=7` 3.88 ms ≈ `COUNT(*) WHERE a=7` 3.47 ms ≈ `SUM(b) WHERE a=7` 3.67 ms — the MAX/MIN
+  scale with the ~1000-row group, i.e. they scan it. Seeking the single prefix-extremum entry would be
+  ~microseconds (cf. the shipped plain MIN/MAX-via-index at ~4.5 µs) → ~800× on this shape.
+- THE LEVER (extends bd-minmax-index-seek, low-risk — single seek, no loop): with a composite `(a,b)`
+  ASC collation-matched index and `WHERE a = <const/placeholder>` plus a single `MAX(b)`/`MIN(b)`:
+  - MAX(b): `SeekLE([a, i64::MAX])` → last entry with first-key `a`; verify `Column 0 == a` (else the
+    `a=?` group is empty → leave the accumulator NULL → MAX = NULL); read `Column 1` = b; feed the same
+    single-row `AggStep`/`AggFinal`/wrapper sequence `codegen_select_minmax_index_seek` already uses.
+  - MIN(b): `SeekGE([a, <first>])` → first `(a,*)`; bounded walk skipping `b`-NULLs (NotNull → feed;
+    else Next) but STOP when `Column 0 != a` (left the prefix) → first non-NULL b within `a=?`, or NULL.
+  - Coerce the `a` probe to the column's affinity (as the range scan does) and gate the `b` collation
+    match; decline DESC / mismatched / WITHOUT ROWID. Byte-exact (b read from the index == scan's b).
+- WHY SURFACED not shipped this pass: profiled and charted with a clear implementation path, but the
+  composite-prefix positioning + affinity/collation + empty-group/NULL surface is a fresh focused
+  effort; teed up as bd-minmax-prefix-seek-4fuo6 rather than started deep in a long session.
