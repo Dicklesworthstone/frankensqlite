@@ -38,7 +38,7 @@ fi
 
 required_feature_lines=(
     '[features]'
-    'default = ["json", "fts5", "rtree"]'
+    'default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]'
     'json = ["dep:fsqlite-ext-json"]'
     'fts5 = ["dep:fsqlite-ext-fts5"]'
     'fts3 = ["dep:fsqlite-ext-fts3"]'
@@ -91,8 +91,8 @@ trap cleanup EXIT
 (cd "${WORKSPACE_ROOT}" && cargo metadata --format-version=1 >"${metadata_json}")
 
 member_count="$(jq '.workspace_members | length' "${metadata_json}")"
-if [[ "${member_count}" -ne 24 ]]; then
-    printf 'bead_id=%s level=ERROR case=workspace_member_count expected=24 actual=%s\n' \
+if [[ "${member_count}" -ne 27 ]]; then
+    printf 'bead_id=%s level=ERROR case=workspace_member_count expected=27 actual=%s\n' \
         "${BEAD_ID}" "${member_count}"
     exit 1
 fi

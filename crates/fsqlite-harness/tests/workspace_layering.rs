@@ -47,7 +47,7 @@ const SPEC_EXPECTED_CRATES: [&str; 24] = [
 ];
 
 /// Workspace crates present in Cargo metadata but not yet listed in spec §8.1.
-const WORKSPACE_ONLY_CRATES: [&str; 2] = ["fsqlite-observability", "fsqlite-c-api"];
+const WORKSPACE_ONLY_CRATES: [&str; 3] = ["fsqlite-observability", "fsqlite-c-api", "fsqlite-wasm"];
 
 const EXPECTED_WORKSPACE_CRATE_COUNT: usize =
     SPEC_EXPECTED_CRATES.len() + WORKSPACE_ONLY_CRATES.len();
@@ -111,6 +111,7 @@ fn layer_assignments() -> HashMap<&'static str, u8> {
     m.insert("fsqlite-e2e", 9);
     m.insert("fsqlite-harness", 9);
     m.insert("fsqlite-c-api", 9);
+    m.insert("fsqlite-wasm", 9);
     m
 }
 
@@ -401,7 +402,7 @@ fn concise_description_allowed(crate_name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_workspace_crate_count_is_26() {
+fn test_workspace_crate_count_is_27() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
 
@@ -542,7 +543,7 @@ fn test_all_workspace_crates_exist() {
     );
     assert_eq!(
         members, expected,
-        "bead_id={ARCH_BEAD_ID} case=all_23_crates_exist_names_mismatch"
+        "bead_id={ARCH_BEAD_ID} case=workspace_crate_names_mismatch"
     );
 }
 
@@ -668,7 +669,7 @@ fn test_feature_flags_declared_on_fsqlite_manifest() -> Result<(), String> {
     let manifest = fsqlite_cargo_toml()?;
     let required_markers = [
         "[features]",
-        "default = [\"json\", \"fts5\", \"rtree\"]",
+        "default = [\"native\", \"linux-asupersync-uring\", \"json\", \"fts5\", \"rtree\"]",
         "json = [\"dep:fsqlite-ext-json\"]",
         "fts5 = [\"dep:fsqlite-ext-fts5\"]",
         "fts3 = [\"dep:fsqlite-ext-fts3\"]",
@@ -737,7 +738,7 @@ fn test_bd_2v8x_unit_compliance_gate() -> Result<(), String> {
 fn prop_bd_2v8x_structure_compliance() -> Result<(), String> {
     let manifest = fsqlite_cargo_toml()?;
     let expected_features = [
-        "default = [\"json\", \"fts5\", \"rtree\"]",
+        "default = [\"native\", \"linux-asupersync-uring\", \"json\", \"fts5\", \"rtree\"]",
         "json = [\"dep:fsqlite-ext-json\"]",
         "fts5 = [\"dep:fsqlite-ext-fts5\"]",
         "fts3 = [\"dep:fsqlite-ext-fts3\"]",

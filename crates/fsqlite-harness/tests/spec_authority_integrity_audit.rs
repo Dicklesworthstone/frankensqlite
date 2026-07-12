@@ -197,9 +197,13 @@ fn preamble_present(spec_text: &str) -> bool {
 }
 
 fn supersession_list_present(spec_text: &str) -> bool {
-    LEGACY_DOCS
-        .iter()
-        .all(|doc| spec_text.contains(&format!("`{doc}`")))
+    LEGACY_DOCS.iter().all(|doc| {
+        let file_name = Path::new(doc)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("legacy spec paths must end in valid UTF-8 file names");
+        spec_text.contains(&format!("`{file_name}`"))
+    })
 }
 
 fn metadata_header_parseable(spec_text: &str) -> bool {
