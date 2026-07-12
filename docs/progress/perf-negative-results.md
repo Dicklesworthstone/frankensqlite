@@ -17842,3 +17842,25 @@ test is on the executed path, not merely linked into it.
 - NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
 - MEDIAN (release-perf, 20k rows): `MAX(a)` 3.98 ms → 4.3 µs (~920× vs the unindexed-column scan);
   `MIN(a)` 3.81 ms → 5.3 µs (~716×). Diagnostic retained: minmax_composite_leading_profile.rs.
+
+## 2026-07-12 - WIN: MAX/MIN via a DESC index (single-column or DESC-leading composite) seeks the index end, not a full scan — ~716× / ~696× byte-exact (bd-minmax-desc-index)
+
+- Result type: WIN / shipped. Completes the MIN/MAX-via-index family (ASC single, ASC composite-leading,
+  ASC composite-prefix all done; DESC was the remaining gap).
+- THE MISS: `minmax_index_seek_plan` required an ASC leading term, so `SELECT MAX(v)/MIN(v)` on a
+  DESC-indexed column (or a DESC-leading composite) full-scanned — though the extremum is still at one
+  end of the index.
+- THE LEVER: added a `descending` flag to `MinMaxIndexSeek` and generalized the BINARY fallback to accept
+  a composite index (ASC OR DESC leading term) or a single-column DESC index. `codegen_select_minmax_
+  index_seek` branches on it: a DESC index stores the max at the FIRST entry and NULLs at the bottom, so
+  MAX → `Rewind` (vs ASC's `Last`) and MIN → `Last` + `Prev`-skip of the trailing NULL region (vs ASC's
+  `Rewind` + `Next`-skip). One row still feeds the shared AggStep/AggFinal/wrapper. BINARY-only leading
+  term (collation-tie representative ambiguity).
+- BYTE-EXACT GATE (`minmax_desc_index_oracle.rs`, PASS): vs rusqlite/C SQLite — MAX/MIN(v) on a DESC
+  single-column index with a trailing NULL region (MIN skips it backward), a DESC-leading composite,
+  all-NULL and empty tables, the COALESCE wrapper, and a NOCASE DESC index (declines to the scan) — all
+  bit-identical. Opcode gate: MIN(v DESC) → `Prev`; MAX(v DESC) → single seek (no scan `Next`); NOCASE
+  declines.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
+- MEDIAN (release-perf, 20k rows): `MAX(v)` DESC 6.76 ms → 9.4 µs (~716×); `MIN(v)` 6.64 ms → 9.5 µs
+  (~696×). Diagnostic: minmax_desc_index_profile.rs.

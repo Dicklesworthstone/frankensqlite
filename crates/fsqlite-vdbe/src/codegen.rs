@@ -9434,10 +9434,12 @@ fn minmax_rowid_seek_plan(agg_columns: &[AggColumn]) -> Option<RowidSeekEnd> {
 
 /// A single `MIN(col)` / `MAX(col)` over a secondary-indexed column, resolvable by one index seek.
 struct MinMaxIndexSeek {
-    /// `true` = `MAX` (seek the last index entry); `false` = `MIN` (first non-NULL entry).
+    /// `true` = `MAX`; `false` = `MIN`.
     is_max: bool,
     index_name: String,
     index_root: i32,
+    /// `true` when the column's leading index term is DESC (extremum ends and NULL region flip).
+    descending: bool,
 }
 
 /// Detect `SELECT MIN(col)` / `SELECT MAX(col)` (no WHERE/HAVING/GROUP BY) where `col` carries a
@@ -9477,13 +9479,15 @@ fn minmax_index_seek_plan(
         _ => return None,
     };
     let col_name = table.columns.get(agg.arg_col_index?)?.name.as_str();
-    let idx = table
+    let (idx, descending) = table
         .single_column_index_for_column_with_collation(col_name, agg.collation.as_deref())
+        .map(|idx| (idx, false))
         .or_else(|| {
-            // Composite index whose LEADING key term is the aggregate column (ASC, BINARY): the
-            // extremum of that column is still at the index end (index column 0), so the same seek
-            // applies. BINARY-only to avoid the collation-tie representative ambiguity that a
-            // non-BINARY leading term would introduce among the extremum's duplicate run.
+            // BINARY-only fallback: a composite index whose LEADING key term is the aggregate column
+            // (ASC or DESC), or a single-column DESC index. The extremum is still at one end of the
+            // index (index column 0); the seek direction follows the term's sort. BINARY-only to
+            // avoid the collation-tie representative ambiguity a non-BINARY leading term would
+            // introduce among the extremum's duplicate run.
             if agg
                 .collation
                 .as_deref()
@@ -9492,23 +9496,26 @@ fn minmax_index_seek_plan(
             {
                 return None;
             }
-            table.indexes.iter().find(|idx| {
-                idx.supports_direct_column_lookup()
-                    && idx.key_term_count() >= 2
-                    && !idx.key_term_descending(0)
+            table.indexes.iter().find_map(|idx| {
+                let leads = idx.supports_direct_column_lookup()
                     && idx
                         .columns
                         .first()
                         .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
                     && idx
                         .key_term_collation(0)
-                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+                // Composite leading (any direction), or a single-column DESC index (single-column ASC
+                // is handled above).
+                let usable = leads && (idx.key_term_count() >= 2 || idx.key_term_descending(0));
+                usable.then(|| (idx, idx.key_term_descending(0)))
             })
         })?;
     Some(MinMaxIndexSeek {
         is_max,
         index_name: idx.name.clone(),
         index_root: idx.root_page,
+        descending,
     })
 }
 
@@ -9739,21 +9746,34 @@ fn codegen_select_minmax_index_seek(
     let arg_reg = b.alloc_reg();
 
     if seek.is_max {
-        // MAX: the last index entry is the maximum (NULLs sort first). Empty → finalize (NULL).
-        b.emit_jump_to_label(Opcode::Last, idx_cursor, 0, finalize_label, P4::None, 0);
+        // MAX: single seek to the max end — ASC index → last entry, DESC index → first entry. NULLs
+        // sit at the opposite end, so this entry is non-NULL unless the column is all-NULL (then it is
+        // NULL and MAX(NULL) = NULL). Empty → finalize (NULL).
+        let max_end = if seek.descending {
+            Opcode::Rewind
+        } else {
+            Opcode::Last
+        };
+        b.emit_jump_to_label(max_end, idx_cursor, 0, finalize_label, P4::None, 0);
         b.emit_op(Opcode::Column, idx_cursor, 0, arg_reg, P4::None, 0);
     } else {
-        // MIN: first entry, skipping the leading NULL region (min() ignores NULLs). Empty → NULL.
-        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+        // MIN: start at the min end and skip the NULL region toward the values — ASC → Rewind + Next,
+        // DESC → Last + Prev. The first non-NULL reached is the minimum; all-NULL/empty → NULL.
+        let (min_end, skip_op) = if seek.descending {
+            (Opcode::Last, Opcode::Prev)
+        } else {
+            (Opcode::Rewind, Opcode::Next)
+        };
+        b.emit_jump_to_label(min_end, idx_cursor, 0, finalize_label, P4::None, 0);
         let scan_top = b.current_addr();
         let step_label = b.emit_label();
         b.emit_op(Opcode::Column, idx_cursor, 0, arg_reg, P4::None, 0);
-        // Non-NULL → accumulate it (it is the minimum). NULL → advance to the next entry.
+        // Non-NULL → accumulate it (it is the minimum). NULL → advance one entry toward the values.
         b.emit_jump_to_label(Opcode::NotNull, arg_reg, 0, step_label, P4::None, 0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let scan_body = scan_top as i32;
-        // Next jumps back to re-test the following entry; falls through (all NULL) to finalize.
-        b.emit_op(Opcode::Next, idx_cursor, scan_body, 0, P4::None, 0);
+        // Next/Prev jumps back to re-test; falls through (all NULL) to finalize.
+        b.emit_op(skip_op, idx_cursor, scan_body, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         b.resolve_label(step_label);
     }
