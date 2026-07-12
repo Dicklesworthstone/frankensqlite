@@ -17821,3 +17821,24 @@ test is on the executed path, not merely linked into it.
 - IMPACT IF FIXED: `MAX(b) WHERE a=?` (composite) 270 µs → ~8 µs (~34×), plus faster composite DESC
   range-scan positioning. The already-shipped composite MIN/MAX lever remains a net win (MAX ~9× / MIN
   ~297× vs the group scan); this only leaves the MAX path short of MIN's speed.
+
+## 2026-07-11 - WIN: MAX(a)/MIN(a) via the LEADING term of a composite index seeks the index end, not a full scan — ~920× (MAX) / ~716× (MIN) byte-exact (bd-minmax-composite-leading)
+
+- Result type: WIN / shipped. A one-line-detection extension of bd-minmax-index-seek.
+- THE MISS: `minmax_index_seek_plan` resolved the seek only via
+  `single_column_index_for_column_with_collation` (requires `columns.len()==1`). So `SELECT MAX(a)/MIN(a)`
+  where `a` is the LEADING key term of a composite `(a,b)` index but has no single-column index
+  full-scanned — even though the extremum of `a` is still at the index end (index column 0).
+- THE LEVER: `minmax_index_seek_plan` now falls back, when no single-column index exists, to a composite
+  index whose leading term is the aggregate column (ASC, BINARY collation, rowid table). The existing
+  `codegen_select_minmax_index_seek` is reused verbatim — it reads `Column 0` (the leading term) and
+  seeks `Last` (MAX) / `Rewind`+skip-NULL (MIN), so no codegen change. BINARY-only on the leading term
+  to avoid the collation-tie representative ambiguity (a non-BINARY leading term could pick a different
+  extremum-duplicate representative by the following key terms than the scan does).
+- BYTE-EXACT GATE (`minmax_composite_leading_oracle.rs`, PASS): vs rusqlite/C SQLite — MAX/MIN(a) via a
+  composite `(a,b)` leading term with leading `a`-NULLs (MIN skips), all-NULL and empty tables, the
+  COALESCE wrapper, a NOCASE leading term (declines to the scan), and a single-column control — all
+  bit-identical. Opcode gate: MAX(a) emits `Last`; the NOCASE leading term does not.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
+- MEDIAN (release-perf, 20k rows): `MAX(a)` 3.98 ms → 4.3 µs (~920× vs the unindexed-column scan);
+  `MIN(a)` 3.81 ms → 5.3 µs (~716×). Diagnostic retained: minmax_composite_leading_profile.rs.

@@ -9477,8 +9477,34 @@ fn minmax_index_seek_plan(
         _ => return None,
     };
     let col_name = table.columns.get(agg.arg_col_index?)?.name.as_str();
-    let idx =
-        table.single_column_index_for_column_with_collation(col_name, agg.collation.as_deref())?;
+    let idx = table
+        .single_column_index_for_column_with_collation(col_name, agg.collation.as_deref())
+        .or_else(|| {
+            // Composite index whose LEADING key term is the aggregate column (ASC, BINARY): the
+            // extremum of that column is still at the index end (index column 0), so the same seek
+            // applies. BINARY-only to avoid the collation-tie representative ambiguity that a
+            // non-BINARY leading term would introduce among the extremum's duplicate run.
+            if agg
+                .collation
+                .as_deref()
+                .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+                || table.without_rowid
+            {
+                return None;
+            }
+            table.indexes.iter().find(|idx| {
+                idx.supports_direct_column_lookup()
+                    && idx.key_term_count() >= 2
+                    && !idx.key_term_descending(0)
+                    && idx
+                        .columns
+                        .first()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                    && idx
+                        .key_term_collation(0)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            })
+        })?;
     Some(MinMaxIndexSeek {
         is_max,
         index_name: idx.name.clone(),
