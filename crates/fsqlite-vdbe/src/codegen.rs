@@ -10974,10 +10974,9 @@ fn aggregate_index_range_seek_target<'t, 'e>(
         return index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range)
             .then_some((idx, range, false));
     }
-    // Residual: a range on an INTEGER-exact single-column index plus other placeholder-free predicates.
-    if expr_has_placeholder(where_expr) {
-        return None;
-    }
+    // Residual: a range on a single-column index plus other predicates. The `bounds_ok` check below
+    // requires LITERAL bounds, so the probe emits no placeholders and a `?` can appear only in the
+    // residual, where the filter numbers it identically to the scan path (bd-agg-param-residual).
     for index in &table.indexes {
         if index.key_term_count() != 1
             || index.key_term_descending(0)
@@ -11070,7 +11069,10 @@ fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
     table_alias: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
     let where_expr = where_clause?;
-    if table.without_rowid || expr_has_placeholder(where_expr) {
+    // A bound parameter is allowed only in the RESIDUAL: the prefix is required to be an integer/text
+    // LITERAL below, so the probe emits no placeholders and the residual filter numbers `?` exactly as
+    // the scan path does (bd-agg-param-residual).
+    if table.without_rowid {
         return None;
     }
     let mut conjuncts = Vec::new();

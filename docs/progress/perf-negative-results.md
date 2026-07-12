@@ -18439,3 +18439,24 @@ test is on the executed path, not merely linked into it.
   PREFIX (`a = ? AND x = 5`) declines". Literal residual byte-exact cases unchanged. (A byte-exact
   param-binding test needs the compat `ConnectionExt::query_row_map` + `ParamValue` API — optional given
   the construction argument + opcode gate.)
+
+## 2026-07-12 - WIN (shipped): parameterized residual in eq/range aggregate seeks (bd-agg-param-residual)
+
+- Result type: WIN / shipped (persistent gate loop finally caught a pool window after several saturated
+  turns). `COUNT(*)/SUM WHERE a = 7 AND x = ?` / `WHERE a > 5 AND x = ?` (a literal indexed constraint +
+  a PARAMETERIZED filter) previously declined and full-scanned; now they seek.
+- FIX (detection only): drop the whole-WHERE `expr_has_placeholder` guard from
+  `aggregate_index_prefix_literal_residual_target` and from the residual branch of
+  `aggregate_index_range_seek_target`. Both already require the prefix / range bounds to be integer/text
+  LITERALS, so the seek probe emits no anonymous placeholders. The rowid-range path KEEPS its guard
+  (`is_rowid_range_constant` accepts placeholders, so a `?` bound could reach that probe).
+- BYTE-EXACT BY CONSTRUCTION: the literal probe consumes zero anonymous placeholders, so the residual
+  filter — the SAME `emit_where_filter` the full scan uses — runs with the anon counter at the same
+  `where_placeholder_base` and numbers a residual `?` identically to the scan path. A `?` in the prefix
+  or a range bound is rejected by the literal requirement (verified: `a = ? AND x = 5` / `a > ? AND x = 5`
+  decline).
+- GATE: `agg_leading_eq_residual_oracle` — literal residual byte-exact battery (INT + TEXT prefix/range,
+  IN/BETWEEN/NOT residuals) unchanged; opcode gates that `a=7 AND x=?` SeekGEs and parameterized
+  prefix/range bounds decline. No-reg: agg_index_range, agg_rowid_range_residual byte-exact.
+- PROCESS NOTE: shipped via a persistent retry-until-slot loop (~28 attempts) that caught an intermittent
+  rch window; the pool was saturated across the prior 3-4 turns.

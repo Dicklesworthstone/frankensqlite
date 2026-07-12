@@ -146,11 +146,20 @@ fn agg_leading_eq_residual_matches_sqlite() {
         ),
         "leading eq + IN-list residual (all literal) must seek the prefix (SeekGE)"
     );
-    // A bound parameter anywhere in the WHERE declines the seek (re-emitting it per row could
-    // mis-number the parameter), falling to a scan that binds it correctly.
+    // A bound parameter in the RESIDUAL is fine: the literal prefix probe consumes no anonymous
+    // placeholders, so the residual filter numbers `?` exactly as the scan path does. The seek fires.
     assert!(
-        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = ?", "SeekGE"),
-        "a WHERE with a bound parameter must decline the residual-filter seek"
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = ?", "SeekGE"),
+        "leading eq (literal) + parameterized residual must still seek the prefix"
+    );
+    // A bound parameter in the PREFIX / range bound (the probe) declines — the probe must be a literal.
+    assert!(
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a = ? AND x = 5", "SeekGE"),
+        "a parameterized PREFIX must decline (probe must be a literal)"
+    );
+    assert!(
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a > ? AND x = 5", "SeekGE"),
+        "a parameterized range bound must decline (bound must be a literal)"
     );
     // The single-column index range seek anchors with SeekGE (exclusive lower handled by a Le skip).
     assert!(
