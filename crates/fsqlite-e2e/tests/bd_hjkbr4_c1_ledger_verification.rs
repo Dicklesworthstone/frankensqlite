@@ -31,10 +31,36 @@ use fsqlite_pager::{
     set_pager_commit_profile_enabled,
 };
 use serde_json::json;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 const BEAD_ID: &str = "bd-hjkbr.4";
 const REPLAY_CMD: &str = "cargo test -p fsqlite-e2e --test bd_hjkbr4_c1_ledger_verification -- --nocapture --test-threads=1";
+
+// The pager profile switch and counters are process-global. Libtest runs the
+// cases in this binary concurrently by default, so every workload must share
+// one guard even when it only produces commits without reading the counters.
+static PAGER_COMMIT_PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+struct PagerCommitProfileTestGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for PagerCommitProfileTestGuard {
+    fn drop(&mut self) {
+        set_pager_commit_profile_enabled(true);
+        reset_pager_commit_profile();
+    }
+}
+
+fn pager_commit_profile_test_guard() -> PagerCommitProfileTestGuard {
+    let lock = PAGER_COMMIT_PROFILE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_pager_commit_profile_enabled(true);
+    reset_pager_commit_profile();
+    PagerCommitProfileTestGuard { _lock: lock }
+}
 
 fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     eprintln!(
@@ -85,6 +111,7 @@ fn ensure_profiling_on() {
 
 #[test]
 fn l1_commit_profile_populated() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l1_commit_populated";
     emit_log(tn, "start", json!({}));
     ensure_profiling_on();
@@ -120,6 +147,7 @@ fn l1_commit_profile_populated() {
 
 #[test]
 fn l2_commit_profile_reset() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l2_reset";
     emit_log(tn, "start", json!({}));
     ensure_profiling_on();
@@ -157,6 +185,7 @@ fn l2_commit_profile_reset() {
 
 #[test]
 fn l3_commit_profile_enable_disable() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l3_enable_disable";
     emit_log(tn, "start", json!({}));
 
@@ -214,6 +243,7 @@ fn l3_commit_profile_enable_disable() {
 
 #[test]
 fn l4_commit_profile_proportional() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l4_proportional";
     emit_log(tn, "start", json!({}));
     ensure_profiling_on();
@@ -259,6 +289,7 @@ fn l4_commit_profile_proportional() {
 
 #[test]
 fn l5_prepared_hit_rate_proof() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l5_prepared_hit_rate";
     emit_log(tn, "start", json!({}));
 
@@ -319,6 +350,7 @@ fn l5_prepared_hit_rate_proof() {
 
 #[test]
 fn l6_publication_snapshot_advances() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l6_pub_snapshot";
     emit_log(tn, "start", json!({}));
 
@@ -367,6 +399,7 @@ fn l6_publication_snapshot_advances() {
 
 #[test]
 fn l7_multi_table_commit_profile() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l7_multi_table";
     emit_log(tn, "start", json!({}));
     ensure_profiling_on();
@@ -423,6 +456,7 @@ fn l7_multi_table_commit_profile() {
 
 #[test]
 fn l8_file_backed_commit_profile() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l8_file_backed";
     emit_log(tn, "start", json!({}));
     ensure_profiling_on();
@@ -481,6 +515,7 @@ fn l8_file_backed_commit_profile() {
 
 #[test]
 fn l9_commit_profile_evidence_pack() {
+    let _profile_guard = pager_commit_profile_test_guard();
     let tn = "l9_evidence_pack";
     emit_log(tn, "start", json!({}));
     ensure_profiling_on();
