@@ -1697,7 +1697,7 @@ impl<F: VfsFile> PagerInner<F> {
         }
     }
 
-    fn read_page_copy_uncached(&mut self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+    fn read_page_copy_uncached(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
         let mut out = vec![0_u8; page_size];
@@ -2363,8 +2363,14 @@ fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     pool: &PageBufPool,
     write_set: &mut HashMap<PageNumber, StagedPage, S>,
 ) -> Result<StagedPage> {
-    if let Some(staged) = write_set.remove(&PageNumber::ONE) {
-        return Ok(staged.into_unpublished_for_mutation(pool));
+    if let Some(staged) = write_set.get_mut(&PageNumber::ONE) {
+        // Keep page 1 resident in the write set until the fallible detach has
+        // succeeded. A capacity error must leave the transaction retryable and
+        // roll-backable with its original staged header bytes intact.
+        staged.make_unpublished_for_mutation(pool, cache, "page_one_commit_mutation")?;
+        return Ok(write_set
+            .remove(&PageNumber::ONE)
+            .expect("page one remained staged after successful detach"));
     }
 
     let page1_vec = inner.read_page_copy(cx, cache, wal_backend, PageNumber::ONE)?;
@@ -6388,13 +6394,37 @@ impl StagedPage {
         }
     }
 
-    fn into_unpublished_for_mutation(self, pool: &PageBufPool) -> Self {
-        let has_published_snapshot = self.published.get().is_some();
-        if has_published_snapshot {
-            Self::from_buf(self.into_buf(pool))
-        } else {
-            self
+    fn make_unpublished_for_mutation(
+        &mut self,
+        pool: &PageBufPool,
+        cache: &ShardedPageCache,
+        operation: &'static str,
+    ) -> Result<()> {
+        if self.published.get().is_none() {
+            return Ok(());
         }
+
+        if matches!(self.backing, StagedPageBacking::Buffered(_)) {
+            // Buffered publication copies into an independent Arc<[u8]>, so
+            // discarding our publication handle is enough to make the unique
+            // PageBuf mutable again without allocating.
+            let _ = self.published.take();
+            return Ok(());
+        }
+
+        // Owned publication clones the same PageData backing. Acquire the
+        // replacement first, so a capacity error leaves both backing and
+        // published snapshot completely unchanged.
+        let mut buffer = acquire_page_buf_with_clean_cache_recovery(pool, cache, operation)?;
+        let source = self.as_page_bytes();
+        let len = buffer.len().min(source.len());
+        buffer[..len].copy_from_slice(&source[..len]);
+        if len < buffer.len() {
+            buffer[len..].fill(0);
+        }
+        self.backing = StagedPageBacking::Buffered(buffer);
+        self.published = OnceLock::new();
+        Ok(())
     }
 
     fn published_page(&self) -> PageData {
@@ -6436,25 +6466,6 @@ impl StagedPage {
                 backing: other,
                 published: OnceLock::new(),
             }),
-        }
-    }
-
-    fn into_buf(self, pool: &PageBufPool) -> PageBuf {
-        match self.backing {
-            StagedPageBacking::Buffered(buf) => buf,
-            StagedPageBacking::Owned(data) => {
-                let page_size = PageSize::new(
-                    u32::try_from(pool.page_size()).expect("pool page size fits u32"),
-                )
-                .expect("pool page size invariant");
-                let mut buf = pool.acquire().unwrap_or_else(|_| PageBuf::new(page_size));
-                let len = buf.len().min(data.len());
-                buf[..len].copy_from_slice(&data.as_bytes()[..len]);
-                if len < buf.len() {
-                    buf[len..].fill(0);
-                }
-                buf
-            }
         }
     }
 
@@ -11355,13 +11366,16 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "native", unix))]
     #[test]
     fn gh_131_file_backed_saturated_cache_write_commit_and_rollback_are_correct() {
         let cx = Cx::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saturated-cache-transaction-cycle.db");
         let pager = SimplePager::open_with_cx_and_page_buffer_max(
             &cx,
-            MemoryVfs::new(),
-            Path::new("/saturated_cache_transaction_cycle.db"),
+            fsqlite_vfs::UnixVfs::new(),
+            &path,
             PageSize::DEFAULT,
             Some(2),
         )
@@ -25946,12 +25960,16 @@ mod tests {
     #[test]
     fn test_staged_page_unpublishes_before_mutation() {
         let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        let cache = ShardedPageCache::with_pool(pool.clone(), PageSize::DEFAULT);
         let mut original = sample_page(0x42);
         original[24] = 0x11;
         let staged = StagedPage::from_page_data(PageData::from_vec(original));
 
         let old_snapshot = staged.published_page();
-        let mut staged = staged.into_unpublished_for_mutation(&pool);
+        let mut staged = staged;
+        staged
+            .make_unpublished_for_mutation(&pool, &cache, "test_page_mutation")
+            .unwrap();
         staged.as_page_bytes_mut()[24] = 0x99;
         let final_page = staged.into_published_page();
 
@@ -25965,6 +25983,75 @@ mod tests {
             0x99,
             "bead_id=bd-page1-staged-invariant case=final_publication_uses_mutated_byte"
         );
+    }
+
+    #[test]
+    fn gh_131_published_page_one_mutation_reclaims_clean_cache_buffer() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 1);
+        let cache = ShardedPageCache::with_pool(pool.clone(), PageSize::DEFAULT);
+        let cached_page = PageNumber::new(2).unwrap();
+        cache.insert_buffer(cached_page, pool.acquire().unwrap());
+        assert_eq!(pool.available(), 0, "pool must start saturated");
+
+        let mut page_one = sample_page(0x61);
+        page_one[32] = 0x12;
+        let staged = StagedPage::from_page_data(PageData::from_vec(page_one));
+        let published = staged.published_page();
+
+        let mut staged = staged;
+        staged
+            .make_unpublished_for_mutation(&pool, &cache, "test_page_one_commit_mutation")
+            .expect("published page-one mutation must reclaim a clean cache buffer");
+        staged.as_page_bytes_mut()[32] = 0x34;
+
+        assert!(!cache.contains(cached_page));
+        assert_eq!(pool.total_buffers(), 1);
+        assert_eq!(published.as_bytes()[32], 0x12);
+        assert_eq!(staged.as_page_bytes()[32], 0x34);
+        assert!(matches!(
+            staged.backing,
+            StagedPageBacking::Buffered(ref buffer) if buffer.returns_to_pool(&pool)
+        ));
+    }
+
+    #[test]
+    fn gh_131_failed_published_page_one_detach_preserves_staged_state() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 1);
+        let cache = ShardedPageCache::with_pool(pool.clone(), PageSize::DEFAULT);
+        let dirty_page = PageNumber::new(2).unwrap();
+        cache
+            .insert_fresh(dirty_page, |bytes| bytes[0] = 0xD1)
+            .unwrap();
+        assert_eq!(pool.available(), 0, "pool must start saturated");
+
+        let mut page_one = sample_page(0x71);
+        page_one[32] = 0x45;
+        let mut staged = StagedPage::from_page_data(PageData::from_vec(page_one.clone()));
+        let published_before = staged.published_page();
+
+        let error = staged
+            .make_unpublished_for_mutation(&pool, &cache, "test_page_one_commit_mutation_failure")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            FrankenError::PageBufferCapacityExhausted { .. }
+        ));
+
+        let published_after = staged.published_page();
+        assert_eq!(staged.as_page_bytes(), page_one);
+        assert_eq!(
+            published_after.as_bytes().as_ptr(),
+            published_before.as_bytes().as_ptr()
+        );
+        assert!(matches!(staged.backing, StagedPageBacking::Owned(_)));
+        assert!(cache.contains(dirty_page));
+        assert!(
+            cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == dirty_page && snapshot.dirty)
+        );
+        assert_eq!(pool.total_buffers(), pool.capacity());
     }
 
     #[test]

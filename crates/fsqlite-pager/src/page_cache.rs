@@ -1771,6 +1771,19 @@ impl FlatPageSlots {
         self.find_slot(page_no).is_some()
     }
 
+    /// Check whether `page_no` still owns both the probed slot and payload.
+    ///
+    /// Unlike [`Self::contains`], this closes the probe-to-payload reuse race
+    /// and is suitable for decisions that coordinate the flat and overflow
+    /// tiers.
+    fn contains_stable(&self, page_no: PageNumber) -> bool {
+        let Some(idx) = self.find_slot(page_no) else {
+            return false;
+        };
+        let data = self.slots[idx].data.lock();
+        self.slots[idx].pgno.load(Ordering::Acquire) == page_no.get() && data.is_some()
+    }
+
     /// Get page data as an owned copy.
     fn get_copy(&self, page_no: PageNumber) -> Option<Vec<u8>> {
         let idx = self.find_slot(page_no)?;
@@ -1966,9 +1979,7 @@ impl FlatPageSlots {
     /// concurrent mutable cache access cannot dirty the page between the
     /// eligibility decision and eviction.
     fn take_if_clean_from_pool(&self, page_no: PageNumber, pool: &PageBufPool) -> Option<PageBuf> {
-        let Some(idx) = self.find_slot(page_no) else {
-            return None;
-        };
+        let idx = self.find_slot(page_no)?;
         let pgno = page_no.get();
         let mut data = self.slots[idx].data.lock();
         let reclaimable = data
@@ -2688,6 +2699,14 @@ impl ShardedPageCache {
     /// Insert one authoritative cache image while preserving the invariant
     /// that a page resides in exactly one storage tier.
     fn insert_tiered(&self, page_no: PageNumber, buf: PageBuf, dirty: bool) -> bool {
+        // Serialize every insertion through the page's overflow shard. The
+        // flat table uses open addressing: without this keyed serialization,
+        // two inserters can select different available slots for the same page
+        // while a tombstone is created between their probes and CASes. Keeping
+        // the shard lock across flat admission also makes overflow cleanup and
+        // fallback publication one atomic tier-selection decision.
+        let shard_idx = self.shard_index(page_no);
+        let mut shard = self.shards[shard_idx].lock();
         let try_flat = |buf| {
             if dirty {
                 self.flat_slots.try_insert_dirty(page_no, buf)
@@ -2698,25 +2717,13 @@ impl ShardedPageCache {
 
         match try_flat(buf) {
             Ok(is_new) => {
-                let duplicate_removed = self.remove_overflow_duplicate(page_no);
+                let duplicate_removed = shard.remove(page_no);
                 is_new && !duplicate_removed
             }
             Err(buf) => {
-                let shard_idx = self.shard_index(page_no);
-                let mut shard = self.shards[shard_idx].lock();
-                // Close the fallback race: while holding the target shard,
-                // retry the flat tier before publishing an overflow copy.
-                match try_flat(buf) {
-                    Ok(is_new) => {
-                        let duplicate_removed = shard.remove(page_no);
-                        is_new && !duplicate_removed
-                    }
-                    Err(buf) => {
-                        let admitted = shard.insert_with_dirty_state(page_no, buf, dirty);
-                        self.shards_dirty.store(true, Ordering::Release);
-                        admitted
-                    }
-                }
+                let admitted = shard.insert_with_dirty_state(page_no, buf, dirty);
+                self.shards_dirty.store(true, Ordering::Release);
+                admitted
             }
         }
     }
@@ -3208,36 +3215,36 @@ impl ShardedPageCache {
         }
 
         let overflow_idx = self.shard_index(page_no);
-        if self.shards[overflow_idx]
-            .lock()
-            .pages
-            .contains_key(&page_no)
         {
-            // A duplicate violates the tier invariant. Refuse to remove the
-            // preferred flat image and expose an older overflow copy; the next
-            // authoritative insertion collapses the duplicate.
-            return None;
+            let mut shard = self.shards[overflow_idx].lock();
+            if shard.pages.contains_key(&page_no) {
+                if self.flat_slots.contains_stable(page_no) {
+                    // A duplicate violates the tier invariant. Refuse to
+                    // remove either image and accidentally expose the other;
+                    // the next authoritative insertion collapses it.
+                    return None;
+                }
+
+                let clean = shard.pages.get(&page_no).is_some_and(|entry| {
+                    !entry.is_dirty() && entry.buf.returns_to_pool(&self.pool)
+                });
+                if !clean {
+                    return None;
+                }
+                let entry = shard
+                    .pages
+                    .remove(&page_no)
+                    .expect("clean overflow cache entry must still be present");
+                shard.evictions = shard.evictions.saturating_add(1);
+                drop(shard);
+                self.forget_eviction_page(page_no);
+                return Some(entry.buf);
+            }
         }
 
         if let Some(buffer) = self.flat_slots.take_if_clean_from_pool(page_no, &self.pool) {
             self.forget_eviction_page(page_no);
             return Some(buffer);
-        }
-
-        let idx = self.shard_index(page_no);
-        let mut shard = self.shards[idx].lock();
-        let clean = shard
-            .pages
-            .get(&page_no)
-            .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(&self.pool));
-        let entry = clean.then(|| shard.pages.remove(&page_no)).flatten();
-        if entry.is_some() {
-            shard.evictions = shard.evictions.saturating_add(1);
-        }
-        drop(shard);
-        if let Some(entry) = entry {
-            self.forget_eviction_page(page_no);
-            return Some(entry.buf);
         }
         None
     }
@@ -4976,7 +4983,7 @@ mod tests {
         original.fill(0xA1);
         cache.insert_buffer(original_page, original);
         let original_slot = cache.flat_slots.find_slot(original_page).unwrap();
-        let replacement_page = (2..=u32::MAX - 1)
+        let replacement_page = (2..u32::MAX)
             .filter_map(PageNumber::new)
             .find(|candidate| {
                 cache.flat_slots.hash_pgno(candidate.get()) == original_slot
@@ -5041,6 +5048,93 @@ mod tests {
         let reclaimed = cache.take_clean_buffer().unwrap();
         assert!(reclaimed.iter().all(|byte| *byte == 0x33));
         assert_eq!(cache.get_copy(page_no), None);
+    }
+
+    #[test]
+    fn gh_131_concurrent_same_page_insertions_leave_one_authoritative_resident() {
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 128;
+        const FINAL_BYTE: u8 = 0xA5;
+
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 1));
+        let page_no = PageNumber::new(17).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(WORKERS + 1));
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for worker in 0..WORKERS {
+            let cache = Arc::clone(&cache);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                for round in 0..ROUNDS {
+                    if (worker + round) % 3 == 0 {
+                        cache.evict(page_no);
+                    }
+                    let mut buffer = PageBuf::new(PageSize::DEFAULT);
+                    buffer.fill(u8::try_from(worker + 1).unwrap());
+                    cache.insert_buffer(page_no, buffer);
+                }
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let mut final_buffer = PageBuf::new(PageSize::DEFAULT);
+        final_buffer.fill(FINAL_BYTE);
+        cache.insert_buffer(page_no, final_buffer);
+
+        let flat_residents = cache
+            .flat_slots
+            .slots
+            .iter()
+            .filter_map(PageSlot::stable_snapshot)
+            .filter(|snapshot| snapshot.page_no == page_no)
+            .count();
+        let shard_idx = cache.shard_index(page_no);
+        let shard_residents = usize::from(cache.shards[shard_idx].lock().contains(page_no));
+        assert_eq!(flat_residents + shard_residents, 1);
+        assert!(
+            cache
+                .get_copy(page_no)
+                .is_some_and(|bytes| bytes.iter().all(|byte| *byte == FINAL_BYTE))
+        );
+    }
+
+    #[test]
+    fn gh_131_clean_buffer_handoff_reclaims_overflow_only_resident() {
+        let resident_count = MAX_PROBE_LENGTH + 1;
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, resident_count);
+        let target_bucket = cache.flat_slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&cache.flat_slots, target_bucket, resident_count);
+
+        for page_no in colliders.iter().copied() {
+            let mut buffer = cache.pool().acquire().unwrap();
+            buffer.fill(u8::try_from(page_no.get() & 0xff).unwrap());
+            cache.insert_buffer(page_no, buffer);
+        }
+        assert_eq!(cache.pool().available(), 0, "pool must start saturated");
+
+        let overflow_page = colliders
+            .iter()
+            .copied()
+            .find(|page_no| !cache.flat_slots.contains(*page_no))
+            .expect("one forced collider must reside only in overflow");
+        let overflow_shard = cache.shard_index(overflow_page);
+        assert!(cache.shards[overflow_shard].lock().contains(overflow_page));
+
+        let reclaimed = cache
+            .take_clean_buffer_at(overflow_page)
+            .expect("clean overflow-only resident must be reclaimable");
+        assert!(
+            reclaimed
+                .iter()
+                .all(|byte| *byte == u8::try_from(overflow_page.get() & 0xff).unwrap())
+        );
+        assert!(!cache.contains(overflow_page));
+        drop(reclaimed);
+        assert_eq!(cache.pool().available(), 1);
     }
 
     #[test]
