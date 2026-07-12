@@ -46255,6 +46255,26 @@ impl Connection {
         Ok(())
     }
 
+    fn first_unowned_database_page(
+        total_pages: u32,
+        page_size: PageSize,
+        mut is_owned: impl FnMut(PageNumber) -> bool,
+    ) -> Option<PageNumber> {
+        let lock_byte_page = fsqlite_pager::lock_byte_page(page_size);
+        (1..=total_pages).find_map(|raw_page_no| {
+            // SQLite permanently reserves the page containing the 1 GiB
+            // pending-lock byte.  It is intentionally absent from both the
+            // b-tree ownership graph and the freelist, so an unreferenced lock
+            // page is healthy; an actual reference is still rejected by
+            // `record_integrity_page_owner` above (GH#133).
+            if raw_page_no == lock_byte_page {
+                return None;
+            }
+            let page_no = PageNumber::new(raw_page_no)?;
+            (!is_owned(page_no)).then_some(page_no)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn walk_integrity_overflow_chain(
         cx: &Cx,
@@ -46611,15 +46631,14 @@ impl Connection {
         }
 
         if !auto_vacuum_enabled {
-            for raw_page_no in 1..=total_pages {
-                let Some(page_no) = PageNumber::new(raw_page_no) else {
-                    continue;
-                };
-                if !owners.contains_key(&page_no) {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!("page {} is never used", page_no.get()),
-                    });
-                }
+            if let Some(page_no) =
+                Self::first_unowned_database_page(total_pages, page_size, |page_no| {
+                    owners.contains_key(&page_no)
+                })
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("page {} is never used", page_no.get()),
+                });
             }
         }
 
@@ -157430,6 +157449,36 @@ mod pager_routing_tests {
             message.contains("reserved lock-byte page"),
             "unexpected quick_check diagnostic: {message}"
         );
+    }
+
+    #[test]
+    fn test_integrity_ownership_exempts_only_the_reserved_lock_byte_page() {
+        for raw_page_size in [512_u32, 1_024, 2_048, 4_096, 8_192, 16_384, 65_536] {
+            let page_size = PageSize::new(raw_page_size).expect("valid SQLite page size");
+            let lock_page = fsqlite_pager::lock_byte_page(page_size);
+            let total_pages = lock_page.saturating_add(1);
+
+            let missing_only_lock =
+                Connection::first_unowned_database_page(total_pages, page_size, |page_no| {
+                    page_no.get() != lock_page
+                });
+            assert_eq!(
+                missing_only_lock, None,
+                "the 1 GiB lock-byte page must be exempt at page size {raw_page_size}"
+            );
+
+            for missing_page in [lock_page - 1, lock_page + 1] {
+                let first_missing =
+                    Connection::first_unowned_database_page(total_pages, page_size, |page_no| {
+                        page_no.get() != missing_page
+                    });
+                assert_eq!(
+                    first_missing.map(PageNumber::get),
+                    Some(missing_page),
+                    "neighboring page {missing_page} must still require ownership at page size {raw_page_size}"
+                );
+            }
+        }
     }
 
     #[test]
