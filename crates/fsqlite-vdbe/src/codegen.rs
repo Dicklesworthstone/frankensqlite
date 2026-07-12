@@ -11212,6 +11212,22 @@ fn codegen_select_aggregate(
             .unwrap_or(usize::MAX);
         let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
 
+        // INTEGER-affinity column + integer literal ⇒ the seek is EXACT: the index's storage-class
+        // order matches the WHERE comparison's, so a 0-match seek is authoritative and the full-scan
+        // fallback (an affinity safety net for mixed-type columns) is unnecessary. A miss then finalizes
+        // to the empty-aggregate result (COUNT=0 / SUM=NULL) directly — making a lookup of an absent key
+        // O(log n), not the O(n) fallback scan. (Non-exact columns keep the fallback.) bd-eq-seek-fallback-zero-match.
+        let exact_seek = matches!(target_expr, Expr::Literal(Literal::Integer(_), _))
+            && table
+                .columns
+                .get(index_table_col)
+                .is_some_and(|c| c.affinity == 'D');
+        let seek_miss_label = if exact_seek {
+            finalize_label
+        } else {
+            scan_fallback
+        };
+
         // Probe key is [target, i64::MIN] so SeekGE anchors on the first entry
         // of the duplicate run in a non-unique index.
         let probe_key_regs = b.alloc_regs(2);
@@ -11263,7 +11279,7 @@ fn codegen_select_aggregate(
             Opcode::SeekGE,
             idx_cursor,
             probe_record_reg,
-            scan_fallback,
+            seek_miss_label,
             P4::None,
             0,
         );
@@ -11329,14 +11345,19 @@ fn codegen_select_aggregate(
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
 
         b.resolve_label(duplicate_run_done);
-        b.emit_jump_to_label(
-            Opcode::If,
-            saw_index_match_reg,
-            0,
-            finalize_label,
-            P4::None,
-            0,
-        );
+        if exact_seek {
+            // Exact seek: 0 matches is authoritative → finalize directly (accumulators still Null).
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(
+                Opcode::If,
+                saw_index_match_reg,
+                0,
+                finalize_label,
+                P4::None,
+                0,
+            );
+        }
 
         // No index match: fall through to the full scan. No AggStep ran, so the
         // accumulators are still Null and the scan starts from a clean slate.

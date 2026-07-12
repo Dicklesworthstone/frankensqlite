@@ -17981,3 +17981,25 @@ test is on the executed path, not merely linked into it.
   SeekLT).
 - NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean. (Before is a range scan; after is
   a single O(log n) table seek — same shape as the shipped bd-minmax-range-seek win.)
+
+## 2026-07-12 - WIN: aggregate `WHERE col=<absent int>` skips the O(n) full-scan fallback (exact seek) — ~550-660× on existence checks (bd-eq-seek-fallback-zero-match)
+
+- Result type: WIN / shipped. The teed-up finding: the aggregate index-eq-seek fell back to a FULL SCAN
+  when the seek found 0 matching rows (an affinity safety net), so `COUNT(*)/SUM(b) FROM t WHERE col = ?`
+  with an absent key (a super-common existence check) cost O(n) (~3.4 ms/20k) not O(log n).
+- THE LEVER: when the seek is EXACT — an INTEGER-affinity column ('D') probed by an integer literal — a
+  0-match is authoritative (the index's storage-class order matches the WHERE comparison's; validated by
+  bd-minmax-range-seek's mixed-type oracle). The codegen now sets `exact_seek` and routes both the
+  `SeekGE` miss and the post-run branch to `finalize` (accumulators still Null → COUNT=0 / SUM=NULL /
+  MIN=NULL — the exact empty-aggregate result) instead of the `scan_fallback`. Non-exact columns (TEXT,
+  real literal, etc.) keep the fallback unchanged.
+- BYTE-EXACT GATE (`eq_seek_exact_oracle.rs`, PASS): vs rusqlite/C SQLite on a MIXED-type INTEGER column
+  (int + real + text values present) — existing keys (single & duplicate runs), NONEXISTENT keys
+  (COUNT=0 / SUM=NULL / MIN=NULL), COALESCE, and the non-exact cases (TEXT column, real literal) that
+  keep the fallback — all bit-identical.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
+- MEDIAN (release-perf, 20k rows): `COUNT(*) WHERE a=<absent>` 3.4 ms → 5.2 µs (~660×); `SUM(b)
+  WHERE a=<absent>` → 6.1 µs (~550×). The unindexed control (`WHERE u=?`) correctly still scans (2.3 ms).
+- SCOPE: this fixes the AGGREGATE eq-seek. The non-aggregate path (`SELECT … WHERE col=? LIMIT 1` /
+  EXISTS, codegen_select) has the same fallback and the same exact-seek opportunity — a follow-up.
+  Diagnostic: eq_seek_exact_profile.rs.
