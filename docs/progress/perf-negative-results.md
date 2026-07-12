@@ -18416,3 +18416,26 @@ test is on the executed path, not merely linked into it.
   passed. Corrected the assertion to `SeekGE`.
 - GATE: `agg_leading_eq_residual_oracle` byte-exact (text range one-/two-sided + residual eq/range/IN) +
   SeekGE opcode gate. No-reg: agg_index_range, agg_rowid_range_residual byte-exact.
+
+## 2026-07-12 - READY (implemented, ungated — pool re-saturated): parameterized residual in eq/range seeks (bd-agg-param-residual)
+
+- Result type: reverted to green (ungated — the rch pool caught a window earlier this turn for the TEXT
+  lever, then re-saturated before this gate ran). Change is compile-safe and byte-exact-safe BY
+  CONSTRUCTION; re-apply + gate the next clean window.
+- GAP: the leading-eq+residual and index-range+residual seeks require a placeholder-free WHERE, so
+  `COUNT(*)/SUM WHERE a = 7 AND x = ?` / `WHERE a > 5 AND x = ?` (a literal indexed constraint + a
+  PARAMETERIZED filter — ubiquitous in real apps) decline and full-scan.
+- CHANGE (detection only, 2 edits): (1) drop `expr_has_placeholder(where_expr)` from
+  `aggregate_index_prefix_literal_residual_target` (the prefix is already required to be an integer/text
+  LITERAL, so a parameterized prefix is rejected anyway); (2) drop the `expr_has_placeholder` early-return
+  from the residual branch of `aggregate_index_range_seek_target` (the `bounds_ok` check already requires
+  LITERAL bounds). Do NOT touch the rowid-range path: `is_rowid_range_constant` ACCEPTS placeholders and
+  that path has no literal-only bound check, so a placeholder bound would enter the probe and mis-number.
+- WHY BYTE-EXACT BY CONSTRUCTION: the seek probe emits only the literal prefix/bounds, consuming ZERO
+  anonymous placeholders, so when the residual filter runs it is the SAME `emit_where_filter` the full
+  scan uses with the anon counter at the same `where_placeholder_base` — a `?` in the residual is numbered
+  identically to the scan path. A `?` in the prefix/bound is rejected by the literal requirement.
+- ORACLE: flip the `a = 7 AND x = ?` assertion from "declines" to "seeks (SeekGE)"; add "parameterized
+  PREFIX (`a = ? AND x = 5`) declines". Literal residual byte-exact cases unchanged. (A byte-exact
+  param-binding test needs the compat `ConnectionExt::query_row_map` + `ParamValue` API — optional given
+  the construction argument + opcode gate.)
