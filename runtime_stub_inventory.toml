@@ -289,7 +289,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0025"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 8541
+line = 8570
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -301,7 +301,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0026"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 8555
+line = 8584
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -313,7 +313,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0027"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 8564
+line = 8593
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -325,7 +325,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0028"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 8574
+line = 8603
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -337,7 +337,7 @@ anchor = "return Err(CodegenError::Unsupported(\"empty join list\".to_owned()));
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0029"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 8631
+line = 8660
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -349,7 +349,7 @@ anchor = "return Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0030"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 9107
+line = 9136
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -361,7 +361,7 @@ anchor = "return Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0031"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 9129
+line = 9158
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -373,7 +373,7 @@ anchor = "_ => Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0032"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 11411
+line = 12176
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -385,7 +385,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0033"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 12322
+line = 13087
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -397,7 +397,7 @@ anchor = "CodegenError::Unsupported(\"result column not in GROUP BY clause\".to_
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0034"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 13040
+line = 13805
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -409,7 +409,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0035"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 13463
+line = 14228
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -421,7 +421,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0036"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 13717
+line = 14482
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -433,7 +433,7 @@ anchor = "return Err(CodegenError::Unsupported(\"empty VALUES\".to_owned()));"
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0037"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 13994
+line = 14759
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -445,7 +445,7 @@ anchor = ".ok_or_else(|| CodegenError::Unsupported(\"empty VALUES\".to_owned()))
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0038"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 14011
+line = 14776
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -457,7 +457,7 @@ anchor = "return Err(CodegenError::Unsupported(message));"
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0039"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 14022
+line = 14787
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -469,7 +469,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0040"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 14755
+line = 15520
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -481,7 +481,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0041"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 14785
+line = 15550
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -493,7 +493,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0042"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 14801
+line = 15566
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -505,7 +505,7 @@ anchor = "return Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0043"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15070
+line = 15835
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -517,7 +517,7 @@ anchor = "return Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0044"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15295
+line = 16060
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -529,7 +529,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0045"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15677
+line = 16442
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -541,7 +541,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0046"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15768
+line = 16533
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -553,7 +553,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0047"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15794
+line = 16559
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -565,7 +565,7 @@ anchor = "return Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0048"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15801
+line = 16566
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -577,7 +577,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0049"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15843
+line = 16608
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -589,7 +589,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0050"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15941
+line = 16706
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -601,7 +601,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0051"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15946
+line = 16711
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -613,7 +613,7 @@ anchor = "CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0052"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15962
+line = 16727
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -625,7 +625,7 @@ anchor = "return Err(CodegenError::Unsupported(format!("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0053"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15969
+line = 16734
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -637,7 +637,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0054"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 15978
+line = 16743
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -649,7 +649,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0055"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 16343
+line = 17108
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -661,7 +661,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0056"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 16601
+line = 17366
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -673,7 +673,7 @@ anchor = "return Err(CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0057"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 16607
+line = 17372
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -685,7 +685,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0058"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 16629
+line = 17394
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -697,7 +697,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0059"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17243
+line = 18008
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -709,7 +709,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0060"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17256
+line = 18021
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -721,7 +721,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0061"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17279
+line = 18044
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -733,7 +733,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0062"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17287
+line = 18052
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -745,7 +745,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0063"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17296
+line = 18061
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -757,7 +757,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0064"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17415
+line = 18180
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -769,7 +769,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0065"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17420
+line = 18185
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -781,7 +781,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0066"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17427
+line = 18192
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -793,7 +793,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0067"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17452
+line = 18217
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -805,7 +805,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0068"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17464
+line = 18229
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -817,7 +817,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0069"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17483
+line = 18248
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -829,7 +829,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0070"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17493
+line = 18258
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -841,7 +841,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0071"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17501
+line = 18266
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -853,7 +853,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0072"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17511
+line = 18276
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -865,7 +865,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0073"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17581
+line = 18346
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -877,7 +877,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0074"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17726
+line = 18491
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -889,7 +889,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0075"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 17857
+line = 18622
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -901,7 +901,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0076"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18071
+line = 18836
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -913,7 +913,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0077"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18083
+line = 18848
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -925,7 +925,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0078"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18087
+line = 18852
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -937,7 +937,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0079"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18099
+line = 18864
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -949,7 +949,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0080"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18107
+line = 18872
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -961,7 +961,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0081"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18118
+line = 18883
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -973,7 +973,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0082"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18491
+line = 19256
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -985,7 +985,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0083"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 18498
+line = 19263
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -997,7 +997,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0084"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 19137
+line = 19902
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -1009,7 +1009,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0085"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 19236
+line = 20001
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -1021,7 +1021,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0086"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 20074
+line = 20839
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
@@ -1033,7 +1033,7 @@ anchor = "CodegenError::Unsupported("
 [[runtime_stubs]]
 stub_id = "RSTUB-ACTIVE-0087"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 20664
+line = 21429
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
