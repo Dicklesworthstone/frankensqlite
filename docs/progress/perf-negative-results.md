@@ -17794,3 +17794,30 @@ test is on the executed path, not merely linked into it.
   large win.)
 - NET: the 3rd shipped byte-exact codegen win this session, extending the MIN/MAX-via-index family to
   the composite `WHERE a=?` prefix. Diagnostic retained: minmax_prefix_profile.rs.
+
+## 2026-07-11 - NEGATIVE: partial-key SeekLE/SeekGT is O(block) (forward walk), not O(log n) — a codegen value-sentinel fix is byte-exact-UNSAFE; the real fix is a chartered btree biased seek (bd-seek-partial-key-oblock-kwdxa)
+
+- Result type: NEGATIVE / root-caused, no clean one-pass fix. Found while benching the just-shipped
+  composite MIN/MAX-prefix lever (bd-minmax-prefix-seek): `MAX(b) WHERE a=7` = 270 µs vs `MIN(b)` = 8 µs
+  on a ~1000-row `a=7` block — a 34× gap for symmetric ops.
+- ROOT CAUSE (engine.rs ~9376-9416 / ~9332-9374): `SeekLE`/`SeekGT` with a PARTIAL (prefix) probe key
+  walk forward past the ENTIRE equal-run: `index_move_to([a])` lands on the FIRST `a`-block entry, then
+  `while compare(current, target, target.len()) == Equal { next() }` steps through every `(a, *)` entry
+  before `prev()` (SeekLE) — O(block size). `SeekGE`/`SeekLT` have no such loop (O(log n)), which is why
+  `MIN` (SeekGE) is 8 µs. This also slows the shipped composite DESC prefix range scans, which likewise
+  position at a block's high end via `SeekLE([prefix..])`.
+- WHY NO CODEGEN WORKAROUND: making `MAX` probe a 2-field `[a, sentinel]` upper bound so the seek lands
+  past the block would need `sentinel` > EVERY `b` in the block. No such value is byte-exact-safe: a
+  column can hold mixed storage classes (NULL<num<text<blob), so a numeric sentinel (`i64::MAX`,
+  `f64::INFINITY`) is beaten by any text/blob `b`, and a blob sentinel is beaten by a larger blob `b` —
+  and affinity does NOT preclude off-type values (a blob inserted into an INTEGER-affinity column stays a
+  blob). On such data the seek would land at the block's FIRST entry and `prev()` off the front → wrong
+  MAX. Verified `index_move_to(cx, key)` (fsqlite-btree traits.rs:85) takes no bias flag.
+- THE CORRECT FIX (chartered, byte-exact): a btree biased seek — position at the first entry STRICTLY
+  GREATER than the prefix in O(log n) by treating a prefix-exhausted key comparison as `Greater`
+  (SQLite's `UNPACKED_PREFIX` / `default_rc`), then `prev()`. Requires threading a bias/upper flag through
+  the `index_move_to` trait + all impls (traits/cursor/engine) + the internal binary-search comparison.
+  Broad, correctness-sensitive `fsqlite-btree` work — not a one-pass lever. bd-seek-partial-key-oblock-kwdxa.
+- IMPACT IF FIXED: `MAX(b) WHERE a=?` (composite) 270 µs → ~8 µs (~34×), plus faster composite DESC
+  range-scan positioning. The already-shipped composite MIN/MAX lever remains a net win (MAX ~9× / MIN
+  ~297× vs the group scan); this only leaves the MAX path short of MIN's speed.
