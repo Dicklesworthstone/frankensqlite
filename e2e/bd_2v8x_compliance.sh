@@ -103,7 +103,12 @@ has_wal_pager_edge="$(
         | ($m.workspace_members | map((split("/")[-1] | split("#")[0]))) as $members
         | .resolve.nodes[]
         | select((.id | split("/")[-1] | split("#")[0]) == "fsqlite-wal")
-        | [.deps[]?.name | gsub("_"; "-") | select(. == "fsqlite-pager")] | length
+        | [.deps[]?
+           | select((.dep_kinds | length) == 0 or any(.dep_kinds[]; .kind != "dev"))
+           | .name
+           | gsub("_"; "-")
+           | select(. == "fsqlite-pager")]
+        | length
     ' "${metadata_json}"
 )"
 if [[ "${has_wal_pager_edge}" -ne 0 ]]; then
@@ -118,7 +123,9 @@ if ! jq -r '
         | .resolve.nodes[]
         | (.id | split("/")[-1] | split("#")[0]) as $from
         | select($members | index($from))
-        | .deps[]?.name as $dep_raw
+        | .deps[]?
+        | select((.dep_kinds | length) == 0 or any(.dep_kinds[]; .kind != "dev"))
+        | .name as $dep_raw
         | ($dep_raw | gsub("_"; "-")) as $dep
         | select($members | index($dep))
         | "\($from) \($dep)"

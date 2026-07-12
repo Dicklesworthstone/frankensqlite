@@ -69,10 +69,14 @@ const SUPPORTING_DIRS: [&str; 5] = [
     "legacy_sqlite_code",
 ];
 
-/// 10-layer dependency hierarchy from §8.2.
+/// Current 10-layer production dependency hierarchy.
 ///
-/// No crate may depend on a strictly higher layer (except where explicitly
-/// allowed for apps at L9).
+/// The original §8.2 hierarchy predated the production pager -> WAL and
+/// MVCC -> B-tree edges.  Keep the same ten-layer shape while assigning each
+/// crate at or above every production dependency.  Development-only edges are
+/// intentionally excluded by `internal_dep_graph`: Cargo permits cycles in the
+/// union of normal and dev dependency graphs, while published crates must have
+/// an acyclic normal/build dependency graph.
 fn layer_assignments() -> HashMap<&'static str, u8> {
     let mut m = HashMap::new();
     // Layer 0: leaves
@@ -82,19 +86,19 @@ fn layer_assignments() -> HashMap<&'static str, u8> {
     m.insert("fsqlite-vfs", 1);
     m.insert("fsqlite-ast", 1);
     m.insert("fsqlite-observability", 1);
-    // Layer 2: cache + parser + func
-    m.insert("fsqlite-pager", 2);
+    // Layer 2: log + parser + func
+    m.insert("fsqlite-wal", 2);
     m.insert("fsqlite-parser", 2);
     m.insert("fsqlite-func", 2);
-    // Layer 3: log + mvcc + planner
-    m.insert("fsqlite-wal", 3);
-    m.insert("fsqlite-mvcc", 3);
+    // Layer 3: cache + planner
+    m.insert("fsqlite-pager", 3);
     m.insert("fsqlite-planner", 3);
     // Layer 4: btree
     m.insert("fsqlite-btree", 4);
-    // Layer 5: vm
-    m.insert("fsqlite-vdbe", 5);
-    // Layer 6: extensions
+    // Layer 5: MVCC (depends on the B-tree implementation)
+    m.insert("fsqlite-mvcc", 5);
+    // Layer 6: VM + extensions
+    m.insert("fsqlite-vdbe", 6);
     m.insert("fsqlite-ext-fts3", 6);
     m.insert("fsqlite-ext-fts5", 6);
     m.insert("fsqlite-ext-rtree", 6);
@@ -186,7 +190,8 @@ fn name_from_pkg_id(id: &str) -> String {
     }
 }
 
-/// Build the internal (workspace-only) dependency graph from cargo metadata.
+/// Build the internal production (workspace-only) dependency graph from cargo
+/// metadata.
 ///
 /// Returns a map: crate_name -> set of internal dependency names.
 fn internal_dep_graph(metadata: &serde_json::Value) -> BTreeMap<String, BTreeSet<String>> {
@@ -208,6 +213,16 @@ fn internal_dep_graph(metadata: &serde_json::Value) -> BTreeMap<String, BTreeSet
         let deps: BTreeSet<String> = deps_array
             .iter()
             .filter_map(|dep| {
+                let dep_kinds = dep["dep_kinds"].as_array();
+                let production_dependency = dep_kinds.is_none_or(|kinds| {
+                    kinds
+                        .iter()
+                        .any(|kind| kind["kind"].as_str() != Some("dev"))
+                });
+                if !production_dependency {
+                    return None;
+                }
+
                 let dep_name = dep["name"].as_str()?;
                 // cargo metadata uses underscores in dep names, convert back
                 let normalized = dep_name.replace('_', "-");
@@ -514,13 +529,13 @@ fn test_wal_does_not_depend_on_pager() {
 }
 
 #[test]
-fn test_mvcc_at_layer_3() {
+fn test_mvcc_at_layer_5() {
     let layers = layer_assignments();
     assert_eq!(
         layers.get("fsqlite-mvcc"),
-        Some(&3),
+        Some(&5),
         "bead_id={BEAD_ID} case=mvcc_layer \
-         fsqlite-mvcc must be at L3 (not L6) per §8.2 rationale"
+         fsqlite-mvcc must be at L5, above its production B-tree dependency"
     );
 }
 
