@@ -120,11 +120,25 @@ fn agg_index_range_matches_sqlite() {
         // Covering SUM of the *indexed* column (read straight from the index, no table lookup).
         "SELECT SUM(a) FROM t WHERE a > 100",
         "SELECT SUM(a) FROM t WHERE a BETWEEN 0 AND 200",
-        // Residual predicate: MUST NOT drop `x = 5` (decline the range seek, still byte-exact via scan).
+        // Range + residual (placeholder-free): seek the range as a superset, re-apply the whole WHERE.
+        // MUST NOT drop the residual `x = 5` / `x > 3` / `x IN (...)`.
         "SELECT COUNT(*) FROM t WHERE a > 100 AND x = 5",
+        "SELECT SUM(x) FROM t WHERE a BETWEEN 0 AND 200 AND x > 3",
+        "SELECT COUNT(*) FROM t WHERE a > 100 AND x IN (2, 5)",
+        "SELECT COUNT(*) FROM t WHERE a >= -100 AND a <= 100 AND x <> 5",
     ] {
         cmp(sql);
     }
+
+    // Range + residual now SEEKS (superset) instead of scanning; the residual is enforced by the filter.
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE a > 100 AND x = 5", "SeekGE"),
+        "range + residual must seek the range (SeekGE) and filter the residual"
+    );
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE a > 100 AND x = 5", "SeekRowid"),
+        "range + residual is non-covering (SeekRowid to read the residual column)"
+    );
 
     // Opcode gate: a lower-bounded range seeks the index for both aggregates.
     assert!(

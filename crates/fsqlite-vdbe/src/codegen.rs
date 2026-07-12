@@ -10944,21 +10944,65 @@ fn index_integer_in_list_target<'t>(
 /// column, so a residual `c = 5` or a second column declines), so the seek — which applies no
 /// residual filter — is byte-exact. Rowid tables only; the trailing sentinel in the probe is the
 /// rowid.
+/// Returns `(index, range, has_residual)`. `has_residual == false` is the residual-free case above.
+/// `has_residual == true` additionally allows a range on an INTEGER-affinity single-column index that
+/// coexists with OTHER (placeholder-free) predicates the seek cannot enforce: the integer-literal
+/// bounds make the seek a SUPERSET of the matching rows, and the caller re-applies the whole WHERE as a
+/// residual filter per row, so it stays byte-exact. Aggregates are order-independent, so visiting a
+/// superset and filtering is safe.
 fn aggregate_index_range_seek_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
-) -> Option<(&'t IndexSchema, ColumnRangeTarget<'e>)> {
+) -> Option<(&'t IndexSchema, ColumnRangeTarget<'e>, bool)> {
     if table.without_rowid {
         return None;
     }
-    let (col_name, range) = extract_column_range_target(where_clause, table, table_alias)?;
-    let idx = table
-        .index_for_column(&col_name)
-        .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
-    index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range)
-        .then_some((idx, range))
+    let where_expr = where_clause?;
+    // Residual-free: the WHOLE WHERE is a range on one column.
+    if let Some((col_name, range)) = extract_column_range_target(where_clause, table, table_alias) {
+        let idx = table
+            .index_for_column(&col_name)
+            .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+        return index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range)
+            .then_some((idx, range, false));
+    }
+    // Residual: a range on an INTEGER-exact single-column index plus other placeholder-free predicates.
+    if expr_has_placeholder(where_expr) {
+        return None;
+    }
+    for index in &table.indexes {
+        if index.key_term_count() != 1
+            || index.key_term_descending(0)
+            || !index.supports_direct_column_lookup()
+        {
+            continue;
+        }
+        let col_name = &index.columns[0];
+        let is_integer = table
+            .column_index(col_name)
+            .and_then(|ci| table.columns.get(ci))
+            .is_some_and(|c| c.affinity == 'D');
+        if !is_integer {
+            continue;
+        }
+        let Some(range) = extract_named_column_range(where_expr, table, table_alias, col_name) else {
+            continue;
+        };
+        let int_bounds = range
+            .lower
+            .as_ref()
+            .is_none_or(|b| matches!(b.expr(), Expr::Literal(Literal::Integer(_), _)))
+            && range
+                .upper
+                .as_ref()
+                .is_none_or(|b| matches!(b.expr(), Expr::Literal(Literal::Integer(_), _)));
+        if int_bounds {
+            return Some((index, range, true));
+        }
+    }
+    None
 }
 
 /// Conservatively whether `expr` might contain a bound parameter. Only provably-literal shapes
@@ -11827,15 +11871,17 @@ fn codegen_select_aggregate(
             );
         }
         skip_scan = true;
-    } else if let Some((idx_schema, index_range)) = index_range_seek {
+    } else if let Some((idx_schema, index_range, has_residual)) = index_range_seek {
         // Single-column index range: position at the lower bound (or `Rewind` when unbounded below),
         // walk while the key stays within the range, accumulate. Mirrors the ascending half of
         // `codegen_select_index_range_scan`; a NULL bound / empty range jumps to finalize (still-Null
         // accumulators → COUNT=0 / SUM=NULL). No ORDER BY / LIMIT to satisfy here. When every aggregate
         // reads only the indexed column (or is COUNT(*)/SUM(rowid)) the walk is COVERING — the table
         // cursor is never opened and no `SeekRowid` is emitted (SQLite's "USING COVERING INDEX" plan).
+        // With a residual predicate the walk is a SUPERSET, so it is forced non-covering and the whole
+        // (placeholder-free) WHERE is re-applied per row.
         let idx_cursor = 1_i32;
-        let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        let covering = !has_residual && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
         let bound_affinity = idx_schema
             .columns
             .first()
@@ -11953,6 +11999,10 @@ fn codegen_select_aggregate(
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+            // Residual: re-apply the whole (placeholder-free) WHERE; the range is a superset.
+            if has_residual && let Some(where_expr) = where_clause {
+                emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+            }
             emit_aggregate_accumulate_body(
                 b,
                 cursor,

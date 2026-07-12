@@ -18316,3 +18316,21 @@ test is on the executed path, not merely linked into it.
   predicate, so it stays byte-exact.
 - GATE: `agg_leading_eq_residual_oracle` extended with IN/BETWEEN/NOT-IN residual cases (+ SeekGE opcode
   gate for the IN residual). No-reg: in_list_shadowed_index, eq_seek_exact byte-exact.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM WHERE a <range> AND <residual> seeks the range + filters (bd-agg-range-residual)
+
+- Result type: WIN / shipped. The symmetric completion of bd-agg-leading-eq-residual: a range on an
+  indexed column PLUS a residual predicate (`a > 100 AND x = 5`, `a BETWEEN 0 AND 200 AND x > 3`,
+  `a > 100 AND x IN (2,5)`) full-scanned — the residual-safe range detection declines a residual, and
+  there is no equality prefix, so neither existing seek fired.
+- FIX: generalize `aggregate_index_range_seek_target` to return `(index, range, has_residual)` — the
+  residual-free case is unchanged; the residual case additionally matches a range on an INTEGER-affinity
+  single-column index (integer-literal bounds → the seek is a SUPERSET, no affinity miss) when the WHERE
+  is placeholder-free. The existing `index_range_seek` branch forces non-covering and re-applies the whole
+  WHERE via `emit_where_filter` per row when `has_residual`. Aggregates are order-independent, so visiting
+  a superset and filtering is byte-exact. Routing: eq+residual → index_prefix_residual_seek; range+residual
+  → index_range_seek; eq + range-on-next-col → composite_prefix_range_seek.
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_index_range_oracle` extended — residual eq / range / IN
+  / `<>`; opcode gates that `a>100 AND x=5` now SeekGEs (and is non-covering / has SeekRowid). No-reg:
+  agg_leading_eq_residual, agg_composite_prefix_range, minmax_range byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a<range> AND <residual>` full scan → O(log n + block) range seek + per-row filter.
