@@ -1684,26 +1684,33 @@ impl<F: VfsFile> PagerInner<F> {
         match cache.read_page_copy(cx, &mut self.db_file, page_no) {
             Ok(data) => Ok(data),
             Err(FrankenError::OutOfMemory) => {
-                if cache.evict_any() {
-                    cache.read_page_copy(cx, &mut self.db_file, page_no)
-                } else {
-                    let page_size = self.page_size.as_usize();
-                    let offset = u64::from(page_no.get() - 1) * page_size as u64;
-                    let mut out = vec![0_u8; page_size];
-                    let bytes_read = self.db_file.read(cx, &mut out, offset)?;
-                    if bytes_read < page_size {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "short read fetching page {page}: got {bytes_read} of {page_size}",
-                                page = page_no.get()
-                            ),
-                        });
+                if cache.evict_clean_any() {
+                    match cache.read_page_copy(cx, &mut self.db_file, page_no) {
+                        Err(FrankenError::OutOfMemory) => self.read_page_copy_uncached(cx, page_no),
+                        result => result,
                     }
-                    Ok(out)
+                } else {
+                    self.read_page_copy_uncached(cx, page_no)
                 }
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn read_page_copy_uncached(&mut self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        let page_size = self.page_size.as_usize();
+        let offset = u64::from(page_no.get() - 1) * page_size as u64;
+        let mut out = vec![0_u8; page_size];
+        let bytes_read = self.db_file.read(cx, &mut out, offset)?;
+        if bytes_read < page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read fetching page {page}: got {bytes_read} of {page_size}",
+                    page = page_no.get()
+                ),
+            });
+        }
+        Ok(out)
     }
 
     /// Read a page from the latest committed database state without consulting
@@ -2315,7 +2322,8 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
             let remaining = durable_freelist.len().saturating_sub(leaf_index);
             let take = remaining.min(max_leaf_entries);
 
-            let mut buf = pool.acquire()?;
+            let mut buf =
+                acquire_page_buf_with_clean_cache_recovery(pool, cache, "freelist_trunk_stage")?;
             // Zero the entire page to avoid leaking stale data from the
             // pool in the unused tail of the trunk page.
             buf.fill(0);
@@ -6290,6 +6298,7 @@ impl StagedPage {
         }
     }
 
+    #[cfg(test)]
     fn from_bytes(pool: &PageBufPool, data: &[u8]) -> Result<Self> {
         let mut buf = pool.acquire()?;
         let len = buf.len().min(data.len());
@@ -6307,11 +6316,57 @@ impl StagedPage {
         }
     }
 
-    fn from_page_data_for_pool(pool: &PageBufPool, data: PageData) -> Result<Self> {
+    fn from_page_data_with_cache_recovery(
+        pool: &PageBufPool,
+        cache: &ShardedPageCache,
+        data: PageData,
+        operation: &'static str,
+    ) -> Result<Self> {
         if data.len() == pool.page_size() {
-            Ok(Self::from_page_data(data))
-        } else {
-            Self::from_bytes(pool, data.as_bytes())
+            return Ok(Self::from_page_data(data));
+        }
+        let mut buffer = acquire_page_buf_with_clean_cache_recovery(pool, cache, operation)?;
+        let len = buffer.len().min(data.len());
+        buffer[..len].copy_from_slice(&data.as_bytes()[..len]);
+        if len < buffer.len() {
+            buffer[len..].fill(0);
+        }
+        Ok(Self::from_buf(buffer))
+    }
+
+    /// Convert a committed staged image into a cache buffer without escaping
+    /// the configured pool bound. A foreign/standalone backing is copied into
+    /// a pool-owned buffer; if no clean resident can be reclaimed, the caller
+    /// may safely omit this post-commit cache admission.
+    fn into_cache_buf(self, pool: &PageBufPool, cache: &ShardedPageCache) -> Result<PageBuf> {
+        match self.backing {
+            StagedPageBacking::Buffered(buffer) if buffer.returns_to_pool(pool) => Ok(buffer),
+            StagedPageBacking::Buffered(source) => {
+                let mut buffer = acquire_page_buf_with_clean_cache_recovery(
+                    pool,
+                    cache,
+                    "committed_page_cache_admission",
+                )?;
+                let len = buffer.len().min(source.len());
+                buffer[..len].copy_from_slice(&source[..len]);
+                if len < buffer.len() {
+                    buffer[len..].fill(0);
+                }
+                Ok(buffer)
+            }
+            StagedPageBacking::Owned(source) => {
+                let mut buffer = acquire_page_buf_with_clean_cache_recovery(
+                    pool,
+                    cache,
+                    "committed_page_cache_admission",
+                )?;
+                let len = buffer.len().min(source.len());
+                buffer[..len].copy_from_slice(&source.as_bytes()[..len]);
+                if len < buffer.len() {
+                    buffer[len..].fill(0);
+                }
+                Ok(buffer)
+            }
         }
     }
 
@@ -6470,6 +6525,44 @@ impl StagedPage {
 /// batches increase lock contention on write-heavy workloads.
 const PAGE_LEASE_BATCH_SIZE: u32 = 8;
 
+fn acquire_page_buf_with_clean_cache_recovery(
+    pool: &PageBufPool,
+    cache: &ShardedPageCache,
+    operation: &'static str,
+) -> Result<PageBuf> {
+    match pool.acquire() {
+        Ok(buffer) => return Ok(buffer),
+        Err(FrankenError::OutOfMemory) => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(buffer) = cache.take_clean_buffer() {
+        return Ok(buffer);
+    }
+    // A concurrent holder may have returned a buffer while the cache victim
+    // scan was in progress. Recheck the free list so the failure snapshot has
+    // a clean linearization point and never reports capacity with an idle
+    // buffer already available.
+    match pool.acquire() {
+        Ok(buffer) => return Ok(buffer),
+        Err(FrankenError::OutOfMemory) => {}
+        Err(error) => return Err(error),
+    }
+
+    let snapshots = cache.page_snapshots();
+    let cached_dirty = snapshots.iter().filter(|page| page.dirty).count();
+    let cached_clean = snapshots.len().saturating_sub(cached_dirty);
+    Err(FrankenError::PageBufferCapacityExhausted {
+        operation,
+        page_size: pool.page_size(),
+        max_buffers: pool.capacity(),
+        total_buffers: pool.total_buffers(),
+        available_buffers: pool.available(),
+        cached_clean,
+        cached_dirty,
+        successful_evictions: 0,
+    })
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
@@ -6625,6 +6718,22 @@ impl<V: Vfs> SimpleTransaction<V> {
     #[must_use]
     pub(crate) fn scratch_arena(&self) -> &bumpalo::Bump {
         &self.scratch_arena
+    }
+
+    /// Allocate a staged write buffer, reclaiming only clean shared-cache
+    /// entries if the common pool has reached its configured ceiling.
+    fn stage_page_bytes(&self, data: &[u8]) -> Result<StagedPage> {
+        let mut buffer = acquire_page_buf_with_clean_cache_recovery(
+            &self.pool,
+            &self.cache,
+            "transaction_write_stage",
+        )?;
+        let len = buffer.len().min(data.len());
+        buffer[..len].copy_from_slice(&data[..len]);
+        if len < buffer.len() {
+            buffer[len..].fill(0);
+        }
+        Ok(StagedPage::from_buf(buffer))
     }
 
     /// Submodular greedy prefetch selector (IMPL-8 / AG-O3 + AAC-P4).
@@ -7168,7 +7277,12 @@ impl<V: Vfs> SimpleTransaction<V> {
                 &mut self.write_set,
                 &mut self.write_pages_sorted,
                 page_no,
-                StagedPage::from_page_data_for_pool(&self.pool, page)?,
+                StagedPage::from_page_data_with_cache_recovery(
+                    &self.pool,
+                    &self.cache,
+                    page,
+                    "retained_memory_overlay_stage",
+                )?,
             );
         }
         Ok(())
@@ -7242,7 +7356,14 @@ impl<V: Vfs> SimpleTransaction<V> {
     fn drain_committed_cache_pages(&mut self) -> Vec<(PageNumber, PageBuf)> {
         let mut committed_pages = Vec::with_capacity(self.write_set.len());
         for (page_no, staged) in self.write_set.drain() {
-            committed_pages.push((page_no, staged.into_buf(&self.pool)));
+            match staged.into_cache_buf(&self.pool, &self.cache) {
+                Ok(buffer) => committed_pages.push((page_no, buffer)),
+                Err(error) => tracing::debug!(
+                    page_no = page_no.get(),
+                    error = %error,
+                    "skipping optional committed-page cache admission at pool capacity"
+                ),
+            }
         }
         self.write_pages_sorted.clear();
         committed_pages
@@ -7250,8 +7371,14 @@ impl<V: Vfs> SimpleTransaction<V> {
 
     fn drain_committed_cache_pages_into_cache(&mut self) {
         for (page_no, staged) in self.write_set.drain() {
-            self.cache
-                .insert_buffer(page_no, staged.into_buf(&self.pool));
+            match staged.into_cache_buf(&self.pool, &self.cache) {
+                Ok(buffer) => self.cache.insert_buffer(page_no, buffer),
+                Err(error) => tracing::debug!(
+                    page_no = page_no.get(),
+                    error = %error,
+                    "skipping optional committed-page cache admission at pool capacity"
+                ),
+            }
         }
         self.write_pages_sorted.clear();
     }
@@ -9040,13 +9167,6 @@ where
 
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.ensure_writer(cx)?;
-        // #70 ghost-commit guard: record that a write was staged on this
-        // transaction. Checked at commit entry to detect silent state loss.
-        self.writes_observed = true;
-
-        // If we are writing to a page that was previously freed in this transaction,
-        // we must "un-free" it.
-        self.remove_freed_page_if_present(page_no);
 
         // Fast path: a second (or Nth) write to the same page within the
         // same transaction reuses the already-allocated StagedPage buffer
@@ -9057,11 +9177,17 @@ where
         if let Some(existing) = self.write_set.get_mut(&page_no)
             && existing.try_overwrite_bytes_in_place(data)
         {
+            self.writes_observed = true;
+            self.remove_freed_page_if_present(page_no);
             STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(());
         }
 
-        let staged = StagedPage::from_bytes(&self.pool, data)?;
+        let staged = self.stage_page_bytes(data)?;
+        // Mutate transaction bookkeeping only after fallible staging succeeds;
+        // a capacity error must leave the prior free/write state untouched.
+        self.writes_observed = true;
+        self.remove_freed_page_if_present(page_no);
         insert_staged_page(
             &mut self.write_set,
             &mut self.write_pages_sorted,
@@ -9073,10 +9199,6 @@ where
 
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         self.ensure_writer(cx)?;
-        // #70 ghost-commit guard: see `write_page` for rationale.
-        self.writes_observed = true;
-
-        self.remove_freed_page_if_present(page_no);
 
         // Same-page steal fast path (see `write_page`). If the existing staged
         // image cannot be overwritten because it has been published or is no
@@ -9085,14 +9207,25 @@ where
         // though `write_pages_sorted` is already correct.
         if let Some(existing) = self.write_set.get_mut(&page_no) {
             if existing.try_overwrite_page_data_in_place(&data) {
+                self.writes_observed = true;
+                self.remove_freed_page_if_present(page_no);
                 STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                 return Ok(());
             }
-            *existing = StagedPage::from_page_data_for_pool(&self.pool, data)?;
-            return Ok(());
         }
 
-        let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
+        let staged = StagedPage::from_page_data_with_cache_recovery(
+            &self.pool,
+            &self.cache,
+            data,
+            "transaction_write_page_data",
+        )?;
+        self.writes_observed = true;
+        self.remove_freed_page_if_present(page_no);
+        if let Some(existing) = self.write_set.get_mut(&page_no) {
+            *existing = staged;
+            return Ok(());
+        }
 
         insert_staged_page(
             &mut self.write_set,
@@ -9142,11 +9275,14 @@ where
         data: PageData,
     ) -> Result<()> {
         self.ensure_writer(cx)?;
-        // #70 ghost-commit guard: restoring staged page data re-enters the
-        // write_set, so mark writes_observed for the same reason as
-        // write_page / write_page_data.
+        let staged = StagedPage::from_page_data_with_cache_recovery(
+            &self.pool,
+            &self.cache,
+            data,
+            "restore_staged_page_data",
+        )?;
+        // #70 ghost-commit guard: mark only after fallible staging succeeds.
         self.writes_observed = true;
-        let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
         insert_staged_page(
             &mut self.write_set,
             &mut self.write_pages_sorted,
@@ -10374,7 +10510,12 @@ where
             .map(|(&k, v)| -> Result<(PageNumber, StagedPage)> {
                 Ok((
                     k,
-                    StagedPage::from_page_data_for_pool(&self.pool, v.clone())?,
+                    StagedPage::from_page_data_with_cache_recovery(
+                        &self.pool,
+                        &self.cache,
+                        v.clone(),
+                        "savepoint_rollback_stage",
+                    )?,
                 ))
             })
             .collect::<Result<PagePageMap<_>>>()?;
@@ -11053,6 +11194,239 @@ mod tests {
         let path = PathBuf::from("/test.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, path)
+    }
+
+    #[test]
+    fn gh_131_write_stage_reclaims_clean_cache_page_when_pool_is_saturated() {
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx_and_page_buffer_max(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/clean_cache_write_admission.db"),
+            PageSize::DEFAULT,
+            Some(2),
+        )
+        .unwrap();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        for raw_page_no in 1..=2 {
+            let page_no = PageNumber::new(raw_page_no).unwrap();
+            let mut buffer = pager.pool.acquire().unwrap();
+            buffer.as_mut_slice()[0] = u8::try_from(raw_page_no).unwrap();
+            pager.cache.insert_buffer(page_no, buffer);
+        }
+        assert_eq!(pager.pool.total_buffers(), 2);
+        assert_eq!(pager.pool.available(), 0);
+        assert_eq!(pager.cache.metrics_snapshot().cached_pages, 2);
+
+        let write_page = PageNumber::new(3).unwrap();
+        txn.write_page(&cx, write_page, &sample_page(0x5A))
+            .expect("write staging should evict one clean cache page and retry");
+
+        assert_eq!(pager.cache.metrics_snapshot().cached_pages, 1);
+        assert!(txn.write_set.contains_key(&write_page));
+        assert_eq!(pager.pool.total_buffers(), 2);
+        txn.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn gh_131_write_stage_reports_capacity_without_evicting_dirty_cache_page() {
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx_and_page_buffer_max(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/dirty_cache_write_admission.db"),
+            PageSize::DEFAULT,
+            Some(1),
+        )
+        .unwrap();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let dirty_page = PageNumber::ONE;
+        pager
+            .cache
+            .insert_fresh(dirty_page, |bytes| bytes[0] = 0xD1)
+            .unwrap();
+
+        let error = txn
+            .write_page(&cx, PageNumber::new(2).unwrap(), &sample_page(0x6B))
+            .expect_err("a dirty-only saturated cache must fail closed");
+        match error {
+            FrankenError::PageBufferCapacityExhausted {
+                operation,
+                page_size,
+                max_buffers,
+                total_buffers,
+                available_buffers,
+                cached_clean,
+                cached_dirty,
+                successful_evictions,
+            } => {
+                assert_eq!(operation, "transaction_write_stage");
+                assert_eq!(page_size, PageSize::DEFAULT.as_usize());
+                assert_eq!(max_buffers, 1);
+                assert_eq!(total_buffers, 1);
+                assert_eq!(available_buffers, 0);
+                assert_eq!(cached_clean, 0);
+                assert_eq!(cached_dirty, 1);
+                assert_eq!(successful_evictions, 0);
+            }
+            other => panic!("expected structured capacity exhaustion, got {other:?}"),
+        }
+        assert!(pager.cache.contains(dirty_page));
+        assert!(!txn.writes_observed);
+        assert!(txn.write_set.is_empty());
+        txn.commit(&cx)
+            .expect("failed staging must leave a valid no-op transaction");
+    }
+
+    #[test]
+    fn gh_131_repeated_owned_page_cache_admission_stays_within_pool_bound() {
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx_and_page_buffer_max(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/bounded_owned_cache_admission.db"),
+            PageSize::DEFAULT,
+            Some(1),
+        )
+        .unwrap();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        pager
+            .cache
+            .insert_buffer(PageNumber::ONE, pager.pool.acquire().unwrap());
+
+        for raw_page_no in 2..=64 {
+            let page_no = PageNumber::new(raw_page_no).unwrap();
+            txn.write_page_data(
+                &cx,
+                page_no,
+                PageData::from_vec(sample_page(u8::try_from(raw_page_no).unwrap())),
+            )
+            .unwrap();
+            txn.drain_committed_cache_pages_into_cache();
+
+            assert_eq!(pager.pool.total_buffers(), 1);
+            assert_eq!(pager.cache.metrics_snapshot().cached_pages, 1);
+            assert!(pager.cache.contains(page_no));
+        }
+        txn.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn gh_131_read_copy_capacity_fallback_preserves_dirty_cache_page() {
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx_and_page_buffer_max(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/dirty_cache_read_fallback.db"),
+            PageSize::DEFAULT,
+            Some(1),
+        )
+        .unwrap();
+        let expected = sample_page(0x27);
+        let page_no = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_no = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page_no, &expected).unwrap();
+            seed.commit(&cx).unwrap();
+            page_no
+        };
+
+        pager.cache.clear();
+        pager
+            .cache
+            .insert_fresh(PageNumber::ONE, |bytes| bytes[0] = 0xD1)
+            .unwrap();
+        let data = pager
+            .inner
+            .lock()
+            .unwrap()
+            .read_page_copy(&cx, &pager.cache, &pager.wal_backend, page_no)
+            .unwrap();
+
+        assert_eq!(data, expected);
+        assert!(pager.cache.contains(PageNumber::ONE));
+        assert!(
+            pager
+                .cache
+                .page_snapshots()
+                .iter()
+                .any(|snapshot| snapshot.page_no == PageNumber::ONE && snapshot.dirty)
+        );
+    }
+
+    #[test]
+    fn gh_131_file_backed_saturated_cache_write_commit_and_rollback_are_correct() {
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx_and_page_buffer_max(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/saturated_cache_transaction_cycle.db"),
+            PageSize::DEFAULT,
+            Some(2),
+        )
+        .unwrap();
+
+        let original = sample_page(0x31);
+        let seeded_page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_no = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page_no, &original).unwrap();
+            seed.commit(&cx).unwrap();
+            page_no
+        };
+
+        let saturate_cache = |page_numbers: &[PageNumber]| {
+            pager.cache.clear();
+            for &page_no in page_numbers {
+                let bytes = pager
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .read_page_copy_uncached(&cx, page_no)
+                    .unwrap();
+                let mut buffer = pager.pool.acquire().unwrap();
+                buffer.copy_from_slice(&bytes);
+                pager.cache.insert_buffer(page_no, buffer);
+            }
+            assert_eq!(pager.pool.available(), 0);
+            assert_eq!(
+                pager.cache.metrics_snapshot().cached_pages,
+                page_numbers.len()
+            );
+        };
+        saturate_cache(&[PageNumber::ONE, seeded_page]);
+
+        let committed = sample_page(0x42);
+        let committed_page = {
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_no = writer.allocate_page(&cx).unwrap();
+            writer.write_page(&cx, page_no, &committed).unwrap();
+            writer.commit(&cx).unwrap();
+            page_no
+        };
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, committed_page).unwrap().as_bytes(),
+            committed
+        );
+        reader.rollback(&cx).unwrap();
+
+        saturate_cache(&[PageNumber::ONE, committed_page]);
+        let rolled_back = sample_page(0x53);
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        writer
+            .write_page(&cx, committed_page, &rolled_back)
+            .unwrap();
+        writer.rollback(&cx).unwrap();
+
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, committed_page).unwrap().as_bytes(),
+            committed
+        );
+        reader.rollback(&cx).unwrap();
+        assert!(pager.pool.total_buffers() <= pager.pool.capacity());
     }
 
     fn sample_page(seed: u8) -> Vec<u8> {

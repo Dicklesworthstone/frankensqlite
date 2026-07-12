@@ -264,6 +264,24 @@ pub enum FrankenError {
     #[error("out of memory")]
     OutOfMemory,
 
+    /// The logical page-buffer ceiling was reached even after reclaiming
+    /// eligible clean cache entries. This is deliberately distinct from
+    /// [`Self::OutOfMemory`]: it describes configured pager capacity, not a
+    /// host allocator failure.
+    #[error(
+        "page buffer capacity exhausted during {operation}: page_size={page_size}, max_buffers={max_buffers}, total_buffers={total_buffers}, available_buffers={available_buffers}, cached_clean={cached_clean}, cached_dirty={cached_dirty}, successful_evictions={successful_evictions}"
+    )]
+    PageBufferCapacityExhausted {
+        operation: &'static str,
+        page_size: usize,
+        max_buffers: usize,
+        total_buffers: usize,
+        available_buffers: usize,
+        cached_clean: usize,
+        cached_dirty: usize,
+        successful_evictions: usize,
+    },
+
     /// SQL function domain/runtime error (analogous to `sqlite3_result_error`).
     #[error("{0}")]
     FunctionError(String),
@@ -426,7 +444,7 @@ impl FrankenError {
             Self::Internal(_) => ErrorCode::Internal,
             Self::Abort => ErrorCode::Abort,
             Self::AuthDenied => ErrorCode::Auth,
-            Self::OutOfMemory => ErrorCode::NoMem,
+            Self::OutOfMemory | Self::PageBufferCapacityExhausted { .. } => ErrorCode::NoMem,
             Self::Unsupported => ErrorCode::NoLfs,
             Self::ReadOnly => ErrorCode::ReadOnly,
             Self::Interrupt => ErrorCode::Interrupt,
@@ -451,6 +469,7 @@ impl FrankenError {
                 | Self::NoSuchTable { .. }
                 | Self::NoSuchColumn { .. }
                 | Self::TypeMismatch { .. }
+                | Self::PageBufferCapacityExhausted { .. }
                 | Self::CannotOpen { .. }
         )
     }
@@ -485,6 +504,9 @@ impl FrankenError {
             Self::QueryReturnedMultipleRows => {
                 Some("Use query() when multiple rows are acceptable, or tighten the query")
             }
+            Self::PageBufferCapacityExhausted { .. } => Some(
+                "Finish or roll back active transactions, then retry; inspect page-buffer diagnostics before raising the configured limit",
+            ),
             _ => None,
         }
     }
@@ -499,6 +521,7 @@ impl FrankenError {
                 | Self::DatabaseLocked { .. }
                 | Self::WriteConflict { .. }
                 | Self::SerializationFailure { .. }
+                | Self::PageBufferCapacityExhausted { .. }
         )
     }
 
@@ -590,6 +613,29 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "write conflict on page 42: held by transaction 7"
+        );
+    }
+
+    #[test]
+    fn page_buffer_capacity_error_is_structured_and_retryable() {
+        let error = FrankenError::PageBufferCapacityExhausted {
+            operation: "transaction_write_stage",
+            page_size: 4096,
+            max_buffers: 8,
+            total_buffers: 8,
+            available_buffers: 0,
+            cached_clean: 0,
+            cached_dirty: 8,
+            successful_evictions: 0,
+        };
+
+        assert_eq!(error.error_code(), ErrorCode::NoMem);
+        assert!(error.is_user_recoverable());
+        assert!(error.is_transient());
+        assert!(error.suggestion().is_some());
+        assert_eq!(
+            error.to_string(),
+            "page buffer capacity exhausted during transaction_write_stage: page_size=4096, max_buffers=8, total_buffers=8, available_buffers=0, cached_clean=0, cached_dirty=8, successful_evictions=0"
         );
     }
 
