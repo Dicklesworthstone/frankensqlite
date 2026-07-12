@@ -10973,6 +10973,22 @@ fn expr_has_placeholder(expr: &Expr) -> bool {
         Expr::BinaryOp { left, right, .. } => {
             expr_has_placeholder(left) || expr_has_placeholder(right)
         }
+        Expr::UnaryOp { expr, .. } => expr_has_placeholder(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_placeholder(expr)
+                || expr_has_placeholder(low)
+                || expr_has_placeholder(high)
+        }
+        Expr::In {
+            expr,
+            set: InSet::List(items),
+            ..
+        } => expr_has_placeholder(expr) || items.iter().any(expr_has_placeholder),
+        // Subqueries, function calls, CASE, CAST, COLLATE, etc. may hide a placeholder in a position
+        // we do not walk; decline conservatively so the residual filter is only ever re-emitted for a
+        // WHERE we have fully proven placeholder-free.
         _ => true,
     }
 }

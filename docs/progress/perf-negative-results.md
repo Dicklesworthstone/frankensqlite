@@ -18306,3 +18306,13 @@ test is on the executed path, not merely linked into it.
   the whole WHERE, prefix included) narrows to exact. Non-BINARY index collation still declines.
 - GATE: `agg_leading_eq_residual_oracle` extended with `s='k3' AND x=5` (byte-exact, present/absent, SUM,
   SeekGE opcode gate). No-reg: eq_seek_exact, agg_composite_full_eq byte-exact.
+
+### follow-up (same session): leading-eq + residual recognizes IN / BETWEEN / NOT residuals
+
+- `expr_has_placeholder` now recurses through `UnaryOp` / `Between` / `In(List)` (still `_ => true` for
+  subqueries, function calls, CASE, etc.), so an all-literal residual using IN/BETWEEN/NOT is recognized
+  as placeholder-free: `COUNT(*)/SUM WHERE a = <int> AND x IN (2,5,8)` / `... AND x BETWEEN 2 AND 6` /
+  `... AND x NOT IN (0,1)` now seeks the prefix and filters. The residual filter enforces the whole
+  predicate, so it stays byte-exact.
+- GATE: `agg_leading_eq_residual_oracle` extended with IN/BETWEEN/NOT-IN residual cases (+ SeekGE opcode
+  gate for the IN residual). No-reg: in_list_shadowed_index, eq_seek_exact byte-exact.

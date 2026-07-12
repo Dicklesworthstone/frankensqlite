@@ -108,6 +108,12 @@ fn agg_leading_eq_residual_matches_sqlite() {
         "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5",
         "SELECT SUM(x) FROM t WHERE s = 'k3' AND x > 2",
         "SELECT COUNT(*) FROM t WHERE s = 'nope' AND x = 5",
+        // Residual with IN / BETWEEN / NOT (all literal) — now recognized as placeholder-free.
+        "SELECT COUNT(*) FROM t WHERE a = 7 AND x IN (2, 5, 8)",
+        "SELECT SUM(x) FROM t WHERE a = 7 AND b IN (1, 3)",
+        "SELECT COUNT(*) FROM t WHERE a = 7 AND x BETWEEN 2 AND 6",
+        "SELECT COUNT(*) FROM t WHERE a = 7 AND x NOT IN (0, 1)",
+        "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x IN (2, 5)",
     ] {
         cmp(sql);
     }
@@ -120,6 +126,10 @@ fn agg_leading_eq_residual_matches_sqlite() {
     assert!(
         has_op(&f, "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5", "SeekGE"),
         "TEXT leading eq + literal residual must seek the prefix (SeekGE)"
+    );
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x IN (2, 5, 8)", "SeekGE"),
+        "leading eq + IN-list residual (all literal) must seek the prefix (SeekGE)"
     );
     // A bound parameter anywhere in the WHERE declines the seek (re-emitting it per row could
     // mis-number the parameter), falling to a scan that binds it correctly.
