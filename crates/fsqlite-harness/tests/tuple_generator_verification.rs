@@ -192,30 +192,41 @@ fn test_deg_distribution_statistical() {
 
 #[test]
 fn test_systematic_params_basic_invariants() {
-    // For various K values, verify L = K + S + H, W = K + S, P = H.
+    // RFC 6330 §5.3 derives the coding parameters from K', the smallest
+    // systematic-index-table entry at least as large as K.  In particular,
+    // L = K' + S + H = W + P and B = W - S; P can include non-HDPC PI
+    // symbols and therefore is not generally equal to H.
     let test_k_values = [1, 5, 10, 50, 100, 500, 1000, 5000];
     for &k in &test_k_values {
         let params = SystematicParams::for_source_block(k, 64);
         assert_eq!(params.k, k, "bead_id={BEAD_ID} case=params_k k={k}");
+        assert!(
+            params.k_prime >= params.k,
+            "bead_id={BEAD_ID} case=params_k_prime_covers_k k={k} k_prime={}",
+            params.k_prime
+        );
         assert_eq!(
             params.l,
-            params.k + params.s + params.h,
-            "bead_id={BEAD_ID} case=params_l_equals_k_s_h k={k} l={} k+s+h={}",
+            params.k_prime + params.s + params.h,
+            "bead_id={BEAD_ID} case=params_l_equals_k_prime_s_h k={k} l={} k_prime+s+h={}",
             params.l,
-            params.k + params.s + params.h
+            params.k_prime + params.s + params.h
         );
         assert_eq!(
-            params.w,
-            params.k + params.s,
-            "bead_id={BEAD_ID} case=params_w_equals_k_s k={k}"
+            params.l,
+            params.w + params.p,
+            "bead_id={BEAD_ID} case=params_l_equals_w_p k={k}"
         );
         assert_eq!(
-            params.p, params.h,
-            "bead_id={BEAD_ID} case=params_p_equals_h k={k}"
+            params.b,
+            params.w - params.s,
+            "bead_id={BEAD_ID} case=params_b_equals_w_minus_s k={k}"
         );
-        assert_eq!(
-            params.b, params.k,
-            "bead_id={BEAD_ID} case=params_b_equals_k k={k}"
+        assert!(
+            params.p >= params.h,
+            "bead_id={BEAD_ID} case=params_p_contains_h k={k} p={} h={}",
+            params.p,
+            params.h
         );
     }
 }
@@ -263,18 +274,26 @@ fn test_systematic_params_h_gte_3() {
 }
 
 #[test]
-fn test_systematic_params_h_grows_with_sqrt_k() {
-    // H >= ceil(sqrt(K)) for half-distance check coverage.
-    let test_k_values = [10, 100, 1000, 5000];
-    for &k in &test_k_values {
+fn test_systematic_params_h_matches_rfc_table() {
+    // H is selected directly from RFC 6330 Table 2; it is not derived from
+    // sqrt(K).  Pin representative rows, including K values that round up to
+    // a larger K', so this test exercises both lookup and parameter selection.
+    let test_cases = [
+        (10, 10, 10),
+        (100, 101, 10),
+        (1000, 1002, 10),
+        (5000, 5008, 11),
+    ];
+    for &(k, expected_k_prime, expected_h) in &test_cases {
         let params = SystematicParams::for_source_block(k, 64);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let sqrt_k = (k as f64).sqrt().ceil() as usize;
-        assert!(
-            params.h >= sqrt_k,
-            "bead_id={BEAD_ID} case=params_h_sqrt k={k} h={} ceil_sqrt={}",
-            params.h,
-            sqrt_k
+        assert_eq!(
+            params.k_prime, expected_k_prime,
+            "bead_id={BEAD_ID} case=params_k_prime_table k={k}"
+        );
+        assert_eq!(
+            params.h, expected_h,
+            "bead_id={BEAD_ID} case=params_h_table k={k} k_prime={} h={}",
+            params.k_prime, params.h,
         );
     }
 }
@@ -372,22 +391,36 @@ fn test_tuple_generator_different_esi_differ() {
 }
 
 #[test]
-fn test_tuple_generator_different_seeds_differ() {
-    // Different seeds should produce different encodings.
+fn test_tuple_generator_is_seed_independent() {
+    // RFC 6330 Tuple[K', X] is fully determined by K' (and its table-driven
+    // J value) plus the ISI X.  The asupersync seed is retained as diagnostic
+    // metadata and must not perturb an RFC repair equation.  Use non-uniform
+    // source data so equality cannot be an artifact of XORing identical rows.
     let k = 10_usize;
     let symbol_size = 64_usize;
-    let source: Vec<Vec<u8>> = (0..k).map(|_| vec![0xAB; symbol_size]).collect();
+    let source = deterministic_source_block(k, symbol_size);
 
     let enc1 = SystematicEncoder::new(&source, symbol_size, 1).expect("encoder seed=1");
     let enc2 = SystematicEncoder::new(&source, symbol_size, 2).expect("encoder seed=2");
+    assert_eq!(
+        enc1.seed(),
+        1,
+        "seed metadata must preserve the caller value"
+    );
+    assert_eq!(
+        enc2.seed(),
+        2,
+        "seed metadata must preserve the caller value"
+    );
     let k_u32 = u32::try_from(k).expect("k fits u32");
 
-    let sym1 = enc1.repair_symbol(k_u32);
-    let sym2 = enc2.repair_symbol(k_u32);
-    assert_ne!(
-        sym1, sym2,
-        "bead_id={BEAD_ID} case=tuple_different_seeds esi={k_u32}"
-    );
+    for esi in k_u32..k_u32 + 20 {
+        assert_eq!(
+            enc1.repair_symbol(esi),
+            enc2.repair_symbol(esi),
+            "bead_id={BEAD_ID} case=tuple_seed_independent esi={esi}"
+        );
+    }
 }
 
 // ============================================================================
@@ -460,11 +493,13 @@ fn verify_systematic_property(k: usize, symbol_size: usize, seed: u64) {
 
 #[test]
 fn test_constraint_matrix_dimensions() {
-    // Matrix should be (S + H + K) rows x L columns.
+    // The encoder solves one row per intermediate symbol: S LDPC rows,
+    // H HDPC rows, and K' LT rows.  Because L = K' + S + H, the matrix is
+    // square even when the source block is padded from K to K'.
     for &k in &[5, 20, 100] {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
-        let expected_rows = params.s + params.h + params.k;
+        let expected_rows = params.s + params.h + params.k_prime;
         assert_eq!(
             matrix.rows, expected_rows,
             "bead_id={BEAD_ID} case=matrix_rows k={k} expected={expected_rows} actual={}",
@@ -474,6 +509,11 @@ fn test_constraint_matrix_dimensions() {
             matrix.cols, params.l,
             "bead_id={BEAD_ID} case=matrix_cols k={k} expected={} actual={}",
             params.l, matrix.cols
+        );
+        assert_eq!(
+            matrix.rows, matrix.cols,
+            "bead_id={BEAD_ID} case=matrix_square k={k} rows={} cols={}",
+            matrix.rows, matrix.cols
         );
     }
 }
