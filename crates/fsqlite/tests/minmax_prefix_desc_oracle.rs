@@ -1,9 +1,9 @@
-//! bd-minmax-prefix-seek follow-on: `SELECT MAX(b) FROM t WHERE a = <const>` on a `(a, b DESC)` index
-//! now seeks the block's FIRST entry (`SeekGE`, O(log n) — no O(block) walk), since a DESC second term
-//! keeps the max `b` at the front of the `a=?` block. HARD GATE: byte-identical to C SQLite (rusqlite)
-//! across a NULL-mixed group, an all-NULL-`b` group and an absent group (→ NULL), boundary `a` values,
-//! and the COALESCE wrapper; `MIN(b)` over a DESC second term declines to the scan and must still match.
-//! Opcode gate: MAX(b) uses SeekGE, covering (no SeekLE / no SeekRowid); MIN(b) declines.
+//! Composite-prefix MIN/MAX differential oracle against C SQLite.
+//!
+//! Covers `(a, b ASC)` and `(a, b DESC)` across ordinary hits, mixed/all-NULL `b` groups, absent and
+//! boundary prefixes, `a = NULL`, wrappers, and empty tables. The DESC `MAX(b)` and both ASC extrema
+//! use the single-row covering seek. DESC `MIN(b)` deliberately uses the general equality-prefix walk;
+//! its partial-key probe must enter the `a=?` block regardless of the next term's direction.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -70,30 +70,46 @@ fn seek_shape(conn: &Connection, sql: &str) -> (bool, bool, bool) {
     (ge, le, rowid)
 }
 
-#[test]
-fn minmax_prefix_desc_matches_sqlite() {
-    let f = Connection::open(":memory:").expect("frank");
-    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+fn populate_prefix_table(
+    f: &Connection,
+    r: &rusqlite::Connection,
+    table: &str,
+    index: &str,
+    direction: &str,
+) {
     for stmt in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, u INTEGER);",
-        "CREATE INDEX idx_ab_desc ON t(a, b DESC);", // DESC second term -> MAX(b) via SeekGE
+        format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, u INTEGER);"),
+        format!("CREATE INDEX {index} ON {table}(a, b {direction});"),
     ] {
-        f.execute(stmt).unwrap();
-        r.execute_batch(stmt).unwrap();
+        f.execute(&stmt).unwrap();
+        r.execute_batch(&stmt).unwrap();
     }
-    // 10 a-groups. a=3 has some NULL b; a=8 has ALL NULL b.
+
+    // Ten a-groups. a=3 mixes NULL/non-NULL b; a=8 has only NULL b.
     for i in 1..=600_i64 {
         let a = i % 10;
         let raw = (i.wrapping_mul(2_654_435_761) >> 8) & 0x3ff;
         let b = if a == 8 || (a == 3 && i % 3 == 0) {
             "NULL".to_owned()
         } else {
-            format!("{}", (raw as i64) - 500)
+            format!("{}", raw - 500)
         };
         let u = (i.wrapping_mul(5)) % 40;
-        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {u});");
+        let stmt = format!("INSERT INTO {table} VALUES ({i}, {a}, {b}, {u});");
         f.execute(&stmt).unwrap();
         r.execute_batch(&stmt).unwrap();
+    }
+}
+
+#[test]
+fn minmax_prefix_desc_matches_sqlite() {
+    let f = Connection::open(":memory:").expect("frank");
+    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+    for (table, index, direction) in [
+        ("t_desc", "idx_ab_desc", "DESC"),
+        ("t_asc", "idx_ab_asc", "ASC"),
+    ] {
+        populate_prefix_table(&f, &r, table, index, direction);
     }
 
     let cmp = |sql: &str| {
@@ -103,44 +119,75 @@ fn minmax_prefix_desc_matches_sqlite() {
             "diverged: `{sql}`"
         );
     };
-    for sql in [
-        "SELECT MAX(b) FROM t WHERE a = 5",
-        "SELECT MAX(b) FROM t WHERE a = 3", // some NULL b
-        "SELECT MAX(b) FROM t WHERE a = 8", // all NULL b -> NULL
-        "SELECT MAX(b) FROM t WHERE a = 0",
-        "SELECT MAX(b) FROM t WHERE a = 9",
-        "SELECT MAX(b) FROM t WHERE a = 999", // absent -> NULL
-        "SELECT MAX(b) FROM t WHERE a = -1",  // below all -> NULL
-        "SELECT COALESCE(MAX(b), -1) FROM t WHERE a = 999",
-        "SELECT COALESCE(MAX(b), -1) FROM t WHERE a = 8",
-        // MIN(b) over a DESC second term declines to the scan; must still match.
-        "SELECT MIN(b) FROM t WHERE a = 5",
-        "SELECT MIN(b) FROM t WHERE a = 3",
-        // Controls.
-        "SELECT COUNT(*) FROM t WHERE a = 5",
-    ] {
-        cmp(sql);
+
+    for table in ["t_desc", "t_asc"] {
+        for aggregate in ["MIN", "MAX"] {
+            for predicate in [
+                "a = 5",    // ordinary hit
+                "a = 3",    // mixed NULL/non-NULL b
+                "a = 8",    // all-NULL b -> NULL
+                "a = 0",    // lowest live prefix
+                "a = 9",    // highest live prefix
+                "a = 999",  // absent above range -> NULL
+                "a = -1",   // absent below range -> NULL
+                "a = NULL", // SQL equality with NULL matches nothing
+            ] {
+                cmp(&format!(
+                    "SELECT {aggregate}(b) FROM {table} WHERE {predicate}"
+                ));
+            }
+            for predicate in ["a = 999", "a = 8"] {
+                cmp(&format!(
+                    "SELECT COALESCE({aggregate}(b), -1) FROM {table} WHERE {predicate}"
+                ));
+            }
+        }
+
+        // These drive the same general equality-prefix probe directly. In particular, COUNT(*) must
+        // not lose rows whose trailing `b` key is NULL on the ASC index, nor miss a DESC block.
+        for predicate in ["a = 5", "a = 3", "a = 8", "a = 999", "a = NULL"] {
+            cmp(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"));
+        }
     }
 
-    // Empty table.
-    for stmt in [
-        "CREATE TABLE e (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);",
-        "CREATE INDEX idx_eab_desc ON e(a, b DESC);",
+    // Empty tables in both index directions.
+    for (table, index, direction) in [
+        ("e_desc", "idx_eab_desc", "DESC"),
+        ("e_asc", "idx_eab_asc", "ASC"),
     ] {
-        f.execute(stmt).unwrap();
-        r.execute_batch(stmt).unwrap();
+        for stmt in [
+            format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);"),
+            format!("CREATE INDEX {index} ON {table}(a, b {direction});"),
+        ] {
+            f.execute(&stmt).unwrap();
+            r.execute_batch(&stmt).unwrap();
+        }
+        for aggregate in ["MIN", "MAX"] {
+            cmp(&format!("SELECT {aggregate}(b) FROM {table} WHERE a = 1"));
+        }
     }
-    cmp("SELECT MAX(b) FROM e WHERE a = 1");
 
-    // Opcode gate: MAX(b) uses the SeekGE prefix seek (covering, no SeekLE/SeekRowid); MIN(b) declines.
+    // DESC MAX: one covering seek to the block front. DESC MIN: general prefix walk, with table lookup.
     assert_eq!(
-        seek_shape(&f, "SELECT MAX(b) FROM t WHERE a = 5"),
+        seek_shape(&f, "SELECT MAX(b) FROM t_desc WHERE a = 5"),
         (true, false, false),
         "MAX(b) on (a, b DESC) must SeekGE the block front, covering (no SeekLE / SeekRowid)"
     );
-    let (min_ge, _le, min_rowid) = seek_shape(&f, "SELECT MIN(b) FROM t WHERE a = 5");
-    assert!(
-        !min_ge || min_rowid,
-        "MIN(b) over a DESC second term must not use the covering SeekGE prefix seek"
+    assert_eq!(
+        seek_shape(&f, "SELECT MIN(b) FROM t_desc WHERE a = 5"),
+        (true, false, true),
+        "MIN(b) on (a, b DESC) must walk the sought prefix and look up matching table rows"
+    );
+
+    // ASC extrema each use their one-row covering end seek.
+    assert_eq!(
+        seek_shape(&f, "SELECT MIN(b) FROM t_asc WHERE a = 5"),
+        (true, false, false),
+        "MIN(b) on (a, b ASC) must SeekGE the block front without a table lookup"
+    );
+    assert_eq!(
+        seek_shape(&f, "SELECT MAX(b) FROM t_asc WHERE a = 5"),
+        (false, true, false),
+        "MAX(b) on (a, b ASC) must SeekLE the block end without a table lookup"
     );
 }

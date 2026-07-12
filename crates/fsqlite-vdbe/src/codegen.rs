@@ -10795,13 +10795,12 @@ fn emit_aggregate_accumulate_body(
     }
 }
 
-/// The index a `WHERE col = <constant>` aggregate can seek instead of scanning.
+/// The index a `WHERE <equality-prefix>` aggregate can seek instead of scanning.
 ///
-/// bd-2dgf5. Built on the same predicate the non-aggregate index-seek branch of
-/// [`codegen_select`] uses (`extract_column_eq_target` + `index_for_column`), so
-/// the seek visits exactly the row set that `SELECT * FROM t WHERE col = <const>`
-/// already visits. Restricted to a single ascending key term because the probe
-/// record is built as one key term + rowid.
+/// bd-2dgf5. The probe record contains only the constrained key prefix. A true
+/// partial key is the block floor regardless of the next key term's ASC/DESC
+/// direction or whether that term is NULL; appending a synthetic integer floor
+/// is not equivalent for either a DESC term or an ASC NULL region.
 ///
 /// Do NOT gate this on an affinity/collation pre-check by analogy with
 /// [`index_range_fast_path_is_safe`]. `cmp_p5` is `0x80 | comparison_affinity(..)`,
@@ -10832,12 +10831,13 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
     table: &'t TableSchema,
     table_alias: Option<&str>,
 ) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
-    // The seek walks the block pinned by an equality PREFIX of an ASC index (`WHERE a=?` on `(a,b)`, or
-    // `WHERE a=? AND b=?` on `(a,b)`) — the `[prefix.., i64::MIN]` probe anchors at the first matching
-    // entry and a per-term `Ne` stops at the end of the run. It applies no residual filter, so it is
-    // only correct when the WHERE is EXACTLY the pinned equalities: `conjunct_count == prefix_len`
-    // declines a query with a leftover predicate the seek can't enforce (e.g. `a=? AND b=?` against a
-    // shorter `(a)` index would drop `b=?`), letting a fuller index win.
+    // The seek walks the block pinned by an equality PREFIX of an ASC-leading index (`WHERE a=?` on
+    // `(a,b)`, or `WHERE a=? AND b=?` on `(a,b)`). A partial `[prefix..]` probe anchors at the first
+    // matching entry even when the next key term is DESC or NULL; a per-term `Ne` stops at the end of
+    // the run. It applies no residual filter, so it is only correct when the WHERE is EXACTLY the
+    // pinned equalities: `conjunct_count == prefix_len` declines a query with a leftover predicate the
+    // seek can't enforce (e.g. `a=? AND b=?` against a shorter `(a)` index would drop `b=?`), letting a
+    // fuller index win.
     let where_expr = where_clause?;
     if table.without_rowid {
         return None;
@@ -11220,13 +11220,14 @@ fn codegen_select_aggregate(
     //
     // `SELECT COUNT(*) FROM t WHERE k = ?` previously walked every row because
     // every index access path was disabled for aggregates. When the WHERE
-    // clause is a single equality against a plain, ascending, single-key,
+    // clause exactly pins an equality prefix of a direct-lookup, ASC-leading
     // rowid-table index, drive the accumulate body from an index seek over the
-    // duplicate run instead. Only the row source changes; the accumulate body
+    // matching run instead. Only the row source changes; the accumulate body
     // and finalize sequence are emitted verbatim, so results are identical.
     //
-    // `extract_column_eq_target` matches only when the *entire* WHERE clause is
-    // `col = <constant>`, so the seek enforces the whole predicate.
+    // `aggregate_index_eq_seek_target` admits the path only when every WHERE
+    // conjunct pins one term of the equality prefix, so the seek enforces the
+    // whole predicate.
     //
     // The gate is deliberately identical to the non-aggregate index-seek gate in
     // `codegen_select` (`index_eq` + `table.index_for_column`): the seek visits
@@ -11244,8 +11245,8 @@ fn codegen_select_aggregate(
     //   * HAVING is not supported on this path.
     //   * A bare (non-aggregate) output column would expose *which* row the scan
     //     happened to end on, so the row source must not change.
-    //   * Single ascending key term only; composite indexes fall back to the
-    //     scan (the probe record below is built for one key term + rowid).
+    //   * Direct-lookup, ASC-leading indexes only; the partial probe record and
+    //     per-term `Ne` guards handle composite equality prefixes.
     let index_eq_seek = if allow_index_seek
         && having.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
@@ -11382,27 +11383,25 @@ fn codegen_select_aggregate(
             scan_fallback
         };
 
-        // Probe key is [prefix.., i64::MIN] so SeekGE anchors on the first entry of the pinned block in
-        // a non-unique index.
-        let probe_key_regs = b.alloc_regs(prefix_len + 1);
-        let min_rowid_reg = probe_key_regs + prefix_len;
+        // A true partial key `[prefix..]` is the floor of the pinned block. Do not append an
+        // `i64::MIN` sentinel: it sorts at the wrong end of a DESC next term and after NULLs in an ASC
+        // next term, turning an exact seek into a false miss or silently dropping NULL-bearing rows.
+        let probe_key_regs = b.alloc_regs(prefix_len);
         for (i, expr) in prefix_exprs.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let reg = probe_key_regs + i as i32;
             emit_expr(b, expr, reg, None);
-            // `col = NULL` matches nothing; let the scan produce the empty result so the NULL semantics
-            // live in exactly one place.
+            // `col = NULL` matches nothing; use the same exact/fallback miss destination as SeekGE.
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, seek_miss_label, P4::None, 0);
         }
 
         let saw_index_match_reg = b.alloc_reg();
         b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
-        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            prefix_len + 1,
+            prefix_len,
             probe_record_reg,
             P4::None,
             0,
@@ -11472,13 +11471,13 @@ fn codegen_select_aggregate(
             );
         }
 
-        // No WHERE filter here, by construction: `extract_column_eq_target`
-        // only matches when the *entire* WHERE clause is `col = <constant>`,
-        // and the SeekGE + Ne pair enforces exactly that predicate. Re-emitting
-        // the filter would also consume a second anonymous placeholder for a
-        // single `?`, misnumbering bound parameters. This mirrors
-        // `codegen_select_index_equality_scan`, which likewise emits no filter
-        // on its index path.
+        // No WHERE filter here, by construction: `aggregate_index_eq_seek_target`
+        // only matches when the entire WHERE clause is the pinned equality
+        // prefix, and the SeekGE + per-term Ne guards enforce exactly those
+        // predicates. Re-emitting the filter would also consume anonymous
+        // placeholders a second time and misnumber bound parameters. This
+        // mirrors `codegen_select_index_equality_scan`, which likewise emits no
+        // filter on its index path.
         if covering {
             emit_aggregate_accumulate_body_covering(
                 b,
