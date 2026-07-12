@@ -588,6 +588,63 @@ fn open_with_flags_read_write_creates_db() {
 }
 
 #[test]
+fn open_with_flags_read_write_without_create_does_not_create_missing_db() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("missing.db");
+
+    let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .expect_err("READ_WRITE without CREATE must reject a missing database");
+
+    assert!(matches!(error, FrankenError::CannotOpen { .. }));
+    assert!(!path.exists(), "failed open must not create the database");
+}
+
+#[test]
+fn open_with_flags_read_write_without_create_preserves_empty_db() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("empty.db");
+    std::fs::write(&path, []).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .expect_err("READ_WRITE without CREATE must not initialize an empty database");
+
+    assert!(matches!(error, FrankenError::CannotOpen { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn open_with_flags_read_write_without_create_preserves_malformed_db() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("malformed.db");
+    let before = b"not a sqlite database".to_vec();
+    std::fs::write(&path, &before).unwrap();
+
+    let error = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .expect_err("READ_WRITE without CREATE must reject a malformed database");
+
+    assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn open_with_flags_read_write_without_create_opens_existing_valid_db() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("existing.db");
+    {
+        let seed = RusqliteConnection::open(&path).unwrap();
+        seed.execute("CREATE TABLE t(x INTEGER)", []).unwrap();
+        seed.execute("INSERT INTO t VALUES (1)", []).unwrap();
+    }
+
+    let conn = open_with_flags(path.to_str().unwrap(), OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .expect("READ_WRITE without CREATE should open an existing valid database");
+    let row = conn.query_row("SELECT x FROM t").unwrap();
+    assert_eq!(row.get(0), Some(&SqliteValue::Integer(1)));
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+}
+
+#[test]
 fn open_with_flags_read_only_supports_datetime_builtin() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("readonly_datetime.db");

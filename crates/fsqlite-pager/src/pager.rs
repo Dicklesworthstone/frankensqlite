@@ -4453,6 +4453,12 @@ pub struct SimplePager<V: Vfs> {
     shared_connection_count: OnceLock<Arc<AtomicUsize>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadWriteOpenDisposition {
+    CreateIfMissing,
+    ExistingOnly,
+}
+
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
 
 fn page_size_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> Option<PageSize> {
@@ -5728,13 +5734,77 @@ where
         requested_page_size: PageSize,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
+        Self::open_readwrite_with_cx_and_page_buffer_max(
+            cx,
+            vfs,
+            path,
+            requested_page_size,
+            None,
+            page_buffer_max,
+            ReadWriteOpenDisposition::CreateIfMissing,
+        )
+    }
+
+    /// Open an existing database for reading and writing without creating or
+    /// initializing the main database file.
+    ///
+    /// The VFS open omits [`VfsOpenFlags::CREATE`]. Empty and malformed files
+    /// are rejected before rollback-journal recovery, ensuring that failed
+    /// opens cannot bootstrap or otherwise mutate their main database image.
+    /// When `expected_identity` is present, it is compared with the identity
+    /// of the already-open VFS handle before any file read or recovery action.
+    #[allow(clippy::too_many_lines)]
+    pub fn open_existing_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        expected_identity: Option<FileIdentity>,
+        page_buffer_max: Option<usize>,
+    ) -> Result<Self> {
+        Self::open_readwrite_with_cx_and_page_buffer_max(
+            cx,
+            vfs,
+            path,
+            requested_page_size,
+            expected_identity,
+            page_buffer_max,
+            ReadWriteOpenDisposition::ExistingOnly,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_readwrite_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        expected_identity: Option<FileIdentity>,
+        page_buffer_max: Option<usize>,
+        disposition: ReadWriteOpenDisposition,
+    ) -> Result<Self> {
         let vfs = Arc::new(vfs);
-        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let mut flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        if disposition == ReadWriteOpenDisposition::CreateIfMissing {
+            flags |= VfsOpenFlags::CREATE;
+        }
         let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
+        if let Some(expected_identity) = expected_identity
+            && db_file.file_identity()? != Some(expected_identity)
+        {
+            return Err(FrankenError::CannotOpen {
+                path: path.to_owned(),
+            });
+        }
 
         // Probe for existing page size BEFORE hot journal recovery.
         // Recovery requires the correct page size to correctly parse records.
         let mut file_size = db_file.file_size(cx)?;
+        if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
+            return Err(FrankenError::CannotOpen {
+                path: path.to_owned(),
+            });
+        }
         let page_size = if file_size >= DATABASE_HEADER_SIZE as u64 {
             let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
             let header_read = db_file.read(cx, &mut header_bytes, 0)?;
@@ -5753,11 +5823,28 @@ where
                     {
                         page_size_from_header_bytes(&header_bytes).unwrap_or(requested_page_size)
                     }
+                    Err(error) if disposition == ReadWriteOpenDisposition::ExistingOnly => {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!("invalid database header: {error}"),
+                        });
+                    }
                     Err(_) => requested_page_size,
                 }
+            } else if disposition == ReadWriteOpenDisposition::ExistingOnly {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short read fetching database header: got {header_read} of {DATABASE_HEADER_SIZE}"
+                    ),
+                });
             } else {
                 requested_page_size
             }
+        } else if disposition == ReadWriteOpenDisposition::ExistingOnly {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
+                ),
+            });
         } else {
             requested_page_size
         };
@@ -5789,6 +5876,11 @@ where
         // Refresh file size after potential recovery.
         file_size = db_file.file_size(cx)?;
         let (header, bootstrapped_from_live_wal_stub) = if file_size == 0 {
+            if disposition == ReadWriteOpenDisposition::ExistingOnly {
+                return Err(FrankenError::CannotOpen {
+                    path: path.to_owned(),
+                });
+            }
             // SQLite databases are never truly empty: page 1 contains the
             // 100-byte database header followed by the sqlite_master root page.
             //

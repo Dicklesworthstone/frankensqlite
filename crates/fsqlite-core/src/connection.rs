@@ -2592,6 +2592,65 @@ impl PagerBackend {
         }
     }
 
+    /// Open an existing file-backed database for reading and writing without
+    /// creating or initializing the main database file.
+    fn open_existing_with_page_buffer_max(
+        path: &str,
+        cx: &Cx,
+        expected_identity: Option<FileIdentity>,
+        page_buffer_max: Option<usize>,
+    ) -> Result<Self> {
+        #[cfg(all(feature = "native", target_os = "linux"))]
+        {
+            let vfs = IoUringVfs::new();
+            let db_path = PathBuf::from(path);
+            let pager = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                PageSize::DEFAULT,
+                expected_identity,
+                page_buffer_max,
+            )?;
+            Ok(Self::IoUring(Arc::new(pager)))
+        }
+        #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
+        {
+            let vfs = UnixVfs::new();
+            let db_path = PathBuf::from(path);
+            let pager = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                PageSize::DEFAULT,
+                expected_identity,
+                page_buffer_max,
+            )?;
+            Ok(Self::Unix(Arc::new(pager)))
+        }
+        #[cfg(all(feature = "native", target_os = "windows"))]
+        {
+            let vfs = fsqlite_vfs::WindowsVfs::new();
+            let db_path = PathBuf::from(path);
+            let pager = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                PageSize::DEFAULT,
+                expected_identity,
+                page_buffer_max,
+            )?;
+            Ok(Self::Windows(Arc::new(pager)))
+        }
+        #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
+        {
+            let _ = (path, cx, expected_identity, page_buffer_max);
+            Err(FrankenError::NotImplemented(
+                "file-backed pager not available on this platform".to_owned(),
+            ))
+        }
+    }
+
     /// Open a database pager in true read-only mode (fast path).
     ///
     /// Skips journal recovery and freelist traversal for instant open on
@@ -9020,6 +9079,36 @@ impl Connection {
         Self::open_with_env(path, ConnectionEnv::default())
     }
 
+    /// Open an existing file-backed database for reading and writing.
+    ///
+    /// Unlike [`Self::open`], this never creates or initializes the main
+    /// database file. Missing and zero-length paths return
+    /// [`FrankenError::CannotOpen`], while malformed database images return
+    /// [`FrankenError::DatabaseCorrupt`] without changing their contents.
+    pub fn open_existing(path: impl Into<String>) -> Result<Self> {
+        Self::open_existing_with_env(path, ConnectionEnv::default())
+    }
+
+    /// Open an existing file-backed database only if its already-open VFS
+    /// handle has `expected_identity`.
+    ///
+    /// The identity comparison happens before any database read, rollback
+    /// journal probe, or recovery action. This binds recovery to a file leased
+    /// by the caller even if the pathname is concurrently renamed or replaced.
+    /// It is an object-identity guarantee rather than a pathname-spelling
+    /// guarantee: a symlink resolving to the same leased object is accepted
+    /// because it cannot redirect recovery to different database bytes.
+    pub fn open_existing_with_expected_identity(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+    ) -> Result<Self> {
+        Self::open_existing_with_expected_identity_and_env(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+    }
+
     /// Open a connection with strict multi-process refusal enabled.
     ///
     /// Convenience shortcut for callers (CI harnesses, multi-agent
@@ -9308,6 +9397,55 @@ impl Connection {
     /// runtime context whose per-database region this connection joins.
     pub fn open_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
         Self::open_with_page_size_and_env(path, PageSize::DEFAULT.get(), env)
+    }
+
+    /// Open an existing file-backed database with an explicit runtime
+    /// environment, without creating or initializing the main database file.
+    pub fn open_existing_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
+        Self::open_existing_with_optional_expected_identity_and_env(path, None, env)
+    }
+
+    /// Open an existing file-backed database with an explicit runtime
+    /// environment only if its already-open VFS handle has
+    /// `expected_identity`.
+    pub fn open_existing_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_existing_with_optional_expected_identity_and_env(
+            path,
+            Some(expected_identity),
+            env,
+        )
+    }
+
+    fn open_existing_with_optional_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: Option<FileIdentity>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        let path = path.into();
+        if path.is_empty() || path == ":memory:" {
+            return Err(FrankenError::CannotOpen {
+                path: std::path::PathBuf::from(path),
+            });
+        }
+
+        let bootstrap_cx =
+            env.runtime()
+                .root_cx
+                .create_child()
+                .with_trace_context(next_trace_id(), 0, 0);
+        let pager = retry_busy_connection_bootstrap(|| {
+            PagerBackend::open_existing_with_page_buffer_max(
+                &path,
+                &bootstrap_cx,
+                expected_identity,
+                env.page_buffer_max(),
+            )
+        })?;
+        Self::open_with_env_and_pager(path, env, pager, false)
     }
 
     /// Open a connection with an explicit runtime environment and requested
