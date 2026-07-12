@@ -18066,3 +18066,22 @@ test is on the executed path, not merely linked into it.
   a test). Oracle covers the range regression cases directly.
 - PERF: full table scan → one O(log n) composite seek (same shape as the shipped composite prefix+range
   seek). Diagnostic: composite_eq_seek_profile.rs.
+
+## 2026-07-12 - WIN: COUNT/SUM/MIN/MAX WHERE a=? on a composite-leading index seeks the a-block, not full-scan (bd-agg-composite-leading-eq)
+
+- Result type: WIN / shipped. The aggregate analogue of bd-minmax-composite-leading + bd-composite-eq-seek.
+- THE MISS: `aggregate_index_eq_seek_target` filtered `key_term_count() == 1`, so `SELECT COUNT(*)/SUM(x)
+  FROM t WHERE a = ?` where `a` is only the LEADING column of a composite `(a,b)` index (no single-column
+  index on `a`) declined the seek → O(n) full scan. Composite indexes are common, so this is a common gap.
+- THE LEVER: relaxed the filter to `!key_term_descending(0)` (drop `== 1`). `index_for_column` already
+  requires a rowid-table index whose leading column is `a`, so a composite `(a, …)` works: the existing
+  `[a, i64::MIN]` probe anchors at the first `(a, *)` entry (MIN sorts below every `b`), and the `Ne` on
+  index column 0 stops at the end of the `a=?` run — exactly the block the single-column seek walks. Only
+  the ASC-leading requirement remains (a DESC leading term flips the anchor).
+- BYTE-EXACT GATE (`agg_composite_leading_eq_oracle.rs`, PASS): vs rusqlite/C SQLite — COUNT(*)/SUM(x)/
+  SUM(b)/MIN(x),MAX(x) WHERE a=? on a composite-only `(a,b)` index (duplicate runs), absent keys
+  (COUNT=0 / SUM=NULL / COALESCE), a-NULLs, and the single-column-index regression — all bit-identical;
+  opcode gate (SeekGE fires).
+- NO-REGRESSION: `fsqlite-vdbe --lib` **1043/0 serial**. clippy clean; fmt clean.
+- PERF: full scan → the same O(block) block seek the single-column aggregate eq seek already uses (the
+  opcode gate confirms SeekGE). A one-line filter relaxation.

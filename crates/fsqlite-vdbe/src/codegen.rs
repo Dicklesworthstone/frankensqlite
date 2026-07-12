@@ -10825,9 +10825,15 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
     table_alias: Option<&str>,
 ) -> Option<(&'t IndexSchema, &'e Expr)> {
     let (col_name, target_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
+    // `index_for_column` already requires a rowid-table index whose LEADING column is `col_name`, so a
+    // composite `(col, …)` index works too: the `[col, i64::MIN]` probe anchors at the first `(col, *)`
+    // entry and the `Ne` on index column 0 stops at the end of the `col=?` run — the same block the
+    // single-column seek walks. Only the ASC-leading requirement remains (a DESC leading term flips the
+    // anchor). This lets `COUNT(*)/SUM(x) WHERE col=?` seek the block when `col` has only a composite
+    // index (was a full scan).
     table
         .index_for_column(&col_name)
-        .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))
+        .filter(|idx| !idx.key_term_descending(0))
         .map(|idx| (idx, target_expr))
 }
 
