@@ -2,9 +2,9 @@
 //! a single index seek (was an O(n) scan). HARD GATE: the result must be byte-identical to C SQLite
 //! (rusqlite) across the correctness surface a value extremum touches — leading NULLs (MIN must skip
 //! them), all-NULL and empty tables, INT/REAL/TEXT/BLOB columns, NOCASE collation, DESC index
-//! (declines to a scan but must still match), the COALESCE wrapper, and mixed sign/dup values. Plus
-//! an opcode gate: the fast path opens the index and emits Last (MAX) / Rewind+Next (MIN) with NO
-//! Rowid-scan of the table.
+//! (uses direction-aware index-end seeks), the COALESCE wrapper, and mixed sign/dup values. Plus an
+//! opcode gate: the fast path opens the index and emits the direction-appropriate seek/NULL-skip
+//! opcodes with NO Rowid-scan of the table.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -81,13 +81,19 @@ fn uses_index_seek(conn: &Connection, sql: &str) -> bool {
     opened_index && !has_rowid_walk
 }
 
+fn has_op(conn: &Connection, sql: &str, want: &str) -> bool {
+    conn.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
+        |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+    )
+}
+
 #[test]
 fn minmax_index_seek_matches_sqlite() {
     let f = Connection::open(":memory:").expect("frank");
     let r = rusqlite::Connection::open_in_memory().expect("sqlite");
     let schema = [
         // v INT indexed ASC, w TEXT indexed ASC, x REAL indexed ASC, c TEXT indexed NOCASE,
-        // d INT indexed DESC (must decline to scan but still match), u INT NOT indexed (control).
+        // d INT indexed DESC (direction-aware end seek), u INT NOT indexed (control).
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT, x REAL, c TEXT COLLATE NOCASE, d INTEGER, u INTEGER);",
         "CREATE INDEX idx_v ON t(v);",
         "CREATE INDEX idx_w ON t(w);",
@@ -152,7 +158,7 @@ fn minmax_index_seek_matches_sqlite() {
         // NOCASE-collated TEXT: the fast path must use the NOCASE index (matching collation).
         "SELECT MIN(c) FROM t",
         "SELECT MAX(c) FROM t",
-        // DESC index: declines the seek, must still match via scan.
+        // DESC index: seeks the opposite index ends from ASC, and must still match.
         "SELECT MIN(d) FROM t",
         "SELECT MAX(d) FROM t",
         // NOT indexed control.
@@ -197,7 +203,7 @@ fn minmax_index_seek_matches_sqlite() {
     cmp("SELECT MAX(v) FROM e");
     cmp("SELECT COALESCE(MIN(v), 99) FROM e");
 
-    // Opcode gate: the indexed MIN/MAX use the index seek; the non-indexed and DESC ones do not.
+    // Opcode gate: ASC and DESC indexed MIN/MAX use index-end seeks; unsafe shapes still decline.
     assert!(
         uses_index_seek(&f, "SELECT MIN(v) FROM t"),
         "MIN(v) (indexed ASC) must use the index seek"
@@ -215,8 +221,16 @@ fn minmax_index_seek_matches_sqlite() {
         "MIN(u) (no index) must full-scan"
     );
     assert!(
-        !uses_index_seek(&f, "SELECT MIN(d) FROM t"),
-        "MIN(d) (DESC index) must decline the seek"
+        uses_index_seek(&f, "SELECT MIN(d) FROM t")
+            && has_op(&f, "SELECT MIN(d) FROM t", "Last")
+            && has_op(&f, "SELECT MIN(d) FROM t", "Prev"),
+        "MIN(d) (DESC index) must seek Last and walk back through trailing NULLs with Prev"
+    );
+    assert!(
+        uses_index_seek(&f, "SELECT MAX(d) FROM t")
+            && has_op(&f, "SELECT MAX(d) FROM t", "Rewind")
+            && !has_op(&f, "SELECT MAX(d) FROM t", "Next"),
+        "MAX(d) (DESC index) must use a single Rewind end seek without a Next scan"
     );
     assert!(
         !uses_index_seek(&f, "SELECT MIN(c COLLATE BINARY) FROM t"),

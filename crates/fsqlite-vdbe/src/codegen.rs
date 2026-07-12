@@ -9478,17 +9478,17 @@ fn find_minmax_leading_index<'t>(
         })
 }
 
-/// Detect `SELECT MIN(col)` / `SELECT MAX(col)` (no WHERE/HAVING/GROUP BY) where `col` carries a
-/// single-column ASC index whose collation matches the aggregate comparison.
+/// Detect `SELECT MIN(col)` / `SELECT MAX(col)` (no WHERE/HAVING/GROUP BY) where `col` is the leading
+/// term of an index whose ordering matches the aggregate comparison.
 ///
 /// The value extremum is then a single seek to one end of the index rather than an O(n) scan. This
 /// mirrors [`minmax_rowid_seek_plan`]'s guards (exactly one output aggregate; no DISTINCT / FILTER /
 /// bare output column / multi-aggregate wrapper / extra args; a single plain-column argument) so the
 /// produced result is byte-identical to the full-scan path — only the row that feeds `AggStep`
-/// changes. The index must be single-column, ASC, and collation-matched
-/// (`single_column_index_for_column_with_collation`) so its stored order equals the MIN/MAX
-/// comparison order; a DESC or differently-collated (or WITHOUT ROWID) index declines to the scan.
-/// A scalar wrapper (`COALESCE(MAX(x), 0)`) is allowed — it is applied unchanged after finalize.
+/// changes. A collation-matched single-column ASC index is preferred; the BINARY fallback also
+/// accepts a composite index led by the column (ASC or DESC) and a single-column DESC index. A
+/// differently-collated index, non-BINARY fallback, or WITHOUT ROWID table declines to the scan. A
+/// scalar wrapper (`COALESCE(MAX(x), 0)`) is allowed — it is applied unchanged after finalize.
 /// bd-minmax-index-seek.
 fn minmax_index_seek_plan(
     agg_columns: &[AggColumn],
@@ -9780,13 +9780,12 @@ fn codegen_select_minmax_rowid_seek(
 
 /// Emit the `MIN(col)` / `MAX(col)` single-seek fast path over a secondary index on `col`.
 ///
-/// `MAX` seeks the last index entry — the maximum, since NULLs sort first (a NULL there means the
-/// table is all-NULL, so `MAX` → NULL). `MIN` rewinds to the first entry and walks past the leading
-/// NULL region to the first non-NULL value (`min()` ignores NULLs; an all-NULL or empty index leaves
-/// the accumulator NULL, so `MIN` → NULL). Exactly one row's value feeds the same
-/// `AggStep`/`AggFinal`/wrapper sequence the full-scan path uses, so the result is bit-identical.
-/// Only the index cursor is opened — the value is index column 0, so no table lookup is needed.
-/// bd-minmax-index-seek.
+/// `MAX` seeks the maximum end (ASC → `Last`, DESC → `Rewind`). `MIN` seeks the minimum end and
+/// walks past the NULL region toward values (ASC → `Rewind` + `Next`, DESC → `Last` + `Prev`), since
+/// `min()` ignores NULLs. An empty or all-NULL index leaves the accumulator NULL. Exactly one
+/// non-NULL row's value feeds the same `AggStep`/`AggFinal`/wrapper sequence the full-scan path uses,
+/// so the result is bit-identical. Only the index cursor is opened — the value is index column 0, so
+/// no table lookup is needed. bd-minmax-index-seek.
 #[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
 fn codegen_select_minmax_index_seek(
     b: &mut ProgramBuilder,
