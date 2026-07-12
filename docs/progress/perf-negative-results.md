@@ -18169,3 +18169,25 @@ test is on the executed path, not merely linked into it.
   eq + residual filter); `EXISTS(SELECT 1 WHERE a=? AND b=?)` (composite existence, seek=false rewind=false);
   `a, COUNT(*) GROUP BY a` (grouped aggregate via ordered index — larger). NB: `codegen_select_count_star`
   also lacks the composite prefix-range / range paths — the same "yield to aggregate" trick may apply.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM(x) WHERE a <range> seeks a single-column index (bd-agg-index-range)
+
+- Result type: WIN / shipped. Predicted directly by the previous entry's NB ("codegen_select_count_star
+  also lacks the range path — the same 'yield to aggregate' trick may apply"). `COUNT(*)/SUM(x) FROM t
+  WHERE a <range>` (`>`,`>=`,`<`,`<=`,`BETWEEN`) on a single-column index full-scanned.
+- FIX: (1) new `aggregate_index_range_seek_target` — reuses the SAME residual-safe extraction as the
+  non-agg range scan (`extract_column_range_target`, whose `And` requires BOTH sides to be range bounds
+  on ONE column, so a residual `x=5` or a second column declines) + `index_range_fast_path_is_safe`.
+  (2) new `index_range_seek` branch in `codegen_select_aggregate` mirroring the ascending half of
+  `codegen_select_index_range_scan` (SeekGE lower / Rewind + NULL-skip; `Le` exclusive-lower guard; `Gt`/
+  `Ge` upper stop; per-row IdxRowid+SeekRowid+AggStep), always non-covering so a `SUM` of a non-indexed
+  column reads exact table values. (3) extend the `simple_count_star` yield so `COUNT(*)` reaches it too.
+- BYTE-EXACTNESS: the seek visits exactly the range's rows (NULLs excluded by the seek/NULL-skip; mixed
+  storage classes ordered by the index's storage-class order, same as the WHERE comparison), accumulated
+  in place of scanned — order-independent for COUNT/SUM.
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_index_range_oracle` PASS — all four operators + BETWEEN,
+  both aggregates, reversed operand order, NULL rows, empty ranges (→ COUNT=0/SUM=NULL), COALESCE, mixed
+  storage classes at the boundary, and the residual-predicate DECLINE (`a>c AND x=5` keeps `x=5`). Opcode
+  gate: both COUNT(*) and SUM(x) SeekGE a lower-bounded range. No-reg: `in_list_shadowed_index`,
+  `agg_composite_full_eq`, `minmax_range` all byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a <range>` full scan → O(log n + matches) seek + bounded walk.

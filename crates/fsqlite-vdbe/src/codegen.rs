@@ -1843,7 +1843,14 @@ pub fn codegen_select(
         && !(aggregate_index_eq_seek_allowed(from_index_hint)
             && (aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias).is_some()
                 || index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
-                    .is_some()));
+                    .is_some()
+                || aggregate_index_range_seek_target(
+                    where_clause.as_deref(),
+                    table,
+                    table_alias,
+                    schema,
+                )
+                .is_some()));
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
     // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
@@ -10898,6 +10905,31 @@ fn index_integer_in_list_target<'t>(
     Some((idx, ints))
 }
 
+/// The single-column ascending index and range a `SELECT COUNT(*)/SUM(...) FROM t WHERE col <range>`
+/// aggregate can seek instead of full-scanning. Reuses the SAME residual-safe extraction and safety
+/// gate as the non-aggregate single-column range scan (`extract_column_range_target` +
+/// `index_range_fast_path_is_safe`): `extract_column_range_target` matches only when EVERY WHERE
+/// conjunct is a range bound on ONE column (an `And` requires both sides to be bounds on the same
+/// column, so a residual `c = 5` or a second column declines), so the seek — which applies no
+/// residual filter — is byte-exact. Rowid tables only; the trailing sentinel in the probe is the
+/// rowid.
+fn aggregate_index_range_seek_target<'t, 'e>(
+    where_clause: Option<&'e Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+) -> Option<(&'t IndexSchema, ColumnRangeTarget<'e>)> {
+    if table.without_rowid {
+        return None;
+    }
+    let (col_name, range) = extract_column_range_target(where_clause, table, table_alias)?;
+    let idx = table
+        .index_for_column(&col_name)
+        .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+    index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range)
+        .then_some((idx, range))
+}
+
 /// Emit one value's index seek + duplicate-run accumulate for the aggregate IN-list path.
 ///
 /// bd-2dgf5. Non-covering: opens no cursor itself (the caller opens `table_cursor` and
@@ -11275,6 +11307,23 @@ fn codegen_select_aggregate(
         None
     };
 
+    // Seek + bounded walk over a single-column index for `WHERE col <range>` (`>`, `>=`, `<`, `<=`,
+    // `BETWEEN`) instead of a full scan. Reuses the residual-safe `aggregate_index_range_seek_target`
+    // detection; mirrors the non-aggregate `codegen_select_index_range_scan`, only the per-row action
+    // changes (accumulate vs `ResultRow`).
+    let index_range_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_range_seek.is_none()
+        && index_in_seek.is_none()
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
+    } else {
+        None
+    };
+
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
@@ -11611,6 +11660,133 @@ fn codegen_select_aggregate(
                 value,
             );
         }
+        skip_scan = true;
+    } else if let Some((idx_schema, index_range)) = index_range_seek {
+        // Single-column index range: position at the lower bound (or `Rewind` when unbounded below),
+        // walk while the key stays within the range, accumulate. Always non-covering (open the table
+        // and `SeekRowid` each entry) so a `SUM` of a non-indexed column reads exact values. Mirrors
+        // the ascending half of `codegen_select_index_range_scan`; a NULL bound / empty range jumps to
+        // finalize (still-Null accumulators → COUNT=0 / SUM=NULL). No ORDER BY / LIMIT to satisfy here.
+        let idx_cursor = 1_i32;
+        let bound_affinity = idx_schema
+            .columns
+            .first()
+            .and_then(|name| table.column_index(name))
+            .map(|i| table.columns[i].affinity)
+            .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
+
+        let lower_probe = index_range.lower.as_ref().map(|bound| {
+            let base = b.alloc_regs(2);
+            emit_expr(b, bound.expr(), base, None);
+            if let Some(aff) = bound_affinity
+                && !bound_matches_affinity(aff, bound.expr())
+            {
+                b.emit_op(Opcode::Affinity, base, 1, 0, P4::Affinity(aff.to_string()), 0);
+            }
+            b.emit_jump_to_label(Opcode::IsNull, base, 0, finalize_label, P4::None, 0);
+            b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+            (base, bound.inclusive)
+        });
+        let upper_reg = index_range.upper.as_ref().map(|bound| {
+            let reg = b.alloc_reg();
+            emit_expr(b, bound.expr(), reg, None);
+            if let Some(aff) = bound_affinity
+                && !bound_matches_affinity(aff, bound.expr())
+            {
+                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+            }
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+            (reg, bound.inclusive)
+        });
+        // A register holding the current key, needed to test an exclusive lower bound or any upper bound.
+        let current_key_reg = (upper_reg.is_some()
+            || lower_probe.as_ref().is_some_and(|(_, inclusive)| !inclusive))
+        .then(|| b.alloc_reg());
+
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            idx_schema.root_page,
+            0,
+            P4::Index(idx_schema.name.clone()),
+            0,
+        );
+
+        if let Some((lower_reg, _)) = lower_probe.as_ref() {
+            let probe_record_reg = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, *lower_reg, 2, probe_record_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                probe_record_reg,
+                finalize_label,
+                P4::None,
+                0,
+            );
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+        }
+
+        let loop_top = b.current_addr();
+        let skip_label = b.emit_label();
+
+        if let Some(key_reg) = current_key_reg {
+            b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+            // With no lower probe (`Rewind` start) the leading NULLs of the index must be skipped —
+            // a NULL key satisfies no range bound.
+            if lower_probe.is_none() {
+                b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, skip_label, P4::None, 0);
+            }
+        }
+        if let Some((lower_reg, inclusive)) = lower_probe.as_ref()
+            && !inclusive
+        {
+            b.emit_jump_to_label(
+                Opcode::Le,
+                *lower_reg,
+                current_key_reg.expect("exclusive lower bound reads current key"),
+                skip_label,
+                P4::None,
+                0,
+            );
+        }
+        if let Some((up_reg, up_inclusive)) = upper_reg {
+            let stop = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
+            b.emit_jump_to_label(
+                stop,
+                up_reg,
+                current_key_reg.expect("upper bound reads current key"),
+                finalize_label,
+                P4::None,
+                0,
+            );
+        }
+
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+        emit_aggregate_accumulate_body(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+        );
+
+        b.resolve_label(skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_body = loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
         skip_scan = true;
     }
 
