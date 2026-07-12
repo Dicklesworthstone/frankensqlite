@@ -80,6 +80,22 @@ lossy values.
   cached rollback-journal/WAL identity components. The next transaction no
   longer mistakes the pager's own commit for an external composition change or
   discards valid publication, cache, and volatile-freelist state.
+- Composite-index `ORDER BY` planning now consumes repeated equality-constrained
+  prefix terms before comparing the remaining index order. Queries such as
+  `WHERE a = ? ORDER BY a, b` use the `(a, b)` index without a sorter and retain
+  SQLite-compatible parameterized `LIMIT` behavior
+  ([#130](https://github.com/Dicklesworthstone/frankensqlite/issues/130)).
+- A saturated clean page-buffer pool no longer turns an otherwise valid write
+  into a false `OutOfMemory` failure. Bounded clean-page reclamation is
+  serialized per shard, never evicts dirty state, preserves transaction state
+  when staging fails, and is covered by concurrent saturation plus file-backed
+  commit/rollback regressions
+  ([#131](https://github.com/Dicklesworthstone/frankensqlite/issues/131)).
+- Full `PRAGMA integrity_check` now recognizes SQLite's intentionally unused
+  lock-byte page at the 1 GiB boundary. The page remains forbidden as a B-tree,
+  overflow, or freelist reference, while an unreferenced lock-byte page is no
+  longer misreported as corruption; every neighboring page still requires an
+  owner ([#133](https://github.com/Dicklesworthstone/frankensqlite/issues/133)).
 
 ### Security
 
