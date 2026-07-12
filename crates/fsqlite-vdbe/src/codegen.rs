@@ -10986,26 +10986,42 @@ fn aggregate_index_range_seek_target<'t, 'e>(
             continue;
         }
         let col_name = &index.columns[0];
-        let is_integer = table
+        let affinity = table
             .column_index(col_name)
             .and_then(|ci| table.columns.get(ci))
-            .is_some_and(|c| c.affinity == 'D');
-        if !is_integer {
-            continue;
-        }
+            .map(|c| c.affinity);
         let Some(range) = extract_named_column_range(where_expr, table, table_alias, col_name)
         else {
             continue;
         };
-        let int_bounds = range
-            .lower
-            .as_ref()
-            .is_none_or(|b| matches!(b.expr(), Expr::Literal(Literal::Integer(_), _)))
-            && range
-                .upper
-                .as_ref()
-                .is_none_or(|b| matches!(b.expr(), Expr::Literal(Literal::Integer(_), _)));
-        if int_bounds {
+        // The seek is a SUPERSET (no affinity/collation miss) when the bound literals match the
+        // column's storage class: an INTEGER column + integer literals, or a BINARY-collation TEXT
+        // column + text literals (a bare `s <op> 'lit'` compares under the column collation, which
+        // equals the BINARY index collation, so the seek range matches the WHERE range). The residual
+        // filter narrows to exact.
+        let bound_is = |b: &ColumnRangeBound<'_>, want_text: bool| {
+            if want_text {
+                matches!(b.expr(), Expr::Literal(Literal::String(_), _))
+            } else {
+                matches!(b.expr(), Expr::Literal(Literal::Integer(_), _))
+            }
+        };
+        let bounds_ok = match affinity {
+            Some('D') => {
+                range.lower.as_ref().is_none_or(|b| bound_is(b, false))
+                    && range.upper.as_ref().is_none_or(|b| bound_is(b, false))
+            }
+            Some('B')
+                if index
+                    .key_term_collation(0)
+                    .is_none_or(|c| c.eq_ignore_ascii_case("BINARY")) =>
+            {
+                range.lower.as_ref().is_none_or(|b| bound_is(b, true))
+                    && range.upper.as_ref().is_none_or(|b| bound_is(b, true))
+            }
+            _ => false,
+        };
+        if bounds_ok {
             return Some((index, range, true));
         }
     }

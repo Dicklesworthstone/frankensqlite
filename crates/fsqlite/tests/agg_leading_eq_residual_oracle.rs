@@ -117,6 +117,10 @@ fn agg_leading_eq_residual_matches_sqlite() {
         "SELECT COUNT(*) FROM t WHERE a = 7 AND x BETWEEN 2 AND 6",
         "SELECT COUNT(*) FROM t WHERE a = 7 AND x NOT IN (0, 1)",
         "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x IN (2, 5)",
+        // TEXT RANGE + residual on a BINARY-indexed text column (one- and two-sided).
+        "SELECT COUNT(*) FROM t WHERE s > 'k1' AND x = 3",
+        "SELECT SUM(x) FROM t WHERE s BETWEEN 'k1' AND 'k4' AND x > 2",
+        "SELECT COUNT(*) FROM t WHERE s < 'k3' AND x IN (2, 5)",
     ] {
         cmp(sql);
     }
@@ -147,5 +151,10 @@ fn agg_leading_eq_residual_matches_sqlite() {
     assert!(
         !has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = ?", "SeekGE"),
         "a WHERE with a bound parameter must decline the residual-filter seek"
+    );
+    // The single-column index range seek anchors with SeekGE (exclusive lower handled by a Le skip).
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE s > 'k1' AND x = 3", "SeekGE"),
+        "TEXT range + residual on a BINARY-indexed column must seek the range (SeekGE)"
     );
 }

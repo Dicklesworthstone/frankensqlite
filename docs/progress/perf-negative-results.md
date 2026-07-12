@@ -18399,3 +18399,20 @@ test is on the executed path, not merely linked into it.
   committed source entrypoints, e.g. `agg_composite_full_eq_oracle.rs`). rch is degraded for verification
   this turn; per method (byte-exact gate before commit, never build local) the change stays reverted /
   uncommitted. Re-apply + gate when rch is healthy — the change and safety argument are recorded above.
+
+## 2026-07-12 - WIN (shipped, after 2 pool-blocked turns): TEXT range + residual seek (bd-agg-text-range-residual)
+
+- Result type: WIN / shipped. rch recovered this turn; the ledgered change gated clean.
+- `COUNT(*)/SUM WHERE s <range> AND <residual>` on a BINARY-collation TEXT index (`s > 'k1' AND x = 3`,
+  `s BETWEEN 'k1' AND 'k4' AND x > 2`, `s < 'k3' AND x IN (2,5)`) full-scanned; now it seeks the text
+  range (a SUPERSET) and re-applies the whole placeholder-free WHERE as a residual filter.
+- FIX (detection only): in the residual branch of `aggregate_index_range_seek_target`, replace the
+  INTEGER-only gate with an affinity-matched bound check — `Some('D')` → integer-literal bounds, or
+  `Some('B')` with a BINARY-collation index key → text-literal bounds. A bare `s <op> 'lit'` compares
+  under the column collation = index collation, so the seek range matches the WHERE range (superset); the
+  residual filter narrows to exact. The existing index-range codegen already handles a text bound.
+- NOTE: the single-column index range seek anchors with `SeekGE` (exclusive lower via a `Le` skip), not
+  `SeekGT` — the first gate run failed only on a wrong `SeekGT` opcode assertion; the byte-exact battery
+  passed. Corrected the assertion to `SeekGE`.
+- GATE: `agg_leading_eq_residual_oracle` byte-exact (text range one-/two-sided + residual eq/range/IN) +
+  SeekGE opcode gate. No-reg: agg_index_range, agg_rowid_range_residual byte-exact.
