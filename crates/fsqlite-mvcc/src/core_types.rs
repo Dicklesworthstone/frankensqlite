@@ -6187,6 +6187,107 @@ mod tests {
     const BEAD_2G5_1: &str = "bd-2g5.1";
     const TXN_SLOT_E2E_SCENARIO_ID: &str = "TXNSLOT-1";
     const TXN_SLOT_E2E_SEED: u64 = 20_260_219;
+    const TXN_SLOT_LATENCY_TARGET_NS: u128 = 1_000;
+    const TXN_SLOT_LATENCY_SLOT_COUNT: usize = 16;
+    const TXN_SLOT_LATENCY_WARMUP_ROUNDS: u64 = 3;
+    const TXN_SLOT_LATENCY_SAMPLE_ROUNDS: usize = 11;
+    const TXN_SLOT_LATENCY_ITERATIONS_PER_SAMPLE: u64 = 2_048;
+    const TXN_SLOT_LATENCY_REPLAY_COMMAND: &str = "cargo test --profile release-perf -p fsqlite-mvcc --lib core_types::tests::test_txn_slot_alloc_release_latency_budget -- --exact --nocapture --test-threads=1";
+
+    #[derive(Debug)]
+    struct TxnSlotLatencyMeasurement {
+        timed_elapsed_us: u128,
+        median_ns_per_operation: u128,
+        samples_ns_per_operation: Vec<u128>,
+    }
+
+    fn run_txn_slot_alloc_release_sample(
+        slot_array: &crate::cache_aligned::TxnSlotArray,
+        cycle_base: u64,
+    ) -> u128 {
+        let sample_started = Instant::now();
+        for offset in 0_u64..TXN_SLOT_LATENCY_ITERATIONS_PER_SAMPLE {
+            let cycle = cycle_base + offset;
+            let txn_id_raw = std::hint::black_box(10_000 + cycle);
+            let hint_index = usize::try_from(
+                cycle
+                    % u64::try_from(TXN_SLOT_LATENCY_SLOT_COUNT)
+                        .expect("bead_id={BEAD_2G5_1} slot count should fit u64"),
+            )
+            .expect("bead_id={BEAD_2G5_1} hint index should fit usize");
+            let slot_index = slot_array
+                .acquire(
+                    txn_id_raw,
+                    hint_index,
+                    6_666,
+                    TXN_SLOT_E2E_SEED + cycle,
+                    100_000 + cycle,
+                    500 + cycle,
+                    500 + cycle,
+                    crate::cache_aligned::slot_mode::CONCURRENT,
+                    1,
+                )
+                .expect("bead_id={BEAD_2G5_1} slot allocation should succeed");
+            slot_array.slot(std::hint::black_box(slot_index)).release();
+        }
+
+        let operations = u128::from(TXN_SLOT_LATENCY_ITERATIONS_PER_SAMPLE).saturating_mul(2);
+        sample_started
+            .elapsed()
+            .as_nanos()
+            .saturating_div(operations.max(1))
+    }
+
+    fn measure_txn_slot_alloc_release_latency() -> TxnSlotLatencyMeasurement {
+        let slot_array = crate::cache_aligned::TxnSlotArray::new(TXN_SLOT_LATENCY_SLOT_COUNT);
+        let mut cycle_base = 0_u64;
+
+        for _ in 0..TXN_SLOT_LATENCY_WARMUP_ROUNDS {
+            std::hint::black_box(run_txn_slot_alloc_release_sample(&slot_array, cycle_base));
+            cycle_base = cycle_base.saturating_add(TXN_SLOT_LATENCY_ITERATIONS_PER_SAMPLE);
+        }
+
+        let timed_started = Instant::now();
+        let mut samples_ns_per_operation = Vec::with_capacity(TXN_SLOT_LATENCY_SAMPLE_ROUNDS);
+        for _ in 0..TXN_SLOT_LATENCY_SAMPLE_ROUNDS {
+            samples_ns_per_operation
+                .push(run_txn_slot_alloc_release_sample(&slot_array, cycle_base));
+            cycle_base = cycle_base.saturating_add(TXN_SLOT_LATENCY_ITERATIONS_PER_SAMPLE);
+        }
+        let timed_elapsed_us = timed_started.elapsed().as_micros().max(1);
+
+        let mut sorted_samples = samples_ns_per_operation.clone();
+        sorted_samples.sort_unstable();
+        let median_ns_per_operation = sorted_samples[sorted_samples.len() / 2];
+
+        TxnSlotLatencyMeasurement {
+            timed_elapsed_us,
+            median_ns_per_operation,
+            samples_ns_per_operation,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "production latency gate; replay with --profile release-perf"
+    )]
+    fn test_txn_slot_alloc_release_latency_budget() {
+        let measurement = measure_txn_slot_alloc_release_latency();
+        eprintln!(
+            "bead_id={BEAD_2G5_1} median_ns_per_operation={} samples_ns_per_operation={:?} target_lt_ns={} replay_command={TXN_SLOT_LATENCY_REPLAY_COMMAND}",
+            measurement.median_ns_per_operation,
+            measurement.samples_ns_per_operation,
+            TXN_SLOT_LATENCY_TARGET_NS,
+        );
+        assert!(
+            measurement.median_ns_per_operation < TXN_SLOT_LATENCY_TARGET_NS,
+            "bead_id={BEAD_2G5_1} median allocation/release latency must remain below {}ns: median_ns_per_operation={} samples_ns_per_operation={:?}; replay with: {TXN_SLOT_LATENCY_REPLAY_COMMAND}",
+            TXN_SLOT_LATENCY_TARGET_NS,
+            measurement.median_ns_per_operation,
+            measurement.samples_ns_per_operation,
+        );
+    }
 
     #[test]
     fn test_txn_slot_recovery_no_orphans_after_100_crash_cycles() {
@@ -6255,34 +6356,21 @@ mod tests {
         GLOBAL_TXN_SLOT_METRICS.reset();
         let metrics_before = GLOBAL_TXN_SLOT_METRICS.snapshot();
 
-        // 1) Measure deterministic allocation/release throughput on shared slots.
-        let slot_array = crate::cache_aligned::TxnSlotArray::new(16);
-        let alloc_release_iterations = 256_u64;
-        for cycle in 0_u64..alloc_release_iterations {
-            let txn_id_raw = 10_000 + cycle;
-            let hint_index = usize::try_from(cycle % 16)
-                .expect("bead_id={BEAD_2G5_1} hint index should fit usize");
-            let slot_index = slot_array
-                .acquire(
-                    txn_id_raw,
-                    hint_index,
-                    6_666,
-                    TXN_SLOT_E2E_SEED + cycle,
-                    100_000 + cycle,
-                    500 + cycle,
-                    500 + cycle,
-                    crate::cache_aligned::slot_mode::CONCURRENT,
-                    1,
-                )
-                .expect("bead_id={BEAD_2G5_1} slot allocation should succeed");
-            slot_array.slot(slot_index).release();
-        }
-        let alloc_release_elapsed_us = scenario_started.elapsed().as_micros().max(1);
-        let alloc_release_ops = u128::from(alloc_release_iterations).saturating_mul(2);
-        let avg_alloc_release_ns = alloc_release_elapsed_us
-            .saturating_mul(1_000)
-            .saturating_div(alloc_release_ops.max(1));
-        let alloc_release_under_one_us = avg_alloc_release_ns < 1_000;
+        // 1) Exercise allocation/release and capture profile-correct timing
+        // evidence. Debug builds retain the functional coverage and artifact
+        // contract but leave the strict production decision to the dedicated
+        // release-perf test above.
+        let latency_measurement = measure_txn_slot_alloc_release_latency();
+        let alloc_release_elapsed_us = latency_measurement.timed_elapsed_us;
+        let avg_alloc_release_ns = latency_measurement.median_ns_per_operation;
+        let latency_budget_enforced = !cfg!(debug_assertions);
+        let alloc_release_under_one_us =
+            !latency_budget_enforced || avg_alloc_release_ns < TXN_SLOT_LATENCY_TARGET_NS;
+        let latency_profile = if latency_budget_enforced {
+            "optimized-gate"
+        } else {
+            "debug-measurement-only"
+        };
 
         // 2) Crash detection within two heartbeat periods.
         let heartbeat_period_secs = CLAIMING_TIMEOUT_SECS;
@@ -6425,7 +6513,12 @@ mod tests {
             json!({
                 "id": "alloc_release_latency_budget",
                 "status": if alloc_release_under_one_us { "pass" } else { "fail" },
-                "detail": format!("avg_alloc_release_ns={avg_alloc_release_ns} target_lt_ns=1000"),
+                "enforced": latency_budget_enforced,
+                "detail": format!(
+                    "median_alloc_release_ns={avg_alloc_release_ns} samples_ns_per_operation={:?} target_lt_ns={} profile={latency_profile} enforced={latency_budget_enforced} replay_command={TXN_SLOT_LATENCY_REPLAY_COMMAND}",
+                    latency_measurement.samples_ns_per_operation,
+                    TXN_SLOT_LATENCY_TARGET_NS,
+                ),
             }),
             json!({
                 "id": "crash_detection_within_two_heartbeats",
@@ -6466,6 +6559,10 @@ mod tests {
                 "total_elapsed_us": total_elapsed_us,
                 "alloc_release_elapsed_us": alloc_release_elapsed_us,
                 "alloc_release_avg_ns": avg_alloc_release_ns,
+                "alloc_release_median_ns": latency_measurement.median_ns_per_operation,
+                "alloc_release_samples_ns": latency_measurement.samples_ns_per_operation,
+                "latency_budget_enforced": latency_budget_enforced,
+                "latency_profile": latency_profile,
                 "crash_cycle_elapsed_us": crash_cycle_elapsed_us,
             },
             "checks": checks,
@@ -6484,6 +6581,7 @@ mod tests {
                 "event_target": "fsqlite.txn_slot",
                 "span_name": "txn_slot",
             },
+            "latency_replay_command": TXN_SLOT_LATENCY_REPLAY_COMMAND,
             "replay_command": replay_command,
         });
         let artifact_bytes = serde_json::to_vec_pretty(&artifact)
