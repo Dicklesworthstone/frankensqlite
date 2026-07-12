@@ -17961,3 +17961,23 @@ test is on the executed path, not merely linked into it.
 - PERF: the before is a measured full scan (5.36 ms / 5.00 ms on 20k rows); the lever replaces it with a
   single O(log n) bound seek (the same single-seek shape as the other MIN/MAX-via-index wins, ~µs).
   Diagnostic: minmax_range_profile.rs.
+
+## 2026-07-12 - WIN: MIN(id) WHERE id >[=] c / MAX(id) WHERE id <[=] c (rowid) → one table b-tree seek (bd-minmax-rowid-range-seek)
+
+- Result type: WIN / shipped. The rowid analogue of bd-minmax-range-seek (common pagination shape: "min
+  id after a cursor"). Aggregates over the rowid with a range bound scanned the range; a single table
+  b-tree seek suffices.
+- THE LEVER: `minmax_rowid_range_seek_plan` detects a single MIN/MAX over the rowid (arg resolved as the
+  rowid alias or the ipk column) with WHERE `id OP <int>` (natural pairing). `codegen_select_minmax_
+  rowid_range_seek` opens the table and does ONE scalar-key seek — `SeekGT`/`SeekGE` → first `id > c` /
+  `>= c` (min), `SeekLT`/`SeekLE` → last `id < c` / `<= c` (max) — feeding the single rowid through the
+  shared AggStep/AggFinal/wrapper. The rowid is a unique, never-NULL integer, so the seek is trivially
+  exact with no NULL/tie handling; an empty match seeks past the end → accumulator NULL.
+- BUG FIXED DURING DEV: the rowid reference (`id`) bypasses `column_name` (which returns None for rowid
+  refs), so the first cut declined; matched instead with `is_rowid_expr`.
+- BYTE-EXACT GATE (`minmax_rowid_range_oracle.rs`, PASS): vs rusqlite/C SQLite — all four operators (ids
+  with gaps, bounds between gaps), reversed operand order, empty→NULL, COALESCE, and the declines
+  (unnatural pairing, non-integer bound) — all bit-identical; opcode gate (MIN id>c → SeekGT, MAX id<c →
+  SeekLT).
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean. (Before is a range scan; after is
+  a single O(log n) table seek — same shape as the shipped bd-minmax-range-seek win.)

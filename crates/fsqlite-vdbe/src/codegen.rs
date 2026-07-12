@@ -9700,6 +9700,90 @@ fn minmax_range_seek_plan(
     })
 }
 
+/// Detect `SELECT MIN(id) WHERE id >[=] c` / `MAX(id) WHERE id <[=] c` over the INTEGER PRIMARY KEY
+/// (rowid) with an integer bound — resolvable by one seek on the table b-tree.
+///
+/// The rowid is a unique, never-NULL integer, so the seek is trivially exact and needs no NULL/tie
+/// handling: `SeekGT`/`SeekGE` on the table lands on the first `id > c` / `>= c` (the min), `SeekLT`/
+/// `SeekLE` on the last `id < c` / `<= c` (the max). Natural pairing only. Returns the seek opcode and
+/// the integer bound. bd-minmax-rowid-range-seek.
+fn minmax_rowid_range_seek_plan(
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_clause: Option<&Expr>,
+) -> Option<(Opcode, i64)> {
+    use fsqlite_ast::BinaryOp::{Ge, Gt, Le, Lt};
+    let [agg] = agg_columns else {
+        return None;
+    };
+    // The aggregate is over the rowid: resolved either as the rowid alias, or as the ipk column.
+    let is_rowid_agg = agg.arg_is_rowid
+        || agg
+            .arg_col_index
+            .is_some_and(|i| table.columns.get(i).is_some_and(|c| c.is_ipk));
+    if !is_rowid_agg
+        || agg.distinct
+        || agg.filter.is_some()
+        || agg.hidden
+        || agg.bare_expr.is_some()
+        || agg.arg_expr.is_some()
+        || !agg.multi_agg_indices.is_empty()
+        || !agg.extra_args.is_empty()
+        || agg.num_args != 1
+        || table.without_rowid
+    {
+        return None;
+    }
+    let is_max = match agg.name.as_str() {
+        "MIN" => false,
+        "MAX" => true,
+        _ => return None,
+    };
+    // WHERE (rowid) OP <int literal>, either operand order. Rowid references (`id`, `rowid`, …) bypass
+    // `column_name` (which returns None for them), so match them with `is_rowid_expr`.
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = where_clause?
+    else {
+        return None;
+    };
+    if !matches!(op, Lt | Le | Gt | Ge) {
+        return None;
+    }
+    let is_rowid = |e: &Expr| is_rowid_expr(e, Some(table), table_alias);
+    let int_lit = |e: &Expr| match e {
+        Expr::Literal(Literal::Integer(n), _) => Some(*n),
+        _ => None,
+    };
+    let (op, bound) = if is_rowid(left)
+        && let Some(n) = int_lit(right)
+    {
+        (*op, n)
+    } else if is_rowid(right)
+        && let Some(n) = int_lit(left)
+    {
+        let rev = match op {
+            Lt => Gt,
+            Le => Ge,
+            Gt => Lt,
+            Ge => Le,
+            _ => return None,
+        };
+        (rev, n)
+    } else {
+        return None;
+    };
+    let seek_op = match (is_max, op) {
+        (false, Gt) => Opcode::SeekGT,
+        (false, Ge) => Opcode::SeekGE,
+        (true, Lt) => Opcode::SeekLT,
+        (true, Le) => Opcode::SeekLE,
+        _ => return None, // unnatural pairing → global extremum, different shape
+    };
+    Some((seek_op, bound))
+}
+
 /// A single `MIN(b)`/`MAX(b)` over the SECOND key term of a composite index, constrained by
 /// `WHERE <first-term> = <const>` — resolvable by one prefix seek to the extremum of the group.
 struct MinMaxPrefixSeek<'e> {
@@ -10186,6 +10270,79 @@ fn codegen_select_minmax_range_seek(
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit `SELECT MIN(id) WHERE id >[=] c` / `MAX(id) WHERE id <[=] c` (rowid) as ONE table b-tree seek.
+///
+/// The rowid is a unique, never-NULL integer, so `Seek*` (a scalar rowid key — no `MakeRecord`) lands
+/// directly on the extremum: `SeekGT`/`SeekGE` on the first `id > c` / `>= c`, `SeekLT`/`SeekLE` on the
+/// last `id < c` / `<= c`. The single rowid feeds the shared AggStep/AggFinal/wrapper; an empty match
+/// (`Seek*` past the end) leaves the accumulator NULL. bd-minmax-rowid-range-seek.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_minmax_rowid_range_seek(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    agg_columns: &[AggColumn],
+    seek_op: Opcode,
+    bound: i64,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let agg = &agg_columns[0];
+    let accum_reg = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, accum_reg, 0, P4::None, 0);
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    let finalize_label = b.emit_label();
+    // Scalar rowid key (table b-tree seek — not a record); jump to finalize (NULL) when no row matches.
+    let bound_reg = b.alloc_reg();
+    b.emit_op(Opcode::Int64, 0, bound_reg, 0, P4::Int64(bound), 0);
+    b.emit_jump_to_label(seek_op, cursor, bound_reg, finalize_label, P4::None, 0);
+
+    let arg_reg = b.alloc_reg();
+    b.emit_op(Opcode::Rowid, cursor, arg_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::AggStep,
+        0,
+        arg_reg,
+        accum_reg,
+        agg_func_p4(&agg.name, agg.collation.as_ref()),
+        1,
+    );
+
+    b.resolve_label(finalize_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_reg,
+        agg.num_args,
+        0,
+        P4::FuncName(agg.name.clone()),
+        0,
+    );
+    if accum_reg != out_regs {
+        b.emit_op(Opcode::Copy, accum_reg, out_regs, 0, P4::None, 0);
+    }
+    if let Some(wrapper) = &agg.wrapper_expr {
+        emit_agg_wrapper(b, wrapper, out_regs);
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
@@ -10877,6 +11034,27 @@ fn codegen_select_aggregate(
             cursor,
             &agg_columns,
             &seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
+
+    // Rowid analogue: `SELECT MIN(id) WHERE id >[=] c` / `MAX(id) WHERE id <[=] c` seeks the table
+    // b-tree (one seek) instead of scanning the range. bd-minmax-rowid-range-seek.
+    if allow_index_seek
+        && having.is_none()
+        && let Some((seek_op, bound)) =
+            minmax_rowid_range_seek_plan(&agg_columns, table, table_alias, where_clause)
+    {
+        return codegen_select_minmax_rowid_range_seek(
+            b,
+            cursor,
+            table,
+            &agg_columns,
+            seek_op,
+            bound,
             out_regs,
             out_col_count,
             done_label,
