@@ -18191,3 +18191,14 @@ test is on the executed path, not merely linked into it.
   gate: both COUNT(*) and SUM(x) SeekGE a lower-bounded range. No-reg: `in_list_shadowed_index`,
   `agg_composite_full_eq`, `minmax_range` all byte-exact.
 - PERF: `COUNT(*)/SUM WHERE a <range>` full scan → O(log n + matches) seek + bounded walk.
+
+### follow-up (same turn): covering range walk for COUNT(*)/SUM(indexed col)
+
+- The `index_range_seek` branch now takes the COVERING path (via `aggregate_seek_is_covering` +
+  `emit_aggregate_accumulate_body_covering`, the same helpers the eq-seek uses) when every aggregate
+  reads only the indexed column or is COUNT(*)/SUM(rowid): the table cursor is never opened and no
+  per-row `SeekRowid` is emitted (SQLite's "USING COVERING INDEX"). `SUM` of a non-indexed column keeps
+  the table lookup. Byte-exact (COUNT reads no columns; the indexed value lives in the index entry).
+- GATE: `agg_index_range_oracle` extended — byte-exact `SUM(a)` (covering) cases, and opcode gates that
+  COUNT(*)/SUM(indexed) emit NO `SeekRowid` while SUM(non-indexed) does. No-reg: agg_composite_full_eq,
+  eq_seek_exact byte-exact.

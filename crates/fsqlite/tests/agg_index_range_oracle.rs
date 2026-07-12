@@ -117,6 +117,9 @@ fn agg_index_range_matches_sqlite() {
         // Boundaries where reals/text interleave the integer range.
         "SELECT COUNT(*) FROM t WHERE a > 249",
         "SELECT COUNT(*) FROM t WHERE a <= 600",
+        // Covering SUM of the *indexed* column (read straight from the index, no table lookup).
+        "SELECT SUM(a) FROM t WHERE a > 100",
+        "SELECT SUM(a) FROM t WHERE a BETWEEN 0 AND 200",
         // Residual predicate: MUST NOT drop `x = 5` (decline the range seek, still byte-exact via scan).
         "SELECT COUNT(*) FROM t WHERE a > 100 AND x = 5",
     ] {
@@ -131,5 +134,19 @@ fn agg_index_range_matches_sqlite() {
     assert!(
         has_op(&f, "SELECT SUM(x) FROM t WHERE a > 100", "SeekGE"),
         "SUM(x) WHERE a>c must seek the index"
+    );
+    // Covering gate: COUNT(*) and SUM(indexed col) read straight from the index (no SeekRowid);
+    // SUM of a non-indexed column still needs the table lookup.
+    assert!(
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a > 100", "SeekRowid"),
+        "COUNT(*) range walk must be covering (no SeekRowid)"
+    );
+    assert!(
+        !has_op(&f, "SELECT SUM(a) FROM t WHERE a > 100", "SeekRowid"),
+        "SUM(indexed col) range walk must be covering (no SeekRowid)"
+    );
+    assert!(
+        has_op(&f, "SELECT SUM(x) FROM t WHERE a > 100", "SeekRowid"),
+        "SUM(non-indexed col) range walk must open the table (SeekRowid)"
     );
 }

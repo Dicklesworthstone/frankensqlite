@@ -11663,11 +11663,18 @@ fn codegen_select_aggregate(
         skip_scan = true;
     } else if let Some((idx_schema, index_range)) = index_range_seek {
         // Single-column index range: position at the lower bound (or `Rewind` when unbounded below),
-        // walk while the key stays within the range, accumulate. Always non-covering (open the table
-        // and `SeekRowid` each entry) so a `SUM` of a non-indexed column reads exact values. Mirrors
-        // the ascending half of `codegen_select_index_range_scan`; a NULL bound / empty range jumps to
-        // finalize (still-Null accumulators → COUNT=0 / SUM=NULL). No ORDER BY / LIMIT to satisfy here.
+        // walk while the key stays within the range, accumulate. Mirrors the ascending half of
+        // `codegen_select_index_range_scan`; a NULL bound / empty range jumps to finalize (still-Null
+        // accumulators → COUNT=0 / SUM=NULL). No ORDER BY / LIMIT to satisfy here. When every aggregate
+        // reads only the indexed column (or is COUNT(*)/SUM(rowid)) the walk is COVERING — the table
+        // cursor is never opened and no `SeekRowid` is emitted (SQLite's "USING COVERING INDEX" plan).
         let idx_cursor = 1_i32;
+        let index_table_col = idx_schema
+            .columns
+            .first()
+            .and_then(|name| table.column_index(name))
+            .unwrap_or(usize::MAX);
+        let covering = aggregate_seek_is_covering(&agg_columns, index_table_col);
         let bound_affinity = idx_schema
             .columns
             .first()
@@ -11703,14 +11710,16 @@ fn codegen_select_aggregate(
             || lower_probe.as_ref().is_some_and(|(_, inclusive)| !inclusive))
         .then(|| b.alloc_reg());
 
-        b.emit_op(
-            Opcode::OpenRead,
-            cursor,
-            table.root_page,
-            0,
-            P4::Table(table.name.clone()),
-            0,
-        );
+        if !covering {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
         b.emit_op(
             Opcode::OpenRead,
             idx_cursor,
@@ -11770,18 +11779,28 @@ fn codegen_select_aggregate(
             );
         }
 
-        let rowid_reg = b.alloc_reg();
-        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
-        emit_aggregate_accumulate_body(
-            b,
-            cursor,
-            table,
-            table_alias,
-            schema,
-            &agg_columns,
-            accum_base,
-        );
+        if covering {
+            emit_aggregate_accumulate_body_covering(
+                b,
+                idx_cursor,
+                index_table_col,
+                &agg_columns,
+                accum_base,
+            );
+        } else {
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                accum_base,
+            );
+        }
 
         b.resolve_label(skip_label);
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
