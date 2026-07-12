@@ -1030,6 +1030,7 @@ dependencies = [
  "fsqlite-ext-rtree",
  "fsqlite-ext-session",
  "fsqlite-func",
+ "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
