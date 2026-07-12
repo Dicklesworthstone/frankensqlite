@@ -44,16 +44,33 @@ fn minmax_prefix_seek_or_scan() {
     }
     let n = 5_000u64;
     let cases = [
-        ("MAX(b) WHERE a=7 [(a,b) idx]", "SELECT MAX(b) FROM t WHERE a = 7"),
-        ("MIN(b) WHERE a=7 [(a,b) idx]", "SELECT MIN(b) FROM t WHERE a = 7"),
-        ("COUNT(*) WHERE a=7 [(a,b) idx]", "SELECT COUNT(*) FROM t WHERE a = 7"),
+        (
+            "MAX(b) WHERE a=7 [(a,b) idx]",
+            "SELECT MAX(b) FROM t WHERE a = 7",
+        ),
+        (
+            "MIN(b) WHERE a=7 [(a,b) idx]",
+            "SELECT MIN(b) FROM t WHERE a = 7",
+        ),
+        (
+            "COUNT(*) WHERE a=7 [(a,b) idx]",
+            "SELECT COUNT(*) FROM t WHERE a = 7",
+        ),
         // Control: MAX over the single-col-indexed c grouped by an eq on c itself (degenerate) and a
         // plain full-column MAX(b) (no WHERE) which already seeks via bd-minmax-index-seek only if b is
         // indexed alone (it is not here) -> full scan baseline.
-        ("MAX(b) no WHERE [b not sole-indexed]", "SELECT MAX(b) FROM t"),
-        ("SUM(b) WHERE a=7 [(a,b) idx]", "SELECT SUM(b) FROM t WHERE a = 7"),
+        (
+            "MAX(b) no WHERE [b not sole-indexed]",
+            "SELECT MAX(b) FROM t",
+        ),
+        (
+            "SUM(b) WHERE a=7 [(a,b) idx]",
+            "SELECT SUM(b) FROM t WHERE a = 7",
+        ),
     ];
-    eprintln!("\n########## bd-5310l MAX/MIN(b) WHERE a=? on (a,b): prefix seek vs group scan ##########");
+    eprintln!(
+        "\n########## bd-5310l MAX/MIN(b) WHERE a=? on (a,b): prefix seek vs group scan ##########"
+    );
     for (label, sql) in cases {
         eprintln!("  [{label:38}] {:9.1} ns/query", measure(&conn, sql, n));
     }
