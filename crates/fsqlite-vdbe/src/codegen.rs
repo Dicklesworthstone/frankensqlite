@@ -9583,6 +9583,123 @@ fn minmax_pair_seek_plan(agg_columns: &[AggColumn], table: &TableSchema) -> Opti
     })
 }
 
+/// `SELECT MIN(col) FROM t WHERE col > c` / `MAX(col) FROM t WHERE col < c` (natural pairing) over an
+/// INTEGER-affinity single-column-indexed column — resolvable by ONE seek to the bound.
+struct MinMaxRangeSeek {
+    index_name: String,
+    index_root: i32,
+    /// The seek that lands on the extremum at the bound: `SeekGT`/`SeekGE` for `MIN col >[=] c`,
+    /// `SeekLT`/`SeekLE` for `MAX col <[=] c`.
+    seek_op: Opcode,
+    /// The integer bound.
+    bound: i64,
+}
+
+/// Extract `col OP <int literal>` (OP ∈ `<,<=,>,>=`, either operand order) from a WHERE that is
+/// exactly that comparison.
+fn extract_col_int_comparison(
+    where_clause: Option<&Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    col_name: &str,
+) -> Option<(fsqlite_ast::BinaryOp, i64)> {
+    use fsqlite_ast::BinaryOp::{Ge, Gt, Le, Lt};
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = where_clause?
+    else {
+        return None;
+    };
+    if !matches!(op, Lt | Le | Gt | Ge) {
+        return None;
+    }
+    let is_col = |e: &Expr| {
+        column_name(e, table, table_alias).is_some_and(|n| n.eq_ignore_ascii_case(col_name))
+    };
+    let int_lit = |e: &Expr| match e {
+        Expr::Literal(Literal::Integer(n), _) => Some(*n),
+        _ => None,
+    };
+    if is_col(left)
+        && let Some(n) = int_lit(right)
+    {
+        return Some((*op, n));
+    }
+    // Reversed operand order: `<int> OP col` ≡ `col <reversed-OP> <int>`.
+    if is_col(right)
+        && let Some(n) = int_lit(left)
+    {
+        let rev = match op {
+            Lt => Gt,
+            Le => Ge,
+            Gt => Lt,
+            Ge => Le,
+            _ => return None,
+        };
+        return Some((rev, n));
+    }
+    None
+}
+
+/// Detect `SELECT MIN(col) WHERE col >[=] c` / `SELECT MAX(col) WHERE col <[=] c` (the "natural"
+/// pairing where the bound IS the extremum) over an INTEGER-affinity, single-column ASC-indexed column
+/// with an integer literal bound — resolvable by one seek to the bound instead of a full scan.
+///
+/// INTEGER affinity + integer literal makes the seek exact: the index's storage-class order matches the
+/// WHERE comparison's, so `SeekGT([c])` lands exactly on the first `col > c` (NULLs, which fail
+/// `col > c`, sort first and are skipped), and `SeekLT([c])` on the last `col < c`. The opposite
+/// pairings (MIN with an upper bound, MAX with a lower bound) yield the GLOBAL extremum — a different
+/// shape — and decline. bd-minmax-range-seek.
+fn minmax_range_seek_plan(
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_clause: Option<&Expr>,
+) -> Option<MinMaxRangeSeek> {
+    use fsqlite_ast::BinaryOp::{Ge, Gt, Le, Lt};
+    let [agg] = agg_columns else {
+        return None;
+    };
+    if agg.arg_is_rowid
+        || agg.distinct
+        || agg.filter.is_some()
+        || agg.hidden
+        || agg.bare_expr.is_some()
+        || agg.arg_expr.is_some()
+        || !agg.multi_agg_indices.is_empty()
+        || !agg.extra_args.is_empty()
+        || agg.num_args != 1
+    {
+        return None;
+    }
+    let is_max = match agg.name.as_str() {
+        "MIN" => false,
+        "MAX" => true,
+        _ => return None,
+    };
+    let col = table.columns.get(agg.arg_col_index?)?;
+    // INTEGER affinity + integer literal ⇒ the seek is exact (no affinity-skew fallback needed).
+    if col.affinity != 'D' {
+        return None;
+    }
+    let (op, bound) = extract_col_int_comparison(where_clause, table, table_alias, &col.name)?;
+    let seek_op = match (is_max, op) {
+        (false, Gt) => Opcode::SeekGT, // MIN col > c  → first entry > c
+        (false, Ge) => Opcode::SeekGE, // MIN col >= c → first entry >= c
+        (true, Lt) => Opcode::SeekLT,  // MAX col < c  → last entry < c
+        (true, Le) => Opcode::SeekLE,  // MAX col <= c → last entry <= c
+        _ => return None,              // unnatural pairing → global extremum, different shape
+    };
+    let idx =
+        table.single_column_index_for_column_with_collation(&col.name, agg.collation.as_deref())?;
+    Some(MinMaxRangeSeek {
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+        seek_op,
+        bound,
+    })
+}
+
 /// A single `MIN(b)`/`MAX(b)` over the SECOND key term of a composite index, constrained by
 /// `WHERE <first-term> = <const>` — resolvable by one prefix seek to the extremum of the group.
 struct MinMaxPrefixSeek<'e> {
@@ -9981,6 +10098,89 @@ fn codegen_select_minmax_pair_seek(
     );
     if accum_max != max_out {
         b.emit_op(Opcode::Copy, accum_max, max_out, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit `SELECT MIN(col) WHERE col >[=] c` / `MAX(col) WHERE col <[=] c` as ONE seek to the bound.
+///
+/// The 1-field probe `[c]` (an integer, matching the INTEGER-affinity column) is `Seek*`'d: `SeekGT`/
+/// `SeekGE` lands on the first `col > c` / `>= c` (the min at the bound; NULLs sort first and fail the
+/// predicate, so the seek skips them), `SeekLT`/`SeekLE` on the last `col < c` / `<= c` (the max). The
+/// single extremum feeds the same AggStep/AggFinal/wrapper sequence the scan uses; an empty match
+/// (`Seek*` past the end, or a NULL landed for MAX) leaves the accumulator NULL. bd-minmax-range-seek.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_minmax_range_seek(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    agg_columns: &[AggColumn],
+    seek: &MinMaxRangeSeek,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let agg = &agg_columns[0];
+    let accum_reg = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, accum_reg, 0, P4::None, 0);
+
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        seek.index_root,
+        0,
+        P4::Index(seek.index_name.clone()),
+        0,
+    );
+
+    let finalize_label = b.emit_label();
+
+    // 1-field probe [bound] for the range seek.
+    let bound_reg = b.alloc_reg();
+    b.emit_op(Opcode::Int64, 0, bound_reg, 0, P4::Int64(seek.bound), 0);
+    let probe_rec = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, bound_reg, 1, probe_rec, P4::None, 0);
+    // Seek to the bound; jump to finalize (accumulator NULL) when no row satisfies it.
+    b.emit_jump_to_label(
+        seek.seek_op,
+        idx_cursor,
+        probe_rec,
+        finalize_label,
+        P4::None,
+        0,
+    );
+
+    let arg_reg = b.alloc_reg();
+    b.emit_op(Opcode::Column, idx_cursor, 0, arg_reg, P4::None, 0);
+    b.emit_op(
+        Opcode::AggStep,
+        0,
+        arg_reg,
+        accum_reg,
+        agg_func_p4(&agg.name, agg.collation.as_ref()),
+        1,
+    );
+
+    b.resolve_label(finalize_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_reg,
+        agg.num_args,
+        0,
+        P4::FuncName(agg.name.clone()),
+        0,
+    );
+    if accum_reg != out_regs {
+        b.emit_op(Opcode::Copy, accum_reg, out_regs, 0, P4::None, 0);
+    }
+    if let Some(wrapper) = &agg.wrapper_expr {
+        emit_agg_wrapper(b, wrapper, out_regs);
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
 
@@ -10655,6 +10855,24 @@ fn codegen_select_aggregate(
         && let Some(seek) = minmax_prefix_seek_plan(&agg_columns, table, table_alias, where_clause)
     {
         return codegen_select_minmax_prefix_seek(
+            b,
+            cursor,
+            &agg_columns,
+            &seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
+
+    // Range-bounded extremum: `SELECT MIN(col) WHERE col >[=] c` / `MAX(col) WHERE col <[=] c` on an
+    // INTEGER-indexed column seeks the bound (one seek) instead of scanning. bd-minmax-range-seek.
+    if allow_index_seek
+        && having.is_none()
+        && let Some(seek) = minmax_range_seek_plan(&agg_columns, table, table_alias, where_clause)
+    {
+        return codegen_select_minmax_range_seek(
             b,
             cursor,
             &agg_columns,

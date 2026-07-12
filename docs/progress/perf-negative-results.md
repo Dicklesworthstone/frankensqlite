@@ -17933,3 +17933,31 @@ test is on the executed path, not merely linked into it.
 - NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
 - MEDIAN (release-perf, 20k rows): `SELECT MIN(v), MAX(v)` 11.3 ms (scan) → 16.6 µs (~681×). Diagnostic:
   minmax_pair_profile.rs.
+
+## 2026-07-12 - WIN: MIN(col) WHERE col >[=] c / MAX(col) WHERE col <[=] c → one bound seek, not a full scan (bd-minmax-range-seek)
+
+- Result type: WIN / shipped. Profile-first (misc_shapes_profile + where_a_plan_probe) found aggregates
+  never take a secondary-index RANGE seek: `MIN(a) WHERE a > c` / `MAX(a) WHERE a < c` on a secondary
+  index full-scan (EXPLAIN: `seek=false`, `Rewind`; profiled 5.36 ms / 5.00 ms on 20k rows).
+- THE LEVER: `minmax_range_seek_plan` detects a single MIN/MAX(col) whose WHERE is exactly `col OP <int>`
+  (OP ∈ `<,<=,>,>=`, either operand order) in the NATURAL pairing (MIN with a lower bound, MAX with an
+  upper bound — where the bound IS the extremum), over an INTEGER-affinity, single-column ASC-indexed
+  column. `codegen_select_minmax_range_seek` builds a 1-field probe `[c]` and does ONE seek —
+  `SeekGT`/`SeekGE` lands on the first `col > c` / `>= c` (the min), `SeekLT`/`SeekLE` on the last
+  `col < c` / `<= c` (the max) — feeding the single extremum through the shared AggStep/AggFinal/wrapper.
+  An empty match seeks past the end → accumulator NULL. Unnatural pairings (global extremum) and
+  non-integer bounds decline.
+- WHY EXACT (INTEGER affinity + integer literal): the index's storage-class order (NULL < numeric <
+  text < blob) matches the WHERE comparison's, so `Seek*([c])` lands exactly on the predicate boundary;
+  NULLs fail `col > c` / `col < c` and sort first, so the seek skips them. This is the same "no scan
+  fallback needed" zone the sibling bd-2dgf5 IN-list path relies on. (A non-INTEGER-affinity column
+  keeps the safety fallback and declines here.)
+- BYTE-EXACT GATE (`minmax_range_oracle.rs`, PASS): vs rusqlite/C SQLite — all four operators, reversed
+  operand order, NULLs, empty→NULL, COALESCE wrapper, and MIXED storage classes in the INTEGER column
+  (int/real/text at the boundaries — stresses the storage-class ordering) — all bit-identical; plus the
+  decline cases (unnatural pairing, non-integer bound). Opcode gate: MIN col>c → `SeekGT`, MAX col<c →
+  `SeekLT`; unnatural pairings do not seek.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
+- PERF: the before is a measured full scan (5.36 ms / 5.00 ms on 20k rows); the lever replaces it with a
+  single O(log n) bound seek (the same single-seek shape as the other MIN/MAX-via-index wins, ~µs).
+  Diagnostic: minmax_range_profile.rs.
