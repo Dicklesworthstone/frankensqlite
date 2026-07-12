@@ -97,6 +97,15 @@ impl PageBuf {
         self.pool.is_some()
     }
 
+    /// Whether dropping this buffer will return its allocation to `pool`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn returns_to_pool(&self, pool: &PageBufPool) -> bool {
+        self.pool
+            .as_ref()
+            .is_some_and(|origin| Arc::ptr_eq(origin, &pool.inner))
+    }
+
     /// Raw pointer to the start of the aligned region (useful for alignment
     /// verification in tests).
     #[inline]
@@ -391,6 +400,14 @@ impl PageBufPool {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.inner.max_buffers
+    }
+
+    /// Number of buffers currently allocated by this pool, including both
+    /// idle and checked-out buffers.
+    #[inline]
+    #[must_use]
+    pub fn total_buffers(&self) -> usize {
+        self.inner.total_buffers.load(Ordering::Acquire)
     }
 
     #[must_use]

@@ -1239,6 +1239,16 @@ impl CachedPageEntry {
     }
 
     #[inline]
+    fn new_dirty(buf: PageBuf) -> Self {
+        Self {
+            buf,
+            shared: None,
+            access_count: AtomicU64::new(0),
+            dirty: AtomicBool::new(true),
+        }
+    }
+
+    #[inline]
     fn as_slice(&self) -> &[u8] {
         self.record_access();
         self.buf.as_slice()
@@ -1467,18 +1477,23 @@ impl FastPageArray {
 
     /// Remove a page.
     fn remove(&mut self, page_no: PageNumber) -> bool {
+        self.take(page_no).is_some()
+    }
+
+    /// Remove and return a page entry.
+    fn take(&mut self, page_no: PageNumber) -> Option<CachedPageEntry> {
         let idx = Self::pgno_to_idx(page_no);
         if let Some(slot) = self.pages.get_mut(idx) {
-            if slot.take().is_some() {
+            if let Some(entry) = slot.take() {
                 self.count = self.count.saturating_sub(1);
                 if self.count == 0 {
                     self.next_eviction_scan_start = 0;
                 }
                 self.evictions = self.evictions.saturating_add(1);
-                return true;
+                return Some(entry);
             }
         }
-        false
+        None
     }
 
     /// Remove an arbitrary page (for eviction).
@@ -1759,16 +1774,38 @@ impl FlatPageSlots {
     /// Get page data as an owned copy.
     fn get_copy(&self, page_no: PageNumber) -> Option<Vec<u8>> {
         let idx = self.find_slot(page_no)?;
-        self.hits.fetch_add(1, Ordering::Relaxed);
         let guard = self.slots[idx].data.lock();
+        if self.slots[idx].pgno.load(Ordering::Acquire) != page_no.get() {
+            return None;
+        }
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        guard.as_ref().map(|entry| entry.as_slice().to_vec())
+    }
+
+    #[cfg(test)]
+    fn get_copy_after_probe_barrier(
+        &self,
+        page_no: PageNumber,
+        barrier: &std::sync::Barrier,
+    ) -> Option<Vec<u8>> {
+        let idx = self.find_slot(page_no)?;
+        barrier.wait();
+        barrier.wait();
+        let guard = self.slots[idx].data.lock();
+        if self.slots[idx].pgno.load(Ordering::Acquire) != page_no.get() {
+            return None;
+        }
         guard.as_ref().map(|entry| entry.as_slice().to_vec())
     }
 
     /// Get page data as a shared [`PageData`].
     fn get_shared(&self, page_no: PageNumber) -> Option<PageData> {
         let idx = self.find_slot(page_no)?;
-        self.hits.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.slots[idx].data.lock();
+        if self.slots[idx].pgno.load(Ordering::Acquire) != page_no.get() {
+            return None;
+        }
+        self.hits.fetch_add(1, Ordering::Relaxed);
         guard.as_mut().map(CachedPageEntry::shared_page)
     }
 
@@ -1793,6 +1830,7 @@ impl FlatPageSlots {
             if slot_pgno == pgno {
                 self.prefetch_slot(idx);
                 if let Some(guard) = slot.data.try_lock()
+                    && slot.pgno.load(Ordering::Acquire) == pgno
                     && let Some(entry) = guard.as_ref()
                 {
                     entry.prefetch_hint();
@@ -1810,59 +1848,91 @@ impl FlatPageSlots {
     /// table is full (caller should use overflow shards).
     #[allow(clippy::missing_errors_doc)]
     fn try_insert(&self, page_no: PageNumber, buf: PageBuf) -> std::result::Result<bool, PageBuf> {
+        self.try_insert_with_dirty_state(page_no, buf, false)
+    }
+
+    /// Insert a newly modified page and publish its dirty state atomically
+    /// with the cache entry.
+    fn try_insert_dirty(
+        &self,
+        page_no: PageNumber,
+        buf: PageBuf,
+    ) -> std::result::Result<bool, PageBuf> {
+        self.try_insert_with_dirty_state(page_no, buf, true)
+    }
+
+    fn try_insert_with_dirty_state(
+        &self,
+        page_no: PageNumber,
+        buf: PageBuf,
+        dirty: bool,
+    ) -> std::result::Result<bool, PageBuf> {
         let pgno = page_no.get();
         // u32::MAX is our tombstone sentinel — cannot store it.
         if pgno == SLOT_TOMBSTONE {
             return Err(buf);
         }
-        let start = self.hash_pgno(pgno);
-        let mut first_available: Option<(usize, u32)> = None;
+        for _attempt in 0..MAX_PROBE_LENGTH {
+            let start = self.hash_pgno(pgno);
+            let mut first_available: Option<(usize, u32)> = None;
 
-        for i in 0..MAX_PROBE_LENGTH {
-            let idx = (start + i) & self.mask;
-            let slot_pgno = self.slots[idx].pgno.load(Ordering::Acquire);
+            for i in 0..MAX_PROBE_LENGTH {
+                let idx = (start + i) & self.mask;
+                let slot_pgno = self.slots[idx].pgno.load(Ordering::Acquire);
 
-            if slot_pgno == pgno {
-                // Already present — update data.
-                *self.slots[idx].data.lock() = Some(CachedPageEntry::new(buf));
-                return Ok(false);
+                if slot_pgno == pgno {
+                    // Already present — update data. Re-probe if eviction or
+                    // reuse changed slot ownership before the payload lock.
+                    let mut data = self.slots[idx].data.lock();
+                    if self.slots[idx].pgno.load(Ordering::Acquire) != pgno {
+                        continue;
+                    }
+                    *data = Some(if dirty {
+                        CachedPageEntry::new_dirty(buf)
+                    } else {
+                        CachedPageEntry::new(buf)
+                    });
+                    return Ok(false);
+                }
+
+                if (slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE)
+                    && first_available.is_none()
+                {
+                    first_available = Some((idx, slot_pgno));
+                }
+
+                if slot_pgno == SLOT_EMPTY {
+                    break; // End of probe chain — page not present.
+                }
             }
 
-            if (slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE) && first_available.is_none()
+            let Some((avail_idx, expected)) = first_available else {
+                return Err(buf); // Probe chain exhausted with no available slot.
+            };
+
+            // Hold the payload lock before publishing pgno: readers that
+            // observe the new page number must block until bytes are installed.
+            let mut data_guard = self.slots[avail_idx].data.lock();
+            if self.slots[avail_idx]
+                .pgno
+                .compare_exchange(expected, pgno, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
             {
-                first_available = Some((idx, slot_pgno));
-            }
-
-            if slot_pgno == SLOT_EMPTY {
-                break; // End of probe chain — page not present.
-            }
-        }
-
-        let Some((avail_idx, expected)) = first_available else {
-            return Err(buf); // Probe chain exhausted with no available slot.
-        };
-
-        // Hold the payload lock before publishing pgno: readers that observe
-        // the new page number must block until the page bytes are installed.
-        let mut data_guard = self.slots[avail_idx].data.lock();
-        match self.slots[avail_idx].pgno.compare_exchange(
-            expected,
-            pgno,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                *data_guard = Some(CachedPageEntry::new(buf));
+                *data_guard = Some(if dirty {
+                    CachedPageEntry::new_dirty(buf)
+                } else {
+                    CachedPageEntry::new(buf)
+                });
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.admits.fetch_add(1, Ordering::Relaxed);
-                Ok(true)
+                return Ok(true);
             }
-            Err(_) => {
-                // Another thread claimed the slot between our probe and CAS.
-                // Fall back to overflow shards rather than re-probing.
-                Err(buf)
-            }
+            // Another thread claimed the slot between probe and CAS. Retry
+            // the full probe so a same-page winner is updated in the flat tier
+            // instead of creating a stale duplicate in the overflow shard.
         }
+
+        Err(buf)
     }
 
     /// Remove a specific page. Returns `true` if evicted.
@@ -1871,12 +1941,16 @@ impl FlatPageSlots {
             return false;
         };
         let pgno = page_no.get();
+        let mut data = self.slots[idx].data.lock();
+        if self.slots[idx].pgno.load(Ordering::Acquire) != pgno {
+            return false;
+        }
         if self.slots[idx]
             .pgno
             .compare_exchange(pgno, SLOT_TOMBSTONE, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            let _ = self.slots[idx].data.lock().take();
+            let _ = data.take();
             self.count.fetch_sub(1, Ordering::Relaxed);
             self.has_tombstones.store(true, Ordering::Release);
             self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -1886,14 +1960,51 @@ impl FlatPageSlots {
         }
     }
 
+    /// Remove `page_no` only while its cache entry is still clean.
+    ///
+    /// The payload lock spans the dirty check and the page-number CAS, so a
+    /// concurrent mutable cache access cannot dirty the page between the
+    /// eligibility decision and eviction.
+    fn take_if_clean_from_pool(&self, page_no: PageNumber, pool: &PageBufPool) -> Option<PageBuf> {
+        let Some(idx) = self.find_slot(page_no) else {
+            return None;
+        };
+        let pgno = page_no.get();
+        let mut data = self.slots[idx].data.lock();
+        let reclaimable = data
+            .as_ref()
+            .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool));
+        if self.slots[idx].pgno.load(Ordering::Acquire) != pgno || !reclaimable {
+            return None;
+        }
+        if self.slots[idx]
+            .pgno
+            .compare_exchange(pgno, SLOT_TOMBSTONE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+
+        let entry = data
+            .take()
+            .expect("reclaimable flat cache entry must still be present");
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        self.has_tombstones.store(true, Ordering::Release);
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        Some(entry.buf)
+    }
+
     /// Remove an arbitrary page (for eviction) and return its page number.
     fn remove_any_page(&self) -> Option<PageNumber> {
         let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.slots.len() {
             let idx = (start + i) & self.mask;
             let slot_pgno = self.slots[idx].pgno.load(Ordering::Relaxed);
-            if slot_pgno != SLOT_EMPTY
-                && slot_pgno != SLOT_TOMBSTONE
+            if slot_pgno == SLOT_EMPTY || slot_pgno == SLOT_TOMBSTONE {
+                continue;
+            }
+            let mut data = self.slots[idx].data.lock();
+            if self.slots[idx].pgno.load(Ordering::Acquire) == slot_pgno
                 && self.slots[idx]
                     .pgno
                     .compare_exchange(
@@ -1904,7 +2015,7 @@ impl FlatPageSlots {
                     )
                     .is_ok()
             {
-                let _ = self.slots[idx].data.lock().take();
+                let _ = data.take();
                 self.count.fetch_sub(1, Ordering::Relaxed);
                 self.has_tombstones.store(true, Ordering::Release);
                 self.eviction_cursor
@@ -2072,15 +2183,22 @@ impl PageCacheShard {
         }
     }
 
-    /// Insert a buffer into this shard.
-    fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
+    fn insert_with_dirty_state(&mut self, page_no: PageNumber, buf: PageBuf, dirty: bool) -> bool {
         let admitted_new = match self.pages.entry(page_no) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(CachedPageEntry::new(buf));
+                entry.insert(if dirty {
+                    CachedPageEntry::new_dirty(buf)
+                } else {
+                    CachedPageEntry::new(buf)
+                });
                 false
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(CachedPageEntry::new(buf));
+                entry.insert(if dirty {
+                    CachedPageEntry::new_dirty(buf)
+                } else {
+                    CachedPageEntry::new(buf)
+                });
                 true
             }
         };
@@ -2518,7 +2636,9 @@ impl ShardedPageCache {
 
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
             let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref entry) = *guard {
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref entry) = *guard
+            {
                 entry.record_access();
                 return;
             }
@@ -2527,31 +2647,6 @@ impl ShardedPageCache {
         let idx = self.shard_index(page_no);
         if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
             entry.record_access();
-        }
-    }
-
-    fn mark_page_dirty(&self, page_no: PageNumber) {
-        if self.use_fast_path.load(Ordering::Relaxed)
-            && let Some(ref fast) = self.fast_array
-        {
-            let idx = FastPageArray::pgno_to_idx(page_no);
-            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
-                entry.mark_dirty();
-            }
-            return;
-        }
-
-        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref entry) = *guard {
-                entry.mark_dirty();
-                return;
-            }
-        }
-
-        let idx = self.shard_index(page_no);
-        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
-            entry.mark_dirty();
         }
     }
 
@@ -2568,7 +2663,9 @@ impl ShardedPageCache {
 
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
             let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref entry) = *guard {
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref entry) = *guard
+            {
                 entry.mark_clean();
                 return;
             }
@@ -2577,6 +2674,50 @@ impl ShardedPageCache {
         let idx = self.shard_index(page_no);
         if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
             entry.mark_clean();
+        }
+    }
+
+    /// Remove an obsolete overflow copy after the authoritative insertion was
+    /// admitted into the flat tier. This preserves the one-resident-image
+    /// invariant across tombstone reuse and probe-chain contraction.
+    fn remove_overflow_duplicate(&self, page_no: PageNumber) -> bool {
+        let idx = self.shard_index(page_no);
+        self.shards[idx].lock().remove(page_no)
+    }
+
+    /// Insert one authoritative cache image while preserving the invariant
+    /// that a page resides in exactly one storage tier.
+    fn insert_tiered(&self, page_no: PageNumber, buf: PageBuf, dirty: bool) -> bool {
+        let try_flat = |buf| {
+            if dirty {
+                self.flat_slots.try_insert_dirty(page_no, buf)
+            } else {
+                self.flat_slots.try_insert(page_no, buf)
+            }
+        };
+
+        match try_flat(buf) {
+            Ok(is_new) => {
+                let duplicate_removed = self.remove_overflow_duplicate(page_no);
+                is_new && !duplicate_removed
+            }
+            Err(buf) => {
+                let shard_idx = self.shard_index(page_no);
+                let mut shard = self.shards[shard_idx].lock();
+                // Close the fallback race: while holding the target shard,
+                // retry the flat tier before publishing an overflow copy.
+                match try_flat(buf) {
+                    Ok(is_new) => {
+                        let duplicate_removed = shard.remove(page_no);
+                        is_new && !duplicate_removed
+                    }
+                    Err(buf) => {
+                        let admitted = shard.insert_with_dirty_state(page_no, buf, dirty);
+                        self.shards_dirty.store(true, Ordering::Release);
+                        admitted
+                    }
+                }
+            }
         }
     }
 
@@ -2716,9 +2857,11 @@ impl ShardedPageCache {
         }
         // Flat slots (bd-eorms) — find_slot is lock-free; data Mutex on hit only
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref buf) = *guard {
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref buf) = *guard
+            {
+                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
                 let result = f(buf.as_slice());
                 drop(guard);
                 self.record_eviction_access(page_no);
@@ -2756,9 +2899,11 @@ impl ShardedPageCache {
         }
         // Flat slots (bd-eorms)
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref mut buf) = *guard {
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref mut buf) = *guard
+            {
+                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
                 let result = f(buf.as_mut_slice());
                 drop(guard);
                 self.record_eviction_access(page_no);
@@ -2825,9 +2970,11 @@ impl ShardedPageCache {
 
         // Flat slots probe (bd-eorms) — lock-free miss path
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref buf) = *guard {
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref buf) = *guard
+            {
+                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
                 let result = f(buf.as_slice());
                 drop(guard);
                 self.record_eviction_access(page_no);
@@ -2870,10 +3017,7 @@ impl ShardedPageCache {
 
         let result = f(buf.as_slice());
         // Insert into flat slots; overflow to shard on CAS failure.
-        if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
-            self.shards[shard_idx].lock().insert(page_no, buf);
-            self.shards_dirty.store(true, Ordering::Release);
-        }
+        self.insert_tiered(page_no, buf, false);
         self.note_page_access_without_metrics(page_no);
         self.record_eviction_admit(page_no);
         Ok(result)
@@ -2904,9 +3048,11 @@ impl ShardedPageCache {
 
         // Flat slots (bd-eorms)
         if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if let Some(ref buf) = *guard {
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref buf) = *guard
+            {
+                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
                 let offset = page_offset(page_no, self.page_size);
                 file.write(cx, buf.as_slice(), offset)?;
                 buf.mark_clean();
@@ -2972,16 +3118,7 @@ impl ShardedPageCache {
         let mut buf = self.pool.acquire()?;
         buf.as_mut_slice().fill(0);
         let result = f(buf.as_mut_slice());
-        let admitted_new = match self.flat_slots.try_insert(page_no, buf) {
-            Ok(is_new) => is_new,
-            Err(buf) => {
-                let idx = self.shard_index(page_no);
-                let admitted = self.shards[idx].lock().insert(page_no, buf);
-                self.shards_dirty.store(true, Ordering::Release);
-                admitted
-            }
-        };
-        self.mark_page_dirty(page_no);
+        let admitted_new = self.insert_tiered(page_no, buf, true);
         self.note_page_access_without_metrics(page_no);
         if admitted_new {
             self.record_eviction_admit(page_no);
@@ -3007,15 +3144,7 @@ impl ShardedPageCache {
             }
         }
         // Flat slots first; overflow to shard.
-        let admitted_new = match self.flat_slots.try_insert(page_no, buf) {
-            Ok(is_new) => is_new,
-            Err(buf) => {
-                let idx = self.shard_index(page_no);
-                let admitted = self.shards[idx].lock().insert(page_no, buf);
-                self.shards_dirty.store(true, Ordering::Release);
-                admitted
-            }
-        };
+        let admitted_new = self.insert_tiered(page_no, buf, false);
         self.mark_page_clean(page_no);
         if admitted_new {
             self.record_eviction_admit(page_no);
@@ -3031,6 +3160,7 @@ impl ShardedPageCache {
             if let Some(ref fast) = self.fast_array {
                 let removed = fast.lock().remove(page_no);
                 if removed {
+                    self.remove_overflow_duplicate(page_no);
                     self.forget_eviction_page(page_no);
                 }
                 return removed;
@@ -3038,6 +3168,7 @@ impl ShardedPageCache {
         }
         // Try flat slots first, then overflow shard.
         if self.flat_slots.remove(page_no) {
+            self.remove_overflow_duplicate(page_no);
             self.forget_eviction_page(page_no);
             return true;
         }
@@ -3047,6 +3178,98 @@ impl ShardedPageCache {
             self.forget_eviction_page(page_no);
         }
         removed
+    }
+
+    /// Take a specific page only if its resident cache image is still clean
+    /// and its buffer belongs to this cache's pool.
+    ///
+    /// Each storage tier rechecks dirtiness while holding the same lock that
+    /// protects removal. Shared [`PageData`] snapshots remain valid because
+    /// they own an independent `Arc<[u8]>`; evicting the cache's `PageBuf`
+    /// cannot invalidate an already-published snapshot.
+    fn take_clean_buffer_at(&self, page_no: PageNumber) -> Option<PageBuf> {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let mut fast = fast.lock();
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            let clean = fast
+                .pages
+                .get(idx)
+                .and_then(Option::as_ref)
+                .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(&self.pool));
+            let entry = clean.then(|| fast.take(page_no)).flatten();
+            drop(fast);
+            if let Some(entry) = entry {
+                self.forget_eviction_page(page_no);
+                return Some(entry.buf);
+            }
+            return None;
+        }
+
+        let overflow_idx = self.shard_index(page_no);
+        if self.shards[overflow_idx]
+            .lock()
+            .pages
+            .contains_key(&page_no)
+        {
+            // A duplicate violates the tier invariant. Refuse to remove the
+            // preferred flat image and expose an older overflow copy; the next
+            // authoritative insertion collapses the duplicate.
+            return None;
+        }
+
+        if let Some(buffer) = self.flat_slots.take_if_clean_from_pool(page_no, &self.pool) {
+            self.forget_eviction_page(page_no);
+            return Some(buffer);
+        }
+
+        let idx = self.shard_index(page_no);
+        let mut shard = self.shards[idx].lock();
+        let clean = shard
+            .pages
+            .get(&page_no)
+            .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(&self.pool));
+        let entry = clean.then(|| shard.pages.remove(&page_no)).flatten();
+        if entry.is_some() {
+            shard.evictions = shard.evictions.saturating_add(1);
+        }
+        drop(shard);
+        if let Some(entry) = entry {
+            self.forget_eviction_page(page_no);
+            return Some(entry.buf);
+        }
+        None
+    }
+
+    /// Atomically remove and return one clean buffer from this cache's pool.
+    ///
+    /// This is the write-admission counterpart to [`Self::evict_any`]. It is
+    /// intentionally fail-closed for dirty entries: transaction staging must
+    /// never recover capacity by discarding an unpublished or unflushed page.
+    /// The path is only used after the shared [`PageBufPool`] reaches its
+    /// configured ceiling, so the diagnostic snapshot and deterministic
+    /// victim scan do not burden ordinary cache hits.
+    pub(crate) fn take_clean_buffer(&self) -> Option<PageBuf> {
+        if let Some(preferred) = self.preferred_reconstructed_victim()
+            && let Some(buffer) = self.take_clean_buffer_at(preferred)
+        {
+            return Some(buffer);
+        }
+
+        let mut candidates = self.page_snapshots();
+        candidates.sort_unstable_by_key(|snapshot| (snapshot.access_count, snapshot.page_no.get()));
+        candidates
+            .into_iter()
+            .filter(|snapshot| !snapshot.dirty)
+            .find_map(|snapshot| self.take_clean_buffer_at(snapshot.page_no))
+    }
+
+    /// Evict one clean pool-backed cache page and return its buffer to the
+    /// free list. Callers that immediately need the allocation should prefer
+    /// [`Self::take_clean_buffer`] to avoid a free-list race.
+    pub fn evict_clean_any(&self) -> bool {
+        self.take_clean_buffer().is_some()
     }
 
     /// Evict an arbitrary page from the cache.
@@ -3066,6 +3289,7 @@ impl ShardedPageCache {
             if let Some(ref fast) = self.fast_array {
                 let removed = fast.lock().remove_any();
                 if let Some(page_no) = removed {
+                    self.remove_overflow_duplicate(page_no);
                     self.forget_eviction_page(page_no);
                     return true;
                 }
@@ -3074,6 +3298,7 @@ impl ShardedPageCache {
         }
         // Flat slots first (bd-eorms)
         if let Some(page_no) = self.flat_slots.remove_any_page() {
+            self.remove_overflow_duplicate(page_no);
             self.forget_eviction_page(page_no);
             return true;
         }
@@ -4671,6 +4896,151 @@ mod tests {
             snapshot.t2_size >= 1,
             "S3-FIFO metrics should expose a non-empty main queue for sharded cache"
         );
+    }
+
+    #[test]
+    fn gh_131_clean_eviction_never_discards_dirty_page() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2);
+        let clean_page = PageNumber::ONE;
+        let dirty_page = PageNumber::new(2).unwrap();
+
+        let clean_buf = cache.pool().acquire().unwrap();
+        cache.insert_buffer(clean_page, clean_buf);
+        cache
+            .insert_fresh(dirty_page, |bytes| bytes[0] = 0xA5)
+            .unwrap();
+        assert_eq!(cache.pool().available(), 0, "pool must start saturated");
+
+        assert!(
+            cache.evict_clean_any(),
+            "clean-cache recovery should reclaim the eligible page"
+        );
+        assert!(!cache.contains(clean_page));
+        assert!(cache.contains(dirty_page));
+        assert_eq!(cache.pool().available(), 1);
+
+        assert!(
+            !cache.evict_clean_any(),
+            "dirty-only cache must fail closed rather than discard data"
+        );
+        assert!(cache.contains(dirty_page));
+    }
+
+    #[test]
+    fn gh_131_clean_eviction_skips_buffers_from_other_allocators() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 1);
+        for raw_page_no in 1..=8 {
+            cache.insert_buffer(
+                PageNumber::new(raw_page_no).unwrap(),
+                PageBuf::new(PageSize::DEFAULT),
+            );
+        }
+        let pooled_page = PageNumber::new(9).unwrap();
+        cache.insert_buffer(pooled_page, cache.pool().acquire().unwrap());
+        assert_eq!(cache.pool().available(), 0);
+
+        assert!(cache.evict_clean_any());
+        assert!(!cache.contains(pooled_page));
+        assert_eq!(cache.pool().available(), 1);
+        for raw_page_no in 1..=8 {
+            assert!(cache.contains(PageNumber::new(raw_page_no).unwrap()));
+        }
+    }
+
+    #[test]
+    fn gh_131_clean_buffer_handoff_preserves_shared_page_snapshot() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 1);
+        let page_no = PageNumber::ONE;
+        let mut buffer = cache.pool().acquire().unwrap();
+        buffer.fill(0xA7);
+        cache.insert_buffer(page_no, buffer);
+        let snapshot = cache
+            .get_shared(page_no)
+            .expect("clean cached page should publish a shared snapshot");
+
+        let mut reclaimed = cache
+            .take_clean_buffer()
+            .expect("shared snapshot must not pin the independent pool buffer");
+        reclaimed.fill(0xB8);
+
+        assert!(!cache.contains(page_no));
+        assert!(snapshot.as_bytes().iter().all(|byte| *byte == 0xA7));
+        assert!(reclaimed.iter().all(|byte| *byte == 0xB8));
+    }
+
+    #[test]
+    fn gh_131_flat_slot_reader_rejects_reused_slot_payload() {
+        let cache = Arc::new(ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 2));
+        let original_page = PageNumber::ONE;
+        let mut original = PageBuf::new(PageSize::DEFAULT);
+        original.fill(0xA1);
+        cache.insert_buffer(original_page, original);
+        let original_slot = cache.flat_slots.find_slot(original_page).unwrap();
+        let replacement_page = (2..=u32::MAX - 1)
+            .filter_map(PageNumber::new)
+            .find(|candidate| {
+                cache.flat_slots.hash_pgno(candidate.get()) == original_slot
+                    && *candidate != original_page
+            })
+            .expect("a colliding replacement page must exist");
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let reader_cache = Arc::clone(&cache);
+        let reader_barrier = Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            reader_cache
+                .flat_slots
+                .get_copy_after_probe_barrier(original_page, &reader_barrier)
+        });
+
+        barrier.wait();
+        assert!(cache.evict(original_page));
+        let mut replacement = PageBuf::new(PageSize::DEFAULT);
+        replacement.fill(0xB2);
+        cache.insert_buffer(replacement_page, replacement);
+        assert_eq!(
+            cache.flat_slots.find_slot(replacement_page),
+            Some(original_slot),
+            "replacement must reuse the probed slot to exercise the race"
+        );
+        barrier.wait();
+
+        assert_eq!(
+            reader.join().unwrap(),
+            None,
+            "a reader for the evicted page must not observe replacement bytes"
+        );
+    }
+
+    #[test]
+    fn gh_131_authoritative_flat_update_purges_overflow_duplicate() {
+        let cache = ShardedPageCache::with_max_buffers(PageSize::DEFAULT, 3);
+        let page_no = PageNumber::ONE;
+
+        let mut flat = cache.pool().acquire().unwrap();
+        flat.fill(0x11);
+        cache.insert_buffer(page_no, flat);
+
+        let mut stale = cache.pool().acquire().unwrap();
+        stale.fill(0x22);
+        let shard_idx = cache.shard_index(page_no);
+        cache.shards[shard_idx]
+            .lock()
+            .insert_with_dirty_state(page_no, stale, false);
+
+        let mut current = cache.pool().acquire().unwrap();
+        current.fill(0x33);
+        cache.insert_buffer(page_no, current);
+        assert!(!cache.shards[shard_idx].lock().contains(page_no));
+        assert!(
+            cache
+                .get_copy(page_no)
+                .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0x33))
+        );
+
+        let reclaimed = cache.take_clean_buffer().unwrap();
+        assert!(reclaimed.iter().all(|byte| *byte == 0x33));
+        assert_eq!(cache.get_copy(page_no), None);
     }
 
     #[test]
