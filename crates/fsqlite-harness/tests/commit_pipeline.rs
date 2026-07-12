@@ -237,7 +237,21 @@ fn test_fifo_ordering_under_contention() {
 #[test]
 #[should_panic(expected = "[ASUP-E103] Cannot create obligation token in root region")]
 fn test_tracked_sender_rejects_root_region_permit() {
-    let cx = test_cx();
+    // A fresh runtime deterministically yields its root context. Reusing the
+    // process-global test runtime here makes the region depend on whichever
+    // parallel test most recently drove it, turning this root-region contract
+    // into a race between ASUP-E103 and the permit drop bomb (ASUP-E101).
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("fresh test runtime should build");
+    let cx = runtime.block_on(async {
+        Cx::current().expect("runtime block_on should install its root context")
+    });
+    assert_eq!(
+        cx.region_id().as_u64(),
+        0,
+        "a fresh runtime must install its root region"
+    );
     let (tracked_sender, _receiver) = session::tracked_channel::<CommitRequest>(4);
     let permit = block_on(tracked_sender.reserve(&cx)).expect("tracked reserve should succeed");
     drop(permit);
