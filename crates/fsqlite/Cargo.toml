@@ -41,6 +41,7 @@ mvcc = []
 [dev-dependencies]
 fsqlite-ast = { workspace = true }
 fsqlite-func = { workspace = true }
+fsqlite-pager = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
 tempfile = { workspace = true }

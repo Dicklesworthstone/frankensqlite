@@ -9,7 +9,7 @@ use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_TOTAL_LOCKS,
 };
-use crate::traits::{Vfs, VfsFile};
+use crate::traits::{FileIdentity, Vfs, VfsFile};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
@@ -751,6 +751,10 @@ impl VfsFile for MemoryFile {
             }
         }
         Ok(())
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        Ok(None)
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {

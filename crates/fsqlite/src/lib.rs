@@ -10,6 +10,7 @@ pub use fsqlite_core::connection::{
 pub use fsqlite_error::FrankenError;
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;
+pub use fsqlite_vfs::FileIdentity;
 
 #[cfg(feature = "session")]
 /// Manual session/changeset API facade re-exported from `fsqlite-ext-session`.
@@ -39,7 +40,7 @@ pub mod migrate;
 )]
 mod tests {
     use super::{
-        Connection, ConnectionEnv, IoPollStrategy, RuntimeConfig, RuntimeContext,
+        Connection, ConnectionEnv, FileIdentity, IoPollStrategy, RuntimeConfig, RuntimeContext,
         init_global_runtime,
     };
     use fsqlite_ast::{CreateTableBody, Statement};
@@ -56,6 +57,176 @@ mod tests {
     fn test_connection_open_and_path() {
         let conn = Connection::open(":memory:").expect("in-memory connection should open");
         assert_eq!(conn.path(), ":memory:");
+    }
+
+    #[test]
+    fn in_memory_connection_has_no_filesystem_identity() {
+        let conn = Connection::open(":memory:").expect("in-memory connection should open");
+        assert_eq!(conn.file_identity().unwrap(), None);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn connection_identity_remains_bound_to_open_file_after_path_swap() {
+        use std::fs::File;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("identity.db");
+        let displaced_path = dir.path().join("identity.opened.db");
+        let conn = Connection::open(database_path.to_string_lossy().into_owned())
+            .expect("open file-backed connection");
+
+        let leased_file = File::open(&database_path).expect("lease opened database descriptor");
+        let leased_identity = FileIdentity::from_file(&leased_file)
+            .expect("read leased descriptor identity")
+            .expect("Unix descriptors have stable identities");
+        let connection_identity = conn
+            .file_identity()
+            .expect("read connection identity")
+            .expect("Unix VFS exposes an open-file identity");
+        assert_eq!(connection_identity, leased_identity);
+
+        std::fs::rename(&database_path, &displaced_path).expect("displace opened database path");
+        drop(File::create(&database_path).expect("create replacement path"));
+        let replacement_file = File::open(&database_path).expect("lease replacement descriptor");
+        let replacement_identity = FileIdentity::from_file(&replacement_file)
+            .expect("read replacement descriptor identity")
+            .expect("Unix descriptors have stable identities");
+
+        assert_ne!(connection_identity, replacement_identity);
+        assert_eq!(conn.file_identity().unwrap(), Some(leased_identity));
+        drop(conn);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn expected_identity_refuses_swapped_hot_journal_without_mutation() {
+        use fsqlite_pager::{JournalHeader, JournalPageRecord};
+        use std::fs::File;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("identity-bound.db");
+        let displaced_path = dir.path().join("identity-bound.leased.db");
+        let journal_path = dir.path().join("identity-bound.db-journal");
+
+        {
+            let leased_seed = rusqlite::Connection::open(&database_path)
+                .expect("create identity-leased database");
+            leased_seed
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
+                     CREATE TABLE leased_marker(value INTEGER);
+                     INSERT INTO leased_marker VALUES (1);",
+                )
+                .expect("seed identity-leased database");
+        }
+        let leased_file = File::open(&database_path).expect("lease original database descriptor");
+        let leased_identity = FileIdentity::from_file(&leased_file)
+            .expect("read leased descriptor identity")
+            .expect("Unix descriptors have stable identities");
+        std::fs::rename(&database_path, &displaced_path).expect("replace leased database pathname");
+
+        let (page_size, page_count) = {
+            let replacement =
+                rusqlite::Connection::open(&database_path).expect("create replacement database");
+            replacement
+                .execute_batch(
+                    "PRAGMA page_size = 4096;
+                     PRAGMA journal_mode = DELETE;
+                     CREATE TABLE replacement_marker(value INTEGER);
+                     INSERT INTO replacement_marker VALUES (2);",
+                )
+                .expect("seed replacement database");
+            let page_size: i64 = replacement
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .expect("read replacement page size");
+            let page_count: i64 = replacement
+                .query_row("PRAGMA page_count", [], |row| row.get(0))
+                .expect("read replacement page count");
+            (
+                u32::try_from(page_size).expect("page size fits u32"),
+                u32::try_from(page_count).expect("page count fits u32"),
+            )
+        };
+        assert!(page_count >= 2, "replacement database must have page 2");
+
+        let replacement_file =
+            File::open(&database_path).expect("open replacement database descriptor");
+        let replacement_identity = FileIdentity::from_file(&replacement_file)
+            .expect("read replacement descriptor identity")
+            .expect("Unix descriptors have stable identities");
+        assert_ne!(replacement_identity, leased_identity);
+
+        let page_size_usize = usize::try_from(page_size).expect("page size fits usize");
+        let replacement_pristine =
+            std::fs::read(&database_path).expect("read replacement database");
+        let mut replacement_bytes = replacement_pristine.clone();
+        assert!(replacement_bytes.len() >= page_size_usize * 2);
+        let page_two_preimage = replacement_bytes[page_size_usize..page_size_usize * 2].to_vec();
+        replacement_bytes[page_size_usize] ^= 0xff;
+        std::fs::write(&database_path, &replacement_bytes)
+            .expect("write simulated interrupted page update");
+
+        let nonce = 0x4653_514c;
+        let journal_header = JournalHeader {
+            page_count: 1,
+            nonce,
+            initial_db_size: page_count,
+            sector_size: 512,
+            page_size,
+        };
+        let mut journal_bytes = journal_header.encode_padded();
+        journal_bytes.extend(JournalPageRecord::new(2, page_two_preimage, nonce).encode());
+        std::fs::write(&journal_path, &journal_bytes).expect("write valid hot journal");
+
+        let database_before = std::fs::read(&database_path).expect("snapshot replacement bytes");
+        let journal_before = std::fs::read(&journal_path).expect("snapshot hot journal bytes");
+        let error = Connection::open_existing_with_expected_identity(
+            database_path.to_string_lossy().into_owned(),
+            leased_identity,
+        )
+        .expect_err("identity-bound open must reject the replacement database");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            std::fs::read(&database_path).unwrap(),
+            database_before,
+            "identity refusal must precede hot-journal recovery writes"
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            journal_before,
+            "identity refusal must not invalidate or delete the hot journal"
+        );
+
+        let control_database_path = dir.path().join("identity-bound-control.db");
+        let control_journal_path = dir.path().join("identity-bound-control.db-journal");
+        std::fs::write(&control_database_path, &database_before)
+            .expect("copy interrupted database into recovery control");
+        std::fs::write(&control_journal_path, &journal_before)
+            .expect("copy hot journal into recovery control");
+
+        let control =
+            Connection::open_existing(control_database_path.to_string_lossy().into_owned())
+                .expect("plain write-existing open must recover the control copy");
+        drop(control);
+
+        let control_after =
+            std::fs::read(&control_database_path).expect("read recovered control database");
+        assert_ne!(
+            control_after, database_before,
+            "control recovery must prove the hot journal is not inert"
+        );
+        assert_eq!(
+            &control_after[page_size_usize..page_size_usize * 2],
+            &replacement_pristine[page_size_usize..page_size_usize * 2],
+            "control recovery must restore the original page-two preimage"
+        );
+        assert!(
+            !control_journal_path.exists()
+                || std::fs::read(&control_journal_path).unwrap().is_empty(),
+            "control recovery must consume or invalidate the hot journal"
+        );
     }
 
     #[test]

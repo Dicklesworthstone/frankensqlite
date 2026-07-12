@@ -18212,3 +18212,159 @@ test is on the executed path, not merely linked into it.
 - GATE: `in_list_shadowed_index_oracle` extended — byte-exact covering `SUM(a)`, plus opcode gates that
   COUNT(*)/SUM(indexed) emit NO `SeekRowid` on both the single-idx and composite-shadow schemas while
   SUM(non-indexed) does. No-reg: agg_index_range, agg_composite_full_eq byte-exact.
+
+## 2026-07-12 - CORRECTNESS FIX (shipped): composite prefix+range seek dropped a residual predicate (bd-zqkrp-residual-drop)
+
+- Result type: correctness bug fixed (found while scouting the composite prefix-range AGGREGATE lever).
+  The shipped NON-aggregate seek `WHERE a = v AND b <range>` on `index(a,b)` (bd-zqkrp) applied NO
+  residual filter, and `composite_index_prefix_range_target`'s genuine-range branch (unlike the demoted
+  full-eq branch, which was guarded by `conjuncts.len() == key_terms`) had NO residual guard. So
+  `SELECT id FROM t WHERE a = 5 AND b > 10 AND c = 1` seeked the `(a=5, b>10)` block and SILENTLY DROPPED
+  `c = 1` — returning rows with the wrong `c`. Differential oracle vs C SQLite 3.46.1: frank ~80 rows,
+  sqlite ~40 (a real, user-visible wrong-results bug).
+- WHY IT HID: the first probe used `ORDER BY id`, which the seek (streams `(b, rowid)` order) can't
+  satisfy, so it DECLINED to a correct sort/scan — masking the bug. Re-probing with no ORDER BY (seek
+  taken) + sorted-set comparison exposed it.
+- FIX: `conjunct_pins_prefix_or_range` residual guard — decline unless EVERY WHERE conjunct is a prefix
+  equality (on a pinned column) or an eq / `>`/`>=`/`<`/`<=` / `BETWEEN` on the range column; a residual
+  falls to the full scan that enforces the whole WHERE. Conservative (LIKE-range conjuncts, which the
+  range extractor doesn't consume anyway, also decline → scan → correct).
+- GATE: `composite_prefix_range_residual_oracle` — byte-exact (sorted sets) across five residual shapes
+  + aggregate variants; opcode gates that the no-residual case STILL seeks (`IdxGT`) and the residual
+  case does NOT (declined). No-reg: composite_eq_seek, agg_composite_full_eq, agg_index_range byte-exact.
+- NB: bd-zqkrp-residual-drop filed. This unblocks a future composite prefix-range AGGREGATE lever — the
+  now-guarded detection is residual-safe to reuse.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM(...) WHERE a=v AND b <range> seeks the composite block (bd-agg-composite-prefix-range)
+
+- Result type: WIN / shipped. Unblocked by the preceding residual-drop fix: `COUNT(*)/SUM(...) FROM t
+  WHERE a = v AND b <range>` on `index(a,b)` full-scanned; now it seeks the `a = v` block bounded by the
+  range on `b`.
+- FIX: (1) new `composite_prefix_range_seek` branch in `codegen_select_aggregate` mirroring the
+  non-aggregate `codegen_select_composite_index_prefix_range_scan` — probe `[prefix.., range-lower-or-
+  NULL, trailing NULLs, MIN-rowid]`, SeekGE anchor, `IdxGT` (P5=prefix_len) ends the run when the prefix
+  changes, `Le`/`Gt`/`Ge` range guards within it; COVERING (via `aggregate_seek_is_covering`) when the
+  aggregates read only the leading pinned column or are COUNT(*)/SUM(rowid). (2) reuses the now
+  residual-safe `composite_index_prefix_range_target` detection (bd-zqkrp-residual-drop guard), so a
+  residual `... AND c=k` declines to the correct scan. (3) `simple_count_star` yield extended so COUNT(*)
+  reaches the seeking path.
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_composite_prefix_range_oracle` PASS — all range
+  operators on `b` (`>`,`>=`,`<`,`<=`,`BETWEEN`, reversed operands), both aggregates, NULL `b`, empty
+  ranges (→ COUNT=0/SUM=NULL), COALESCE, mixed storage classes, and the residual-predicate DECLINE.
+  Opcode gates: SeekGE + IdxGT fire; COUNT(*)/SUM(leading col) covering (no SeekRowid), SUM(b) not;
+  residual case declines (no IdxGT). No-reg: agg_index_range, composite_eq_seek,
+  composite_prefix_range_residual byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a=v AND b<range>` full scan → O(log n + matches) block seek.
+
+## 2026-07-12 - WIN (shipped): covering seek generalized to ANY index key column, not just the leading one (bd-agg-covering-any-key)
+
+- Result type: WIN / shipped. Found via gap_probe2: `SUM(b)/MIN(b)/MAX(b) WHERE a=v AND b<range` on
+  `index(a,b)` SEEKED (composite prefix-range) but were NON-covering — opening the table and doing a
+  `SeekRowid` per row to read `b`, even though `b` is a key column right there in the index entry.
+- ROOT CAUSE: `aggregate_seek_is_covering` / `emit_aggregate_accumulate_body_covering` only recognized
+  the LEADING index column (index column 0). Any aggregate reading a non-leading key column forced the
+  table lookup.
+- FIX: generalize both helpers to accept the `IndexSchema` + `TableSchema` and a new
+  `index_key_position_of` mapping (table-column ordinal → index key position). Covering now holds when
+  every aggregate reads ANY of the index's key columns (or is COUNT(*)/SUM(rowid)); the covering body
+  reads `Column idx_cursor, <key position>` for each. All four seek paths (eq / range / IN / composite
+  prefix-range) share the change. Byte-exact: key-column values live in the index entry verbatim.
+- GATE: `agg_composite_prefix_range_oracle` extended — byte-exact SUM(b)/MIN(b)/MAX(b) covering cases;
+  opcode gates that SUM(b) (key col) has NO SeekRowid while SUM(c) (non-key) does. No-reg: agg_index_range,
+  in_list_shadowed_index, agg_composite_full_eq, eq_seek_exact byte-exact (their SUM(non-indexed) stay
+  non-covering, SUM(indexed)/COUNT(*) stay covering).
+- PERF: aggregates over a non-leading index key column now skip one SeekRowid per matched row.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM WHERE a=<int> AND <residual> seeks the prefix + filters (bd-agg-leading-eq-residual)
+
+- Result type: WIN / shipped. `COUNT(*)/SUM(...) FROM t WHERE a = <int> AND <residual>` (a residual on a
+  non-key column, or any predicate the composite range path doesn't handle) full-scanned.
+- FIX: new `index_prefix_residual_seek` branch in `codegen_select_aggregate` — seek the integer-exact
+  equality-prefix block (probe `[prefix.., MIN]`, SeekGE, per-term `Ne` run stop), `SeekRowid` each row,
+  then apply the FULL WHERE via `emit_where_filter` (the prefix equalities are redundant with the seek;
+  the residual conjuncts are enforced), and accumulate. Always non-covering (the filter reads table
+  columns). `simple_count_star` yield extended so COUNT(*) reaches it.
+- SAFETY GATES (why it is byte-exact, no dropped-predicate or param-misnumber bug): (1) the prefix is
+  INTEGER-affinity + integer literal, so the seek matches exactly with no affinity fallback; (2) the
+  residual filter enforces the WHOLE WHERE, so no predicate is dropped; (3) `expr_has_placeholder`
+  requires a placeholder-FREE WHERE, so re-emitting it per row consumes no anonymous placeholders and
+  cannot mis-number a bound parameter — a `WHERE ... = ?` declines the seek and scans (which binds it).
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_leading_eq_residual_oracle` PASS — residual
+  eq/range/`<>`/OR/multi-term, a multi-column equality prefix, absent keys (→ COUNT=0/SUM=NULL),
+  COALESCE, MIN/MAX; opcode gate all-literal WHERE SeekGEs, a `?`-bearing WHERE declines. No-reg:
+  agg_composite_full_eq, agg_composite_prefix_range, eq_seek_exact byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a=<int> AND <residual>` full scan → O(log n + block) seek + per-row filter.
+- FOLLOW-UP: the placeholder-free restriction is conservative; a general `?`-safe version needs the
+  prefix probe to consume placeholders in textual order (charted mentally, not yet a bead).
+
+### follow-up (same session): leading-eq + residual extended to TEXT prefixes
+
+- `aggregate_index_prefix_literal_residual_target` now also accepts a TEXT-affinity ('B') leading column
+  pinned by a text literal when the index key collation is BINARY: `COUNT(*)/SUM WHERE s = 'k3' AND
+  <residual>` seeks the `s='k3'` block. Safe by the same superset argument — a text literal vs a TEXT
+  column indexed BINARY seeks without an affinity/collation miss, and the residual filter (which re-applies
+  the whole WHERE, prefix included) narrows to exact. Non-BINARY index collation still declines.
+- GATE: `agg_leading_eq_residual_oracle` extended with `s='k3' AND x=5` (byte-exact, present/absent, SUM,
+  SeekGE opcode gate). No-reg: eq_seek_exact, agg_composite_full_eq byte-exact.
+
+### follow-up (same session): leading-eq + residual recognizes IN / BETWEEN / NOT residuals
+
+- `expr_has_placeholder` now recurses through `UnaryOp` / `Between` / `In(List)` (still `_ => true` for
+  subqueries, function calls, CASE, etc.), so an all-literal residual using IN/BETWEEN/NOT is recognized
+  as placeholder-free: `COUNT(*)/SUM WHERE a = <int> AND x IN (2,5,8)` / `... AND x BETWEEN 2 AND 6` /
+  `... AND x NOT IN (0,1)` now seeks the prefix and filters. The residual filter enforces the whole
+  predicate, so it stays byte-exact.
+- GATE: `agg_leading_eq_residual_oracle` extended with IN/BETWEEN/NOT-IN residual cases (+ SeekGE opcode
+  gate for the IN residual). No-reg: in_list_shadowed_index, eq_seek_exact byte-exact.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM WHERE a <range> AND <residual> seeks the range + filters (bd-agg-range-residual)
+
+- Result type: WIN / shipped. The symmetric completion of bd-agg-leading-eq-residual: a range on an
+  indexed column PLUS a residual predicate (`a > 100 AND x = 5`, `a BETWEEN 0 AND 200 AND x > 3`,
+  `a > 100 AND x IN (2,5)`) full-scanned — the residual-safe range detection declines a residual, and
+  there is no equality prefix, so neither existing seek fired.
+- FIX: generalize `aggregate_index_range_seek_target` to return `(index, range, has_residual)` — the
+  residual-free case is unchanged; the residual case additionally matches a range on an INTEGER-affinity
+  single-column index (integer-literal bounds → the seek is a SUPERSET, no affinity miss) when the WHERE
+  is placeholder-free. The existing `index_range_seek` branch forces non-covering and re-applies the whole
+  WHERE via `emit_where_filter` per row when `has_residual`. Aggregates are order-independent, so visiting
+  a superset and filtering is byte-exact. Routing: eq+residual → index_prefix_residual_seek; range+residual
+  → index_range_seek; eq + range-on-next-col → composite_prefix_range_seek.
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_index_range_oracle` extended — residual eq / range / IN
+  / `<>`; opcode gates that `a>100 AND x=5` now SeekGEs (and is non-covering / has SeekRowid). No-reg:
+  agg_leading_eq_residual, agg_composite_prefix_range, minmax_range byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a<range> AND <residual>` full scan → O(log n + block) range seek + per-row filter.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM WHERE id <range> AND <residual> seeks the rowid range + filters (bd-agg-rowid-range-residual)
+
+- Result type: WIN / shipped. The rowid analogue of bd-agg-range-residual: a rowid range plus a residual
+  predicate (`id > 500 AND x = 5`, `id BETWEEN 100 AND 400 AND x > 3`, `id < 200 AND x IN (2,5,8)`)
+  full-scanned — `extract_rowid_range_target` is residual-safe (an `And` needs both sides to be rowid
+  bounds), so a residual declined the seek.
+- FIX: new `extract_rowid_range_residual_target` returns `(range, has_residual)` — residual-free case
+  unchanged; residual case collects rowid bounds from the conjuncts (ignoring non-rowid ones), requires a
+  placeholder-free WHERE, and re-checks `rowid_range_fast_path_is_safe`. The rowid-range branch adds a
+  per-row skip label and re-applies the whole WHERE via `emit_where_filter` when `has_residual`; the rowid
+  range visits a SUPERSET and the filter narrows (aggregates are order-independent → byte-exact). The
+  `simple_count_star` yield fires ONLY for the residual case, so a residual-free `COUNT(*) WHERE id>c`
+  keeps its `codegen_select_count_star` fast path.
+- GATE: `agg_rowid_range_residual_oracle` byte-exact — residual eq/range/IN/`<>`, one/two-sided ranges,
+  absent (COUNT=0/SUM=NULL), COALESCE, MIN/MAX, residual-free regression; opcode gate SeekGT. No-reg:
+  minmax_rowid_range, agg_index_range, agg_leading_eq_residual byte-exact.
+
+## 2026-07-12 - CHARTED (deferred, substantial): GROUP BY via ordered index streaming (bd-groupby-ordered-index)
+
+- Not attempted this session — too large for a small increment. `SELECT a, COUNT(*) FROM t GROUP BY a`
+  (a indexed) currently uses the two-pass scan→sort→iterate `codegen_select_group_by_aggregate` (994
+  lines). A streaming variant would walk the ordered index (idx_a is sorted by a), detect group
+  boundaries inline (compare current key to previous), finalize + emit each group on change, and emit the
+  last group at EOF — skipping the sorter entirely.
+- PLAN: add an isolated `codegen_select_group_by_ordered_index` fast path (precedent:
+  `simple_group_by_rowid_bucket_sum_plan`), gated on: single-column (or leading-prefix) GROUP BY on a
+  plain ascending index, simple aggregates, no HAVING (or a post-filter), and ORDER BY empty-or-equal to
+  the group columns. ORDER-SAFETY is the crux: with `ORDER BY <group cols>` the output is unambiguously
+  group-key-ascending, matching the index walk bit-for-bit; a bare GROUP BY (no ORDER BY) must be
+  oracle-checked against SQLite's order before allowing it (SQLite emits group-key order via index/sort,
+  but confirm before shipping). Non-covering unless every aggregate reads only index key columns.
+- WHY DEFERRED: ~120-150 lines of new control flow (group-boundary detection, AggFinal + ResultRow per
+  group, last-group-at-EOF) — a dedicated turn, not a small increment.

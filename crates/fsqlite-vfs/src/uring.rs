@@ -36,7 +36,7 @@ use nix::unistd::{Whence, lseek};
 use tracing::{info, warn};
 
 use crate::shm::ShmRegion;
-use crate::traits::{Vfs, VfsFile};
+use crate::traits::{FileIdentity, Vfs, VfsFile};
 use crate::unix::{UnixFile, UnixVfs};
 
 #[cfg(feature = "linux-uring-fs")]
@@ -732,6 +732,10 @@ impl Vfs for IoUringVfs {
 impl VfsFile for IoUringFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         self.inner.close(cx)
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {

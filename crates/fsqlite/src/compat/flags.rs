@@ -1,7 +1,5 @@
 //! Connection open flags, analogous to `rusqlite::OpenFlags`.
 
-use std::path::Path;
-
 use fsqlite_error::FrankenError;
 use fsqlite_types::flags::VfsOpenFlags;
 
@@ -202,10 +200,11 @@ pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, Frank
     match classify_access_mode(flags)? {
         OpenDisposition::ReadOnly => open_read_only_connection(path),
         OpenDisposition::WriteExisting => {
-            if path != ":memory:" && !Path::new(path).exists() {
-                return Err(FrankenError::CannotOpen { path: path.into() });
+            if path == ":memory:" {
+                Connection::open(path)
+            } else {
+                Connection::open_existing(path)
             }
-            Connection::open(path)
         }
         OpenDisposition::WriteCreate => Connection::open(path),
     }
