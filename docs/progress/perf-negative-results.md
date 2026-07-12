@@ -18368,3 +18368,26 @@ test is on the executed path, not merely linked into it.
   but confirm before shipping). Non-covering unless every aggregate reads only index key columns.
 - WHY DEFERRED: ~120-150 lines of new control flow (group-boundary detection, AggFinal + ResultRow per
   group, last-group-at-EOF) — a dedicated turn, not a small increment.
+
+## 2026-07-12 - BLOCKED (implemented, unverifiable — pool saturation): TEXT range + residual seek (bd-agg-text-range-residual)
+
+- Result type: reverted to green (uncompiled + ungated — every gate attempt hit `no admissible
+  workers: insufficient_slots=7` for the whole turn; per method an unverified byte-exact change is not
+  committable, and committing uncompiled code would break the build).
+- GAP (confirmed by gap_probe3 EXPLAIN): `COUNT(*)/SUM WHERE s > 'k1' AND x = 3` (a TEXT range + a
+  residual) full-scans — the range+residual detection `aggregate_index_range_seek_target` only accepts
+  an INTEGER-affinity column with integer-literal bounds.
+- CHANGE (implemented, reverted; re-apply next turn when the pool frees): in the residual branch of
+  `aggregate_index_range_seek_target`, replace the `is_integer` + `int_bounds` gate with an
+  affinity-matched bound check — `Some('D')` → integer-literal bounds (unchanged), or `Some('B')` with a
+  BINARY-collation index key (`key_term_collation(0)` is None or "BINARY") → text-literal (String) bounds.
+  SAFETY: a bare `s <op> 'lit'` compares under the column collation, which equals the BINARY index
+  collation, so the seek range matches the WHERE range exactly (superset); the residual filter narrows.
+  The existing range codegen already handles a TEXT bound (bound_affinity 'B', no coercion for a text
+  literal); the upper-bound `Gt/Ge` comparison is BINARY, which matches a BINARY index. No codegen change
+  needed — detection only.
+- ORACLE (written, reverted): `agg_leading_eq_residual_oracle` (has `s TEXT` + BINARY `idx_s`) +=
+  `s > 'k1' AND x = 3`, `s BETWEEN 'k1' AND 'k4' AND x > 2`, `s < 'k3' AND x IN (2,5)`, and a SeekGT
+  opcode gate.
+- RETRY CONDITION: when rch has a free worker, re-apply the ~20-line detection change + oracle cases,
+  gate byte-exact + no-reg, commit. Low risk (proven range+residual codegen; detection-only change).
