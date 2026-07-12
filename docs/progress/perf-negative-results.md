@@ -18085,3 +18085,24 @@ test is on the executed path, not merely linked into it.
 - NO-REGRESSION: `fsqlite-vdbe --lib` **1043/0 serial**. clippy clean; fmt clean.
 - PERF: full scan → the same O(block) block seek the single-column aggregate eq seek already uses (the
   opcode gate confirms SeekGE). A one-line filter relaxation.
+
+## 2026-07-12 - NEGATIVE (teed-up P1): COUNT(*)/SUM(x) WHERE a=? AND b=? on a composite (a,b) index full-scans — aggregate composite eq not implemented (bd-agg-composite-full-eq)
+
+- Result type: NEGATIVE / gap profiled and charted, not a small increment. EXPLAIN probe on main
+  (a59e99ea): `SELECT COUNT(*)/SUM(x) FROM t WHERE a=? AND b=?` on a composite `(a,b)` index does a FULL
+  TABLE SCAN (`OpenRead table, Rewind, Column/Ne a, Column/Ne b, AggStep, Next` — `seek=false`).
+- WHY: the aggregate index-eq seek (`aggregate_index_eq_seek_target` + codegen ~11195) handles only a
+  SINGLE-column equality — `extract_column_eq_target` requires the ENTIRE WHERE to be `col = const`, so a
+  compound `a=? AND b=?` declines. (The NON-aggregate version was fixed as bd-composite-eq-seek, by
+  demoting the last pinned column to `[c,c]` in `composite_index_prefix_range_target`.)
+- WHY NOT A SMALL INCREMENT: two clean routes, both moderate — (a) a new aggregate composite-eq codegen
+  that builds an N-field probe `[a, b, i64::MIN]`, `SeekGE`, and stops the `(a,b)` run with `IdxGT`
+  (mirroring `codegen_select_index_equality_scan`'s multi-term branch) while accumulating; or (b) reuse
+  `composite_index_prefix_range_target` (which already detects `a=? AND b=?` as prefix `a=?` + range
+  `b in [c,c]`) behind a new aggregate accumulate-over-composite-range codegen. Generalizing
+  `aggregate_index_eq_seek_target`'s signature ripples to 3 call sites + 5 test assertions, so a separate
+  composite path is cleaner. Either is a full oracle+gating cycle.
+- BYTE-EXACTNESS (when done): the seek visits exactly the `a=?,b=?` rows in rowid order, which the full
+  scan and C SQLite also produce — so it is byte-exact (no ORDER-BY tie ambiguity here).
+- IMPACT: common shape (count/sum matching a composite key); full scan → O(log n + matches). Charted as
+  bd-agg-composite-full-eq for a focused turn.
