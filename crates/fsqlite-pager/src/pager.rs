@@ -25,7 +25,7 @@ use fsqlite_types::{
     DatabaseHeaderError, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,
     PageNumberBuildHasher, PageSize,
 };
-use fsqlite_vfs::{Vfs, VfsFile};
+use fsqlite_vfs::{FileIdentity, Vfs, VfsFile};
 use smallvec::SmallVec;
 
 use crate::journal::{JournalHeader, JournalPageRecord};
@@ -5166,6 +5166,18 @@ where
     /// Clone the pager's VFS handle for companion-file operations.
     pub fn vfs_handle(&self) -> Arc<V> {
         Arc::clone(&self.vfs)
+    }
+
+    /// Return the identity of the already-open main database file.
+    ///
+    /// The VFS implementation determines whether a stable descriptor identity
+    /// is available. The pager never re-resolves [`Self::db_path`] here.
+    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        inner.db_file.file_identity()
     }
 
     /// Propagate the connection's busy-timeout to the underlying VFS file so

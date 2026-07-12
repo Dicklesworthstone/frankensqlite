@@ -169,7 +169,7 @@ use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use fsqlite_vfs::uring::IoUringRuntimeStatus;
-use fsqlite_vfs::{MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
+use fsqlite_vfs::{FileIdentity, MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_wal::{
     WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairSeverityBucket,
@@ -2461,6 +2461,19 @@ impl PagerBackend {
             Self::Unix(_) => "unix",
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => "windows",
+        }
+    }
+
+    /// Return the identity of the already-open main database file.
+    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        match self {
+            Self::Memory(p) => p.file_identity(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.file_identity(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.file_identity(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.file_identity(),
         }
     }
 
@@ -9618,6 +9631,15 @@ impl Connection {
     /// Returns the configured database path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Return the identity of the main database object held by this connection.
+    ///
+    /// This is derived from the VFS's already-open main-file handle, never by
+    /// looking up [`Self::path`]. File-backed Unix connections return `Some`;
+    /// memory and backends without a stable descriptor identity return `None`.
+    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.pager.file_identity()
     }
 
     fn attach_connection_pool_metrics(&self) {

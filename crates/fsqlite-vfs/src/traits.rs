@@ -8,6 +8,56 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
 use crate::shm::ShmRegion;
 
+/// Opaque identity of an already-open filesystem object.
+///
+/// Identities are intended only for equality comparisons while the relevant
+/// file handles remain open. They are not persistent database identifiers and
+/// must not be serialized or compared across machines or boots.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    namespace: u64,
+    object: u64,
+}
+
+impl FileIdentity {
+    /// Read the identity of an independently opened filesystem descriptor.
+    ///
+    /// On Unix this uses descriptor metadata (`st_dev`, `st_ino`), so a later
+    /// rename or pathname replacement does not change the result. Platforms
+    /// without a stable descriptor identity exposed by this crate return
+    /// `Ok(None)`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_file(file: &std::fs::File) -> std::io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let metadata = file.metadata()?;
+            Ok(Some(Self::from_unix_parts(metadata.dev(), metadata.ino())))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(None)
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) const fn from_unix_parts(device: u64, inode: u64) -> Self {
+        Self {
+            namespace: device,
+            object: inode,
+        }
+    }
+}
+
+impl std::fmt::Debug for FileIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileIdentity(..)")
+    }
+}
+
 /// Durability level for `VfsFile::durable_sync`.
 ///
 /// Centralizes per-filesystem sync policy so callers express intent
@@ -120,6 +170,16 @@ pub trait VfsFile: Send + Sync {
     ///
     /// After this call, the file handle should not be used.
     fn close(&mut self, cx: &Cx) -> Result<()>;
+
+    /// Return the identity of the filesystem object held by this open handle.
+    ///
+    /// Implementations must derive this from the open descriptor (or from
+    /// descriptor metadata captured at open time), never by resolving the
+    /// current pathname. The default is `None` for memory and custom backends
+    /// that cannot provide a stable comparable identity.
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        Ok(None)
+    }
 
     /// Read `buf.len()` bytes starting at byte offset `offset`.
     ///

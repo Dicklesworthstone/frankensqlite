@@ -25,7 +25,7 @@ use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_TOTAL_LOCKS,
 };
-use crate::traits::{Vfs, VfsFile};
+use crate::traits::{FileIdentity, Vfs, VfsFile};
 
 /// SQLite I/O capability bit indicating files cannot be deleted while open.
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
@@ -871,6 +871,12 @@ impl VfsFile for WindowsFile {
         }
 
         first_error.map_or(Ok(()), Err)
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        // Rust's stable Windows metadata API does not yet expose the
+        // volume-serial/file-index pair needed for a handle-bound identity.
+        Ok(None)
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {

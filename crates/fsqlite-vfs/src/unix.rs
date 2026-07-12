@@ -40,7 +40,7 @@ use crate::shm::{
     SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_NREADER_USIZE, WAL_TOTAL_LOCKS,
     WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
 };
-use crate::traits::{Vfs, VfsFile};
+use crate::traits::{FileIdentity, Vfs, VfsFile};
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -407,12 +407,8 @@ fn posix_getlk(
 // Inode table — per-process lock coalescing
 // ---------------------------------------------------------------------------
 
-/// Unique identity for an open file (device + inode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct InodeKey {
-    dev: u64,
-    ino: u64,
-}
+/// Internal name for the public opaque descriptor identity used by the inode table.
+type InodeKey = FileIdentity;
 
 /// Per-inode lock state shared across all file handles in this process.
 ///
@@ -891,10 +887,7 @@ impl Vfs for UnixVfs {
 fn inode_key_from_file(file: &File) -> Result<InodeKey> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata().map_err(FrankenError::Io)?;
-    Ok(InodeKey {
-        dev: meta.dev(),
-        ino: meta.ino(),
-    })
+    Ok(FileIdentity::from_unix_parts(meta.dev(), meta.ino()))
 }
 
 /// Extract the (device, inode) pair from a path without opening the file.
@@ -903,10 +896,7 @@ fn inode_key_from_file(file: &File) -> Result<InodeKey> {
 fn inode_key_from_path(path: &Path) -> Result<Option<InodeKey>> {
     use std::os::unix::fs::MetadataExt;
     match fs::metadata(path) {
-        Ok(meta) => Ok(Some(InodeKey {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })),
+        Ok(meta) => Ok(Some(FileIdentity::from_unix_parts(meta.dev(), meta.ino()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(FrankenError::Io(e)),
     }
@@ -1709,6 +1699,10 @@ impl VfsFile for UnixFile {
 
         self.closed = true;
         Ok(())
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        Ok(Some(self.inode_key))
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {

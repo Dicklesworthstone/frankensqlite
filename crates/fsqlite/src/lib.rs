@@ -10,6 +10,7 @@ pub use fsqlite_core::connection::{
 pub use fsqlite_error::FrankenError;
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;
+pub use fsqlite_vfs::FileIdentity;
 
 #[cfg(feature = "session")]
 /// Manual session/changeset API facade re-exported from `fsqlite-ext-session`.
@@ -39,7 +40,7 @@ pub mod migrate;
 )]
 mod tests {
     use super::{
-        Connection, ConnectionEnv, IoPollStrategy, RuntimeConfig, RuntimeContext,
+        Connection, ConnectionEnv, FileIdentity, IoPollStrategy, RuntimeConfig, RuntimeContext,
         init_global_runtime,
     };
     use fsqlite_ast::{CreateTableBody, Statement};
@@ -56,6 +57,45 @@ mod tests {
     fn test_connection_open_and_path() {
         let conn = Connection::open(":memory:").expect("in-memory connection should open");
         assert_eq!(conn.path(), ":memory:");
+    }
+
+    #[test]
+    fn in_memory_connection_has_no_filesystem_identity() {
+        let conn = Connection::open(":memory:").expect("in-memory connection should open");
+        assert_eq!(conn.file_identity().unwrap(), None);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn connection_identity_remains_bound_to_open_file_after_path_swap() {
+        use std::fs::File;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("identity.db");
+        let displaced_path = dir.path().join("identity.opened.db");
+        let conn = Connection::open(database_path.to_string_lossy().into_owned())
+            .expect("open file-backed connection");
+
+        let leased_file = File::open(&database_path).expect("lease opened database descriptor");
+        let leased_identity = FileIdentity::from_file(&leased_file)
+            .expect("read leased descriptor identity")
+            .expect("Unix descriptors have stable identities");
+        let connection_identity = conn
+            .file_identity()
+            .expect("read connection identity")
+            .expect("Unix VFS exposes an open-file identity");
+        assert_eq!(connection_identity, leased_identity);
+
+        std::fs::rename(&database_path, &displaced_path).expect("displace opened database path");
+        drop(File::create(&database_path).expect("create replacement path"));
+        let replacement_file = File::open(&database_path).expect("lease replacement descriptor");
+        let replacement_identity = FileIdentity::from_file(&replacement_file)
+            .expect("read replacement descriptor identity")
+            .expect("Unix descriptors have stable identities");
+
+        assert_ne!(connection_identity, replacement_identity);
+        assert_eq!(conn.file_identity().unwrap(), Some(leased_identity));
+        drop(conn);
     }
 
     #[test]

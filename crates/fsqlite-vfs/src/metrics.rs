@@ -29,7 +29,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 
 use crate::shm::ShmRegion;
-use crate::traits::VfsFile;
+use crate::traits::{FileIdentity, VfsFile};
 
 // ---------------------------------------------------------------------------
 // Global metrics counters
@@ -254,6 +254,10 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         GLOBAL_VFS_METRICS.close_ops.fetch_add(1, Ordering::Relaxed);
         vfs_trace_op!("close", &*self.path, 0_u64, self.inner.close(cx))
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
