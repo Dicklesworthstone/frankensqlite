@@ -18212,3 +18212,25 @@ test is on the executed path, not merely linked into it.
 - GATE: `in_list_shadowed_index_oracle` extended — byte-exact covering `SUM(a)`, plus opcode gates that
   COUNT(*)/SUM(indexed) emit NO `SeekRowid` on both the single-idx and composite-shadow schemas while
   SUM(non-indexed) does. No-reg: agg_index_range, agg_composite_full_eq byte-exact.
+
+## 2026-07-12 - CORRECTNESS FIX (shipped): composite prefix+range seek dropped a residual predicate (bd-zqkrp-residual-drop)
+
+- Result type: correctness bug fixed (found while scouting the composite prefix-range AGGREGATE lever).
+  The shipped NON-aggregate seek `WHERE a = v AND b <range>` on `index(a,b)` (bd-zqkrp) applied NO
+  residual filter, and `composite_index_prefix_range_target`'s genuine-range branch (unlike the demoted
+  full-eq branch, which was guarded by `conjuncts.len() == key_terms`) had NO residual guard. So
+  `SELECT id FROM t WHERE a = 5 AND b > 10 AND c = 1` seeked the `(a=5, b>10)` block and SILENTLY DROPPED
+  `c = 1` — returning rows with the wrong `c`. Differential oracle vs C SQLite 3.46.1: frank ~80 rows,
+  sqlite ~40 (a real, user-visible wrong-results bug).
+- WHY IT HID: the first probe used `ORDER BY id`, which the seek (streams `(b, rowid)` order) can't
+  satisfy, so it DECLINED to a correct sort/scan — masking the bug. Re-probing with no ORDER BY (seek
+  taken) + sorted-set comparison exposed it.
+- FIX: `conjunct_pins_prefix_or_range` residual guard — decline unless EVERY WHERE conjunct is a prefix
+  equality (on a pinned column) or an eq / `>`/`>=`/`<`/`<=` / `BETWEEN` on the range column; a residual
+  falls to the full scan that enforces the whole WHERE. Conservative (LIKE-range conjuncts, which the
+  range extractor doesn't consume anyway, also decline → scan → correct).
+- GATE: `composite_prefix_range_residual_oracle` — byte-exact (sorted sets) across five residual shapes
+  + aggregate variants; opcode gates that the no-residual case STILL seeks (`IdxGT`) and the residual
+  case does NOT (declined). No-reg: composite_eq_seek, agg_composite_full_eq, agg_index_range byte-exact.
+- NB: bd-zqkrp-residual-drop filed. This unblocks a future composite prefix-range AGGREGATE lever — the
+  now-guarded detection is residual-safe to reuse.

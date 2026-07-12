@@ -22244,6 +22244,41 @@ struct CompositePrefixRange<'a> {
     range: ColumnRangeTarget<'a>,
 }
 
+/// Whether a single WHERE conjunct is fully enforced by the composite prefix+range seek — i.e. it is
+/// an equality on one of the pinned prefix columns, or an equality / range comparison (`>`,`>=`,`<`,
+/// `<=`) / `BETWEEN` on the range column. The seek applies NO residual filter, so any conjunct that is
+/// none of these (e.g. `c = 1` on a non-key column, or a second, unpinnable predicate) would be
+/// silently dropped; the caller declines then, letting the full scan enforce the whole WHERE.
+fn conjunct_pins_prefix_or_range(
+    term: &Expr,
+    index: &IndexSchema,
+    range_pos: usize,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    if index.columns[..range_pos]
+        .iter()
+        .any(|pcol| extract_index_column_equality_expr(term, table, table_alias, pcol).is_some())
+    {
+        return true;
+    }
+    let range_col = &index.columns[range_pos];
+    // Equality on the range column covers the demoted full-eq case (last column's `=` → degenerate range).
+    if extract_index_column_equality_expr(term, table, table_alias, range_col).is_some() {
+        return true;
+    }
+    match term {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => extract_column_range_bound(left, *op, right, table, table_alias)
+            .is_some_and(|(col, _, _)| col.eq_ignore_ascii_case(range_col)),
+        Expr::Between {
+            expr, not: false, ..
+        } => column_name(expr, table, table_alias).is_some_and(|c| c.eq_ignore_ascii_case(range_col)),
+        _ => false,
+    }
+}
+
 /// Detect a composite-index equality-prefix + trailing-range seek. Requires a plain ascending
 /// composite index whose leading columns are all pinned by `= <lit/param>` conjuncts and whose
 /// next column has a range; the prefix and range bounds must be seek-safe (same affinity/collation
@@ -22301,6 +22336,18 @@ fn composite_index_prefix_range_target<'a>(
             let pos = prefix_exprs.len();
             (prefix_exprs, pos, range)
         };
+        // Residual guard: the seek enforces only the pinned prefix equalities and the range on
+        // `columns[range_pos]`. If ANY conjunct is not one of those (a predicate on a non-key column,
+        // or a second unpinnable term), decline so the full scan enforces the whole WHERE — otherwise
+        // that predicate is silently dropped and wrong rows are returned. (bd-zqkrp residual bug.)
+        let mut all_conjuncts = Vec::new();
+        collect_conjunctive_terms(where_expr, &mut all_conjuncts);
+        if !all_conjuncts
+            .iter()
+            .all(|term| conjunct_pins_prefix_or_range(term, index, range_pos, table, table_alias))
+        {
+            continue;
+        }
         let range_column = &index.columns[range_pos];
         if !index_range_fast_path_is_safe(table, table_alias, schema, range_column, &range) {
             continue;
