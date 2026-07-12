@@ -18042,3 +18042,27 @@ test is on the executed path, not merely linked into it.
 - NO-REGRESSION: `fsqlite-vdbe --lib` **1043/0 serially**. clippy clean; fmt clean.
 - PERF: full scan → the same single-seek shape as the plain MIN/MAX-via-index win (measured ~900× this
   session). The opcode gate confirms the seek fires.
+
+## 2026-07-12 - WIN: WHERE a=? AND b=? on a composite (a,b) index seeks instead of full-scanning (bd-composite-eq-seek)
+
+- Result type: WIN / shipped. Profile-first (composite_eq_plan_probe): `SELECT ... FROM t WHERE a=? AND
+  b=?` on a composite `(a,b)` index did a FULL TABLE SCAN (`OpenRead table, Rewind, Column/Ne a,
+  Column/Ne b, Next` — no index seek at all). The single-column eq-seek declines a compound `AND`, and
+  `composite_index_prefix_range_target` declined `prefix_len == key_terms` (all key columns pinned).
+- THE LEVER: when the equality prefix pins EVERY key column (a full composite equality / point lookup),
+  `composite_index_prefix_range_target` demotes the LAST pinned column to a degenerate range `[c, c]`
+  (inclusive both ends) and reuses the existing prefix+range seek codegen — `WHERE a=? AND b=?` on
+  `(a,b)` becomes prefix `a=?` + range `b in [c,c]`, one O(log n) seek.
+- CORRECTNESS GUARD (oracle-caught): the seek applies NO residual filter, so demoting is safe ONLY when
+  the WHERE is EXACTLY the key-column equalities. `WHERE a=? AND b=? AND z=?` matched against a shorter
+  `(a,b)` index would silently DROP `z=?` (the first oracle run diverged on exactly this). Fix: require
+  `conjunct_count == key_terms`, so the short `(a,b)` index declines and the fuller `(a,b,z)` index wins.
+- BYTE-EXACT GATE (`composite_eq_seek_oracle.rs`, PASS): vs rusqlite/C SQLite — multi-row matches
+  (natural + ORDER BY id order), reversed conjunct order, absent keys (empty), a TEXT second column, the
+  3-term full equality on `(a,b,z)` (routes to the right index), and the regression cases `a=? AND b>?` /
+  `a=? AND b BETWEEN ? AND ?` (real ranges, still work) — all bit-identical; opcode gate (SeekGE fires).
+- NO-REGRESSION: contained to `composite_index_prefix_range_target`; clippy clean; fmt clean; serial
+  `fsqlite-vdbe --lib` re-run in flight (a prior run failed on an rch dependency-preflight sync race, not
+  a test). Oracle covers the range regression cases directly.
+- PERF: full table scan → one O(log n) composite seek (same shape as the shipped composite prefix+range
+  seek). Diagnostic: composite_eq_seek_profile.rs.

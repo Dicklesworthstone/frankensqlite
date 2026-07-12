@@ -22005,19 +22005,44 @@ fn composite_index_prefix_range_target<'a>(
         }
         let prefix_exprs =
             extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
-        let prefix_len = prefix_exprs.len();
-        if prefix_len == 0 || prefix_len >= key_terms {
+        if prefix_exprs.is_empty() {
             continue;
         }
-        let range_column = &index.columns[prefix_len];
-        let Some(range) = extract_named_column_range(where_expr, table, table_alias, range_column)
-        else {
-            continue;
+        // When the prefix pins EVERY key column (`WHERE a=? AND b=?` on `(a,b)` — a full composite
+        // equality / point lookup), demote the last pinned column to a degenerate range `[c, c]` so the
+        // same prefix+range seek resolves it as one seek instead of a full scan.
+        let (prefix_exprs, range_pos, range) = if prefix_exprs.len() == key_terms {
+            // Safe to demote ONLY when the WHERE is EXACTLY these key-column equalities: the seek
+            // applies no residual filter, so a leftover predicate (e.g. a non-key column, as in
+            // `a=? AND b=? AND z=?` matched against a shorter `(a,b)` index) would be silently dropped.
+            // Requiring one conjunct per key term declines the short index and lets a fuller index win.
+            let mut conjuncts = Vec::new();
+            collect_conjunctive_terms(where_expr, &mut conjuncts);
+            if conjuncts.len() != key_terms {
+                continue;
+            }
+            let mut prefix = prefix_exprs;
+            let last = prefix.pop().expect("prefix is non-empty");
+            let range = ColumnRangeTarget {
+                lower: Some(borrowed_column_range_bound(last, true)),
+                upper: Some(borrowed_column_range_bound(last, true)),
+            };
+            (prefix, key_terms - 1, range)
+        } else {
+            let range_column = &index.columns[prefix_exprs.len()];
+            let Some(range) =
+                extract_named_column_range(where_expr, table, table_alias, range_column)
+            else {
+                continue;
+            };
+            let pos = prefix_exprs.len();
+            (prefix_exprs, pos, range)
         };
+        let range_column = &index.columns[range_pos];
         if !index_range_fast_path_is_safe(table, table_alias, schema, range_column, &range) {
             continue;
         }
-        let prefix_ok = index.columns[..prefix_len]
+        let prefix_ok = index.columns[..range_pos]
             .iter()
             .zip(prefix_exprs.iter())
             .all(|(col, expr)| {
