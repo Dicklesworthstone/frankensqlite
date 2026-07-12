@@ -9499,6 +9499,35 @@ fn find_minmax_leading_index<'t>(
         })
 }
 
+/// A WHERE that is exactly `<col> IS NOT NULL`, where `<col>` is the column EVERY MIN/MAX aggregate
+/// here reads — redundant (MIN/MAX already ignore NULLs), so the index-seek fast paths may treat it as
+/// no WHERE and still be byte-identical. Handles the single aggregate and the `MIN(col), MAX(col)` pair.
+/// bd-minmax-redundant-not-null.
+fn minmax_where_is_redundant_not_null(
+    where_clause: Option<&Expr>,
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let Some(Expr::IsNull {
+        expr, not: true, ..
+    }) = where_clause
+    else {
+        return false;
+    };
+    let Some(filter_col) = column_name(expr, table, table_alias) else {
+        return false;
+    };
+    !agg_columns.is_empty()
+        && agg_columns.iter().all(|agg| {
+            matches!(agg.name.as_str(), "MIN" | "MAX")
+                && agg
+                    .arg_col_index
+                    .and_then(|i| table.columns.get(i))
+                    .is_some_and(|c| c.name.eq_ignore_ascii_case(&filter_col))
+        })
+}
+
 /// Detect `SELECT MIN(col)` / `SELECT MAX(col)` (no WHERE/HAVING/GROUP BY) where `col` is the leading
 /// term of an index whose ordering matches the aggregate comparison.
 ///
@@ -10989,8 +11018,13 @@ fn codegen_select_aggregate(
     // carries a collation-matched ASC index resolves to a single seek to one end of the index
     // instead of an O(n) scan (~800x on a 20k-row table). Gated on `allow_index_seek` because it
     // opens an index cursor; byte-identical (only the fed row changes). bd-minmax-index-seek.
+    // MIN/MAX ignore NULLs, so a redundant `WHERE <col> IS NOT NULL` on the aggregate's own column can
+    // still take the same no-WHERE index-seek fast paths, byte-identically. bd-minmax-redundant-not-null.
+    let minmax_no_effective_where = where_clause.is_none()
+        || minmax_where_is_redundant_not_null(where_clause, &agg_columns, table, table_alias);
+
     if allow_index_seek
-        && where_clause.is_none()
+        && minmax_no_effective_where
         && having.is_none()
         && let Some(seek) = minmax_index_seek_plan(&agg_columns, table)
     {
@@ -11009,7 +11043,7 @@ fn codegen_select_aggregate(
     // `SELECT MIN(col), MAX(col)` over one indexed column: two seeks (one per index end) instead of a
     // scan. Byte-identical; gated on `allow_index_seek`. bd-minmax-pair-seek.
     if allow_index_seek
-        && where_clause.is_none()
+        && minmax_no_effective_where
         && having.is_none()
         && let Some(seek) = minmax_pair_seek_plan(&agg_columns, table)
     {

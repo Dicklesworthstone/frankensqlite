@@ -18024,3 +18024,21 @@ test is on the executed path, not merely linked into it.
 - PERF: same seek-miss→finalize skip as the aggregate exact-seek win (measured ~660×: 3.4 ms scan → ~5 µs
   seek). The before is the O(n) fallback scan; the after is O(log n). Diagnostic: eq_seek_nonagg_profile.rs.
 - bd-eq-seek-fallback-zero-match now COMPLETE (aggregate + non-aggregate).
+
+## 2026-07-12 - WIN: MIN/MAX WHERE col IS NOT NULL takes the index-seek fast path (redundant filter) — full scan → single seek (bd-minmax-redundant-not-null)
+
+- Result type: WIN / shipped. `SELECT MIN(col)/MAX(col) [, ...] FROM t WHERE col IS NOT NULL` is
+  byte-identical to the no-WHERE form (MIN/MAX already ignore NULLs), but the WHERE made the MIN/MAX
+  index-seek fast paths (`where_clause.is_none()` gate) decline → O(n) full scan.
+- THE LEVER: `minmax_where_is_redundant_not_null` recognizes a WHERE that is exactly `<col> IS NOT NULL`
+  where `<col>` is the column EVERY MIN/MAX aggregate reads (handles the single aggregate and the
+  `MIN(col), MAX(col)` pair). The `minmax_index_seek` and `minmax_pair_seek` dispatches now treat that
+  redundant filter as no-WHERE, so they take the same index-end seek. The seek codegen applies no filter
+  — correct, because the filter is redundant.
+- BYTE-EXACT GATE (`minmax_not_null_oracle.rs`, PASS): vs rusqlite/C SQLite — MIN/MAX/pair `WHERE v IS
+  NOT NULL` with leading `v`-NULLs, all-NULL table, COALESCE; plus the declines (filter on a DIFFERENT
+  column, `IS NULL`, and non-MIN/MAX aggregates COUNT/SUM) which keep the scan — all bit-identical.
+  Opcode gate: `MAX(v) WHERE v IS NOT NULL` emits `Last` (index-end seek); `WHERE w IS NOT NULL` does not.
+- NO-REGRESSION: `fsqlite-vdbe --lib` **1043/0 serially**. clippy clean; fmt clean.
+- PERF: full scan → the same single-seek shape as the plain MIN/MAX-via-index win (measured ~900× this
+  session). The opcode gate confirms the seek fires.
