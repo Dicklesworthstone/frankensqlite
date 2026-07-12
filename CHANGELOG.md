@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.16] -- 2026-07-11 (UPSERT page-retirement corruption fix and complete workspace release)
+## [0.1.16] -- 2026-07-12 (UPSERT page-retirement corruption fix and complete workspace release)
 
 Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
 two low-level helper APIs now expose failure explicitly instead of fabricating
@@ -122,6 +122,9 @@ lossy values.
   public package set from Cargo metadata and fails before publishing if the
   configured topological sequence is incomplete. The intentionally private
   `fsqlite-e2e` and `fsqlite-harness` packages remain `publish = false`.
+- The MVCC concurrent-writer Criterion benchmark now releases its validation
+  guard before abort cleanup re-locks the same session. `cargo test
+  --workspace --all-targets` no longer self-deadlocks in the benchmark harness.
 
 ## [0.1.15] -- 2026-07-06 (FTS5 UPDATE on WITHOUT ROWID shadow tables)
 

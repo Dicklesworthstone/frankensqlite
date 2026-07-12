@@ -660,9 +660,12 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
 
                     // First writer commits successfully (FCW clean for its write set).
                     let first_session = session_ids[0];
-                    let first_handle = registry.get(first_session).unwrap();
-                    let fcw_result = validate_first_committer_wins(&first_handle, &commit_index);
-                    black_box(&fcw_result);
+                    {
+                        let first_handle = registry.get(first_session).unwrap();
+                        let fcw_result =
+                            validate_first_committer_wins(&first_handle, &commit_index);
+                        black_box(&fcw_result);
+                    }
 
                     // Remaining writers validate FCW (may see conflicts on shared pages).
                     for &session_id in &session_ids[1..] {
