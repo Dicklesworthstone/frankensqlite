@@ -78,6 +78,12 @@ jobs:
           set -euo pipefail
           cargo test -p fsqlite-wasm --locked -- --nocapture
 
+      - name: Run browser tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          wasm-pack test --headless --chrome crates/fsqlite-wasm
+
       - name: Verify wasm32 build
         shell: bash
         run: |

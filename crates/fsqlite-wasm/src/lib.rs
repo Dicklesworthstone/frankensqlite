@@ -1873,24 +1873,6 @@ mod tests {
         assert!(message.contains("memory.initialPages"));
     }
 
-    #[cfg(feature = "diagnostics")]
-    #[test]
-    fn describe_js_value_reports_rich_types_with_diagnostics() {
-        assert_eq!(describe_js_value(&Array::new().into()), "Array");
-        assert_eq!(
-            describe_js_value(&Uint8Array::new_with_length(0).into()),
-            "Uint8Array"
-        );
-    }
-
-    #[cfg(not(feature = "diagnostics"))]
-    #[test]
-    fn describe_js_value_uses_compact_default_types() {
-        assert_eq!(describe_js_value(&JsValue::NULL), "null");
-        assert_eq!(describe_js_value(&JsValue::UNDEFINED), "undefined");
-        assert_eq!(describe_js_value(&Array::new().into()), "object");
-    }
-
     #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
     #[test]
     fn parse_database_options_requires_tracked_cap_for_warn_at_percent() {
@@ -2270,6 +2252,24 @@ mod wasm_tests {
             .expect("message should be a string")
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[wasm_bindgen_test]
+    fn describe_js_value_reports_rich_types_with_diagnostics() {
+        assert_eq!(describe_js_value(&Array::new().into()), "Array");
+        assert_eq!(
+            describe_js_value(&Uint8Array::new_with_length(0).into()),
+            "Uint8Array"
+        );
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    #[wasm_bindgen_test]
+    fn describe_js_value_uses_compact_default_types() {
+        assert_eq!(describe_js_value(&JsValue::NULL), "null");
+        assert_eq!(describe_js_value(&JsValue::UNDEFINED), "undefined");
+        assert_eq!(describe_js_value(&Array::new().into()), "object");
+    }
+
     #[wasm_bindgen_test]
     fn wasm_db_roundtrip() {
         let db = FrankenDb::new(None).expect("db should open");
@@ -2286,6 +2286,27 @@ mod wasm_tests {
             .unchecked_into::<Array>();
 
         assert_eq!(rows.length(), 2);
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_wall_clock_sql_and_snapshot_capture_use_browser_time() {
+        let db = FrankenDb::new(None).expect("db should open");
+        let result = db
+            .query("SELECT CURRENT_TIMESTAMP AS observed_at")
+            .expect("browser wall-clock query should succeed");
+        let rows = Reflect::get(&result, &JsValue::from_str("rows"))
+            .expect("rows field should exist")
+            .unchecked_into::<Array>();
+        let first_row = rows.get(0).unchecked_into::<Object>();
+        let observed_at = row_property(&first_row, "observed_at")
+            .as_string()
+            .expect("CURRENT_TIMESTAMP should be text");
+        assert_eq!(observed_at.len(), 19);
+
+        db.execute("CREATE TABLE wasm_clock (id INTEGER PRIMARY KEY)")
+            .expect("table create should capture a time-travel snapshot");
+        db.execute("INSERT INTO wasm_clock VALUES (1)")
+            .expect("insert should capture a time-travel snapshot");
     }
 
     #[wasm_bindgen_test]
@@ -2600,7 +2621,10 @@ mod wasm_tests {
             .as_string()
             .expect("message should be a string");
         assert!(unsupported_message.contains("SQLite-compatible scalar parameter"));
+        #[cfg(feature = "diagnostics")]
         assert!(unsupported_message.contains("Object"));
+        #[cfg(not(feature = "diagnostics"))]
+        assert!(unsupported_message.contains("object"));
     }
 
     #[cfg(all(feature = "diagnostics", feature = "prepared-statements"))]
@@ -2989,7 +3013,8 @@ mod wasm_tests {
             .expect("message field should exist")
             .as_string()
             .expect("message should be a string");
-        assert!(message.contains("syntax error"));
+        assert!(message.contains("SQL error at offset"));
+        assert!(message.contains("unexpected token"));
     }
 
     #[wasm_bindgen_test]
@@ -3004,6 +3029,7 @@ mod wasm_tests {
             .as_string()
             .expect("message should be a string");
         assert!(message.contains("FrankenSQLite WASM ran out of memory"));
+        #[cfg(all(feature = "diagnostics", feature = "memory-options"))]
         assert!(message.contains("4 GiB"));
         assert_eq!(
             Reflect::get(&error, &JsValue::from_str("oom"))
