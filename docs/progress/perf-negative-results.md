@@ -18274,3 +18274,25 @@ test is on the executed path, not merely linked into it.
   in_list_shadowed_index, agg_composite_full_eq, eq_seek_exact byte-exact (their SUM(non-indexed) stay
   non-covering, SUM(indexed)/COUNT(*) stay covering).
 - PERF: aggregates over a non-leading index key column now skip one SeekRowid per matched row.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM WHERE a=<int> AND <residual> seeks the prefix + filters (bd-agg-leading-eq-residual)
+
+- Result type: WIN / shipped. `COUNT(*)/SUM(...) FROM t WHERE a = <int> AND <residual>` (a residual on a
+  non-key column, or any predicate the composite range path doesn't handle) full-scanned.
+- FIX: new `index_prefix_residual_seek` branch in `codegen_select_aggregate` — seek the integer-exact
+  equality-prefix block (probe `[prefix.., MIN]`, SeekGE, per-term `Ne` run stop), `SeekRowid` each row,
+  then apply the FULL WHERE via `emit_where_filter` (the prefix equalities are redundant with the seek;
+  the residual conjuncts are enforced), and accumulate. Always non-covering (the filter reads table
+  columns). `simple_count_star` yield extended so COUNT(*) reaches it.
+- SAFETY GATES (why it is byte-exact, no dropped-predicate or param-misnumber bug): (1) the prefix is
+  INTEGER-affinity + integer literal, so the seek matches exactly with no affinity fallback; (2) the
+  residual filter enforces the WHOLE WHERE, so no predicate is dropped; (3) `expr_has_placeholder`
+  requires a placeholder-FREE WHERE, so re-emitting it per row consumes no anonymous placeholders and
+  cannot mis-number a bound parameter — a `WHERE ... = ?` declines the seek and scans (which binds it).
+- HARD GATE (byte-exact vs C SQLite 3.46.1): `agg_leading_eq_residual_oracle` PASS — residual
+  eq/range/`<>`/OR/multi-term, a multi-column equality prefix, absent keys (→ COUNT=0/SUM=NULL),
+  COALESCE, MIN/MAX; opcode gate all-literal WHERE SeekGEs, a `?`-bearing WHERE declines. No-reg:
+  agg_composite_full_eq, agg_composite_prefix_range, eq_seek_exact byte-exact.
+- PERF: `COUNT(*)/SUM WHERE a=<int> AND <residual>` full scan → O(log n + block) seek + per-row filter.
+- FOLLOW-UP: the placeholder-free restriction is conservative; a general `?`-safe version needs the
+  prefix probe to consume placeholders in textual order (charted mentally, not yet a bead).

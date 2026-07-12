@@ -1857,6 +1857,12 @@ pub fn codegen_select(
                     table_alias,
                     schema,
                 )
+                .is_some()
+                || aggregate_index_prefix_literal_residual_target(
+                    where_clause.as_deref(),
+                    table,
+                    table_alias,
+                )
                 .is_some()));
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
@@ -10955,6 +10961,67 @@ fn aggregate_index_range_seek_target<'t, 'e>(
         .then_some((idx, range))
 }
 
+/// Conservatively whether `expr` might contain a bound parameter. Only provably-literal shapes
+/// (literals, column refs, and binary trees over them) return `false`; ANYTHING else returns `true`.
+/// Used to gate the leading-eq + residual-filter seek, which re-emits the whole WHERE per seeked row:
+/// a fully-literal WHERE consumes no anonymous placeholders, so the seek's prefix probe and the
+/// residual filter cannot mis-number bound parameters.
+fn expr_has_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Placeholder(..) => true,
+        Expr::Literal(..) | Expr::Column(..) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_placeholder(left) || expr_has_placeholder(right)
+        }
+        _ => true,
+    }
+}
+
+/// The index and equality prefix a `COUNT(*)/SUM(...) WHERE a = <int> AND <residual>` aggregate can
+/// seek: pin the leading key column(s) with an integer-literal equality, walk that block, and apply
+/// the FULL (placeholder-free) WHERE as a residual filter per row. Gated tight so it is byte-exact and
+/// safe: (1) the prefix is INTEGER-affinity + integer literal, so the seek matches exactly with no
+/// affinity fallback; (2) the WHERE is placeholder-free (see [`expr_has_placeholder`]), so re-emitting
+/// it per row cannot mis-number bound parameters; (3) there is at least one residual conjunct beyond
+/// the prefix (otherwise the exact eq-seek already handles it). The residual filter enforces the whole
+/// predicate, so a dropped-predicate class of bug cannot occur.
+fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
+    where_clause: Option<&'e Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, Vec<&'e Expr>)> {
+    let where_expr = where_clause?;
+    if table.without_rowid || expr_has_placeholder(where_expr) {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    for index in &table.indexes {
+        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+            continue;
+        }
+        let prefix = extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
+        // Need a non-empty prefix AND at least one residual conjunct (else the exact eq-seek owns it).
+        if prefix.is_empty() || prefix.len() >= conjuncts.len() {
+            continue;
+        }
+        let exact = prefix.iter().enumerate().all(|(i, e)| {
+            matches!(e, Expr::Literal(Literal::Integer(_), _))
+                && index
+                    .columns
+                    .get(i)
+                    .and_then(|name| table.column_index(name))
+                    .and_then(|ci| table.columns.get(ci))
+                    .is_some_and(|c| c.affinity == 'D')
+        });
+        if !exact {
+            continue;
+        }
+        return Some((index, prefix));
+    }
+    None
+}
+
 /// Emit one value's index seek + duplicate-run accumulate for the aggregate IN-list path.
 ///
 /// bd-2dgf5. Opens no cursor itself (the caller opens `idx_cursor`, and `table_cursor` when not
@@ -11376,6 +11443,25 @@ fn codegen_select_aggregate(
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         composite_index_prefix_range_target(where_clause, table, table_alias, schema)
+    } else {
+        None
+    };
+
+    // Seek the equality-prefix block and apply the full (placeholder-free) WHERE as a residual filter
+    // per row — for `WHERE a = <int> AND <residual>` where the residual is not a range the composite
+    // path handles. INTEGER-exact prefix (no affinity fallback) and a placeholder-free WHERE keep it
+    // byte-exact and safe.
+    let index_prefix_residual_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_range_seek.is_none()
+        && index_in_seek.is_none()
+        && index_range_seek.is_none()
+        && composite_prefix_range_seek.is_none()
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        aggregate_index_prefix_literal_residual_target(where_clause, table, table_alias)
     } else {
         None
     };
@@ -12023,6 +12109,105 @@ fn codegen_select_aggregate(
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let loop_body = loop_top as i32;
         b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
+        skip_scan = true;
+    } else if let Some((idx_schema, prefix_exprs)) = index_prefix_residual_seek {
+        // bd-agg-leading-eq-residual: seek the integer-exact equality-prefix block, then apply the full
+        // (placeholder-free) WHERE per row so the residual predicate is enforced (no dropped-predicate
+        // bug), and accumulate. Always non-covering — the residual filter reads table columns.
+        let idx_cursor = 1_i32;
+        let duplicate_run_done = b.emit_label();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let prefix_len = prefix_exprs.len() as i32;
+
+        let probe_key_regs = b.alloc_regs(prefix_len + 1);
+        let min_rowid_reg = probe_key_regs + prefix_len;
+        for (i, expr) in prefix_exprs.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let reg = probe_key_regs + i as i32;
+            emit_expr(b, expr, reg, None);
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
+        }
+        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+        let probe_record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            probe_key_regs,
+            prefix_len + 1,
+            probe_record_reg,
+            P4::None,
+            0,
+        );
+
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            idx_schema.root_page,
+            0,
+            P4::Index(idx_schema.name.clone()),
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_record_reg,
+            finalize_label,
+            P4::None,
+            0,
+        );
+
+        let idx_loop_top = b.current_addr();
+        let idx_key_reg = b.alloc_reg();
+        for i in 0..prefix_exprs.len() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let col = i as i32;
+            b.emit_op(Opcode::Column, idx_cursor, col, idx_key_reg, P4::None, 0);
+            let coll = idx_schema
+                .key_term_collation(i)
+                .filter(|c| !c.eq_ignore_ascii_case("BINARY"))
+                .map_or(P4::None, |c| P4::Collation(c.to_owned()));
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                probe_key_regs + col,
+                idx_key_reg,
+                duplicate_run_done,
+                coll,
+                0x10,
+            );
+        }
+
+        let skip_label = b.emit_label();
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+        // Apply the whole WHERE (placeholder-free) — the prefix equalities are redundant with the seek
+        // but harmless; the residual conjuncts are the point.
+        if let Some(where_expr) = where_clause {
+            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        }
+        emit_aggregate_accumulate_body(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+        );
+
+        b.resolve_label(skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        b.resolve_label(duplicate_run_done);
         skip_scan = true;
     }
 
