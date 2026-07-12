@@ -22,6 +22,9 @@
 //! ```sh
 //! cargo test -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack -- --nocapture --test-threads=1
 //! ```
+//!
+//! P4 is a production-profile performance gate and is ignored when debug
+//! assertions are enabled. Replay it explicitly with `--profile release-perf`.
 
 #![allow(clippy::cast_precision_loss)]
 
@@ -31,6 +34,7 @@ use std::time::Instant;
 
 const BEAD_ID: &str = "bd-db300.3.8.10";
 const REPLAY_CMD: &str = "cargo test -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack -- --nocapture --test-threads=1";
+const P4_REPLAY_CMD: &str = "cargo test --profile release-perf -p fsqlite-e2e --test bd_db300_3_8_10_commit_path_proof_pack p4_non_regression_throughput -- --nocapture --test-threads=1";
 
 fn emit_log(test_name: &str, phase: &str, data: serde_json::Value) {
     eprintln!(
@@ -324,74 +328,125 @@ fn p3_fair_wakeup_multi_writer() {
 
 // ─── P4: Non-regression throughput ───────────────────────────────────
 
+fn measure_fsqlite_insert_batch(row_count: i64) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p4_f.db");
+    let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
+    conn.execute("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    let stmt = conn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
+
+    let start = Instant::now();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..row_count {
+        conn.execute_prepared_with_params(
+            &stmt,
+            &[
+                fsqlite_types::value::SqliteValue::Integer(i),
+                fsqlite_types::value::SqliteValue::Integer(i * 7),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    start.elapsed().as_nanos() as u64
+}
+
+fn measure_csqlite_insert_batch(row_count: i64) -> u64 {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p4_c.db");
+    let conn = rusqlite::Connection::open(path.to_str().unwrap()).unwrap();
+    conn.execute_batch("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER);")
+        .unwrap();
+    let mut stmt = conn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
+
+    let start = Instant::now();
+    conn.execute_batch("BEGIN;").unwrap();
+    for i in 0..row_count {
+        stmt.execute(rusqlite::params![i, i * 7]).unwrap();
+    }
+    conn.execute_batch("COMMIT;").unwrap();
+    start.elapsed().as_nanos() as u64
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
 #[test]
+fn p4_median_uses_the_middle_order_statistic() {
+    let mut values = [9.0, 1.0, 7.0, 3.0, 5.0];
+    assert_eq!(median(&mut values), 5.0);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "production performance gate; replay with --profile release-perf"
+)]
 fn p4_non_regression_throughput() {
     let tn = "p4_throughput";
     let row_count = 5000i64;
-    emit_log(tn, "start", json!({"rows": row_count}));
+    let sample_count = 11usize;
+    emit_log(
+        tn,
+        "start",
+        json!({
+            "rows": row_count,
+            "samples": sample_count,
+            "replay_command": P4_REPLAY_CMD,
+        }),
+    );
 
-    // Measure fsqlite
-    let f_dir = tempfile::tempdir().unwrap();
-    let f_path = f_dir.path().join("p4_f.db");
-    let fconn = fsqlite::Connection::open(f_path.to_str().unwrap()).unwrap();
-    fconn
-        .execute("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER)")
-        .unwrap();
-    let fstmt = fconn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
+    // Populate code/data caches before measuring. Alternate engine order in
+    // each paired sample so scheduler and filesystem drift cannot
+    // systematically penalize the engine that always runs first.
+    let _ = measure_fsqlite_insert_batch(row_count);
+    let _ = measure_csqlite_insert_batch(row_count);
 
-    let f_start = Instant::now();
-    fconn.execute("BEGIN").unwrap();
-    for i in 0..row_count {
-        fconn
-            .execute_prepared_with_params(
-                &fstmt,
-                &[
-                    fsqlite_types::value::SqliteValue::Integer(i),
-                    fsqlite_types::value::SqliteValue::Integer(i * 7),
-                ],
+    let mut sample_evidence = Vec::with_capacity(sample_count);
+    let mut ratios = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let (f_ns, c_ns, order) = if sample % 2 == 0 {
+            (
+                measure_fsqlite_insert_batch(row_count),
+                measure_csqlite_insert_batch(row_count),
+                "fsqlite_first",
             )
-            .unwrap();
+        } else {
+            let c_ns = measure_csqlite_insert_batch(row_count);
+            let f_ns = measure_fsqlite_insert_batch(row_count);
+            (f_ns, c_ns, "csqlite_first")
+        };
+        let ratio = f_ns as f64 / c_ns.max(1) as f64;
+        ratios.push(ratio);
+        sample_evidence.push(json!({
+            "sample": sample,
+            "order": order,
+            "fsqlite_ns": f_ns,
+            "csqlite_ns": c_ns,
+            "ratio": ratio,
+        }));
     }
-    fconn.execute("COMMIT").unwrap();
-    let f_ns = f_start.elapsed().as_nanos() as u64;
-
-    // Measure csqlite
-    let c_dir = tempfile::tempdir().unwrap();
-    let c_path = c_dir.path().join("p4_c.db");
-    let cconn = rusqlite::Connection::open(c_path.to_str().unwrap()).unwrap();
-    cconn
-        .execute_batch("CREATE TABLE p4 (id INTEGER PRIMARY KEY, val INTEGER);")
-        .unwrap();
-    let mut cstmt = cconn.prepare("INSERT INTO p4 VALUES (?1, ?2)").unwrap();
-
-    let c_start = Instant::now();
-    cconn.execute_batch("BEGIN;").unwrap();
-    for i in 0..row_count {
-        cstmt.execute(rusqlite::params![i, i * 7]).unwrap();
-    }
-    cconn.execute_batch("COMMIT;").unwrap();
-    let c_ns = c_start.elapsed().as_nanos() as u64;
-
-    let ratio = if c_ns > 0 {
-        f_ns as f64 / c_ns as f64
-    } else {
-        1.0
-    };
+    let ratio_median = median(&mut ratios);
 
     emit_log(
         tn,
         "result",
         json!({
             "rows": row_count,
-            "fsqlite_ns": f_ns,
-            "csqlite_ns": c_ns,
-            "ratio": ratio,
+            "samples": sample_evidence,
+            "ratio_median": ratio_median,
+            "threshold": 5.0,
+            "replay_command": P4_REPLAY_CMD,
         }),
     );
 
     assert!(
-        ratio < 5.0,
-        "[P4] throughput ratio {ratio:.2}x exceeds 5x threshold (fsqlite={f_ns}ns, csqlite={c_ns}ns)"
+        ratio_median < 5.0,
+        "[P4] median throughput ratio {ratio_median:.2}x exceeds 5x threshold; samples={sample_evidence:?}"
     );
 }
 
