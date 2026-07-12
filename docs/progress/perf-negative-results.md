@@ -18334,3 +18334,37 @@ test is on the executed path, not merely linked into it.
   / `<>`; opcode gates that `a>100 AND x=5` now SeekGEs (and is non-covering / has SeekRowid). No-reg:
   agg_leading_eq_residual, agg_composite_prefix_range, minmax_range byte-exact.
 - PERF: `COUNT(*)/SUM WHERE a<range> AND <residual>` full scan → O(log n + block) range seek + per-row filter.
+
+## 2026-07-12 - WIN (shipped): COUNT(*)/SUM WHERE id <range> AND <residual> seeks the rowid range + filters (bd-agg-rowid-range-residual)
+
+- Result type: WIN / shipped. The rowid analogue of bd-agg-range-residual: a rowid range plus a residual
+  predicate (`id > 500 AND x = 5`, `id BETWEEN 100 AND 400 AND x > 3`, `id < 200 AND x IN (2,5,8)`)
+  full-scanned — `extract_rowid_range_target` is residual-safe (an `And` needs both sides to be rowid
+  bounds), so a residual declined the seek.
+- FIX: new `extract_rowid_range_residual_target` returns `(range, has_residual)` — residual-free case
+  unchanged; residual case collects rowid bounds from the conjuncts (ignoring non-rowid ones), requires a
+  placeholder-free WHERE, and re-checks `rowid_range_fast_path_is_safe`. The rowid-range branch adds a
+  per-row skip label and re-applies the whole WHERE via `emit_where_filter` when `has_residual`; the rowid
+  range visits a SUPERSET and the filter narrows (aggregates are order-independent → byte-exact). The
+  `simple_count_star` yield fires ONLY for the residual case, so a residual-free `COUNT(*) WHERE id>c`
+  keeps its `codegen_select_count_star` fast path.
+- GATE: `agg_rowid_range_residual_oracle` byte-exact — residual eq/range/IN/`<>`, one/two-sided ranges,
+  absent (COUNT=0/SUM=NULL), COALESCE, MIN/MAX, residual-free regression; opcode gate SeekGT. No-reg:
+  minmax_rowid_range, agg_index_range, agg_leading_eq_residual byte-exact.
+
+## 2026-07-12 - CHARTED (deferred, substantial): GROUP BY via ordered index streaming (bd-groupby-ordered-index)
+
+- Not attempted this session — too large for a small increment. `SELECT a, COUNT(*) FROM t GROUP BY a`
+  (a indexed) currently uses the two-pass scan→sort→iterate `codegen_select_group_by_aggregate` (994
+  lines). A streaming variant would walk the ordered index (idx_a is sorted by a), detect group
+  boundaries inline (compare current key to previous), finalize + emit each group on change, and emit the
+  last group at EOF — skipping the sorter entirely.
+- PLAN: add an isolated `codegen_select_group_by_ordered_index` fast path (precedent:
+  `simple_group_by_rowid_bucket_sum_plan`), gated on: single-column (or leading-prefix) GROUP BY on a
+  plain ascending index, simple aggregates, no HAVING (or a post-filter), and ORDER BY empty-or-equal to
+  the group columns. ORDER-SAFETY is the crux: with `ORDER BY <group cols>` the output is unambiguously
+  group-key-ascending, matching the index walk bit-for-bit; a bare GROUP BY (no ORDER BY) must be
+  oracle-checked against SQLite's order before allowing it (SQLite emits group-key order via index/sort,
+  but confirm before shipping). Non-covering unless every aggregate reads only index key columns.
+- WHY DEFERRED: ~120-150 lines of new control flow (group-boundary detection, AggFinal + ResultRow per
+  group, last-group-at-EOF) — a dedicated turn, not a small increment.

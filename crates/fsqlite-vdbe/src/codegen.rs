@@ -1863,7 +1863,9 @@ pub fn codegen_select(
                     table,
                     table_alias,
                 )
-                .is_some()));
+                .is_some()
+                || extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
+                    .is_some_and(|(_, has_residual)| has_residual)));
 
     // Check for aggregate columns FIRST, before rowid/index seek optimizations.
     // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
@@ -11463,8 +11465,7 @@ fn codegen_select_aggregate(
         && rowid_eq_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        extract_rowid_range_target(where_clause, Some(table), table_alias)
-            .and_then(|range| rowid_range_fast_path_is_safe(range).then_some(range))
+        extract_rowid_range_residual_target(where_clause, table, table_alias)
     } else {
         None
     };
@@ -11752,11 +11753,12 @@ fn codegen_select_aggregate(
             accum_base,
         );
         skip_scan = true;
-    } else if let Some(range) = rowid_range_seek {
+    } else if let Some((range, has_residual)) = rowid_range_seek {
         // bd-2dgf5 rowid range: position at the lower bound (or start), accumulate, and
         // stop early once the cursor rowid passes the upper bound. Mirrors the ascending
         // path of `codegen_select_rowid_range_scan`; a NULL bound yields the empty result
-        // via a jump to finalize (still-Null accumulators → COUNT=0 / SUM=NULL).
+        // via a jump to finalize (still-Null accumulators → COUNT=0 / SUM=NULL). With a residual
+        // predicate the range is a SUPERSET, so the whole (placeholder-free) WHERE is re-applied per row.
         let lower_reg = range.lower.map(|bound| {
             let reg = b.alloc_reg();
             emit_expr(b, bound.expr, reg, None);
@@ -11820,6 +11822,11 @@ fn codegen_select_aggregate(
                 upper_comparison.as_ref().map_or(0, |c| c.cmp_p5),
             );
         }
+        let range_skip_label = b.emit_label();
+        // Residual: re-apply the whole (placeholder-free) WHERE; the rowid range is a superset.
+        if has_residual && let Some(where_expr) = where_clause {
+            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, range_skip_label);
+        }
         emit_aggregate_accumulate_body(
             b,
             cursor,
@@ -11829,6 +11836,7 @@ fn codegen_select_aggregate(
             &agg_columns,
             accum_base,
         );
+        b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
         skip_scan = true;
     } else if let Some((idx_schema, values)) = index_in_seek {
@@ -22155,6 +22163,78 @@ fn extract_rowid_range_target<'a>(
     } else {
         None
     }
+}
+
+/// Returns `(range, has_residual)`. `has_residual == false` is the plain rowid-range case (whole WHERE
+/// is a rowid range). `has_residual == true` additionally allows a rowid range that coexists with OTHER
+/// (placeholder-free) predicates the seek cannot enforce: the rowid range visits a SUPERSET of the
+/// matching rows and the caller re-applies the whole WHERE as a residual filter per row. Aggregates are
+/// order-independent, so visiting a superset and filtering is byte-exact. Both cases require the range
+/// to pass `rowid_range_fast_path_is_safe`.
+fn extract_rowid_range_residual_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(RowidRangeTarget<'a>, bool)> {
+    let expr = where_clause?;
+    if let Some(range) = extract_rowid_range_target(where_clause, Some(table), table_alias) {
+        return rowid_range_fast_path_is_safe(range).then_some((range, false));
+    }
+    if expr_has_placeholder(expr) {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(expr, &mut conjuncts);
+    let mut target = RowidRangeTarget::default();
+    for term in &conjuncts {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                if let Some((slot, bound)) =
+                    extract_rowid_range_bound(left, *op, right, Some(table), table_alias)
+                    && !assign_rowid_range_bound(&mut target, slot, bound)
+                {
+                    return None; // conflicting duplicate bound
+                }
+            }
+            Expr::Between {
+                expr: operand,
+                low,
+                high,
+                not: false,
+                ..
+            } if is_rowid_expr(operand, Some(table), table_alias)
+                && is_rowid_range_constant(low)
+                && is_rowid_range_constant(high) =>
+            {
+                if !assign_rowid_range_bound(
+                    &mut target,
+                    RowidRangeSlot::Lower,
+                    RowidRangeBound {
+                        rowid_expr: operand,
+                        expr: low,
+                        inclusive: true,
+                    },
+                ) || !assign_rowid_range_bound(
+                    &mut target,
+                    RowidRangeSlot::Upper,
+                    RowidRangeBound {
+                        rowid_expr: operand,
+                        expr: high,
+                        inclusive: true,
+                    },
+                ) {
+                    return None;
+                }
+            }
+            _ => {} // non-rowid conjunct: a residual the filter enforces
+        }
+    }
+    if target.lower.is_none() && target.upper.is_none() {
+        return None;
+    }
+    rowid_range_fast_path_is_safe(target).then_some((target, true))
 }
 
 fn collect_rowid_range_bounds<'a>(
