@@ -72,7 +72,10 @@ fn agg_leading_eq_residual_matches_sqlite() {
         let b = i % 7;
         let x = i % 10;
         let y = i % 3;
-        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {x}, {y}, 'k{}');", i % 6);
+        let stmt = format!(
+            "INSERT INTO t VALUES ({i}, {a}, {b}, {x}, {y}, 'k{}');",
+            i % 6
+        );
         f.execute(&stmt).unwrap();
         r.execute_batch(&stmt).unwrap();
     }
@@ -124,11 +127,19 @@ fn agg_leading_eq_residual_matches_sqlite() {
         "leading eq + literal residual must seek the prefix (SeekGE)"
     );
     assert!(
-        has_op(&f, "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5", "SeekGE"),
+        has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE s = 'k3' AND x = 5",
+            "SeekGE"
+        ),
         "TEXT leading eq + literal residual must seek the prefix (SeekGE)"
     );
     assert!(
-        has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x IN (2, 5, 8)", "SeekGE"),
+        has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE a = 7 AND x IN (2, 5, 8)",
+            "SeekGE"
+        ),
         "leading eq + IN-list residual (all literal) must seek the prefix (SeekGE)"
     );
     // A bound parameter anywhere in the WHERE declines the seek (re-emitting it per row could

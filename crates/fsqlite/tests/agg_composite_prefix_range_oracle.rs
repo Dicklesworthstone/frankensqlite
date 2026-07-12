@@ -128,8 +128,11 @@ fn agg_composite_prefix_range_matches_sqlite() {
 
     // Opcode gate: the composite prefix+range seek fires (SeekGE anchor + IdxGT prefix stop).
     assert!(
-        has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10", "SeekGE")
-            && has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10", "IdxGT"),
+        has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10",
+            "SeekGE"
+        ) && has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10", "IdxGT"),
         "COUNT(*) WHERE a=v AND b>c must seek (SeekGE + IdxGT)"
     );
     assert!(
@@ -138,25 +141,45 @@ fn agg_composite_prefix_range_matches_sqlite() {
     );
     // Covering gate: COUNT(*)/SUM(leading col a) read straight from the index; SUM(b) needs the table.
     assert!(
-        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
+        !has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10",
+            "SeekRowid"
+        ),
         "COUNT(*) composite prefix+range must be covering (no SeekRowid)"
     );
     assert!(
-        !has_op(&f, "SELECT SUM(a) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
+        !has_op(
+            &f,
+            "SELECT SUM(a) FROM t WHERE a = 5 AND b > 10",
+            "SeekRowid"
+        ),
         "SUM(leading col) composite prefix+range must be covering (no SeekRowid)"
     );
     assert!(
-        !has_op(&f, "SELECT SUM(b) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
+        !has_op(
+            &f,
+            "SELECT SUM(b) FROM t WHERE a = 5 AND b > 10",
+            "SeekRowid"
+        ),
         "SUM(range col b) is a KEY column -> covering (no SeekRowid)"
     );
     // A SUM of a NON-key column still needs the table lookup.
     assert!(
-        has_op(&f, "SELECT SUM(c) FROM t WHERE a = 5 AND b > 10", "SeekRowid"),
+        has_op(
+            &f,
+            "SELECT SUM(c) FROM t WHERE a = 5 AND b > 10",
+            "SeekRowid"
+        ),
         "SUM(non-key col c) must open the table (SeekRowid)"
     );
     // Residual declines the seek (no IdxGT), falling to a scan that enforces c.
     assert!(
-        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10 AND c = 1", "IdxGT"),
+        !has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE a = 5 AND b > 10 AND c = 1",
+            "IdxGT"
+        ),
         "residual `c = 1` must decline the composite prefix+range seek"
     );
 }

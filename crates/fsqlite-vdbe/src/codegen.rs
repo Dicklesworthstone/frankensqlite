@@ -10605,7 +10605,11 @@ fn codegen_select_minmax_prefix_seek(
 /// column is one of the index's key columns. Reading `Column idx_cursor, <this>` yields the value
 /// without a table lookup. Only plain (non-expression) key columns match, which is exactly what the
 /// direct-lookup indexes these seeks use carry.
-fn index_key_position_of(index: &IndexSchema, table: &TableSchema, table_col: usize) -> Option<i32> {
+fn index_key_position_of(
+    index: &IndexSchema,
+    table: &TableSchema,
+    table_col: usize,
+) -> Option<i32> {
     index
         .columns
         .iter()
@@ -10987,7 +10991,8 @@ fn aggregate_index_range_seek_target<'t, 'e>(
         if !is_integer {
             continue;
         }
-        let Some(range) = extract_named_column_range(where_expr, table, table_alias, col_name) else {
+        let Some(range) = extract_named_column_range(where_expr, table, table_alias, col_name)
+        else {
             continue;
         };
         let int_bounds = range
@@ -11020,11 +11025,7 @@ fn expr_has_placeholder(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. } => expr_has_placeholder(expr),
         Expr::Between {
             expr, low, high, ..
-        } => {
-            expr_has_placeholder(expr)
-                || expr_has_placeholder(low)
-                || expr_has_placeholder(high)
-        }
+        } => expr_has_placeholder(expr) || expr_has_placeholder(low) || expr_has_placeholder(high),
         Expr::In {
             expr,
             set: InSet::List(items),
@@ -11895,7 +11896,14 @@ fn codegen_select_aggregate(
             if let Some(aff) = bound_affinity
                 && !bound_matches_affinity(aff, bound.expr())
             {
-                b.emit_op(Opcode::Affinity, base, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    base,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, base, 0, finalize_label, P4::None, 0);
             b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
@@ -11907,14 +11915,23 @@ fn codegen_select_aggregate(
             if let Some(aff) = bound_affinity
                 && !bound_matches_affinity(aff, bound.expr())
             {
-                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
             (reg, bound.inclusive)
         });
         // A register holding the current key, needed to test an exclusive lower bound or any upper bound.
         let current_key_reg = (upper_reg.is_some()
-            || lower_probe.as_ref().is_some_and(|(_, inclusive)| !inclusive))
+            || lower_probe
+                .as_ref()
+                .is_some_and(|(_, inclusive)| !inclusive))
         .then(|| b.alloc_reg());
 
         if !covering {
@@ -11938,7 +11955,14 @@ fn codegen_select_aggregate(
 
         if let Some((lower_reg, _)) = lower_probe.as_ref() {
             let probe_record_reg = b.alloc_reg();
-            b.emit_op(Opcode::MakeRecord, *lower_reg, 2, probe_record_reg, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                *lower_reg,
+                2,
+                probe_record_reg,
+                P4::None,
+                0,
+            );
             b.emit_jump_to_label(
                 Opcode::SeekGE,
                 idx_cursor,
@@ -11998,10 +12022,25 @@ fn codegen_select_aggregate(
         } else {
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
             // Residual: re-apply the whole (placeholder-free) WHERE; the range is a superset.
             if has_residual && let Some(where_expr) = where_clause {
-                emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_label,
+                );
             }
             emit_aggregate_accumulate_body(
                 b,
@@ -12055,7 +12094,14 @@ fn codegen_select_aggregate(
             if let Some(aff) = key_affinities[pos]
                 && !bound_matches_affinity(aff, expr)
             {
-                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
         }
@@ -12066,7 +12112,14 @@ fn codegen_select_aggregate(
             if let Some(aff) = key_affinities[range_pos]
                 && !bound_matches_affinity(aff, lower.expr())
             {
-                b.emit_op(Opcode::Affinity, range_reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    range_reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, range_reg, 0, finalize_label, P4::None, 0);
             Some(lower.inclusive)
@@ -12099,7 +12152,14 @@ fn codegen_select_aggregate(
             if let Some(aff) = key_affinities[range_pos]
                 && !bound_matches_affinity(aff, u.expr())
             {
-                b.emit_op(Opcode::Affinity, reg, 1, 0, P4::Affinity(aff.to_string()), 0);
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Affinity(aff.to_string()),
+                    0,
+                );
             }
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, finalize_label, P4::None, 0);
             (reg, u.inclusive)
@@ -12123,7 +12183,14 @@ fn codegen_select_aggregate(
             P4::Index(idx_schema.name.clone()),
             0,
         );
-        b.emit_jump_to_label(Opcode::SeekGE, idx_cursor, probe_rec, finalize_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_rec,
+            finalize_label,
+            P4::None,
+            0,
+        );
 
         let loop_top = b.current_addr();
         let skip_label = b.emit_label();
@@ -12152,7 +12219,14 @@ fn codegen_select_aggregate(
             b.emit_jump_to_label(Opcode::IsNull, range_key_reg, 0, skip_label, P4::None, 0);
         }
         if lower_inclusive == Some(false) {
-            b.emit_jump_to_label(Opcode::Le, range_reg, range_key_reg, skip_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Le,
+                range_reg,
+                range_key_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
         }
         if let Some((up_reg, up_inclusive)) = upper {
             let stop = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
@@ -12171,7 +12245,14 @@ fn codegen_select_aggregate(
         } else {
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
             emit_aggregate_accumulate_body(
                 b,
                 cursor,
@@ -12264,11 +12345,26 @@ fn codegen_select_aggregate(
         let skip_label = b.emit_label();
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
         // Apply the whole WHERE (placeholder-free) — the prefix equalities are redundant with the seek
         // but harmless; the residual conjuncts are the point.
         if let Some(where_expr) = where_clause {
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
+            );
         }
         emit_aggregate_accumulate_body(
             b,
@@ -22731,7 +22827,9 @@ fn conjunct_pins_prefix_or_range(
             .is_some_and(|(col, _, _)| col.eq_ignore_ascii_case(range_col)),
         Expr::Between {
             expr, not: false, ..
-        } => column_name(expr, table, table_alias).is_some_and(|c| c.eq_ignore_ascii_case(range_col)),
+        } => {
+            column_name(expr, table, table_alias).is_some_and(|c| c.eq_ignore_ascii_case(range_col))
+        }
         _ => false,
     }
 }

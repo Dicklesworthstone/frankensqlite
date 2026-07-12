@@ -119,15 +119,27 @@ fn check_schema(label: &str, ddl: &[&str]) {
     // Covering gate: COUNT(*) and SUM(indexed col) accumulate straight off the index (no SeekRowid);
     // SUM of a non-indexed column still needs the table lookup.
     assert!(
-        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11)", "SeekRowid"),
+        !has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 11)",
+            "SeekRowid"
+        ),
         "[{label}] COUNT(*) IN-list walk must be covering (no SeekRowid)"
     );
     assert!(
-        !has_op(&f, "SELECT SUM(a) FROM t WHERE a IN (3, 7, 11)", "SeekRowid"),
+        !has_op(
+            &f,
+            "SELECT SUM(a) FROM t WHERE a IN (3, 7, 11)",
+            "SeekRowid"
+        ),
         "[{label}] SUM(indexed col) IN-list walk must be covering (no SeekRowid)"
     );
     assert!(
-        has_op(&f, "SELECT SUM(x) FROM t WHERE a IN (3, 7, 11)", "SeekRowid"),
+        has_op(
+            &f,
+            "SELECT SUM(x) FROM t WHERE a IN (3, 7, 11)",
+            "SeekRowid"
+        ),
         "[{label}] SUM(non-indexed col) IN-list walk must open the table (SeekRowid)"
     );
 }
