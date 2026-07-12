@@ -107,13 +107,22 @@ impl Histogram {
 }
 
 fn bytes_to_fraction(bytes: &[u8]) -> f64 {
-    let mut fraction = 0.0;
-    let mut weight = 1.0 / 256.0;
-    for &b in bytes.iter().take(8) {
-        fraction = f64::from(b).mul_add(weight, fraction);
-        weight /= 256.0;
+    const PREFIX_BYTES: usize = size_of::<u64>();
+    const FRACTION_SCALE: f64 = (1_u64 << f64::MANTISSA_DIGITS) as f64;
+
+    // Interpret the first eight bytes as a big-endian base-256 fraction. A
+    // binary64 cannot represent all 64 fraction bits: values sufficiently
+    // close to one (including eight 0xFF bytes) round to 1.0. Truncating the
+    // integer prefix to binary64's 53 significant bits before conversion
+    // gives an exact dyadic fraction, preserves lexicographic monotonicity,
+    // and guarantees the result is in the required half-open interval [0, 1).
+    let mut prefix_bytes = [0_u8; PREFIX_BYTES];
+    for (destination, source) in prefix_bytes.iter_mut().zip(bytes) {
+        *destination = *source;
     }
-    fraction
+    let prefix = u64::from_be_bytes(prefix_bytes);
+    let numerator = prefix >> (u64::BITS - f64::MANTISSA_DIGITS);
+    numerator as f64 / FRACTION_SCALE
 }
 
 /// Heuristic linear interpolation of `val` between `min` and `max`.
@@ -598,7 +607,7 @@ mod tests {
         assert!(approx(bf(&[0x80, 0x80]), 0.5 + 128.0 / 65536.0));
 
         // Only the first 8 bytes matter; trailing bytes are ignored.
-        assert!(approx(bf(&[0xFF; 9]), bf(&[0xFF; 8])));
+        assert_eq!(bf(&[0xFF; 9]), bf(&[0xFF; 8]));
 
         // Strictly increasing with the most-significant byte; result stays in [0, 1).
         assert!(bf(&[0x02]) > bf(&[0x01]));
@@ -608,6 +617,20 @@ mod tests {
             (0.0..1.0).contains(&max8),
             "eight 0xFF bytes must stay below 1.0, got {max8}"
         );
+        assert_eq!(
+            max8,
+            1.0 - f64::EPSILON / 2.0,
+            "the maximum prefix maps to the largest binary64 below 1.0"
+        );
+
+        // The conversion rounds downward to a 53-bit dyadic grid. Prefixes
+        // in one grid cell compare equal, while crossing the next 53-bit
+        // boundary remains strictly ordered even at the upper endpoint.
+        let same_top_bin = (u64::MAX - ((1_u64 << 11) - 1)).to_be_bytes();
+        let previous_bin = (u64::MAX - (1_u64 << 11)).to_be_bytes();
+        assert_eq!(bf(&same_top_bin), max8);
+        assert!(bf(&previous_bin) < max8);
+        assert_eq!(max8 - bf(&previous_bin), f64::EPSILON / 2.0);
     }
 
     #[test]
