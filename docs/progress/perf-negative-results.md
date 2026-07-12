@@ -17864,3 +17864,25 @@ test is on the executed path, not merely linked into it.
 - NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
 - MEDIAN (release-perf, 20k rows): `MAX(v)` DESC 6.76 ms → 9.4 µs (~716×); `MIN(v)` 6.64 ms → 9.5 µs
   (~696×). Diagnostic: minmax_desc_index_profile.rs.
+
+## 2026-07-12 - WIN: MAX(b) WHERE a=? on a (a, b DESC) index seeks the block FRONT via SeekGE (O(log n), no O(block) walk) — ~144× vs group scan, ~11× faster than the ASC-second MAX (bd-minmax-prefix-desc-max)
+
+- Result type: WIN / shipped. A small extension of bd-minmax-prefix-seek that ALSO sidesteps the
+  O(block) SeekLE walk negative-ledgered as bd-seek-partial-key-oblock.
+- THE MISS: `minmax_prefix_seek_plan` declined a DESC second key term (`!key_term_descending(1)`). But a
+  `(a, b DESC)` index — the natural "max b per a" / "latest per group" index — keeps the max `b` of the
+  `a=?` block at its FIRST entry, reachable via `SeekGE([a])` (O(log n)); MAX previously either declined
+  to the group scan or (for ASC `b`) used `SeekLE`, which does an O(block) forward walk.
+- THE LEVER: added `b_descending` to `MinMaxPrefixSeek`; the plan now accepts a DESC second term for MAX
+  only (a DESC `b` MIN — last non-NULL via SeekLE — still declines). `codegen_select_minmax_prefix_seek`
+  picks the MAX seek op by direction: DESC `b` → `SeekGE` (block front = max, NULLs at the block's back),
+  ASC `b` → `SeekLE` (block back = max, unchanged). Verify + single-row AggStep are shared; byte-identical.
+- BYTE-EXACT GATE (`minmax_prefix_desc_oracle.rs`, PASS): vs rusqlite/C SQLite — MAX(b) on `(a, b DESC)`
+  across a NULL-mixed group, an all-NULL-`b` group and an absent/below-range group (→ NULL), boundary
+  `a`, and COALESCE; MIN(b) over the DESC term declines to the scan and still matches. Opcode gate:
+  MAX→`SeekGE` covering (no `SeekLE`/`SeekRowid`); MIN does not use the covering seek.
+- NO-REGRESSION: `fsqlite-vdbe --lib` 1043/0. clippy clean; fmt clean.
+- MEDIAN (release-perf, 20k rows, ~1000/group): `MAX(b) WHERE a=7` 24 µs vs the same-group COUNT scan
+  3.46 ms (~144×) — and ~11× faster than the ASC-second-term MAX (270 µs, which pays the O(block) SeekLE
+  walk). So a `(a, b DESC)` index makes MAX-per-group both correct and O(log n). Diagnostic:
+  minmax_prefix_desc_profile.rs.

@@ -9522,8 +9522,11 @@ fn minmax_index_seek_plan(
 /// A single `MIN(b)`/`MAX(b)` over the SECOND key term of a composite index, constrained by
 /// `WHERE <first-term> = <const>` — resolvable by one prefix seek to the extremum of the group.
 struct MinMaxPrefixSeek<'e> {
-    /// `true` = `MAX` (last entry of the `a=?` block); `false` = `MIN` (first non-NULL `b` in it).
+    /// `true` = `MAX`; `false` = `MIN`.
     is_max: bool,
+    /// `true` when key term 1 (`b`) is DESC — then `MAX(b)` is the block's FIRST entry (`SeekGE`),
+    /// not the last (`SeekLE`). Only ever set for MAX (a DESC `b` declines MIN).
+    b_descending: bool,
     index_name: String,
     index_root: i32,
     /// Affinity to coerce the `a` probe to (`'C'|'D'|'E'|'B'`), or `None` (untyped → no coercion).
@@ -9592,7 +9595,10 @@ fn minmax_prefix_seek_plan<'e>(
         idx.supports_direct_column_lookup()
             && idx.key_term_count() >= 2
             && !idx.key_term_descending(0)
-            && !idx.key_term_descending(1)
+            // ASC `b`: MIN=first / MAX=last of the block. DESC `b`: MAX is the block's FIRST entry
+            // (SeekGE, O(log n) — no O(block) walk); MIN over a DESC `b` (last non-NULL, SeekLE) is
+            // declined here, so a DESC second term is only accepted for MAX.
+            && (!idx.key_term_descending(1) || is_max)
             && idx
                 .columns
                 .first()
@@ -9605,6 +9611,7 @@ fn minmax_prefix_seek_plan<'e>(
                 .key_term_collation(1)
                 .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
     })?;
+    let b_descending = idx.key_term_descending(1);
     let a_affinity = table
         .column_index(&a_col_name)
         .map(|i| table.columns[i].affinity)
@@ -9615,6 +9622,7 @@ fn minmax_prefix_seek_plan<'e>(
         .map(str::to_owned);
     Some(MinMaxPrefixSeek {
         is_max,
+        b_descending,
         index_name: idx.name.clone(),
         index_root: idx.root_page,
         a_affinity,
@@ -9878,15 +9886,15 @@ fn codegen_select_minmax_prefix_seek(
     let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
 
     if seek.is_max {
-        // MAX: last entry of the `a=?` block.
-        b.emit_jump_to_label(
-            Opcode::SeekLE,
-            idx_cursor,
-            probe_rec,
-            finalize_label,
-            P4::None,
-            0,
-        );
+        // MAX is at the block's extremum-`b` end: ASC `b` → last entry (`SeekLE`); DESC `b` → first
+        // entry (`SeekGE`, O(log n) with no O(block) forward walk). `b` there is the max (NULLs sit at
+        // the opposite `b` end, so a NULL means the whole block's `b` is NULL → MAX = NULL).
+        let max_seek = if seek.b_descending {
+            Opcode::SeekGE
+        } else {
+            Opcode::SeekLE
+        };
+        b.emit_jump_to_label(max_seek, idx_cursor, probe_rec, finalize_label, P4::None, 0);
         b.emit_op(Opcode::Column, idx_cursor, 0, cur_a_reg, P4::None, 0);
         b.emit_jump_to_label(
             Opcode::Ne,
