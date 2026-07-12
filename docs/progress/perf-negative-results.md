@@ -17694,3 +17694,45 @@ test is on the executed path, not merely linked into it.
 - clippy clean on the change (codegen + minmax_index_oracle); fmt clean.
 - NET: the 6th shipped byte-exact codegen win in this series, and the largest single-query speedup
   (~900×). Diagnostic retained: `minmax_index_profile.rs`.
+
+## 2026-07-11 - SURFACE: DISTINCT-over-indexed-column is sorter-based (14.8ms, index unused); the emit-on-change index WALK is byte-exact but FLAT; the loose/skip scan is the real lever but hangs — reverted (bd-distinct-index-stream)
+
+- Result type: SURFACE / lever attempted, not shipped (reverted). Profiled the DISTINCT/GROUP BY lane
+  (`crates/fsqlite/tests/distinct_groupby_profile.rs`, retained).
+- THE GAP: `SELECT DISTINCT <col>` where `<col>` is single-column-indexed runs the generic
+  `codegen_select_distinct_scan` — a full table scan into a SORTER (SorterOpen + n SorterInsert + sort
+  + dedup), completely ignoring the already-sorted index. Median (release-perf, 20k rows, 50 distinct):
+  `DISTINCT k` (indexed) 14.82 ms == `DISTINCT u` (NOT indexed) 14.79 ms — the index is unused. (By
+  contrast GROUP BY is hash-based at ~2.9 ms, so the SORTER, not the scan, is DISTINCT's ~12 ms cost.)
+  Feasibility probe confirmed frank AND C SQLite both return bare DISTINCT in ASCENDING (index) order
+  and agree, so an index-ordered stream is byte-exact-feasible.
+- ATTEMPT 1 — emit-on-change index WALK (Rewind + Next, emit when the value changes, `Eq` with
+  `p5=0x80` NULLEQ + `P4::Collation` for collation-aware NULL-equal dedup): byte-exact (oracle 15+
+  cases vs rusqlite: INT/TEXT/REAL/NOCASE, LIMIT/OFFSET, leading-NULL collapse, all-NULL, empty, all
+  bit-identical; opcode gate confirmed the index stream fired, no sorter) and no-regression clean
+  (vdbe --lib 1036/0). BUT the MEDIAN was FLAT: `DISTINCT k` 13.88 ms vs `DISTINCT u` (sorter) 15.01 ms
+  — ~7%, within worker noise. Root cause: walking n index entries through the MVCC/pager cursor `Next`
+  costs about the same as the sorter — the SAME systemic per-operation cursor-abstraction cost this
+  campaign already decomposed (the ~fixed cursor cost, tree-depth-independent). An O(n) index walk
+  cannot beat an O(n) sorter here; both are dominated by n cursor ops. NOT a clear median win -> not
+  shipped.
+- ATTEMPT 2 — loose/SKIP scan (emit a value, then `SeekGT` on the probe `[value, i64::MAX]` to jump
+  PAST the whole duplicate run to the next distinct value — O(#distinct·log n) seeks, ~50 not 20k):
+  this IS the real win shape. Codegen mirrors the shipped ASC index-range probe
+  (`MakeRecord([value, sentinel]) + index Seek`), jump direction verified (seeks jump to p2 on eof,
+  engine.rs:9504). But the oracle HUNG (a 0.14 s test ran >60 s) — an apparent non-termination or
+  pathological slowness in the SeekGT skip loop that could not be root-caused within the remote
+  build-iteration budget (~10 min/iteration). Reverted rather than ship an unverified/hanging path.
+- PRE-EXISTING BUG SURFACED (independent of this lever; proven by re-running with the change stashed):
+  `codegen_select_distinct_scan` bare-DISTINCT ROW ORDER diverges from C SQLite when C SQLite scans an
+  index the sorter path ignores. Concretely: `SELECT DISTINCT d` on a DESC-indexed column — C SQLite
+  returns DESCENDING (uses the DESC index), frank's sorter returns ASCENDING; and
+  `SELECT DISTINCT c COLLATE BINARY` on a NOCASE column — frank sorts BINARY
+  (`['A','K01','K02','a','k01','k02']`) while C SQLite returns the NOCASE-index scan order
+  BINARY-deduped (`['K01','k01','K02','k02','A','a']`). Same SET, different ORDER (bare DISTINCT order
+  is implementation-defined, but not byte-identical). A separate distinct_scan concern, not a perf lever.
+- NEXT: the skip-scan is the correct big lever (~100-400x on DISTINCT-over-low-cardinality-index) and
+  deserves a chartered follow-up: reproduce the hang on a 5-row table with a local/fast build, confirm
+  `SeekGT` on an index cursor with a 2-field `[value, MAX]` record probe advances past the run (vs
+  landing back on it -> the loop suspect), then re-gate with the (retained-in-git-history) oracle. The
+  emit-on-change walk is a dead end (systemic cursor cost). Diagnostic retained: distinct_groupby_profile.rs.
