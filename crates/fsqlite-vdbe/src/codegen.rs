@@ -2142,6 +2142,43 @@ pub fn codegen_select(
         );
     }
 
+    // bd-covering-range-before-directive: `SELECT <covering cols> FROM t WHERE col <range>` (no
+    // ORDER BY) receives a `FullTableScan` planner directive — the planner does not model a
+    // single-column range as a seekable access path — which short-circuits to
+    // `codegen_select_full_scan` below and reads every row, bypassing the `index_range` heuristic (only
+    // reached when no directive is emitted). When the seek is COVERING (every output is the rowid or an
+    // index column, so `resolve_covering_output_sources` succeeds and no table row is ever read) the
+    // index-range walk visits only the matching key slice and is strictly cheaper than the full scan —
+    // it cannot pessimize even a non-selective range the way a non-covering per-row `SeekRowid` could.
+    // Route it before the directive, exactly like the bd-2dgf5 IN-list and bd-zqkrp composite-prefix
+    // seeks; the emitted rows are index-ordered (spec-legal without ORDER BY) and byte-identical as a
+    // set to the full scan (same oracle-tested emitter used at the heuristic below). Rowid tables only;
+    // non-covering ranges are left to the planner's full scan to avoid random-lookup regressions.
+    if let Some((_range_col, idx_schema, range)) = index_range.as_ref()
+        && !table.without_rowid
+        && ctx.planner_select_directive.as_ref().is_some_and(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+        })
+        && resolve_covering_output_sources(columns, table, table_alias, idx_schema).is_some()
+    {
+        return codegen_select_index_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            planner_index_range_target_from_column_range(range),
+        );
+    }
+
     if let Some(directive) = ctx.planner_select_directive.as_ref() {
         let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
             Some("table_mismatch")
