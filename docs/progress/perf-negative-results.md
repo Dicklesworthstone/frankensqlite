@@ -18525,3 +18525,28 @@ test is on the executed path, not merely linked into it.
   SeekRowid (non-covering).
 - INFRA NOTE: the stale-fsqlite-pager E0599 sync race blocked several gate windows this turn; the gate
   loop should treat `file_identity`/`SimplePager` E0599 as an infra-miss and keep hunting a clean worker.
+
+## 2026-07-12 - Table seek-cache MRU refresh short-circuit
+
+- Target: the file-backed prepared `pipeline/btree_seek_file_clustered_in/fsqlite` workload added by
+  the preceding resident-entry keep. Negative-ledger-first search found no prior attempt to optimize
+  `BtCursor::remember_table_seek` when the landed page is already slot 0 of the four-entry LRU.
+- Candidate touched `crates/fsqlite-btree/src/cursor.rs`. It refreshed slot 0's rowid/cell index and
+  returned immediately when slot 0 already named the landed page, instead of rebuilding and scanning
+  the four-slot cache. A focused assertion preserved slots 1-3. The source and test patch were manually
+  unwound after measurement; this ledger entry is the only retained change.
+- Evidence (strict remote-only RCH, same worker `vmi1264463`, 30 samples, identical command/profile):
+  baseline median `25.457 us` (`24.371..26.411 us`) versus candidate median `24.646 us`
+  (`23.013..26.215 us`), a `3.19%` median reduction / `1.03x` throughput equivalent. Criterion found
+  no significant change: interval `-9.6778%..+0.3360%`, `p=0.07`, with two high outliers.
+- Command: `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1264463 ... rch exec -- cargo bench --config
+  'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile
+  release-perf -j3 -p fsqlite-e2e --bench pipeline_stage_bench --
+  '^pipeline/btree_seek_file_clustered_in/fsqlite$' --warm-up-time 0.5 --measurement-time 2
+  --sample-size 30 --noplot`. Both jobs were proven remote on `vmi1264463`; RCH invalidated the target
+  graph during each sync, so the control and candidate were comparable cold builds (24m18s and 23m31s).
+  No local Cargo command was substituted. The stable, unrelated `codegen.rs` dead-code warning appeared
+  on both sides.
+- Result: rejected as within noise. Do not retry the standalone slot-0 early return from a cold read.
+  Reconsider only if a new profile attributes material self-time to `remember_table_seek`/LRU rebuild,
+  and require a same-worker confidence interval that excludes zero on the real clustered-seek workload.
