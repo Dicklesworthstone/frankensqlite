@@ -18635,3 +18635,33 @@ test is on the executed path, not merely linked into it.
   GROUP-BY-by-index (walk `idx_a`/`idx_ab` prefix in key order, detect group boundaries by key change,
   skip the sorter entirely) is the concrete candidate. Larger scope; needs its own turn and a
   byte-exact oracle vs rusqlite (group values, ordering, NULL-group handling).
+
+## 2026-07-12 - Same-size VDBE register fill fast path
+
+- Target: `VdbeEngine::reset_for_reuse_impl`, measured by the existing direct
+  `vdbe_engine_reset_for_reuse/{4,16}` Criterion seam. Negative-ledger-first review found no exact
+  prior attempt; the broad historical `SmallVec` bundle fence permits an isolated executed-path A/B,
+  while the prepared-DELETE reset rejects are a different non-VDBE path.
+- Candidate touched `crates/fsqlite-vdbe/src/engine.rs`. When the next program requested the current
+  register count, it filled the existing `SmallVec` in place with `SqliteValue::Null`; changed register
+  counts retained the original `clear` + `resize` path. A focused draft test covered Integer/Text/Blob
+  clearing at equal length and the unequal-length fallback. Ordering, values after reset, capacity,
+  floating-point behavior, and opcode execution were unchanged. The source and test patch were
+  manually unwound after measurement; this ledger row is the only retained change.
+- Evidence (strict remote-only RCH, same worker `vmi1264463`, 30 samples, identical command/profile):
+  the 4-register row moved from `77.992 ns` (`75.545..80.402 ns`) to `66.312 ns`
+  (`65.380..67.323 ns`), a `15.0%` median reduction / `1.18x` throughput equivalent; Criterion reported
+  `-18.044%..-9.3984%`, `p=0.00`. The 16-register row moved from `153.14 ns`
+  (`147.00..158.64 ns`) to `147.50 ns` (`144.84..149.95 ns`), only a `3.68%` median reduction /
+  `1.04x` throughput equivalent, with a confidence interval crossing zero (`-4.8951%..+4.0267%`,
+  `p=0.80`).
+- Command: `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1264463 ... rch exec -- cargo bench --config
+  'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile
+  release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages --
+  '^vdbe_engine_reset_for_reuse/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`.
+  Both jobs were proven remote on `vmi1264463`; RCH invalidated the graph during each sync, producing
+  comparable cold builds (9m50s baseline, 9m30s candidate). No local Cargo command was substituted.
+- Result: rejected because the predeclared keep gate required confidence intervals excluding zero on
+  both register-count rows. Do not retry the standalone equal-length `fill` branch on this synthetic
+  reset seam. Reconsider only with production evidence that cached-statement reuse is dominated by
+  tiny (four-register) programs and a real statement-level benchmark that reproduces the win.
