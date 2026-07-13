@@ -17442,6 +17442,15 @@ pub fn codegen_update(
     } else {
         None
     };
+    // bd-update-rowid-range: `UPDATE ... WHERE <rowid> <range>` collects the [lower, upper] slice with a
+    // bounded seek+walk instead of full-scanning. Bare range, integer-literal bounds only (so Pass 1 emits
+    // no anon placeholders — the SET placeholders are numbered in Pass 2 as before).
+    let rowid_range = if rowid_target.is_none() && rowid_in_list.is_none() {
+        extract_rowid_range_target(stmt.where_clause.as_ref(), Some(table), stmt.table.alias.as_deref())
+            .filter(|range| range.lower.is_some() && rowid_range_fast_path_is_safe(*range) && rowid_range_bounds_are_int_literals(range))
+    } else {
+        None
+    };
 
     let set_placeholder_count: u32 = stmt
         .assignments
@@ -17494,6 +17503,18 @@ pub fn codegen_update(
                 b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
                 b.resolve_label(next_value);
             }
+        } else if let Some(range) = rowid_range {
+            emit_rowid_range_rowset_collect(
+                b,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                table_cursor,
+                rowset_reg,
+                matched_rowid_reg,
+                collect_done_label,
+                range,
+            );
         } else {
             let collect_start = b.current_addr();
             b.emit_jump_to_label(
@@ -18439,6 +18460,93 @@ fn codegen_update_from(
 /// Generate VDBE bytecode for a DELETE statement.
 ///
 /// Handles both rowid-equality WHERE and general column-based WHERE via
+/// True when every present bound of `range` is an integer literal — so a Pass-1 rowid-range collection
+/// emits the bounds as constants (no anonymous placeholders) and the seek+stop bounds are exact (no WHERE
+/// filter needed). bd-delete-rowid-range / bd-update-rowid-range.
+fn rowid_range_bounds_are_int_literals(range: &RowidRangeTarget<'_>) -> bool {
+    let is_int = |bound: Option<RowidRangeBound<'_>>| {
+        bound.map_or(true, |b| matches!(b.expr, Expr::Literal(Literal::Integer(_), _)))
+    };
+    is_int(range.lower) && is_int(range.upper)
+}
+
+/// DELETE/UPDATE Pass-1 rowid-range collection: position at the lower bound (`SeekGE`/`SeekGT`, or
+/// `Rewind` when unbounded below), walk forward adding each rowid to the RowSet, and stop once past the
+/// upper bound (`Gt`/`Ge`). Mirrors the ascending walk of `codegen_select_rowid_range_scan` but collects
+/// rowids instead of emitting rows. Requires integer-literal bounds (`rowid_range_bounds_are_int_literals`),
+/// so it emits no anonymous placeholders and needs no WHERE filter (the bounds are exact). The caller
+/// resolves `collect_done_label` after this returns (the trailing `Next` falls through to it on
+/// exhaustion). bd-delete-rowid-range / bd-update-rowid-range.
+#[allow(clippy::too_many_arguments)]
+fn emit_rowid_range_rowset_collect(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    table_cursor: i32,
+    rowset_reg: i32,
+    rowid_reg: i32,
+    collect_done_label: crate::Label,
+    range: RowidRangeTarget<'_>,
+) {
+    let lower_reg = range.lower.map(|bound| {
+        let r = b.alloc_reg();
+        emit_expr(b, bound.expr, r, None);
+        r
+    });
+    let upper_reg = range.upper.map(|bound| {
+        let r = b.alloc_reg();
+        emit_expr(b, bound.expr, r, None);
+        r
+    });
+    let upper_comparison = range
+        .upper
+        .map(|bound| resolved_rowid_range_comparison(table, table_alias, schema, bound));
+
+    let collect_start = b.current_addr();
+    if let Some(bound) = range.lower {
+        let seek_opcode = if bound.inclusive {
+            Opcode::SeekGE
+        } else {
+            Opcode::SeekGT
+        };
+        b.emit_jump_to_label(
+            seek_opcode,
+            table_cursor,
+            lower_reg.expect("lower bound register should exist"),
+            collect_done_label,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, collect_done_label, P4::None, 0);
+    }
+
+    // Loop body (collect_start + 1): read the rowid, stop once past the upper bound, else add it.
+    b.emit_op(Opcode::Rowid, table_cursor, rowid_reg, 0, P4::None, 0);
+    if let Some(bound) = range.upper {
+        let stop_opcode = if bound.inclusive {
+            Opcode::Gt
+        } else {
+            Opcode::Ge
+        };
+        b.emit_jump_to_label(
+            stop_opcode,
+            upper_reg.expect("upper bound register should exist"),
+            rowid_reg,
+            collect_done_label,
+            upper_comparison
+                .as_ref()
+                .map_or(P4::None, |c| c.collation_p4.clone()),
+            upper_comparison.as_ref().map_or(0, |c| c.cmp_p5),
+        );
+    }
+    b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let collect_body = (collect_start + 1) as i32;
+    b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
+}
+
 /// a full table scan with filter.
 ///
 /// Init → Transaction(write) → OpenWrite → Rewind → [WHERE filter] →
@@ -18523,6 +18631,16 @@ pub fn codegen_delete(
     } else {
         None
     };
+    // bd-delete-rowid-range: `DELETE ... WHERE <rowid> <range>` collects the [lower, upper] slice with a
+    // bounded seek+walk (SeekGE/SeekGT to the lower bound, stop past the upper) instead of full-scanning.
+    // Bare range only (no residual), integer-literal bounds only (so the walk emits no anon placeholders),
+    // and only after the eq / IN cases decline.
+    let rowid_range = if rowid_target.is_none() && rowid_in_list.is_none() {
+        extract_rowid_range_target(stmt.where_clause.as_ref(), Some(table), stmt.table.alias.as_deref())
+            .filter(|range| range.lower.is_some() && rowid_range_fast_path_is_safe(*range) && rowid_range_bounds_are_int_literals(range))
+    } else {
+        None
+    };
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
@@ -18553,6 +18671,18 @@ pub fn codegen_delete(
             b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
             b.resolve_label(next_value);
         }
+    } else if let Some(range) = rowid_range {
+        emit_rowid_range_rowset_collect(
+            b,
+            table,
+            stmt.table.alias.as_deref(),
+            schema,
+            table_cursor,
+            rowset_reg,
+            rowid_reg,
+            collect_done_label,
+            range,
+        );
     } else {
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
