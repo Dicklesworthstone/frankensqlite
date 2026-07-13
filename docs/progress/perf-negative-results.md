@@ -18599,3 +18599,39 @@ test is on the executed path, not merely linked into it.
   expression at `codegen.rs:11875` (`unnecessary_lazy_evaluations`: use `then_some`). The earlier
   peer-owned `codegen.rs` dead-code warning appeared in the control, candidate, test, and check builds
   and was fixed upstream before the final rebase; neither finding is related to this lever.
+
+## 2026-07-12 - NON-CANDIDATE: scalar EXISTS composite-eq is already constant-folded, not a scan
+
+- Target: `SELECT EXISTS(SELECT 1 FROM t WHERE a = <eq> AND b = <eq>)` (composite-prefix equality on
+  `idx_ab(a,b)`), surfaced by the `gap_probe2` SEEK-vs-SCAN probe as `[SCAN!] seek=false rewind=false`.
+  The intended lever was "make the uncorrelated EXISTS seek the composite index (SeekGE early-exit)
+  instead of scanning." Negative-ledger-first search found no prior entry.
+- Assessment (no source touched; decided at the EXPLAIN stage — there was nothing to bench). The
+  `[SCAN!]` label is a probe false positive. `emit_exists_subquery` routes an uncorrelated subquery to
+  `emit_once_materialized_exists_subquery` (`codegen.rs:25551`/`25487`), which evaluates the subquery at
+  prepare time and bakes the boolean into the program. The full EXPLAIN is a compile-time constant:
+  `Init / Transaction / Integer 0 -> r1 / ResultRow r1 / Halt` — no OpenRead, no Seek, no Rewind. A
+  folded constant is already O(1) at run time; a real index seek would be strictly slower. So there is
+  no run-time scan/seek to optimize, and the probe's "no Seek + no Rewind ⇒ SCAN" heuristic mislabels
+  every constant-folded scalar subquery. Future SEEK/SCAN probing should exclude scalar EXISTS/subquery
+  result expressions.
+- Evidence (strict remote-only RCH, worker via `rch exec`; behavior, not criterion). EXPLAIN of the
+  probe query is the 5-op constant program above. Fold is data-correct on the 300-row probe table:
+  `EXISTS a=7 AND b=7` → `1` (row i=7 matches), `EXISTS a=7 AND b=3` → `0` (no match), and after
+  `INSERT INTO t VALUES (99999,7,3,0)` the same query → `1`. Each `Connection::query` re-prepares, so
+  the one-shot result always reflects current data.
+- Result: NON-CANDIDATE. Do not add a composite-index seek path to scalar EXISTS to "fix the scan" —
+  it would regress a folded constant into a seek. Retry only if a profile attributes material
+  *prepare-time* self-time to evaluating large uncorrelated EXISTS subqueries (then the lever would be
+  the opposite: DEFER evaluation to run time behind a real seek, trading prepare cost for run cost).
+- PARITY CAVEAT (correctness, not perf — flagged for a separate pass, not chased here): C SQLite does
+  NOT execute subqueries at prepare time, so its EXPLAIN for this shape shows the OpenRead/seek/scan
+  opcodes and its result tracks the table on every step. fsqlite's prepare-time fold reflects
+  prepare-time data; under prepared-statement *reuse* across intervening data mutations the baked
+  constant could go stale. Not reproduced here (query() re-prepares). Worth a targeted prepared-reuse
+  differential test in a correctness pass; out of scope for a perf lever.
+- NEXT LEVER (tee-up, deferred): `SELECT a, COUNT(*) FROM t GROUP BY a` is a genuine remaining full
+  scan — `SorterOpen / OpenRead / Rewind ... SorterInsert / SorterSort ...` (`codegen_select_group_by_aggregate`).
+  GROUP-BY-by-index (walk `idx_a`/`idx_ab` prefix in key order, detect group boundaries by key change,
+  skip the sorter entirely) is the concrete candidate. Larger scope; needs its own turn and a
+  byte-exact oracle vs rusqlite (group values, ordering, NULL-group handling).
