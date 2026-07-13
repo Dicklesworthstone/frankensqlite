@@ -1994,8 +1994,11 @@ pub fn codegen_select(
         && having.is_none()
         && !table.without_rowid;
     // bd-2dgf5: `WHERE <rowid> IN (<int literals>)` — one SeekRowid per distinct value.
+    // bd-nonagg-rowid-in-residual: also admit `rowid IN (ints) AND <residual>` — the residual variant
+    // returns `has_residual = true`; the SeekRowid probes visit only the listed rows and the emitter
+    // re-applies the whole WHERE per row. The table is always open, so the residual reads any column.
     let rowid_in = if in_list_seek_allowed {
-        extract_rowid_in_list_target(where_clause.as_deref(), table, table_alias)
+        extract_rowid_in_list_residual_target(where_clause.as_deref(), table, table_alias)
     } else {
         None
     };
@@ -2016,7 +2019,7 @@ pub fn codegen_select(
     // (INTEGER-affinity + integer literals + IN, no ORDER BY / LIMIT / DISTINCT) and the seek
     // is differential-proven bit-identical to SQLite, so preferring it over a full scan is
     // always correct and strictly faster.
-    if let Some(values) = rowid_in {
+    if let Some((values, has_residual)) = rowid_in {
         return codegen_select_rowid_in_scan(
             b,
             cursor,
@@ -2029,8 +2032,11 @@ pub fn codegen_select(
             done_label,
             end_label,
             &values,
+            where_clause.as_deref(),
+            has_residual,
         );
     }
+
     if let Some((idx_schema, values, has_residual)) = index_in {
         return codegen_select_index_in_scan(
             b,
@@ -3266,7 +3272,16 @@ fn codegen_select_rowid_in_scan(
     done_label: crate::Label,
     end_label: crate::Label,
     values: &[i64],
+    where_clause: Option<&Expr>,
+    // When true, the full `where_clause` is applied as a per-row residual filter after `SeekRowid` — for
+    // `rowid IN (ints) AND <residual>`. The rowid lookups visit only the listed rows; the residual
+    // narrows them. The table is always open here, so the residual reads any column. `false` for the
+    // exact-`rowid IN` caller → byte-identical. Placeholder base reset per lookup so a `?` in the
+    // residual numbers identically. bd-nonagg-rowid-in-residual.
+    residual_filter: bool,
 ) -> Result<(), CodegenError> {
+    // Captured before any placeholder-emitting op (rowid values are integer literals).
+    let where_placeholder_base = b.current_anon_placeholder();
     b.emit_op(
         Opcode::OpenRead,
         cursor,
@@ -3287,6 +3302,13 @@ fn codegen_select_rowid_in_scan(
             P4::None,
             0,
         );
+        // bd-nonagg-rowid-in-residual: narrow the listed rows with the full WHERE.
+        if residual_filter
+            && let Some(where_expr) = where_clause
+        {
+            b.set_next_anon_placeholder(where_placeholder_base);
+            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, next_value);
+        }
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
         b.resolve_label(next_value);
@@ -22534,6 +22556,32 @@ fn extract_rowid_in_list_target(
 ) -> Option<Vec<i64>> {
     let (column, ints) = column_int_list_from_predicate(where_clause, table, table_alias)?;
     is_rowid_expr(column, Some(table), table_alias).then_some(ints)
+}
+
+/// `(values, has_residual)`. `false` = the whole WHERE is `rowid IN (ints)`. `true` = it is a conjunct
+/// alongside OTHER predicates the SeekRowid probes cannot enforce; the caller re-applies the whole WHERE
+/// per row (the listed rowids are a SUPERSET, the residual narrows to exact). Mirrors
+/// [`index_integer_in_list_residual_target`]. bd-nonagg-rowid-in-residual.
+fn extract_rowid_in_list_residual_target(
+    where_clause: Option<&Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(Vec<i64>, bool)> {
+    if let Some(ints) = extract_rowid_in_list_target(where_clause, table, table_alias) {
+        return Some((ints, false));
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    for term in &conjuncts {
+        if let Some(ints) = extract_rowid_in_list_target(Some(term), table, table_alias) {
+            return Some((ints, true));
+        }
+    }
+    None
 }
 
 fn extract_rowid_range_target<'a>(
