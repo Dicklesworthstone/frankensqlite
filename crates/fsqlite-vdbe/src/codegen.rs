@@ -9540,6 +9540,73 @@ fn find_minmax_leading_index<'t>(
         })
 }
 
+/// The single-column ASC BINARY-collation index a `SELECT COUNT(DISTINCT col) FROM t` (no
+/// WHERE/HAVING/GROUP BY) can walk in key order — counting non-NULL key-changes — instead of a full
+/// scan that maintains an ephemeral dedup B-tree. The index groups equal values adjacently under
+/// BINARY, so adjacent-key counting is byte-identical to the full-scan DISTINCT path, and COUNT(*) needs
+/// no table read (covering).
+struct CountDistinctIndexWalk {
+    index_name: String,
+    index_root: i32,
+}
+
+/// Detect `SELECT COUNT(DISTINCT col) FROM t` served by a single covering index walk. Gated tight so
+/// the adjacent-key count is provably byte-identical: exactly one aggregate (no bare output column), a
+/// plain single-column argument (not `*`/rowid/expr), no FILTER/wrapper/DISTINCT-collation other than
+/// BINARY, and a single-column ASC BINARY index on the column. A non-BINARY (e.g. NOCASE) column would
+/// group case-folded values that the BINARY index/compare splits, so it declines to the scan. Searches
+/// all indexes so a composite `(col, …)` index declared first does not shadow a usable single-column one
+/// (bd-agg-range-shadowed-index). bd-count-distinct-index-walk.
+fn count_distinct_index_walk_plan(
+    agg_columns: &[AggColumn],
+    columns: &[ResultColumn],
+    table: &TableSchema,
+) -> Option<CountDistinctIndexWalk> {
+    let [agg] = agg_columns else {
+        return None;
+    };
+    if columns.len() != 1
+        || !agg.name.eq_ignore_ascii_case("count")
+        || !agg.distinct
+        || agg.filter.is_some()
+        || agg.wrapper_expr.is_some()
+        || agg.bare_expr.is_some()
+        || agg.arg_expr.is_some()
+        || agg.arg_is_rowid
+        || agg.hidden
+        || !agg.extra_args.is_empty()
+    {
+        return None;
+    }
+    // BINARY only: the index's BINARY key order must equal the DISTINCT comparison so the adjacent-key
+    // (no-affinity) equality matches C SQLite's grouping.
+    if agg
+        .collation
+        .as_deref()
+        .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+    let col_idx = agg.arg_col_index?;
+    let column = table.columns.get(col_idx)?;
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
+            && idx
+                .key_term_collation(0)
+                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+    })?;
+    Some(CountDistinctIndexWalk {
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+    })
+}
+
 /// A WHERE that is exactly `<col> IS NOT NULL`, where `<col>` is the column EVERY MIN/MAX aggregate
 /// here reads — redundant (MIN/MAX already ignore NULLs), so the index-seek fast paths may treat it as
 /// no WHERE and still be byte-identical. Handles the single aggregate and the `MIN(col), MAX(col)` pair.
@@ -10162,6 +10229,67 @@ fn codegen_select_minmax_index_seek(
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
 
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit `SELECT COUNT(DISTINCT col) FROM t` as a single covering index walk: open the single-column
+/// ASC index, skip the leading NULL run (DISTINCT ignores NULLs), and increment the count once per
+/// key-change. No ephemeral dedup B-tree and no table read. Byte-identical to the full-scan DISTINCT
+/// path because the BINARY index groups equal values adjacently. bd-count-distinct-index-walk.
+fn codegen_select_count_distinct_index_walk(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    walk: &CountDistinctIndexWalk,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    // Count accumulates directly in the output register (COUNT is never NULL; wrappers are declined).
+    let count_reg = out_regs;
+    let prev_reg = b.alloc_reg();
+    let have_prev_reg = b.alloc_reg();
+    let key_reg = b.alloc_reg();
+
+    b.emit_op(Opcode::Integer, 0, count_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, have_prev_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        walk.index_root,
+        0,
+        P4::Index(walk.index_name.clone()),
+        0,
+    );
+
+    let finalize_label = b.emit_label();
+    // Empty index → count stays 0.
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let scan_top = b.current_addr() as i32;
+    let next_label = b.emit_label();
+    let count_label = b.emit_label();
+    b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+    // DISTINCT ignores NULLs — skip the leading NULL run entirely.
+    b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, next_label, P4::None, 0);
+    // First non-NULL is a new distinct value; otherwise count only when the key differs from the prev.
+    b.emit_jump_to_label(Opcode::IfNot, have_prev_reg, 0, count_label, P4::None, 0);
+    // Eq p1==p3 → jump (skip): key equals the previous distinct value, not new.
+    b.emit_jump_to_label(Opcode::Eq, key_reg, prev_reg, next_label, P4::None, 0);
+    b.resolve_label(count_label);
+    b.emit_op(Opcode::AddImm, count_reg, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, key_reg, prev_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 1, have_prev_reg, 0, P4::None, 0);
+    b.resolve_label(next_label);
+    b.emit_op(Opcode::Next, idx_cursor, scan_top, 0, P4::None, 0);
+
+    b.resolve_label(finalize_label);
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -11334,6 +11462,26 @@ fn codegen_select_aggregate(
             cursor,
             &agg_columns,
             &seek,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    }
+
+    // `SELECT COUNT(DISTINCT col) FROM t` over a single-column ASC BINARY index walks the index and
+    // counts key-changes — no ephemeral dedup B-tree, no table read — instead of a full scan that
+    // deduplicates every row. Byte-identical (BINARY index order == DISTINCT grouping); gated on
+    // `allow_index_seek`. bd-count-distinct-index-walk.
+    if allow_index_seek
+        && where_clause.is_none()
+        && having.is_none()
+        && let Some(walk) = count_distinct_index_walk_plan(&agg_columns, columns, table)
+    {
+        return codegen_select_count_distinct_index_walk(
+            b,
+            cursor,
+            &walk,
             out_regs,
             out_col_count,
             done_label,
