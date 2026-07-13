@@ -18487,6 +18487,14 @@ pub fn codegen_delete(
     // --- Pass 1: collect matching rowids ---
     let collect_done_label = b.emit_label();
     let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
+    // bd-delete-rowid-in: `DELETE ... WHERE <rowid> IN (<int literals>)` collects the listed rows with one
+    // `SeekRowid` each instead of full-scanning the whole table. Only the bare form (no residual) is
+    // admitted, and only after the bare `rowid = const` case declines.
+    let rowid_in_list = if rowid_target.is_none() {
+        extract_rowid_in_list_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+    } else {
+        None
+    };
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
@@ -18499,6 +18507,24 @@ pub fn codegen_delete(
             0,
         );
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+    } else if let Some(values) = rowid_in_list {
+        // One `SeekRowid` per listed value; a miss skips to the next value. The listed values are already
+        // sorted+deduped, and the RowSet dedups again, so the collected set is exactly the existing listed
+        // rows — the same set the full scan below would gather. Pass 2 is unchanged.
+        for &value in &values {
+            let next_value = b.emit_label();
+            b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                table_cursor,
+                rowid_reg,
+                next_value,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+            b.resolve_label(next_value);
+        }
     } else {
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
