@@ -65,8 +65,13 @@ fn dml_index_eq_matches_sqlite() {
     check("UPDATE t SET c = c + 100 WHERE c = 3", true);       // rewrites the INDEXED column itself
     check("UPDATE t SET id = id + 5000 WHERE c = 7", true);    // rewrites the ROWID
     check("UPDATE t SET x = 'n' WHERE c = 999", true);         // zero matches -> no-op
-    // Controls: a non-indexed column eq and a residual conjunction must still full-scan (Rewind).
+    // bd-*-index-eq-residual: `<indexed> = <int> AND <residual>` seeks the index and filters per candidate.
+    check("DELETE FROM t WHERE c = 5 AND x = 'v3'", true);     // eq residual on a non-indexed col
+    check("DELETE FROM t WHERE c = 0 AND a > 10", true);       // range residual
+    check("DELETE FROM t WHERE c = 7 AND a != 5 AND x = 'v2'", true); // multi-conjunct residual
+    check("DELETE FROM t WHERE c = 5 AND x = 'nope'", true);   // residual matches nothing
+    check("UPDATE t SET x = 'r' WHERE c = 5 AND a > 3", true); // update + residual
+    check("UPDATE t SET c = c + 100 WHERE c = 3 AND a < 15", true); // indexed-col rewrite + residual
+    // Controls: a non-indexed column eq must still full-scan (Rewind), and stay correct.
     check("DELETE FROM t WHERE a = 5", false);                 // a is not indexed
-    check("DELETE FROM t WHERE c = 5 AND x = 'v3'", false);    // residual -> not bare col = int
-    check("UPDATE t SET x = 'c' WHERE c = 5 AND a > 3", false);
 }

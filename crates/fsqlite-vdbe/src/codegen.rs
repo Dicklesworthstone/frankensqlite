@@ -17460,14 +17460,15 @@ pub fn codegen_update(
     } else {
         None
     };
-    // bd-update-index-eq: `UPDATE ... WHERE <single-col-int-indexed> = <int literal>` seeks the index for
-    // the matching rowids (fresh read cursor) instead of full-scanning. After all rowid cases decline.
+    // bd-update-index-eq(-residual): `UPDATE ... WHERE <single-col-int-indexed> = <int> [AND <residual>]`
+    // seeks the index for the candidate rowids (fresh read cursor), applies the residual per candidate,
+    // instead of full-scanning. After all rowid cases decline.
     let index_eq = if rowid_target.is_none()
         && rowid_in_list.is_none()
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_int_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        index_eq_int_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
     } else {
         None
     };
@@ -17576,11 +17577,26 @@ pub fn codegen_update(
                 );
             }
             b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
-        } else if let Some((idx_schema, value)) = index_eq {
-            // Fresh read cursor beyond the table + registered index-maintenance cursors.
+        } else if let Some((idx_schema, value, has_residual)) = index_eq {
+            // Fresh read cursor beyond the table + registered index-maintenance cursors. The residual (if
+            // any) numbers from set_placeholder_count + 1, after the SET placeholders emitted in Pass 2.
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
-            emit_index_eq_rowset_collect(b, idx_read_cursor, idx_schema, value, rowset_reg, matched_rowid_reg);
+            emit_index_eq_rowset_collect(
+                b,
+                idx_read_cursor,
+                idx_schema,
+                value,
+                rowset_reg,
+                matched_rowid_reg,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                table_cursor,
+                stmt.where_clause.as_ref(),
+                set_placeholder_count + 1,
+                has_residual,
+            );
         } else {
             let collect_start = b.current_addr();
             b.emit_jump_to_label(
@@ -18640,12 +18656,41 @@ fn index_eq_int_seek_target<'t>(
     Some((idx, *value))
 }
 
-/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <int literal>`: open a
-/// FRESH read cursor on the index (distinct from the table cursor and the registered index-maintenance
-/// cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run adding each rowid
-/// to the RowSet, then close the cursor. The exact integer seek is authoritative, so there is no affinity
-/// fallback. Control falls through to `collect_done` (resolved by the caller). bd-delete-index-eq /
-/// bd-update-index-eq.
+/// `(index, value, has_residual)` — like [`index_eq_int_seek_target`] but also admits the eq as a CONJUNCT
+/// alongside other predicates the index seek cannot enforce: `<col> = <int> AND <residual>`. The caller
+/// applies the full WHERE per candidate (via the table row) before adding it. `has_residual == false` is
+/// the bare eq. bd-delete-index-eq-residual / bd-update-index-eq-residual.
+fn index_eq_int_residual_seek_target<'t>(
+    where_clause: Option<&Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, i64, bool)> {
+    if let Some((idx, value)) = index_eq_int_seek_target(where_clause, table, table_alias) {
+        return Some((idx, value, false));
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    for term in conjuncts {
+        if let Some((idx, value)) = index_eq_int_seek_target(Some(term), table, table_alias) {
+            return Some((idx, value, true));
+        }
+    }
+    None
+}
+
+/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <int literal> [AND
+/// <residual>]`: open a FRESH read cursor on the index (distinct from the table cursor and the registered
+/// index-maintenance cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run
+/// adding each rowid to the RowSet, then close the cursor. The exact integer seek is authoritative, so
+/// there is no affinity fallback. When `residual_filter` is true, each candidate is positioned on the
+/// table cursor and the full WHERE is applied before `RowSetAdd` (there is no covering decision in a DML
+/// collect — the table row is always read for the residual). Control falls through to `collect_done`
+/// (resolved by the caller). bd-delete-index-eq(-residual) / bd-update-index-eq(-residual).
+#[allow(clippy::too_many_arguments)]
 fn emit_index_eq_rowset_collect(
     b: &mut ProgramBuilder,
     idx_read_cursor: i32,
@@ -18653,6 +18698,15 @@ fn emit_index_eq_rowset_collect(
     target_value: i64,
     rowset_reg: i32,
     rowid_reg: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    table_cursor: i32,
+    where_clause: Option<&Expr>,
+    // Reset target for the residual's anon placeholders (`current_anon_placeholder()` for DELETE,
+    // `set_placeholder_count + 1` for UPDATE). Ignored when `residual_filter` is false.
+    where_placeholder_base: u32,
+    residual_filter: bool,
 ) {
     let probe_key_regs = b.alloc_regs(2);
     let min_rowid_reg = probe_key_regs + 1;
@@ -18678,6 +18732,7 @@ fn emit_index_eq_rowset_collect(
         0,
     );
     let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
     let idx_key_reg = b.alloc_reg();
     b.emit_op(Opcode::Column, idx_read_cursor, 0, idx_key_reg, P4::None, 0);
     b.emit_jump_to_label(
@@ -18689,7 +18744,17 @@ fn emit_index_eq_rowset_collect(
         0x10,
     );
     b.emit_op(Opcode::IdxRowid, idx_read_cursor, rowid_reg, 0, P4::None, 0);
+    if residual_filter
+        && let Some(where_expr) = where_clause
+    {
+        // Position the table cursor on the candidate row and apply the full WHERE; a residual miss skips
+        // to the next index entry (skip_label = the Next).
+        b.emit_jump_to_label(Opcode::SeekRowid, table_cursor, rowid_reg, skip_label, P4::None, 0);
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(b, where_expr, table_cursor, table, table_alias, schema, skip_label);
+    }
     b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+    b.resolve_label(skip_label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = loop_top as i32;
     b.emit_op(Opcode::Next, idx_read_cursor, loop_body, 0, P4::None, 0);
@@ -18798,14 +18863,15 @@ pub fn codegen_delete(
     } else {
         None
     };
-    // bd-delete-index-eq: `DELETE ... WHERE <single-col-int-indexed> = <int literal>` seeks the index for
-    // the matching rowids (fresh read cursor) instead of full-scanning. After all rowid cases decline.
+    // bd-delete-index-eq(-residual): `DELETE ... WHERE <single-col-int-indexed> = <int> [AND <residual>]`
+    // seeks the index for the candidate rowids (fresh read cursor), applies the residual per candidate,
+    // instead of full-scanning. After all rowid cases decline.
     let index_eq = if rowid_target.is_none()
         && rowid_in_list.is_none()
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_int_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        index_eq_int_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
     } else {
         None
     };
@@ -18894,11 +18960,26 @@ pub fn codegen_delete(
             );
         }
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
-    } else if let Some((idx_schema, value)) = index_eq {
+    } else if let Some((idx_schema, value, has_residual)) = index_eq {
         // Fresh read cursor beyond the table + registered index-maintenance cursors.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
-        emit_index_eq_rowset_collect(b, idx_read_cursor, idx_schema, value, rowset_reg, rowid_reg);
+        let where_base = b.current_anon_placeholder();
+        emit_index_eq_rowset_collect(
+            b,
+            idx_read_cursor,
+            idx_schema,
+            value,
+            rowset_reg,
+            rowid_reg,
+            table,
+            stmt.table.alias.as_deref(),
+            schema,
+            table_cursor,
+            stmt.where_clause.as_ref(),
+            where_base,
+            has_residual,
+        );
     } else {
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
