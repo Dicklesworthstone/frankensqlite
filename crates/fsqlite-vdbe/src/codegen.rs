@@ -17452,6 +17452,14 @@ pub fn codegen_update(
     } else {
         None
     };
+    // bd-update-rowid-eq-residual: `UPDATE ... WHERE <rowid> = <const> AND <residual>` seeks the single
+    // target row and applies the residual — the common optimistic-lock shape (`WHERE id = ? AND version =
+    // ?`), routed through the two-pass collect so the RowSet path (and its Halloween safety) is reused.
+    let rowid_eq_residual = if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
+        extract_rowid_eq_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+    } else {
+        None
+    };
 
     let set_placeholder_count: u32 = stmt
         .assignments
@@ -17530,6 +17538,33 @@ pub fn codegen_update(
                 collect_done_label,
                 range,
             );
+        } else if let Some(target_expr) = rowid_eq_residual {
+            // Seek the single target row; a miss or a residual failure jumps to collect_done (no update).
+            // The `rowid = <const>` probe and the re-applied residual both number from
+            // `set_placeholder_count + 1` (after the SET placeholders, emitted in Pass 2).
+            b.set_next_anon_placeholder(set_placeholder_count + 1);
+            emit_expr(b, target_expr, matched_rowid_reg, None);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                table_cursor,
+                matched_rowid_reg,
+                collect_done_label,
+                P4::None,
+                0,
+            );
+            if let Some(where_expr) = &stmt.where_clause {
+                b.set_next_anon_placeholder(set_placeholder_count + 1);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    table_cursor,
+                    table,
+                    stmt.table.alias.as_deref(),
+                    schema,
+                    collect_done_label,
+                );
+            }
+            b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
         } else {
             let collect_start = b.current_addr();
             b.emit_jump_to_label(
@@ -18656,6 +18691,13 @@ pub fn codegen_delete(
     } else {
         None
     };
+    // bd-delete-rowid-eq-residual: `DELETE ... WHERE <rowid> = <const> AND <residual>` seeks the single
+    // target row and applies the residual, instead of full-scanning — the common compare-and-delete shape.
+    let rowid_eq_residual = if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
+        extract_rowid_eq_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+    } else {
+        None
+    };
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
@@ -18714,6 +18756,33 @@ pub fn codegen_delete(
             collect_done_label,
             range,
         );
+    } else if let Some(target_expr) = rowid_eq_residual {
+        // Seek the single target row; a miss or a residual failure jumps to collect_done (nothing to
+        // delete). The placeholder base is reset before the re-applied WHERE so a `?` in the residual
+        // numbers identically to the `rowid = ?` probe.
+        let where_base = b.current_anon_placeholder();
+        emit_expr(b, target_expr, rowid_reg, None);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            table_cursor,
+            rowid_reg,
+            collect_done_label,
+            P4::None,
+            0,
+        );
+        if let Some(where_expr) = &stmt.where_clause {
+            b.set_next_anon_placeholder(where_base);
+            emit_where_filter(
+                b,
+                where_expr,
+                table_cursor,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                collect_done_label,
+            );
+        }
+        b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
     } else {
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
