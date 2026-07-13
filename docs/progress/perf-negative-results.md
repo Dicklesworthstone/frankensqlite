@@ -18501,3 +18501,27 @@ test is on the executed path, not merely linked into it.
   four-slot LRU test, hot-set root-descent counter test, and forced-full-descent property comparison all
   passed (`3/3`). The candidate benchmark build also compiled the changed B-tree and downstream
   e2e/core surface successfully.
+
+## 2026-07-12 - READY (implemented, ungated — rch pool + pager sync race): IN-list + residual seek (bd-agg-in-list-residual)
+
+- Result: reverted to green. Implemented + compiles (fsqlite-vdbe built on every worker) but never gated:
+  rch was saturated AND repeatedly landed on workers with a STALE fsqlite-pager checkout (E0599 `no method
+  file_identity` / `open_existing_with_cx_and_page_buffer_max` on `SimplePager` in fsqlite-core/fsqlite —
+  a remote sync inconsistency unrelated to this change). Re-apply + gate the next clean-sync window.
+- GAP: `COUNT(*)/SUM WHERE a IN (<int list>) AND <residual>` full-scans — `column_int_list_from_predicate`
+  requires the WHOLE WHERE be the IN-list, so `AND <residual>` declines.
+- RE-APPLY PLAN: (1) new `index_integer_in_list_residual_target -> (index, ints, has_residual)`: try the
+  residual-free path first, else find an `a IN (int list)` CONJUNCT among several, rest = residual.
+  (2) `emit_aggregate_index_value_seek` gains `residual_where: Option<&Expr>`; when Some, apply
+  `emit_where_filter(where_expr, table_cursor, ...)` after the per-value SeekRowid, before accumulate.
+  (3) IN-list branch destructures `(idx_schema, values, has_residual)`, `covering = !has_residual && ...`,
+  `residual_where = has_residual.then(|| where_clause).flatten()`, passed to each value seek.
+  (4) `index_in_seek` local + `simple_count_star` yield use the new detection.
+- BYTE-EXACT BY CONSTRUCTION (same as the 3 shipped residual paths): integer-literal IN values => probe
+  is placeholder-free => residual filter numbers a `?` as the scan path; de-duplicated values keep the
+  runs disjoint (no double-count with a residual).
+- ORACLE (written, reverted): `agg_in_list_residual_oracle` — IN-list + residual eq/range/IN, dup values,
+  absent values, COALESCE, MIN/MAX, residual-free regression; opcode gates SeekGE (+ parameterized) and
+  SeekRowid (non-covering).
+- INFRA NOTE: the stale-fsqlite-pager E0599 sync race blocked several gate windows this turn; the gate
+  loop should treat `file_identity`/`SimplePager` E0599 as an infra-miss and keep hunting a clean worker.
