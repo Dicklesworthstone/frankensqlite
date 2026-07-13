@@ -1842,7 +1842,7 @@ pub fn codegen_select(
         // its specialized fast path.
         && !(aggregate_index_eq_seek_allowed(from_index_hint)
             && (aggregate_index_eq_seek_target(where_clause.as_deref(), table, table_alias).is_some()
-                || index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
+                || index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
                     .is_some()
                 || aggregate_index_range_seek_target(
                     where_clause.as_deref(),
@@ -10942,6 +10942,31 @@ fn index_integer_in_list_target<'t>(
     Some((idx, ints))
 }
 
+/// Returns `(index, ints, has_residual)`. `has_residual == false` is the residual-free case above (the
+/// WHOLE WHERE is the IN-list). `has_residual == true` additionally matches an `a IN (<int list>)`
+/// CONJUNCT alongside other predicates the caller re-applies as a residual filter. bd-agg-in-list-residual.
+fn index_integer_in_list_residual_target<'t>(
+    where_clause: Option<&Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, Vec<i64>, bool)> {
+    if let Some((idx, ints)) = index_integer_in_list_target(where_clause, table, table_alias) {
+        return Some((idx, ints, false));
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    for term in &conjuncts {
+        if let Some((idx, ints)) = index_integer_in_list_target(Some(term), table, table_alias) {
+            return Some((idx, ints, true));
+        }
+    }
+    None
+}
+
 /// The single-column ascending index and range a `SELECT COUNT(*)/SUM(...) FROM t WHERE col <range>`
 /// aggregate can seek instead of full-scanning. Reuses the SAME residual-safe extraction and safety
 /// gate as the non-aggregate single-column range scan (`extract_column_range_target` +
@@ -11108,6 +11133,7 @@ fn emit_aggregate_index_value_seek(
     accum_base: i32,
     value: i64,
     covering: bool,
+    residual_where: Option<&Expr>,
 ) {
     let probe_key_regs = b.alloc_regs(2);
     b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
@@ -11172,6 +11198,9 @@ fn emit_aggregate_index_value_seek(
             P4::None,
             0,
         );
+        if let Some(where_expr) = residual_where {
+            emit_where_filter(b, where_expr, table_cursor, table, table_alias, schema, skip_row);
+        }
         emit_aggregate_accumulate_body(
             b,
             table_cursor,
@@ -11471,7 +11500,7 @@ fn codegen_select_aggregate(
         && rowid_range_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        index_integer_in_list_target(where_clause, table, table_alias)
+        index_integer_in_list_residual_target(where_clause, table, table_alias)
     } else {
         None
     };
@@ -11836,13 +11865,14 @@ fn codegen_select_aggregate(
         b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
         skip_scan = true;
-    } else if let Some((idx_schema, values)) = index_in_seek {
+    } else if let Some((idx_schema, values, has_residual)) = index_in_seek {
         // bd-2dgf5 IN-list: open the index (and the table only when not covering), then seek each
         // distinct value's duplicate run and accumulate its rows. INTEGER-affinity + integer-literal
         // values make each probe exact and the runs disjoint, so no scan fallback is needed. Covering
         // when every aggregate reads only the indexed column or is COUNT(*)/SUM(rowid).
         let idx_cursor = 1_i32;
-        let covering = aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        let covering = !has_residual && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
+        let residual_where = has_residual.then(|| where_clause).flatten();
         if !covering {
             b.emit_op(
                 Opcode::OpenRead,
@@ -11874,6 +11904,7 @@ fn codegen_select_aggregate(
                 accum_base,
                 value,
                 covering,
+                residual_where,
             );
         }
         skip_scan = true;
@@ -28206,6 +28237,32 @@ mod tests {
             span: Span::ZERO,
         };
         assert!(aggregate_index_eq_seek_target(Some(&range), &table, None).is_none());
+    }
+
+    #[test]
+    fn in_list_residual_detection_and_routing() {
+        let table = bd_2dgf5_table();
+        // Detection: `k IN (1, 2) AND v = 3` — an IN-list CONJUNCT plus a residual.
+        let e = parse_sql_expr("k IN (1, 2) AND v = 3").expect("parse");
+        let r = index_integer_in_list_residual_target(Some(&e), &table, None);
+        assert!(r.is_some(), "IN-list + residual must be detected");
+        let (idx, ints, has_residual) = r.unwrap();
+        assert_eq!(idx.name, "idx_t_k");
+        assert_eq!(ints, vec![1, 2]);
+        assert!(has_residual);
+        // Residual-free still reported (has_residual = false).
+        let e2 = parse_sql_expr("k IN (1, 2)").expect("parse");
+        assert_eq!(
+            index_integer_in_list_residual_target(Some(&e2), &table, None).map(|(_, _, h)| h),
+            Some(false)
+        );
+        // Routing: COUNT(*) with an IN-list + residual must reach the seek (SeekGE in the program).
+        let ops = bd_2dgf5_program("SELECT COUNT(*) FROM t WHERE k IN (1, 2) AND v = 3");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "COUNT(*) IN-list + residual must seek (SeekGE), got: {:?}",
+            ops.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
     }
 
     /// Compile `sql` against [`bd_2dgf5_table`] and return the emitted opcodes.
