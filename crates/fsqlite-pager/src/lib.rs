@@ -43,7 +43,7 @@ pub use page_cache::{
     PageCacheQueueKind, ShardedPageCache, resolve_page_buffer_max,
 };
 pub use pager::{
-    PAGER_METADATA_PUBLICATION_CONTRACTS, PagerCommitProfileSnapshot,
+    ConnectionPagerOpenMode, PAGER_METADATA_PUBLICATION_CONTRACTS, PagerCommitProfileSnapshot,
     PagerMetadataPublicationClass, PagerMetadataPublicationContract, PagerPublishedSnapshot,
     ParallelWalPublicationIntent, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
     WalCommitSyncPolicy, pager_commit_profile_snapshot, remove_group_commit_queue,

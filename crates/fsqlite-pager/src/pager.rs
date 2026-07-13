@@ -26,6 +26,11 @@ use fsqlite_types::{
     DatabaseHeaderError, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,
     PageNumberBuildHasher, PageSize,
 };
+#[cfg(all(feature = "native", any(unix, windows)))]
+use fsqlite_vfs::{
+    DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
+    validate_reserved_database_artifacts,
+};
 use fsqlite_vfs::{FileIdentity, Vfs, VfsFile};
 use smallvec::SmallVec;
 
@@ -4431,6 +4436,9 @@ pub struct SimplePager<V: Vfs> {
     vfs: Arc<V>,
     /// Path to the database file.
     db_path: PathBuf,
+    /// Native namespace generation retained for the pager lifetime.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
     /// Shared mutable state used by transactions.
     inner: Arc<Mutex<PagerInner<V::File>>>,
     /// Parks single-writer waiters for bounded baton handoff.
@@ -4459,6 +4467,25 @@ enum ReadWriteOpenDisposition {
     CreateIfMissing,
     ExistingOnly,
     ReservedEmpty,
+}
+
+/// Pager-open intent used by the SQL connection layer while it retains the
+/// native namespace bootstrap lease through its higher-level initialization.
+///
+/// This is an internal cross-crate contract. Ordinary pager callers should use
+/// the existing `open_*` constructors, which complete the namespace transition
+/// before returning.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPagerOpenMode {
+    /// Open or create the main database.
+    CreateIfMissing,
+    /// Open an existing read-write database, optionally identity-bound.
+    ExistingOnly(Option<FileIdentity>),
+    /// Initialize an identity-bound caller-reserved empty database.
+    ReservedEmpty(FileIdentity),
+    /// Open an existing database read-only, optionally identity-bound.
+    ReadOnly(Option<FileIdentity>),
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -4697,6 +4724,7 @@ where
     type Txn = SimpleTransaction<V>;
 
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
+        self.validate_namespace_binding()?;
         let mut inner = self
             .inner
             .lock()
@@ -4815,6 +4843,8 @@ where
             return Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
                 journal_path: Self::journal_path(&self.db_path),
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                namespace_binding: self.namespace_binding.clone(),
                 group_commit_queue: group_commit_queue_for_backend(
                     self.vfs.as_ref(),
                     &self.db_path,
@@ -5019,6 +5049,8 @@ where
         Ok(SimpleTransaction {
             vfs: Arc::clone(&self.vfs),
             journal_path: Self::journal_path(&self.db_path),
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            namespace_binding: self.namespace_binding.clone(),
             group_commit_queue: group_commit_queue_for_backend(self.vfs.as_ref(), &self.db_path),
             inner: Arc::clone(&self.inner),
             writer_idle: Arc::clone(&self.writer_idle),
@@ -5067,6 +5099,7 @@ where
     }
 
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        self.validate_namespace_binding()?;
         let mut inner = self
             .inner
             .lock()
@@ -5171,6 +5204,41 @@ where
         &self.db_path
     }
 
+    /// Clone the native lifetime binding for components that derive companion
+    /// paths (notably the path-refreshing WAL backend).
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub fn namespace_binding(&self) -> Option<Arc<DatabaseNamespaceBinding>> {
+        self.namespace_binding.clone()
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    pub fn validate_namespace_binding(&self) -> Result<()> {
+        if let Some(binding) = &self.namespace_binding {
+            binding.validate_path_identity()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    pub fn validate_namespace_binding(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[doc(hidden)]
+    pub fn finish_namespace_bootstrap(&self) -> Result<()> {
+        if let Some(binding) = &self.namespace_binding {
+            binding.finish_bootstrap()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    #[doc(hidden)]
+    pub fn finish_namespace_bootstrap(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Clone the pager's VFS handle for companion-file operations.
     pub fn vfs_handle(&self) -> Arc<V> {
         Arc::clone(&self.vfs)
@@ -5254,6 +5322,7 @@ where
     /// The pager must be quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the returned bytes contain the durable main image.
     pub fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+        self.validate_namespace_binding()?;
         let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
 
         let journal_mode = {
@@ -5312,6 +5381,7 @@ where
     /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the destination contains a self-contained main DB.
     pub fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
         let source_full = self.vfs.full_pathname(cx, &source_path)?;
         let target_full = self.vfs.full_pathname(cx, target_path)?;
@@ -5425,6 +5495,7 @@ where
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
     pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+        self.validate_namespace_binding()?;
         let mut inner = self
             .inner
             .lock()
@@ -5520,6 +5591,7 @@ where
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
+        self.validate_namespace_binding()?;
         let mut inner = self
             .inner
             .lock()
@@ -5660,6 +5732,19 @@ where
         PathBuf::from(jp)
     }
 
+    fn ensure_reserved_recovery_artifacts_absent(cx: &Cx, vfs: &V, db_path: &Path) -> Result<()> {
+        for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+            let mut artifact_path = db_path.as_os_str().to_owned();
+            artifact_path.push(suffix);
+            if vfs.path_entry_exists(cx, Path::new(&artifact_path))? {
+                return Err(FrankenError::CannotOpen {
+                    path: db_path.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn recover_rollback_journal_if_present(
         cx: &Cx,
         vfs: &V,
@@ -5699,6 +5784,71 @@ where
             (Err(recovery_err), Err(restore_err)) => Err(FrankenError::internal(format!(
                 "hot journal recovery failed and could not restore lock level {restore_lock_level:?}: recovery={recovery_err}; restore={restore_err}"
             ))),
+        }
+    }
+
+    /// Open a pager for the SQL connection layer while deliberately retaining
+    /// the native namespace bootstrap lease. The caller must invoke
+    /// [`Self::finish_namespace_bootstrap`] immediately before returning a
+    /// successfully initialized connection.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_lines)]
+    pub fn open_for_connection_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        page_buffer_max: Option<usize>,
+        mode: ConnectionPagerOpenMode,
+    ) -> Result<Self> {
+        match mode {
+            ConnectionPagerOpenMode::CreateIfMissing => {
+                Self::open_readwrite_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    path,
+                    requested_page_size,
+                    None,
+                    page_buffer_max,
+                    ReadWriteOpenDisposition::CreateIfMissing,
+                    false,
+                )
+            }
+            ConnectionPagerOpenMode::ExistingOnly(expected_identity) => {
+                Self::open_readwrite_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    path,
+                    requested_page_size,
+                    expected_identity,
+                    page_buffer_max,
+                    ReadWriteOpenDisposition::ExistingOnly,
+                    false,
+                )
+            }
+            ConnectionPagerOpenMode::ReservedEmpty(expected_identity) => {
+                Self::open_readwrite_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    path,
+                    requested_page_size,
+                    Some(expected_identity),
+                    page_buffer_max,
+                    ReadWriteOpenDisposition::ReservedEmpty,
+                    false,
+                )
+            }
+            ConnectionPagerOpenMode::ReadOnly(expected_identity) => {
+                Self::open_readonly_with_optional_expected_identity(
+                    cx,
+                    vfs,
+                    path,
+                    requested_page_size,
+                    expected_identity,
+                    page_buffer_max,
+                    false,
+                )
+            }
         }
     }
 
@@ -5744,6 +5894,7 @@ where
             None,
             page_buffer_max,
             ReadWriteOpenDisposition::CreateIfMissing,
+            true,
         )
     }
 
@@ -5771,6 +5922,7 @@ where
             Some(expected_identity),
             page_buffer_max,
             ReadWriteOpenDisposition::ReservedEmpty,
+            true,
         )
     }
 
@@ -5799,6 +5951,7 @@ where
             expected_identity,
             page_buffer_max,
             ReadWriteOpenDisposition::ExistingOnly,
+            true,
         )
     }
 
@@ -5811,36 +5964,79 @@ where
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         disposition: ReadWriteOpenDisposition,
+        finish_namespace_bootstrap: bool,
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
+        let db_path = vfs.full_pathname(cx, path)?;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let pending_namespace = if vfs.is_memory() {
+            None
+        } else {
+            let intent = if disposition == ReadWriteOpenDisposition::ReservedEmpty {
+                NamespaceOpenIntent::ReservedExclusive
+            } else {
+                NamespaceOpenIntent::Shared
+            };
+            Some(PendingNamespaceOpen::begin(&db_path, intent)?)
+        };
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if disposition == ReadWriteOpenDisposition::ReservedEmpty && pending_namespace.is_some() {
+            validate_reserved_database_artifacts(&db_path, WindowsLockSidecarPolicy::RejectAll)?;
+        }
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let namespace_expected_identity = pending_namespace
+            .as_ref()
+            .and_then(PendingNamespaceOpen::expected_identity);
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let effective_expected_identity = match (expected_identity, namespace_expected_identity) {
+            (Some(caller), Some(generation)) if caller != generation => {
+                return Err(FrankenError::CannotOpen {
+                    path: db_path.clone(),
+                });
+            }
+            (Some(caller), _) => Some(caller),
+            (None, generation) => generation,
+        };
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
+        let effective_expected_identity = expected_identity;
         let mut flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         if disposition == ReadWriteOpenDisposition::CreateIfMissing {
             flags |= VfsOpenFlags::CREATE;
         }
-        let (mut db_file, _actual_flags) = match (disposition, expected_identity) {
+        let (mut db_file, _actual_flags) = match (disposition, effective_expected_identity) {
             (ReadWriteOpenDisposition::ReservedEmpty, Some(expected_identity)) => {
-                vfs.open_reserved_with_expected_identity(cx, path, flags, expected_identity)?
+                vfs.open_reserved_with_expected_identity(cx, &db_path, flags, expected_identity)?
             }
             (_, Some(expected_identity)) => {
-                vfs.open_with_expected_identity(cx, path, flags, expected_identity)?
+                vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
             }
             (ReadWriteOpenDisposition::ReservedEmpty, None) => {
-                return Err(FrankenError::CannotOpen {
-                    path: path.to_owned(),
-                });
+                return Err(FrankenError::CannotOpen { path: db_path });
             }
-            (_, None) => vfs.open(cx, Some(path), flags)?,
+            (_, None) => vfs.open(cx, Some(&db_path), flags)?,
+        };
+
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let namespace_binding = if let Some(pending) = pending_namespace {
+            let identity = db_file
+                .file_identity()?
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: db_path.clone(),
+                })?;
+            let binding = pending.bind(identity)?;
+            binding.validate_path_identity()?;
+            Some(binding)
+        } else {
+            None
         };
 
         // Probe for existing page size BEFORE hot journal recovery.
         // Recovery requires the correct page size to correctly parse records.
         let mut file_size = db_file.file_size(cx)?;
         if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
-            return Err(FrankenError::CannotOpen {
-                path: path.to_owned(),
-            });
+            return Err(FrankenError::CannotOpen { path: db_path });
         }
-        let journal_path = Self::journal_path(path);
+        let journal_path = Self::journal_path(&db_path);
         let page_size = if file_size >= DATABASE_HEADER_SIZE as u64 {
             let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
             let header_read = db_file.read(cx, &mut header_bytes, 0)?;
@@ -5851,7 +6047,7 @@ where
                         if stale_main_header_can_be_recovered_from_live_wal(
                             cx,
                             &*vfs,
-                            path,
+                            &db_path,
                             &header_bytes,
                             &error,
                             false,
@@ -5892,7 +6088,7 @@ where
             // when there is a rollback journal to recover. Clean WAL-mode
             // shared-file startup storms should not serialize every opener
             // through a recovery fence just to rediscover "no journal".
-            let recovery_fence = recovery_fence_for_backend(&*vfs, path);
+            let recovery_fence = recovery_fence_for_backend(&*vfs, &db_path);
             let _recovery_guard = recovery_fence.acquire_for_recovery()?;
 
             // Hot journal recovery writes the database image back to its durable
@@ -5913,37 +6109,76 @@ where
         file_size = db_file.file_size(cx)?;
         let (header, bootstrapped_from_live_wal_stub) = if file_size == 0 {
             if disposition == ReadWriteOpenDisposition::ExistingOnly {
-                return Err(FrankenError::CannotOpen {
-                    path: path.to_owned(),
-                });
+                return Err(FrankenError::CannotOpen { path: db_path });
             }
-            // SQLite databases are never truly empty: page 1 contains the
-            // 100-byte database header followed by the sqlite_master root page.
-            //
-            // This makes newly-created databases valid for downstream layers
-            // (B-tree, schema) and avoids surprising "empty file" semantics.
-            let page_len = page_size.as_usize();
-            let mut page1 = vec![0u8; page_len];
+            let reserved_bootstrap = disposition == ReadWriteOpenDisposition::ReservedEmpty;
+            if reserved_bootstrap {
+                db_file.lock(cx, LockLevel::Exclusive)?;
+            }
 
-            let header = DatabaseHeader {
-                page_size,
-                page_count: 1,
-                sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
-                ..DatabaseHeader::default()
+            let bootstrap_result = (|| -> Result<(DatabaseHeader, u64)> {
+                if reserved_bootstrap {
+                    if db_file.file_identity()? != expected_identity || db_file.file_size(cx)? != 0
+                    {
+                        return Err(FrankenError::CannotOpen {
+                            path: db_path.clone(),
+                        });
+                    }
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    if let Some(binding) = &namespace_binding {
+                        binding.validate_path_identity()?;
+                        validate_reserved_database_artifacts(
+                            &db_path,
+                            WindowsLockSidecarPolicy::AllowExpected,
+                        )?;
+                    }
+                    Self::ensure_reserved_recovery_artifacts_absent(cx, &*vfs, &db_path)?;
+                }
+
+                // SQLite databases are never truly empty: page 1 contains the
+                // 100-byte database header followed by the sqlite_master root page.
+                //
+                // This makes newly-created databases valid for downstream layers
+                // (B-tree, schema) and avoids surprising "empty file" semantics.
+                let page_len = page_size.as_usize();
+                let mut page1 = vec![0u8; page_len];
+
+                let header = DatabaseHeader {
+                    page_size,
+                    page_count: 1,
+                    sqlite_version: FRANKENSQLITE_SQLITE_VERSION_NUMBER,
+                    ..DatabaseHeader::default()
+                };
+                let hdr_bytes = header.to_bytes().map_err(|err| {
+                    FrankenError::internal(format!("failed to encode new database header: {err}"))
+                })?;
+                page1[..DATABASE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+
+                // Initialize sqlite_master root page as an empty leaf table B-tree
+                // page (type 0x0D) with zero cells.
+                let usable = page_size.usable(header.reserved_per_page);
+                BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
+
+                db_file.write(cx, &page1, 0)?;
+                db_file.sync(cx, SyncFlags::NORMAL)?;
+                Ok((header, db_file.file_size(cx)?))
+            })();
+
+            let unlock_result = if reserved_bootstrap {
+                db_file.unlock(cx, LockLevel::None)
+            } else {
+                Ok(())
             };
-            let hdr_bytes = header.to_bytes().map_err(|err| {
-                FrankenError::internal(format!("failed to encode new database header: {err}"))
-            })?;
-            page1[..DATABASE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
-
-            // Initialize sqlite_master root page as an empty leaf table B-tree
-            // page (type 0x0D) with zero cells.
-            let usable = page_size.usable(header.reserved_per_page);
-            BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
-
-            db_file.write(cx, &page1, 0)?;
-            db_file.sync(cx, SyncFlags::NORMAL)?;
-            file_size = db_file.file_size(cx)?;
+            let (header, initialized_size) = match (bootstrap_result, unlock_result) {
+                (Ok(value), Ok(())) => value,
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                (Err(bootstrap_error), Err(unlock_error)) => {
+                    return Err(FrankenError::internal(format!(
+                        "reserved database bootstrap failed and could not release the main-file lock: bootstrap={bootstrap_error}; unlock={unlock_error}"
+                    )));
+                }
+            };
+            file_size = initialized_size;
             (header, false)
         } else {
             if file_size < DATABASE_HEADER_SIZE as u64 {
@@ -5970,7 +6205,7 @@ where
                         if stale_main_header_can_be_recovered_from_live_wal(
                             cx,
                             &*vfs,
-                            path,
+                            &db_path,
                             &header_bytes,
                             &error,
                             false,
@@ -6047,9 +6282,11 @@ where
             resolved_max,
         )));
         let pool = cache.pool().clone();
-        Ok(Self {
+        let pager = Self {
             vfs,
-            db_path: path.to_owned(),
+            db_path,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            namespace_binding,
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
                 page_size,
@@ -6089,7 +6326,11 @@ where
                 db_file_size_bytes: file_size,
             }))),
             shared_connection_count: OnceLock::new(),
-        })
+        };
+        if finish_namespace_bootstrap {
+            pager.finish_namespace_bootstrap()?;
+        }
+        Ok(pager)
     }
 
     /// Enable the single-connection cache fast path when this pager is still
@@ -6151,6 +6392,7 @@ where
             _requested_page_size,
             None,
             page_buffer_max,
+            true,
         )
     }
 
@@ -6174,6 +6416,7 @@ where
             _requested_page_size,
             Some(expected_identity),
             page_buffer_max,
+            true,
         )
     }
 
@@ -6185,20 +6428,60 @@ where
         _requested_page_size: PageSize,
         expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
+        finish_namespace_bootstrap: bool,
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
-        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (db_file, _actual_flags) = if let Some(expected_identity) = expected_identity {
-            vfs.open_with_expected_identity(cx, path, flags, expected_identity)?
+        let db_path = vfs.full_pathname(cx, path)?;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let pending_namespace = if vfs.is_memory() {
+            None
         } else {
-            vfs.open(cx, Some(path), flags)?
+            Some(PendingNamespaceOpen::begin(
+                &db_path,
+                NamespaceOpenIntent::Shared,
+            )?)
+        };
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let namespace_expected_identity = pending_namespace
+            .as_ref()
+            .and_then(PendingNamespaceOpen::expected_identity);
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let effective_expected_identity = match (expected_identity, namespace_expected_identity) {
+            (Some(caller), Some(generation)) if caller != generation => {
+                return Err(FrankenError::CannotOpen {
+                    path: db_path.clone(),
+                });
+            }
+            (Some(caller), _) => Some(caller),
+            (None, generation) => generation,
+        };
+        #[cfg(not(all(feature = "native", any(unix, windows))))]
+        let effective_expected_identity = expected_identity;
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (db_file, _actual_flags) = if let Some(expected_identity) = effective_expected_identity
+        {
+            vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
+        } else {
+            vfs.open(cx, Some(&db_path), flags)?
+        };
+
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let namespace_binding = if let Some(pending) = pending_namespace {
+            let identity = db_file
+                .file_identity()?
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: db_path.clone(),
+                })?;
+            let binding = pending.bind(identity)?;
+            binding.validate_path_identity()?;
+            Some(binding)
+        } else {
+            None
         };
 
         let file_size = db_file.file_size(cx)?;
         if file_size == 0 {
-            return Err(FrankenError::CannotOpen {
-                path: path.to_owned(),
-            });
+            return Err(FrankenError::CannotOpen { path: db_path });
         }
         if file_size < DATABASE_HEADER_SIZE as u64 {
             return Err(FrankenError::DatabaseCorrupt {
@@ -6226,7 +6509,7 @@ where
                 if stale_main_header_can_be_recovered_from_live_wal(
                     cx,
                     &*vfs,
-                    path,
+                    &db_path,
                     &header_bytes,
                     &error,
                     true,
@@ -6282,9 +6565,11 @@ where
             resolved_max,
         )));
         let pool = cache.pool().clone();
-        Ok(Self {
+        let pager = Self {
             vfs,
-            db_path: path.to_owned(),
+            db_path,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            namespace_binding,
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
                 page_size,
@@ -6326,7 +6611,11 @@ where
                 db_file_size_bytes: file_size,
             }))),
             shared_connection_count: OnceLock::new(),
-        })
+        };
+        if finish_namespace_bootstrap {
+            pager.finish_namespace_bootstrap()?;
+        }
+        Ok(pager)
     }
 
     /// Open (or create) a database and return a pager using a detached test context.
@@ -6763,6 +7052,8 @@ fn acquire_page_buf_with_clean_cache_recovery(
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
     journal_path: PathBuf,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
     group_commit_queue: GroupCommitQueueRef,
     inner: Arc<Mutex<PagerInner<V::File>>>,
     writer_idle: Arc<Condvar>,
@@ -6891,6 +7182,19 @@ impl WalPageOneWritePlan {
 }
 
 impl<V: Vfs> SimpleTransaction<V> {
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn validate_namespace_binding(&self) -> Result<()> {
+        if let Some(binding) = &self.namespace_binding {
+            binding.validate_path_identity()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    fn validate_namespace_binding(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether this transaction has been upgraded to a writer.
     #[must_use]
     pub fn is_writer(&self) -> bool {
@@ -9609,6 +9913,7 @@ where
         if self.finished {
             return Ok(());
         }
+        self.validate_namespace_binding()?;
         if !self.is_writer {
             let mut inner = self
                 .inner
@@ -10524,6 +10829,7 @@ where
         if self.finished {
             return Ok(());
         }
+        self.validate_namespace_binding()?;
         if self.vfs.is_memory()
             && self.memory_db_bump_alloc
             && !self.retained_memory_overlay_dirty_pages.is_empty()
@@ -11081,6 +11387,7 @@ where
         cx: &Cx,
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
+        self.validate_namespace_binding()?;
         let cleanup_cx = cleanup_child_cx(cx);
         let checkpoint_gate_state;
         // Take the WAL backend out of the pager while marking checkpoint active.
@@ -11350,6 +11657,8 @@ mod tests {
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
     use fsqlite_vfs::{MemoryFile, MemoryVfs, Vfs, VfsFile};
+    #[cfg(all(feature = "native", unix))]
+    use fsqlite_vfs::{NamespaceOpenIntent, PendingNamespaceOpen, UnixVfs};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -11391,6 +11700,43 @@ mod tests {
         let path = PathBuf::from("/test.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, path)
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn connection_open_mode_retains_namespace_exclusivity_until_explicit_finish() {
+        let cx = Cx::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let database = dir.path().join("connection-bootstrap.db");
+        let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+            &cx,
+            UnixVfs::new(),
+            &database,
+            PageSize::DEFAULT,
+            None,
+            ConnectionPagerOpenMode::CreateIfMissing,
+        )
+        .expect("open deferred connection pager");
+        let binding = pager
+            .namespace_binding()
+            .expect("native pager retains a namespace binding");
+
+        assert!(binding.bootstrap_is_exclusive());
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared),
+            Err(FrankenError::Busy)
+        ));
+
+        pager
+            .finish_namespace_bootstrap()
+            .expect("publish completed connection generation");
+        assert!(!binding.bootstrap_is_exclusive());
+
+        let peer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("peer can join after the connection success boundary");
+        assert_eq!(peer.expected_identity(), Some(binding.identity()));
+        peer.bind(binding.identity())
+            .expect("peer joins the published generation");
     }
 
     #[test]

@@ -23,6 +23,8 @@ use fsqlite_pager::{
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+#[cfg(all(feature = "native", any(unix, windows)))]
+use fsqlite_vfs::DatabaseNamespaceBinding;
 use fsqlite_vfs::{Vfs, VfsFile};
 use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
@@ -1362,6 +1364,8 @@ where
     wal_path: PathBuf,
     page_size: u32,
     create_missing: bool,
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -1377,12 +1381,17 @@ where
         page_size: u32,
         wal: WalFile<V::File>,
         create_missing: bool,
+        #[cfg(all(feature = "native", any(unix, windows)))] namespace_binding: Option<
+            Arc<DatabaseNamespaceBinding>,
+        >,
     ) -> Self {
         Self {
             vfs,
             wal_path: wal_path.as_ref().to_path_buf(),
             page_size,
             create_missing,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            namespace_binding,
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -1448,6 +1457,10 @@ where
     }
 
     fn ensure_current_wal_path(&mut self, cx: &Cx) -> Result<()> {
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        if let Some(binding) = &self.namespace_binding {
+            binding.validate_path_identity()?;
+        }
         if !self.vfs.access(cx, &self.wal_path, AccessFlags::EXISTS)? {
             if self.create_missing {
                 return self.replace_with_created_wal(cx);
@@ -1843,8 +1856,15 @@ mod tests {
 
         let file = open_wal_file(&vfs, &cx);
         let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
-        let mut backend =
-            PathRefreshingWalBackend::new(vfs.clone(), wal_path, PAGE_SIZE, wal, true);
+        let mut backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            wal_path,
+            PAGE_SIZE,
+            wal,
+            true,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            None,
+        );
 
         backend
             .append_frame(&cx, 1, &sample_page(0x31), 1)

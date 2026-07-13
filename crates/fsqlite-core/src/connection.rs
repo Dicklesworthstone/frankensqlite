@@ -100,6 +100,8 @@ use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
     get_total_changes, sqlite_compile_options,
 };
+#[cfg(all(feature = "native", any(unix, windows)))]
+use fsqlite_pager::ConnectionPagerOpenMode;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
@@ -2319,6 +2321,44 @@ impl std::fmt::Debug for PagerBackend {
 }
 
 impl PagerBackend {
+    /// Resolve a file-backed database path exactly once before any retryable
+    /// bootstrap work. All namespace keys and companion-file paths are derived
+    /// from this stable absolute spelling for the connection lifetime.
+    fn resolve_stable_database_path(path: &str, cx: &Cx) -> Result<String> {
+        if path == ":memory:" {
+            return Ok(path.to_owned());
+        }
+
+        let requested = Path::new(path);
+        let resolved = {
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            {
+                IoUringVfs::new().full_pathname(cx, requested)?
+            }
+            #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
+            {
+                UnixVfs::new().full_pathname(cx, requested)?
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            {
+                fsqlite_vfs::WindowsVfs::new().full_pathname(cx, requested)?
+            }
+            #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
+            {
+                return Err(FrankenError::NotImplemented(
+                    "file-backed pager not available on this platform".to_owned(),
+                ));
+            }
+        };
+
+        resolved
+            .into_os_string()
+            .into_string()
+            .map_err(|path| FrankenError::CannotOpen {
+                path: PathBuf::from(path),
+            })
+    }
+
     /// Returns `true` if this backend uses the in-memory VFS (`:memory:`).
     #[must_use]
     pub fn is_memory(&self) -> bool {
@@ -2349,6 +2389,30 @@ impl PagerBackend {
             Self::Unix(p) => p.set_vfs_busy_timeout_ms(ms),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.set_vfs_busy_timeout_ms(ms),
+        }
+    }
+
+    fn validate_namespace_binding(&self) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.validate_namespace_binding(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.validate_namespace_binding(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.validate_namespace_binding(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.validate_namespace_binding(),
+        }
+    }
+
+    fn finish_namespace_bootstrap(&self) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.finish_namespace_bootstrap(),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.finish_namespace_bootstrap(),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.finish_namespace_bootstrap(),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.finish_namespace_bootstrap(),
         }
     }
 
@@ -2581,72 +2645,57 @@ impl PagerBackend {
             {
                 let vfs = IoUringVfs::new();
                 let db_path = PathBuf::from(path);
-                let pager = if let Some(expected_identity) = expected_identity {
-                    SimplePager::open_reserved_with_cx_and_page_buffer_max(
-                        cx,
-                        vfs,
-                        &db_path,
-                        requested_page_size,
-                        expected_identity,
-                        page_buffer_max,
-                    )?
+                let mode = if let Some(expected_identity) = expected_identity {
+                    ConnectionPagerOpenMode::ReservedEmpty(expected_identity)
                 } else {
-                    SimplePager::open_with_cx_and_page_buffer_max(
-                        cx,
-                        vfs,
-                        &db_path,
-                        requested_page_size,
-                        page_buffer_max,
-                    )?
+                    ConnectionPagerOpenMode::CreateIfMissing
                 };
+                let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    requested_page_size,
+                    page_buffer_max,
+                    mode,
+                )?;
                 Ok(Self::IoUring(Arc::new(pager)))
             }
             #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
             {
                 let vfs = UnixVfs::new();
                 let db_path = PathBuf::from(path);
-                let pager = if let Some(expected_identity) = expected_identity {
-                    SimplePager::open_reserved_with_cx_and_page_buffer_max(
-                        cx,
-                        vfs,
-                        &db_path,
-                        requested_page_size,
-                        expected_identity,
-                        page_buffer_max,
-                    )?
+                let mode = if let Some(expected_identity) = expected_identity {
+                    ConnectionPagerOpenMode::ReservedEmpty(expected_identity)
                 } else {
-                    SimplePager::open_with_cx_and_page_buffer_max(
-                        cx,
-                        vfs,
-                        &db_path,
-                        requested_page_size,
-                        page_buffer_max,
-                    )?
+                    ConnectionPagerOpenMode::CreateIfMissing
                 };
+                let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    requested_page_size,
+                    page_buffer_max,
+                    mode,
+                )?;
                 Ok(Self::Unix(Arc::new(pager)))
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 let db_path = PathBuf::from(path);
-                let pager = if let Some(expected_identity) = expected_identity {
-                    SimplePager::open_reserved_with_cx_and_page_buffer_max(
-                        cx,
-                        vfs,
-                        &db_path,
-                        requested_page_size,
-                        expected_identity,
-                        page_buffer_max,
-                    )?
+                let mode = if let Some(expected_identity) = expected_identity {
+                    ConnectionPagerOpenMode::ReservedEmpty(expected_identity)
                 } else {
-                    SimplePager::open_with_cx_and_page_buffer_max(
-                        cx,
-                        vfs,
-                        &db_path,
-                        requested_page_size,
-                        page_buffer_max,
-                    )?
+                    ConnectionPagerOpenMode::CreateIfMissing
                 };
+                let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    requested_page_size,
+                    page_buffer_max,
+                    mode,
+                )?;
                 Ok(Self::Windows(Arc::new(pager)))
             }
             #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
@@ -2670,13 +2719,13 @@ impl PagerBackend {
         {
             let vfs = IoUringVfs::new();
             let db_path = PathBuf::from(path);
-            let pager = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
                 cx,
                 vfs,
                 &db_path,
                 PageSize::DEFAULT,
-                expected_identity,
                 page_buffer_max,
+                ConnectionPagerOpenMode::ExistingOnly(expected_identity),
             )?;
             Ok(Self::IoUring(Arc::new(pager)))
         }
@@ -2684,13 +2733,13 @@ impl PagerBackend {
         {
             let vfs = UnixVfs::new();
             let db_path = PathBuf::from(path);
-            let pager = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
                 cx,
                 vfs,
                 &db_path,
                 PageSize::DEFAULT,
-                expected_identity,
                 page_buffer_max,
+                ConnectionPagerOpenMode::ExistingOnly(expected_identity),
             )?;
             Ok(Self::Unix(Arc::new(pager)))
         }
@@ -2698,13 +2747,13 @@ impl PagerBackend {
         {
             let vfs = fsqlite_vfs::WindowsVfs::new();
             let db_path = PathBuf::from(path);
-            let pager = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            let pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
                 cx,
                 vfs,
                 &db_path,
                 PageSize::DEFAULT,
-                expected_identity,
                 page_buffer_max,
+                ConnectionPagerOpenMode::ExistingOnly(expected_identity),
             )?;
             Ok(Self::Windows(Arc::new(pager)))
         }
@@ -2744,24 +2793,14 @@ impl PagerBackend {
         {
             let vfs = IoUringVfs::new();
             let db_path = PathBuf::from(path);
-            let mut pager = if let Some(expected_identity) = expected_identity {
-                SimplePager::open_readonly_with_expected_identity_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    PageSize::DEFAULT,
-                    expected_identity,
-                    page_buffer_max,
-                )?
-            } else {
-                SimplePager::open_readonly_with_cx_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    PageSize::DEFAULT,
-                    page_buffer_max,
-                )?
-            };
+            let mut pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                PageSize::DEFAULT,
+                page_buffer_max,
+                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+            )?;
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::IoUring(Arc::new(pager)))
         }
@@ -2769,24 +2808,14 @@ impl PagerBackend {
         {
             let vfs = UnixVfs::new();
             let db_path = PathBuf::from(path);
-            let mut pager = if let Some(expected_identity) = expected_identity {
-                SimplePager::open_readonly_with_expected_identity_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    PageSize::DEFAULT,
-                    expected_identity,
-                    page_buffer_max,
-                )?
-            } else {
-                SimplePager::open_readonly_with_cx_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    PageSize::DEFAULT,
-                    page_buffer_max,
-                )?
-            };
+            let mut pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                PageSize::DEFAULT,
+                page_buffer_max,
+                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+            )?;
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Unix(Arc::new(pager)))
         }
@@ -2794,24 +2823,14 @@ impl PagerBackend {
         {
             let vfs = fsqlite_vfs::WindowsVfs::new();
             let db_path = PathBuf::from(path);
-            let mut pager = if let Some(expected_identity) = expected_identity {
-                SimplePager::open_readonly_with_expected_identity_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    PageSize::DEFAULT,
-                    expected_identity,
-                    page_buffer_max,
-                )?
-            } else {
-                SimplePager::open_readonly_with_cx_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    PageSize::DEFAULT,
-                    page_buffer_max,
-                )?
-            };
+            let mut pager = SimplePager::open_for_connection_with_cx_and_page_buffer_max(
+                cx,
+                vfs,
+                &db_path,
+                PageSize::DEFAULT,
+                page_buffer_max,
+                ConnectionPagerOpenMode::ReadOnly(expected_identity),
+            )?;
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Windows(Arc::new(pager)))
         }
@@ -2874,6 +2893,7 @@ impl PagerBackend {
     }
 
     fn install_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<()> {
+        self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
         match self {
             Self::Memory(p) => {
@@ -2904,6 +2924,7 @@ impl PagerBackend {
         db_path: &str,
         allow_readonly: bool,
     ) -> Result<bool> {
+        self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
         match self {
             Self::Memory(p) => {
@@ -2969,9 +2990,10 @@ impl PagerBackend {
 
     /// Probe whether a sibling `-wal` file exists and is large enough to
     /// contain at least a complete WAL header.
-    fn wal_file_present(&self, cx: &Cx, db_path: &str) -> bool {
+    fn wal_file_present(&self, cx: &Cx, db_path: &str) -> Result<bool> {
+        self.validate_namespace_binding()?;
         let wal_path = wal_path_for_db_path(db_path);
-        match self {
+        Ok(match self {
             Self::Memory(p) => {
                 let vfs = p.vfs_handle();
                 wal_file_present_with_vfs(vfs.as_ref(), cx, &wal_path)
@@ -2991,7 +3013,7 @@ impl PagerBackend {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 wal_file_present_with_vfs(&vfs, cx, &wal_path)
             }
-        }
+        })
     }
 
     /// Run a WAL checkpoint.
@@ -3127,8 +3149,15 @@ where
             ),
         });
     }
-    let adapter =
-        PathRefreshingWalBackend::new(vfs, wal_path, expected_page_size, wal, create_missing);
+    let adapter = PathRefreshingWalBackend::new(
+        vfs,
+        wal_path,
+        expected_page_size,
+        wal,
+        create_missing,
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        pager.namespace_binding(),
+    );
     match pager.set_wal_backend_owned(adapter) {
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
@@ -9361,6 +9390,7 @@ impl Connection {
                 .root_cx
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
+        let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_readonly_with_page_buffer_max(
                 &path,
@@ -9569,6 +9599,10 @@ impl Connection {
         conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
         conn.sync_change_tracking_context();
         conn.attach_connection_pool_metrics();
+        // The native namespace gate remains exclusive throughout every
+        // journal/WAL/schema/MemDB bootstrap step above. Publish the completed
+        // connection generation only at the final success boundary.
+        conn.pager.finish_namespace_bootstrap()?;
         Ok(conn)
     }
 
@@ -9626,6 +9660,7 @@ impl Connection {
                 .root_cx
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
+        let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_reserved_with_page_buffer_max(
                 &path,
@@ -9655,6 +9690,7 @@ impl Connection {
                 .root_cx
                 .create_child()
                 .with_trace_context(next_trace_id(), 0, 0);
+        let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_existing_with_page_buffer_max(
                 &path,
@@ -9687,6 +9723,14 @@ impl Connection {
                 what: "page_size".to_owned(),
                 value: page_size_bytes.to_string(),
             })?;
+        // Phase 5 (bd-3iw8): initialize the pager backend as the primary
+        // storage layer. The pager handles all persistence via WAL.
+        let bootstrap_cx =
+            env.runtime()
+                .root_cx
+                .create_child()
+                .with_trace_context(next_trace_id(), 0, 0);
+        let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let storage_was_empty = if path == ":memory:" {
             true
         } else {
@@ -9696,14 +9740,6 @@ impl Connection {
                 Err(_) => false,
             }
         };
-
-        // Phase 5 (bd-3iw8): initialize the pager backend as the primary
-        // storage layer. The pager handles all persistence via WAL.
-        let bootstrap_cx =
-            env.runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_with_requested_page_size_and_page_buffer_max(
                 &path,
@@ -9982,6 +10018,10 @@ impl Connection {
         conn.align_commit_clock_floor(*conn.memdb_visible_commit_seq.borrow());
         conn.sync_change_tracking_context();
         conn.attach_connection_pool_metrics();
+        // Retain the native namespace bootstrap lease through journal/WAL,
+        // schema, and MemDB initialization. Publish the generation only at
+        // this final successful Connection boundary.
+        conn.pager.finish_namespace_bootstrap()?;
         Ok(conn)
     }
 
@@ -14046,7 +14086,7 @@ impl Connection {
             .as_ref()
             .is_some_and(|header| header.write_version == 2 || header.read_version == 2);
         let op_cx = self.op_cx()?;
-        let wal_file_present = self.pager.wal_file_present(&op_cx, &self.path);
+        let wal_file_present = self.pager.wal_file_present(&op_cx, &self.path)?;
         let wal_sidecar_requests_wal = wal_file_present && header.is_none();
         let mut pragma_state = self.pragma_state.borrow_mut();
         if header_requests_wal || wal_sidecar_requests_wal || storage_was_empty {
@@ -122629,7 +122669,7 @@ mod tests {
         wal_file.close(&cx).unwrap();
 
         assert!(
-            backend.wal_file_present(&cx, ":memory:"),
+            backend.wal_file_present(&cx, ":memory:").unwrap(),
             "memory-backed WAL detection must query the pager's VFS, not a fresh empty MemoryVfs"
         );
     }

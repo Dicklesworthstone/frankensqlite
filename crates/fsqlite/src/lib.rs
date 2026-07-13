@@ -127,6 +127,50 @@ mod tests {
 
     #[cfg(all(feature = "native", any(unix, windows)))]
     #[test]
+    fn namespace_lifetime_connections_to_the_same_database_identity_coexist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("shared-generation.db");
+        let database_path = database_path.to_string_lossy().into_owned();
+        let first = Connection::open(database_path.clone()).expect("open first connection");
+        let second = Connection::open_existing(database_path)
+            .expect("join the initialized live database generation");
+        first
+            .execute("PRAGMA fsqlite.stmt_microbatch = OFF;")
+            .expect("disable statement carry on first connection");
+        second
+            .execute("PRAGMA fsqlite.stmt_microbatch = OFF;")
+            .expect("disable statement carry on peer connection");
+        first
+            .execute_batch(
+                "CREATE TABLE shared_generation(value INTEGER NOT NULL);
+                 INSERT INTO shared_generation VALUES (1);",
+            )
+            .expect("seed the shared generation");
+
+        let first_identity = first
+            .file_identity()
+            .expect("query first connection identity")
+            .expect("native database has a stable identity");
+        assert_eq!(
+            second.file_identity().expect("query peer identity"),
+            Some(first_identity),
+            "both connections must remain leased to the same database object"
+        );
+
+        second
+            .execute("INSERT INTO shared_generation VALUES (2);")
+            .expect("peer connection writes through the shared generation");
+        let rows = first
+            .query("SELECT value FROM shared_generation ORDER BY value;")
+            .expect("first connection observes the peer commit");
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(2)]]
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
     fn reserved_identity_open_never_synthesizes_a_missing_path() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let identity_path = dir.path().join("existing-identity.db");
@@ -273,6 +317,49 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn namespace_lifetime_reserved_open_refuses_wal_segment_and_fec_rewrite_artifacts() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+
+        for artifact_kind in ["wal-segment", "wal-fec-rewrite"] {
+            let database_path = dir.path().join(format!("reserved-{artifact_kind}.db"));
+            drop(std::fs::File::create(&database_path).expect("reserve empty database path"));
+            let reservation =
+                std::fs::File::open(&database_path).expect("retain reservation handle");
+            let expected_identity = FileIdentity::from_file(&reservation)
+                .expect("query reservation identity")
+                .expect("native filesystem identity must be available");
+            let artifact_path = match artifact_kind {
+                "wal-segment" => dir.path().join("reserved-wal-segment.db-wal-seg-00000001"),
+                "wal-fec-rewrite" => {
+                    native_suffixed_path(&database_path, "-wal-fec").with_extension("wal-fec.tmp")
+                }
+                _ => unreachable!("artifact cases are exhaustive"),
+            };
+            let sentinel = format!("{artifact_kind} sentinel").into_bytes();
+            std::fs::write(&artifact_path, &sentinel).expect("seed forbidden artifact");
+
+            let error = Connection::open_reserved_with_expected_identity(
+                database_path.to_string_lossy().into_owned(),
+                expected_identity,
+            )
+            .expect_err("reserved bootstrap must reject every pre-existing WAL artifact");
+
+            assert!(matches!(error, FrankenError::CannotOpen { .. }));
+            assert_eq!(
+                std::fs::metadata(&database_path).unwrap().len(),
+                0,
+                "refusal must leave the reserved main file empty"
+            );
+            assert_eq!(
+                std::fs::read(&artifact_path).expect("read preserved forbidden artifact"),
+                sentinel,
+                "refusal must not mutate the forbidden artifact"
+            );
+        }
+    }
+
     #[cfg(all(feature = "native", unix))]
     #[test]
     fn connection_identity_remains_bound_to_open_file_after_path_swap() {
@@ -304,6 +391,171 @@ mod tests {
         assert_ne!(connection_identity, replacement_identity);
         assert_eq!(conn.file_identity().unwrap(), Some(leased_identity));
         drop(conn);
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    fn exercise_live_namespace_replacement_rejection(journal_mode: &str) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join(format!("live-{journal_mode}.db"));
+        let displaced_path = dir.path().join(format!("live-{journal_mode}.displaced.db"));
+        let replacement_stage = dir
+            .path()
+            .join(format!("live-{journal_mode}.replacement.db"));
+        let database_path_string = database_path.to_string_lossy().into_owned();
+
+        let live = Connection::open(database_path_string.clone()).expect("open live generation");
+        live.execute("PRAGMA fsqlite.stmt_microbatch = OFF;")
+            .expect("disable retained statement carry for namespace boundary proof");
+        live.execute(&format!("PRAGMA journal_mode = '{journal_mode}';"))
+            .expect("select requested journal mode");
+        live.execute_batch(
+            "CREATE TABLE identity_probe(value INTEGER NOT NULL);
+             INSERT INTO identity_probe VALUES (1);",
+        )
+        .expect("seed live generation");
+        let live_identity = live
+            .file_identity()
+            .expect("query live identity")
+            .expect("Unix database has a stable identity");
+
+        {
+            let replacement = rusqlite::Connection::open(&replacement_stage)
+                .expect("create valid replacement database");
+            replacement
+                .execute_batch(
+                    "PRAGMA journal_mode = DELETE;
+                     CREATE TABLE identity_probe(value INTEGER NOT NULL);
+                     INSERT INTO identity_probe VALUES (9001);",
+                )
+                .expect("seed replacement database");
+        }
+        let replacement_staged_bytes =
+            std::fs::read(&replacement_stage).expect("snapshot staged replacement");
+
+        std::fs::rename(&database_path, &displaced_path).expect("displace live main file");
+        std::fs::rename(&replacement_stage, &database_path)
+            .expect("install replacement at the live pathname");
+        let replacement_file =
+            std::fs::File::open(&database_path).expect("open replacement identity handle");
+        let replacement_identity = FileIdentity::from_file(&replacement_file)
+            .expect("query replacement identity")
+            .expect("Unix database has a stable identity");
+        assert_ne!(live_identity, replacement_identity);
+
+        let write_error = live
+            .execute("INSERT INTO identity_probe VALUES (2);")
+            .expect_err("live connection must reject a replaced main pathname");
+        assert!(matches!(write_error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            std::fs::read(&database_path).expect("read rejected replacement"),
+            replacement_staged_bytes,
+            "rejection must precede every write to the replacement database object"
+        );
+
+        let join_error = Connection::open(database_path_string.clone())
+            .expect_err("a peer must not join the replacement while the old generation is live");
+        assert!(matches!(join_error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            std::fs::read(&database_path).expect("read replacement after rejected join"),
+            replacement_staged_bytes,
+            "rejected admission must not mutate the replacement"
+        );
+
+        drop(live);
+        let replacement = Connection::open_existing(database_path_string)
+            .expect("replacement becomes a new generation after the old lease drops");
+        assert_eq!(
+            replacement.file_identity().unwrap(),
+            Some(replacement_identity)
+        );
+        let rows = replacement
+            .query("SELECT value FROM identity_probe;")
+            .expect("query the replacement generation");
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(9001)]);
+        replacement
+            .execute("INSERT INTO identity_probe VALUES (9002);")
+            .expect("new generation is writable");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn namespace_lifetime_delete_mode_replacement_is_rejected() {
+        exercise_live_namespace_replacement_rejection("DELETE");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn namespace_lifetime_wal_mode_replacement_is_rejected() {
+        exercise_live_namespace_replacement_rejection("WAL");
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn namespace_lifetime_relative_path_remains_anchored_after_cwd_change() {
+        const CHILD_ROOT: &str = "FSQLITE_NAMESPACE_CWD_CHILD_ROOT";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let original_dir = root.join("original-cwd");
+            let later_dir = root.join("later-cwd");
+            std::env::set_current_dir(&original_dir).expect("enter original cwd");
+
+            let conn = Connection::open("anchored.db").expect("open relative database path");
+            let expected_path = original_dir.join("anchored.db");
+            let expected_canonical_path = expected_path
+                .canonicalize()
+                .expect("canonicalize newly opened relative database path");
+            assert_eq!(std::path::Path::new(conn.path()), expected_canonical_path);
+            conn.execute_batch(
+                "CREATE TABLE cwd_probe(value INTEGER NOT NULL);
+                 INSERT INTO cwd_probe VALUES (1);",
+            )
+            .expect("seed database from original cwd");
+
+            std::env::set_current_dir(&later_dir).expect("change process cwd");
+            conn.execute("INSERT INTO cwd_probe VALUES (2);")
+                .expect("write remains bound to original absolute path");
+            drop(conn);
+
+            assert!(expected_path.exists());
+            assert!(
+                !later_dir.join("anchored.db").exists(),
+                "no operation may re-resolve the configured relative path against the new cwd"
+            );
+            let verification =
+                rusqlite::Connection::open(expected_path).expect("open anchored database");
+            let values = verification
+                .prepare("SELECT value FROM cwd_probe ORDER BY value")
+                .expect("prepare anchored verification")
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("query anchored verification")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect anchored verification");
+            assert_eq!(values, vec![1, 2]);
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create parent temp dir");
+        std::fs::create_dir(dir.path().join("original-cwd")).expect("create original cwd");
+        std::fs::create_dir(dir.path().join("later-cwd")).expect("create later cwd");
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate current Rust test binary"),
+        )
+        .args([
+            "--exact",
+            "tests::namespace_lifetime_relative_path_remains_anchored_after_cwd_change",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, dir.path())
+        .current_dir(dir.path())
+        .output()
+        .expect("run cwd-isolated child test");
+        assert!(
+            output.status.success(),
+            "cwd-isolated child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(all(feature = "native", unix))]
