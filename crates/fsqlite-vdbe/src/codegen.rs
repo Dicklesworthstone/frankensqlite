@@ -2697,9 +2697,20 @@ pub fn codegen_select(
             idx_schema,
             planner_index_range_target_from_column_range(&index_range),
         )
-    } else if let Some((col_name, target_expr)) = index_eq.filter(|_| stmt.order_by.is_empty()) {
-        // --- Index-seek SELECT (only when no ORDER BY, since the index
-        //     seek returns rows in index insertion order, not sort order) ---
+    } else if let Some((col_name, target_expr)) = index_eq.filter(|(col_name, _)| {
+        // bd-nonagg-index-eq-order-rowid: the index-equality seek returns rows in index-key order —
+        // for a SINGLE-column ASCENDING index that is exactly rowid-ascending WITHIN the one eq value
+        // (the seek positions at `(val, i64::MIN)` and walks forward), so it also satisfies
+        // `ORDER BY <rowid> ASC` for free, seeking only the matching rows instead of full-scanning +
+        // sorting. A composite index would order by its trailing key column, and a DESC index reverses
+        // the walk, so both decline (and keep the sorter / plain scan). No ORDER BY is always fine.
+        stmt.order_by.is_empty()
+            || (matches!(rowid_order, Some(SortDirection::Asc))
+                && table
+                    .index_for_column(col_name)
+                    .is_some_and(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0)))
+    }) {
+        // --- Index-seek SELECT: no ORDER BY, or `ORDER BY <rowid> ASC` served by the seek's key order.
         if let Some(idx_schema) = table.index_for_column(&col_name) {
             codegen_select_index_equality_scan(
                 b,
