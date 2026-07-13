@@ -18782,3 +18782,38 @@ test is on the executed path, not merely linked into it.
   page cache, where the covering walk reads only the narrow index and the sorter must scan the full
   wide table — a covering-I/O win the in-memory harness cannot expose — and gate the retry on that
   disk-bound benchmark, not this one.
+
+## 2026-07-13 - Non-aggregate eq-prefix + residual seek as a pre-directive hoist (bd-nonagg-eq-residual-before-directive)
+
+- Target: a data-driven non-aggregate SEEK/SCAN probe found `SELECT ... FROM t WHERE <int-indexed
+  col> = <int lit> AND <residual on a non-indexed col>` (e.g. `a = 5 AND c = 7`) full-scans, unlike the
+  just-landed range hoists (`fdde59c3`, `176e36b1`). The idea, mirroring those: detect the exact
+  eq-literal prefix via the reusable `aggregate_index_prefix_literal_residual_target`, and reuse the
+  oracle-tested `codegen_select_index_equality_scan` (which already seeks the `col=lit` duplicate run
+  and applies the full WHERE per row via `emit_where_filter`) to visit only the eq block.
+- Candidate touched `crates/fsqlite-vdbe/src/codegen.rs` (a pre-directive hoist) plus an oracle test and
+  bench; all reverted. Correctness was never in doubt — every `cmp` against rusqlite passed
+  byte-set-identically. It was rejected on the OPTIMIZATION not engaging, plus escalating design
+  surface:
+  1. `codegen_select_index_equality_scan`'s covering decision (`resolve_covering_output_sources`) looks
+     only at the OUTPUT columns, not the residual — so a covering output (e.g. `SELECT a`) would skip
+     the table and the residual on a non-covered column could not be read. Forces a `NON-covering
+     output` gate (excludes `SELECT a`, and `SELECT id` only works because the rowid is treated as
+     non-covering).
+  2. A pre-directive hoist gated on `access_kind == FullTableScan` never fired: for `a = 5 AND c = 5`
+     on the test schema the planner emits an **IndexEquality directive naming `idx_a`** (it recognizes
+     the `a=5` conjunct), NOT FullTableScan. Loosening the gate to `is_none_or(FullTableScan)` (fire on
+     None too) still did not fire, because the IndexEquality directive is honored first and then
+     **bypasses on the `c=5` residual it cannot enforce** (`directive_index_contract_bypass_reason`),
+     falling through to the heuristic — where `index_eq`'s `extract_column_eq_target` requires a bare
+     top-level `Eq` and so misses the conjunction, yielding the full scan.
+- Result: rejected as a pre-directive hoist. The correct fix is a HEURISTIC-CHAIN fallback: compute the
+  eq-residual target in the `codegen_select` preamble and dispatch it as an `else if` in the
+  post-directive chain (2396+) AFTER `rowid_target` / `rowid_range` / `index_range` / `index_eq` and
+  before the final full-scan `else`, so the bypassed-IndexEquality and no-directive paths reach it while
+  the strictly-better rowid/range paths still win. That is a planner-chain change, not the one-line
+  hoist the range levers were, and each fix here uncovered a new planner interaction (covering-ignores-
+  residual → directive-is-IndexEquality → IndexEquality-bypasses) — a signal the shape is not yet fully
+  understood. Retry as the heuristic-chain fallback (keep the exact-literal + non-covering-output gates,
+  reuse `codegen_select_index_equality_scan`), with an oracle that asserts a Seek AND a full
+  `-p fsqlite` suite, when the remote fleet is healthy enough to iterate.
