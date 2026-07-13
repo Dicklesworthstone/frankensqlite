@@ -64,7 +64,9 @@ fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
         .any(|row| {
             let vals = row.values();
             matches!(vals.get(1), Some(SqliteValue::Text(op)) if op.to_string() == "OpenRead")
-                && vals.iter().any(|v| matches!(v, SqliteValue::Text(t) if t.to_string() == name))
+                && vals
+                    .iter()
+                    .any(|v| matches!(v, SqliteValue::Text(t) if t.to_string() == name))
         })
 }
 
@@ -105,7 +107,11 @@ fn check_big(label: &str, ddl: &[&str]) {
         } else {
             format!("'k{}'", i % 25)
         };
-        insert_both(&f, &r, &format!("INSERT INTO t VALUES ({i}, {a}, {c}, {});", i % 100));
+        insert_both(
+            &f,
+            &r,
+            &format!("INSERT INTO t VALUES ({i}, {a}, {c}, {});", i % 100),
+        );
     }
     for (sql, idx) in [
         ("SELECT COUNT(DISTINCT a) FROM t", "idx_a"),
@@ -155,10 +161,18 @@ fn count_distinct_index_walk_edge_cases() {
         "CREATE INDEX idx_a ON t(a);",
     ]);
     cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "empty");
-    insert_both(&f, &r, "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);");
+    insert_both(
+        &f,
+        &r,
+        "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL);",
+    );
     cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-null");
     insert_both(&f, &r, "DELETE FROM t;");
-    insert_both(&f, &r, "INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5);");
+    insert_both(
+        &f,
+        &r,
+        "INSERT INTO t VALUES (1, 5), (2, 5), (3, 5), (4, 5);",
+    );
     cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-same");
     insert_both(&f, &r, "DELETE FROM t;");
     insert_both(&f, &r, "INSERT INTO t VALUES (1, 7);");
@@ -169,7 +183,12 @@ fn count_distinct_index_walk_edge_cases() {
     }
     // Mix in leading NULLs before the distinct run.
     insert_both(&f, &r, "INSERT INTO t VALUES (100, NULL), (101, NULL);");
-    cmp(&f, &r, "SELECT COUNT(DISTINCT a) FROM t", "all-distinct-plus-nulls");
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(DISTINCT a) FROM t",
+        "all-distinct-plus-nulls",
+    );
     assert!(
         opens(&f, "SELECT COUNT(DISTINCT a) FROM t", "idx_a"),
         "edge: COUNT(DISTINCT) must walk idx_a"
@@ -185,11 +204,7 @@ fn count_distinct_nocase_declines_but_matches() {
         "CREATE INDEX idx_c ON t(c);",
     ]);
     for (i, v) in ["A", "a", "B", "b", "c", "C", "d"].iter().enumerate() {
-        insert_both(
-            &f,
-            &r,
-            &format!("INSERT INTO t VALUES ({}, '{v}');", i + 1),
-        );
+        insert_both(&f, &r, &format!("INSERT INTO t VALUES ({}, '{v}');", i + 1));
     }
     cmp(&f, &r, "SELECT COUNT(DISTINCT c) FROM t", "nocase");
 }

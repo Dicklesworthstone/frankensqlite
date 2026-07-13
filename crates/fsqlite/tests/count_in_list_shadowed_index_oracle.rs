@@ -77,7 +77,9 @@ fn opens(conn: &Connection, sql: &str, name: &str) -> bool {
         .any(|row| {
             let vals = row.values();
             matches!(vals.get(1), Some(SqliteValue::Text(op)) if op.to_string() == "OpenRead")
-                && vals.iter().any(|v| matches!(v, SqliteValue::Text(t) if t.to_string() == name))
+                && vals
+                    .iter()
+                    .any(|v| matches!(v, SqliteValue::Text(t) if t.to_string() == name))
         })
 }
 
