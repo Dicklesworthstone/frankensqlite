@@ -3,9 +3,9 @@
 //! reverse walk (Last+Prev) is descending, and the rowid is unique so there are no ties. Previously
 //! `resolve_order_by_index_plan` returned None for the rowid, so all rows were sorted. ASC routes to the
 //! plain scan; DESC to the unbounded descending rowid-range scan (both apply LIMIT/OFFSET, stop early).
-//! ASC also admits a plain-scan-safe WHERE (no MATCH, no subquery) via `codegen_select_full_scan`.
-//! Compared IN OUTPUT ORDER against C SQLite; scan-served cases assert NO sorter opcode; a filtered DESC
-//! (follow-up), a subquery filter, or a non-rowid ORDER BY still uses the sorter (correctness preserved).
+//! Both directions also admit a plain-scan-safe WHERE (no MATCH, no subquery) via a descending-capable
+//! `codegen_select_full_scan`. Compared IN OUTPUT ORDER against C SQLite; scan-served cases assert NO
+//! sorter opcode; a subquery filter or a non-rowid ORDER BY still uses the sorter (correctness kept).
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 fn render(v: &SqliteValue) -> String {
@@ -69,23 +69,28 @@ fn nonagg_rowid_order_scan_matches_sqlite() {
         "SELECT * FROM t WHERE a BETWEEN 3 AND 9 ORDER BY id LIMIT 10",
         "SELECT * FROM t WHERE x IS NOT NULL ORDER BY id LIMIT 15",
         "SELECT c FROM t WHERE x LIKE 'v%' ORDER BY id LIMIT 7",     // LIKE (not MATCH)
+        // filtered DESC (bd-nonagg-rowid-order-scan-desc): Last + Prev + plain-scan-safe WHERE, no sorter.
+        "SELECT * FROM t WHERE c = 5 ORDER BY id DESC",
+        "SELECT * FROM t WHERE x = 'v3' ORDER BY id DESC LIMIT 20",
+        "SELECT id FROM t WHERE a > 10 AND c < 8 ORDER BY id DESC LIMIT 5",
+        "SELECT * FROM t WHERE a BETWEEN 3 AND 9 ORDER BY id DESC LIMIT 10",
+        "SELECT * FROM t WHERE a < 5 ORDER BY id DESC",
     ];
     for sql in scans {
         cmp_ord(&f, &r, sql, "rowid-order-scan");
         assert!(!has_sorter(&f, sql), "ORDER BY rowid (scan-safe) must NOT open a sorter: `{sql}`");
     }
-    // NOT bypassed by this cut (still correct via the sorter): filtered DESC (follow-up), a subquery
-    // filter (declined by where_is_plain_scan_safe), or a non-rowid ORDER BY.
+    // NOT bypassed (still correct via the sorter): a subquery filter (declined by
+    // where_is_plain_scan_safe) in either direction, or a non-rowid ORDER BY.
     let sorted = [
-        "SELECT * FROM t WHERE c = 5 ORDER BY id DESC",              // filtered DESC -> declines
-        "SELECT * FROM t WHERE a < 5 ORDER BY id DESC",
-        "SELECT * FROM t WHERE a IN (SELECT 3) ORDER BY id",         // IN (subquery) -> declines
+        "SELECT * FROM t WHERE a IN (SELECT 3) ORDER BY id",         // IN (subquery) ASC -> declines
+        "SELECT * FROM t WHERE a IN (SELECT 3) ORDER BY id DESC",    // IN (subquery) DESC -> declines
         "SELECT * FROM t WHERE a > (SELECT 5) ORDER BY id",          // scalar subquery -> declines
         "SELECT * FROM t ORDER BY x LIMIT 10",                       // non-rowid ORDER BY
         "SELECT * FROM t ORDER BY x DESC",                           // non-rowid DESC
     ];
     for sql in sorted {
         cmp_ord(&f, &r, sql, "still-sorts");
-        assert!(has_sorter(&f, sql), "filtered-DESC / subquery / non-rowid ORDER BY should still sort: `{sql}`");
+        assert!(has_sorter(&f, sql), "subquery / non-rowid ORDER BY should still sort: `{sql}`");
     }
 }

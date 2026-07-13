@@ -2379,6 +2379,7 @@ pub fn codegen_select(
                         out_col_count,
                         done_label,
                         end_label,
+                        false,
                     );
                 }
                 PlannerSelectAccessKind::RowidLookup => match rowid_target {
@@ -2733,6 +2734,7 @@ pub fn codegen_select(
                 out_col_count,
                 done_label,
                 end_label,
+                false,
             )
         }
     } else if let Some((idx_schema, target_expr)) = eq_residual {
@@ -2831,23 +2833,26 @@ pub fn codegen_select(
             );
         }
 
-        // bd-nonagg-rowid-order-scan: `ORDER BY <rowid> ASC` needs NO sorter — a table scan (Rewind +
-        // Next) already visits rows in ascending rowid order, and the rowid is unique so there are no
-        // ties to resolve. `resolve_order_by_index_plan` returns None for the rowid (no secondary index
-        // covers it), so we would otherwise sort every row. Route to the plain scan, which applies
-        // LIMIT/OFFSET and stops early under a LIMIT. `rowid_range_allowed` is exactly the safe gate
-        // (non-aggregate, no GROUP BY/HAVING/DISTINCT, and — since rowid_order is Some — the ORDER BY is
-        // a single rowid term). A WHERE is allowed only when `where_is_plain_scan_safe` proves it carries
-        // no MATCH and no subquery — `codegen_select_full_scan` applies it via the SAME per-row filter
-        // the sorter path uses, so scan and sort are byte-identical there (the sort is just elided). The
-        // MATCH / subquery cases keep the sorter (they churned golden snapshots and are not oracle-proven
-        // equivalent here).
-        if matches!(rowid_order, Some(SortDirection::Asc))
-            && rowid_range_allowed
-            && where_clause
-                .as_deref()
-                .map_or(true, where_is_plain_scan_safe)
-        {
+        // bd-nonagg-rowid-order-scan (+ -desc): `ORDER BY <rowid>` needs NO sorter — a forward table
+        // walk (Rewind+Next) is ascending rowid order and a reverse walk (Last+Prev) is descending, and
+        // the rowid is unique so there are no ties to resolve. `resolve_order_by_index_plan` returns None
+        // for the rowid (no secondary index covers it), so we would otherwise sort every row. Route to
+        // the plain scan, which applies LIMIT/OFFSET and stops early under a LIMIT. `rowid_range_allowed`
+        // is exactly the safe gate (non-aggregate, no GROUP BY/HAVING/DISTINCT, and — since rowid_order
+        // is Some — the ORDER BY is a single rowid term). A WHERE is allowed only when
+        // `where_is_plain_scan_safe` proves it carries no MATCH and no subquery — `codegen_select_full_scan`
+        // applies it via the SAME per-row filter the sorter path uses, so scan and sort are byte-identical
+        // (the sort is just elided). MATCH / subquery cases keep the sorter (they churned golden snapshots
+        // and are not oracle-proven equivalent here).
+        // Both directions use the SAME scan emitter: `codegen_select_full_scan` walks ascending
+        // (`Rewind`+`Next`) or descending (`Last`+`Prev`) and applies the WHERE + LIMIT/OFFSET the same
+        // way the sorter path would, so it is byte-identical output with the sort elided.
+        if let Some(dir) = rowid_order.filter(|_| {
+            rowid_range_allowed
+                && where_clause
+                    .as_deref()
+                    .map_or(true, where_is_plain_scan_safe)
+        }) {
             return codegen_select_full_scan(
                 b,
                 cursor,
@@ -2862,37 +2867,7 @@ pub fn codegen_select(
                 out_col_count,
                 done_label,
                 end_label,
-            );
-        }
-        // bd-nonagg-rowid-order-scan-desc: the DESC analog — `ORDER BY <rowid> DESC` needs no sorter
-        // either, since a reverse table walk (`Last` + `Prev`) visits rows in descending rowid order.
-        // `codegen_select_full_scan` is ascending-only, so reuse `codegen_select_rowid_range_scan` with an
-        // UNBOUNDED range (`RowidRangeTarget::default()`, both bounds None) and `descending = true`: with
-        // no upper bound it emits `Last`, with no lower bound it walks to exhaustion via `Prev`, applying
-        // LIMIT/OFFSET (stops early). Kept to `where_clause.is_none()`: the descending range scan's
-        // residual-filter + LIMIT placeholder ordering is not yet exercised, so a filtered DESC variant
-        // is a follow-up (the ASC route reuses the well-tested `codegen_select_full_scan` for filters).
-        if matches!(rowid_order, Some(SortDirection::Desc))
-            && rowid_range_allowed
-            && where_clause.is_none()
-        {
-            return codegen_select_rowid_range_scan(
-                b,
-                cursor,
-                table,
-                table_alias,
-                time_travel,
-                schema,
-                columns,
-                stmt.limit.as_ref(),
-                out_regs,
-                out_col_count,
-                done_label,
-                end_label,
-                RowidRangeTarget::default(),
-                true,
-                None,
-                false,
+                dir == SortDirection::Desc,
             );
         }
 
@@ -2945,6 +2920,7 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
+            false,
         )
     }
 }
@@ -3553,6 +3529,11 @@ fn codegen_select_full_scan(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
+    // When true, walk the table b-tree in DESCENDING rowid order (`Last` + `Prev`) instead of ascending
+    // (`Rewind` + `Next`) — used to serve `ORDER BY <rowid> DESC` without a sorter. Everything else
+    // (WHERE filter, LIMIT/OFFSET, placeholder numbering) is identical, so `false` is byte-identical to
+    // the pre-flag behavior. bd-nonagg-rowid-order-scan-desc.
+    descending: bool,
 ) -> Result<(), CodegenError> {
     // Allocate LIMIT/OFFSET counter registers (if present).
     let limit_reg = limit_clause.map(|lc| {
@@ -3583,9 +3564,17 @@ fn codegen_select_full_scan(
     );
     emit_set_snapshot(b, cursor, time_travel);
 
-    // Rewind to first row; jump to done if table is empty.
+    // Position at the first row in scan order (`Rewind` = ascending rowid, `Last` = descending); jump to
+    // done if the table is empty.
     let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(
+        if descending { Opcode::Last } else { Opcode::Rewind },
+        cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
 
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
@@ -3620,10 +3609,18 @@ fn codegen_select_full_scan(
     // Skip label for WHERE-filtered rows.
     b.resolve_label(skip_label);
 
-    // Next: jump back to start of loop body (the instruction after Rewind).
+    // Advance to the next row in scan order (`Next` ascending, `Prev` descending); jump back to the
+    // start of the loop body (the instruction after Rewind/Last).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+    b.emit_op(
+        if descending { Opcode::Prev } else { Opcode::Next },
+        cursor,
+        loop_body,
+        0,
+        P4::None,
+        0,
+    );
 
     // Done: Close + Halt.
     b.resolve_label(done_label);
