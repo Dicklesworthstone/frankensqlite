@@ -2506,6 +2506,7 @@ pub fn codegen_select(
             group_by,
             having.as_deref(),
             stmt.limit.as_ref(),
+            aggregate_index_eq_seek_allowed(from_index_hint),
             out_regs,
             out_col_count,
             done_label,
@@ -4712,6 +4713,114 @@ fn simple_group_by_rowid_bucket_sum_plan(
     })
 }
 
+/// A `SELECT <col>, COUNT(*) FROM t GROUP BY <col>` (columns in either order; no WHERE/HAVING/LIMIT)
+/// served by a single covering index walk instead of a full scan into a sorter.
+///
+/// The group column carries a single-column ASC BINARY index, so the index key order equals the
+/// GROUP BY key order and every run of adjacent-equal keys is exactly one group. Walking the index
+/// and counting each run emits the identical `(key, count)` rows the sort-then-group path produces —
+/// with no ephemeral sorter and no table read (COUNT(*) needs only the index entry count, so the
+/// index is covering). BINARY only: a non-BINARY (e.g. NOCASE) group column would fold values that
+/// the BINARY index and the group comparison split apart. Searches all indexes so a composite
+/// `(col, …)` index declared first does not shadow a usable single-column one
+/// (bd-agg-range-shadowed-index). bd-group-by-count-index-walk.
+struct GroupByCountIndexWalk {
+    index_name: String,
+    index_root: i32,
+    /// SELECT-list position (register offset) of the group-key output and of the COUNT(*) output.
+    key_out_col: i32,
+    count_out_col: i32,
+}
+
+fn group_by_count_index_walk_plan(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    group_by: &[Expr],
+) -> Option<GroupByCountIndexWalk> {
+    if columns.len() != 2 {
+        return None;
+    }
+    let [group_expr] = group_by else {
+        return None;
+    };
+    // The group key must be a plain table column (no COLLATE / expression) whose collation is BINARY,
+    // so the GROUP BY comparison equals the BINARY index key order and adjacent-key grouping.
+    let Some(SortKeySource::Column(group_col_idx)) =
+        resolve_column_ref(group_expr, table, table_alias)
+    else {
+        return None;
+    };
+    let group_col = table.columns.get(group_col_idx)?;
+    if group_col
+        .collation
+        .as_deref()
+        .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+
+    // Exactly one bare-group-column output and one COUNT(*) output, in either order.
+    let mut key_out_col = None;
+    let mut count_out_col = None;
+    for (out_idx, column) in columns.iter().enumerate() {
+        let ResultColumn::Expr { expr, .. } = column else {
+            return None;
+        };
+        // The bare group column (structurally identical to the GROUP BY term).
+        if expr == group_expr {
+            if key_out_col.replace(i32::try_from(out_idx).ok()?).is_some() {
+                return None;
+            }
+            continue;
+        }
+        // COUNT(*): no DISTINCT / FILTER / ORDER BY / window / wrapper.
+        if let Expr::FunctionCall {
+            name,
+            args: FunctionArgs::Star,
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } = expr
+            && name.eq_ignore_ascii_case("count")
+            && order_by.is_empty()
+        {
+            if count_out_col
+                .replace(i32::try_from(out_idx).ok()?)
+                .is_some()
+            {
+                return None;
+            }
+            continue;
+        }
+        return None;
+    }
+
+    // A single-column ASC BINARY index on the group column; search all indexes so a composite index
+    // declared first does not shadow it.
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&group_col.name))
+            && idx
+                .key_term_collation(0)
+                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+    })?;
+
+    Some(GroupByCountIndexWalk {
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+        key_out_col: key_out_col?,
+        count_out_col: count_out_col?,
+    })
+}
+
 fn simple_count_star_plus_sum_plan(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -5203,6 +5312,117 @@ fn codegen_select_group_by_rowid_bucket_sum(
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Emit `SELECT <col>, COUNT(*) FROM t GROUP BY <col>` as a single covering walk of the group column's
+/// ASC BINARY index: no sorter, no table read. The index yields keys in group order, so a run of
+/// adjacent-equal keys is one group; a running counter increments per index entry (each entry is one
+/// row, so it is COUNT(*)) and the `(key, count)` row is emitted at each group boundary. The
+/// group-change test is `Ne cur,prev` with NULLEQ (`0x80`) so NULLs group together, matching the
+/// sort-then-group path's boundary comparison exactly. bd-group-by-count-index-walk.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_group_by_count_index_walk(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    walk: &GroupByCountIndexWalk,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let group_reg = out_regs + walk.key_out_col;
+    let count_out_reg = out_regs + walk.count_out_col;
+    let cur_key_reg = b.alloc_reg();
+    let prev_key_reg = b.alloc_reg();
+    let count_accum_reg = b.alloc_reg();
+    let have_group_reg = b.alloc_reg();
+
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        walk.index_root,
+        0,
+        P4::Index(walk.index_name.clone()),
+        0,
+    );
+    b.emit_op(Opcode::Null, 0, prev_key_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, count_accum_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, have_group_reg, 0, P4::None, 0);
+
+    let finalize_label = b.emit_label();
+    let compare_keys_label = b.emit_label();
+    let new_group_label = b.emit_label();
+    let first_row_label = b.emit_label();
+    let same_group_label = b.emit_label();
+
+    let scan_start = b.current_addr();
+    // Empty index → GROUP BY yields zero rows.
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+    b.emit_op(Opcode::Column, idx_cursor, 0, cur_key_reg, P4::None, 0);
+
+    b.emit_jump_to_label(
+        Opcode::IfPos,
+        have_group_reg,
+        0,
+        compare_keys_label,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, first_row_label, P4::None, 0);
+
+    b.resolve_label(compare_keys_label);
+    // Ne p1=cur_key, p2=new_group_label, p3=prev_key, p5=0x80 (NULLEQ): NULLs compare equal so they
+    // stay one group, matching codegen_select_group_by_aggregate's sorted boundary test.
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        cur_key_reg,
+        prev_key_reg,
+        new_group_label,
+        P4::None,
+        0x80,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, same_group_label, P4::None, 0);
+
+    b.resolve_label(new_group_label);
+    // Emit the completed group `(prev_key, running count)`, then reset the counter for the new group.
+    b.emit_op(Opcode::Copy, prev_key_reg, group_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, count_accum_reg, count_out_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, count_accum_reg, 0, P4::None, 0);
+
+    b.resolve_label(first_row_label);
+    b.emit_op(Opcode::Integer, 1, have_group_reg, 0, P4::None, 0);
+
+    b.resolve_label(same_group_label);
+    b.emit_op(Opcode::Copy, cur_key_reg, prev_key_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::AddImm, count_accum_reg, 1, 0, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, idx_cursor, scan_body, 0, P4::None, 0);
+
+    let output_final_label = b.emit_label();
+    b.resolve_label(finalize_label);
+    b.emit_jump_to_label(
+        Opcode::IfPos,
+        have_group_reg,
+        0,
+        output_final_label,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(output_final_label);
+    b.emit_op(Opcode::Copy, prev_key_reg, group_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, count_accum_reg, count_out_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
@@ -14438,6 +14658,7 @@ fn codegen_select_group_by_aggregate(
     group_by: &[Expr],
     having: Option<&Expr>,
     limit_clause: Option<&LimitClause>,
+    allow_index_seek: bool,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -14456,6 +14677,27 @@ fn codegen_select_group_by_aggregate(
     {
         return codegen_select_group_by_rowid_bucket_sum(
             b, cursor, table, &plan, out_regs, done_label, end_label,
+        );
+    }
+
+    // `SELECT <col>, COUNT(*) FROM t GROUP BY <col>` over a single-column ASC BINARY index walks the
+    // index and counts adjacent-equal key runs — no sorter, no table read — instead of scanning every
+    // row into a sorter. Byte-identical (BINARY index order == GROUP BY order); gated on
+    // `allow_index_seek` because it opens an index cursor. bd-group-by-count-index-walk.
+    if where_clause.is_none()
+        && having.is_none()
+        && limit_clause.is_none()
+        && allow_index_seek
+        && let Some(walk) = group_by_count_index_walk_plan(columns, table, table_alias, group_by)
+    {
+        return codegen_select_group_by_count_index_walk(
+            b,
+            cursor,
+            &walk,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
         );
     }
 
