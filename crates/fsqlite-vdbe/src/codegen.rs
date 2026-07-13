@@ -2142,6 +2142,40 @@ pub fn codegen_select(
         );
     }
 
+    // bd-rowid-range-before-directive: `SELECT ... FROM t WHERE <rowid> <range>` receives a
+    // `FullTableScan` planner directive — `PlannerSelectAccessKind` has no rowid-range variant, so the
+    // planner cannot model it as a seekable path — which short-circuits to `codegen_select_full_scan`
+    // below and reads every row, bypassing the `rowid_range` heuristic (only reached with no
+    // directive). The rowid-range scan positions on the table b-tree at the bound and walks only the
+    // `[lower, upper]` rowid slice in rowid order — the SAME order the full scan emits — so it is
+    // byte-identical to the full scan (same rows, same order, just fewer) and always ≤ it: no covering
+    // gate is needed because it reads the table directly, exactly like the scan, only bounded. Route it
+    // before the directive, mirroring the bd-2dgf5 / bd-zqkrp seeks. `rowid_range` is `Copy`, so the
+    // heuristic dispatch below is left intact for the no-directive path. bd-rowid-range-before-directive.
+    if let Some(rr) = rowid_range
+        && ctx.planner_select_directive.as_ref().is_some_and(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+        })
+    {
+        return codegen_select_rowid_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            rr,
+            matches!(rowid_order, Some(SortDirection::Desc)),
+        );
+    }
+
     // bd-covering-range-before-directive: `SELECT <covering cols> FROM t WHERE col <range>` (no
     // ORDER BY) receives a `FullTableScan` planner directive — the planner does not model a
     // single-column range as a seekable access path — which short-circuits to
