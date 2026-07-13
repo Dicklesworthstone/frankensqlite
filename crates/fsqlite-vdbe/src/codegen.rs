@@ -2839,7 +2839,7 @@ pub fn codegen_select(
         // (non-aggregate, no GROUP BY/HAVING/DISTINCT, and — since rowid_order is Some — the ORDER BY is
         // a single rowid term). Restricted to `where_clause.is_none()` for this cut: a WHERE could carry
         // MATCH / a subquery / other predicates whose interaction with the plain scan is not oracle-
-        // proven here (a filtered variant is a follow-up). DESC (Last + Prev) is also a follow-up.
+        // proven here (a filtered variant is a follow-up).
         if matches!(rowid_order, Some(SortDirection::Asc))
             && rowid_range_allowed
             && where_clause.is_none()
@@ -2858,6 +2858,35 @@ pub fn codegen_select(
                 out_col_count,
                 done_label,
                 end_label,
+            );
+        }
+        // bd-nonagg-rowid-order-scan-desc: the DESC analog — `ORDER BY <rowid> DESC` needs no sorter
+        // either, since a reverse table walk (`Last` + `Prev`) visits rows in descending rowid order.
+        // `codegen_select_full_scan` is ascending-only, so reuse `codegen_select_rowid_range_scan` with an
+        // UNBOUNDED range (`RowidRangeTarget::default()`, both bounds None) and `descending = true`: with
+        // no upper bound it emits `Last`, with no lower bound it walks to exhaustion via `Prev`, applying
+        // LIMIT/OFFSET (stops early). Same no-WHERE gate as the ASC route.
+        if matches!(rowid_order, Some(SortDirection::Desc))
+            && rowid_range_allowed
+            && where_clause.is_none()
+        {
+            return codegen_select_rowid_range_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                time_travel,
+                schema,
+                columns,
+                stmt.limit.as_ref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                RowidRangeTarget::default(),
+                true,
+                None,
+                false,
             );
         }
 

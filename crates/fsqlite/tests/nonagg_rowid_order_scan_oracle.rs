@@ -1,9 +1,10 @@
-//! bd-nonagg-rowid-order-scan: `SELECT ... FROM t [WHERE <filter>] ORDER BY <rowid> ASC [LIMIT k]`
-//! needs NO sorter — a table scan (Rewind+Next) is already in ascending rowid order (rowid is unique,
-//! no ties). Previously `resolve_order_by_index_plan` returned None for the rowid, so all rows were
-//! sorted. This routes to the plain scan (filter + LIMIT/OFFSET, stops early under LIMIT). Compared IN
-//! OUTPUT ORDER against C SQLite; ASC cases assert NO sorter opcode; DESC / non-rowid ORDER BY still use
-//! the sorter (correctness preserved).
+//! bd-nonagg-rowid-order-scan (+ -desc): `SELECT ... FROM t ORDER BY <rowid> [ASC|DESC] [LIMIT k]` with
+//! NO WHERE needs NO sorter — a forward table scan (Rewind+Next) is already ascending rowid order and a
+//! reverse walk (Last+Prev) is descending, and the rowid is unique so there are no ties. Previously
+//! `resolve_order_by_index_plan` returned None for the rowid, so all rows were sorted. ASC routes to the
+//! plain scan; DESC to the unbounded descending rowid-range scan (both apply LIMIT/OFFSET, stop early).
+//! Compared IN OUTPUT ORDER against C SQLite; WHERE-less rowid cases assert NO sorter opcode; any WHERE
+//! (this cut) or non-rowid ORDER BY still uses the sorter (correctness preserved).
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 fn render(v: &SqliteValue) -> String {
@@ -45,29 +46,36 @@ fn nonagg_rowid_order_scan_matches_sqlite() {
         let c = if i % 19 == 0 { "NULL".to_owned() } else { format!("{}", i % 12) };
         ins(&f, &r, &format!("INSERT INTO t VALUES ({i}, {a}, {c}, 'v{}');", i % 7));
     }
-    // WHERE-less `ORDER BY <rowid> ASC`: served by the plain scan, NO sorter, verified in output order.
+    // WHERE-less `ORDER BY <rowid>` (ASC or DESC): served by a scan, NO sorter, verified in output order.
     let scans = [
+        // ASC
         "SELECT * FROM t ORDER BY id",
         "SELECT * FROM t ORDER BY id LIMIT 10",
         "SELECT id, x FROM t ORDER BY id ASC LIMIT 5 OFFSET 3",
         "SELECT rowid, x FROM t ORDER BY rowid LIMIT 3",             // explicit rowid keyword
         "SELECT * FROM t ORDER BY id ASC",
         "SELECT id FROM t ORDER BY id LIMIT 1",                      // top-1
+        // DESC (bd-nonagg-rowid-order-scan-desc): Last + Prev, no sorter.
+        "SELECT * FROM t ORDER BY id DESC",
+        "SELECT * FROM t ORDER BY id DESC LIMIT 10",                 // latest-10
+        "SELECT id, x FROM t ORDER BY id DESC LIMIT 5 OFFSET 3",
+        "SELECT rowid, x FROM t ORDER BY rowid DESC LIMIT 3",
+        "SELECT id FROM t ORDER BY id DESC LIMIT 1",                 // bottom-1
     ];
     for sql in scans {
         cmp_ord(&f, &r, sql, "rowid-order-scan");
-        assert!(!has_sorter(&f, sql), "WHERE-less ORDER BY rowid ASC must NOT open a sorter: `{sql}`");
+        assert!(!has_sorter(&f, sql), "WHERE-less ORDER BY rowid must NOT open a sorter: `{sql}`");
     }
-    // NOT bypassed by this cut (still correct via the sorter): any WHERE, DESC, or non-rowid ORDER BY.
+    // NOT bypassed by this cut (still correct via the sorter): any WHERE, or a non-rowid ORDER BY.
     let sorted = [
         "SELECT * FROM t WHERE x = 'v3' ORDER BY id",     // has WHERE -> declines (follow-up)
         "SELECT c FROM t WHERE a > 10 ORDER BY id LIMIT 20",
-        "SELECT * FROM t ORDER BY id DESC LIMIT 10",      // DESC (follow-up)
+        "SELECT * FROM t WHERE a < 5 ORDER BY id DESC",   // has WHERE + DESC -> declines
         "SELECT * FROM t ORDER BY x LIMIT 10",            // non-rowid ORDER BY
-        "SELECT * FROM t WHERE a < 5 ORDER BY id DESC",
+        "SELECT * FROM t ORDER BY x DESC",                // non-rowid DESC
     ];
     for sql in sorted {
         cmp_ord(&f, &r, sql, "still-sorts");
-        assert!(has_sorter(&f, sql), "WHERE / DESC / non-rowid ORDER BY should still use the sorter: `{sql}`");
+        assert!(has_sorter(&f, sql), "WHERE / non-rowid ORDER BY should still use the sorter: `{sql}`");
     }
 }
