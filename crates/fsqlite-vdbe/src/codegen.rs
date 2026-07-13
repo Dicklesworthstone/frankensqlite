@@ -1957,16 +1957,39 @@ pub fn codegen_select(
     // We probe with [bound_value, i64::MIN] so SeekGE anchors on the first
     // duplicate entry in non-unique indexes and the loop can walk the full
     // duplicate run via Next + IdxRowid.
-    let index_eq = if is_aggregate {
+    let index_eq_target = if is_aggregate {
         None
     } else {
         extract_column_eq_target(where_clause.as_deref(), table, table_alias)
+    };
+    // Heuristic equality lowering must never compete with an explicit table hint. Resolve the exact
+    // usable index once, including collation and physical-shape checks, and carry that same object into
+    // emission. This prevents validating one index and then opening a different first-match index.
+    // The current equality extractor accepts only a bare column paired with a simple constant, so the
+    // comparison collation is exactly the column's declared collation; explicit COLLATE shapes decline.
+    let heuristic_index_eq: Option<(&IndexSchema, &Expr)> = if from_index_hint.is_some() {
+        None
+    } else {
+        index_eq_target
+            .as_ref()
+            .and_then(|(column_name, target_expr)| {
+                let comparison_collation = table
+                    .column_index(column_name)
+                    .and_then(|column_idx| table.columns.get(column_idx))
+                    .and_then(|column| column.collation.as_deref());
+                table
+                    .single_column_index_for_column_with_collation(
+                        column_name,
+                        comparison_collation,
+                    )
+                    .map(|index| (index, *target_expr))
+            })
     };
 
     // bd-nonagg-eq-residual: `SELECT <non-covering cols> FROM t WHERE <int/text-indexed col> = <lit>
     // AND <residual on a non-indexed col>` (e.g. `SELECT * ... WHERE a = 5 AND c = 7`). The planner
     // emits an IndexEquality directive for the `col=lit` conjunct which bypasses on the residual it
-    // cannot enforce (or emits none), reaching the heuristic chain below — where `index_eq`'s bare-`Eq`
+    // cannot enforce (or emits none), reaching the heuristic chain below — where `index_eq_target`'s bare-`Eq`
     // detection misses the conjunction and the query full-scans. Detect the exact eq-literal prefix (via
     // the residual-safe `aggregate_index_prefix_literal_residual_target`, which requires ≥1 residual
     // conjunct so pure `col=lit` still routes through the directive) and seek the `col=lit` block,
@@ -2468,7 +2491,8 @@ pub fn codegen_select(
                                 } else {
                                     Some("index_equality_target_missing")
                                 }
-                            } else if let Some((index_column_name, target_expr)) = index_eq.as_ref()
+                            } else if let Some((index_column_name, target_expr)) =
+                                index_eq_target.as_ref()
                             {
                                 if directive.index_key_label.as_deref().is_none_or(|label| {
                                     !label.eq_ignore_ascii_case(index_column_name)
@@ -2704,63 +2728,39 @@ pub fn codegen_select(
             idx_schema,
             planner_index_range_target_from_column_range(&index_range),
         )
-    } else if let Some((col_name, target_expr)) = index_eq.filter(|(col_name, _)| {
+    } else if let Some((idx_schema, target_expr)) = heuristic_index_eq.filter(|_| {
         // bd-nonagg-index-eq-order-rowid: the index-equality seek returns rows in index-key order — for a
         // SINGLE-column ASCENDING index that is exactly rowid order WITHIN the one eq value (ascending
         // seeks `(val, i64::MIN)` + walk forward; descending seeks `(val, i64::MAX)` + `Prev`), so it
         // also satisfies `ORDER BY <rowid>` ASC or DESC for free, seeking only the matching rows instead
         // of full-scanning + sorting. A composite index would order by its trailing key column, so it
         // declines and keeps the sorter / plain scan. No ORDER BY is always fine.
-        stmt.order_by.is_empty()
-            || (rowid_order.is_some()
-                && table
-                    .index_for_column(col_name)
-                    .is_some_and(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0)))
+        stmt.order_by.is_empty() || rowid_order.is_some()
     }) {
         // --- Index-seek SELECT: no ORDER BY, or `ORDER BY <rowid>` served by the seek's key order.
         let idx_desc = matches!(rowid_order, Some(SortDirection::Desc));
-        if let Some(idx_schema) = table.index_for_column(&col_name) {
-            codegen_select_index_equality_scan(
-                b,
-                cursor,
-                table,
-                table_alias,
-                schema,
-                columns,
-                where_clause.as_deref(),
-                stmt.limit.as_ref(),
-                out_regs,
-                out_col_count,
-                done_label,
-                end_label,
-                idx_schema,
-                target_expr,
-                false,
-                idx_desc,
-            )
-        } else {
-            // Fallback to full scan (respect the ORDER BY rowid direction).
-            codegen_select_full_scan(
-                b,
-                cursor,
-                table,
-                table_alias,
-                time_travel,
-                schema,
-                columns,
-                where_clause.as_deref(),
-                stmt.limit.as_ref(),
-                out_regs,
-                out_col_count,
-                done_label,
-                end_label,
-                idx_desc,
-            )
-        }
+        codegen_select_index_equality_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            target_expr,
+            false,
+            idx_desc,
+        )
     } else if let Some((idx_schema, target_expr)) = eq_residual {
         // --- Eq-prefix + residual seek (bd-nonagg-eq-residual) ---
         // Reached when the IndexEquality directive bypassed on the residual (or none was emitted) and
-        // `index_eq`'s bare-`Eq` detection missed the conjunction. Seek the `col = lit` block and filter
+        // `index_eq_target`'s bare-`Eq` detection missed the conjunction. Seek the `col = lit` block and filter
         // the FULL WHERE per row (`residual_filter = true`) instead of scanning every row.
         codegen_select_index_equality_scan(
             b,
@@ -17469,7 +17469,11 @@ pub fn codegen_update(
     // [AND <residual>]` collects the listed rows with one `SeekRowid` each (Pass 1) instead of
     // full-scanning; a residual is re-applied per seeked row. After `rowid = const`.
     let rowid_in_list = if rowid_target.is_none() {
-        extract_rowid_in_list_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        extract_rowid_in_list_residual_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
     } else {
         None
     };
@@ -17477,8 +17481,16 @@ pub fn codegen_update(
     // bounded seek+walk instead of full-scanning. Bare range, integer-literal bounds only (so Pass 1 emits
     // no anon placeholders — the SET placeholders are numbered in Pass 2 as before).
     let rowid_range = if rowid_target.is_none() && rowid_in_list.is_none() {
-        extract_rowid_range_target(stmt.where_clause.as_ref(), Some(table), stmt.table.alias.as_deref())
-            .filter(|range| range.lower.is_some() && rowid_range_fast_path_is_safe(*range) && rowid_range_bounds_are_int_literals(range))
+        extract_rowid_range_target(
+            stmt.where_clause.as_ref(),
+            Some(table),
+            stmt.table.alias.as_deref(),
+        )
+        .filter(|range| {
+            range.lower.is_some()
+                && rowid_range_fast_path_is_safe(*range)
+                && rowid_range_bounds_are_int_literals(range)
+        })
     } else {
         None
     };
@@ -17551,9 +17563,7 @@ pub fn codegen_update(
                     P4::None,
                     0,
                 );
-                if *has_residual
-                    && let Some(where_expr) = &stmt.where_clause
-                {
+                if *has_residual && let Some(where_expr) = &stmt.where_clause {
                     b.set_next_anon_placeholder(set_placeholder_count + 1);
                     emit_where_filter(
                         b,
@@ -17565,7 +17575,14 @@ pub fn codegen_update(
                         next_value,
                     );
                 }
-                b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
+                b.emit_op(
+                    Opcode::RowSetAdd,
+                    rowset_reg,
+                    matched_rowid_reg,
+                    0,
+                    P4::None,
+                    0,
+                );
                 b.resolve_label(next_value);
             }
         } else if let Some(range) = rowid_range {
@@ -18578,7 +18595,9 @@ fn codegen_update_from(
 /// filter needed). bd-delete-rowid-range / bd-update-rowid-range.
 fn rowid_range_bounds_are_int_literals(range: &RowidRangeTarget<'_>) -> bool {
     let is_int = |bound: Option<RowidRangeBound<'_>>| {
-        bound.map_or(true, |b| matches!(b.expr, Expr::Literal(Literal::Integer(_), _)))
+        bound.map_or(true, |b| {
+            matches!(b.expr, Expr::Literal(Literal::Integer(_), _))
+        })
     };
     is_int(range.lower) && is_int(range.upper)
 }
@@ -18632,7 +18651,14 @@ fn emit_rowid_range_rowset_collect(
             0,
         );
     } else {
-        b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, collect_done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Rewind,
+            table_cursor,
+            0,
+            collect_done_label,
+            P4::None,
+            0,
+        );
     }
 
     // Loop body (collect_start + 1): read the rowid, stop once past the upper bound, else add it.
@@ -18906,7 +18932,11 @@ pub fn codegen_delete(
     // [AND <residual>]` collects the listed rows with one `SeekRowid` each instead of full-scanning; when a
     // residual is present it is re-applied per seeked row before adding to the RowSet. After `rowid = const`.
     let rowid_in_list = if rowid_target.is_none() {
-        extract_rowid_in_list_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        extract_rowid_in_list_residual_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
     } else {
         None
     };
@@ -18915,8 +18945,16 @@ pub fn codegen_delete(
     // Bare range only (no residual), integer-literal bounds only (so the walk emits no anon placeholders),
     // and only after the eq / IN cases decline.
     let rowid_range = if rowid_target.is_none() && rowid_in_list.is_none() {
-        extract_rowid_range_target(stmt.where_clause.as_ref(), Some(table), stmt.table.alias.as_deref())
-            .filter(|range| range.lower.is_some() && rowid_range_fast_path_is_safe(*range) && rowid_range_bounds_are_int_literals(range))
+        extract_rowid_range_target(
+            stmt.where_clause.as_ref(),
+            Some(table),
+            stmt.table.alias.as_deref(),
+        )
+        .filter(|range| {
+            range.lower.is_some()
+                && rowid_range_fast_path_is_safe(*range)
+                && rowid_range_bounds_are_int_literals(range)
+        })
     } else {
         None
     };
@@ -18968,9 +19006,7 @@ pub fn codegen_delete(
                 P4::None,
                 0,
             );
-            if has_residual
-                && let Some(where_expr) = &stmt.where_clause
-            {
+            if has_residual && let Some(where_expr) = &stmt.where_clause {
                 b.set_next_anon_placeholder(where_base);
                 emit_where_filter(
                     b,
