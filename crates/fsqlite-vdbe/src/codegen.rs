@@ -10993,11 +10993,24 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     let where_expr = where_clause?;
     // Residual-free: the WHOLE WHERE is a range on one column.
     if let Some((col_name, range)) = extract_column_range_target(where_clause, table, table_alias) {
-        let idx = table
-            .index_for_column(&col_name)
-            .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
-        return index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range)
-            .then_some((idx, range, false));
+        // Search ALL indexes for a single-column ascending index on `col_name`. `index_for_column`
+        // returns the FIRST leading-column match, which may be a COMPOSITE `(col, …)` index that
+        // shadows a usable single-column one declared after it; filtering that result with `?` would
+        // early-return None and a `COUNT(*) WHERE a <range>` (no residual) would full-scan whenever a
+        // composite `(a, …)` index is declared before `idx_a` (bd-agg-range-shadowed-index — the same
+        // shadowing fixed for the IN-list seek). Searching all indexes finds the single-column one.
+        if let Some(idx) = table.indexes.iter().find(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx.key_term_count() == 1
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+        }) {
+            return index_range_fast_path_is_safe(table, table_alias, schema, &col_name, &range)
+                .then_some((idx, range, false));
+        }
     }
     // Residual: a range on a single-column index plus other predicates. The `bounds_ok` check below
     // requires LITERAL bounds, so the probe emits no placeholders and a `?` can appear only in the
