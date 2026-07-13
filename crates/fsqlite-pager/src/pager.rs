@@ -11274,7 +11274,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    static FAULT_HOOK_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FAULT_HOOK_TEST_GUARD: crate::fault_hooks::FaultInjectionSessionLock =
+        crate::fault_hooks::FaultInjectionSessionLock::new();
 
     const BEAD_ID: &str = "bd-bca.1";
     const DB300_E3_3_BEAD_ID: &str = "bd-db300.5.3.3";
@@ -16940,6 +16941,7 @@ mod tests {
             let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
             let pool = pager.pool.clone();
             let start = StdArc::new(std::sync::Barrier::new(3));
+            let fault_participant = _guard.participant();
 
             let spawn_commit = |page_number: u32, fill: u8| {
                 let inner = Arc::clone(&inner);
@@ -16948,6 +16950,7 @@ mod tests {
                 let pool = pool.clone();
                 let start = StdArc::clone(&start);
                 std::thread::spawn(move || {
+                    let _fault_participation = fault_participant.enter();
                     let cx = Cx::new();
                     let page_no = PageNumber::new(page_number).unwrap();
                     let page =
@@ -17069,6 +17072,7 @@ mod tests {
             let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
             let pool = pager.pool.clone();
             let start = StdArc::new(std::sync::Barrier::new(3));
+            let fault_participant = _guard.participant();
 
             let spawn_commit = |page_number: u32, fill: u8| {
                 let inner = Arc::clone(&inner);
@@ -17077,6 +17081,7 @@ mod tests {
                 let pool = pool.clone();
                 let start = StdArc::clone(&start);
                 std::thread::spawn(move || {
+                    let _fault_participation = fault_participant.enter();
                     let cx = Cx::new();
                     let page_no = PageNumber::new(page_number).unwrap();
                     let page =

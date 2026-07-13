@@ -1,7 +1,16 @@
 //! Targeted fault hooks for group-commit publish verification.
+//!
+//! Hooks retain their original process-global behavior unless the caller holds
+//! a [`FaultInjectionSession`]. A session serializes fault-injection scenarios,
+//! scopes hook consumption to explicitly participating threads, and clears all
+//! hook state on drop. This prevents unrelated concurrent pager work from
+//! stealing a one-shot hook while still supporting multi-threaded scenarios.
 
+use std::cell::Cell;
 use std::mem;
-use std::sync::{LazyLock, Mutex};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, LockResult, Mutex, MutexGuard};
 
 use fsqlite_error::{FrankenError, Result};
 use tracing::warn;
@@ -50,10 +59,178 @@ struct PagerFaultHookState {
 static PAGER_FAULT_HOOK_STATE: LazyLock<Mutex<PagerFaultHookState>> =
     LazyLock::new(|| Mutex::new(PagerFaultHookState::default()));
 
+static FAULT_INJECTION_SESSION_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_FAULT_INJECTION_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_FAULT_INJECTION_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static THREAD_FAULT_INJECTION_SESSION_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Shared lock for deterministic fault-injection scenarios.
+///
+/// Every test or harness that arms process-global hooks should acquire this
+/// lock before configuring the scenario. The acquiring thread participates
+/// automatically; worker threads must enter with a token obtained from
+/// [`FaultInjectionSession::participant`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FaultInjectionSessionLock;
+
+impl FaultInjectionSessionLock {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Acquire exclusive ownership of the process-global pager fault hooks.
+    ///
+    /// Poisoning is recovered internally because the returned RAII session
+    /// resets all hook state before use. `LockResult` is retained so this type
+    /// can replace existing `Mutex<()>` guards without bespoke call sites.
+    pub fn lock(&self) -> LockResult<FaultInjectionSession> {
+        let guard = FAULT_INJECTION_SESSION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session_id = next_fault_injection_session_id();
+        let previous_session_id =
+            ACTIVE_FAULT_INJECTION_SESSION_ID.swap(session_id, Ordering::AcqRel);
+        debug_assert_eq!(
+            previous_session_id, 0,
+            "fault session lock held while another session is active"
+        );
+        let previous_thread_session_id =
+            THREAD_FAULT_INJECTION_SESSION_ID.with(|active| active.replace(session_id));
+
+        clear();
+
+        Ok(FaultInjectionSession {
+            _guard: guard,
+            session_id,
+            previous_thread_session_id,
+        })
+    }
+}
+
+/// RAII ownership of all process-global pager fault hooks.
+///
+/// Hook checks on unrelated threads are no-ops while this value is alive.
+/// Dropping it clears all arms and records, including during panic unwinding.
+#[must_use = "dropping the session immediately removes fault-hook isolation"]
+pub struct FaultInjectionSession {
+    _guard: MutexGuard<'static, ()>,
+    session_id: u64,
+    previous_thread_session_id: u64,
+}
+
+impl FaultInjectionSession {
+    /// Create a token that lets one worker thread join this fault scenario.
+    #[must_use]
+    pub const fn participant(&self) -> FaultInjectionParticipant {
+        FaultInjectionParticipant {
+            session_id: self.session_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for FaultInjectionSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultInjectionSession")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for FaultInjectionSession {
+    fn drop(&mut self) {
+        clear();
+        THREAD_FAULT_INJECTION_SESSION_ID.with(|active| {
+            active.set(self.previous_thread_session_id);
+        });
+        let active_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.swap(0, Ordering::AcqRel);
+        debug_assert_eq!(
+            active_session_id, self.session_id,
+            "dropping a pager fault session that is not active"
+        );
+    }
+}
+
+/// Transferable permission for a worker thread to join a fault session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FaultInjectionParticipant {
+    session_id: u64,
+}
+
+impl FaultInjectionParticipant {
+    /// Enter the associated fault session on the current thread.
+    ///
+    /// The returned guard restores the thread's prior participation on drop.
+    #[must_use = "the participation guard must live for the fault-injected operation"]
+    pub fn enter(self) -> FaultInjectionParticipantGuard {
+        let active_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.load(Ordering::Acquire);
+        assert_eq!(
+            active_session_id, self.session_id,
+            "cannot enter an inactive pager fault session"
+        );
+        let previous_session_id =
+            THREAD_FAULT_INJECTION_SESSION_ID.with(|active| active.replace(self.session_id));
+        FaultInjectionParticipantGuard {
+            session_id: self.session_id,
+            previous_session_id,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Thread-bound guard returned by [`FaultInjectionParticipant::enter`].
+pub struct FaultInjectionParticipantGuard {
+    session_id: u64,
+    previous_session_id: u64,
+    _not_send: std::marker::PhantomData<Rc<()>>,
+}
+
+impl std::fmt::Debug for FaultInjectionParticipantGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultInjectionParticipantGuard")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for FaultInjectionParticipantGuard {
+    fn drop(&mut self) {
+        THREAD_FAULT_INJECTION_SESSION_ID.with(|active| {
+            debug_assert_eq!(
+                active.get(),
+                self.session_id,
+                "dropping a pager fault participant outside its session"
+            );
+            active.set(self.previous_session_id);
+        });
+    }
+}
+
+fn next_fault_injection_session_id() -> u64 {
+    loop {
+        let session_id = NEXT_FAULT_INJECTION_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        if session_id != 0 {
+            return session_id;
+        }
+    }
+}
+
+fn fault_hook_applies_to_current_thread() -> bool {
+    let active_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.load(Ordering::Acquire);
+    active_session_id == 0
+        || THREAD_FAULT_INJECTION_SESSION_ID.with(|active| active.get() == active_session_id)
+}
+
 pub fn clear() {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return;
+    }
     *state = PagerFaultHookState::default();
 }
 
@@ -62,6 +239,9 @@ pub fn take_records() -> Vec<FaultInjectionRecord> {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return Vec::new();
+    }
     mem::take(&mut state.records)
 }
 
@@ -69,6 +249,9 @@ pub fn arm_after_flush_before_publish(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return;
+    }
     state.after_flush_before_publish = Some(arm);
 }
 
@@ -80,6 +263,9 @@ pub(crate) fn maybe_inject_after_flush_before_publish(
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
     let Some(arm) = state.after_flush_before_publish.take() else {
         return Ok(());
     };
@@ -102,6 +288,9 @@ pub fn arm_during_phase_c(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return;
+    }
     state.during_phase_c = Some(arm);
 }
 
@@ -110,6 +299,9 @@ pub(crate) fn maybe_inject_during_phase_c(commit_seq: u64, db_size: u32) -> Resu
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return Ok(());
+    }
     let Some(arm) = state.during_phase_c.take() else {
         return Ok(());
     };
@@ -133,6 +325,9 @@ pub fn arm_drop_condvar_notify(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return;
+    }
     state.drop_condvar_notify = Some(arm);
 }
 
@@ -143,6 +338,9 @@ pub(crate) fn maybe_inject_drop_condvar_notify(completed_epoch: u64) -> bool {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !fault_hook_applies_to_current_thread() {
+        return false;
+    }
     let Some(arm) = state.drop_condvar_notify.take() else {
         return false;
     };
@@ -184,10 +382,50 @@ fn record_trigger(
 mod tests {
     use super::*;
 
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
+    static TEST_GUARD: FaultInjectionSessionLock = FaultInjectionSessionLock::new();
 
     fn arm(point: &str) -> FaultHookArm {
         FaultHookArm::new(format!("test-{point}"), format!("scenario-{point}"), "unit")
+    }
+
+    #[test]
+    fn scoped_session_prevents_nonparticipant_thread_from_stealing_hook() {
+        let session = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arm_after_flush_before_publish(arm("owned"));
+
+        let unrelated_result =
+            std::thread::spawn(|| maybe_inject_after_flush_before_publish(1, 1, 1))
+                .join()
+                .expect("unrelated thread should not panic");
+        assert!(
+            unrelated_result.is_ok(),
+            "a nonparticipant thread must not consume the armed hook"
+        );
+        assert!(
+            take_records().is_empty(),
+            "a nonparticipant thread must not record a trigger"
+        );
+
+        let participant = session.participant();
+        let participant_result = std::thread::spawn(move || {
+            let _participation = participant.enter();
+            maybe_inject_after_flush_before_publish(2, 3, 5)
+        })
+        .join()
+        .expect("participant thread should not panic");
+        assert!(
+            participant_result.is_err(),
+            "a participant thread must consume the armed hook"
+        );
+
+        let records = take_records();
+        assert_eq!(records.len(), 1, "the hook must fire exactly once");
+        assert_eq!(records[0].run_id, "test-owned");
+        assert!(records[0].detail.contains("flush_epoch=2"));
+        assert!(records[0].detail.contains("batch_count=3"));
+        assert!(records[0].detail.contains("frame_count=5"));
     }
 
     #[test]
