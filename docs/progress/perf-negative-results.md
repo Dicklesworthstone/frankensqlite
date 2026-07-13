@@ -18878,3 +18878,29 @@ test is on the executed path, not merely linked into it.
   index offers a trailing-range prefix for the same WHERE (let the composite path own it / decline
   together), or update the composite test to accept the better eq-seek plan — on a healthy fleet with no
   concurrent edits in that region. The non-covering base lever (`e7f8cbaf`) is unaffected and stands.
+
+## 2026-07-13 - SELECT DISTINCT <col> single-column index walk (bd-distinct-index-walk)
+
+- Target: `SELECT DISTINCT <col> FROM t` (no WHERE/ORDER BY/LIMIT) uses `codegen_select_distinct_scan`
+  (SorterOpen + full table scan + adjacent dedup), never the column's index. The `bd-5310l` profile
+  showed DISTINCT ~18M ns vs the equivalent GROUP BY ~3M ns in the same binary, suggesting ~6× headroom.
+  Candidate: the projection analog of the shipped `bd-count-distinct-index-walk` — walk the single-column
+  ASC BINARY index and `ResultRow` each distinct value once (NULLEQ compare so DISTINCT keeps one NULL),
+  no sorter, no table read. Struct + plan detector + emitter + dispatch at the `Distinctness::Distinct`
+  branch; all reverted.
+- Correctness proof (byte-set-identical, rusqlite oracle): 3/3 — INTEGER and TEXT columns with NULLs on
+  single-index and composite-shadow schemas, plus empty/all-null/all-same/mixed-with-null edges, and a
+  NOCASE column that declines to the sorter. Opcode-gated: walks the index, never opens the table or a
+  sorter.
+- Bench (release-perf, :memory:, 20k rows / 50 distinct, freshness-gated so the walk is proven active):
+  index walk `12,569,001 ns` vs sorter (`DISTINCT u`, no index) `9,506,141 ns` — the walk is ~32%
+  SLOWER. The `bd-5310l` "18M DISTINCT" was NOT representative; in the same fresh binary the vectorized
+  sorter is 9.5M, and its bulk insert+sort beats the walk's per-row B-tree `Next` + `Column`/`Eq`/`Copy`
+  VDBE dispatch over all 20k rows.
+- Result: rejected — a ~32% regression. This is the SECOND distinct/group-by dedup index-walk to lose to
+  the sorter (after `bd-group-by-count-index-walk`, `63cc5f87`, which was flat). GENERAL LESSON: in
+  memory, do NOT replace the vectorized sorter with an index walk for DISTINCT / GROUP-BY-style dedup —
+  the sorter's bulk path wins; index walks only pay off when they REDUCE rows visited (seeks), not when
+  they merely reorder an O(n) pass. Reconsider only for a large ON-DISK cold-cache table where the walk
+  reads only the narrow index while the sorter must scan+spill the full table, and gate the retry on that
+  disk-bound benchmark.
