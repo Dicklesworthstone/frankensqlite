@@ -72,10 +72,14 @@ fn assert_update_plan(c: &Connection, sql: &str, unique_seek_values: Option<usiz
             assert_eq!(op_count(&ops, "Rewind"), 0, "plan: {ops:?}");
             assert_eq!(op_count(&ops, "Next"), 0, "plan: {ops:?}");
             assert_eq!(op_count(&ops, "RowSetAdd"), unique_values, "plan: {ops:?}");
+            let returning_reseek = usize::from(
+                sql.split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("RETURNING")),
+            );
             assert_eq!(
                 op_count(&ops, "SeekRowid"),
-                unique_values + 1,
-                "one probe per unique literal plus the single Pass-2 seek: {ops:?}"
+                unique_values + 1 + returning_reseek,
+                "one probe per unique literal, the Pass-2 apply seek, and the RETURNING re-seek when present: {ops:?}"
             );
         }
         None => {
