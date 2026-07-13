@@ -2,8 +2,8 @@
 //!
 //! Covers `(a, b ASC)` and `(a, b DESC)` across ordinary hits, mixed/all-NULL `b` groups, absent and
 //! boundary prefixes, `a = NULL`, wrappers, and empty tables. The DESC `MAX(b)` and both ASC extrema
-//! use the single-row covering seek. DESC `MIN(b)` deliberately uses the general equality-prefix walk;
-//! its partial-key probe must enter the `a=?` block regardless of the next term's direction.
+//! use the single-row covering seek. DESC `MIN(b)` uses the covering equality-prefix walk; its
+//! partial-key probe must enter the `a=?` block regardless of the next term's direction.
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -167,7 +167,7 @@ fn minmax_prefix_desc_matches_sqlite() {
         }
     }
 
-    // DESC MAX: one covering seek to the block front. DESC MIN: general prefix walk, with table lookup.
+    // DESC MAX: one covering seek to the block front. DESC MIN: covering prefix walk over index keys.
     assert_eq!(
         seek_shape(&f, "SELECT MAX(b) FROM t_desc WHERE a = 5"),
         (true, false, false),
@@ -175,8 +175,8 @@ fn minmax_prefix_desc_matches_sqlite() {
     );
     assert_eq!(
         seek_shape(&f, "SELECT MIN(b) FROM t_desc WHERE a = 5"),
-        (true, false, true),
-        "MIN(b) on (a, b DESC) must walk the sought prefix and look up matching table rows"
+        (true, false, false),
+        "MIN(b) on (a, b DESC) must walk the sought prefix using covering index keys"
     );
 
     // ASC extrema each use their one-row covering end seek.
