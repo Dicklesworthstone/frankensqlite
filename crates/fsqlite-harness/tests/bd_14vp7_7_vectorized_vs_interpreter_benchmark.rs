@@ -595,7 +595,6 @@ fn test_hash_join_benchmark() {
 #[test]
 fn test_metrics_reporting() {
     let vec_before = vectorized_metrics_snapshot();
-    let dispatch_before = morsel_dispatch_metrics_snapshot();
 
     let rows = generate_lineitem_rows(5_000, 42);
     let specs = lineitem_specs();
@@ -607,14 +606,17 @@ fn test_metrics_reporting() {
     let dispatch_after = morsel_dispatch_metrics_snapshot();
 
     let delta_rows = vec_after.vectorized_rows_total - vec_before.vectorized_rows_total;
-    let delta_simd = vec_after.simd_utilization_milli - vec_before.simd_utilization_milli;
-    let delta_throughput = dispatch_after.fsqlite_morsel_throughput_rows_per_sec
-        - dispatch_before.fsqlite_morsel_throughput_rows_per_sec;
-    let delta_workers = dispatch_after.fsqlite_morsel_workers_active
-        - dispatch_before.fsqlite_morsel_workers_active;
+    // These are gauges, not monotonically increasing counters. Other tests in
+    // this binary exercise vectorized operators and morsel dispatch in
+    // parallel, so their latest value may legitimately be lower than the
+    // snapshot taken above. Report the current values directly rather than
+    // subtracting unsigned gauge samples.
+    let simd_utilization = vec_after.simd_utilization_milli;
+    let morsel_throughput = dispatch_after.fsqlite_morsel_throughput_rows_per_sec;
+    let morsel_workers = dispatch_after.fsqlite_morsel_workers_active;
 
     println!(
-        "[{BEAD_ID}] metrics: vectorized_rows={delta_rows} simd_util_milli={delta_simd} morsel_throughput={delta_throughput} morsel_workers={delta_workers}",
+        "[{BEAD_ID}] metrics: vectorized_rows={delta_rows} simd_util_milli={simd_utilization} morsel_throughput={morsel_throughput} morsel_workers={morsel_workers}",
     );
 
     // Vectorized metrics should show non-zero rows processed.

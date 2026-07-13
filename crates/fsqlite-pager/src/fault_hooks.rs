@@ -2,9 +2,11 @@
 //!
 //! Hooks retain their original process-global behavior unless the caller holds
 //! a [`FaultInjectionSession`]. A session serializes fault-injection scenarios,
-//! scopes hook consumption to explicitly participating threads, and clears all
-//! hook state on drop. This prevents unrelated concurrent pager work from
-//! stealing a one-shot hook while still supporting multi-threaded scenarios.
+//! tags every arm with its owning generation, scopes hook consumption to
+//! explicitly participating threads, and clears all hook state on drop. This
+//! prevents unrelated concurrent pager work and late participants from
+//! stealing or leaking a one-shot hook while still supporting multi-threaded
+//! scenarios.
 
 use std::cell::Cell;
 use std::mem;
@@ -37,6 +39,21 @@ impl FaultHookArm {
     }
 }
 
+#[derive(Debug)]
+struct OwnedFaultHookArm {
+    owner_session_id: u64,
+    arm: FaultHookArm,
+}
+
+impl OwnedFaultHookArm {
+    const fn new(owner_session_id: u64, arm: FaultHookArm) -> Self {
+        Self {
+            owner_session_id,
+            arm,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultInjectionRecord {
     pub trigger_seq: u64,
@@ -50,9 +67,9 @@ pub struct FaultInjectionRecord {
 #[derive(Debug, Default)]
 struct PagerFaultHookState {
     next_trigger_seq: u64,
-    after_flush_before_publish: Option<FaultHookArm>,
-    during_phase_c: Option<FaultHookArm>,
-    drop_condvar_notify: Option<FaultHookArm>,
+    after_flush_before_publish: Option<OwnedFaultHookArm>,
+    during_phase_c: Option<OwnedFaultHookArm>,
+    drop_condvar_notify: Option<OwnedFaultHookArm>,
     records: Vec<FaultInjectionRecord>,
 }
 
@@ -91,6 +108,9 @@ impl FaultInjectionSessionLock {
         let guard = FAULT_INJECTION_SESSION_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = PAGER_FAULT_HOOK_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session_id = next_fault_injection_session_id();
         let previous_session_id =
             ACTIVE_FAULT_INJECTION_SESSION_ID.swap(session_id, Ordering::AcqRel);
@@ -100,8 +120,8 @@ impl FaultInjectionSessionLock {
         );
         let previous_thread_session_id =
             THREAD_FAULT_INJECTION_SESSION_ID.with(|active| active.replace(session_id));
-
-        clear();
+        *state = PagerFaultHookState::default();
+        drop(state);
 
         Ok(FaultInjectionSession {
             _guard: guard,
@@ -142,15 +162,22 @@ impl std::fmt::Debug for FaultInjectionSession {
 
 impl Drop for FaultInjectionSession {
     fn drop(&mut self) {
-        clear();
-        THREAD_FAULT_INJECTION_SESSION_ID.with(|active| {
-            active.set(self.previous_thread_session_id);
-        });
+        // Serialize deactivation with every hook mutation and consumption. Once
+        // this lock is released, late participants see an inactive generation
+        // and cannot recreate a globally consumable arm.
+        let mut state = PAGER_FAULT_HOOK_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.swap(0, Ordering::AcqRel);
         debug_assert_eq!(
             active_session_id, self.session_id,
             "dropping a pager fault session that is not active"
         );
+        *state = PagerFaultHookState::default();
+        drop(state);
+        THREAD_FAULT_INJECTION_SESSION_ID.with(|active| {
+            active.set(self.previous_thread_session_id);
+        });
     }
 }
 
@@ -218,17 +245,31 @@ fn next_fault_injection_session_id() -> u64 {
     }
 }
 
-fn fault_hook_applies_to_current_thread() -> bool {
+fn current_fault_hook_session_id() -> Option<u64> {
     let active_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.load(Ordering::Acquire);
-    active_session_id == 0
-        || THREAD_FAULT_INJECTION_SESSION_ID.with(|active| active.get() == active_session_id)
+    let thread_session_id = THREAD_FAULT_INJECTION_SESSION_ID.with(Cell::get);
+    match (active_session_id, thread_session_id) {
+        (0, 0) => Some(0),
+        (active, thread) if active == thread => Some(active),
+        _ => None,
+    }
+}
+
+fn take_owned_hook_for_current_thread(
+    hook: &mut Option<OwnedFaultHookArm>,
+) -> Option<FaultHookArm> {
+    let current_session_id = current_fault_hook_session_id()?;
+    if hook.as_ref()?.owner_session_id != current_session_id {
+        return None;
+    }
+    hook.take().map(|owned| owned.arm)
 }
 
 pub fn clear() {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
+    if current_fault_hook_session_id().is_none() {
         return;
     }
     *state = PagerFaultHookState::default();
@@ -239,7 +280,7 @@ pub fn take_records() -> Vec<FaultInjectionRecord> {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
+    if current_fault_hook_session_id().is_none() {
         return Vec::new();
     }
     mem::take(&mut state.records)
@@ -249,10 +290,10 @@ pub fn arm_after_flush_before_publish(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
+    let Some(owner_session_id) = current_fault_hook_session_id() else {
         return;
-    }
-    state.after_flush_before_publish = Some(arm);
+    };
+    state.after_flush_before_publish = Some(OwnedFaultHookArm::new(owner_session_id, arm));
 }
 
 pub(crate) fn maybe_inject_after_flush_before_publish(
@@ -263,10 +304,8 @@ pub(crate) fn maybe_inject_after_flush_before_publish(
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
-        return Ok(());
-    }
-    let Some(arm) = state.after_flush_before_publish.take() else {
+    let Some(arm) = take_owned_hook_for_current_thread(&mut state.after_flush_before_publish)
+    else {
         return Ok(());
     };
 
@@ -288,10 +327,10 @@ pub fn arm_during_phase_c(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
+    let Some(owner_session_id) = current_fault_hook_session_id() else {
         return;
-    }
-    state.during_phase_c = Some(arm);
+    };
+    state.during_phase_c = Some(OwnedFaultHookArm::new(owner_session_id, arm));
 }
 
 /// Check and fire the Phase-C publication fault hook.
@@ -299,10 +338,7 @@ pub(crate) fn maybe_inject_during_phase_c(commit_seq: u64, db_size: u32) -> Resu
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
-        return Ok(());
-    }
-    let Some(arm) = state.during_phase_c.take() else {
+    let Some(arm) = take_owned_hook_for_current_thread(&mut state.during_phase_c) else {
         return Ok(());
     };
 
@@ -325,10 +361,10 @@ pub fn arm_drop_condvar_notify(arm: FaultHookArm) {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
+    let Some(owner_session_id) = current_fault_hook_session_id() else {
         return;
-    }
-    state.drop_condvar_notify = Some(arm);
+    };
+    state.drop_condvar_notify = Some(OwnedFaultHookArm::new(owner_session_id, arm));
 }
 
 /// Check and fire the dropped-condvar-notify hook.
@@ -338,10 +374,7 @@ pub(crate) fn maybe_inject_drop_condvar_notify(completed_epoch: u64) -> bool {
     let mut state = PAGER_FAULT_HOOK_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !fault_hook_applies_to_current_thread() {
-        return false;
-    }
-    let Some(arm) = state.drop_condvar_notify.take() else {
+    let Some(arm) = take_owned_hook_for_current_thread(&mut state.drop_condvar_notify) else {
         return false;
     };
 
@@ -426,6 +459,157 @@ mod tests {
         assert!(records[0].detail.contains("flush_epoch=2"));
         assert!(records[0].detail.contains("batch_count=3"));
         assert!(records[0].detail.contains("frame_count=5"));
+    }
+
+    #[test]
+    fn session_owned_hook_is_inert_while_owner_generation_is_inactive() {
+        let session = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arm_after_flush_before_publish(arm("owned-generation"));
+
+        let session_id = session.session_id;
+        let previous_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.swap(0, Ordering::AcqRel);
+        assert_eq!(previous_session_id, session_id);
+
+        let unrelated_result =
+            std::thread::spawn(|| maybe_inject_after_flush_before_publish(1, 1, 1)).join();
+
+        let inactive_session_id =
+            ACTIVE_FAULT_INJECTION_SESSION_ID.swap(session_id, Ordering::AcqRel);
+        assert_eq!(inactive_session_id, 0);
+        let unrelated_result = unrelated_result.expect("unrelated thread should not panic");
+        assert!(
+            unrelated_result.is_ok(),
+            "an inactive session's arm must not become a legacy-global hook"
+        );
+
+        assert!(
+            maybe_inject_after_flush_before_publish(2, 2, 2).is_err(),
+            "the reactivated owner must retain exclusive access to its arm"
+        );
+    }
+
+    #[test]
+    fn inactive_session_context_cannot_arm_a_legacy_global_hook() {
+        let session = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session_id = session.session_id;
+        let previous_session_id = ACTIVE_FAULT_INJECTION_SESSION_ID.swap(0, Ordering::AcqRel);
+        assert_eq!(previous_session_id, session_id);
+
+        arm_after_flush_before_publish(arm("stale-participant"));
+
+        let inactive_session_id =
+            ACTIVE_FAULT_INJECTION_SESSION_ID.swap(session_id, Ordering::AcqRel);
+        assert_eq!(inactive_session_id, 0);
+        assert!(
+            PAGER_FAULT_HOOK_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .after_flush_before_publish
+                .is_none(),
+            "a stale enrolled context must not create an owner-zero hook"
+        );
+    }
+
+    #[test]
+    fn entered_participant_cannot_cross_session_generation() {
+        let first_session = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale_participant = first_session.participant();
+        let participant_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let next_generation_active = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let worker_entered = std::sync::Arc::clone(&participant_entered);
+        let worker_next_generation = std::sync::Arc::clone(&next_generation_active);
+        let worker = std::thread::spawn(move || {
+            let _participation = stale_participant.enter();
+            worker_entered.wait();
+            worker_next_generation.wait();
+
+            arm_after_flush_before_publish(arm("stale-generation"));
+            maybe_inject_after_flush_before_publish(1, 1, 1)
+        });
+
+        participant_entered.wait();
+        drop(first_session);
+
+        let _second_session = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arm_after_flush_before_publish(arm("current-generation"));
+        next_generation_active.wait();
+
+        let stale_result = worker.join().expect("stale participant must not panic");
+        assert!(
+            stale_result.is_ok(),
+            "a participant from the previous generation must not consume the new arm"
+        );
+        assert!(
+            maybe_inject_after_flush_before_publish(2, 2, 2).is_err(),
+            "the current generation must retain its arm"
+        );
+        let records = take_records();
+        assert_eq!(records.len(), 1, "only the current arm may fire");
+        assert_eq!(records[0].run_id, "test-current-generation");
+    }
+
+    #[test]
+    fn session_panic_unwind_clears_arms_and_recovers_lock() {
+        let outcome = std::panic::catch_unwind(|| {
+            let _session = TEST_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            arm_after_flush_before_publish(arm("panic-owned"));
+            panic!("intentional fault-session unwind");
+        });
+        assert!(outcome.is_err(), "the test panic must be observed");
+
+        let recovered_session = TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            maybe_inject_after_flush_before_publish(1, 1, 1).is_ok(),
+            "an arm from the unwound session must be cleared"
+        );
+        assert!(
+            take_records().is_empty(),
+            "an unwound session must not retain evidence records"
+        );
+        // The panic intentionally poisoned the raw std mutex. Prove that the
+        // public session API recovered it, then restore pristine global state
+        // before releasing the mutex so no waiter can inherit the poison.
+        FAULT_INJECTION_SESSION_LOCK.clear_poison();
+        drop(recovered_session);
+    }
+
+    #[test]
+    fn legacy_global_hook_remains_consumable_across_threads() {
+        let _serialization = FAULT_INJECTION_SESSION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            ACTIVE_FAULT_INJECTION_SESSION_ID.load(Ordering::Acquire),
+            0,
+            "the raw serialization guard must not activate a scoped session"
+        );
+        clear();
+        arm_after_flush_before_publish(arm("legacy-global"));
+
+        let result = std::thread::spawn(|| maybe_inject_after_flush_before_publish(3, 5, 8))
+            .join()
+            .expect("legacy consumer thread must not panic");
+        assert!(
+            result.is_err(),
+            "owner-zero hooks must preserve their legacy cross-thread behavior"
+        );
+        let records = take_records();
+        assert_eq!(records.len(), 1, "the legacy hook must fire exactly once");
+        assert_eq!(records[0].run_id, "test-legacy-global");
+        clear();
     }
 
     #[test]

@@ -1871,9 +1871,9 @@ pub fn codegen_select(
     // Most aggregates still require a full scan + AggStep/AggFinal path. Plain
     // COUNT(*) is handled separately below so it can keep a specialized fast path.
     let is_aggregate = has_aggregate_columns(columns);
-
+    let forced_index_hint = matches!(from_index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_)));
     // Check for rowid-equality WHERE clause (only for non-aggregate queries).
-    let rowid_target = if is_aggregate {
+    let rowid_target = if is_aggregate || forced_index_hint {
         None
     } else {
         extract_rowid_target_expr(where_clause.as_deref(), Some(table), table_alias)
@@ -1881,7 +1881,8 @@ pub fn codegen_select(
     let rowid_order = (!stmt.order_by.is_empty())
         .then(|| resolve_order_by_rowid_direction(table, table_alias, columns, &stmt.order_by))
         .flatten();
-    let rowid_range_allowed = !((is_aggregate && !simple_count_star)
+    let rowid_range_allowed = !(forced_index_hint
+        || (is_aggregate && !simple_count_star)
         || distinct != Distinctness::All
         || !group_by.is_empty()
         || having.is_some()
@@ -1905,6 +1906,7 @@ pub fn codegen_select(
         None
     };
     let index_range = if is_aggregate
+        || from_index_hint.is_some()
         || time_travel.is_some()
         || distinct != Distinctness::All
         || !group_by.is_empty()
@@ -1976,6 +1978,7 @@ pub fn codegen_select(
     // full scan (lifting that needs the covering-decision fix, see the negative-results ledger). The
     // `col=lit` rows come back in rowid order — the full scan's order within that block — so byte-identical.
     let eq_residual: Option<(&IndexSchema, &Expr)> = if is_aggregate
+        || from_index_hint.is_some()
         || !stmt.order_by.is_empty()
         || distinct != Distinctness::All
         || !group_by.is_empty()

@@ -8,6 +8,9 @@
 # Structured logging contract:
 #   emits JSONL events with trace_id/run_id/scenario_id/seed/timing/outcome
 #   to artifacts/bd-2yqp6.3.3/<run_id>/events.jsonl
+#
+# Set FSQLITE_DISABLE_RCH=1 to force a local Cargo invocation (for example on
+# GitHub-hosted runners, where rch is not installed).
 
 set -euo pipefail
 
@@ -54,8 +57,13 @@ if [[ ! -f "${MANIFEST}" ]]; then
 fi
 emit_event "manifest_presence" "pass" "pass" "canonical manifest exists"
 
+DASHBOARD_RUNNER=(cargo run -p fsqlite-harness --bin feature_coverage_dashboard --)
+if command -v rch >/dev/null 2>&1 && [[ "${FSQLITE_DISABLE_RCH:-0}" != "1" ]]; then
+  DASHBOARD_RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin feature_coverage_dashboard --)
+fi
+
 emit_event "dashboard" "start" "running" "building feature coverage dashboard"
-if rch exec -- cargo run -p fsqlite-harness --bin feature_coverage_dashboard -- \
+if "${DASHBOARD_RUNNER[@]}" \
   --manifest "${MANIFEST}" \
   --output-json "${REPORT_JSON}" \
   --run-id "${RUN_ID}" \

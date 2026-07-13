@@ -156,12 +156,22 @@ impl SeqLock {
     /// exhausted (should never happen in practice).
     #[inline]
     pub fn read(&self, data_key: &str) -> Option<u64> {
+        self.read_with_retry_observer(data_key, |_| {})
+    }
+
+    #[inline]
+    fn read_with_retry_observer(
+        &self,
+        data_key: &str,
+        mut observe_retry: impl FnMut(u32),
+    ) -> Option<u64> {
         let mut retries: u32 = 0;
 
         let result = loop {
             let seq1 = self.seq.load(Ordering::Acquire);
             if seq1 & 1 == 1 {
                 retries += 1;
+                observe_retry(retries);
                 if retries >= MAX_RETRIES {
                     emit_trace(data_key, retries);
                     return None;
@@ -182,6 +192,7 @@ impl SeqLock {
             }
 
             retries += 1;
+            observe_retry(retries);
             if retries >= MAX_RETRIES {
                 emit_trace(data_key, retries);
                 return None;
@@ -740,45 +751,41 @@ mod tests {
     /// spin-retry until the sequence becomes even again.
     #[test]
     fn test_seqlock_writer_blocks_readers() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::Ordering;
 
         let sl = Arc::new(SeqLock::new(0));
-        let reader_retries = Arc::new(AtomicU64::new(0));
-        let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retry_observed = Arc::new(Barrier::new(2));
+        let writer_released = Arc::new(Barrier::new(2));
 
-        // Spawn a reader that will encounter the odd sequence.
+        // Keep the writer active until the reader proves that it observed the
+        // odd sequence. The second barrier holds the reader in its first retry
+        // callback until the new value and even sequence are both published.
+        let guard = sl.write_lock.lock();
+        sl.seq.fetch_add(1, Ordering::Release); // odd = writing
+
         let reader_sl = Arc::clone(&sl);
-        let reader_wd = Arc::clone(&writer_done);
-        let rr = Arc::clone(&reader_retries);
+        let reader_retry_observed = Arc::clone(&retry_observed);
+        let reader_writer_released = Arc::clone(&writer_released);
         let reader = thread::spawn(move || {
-            // Wait for writer to signal it's mid-write.
-            while !reader_wd.load(Ordering::Acquire) {
-                thread::yield_now();
-            }
-            // Now attempt a read — should see retries.
-            let before = seqlock_metrics().fsqlite_seqlock_retries_total;
-            let val = reader_sl.read("writer_blocks_test");
-            let after = seqlock_metrics().fsqlite_seqlock_retries_total;
-            rr.store(after.saturating_sub(before), Ordering::Release);
-            val
+            let mut observed_retries = 0;
+            let value = reader_sl.read_with_retry_observer("writer_blocks_test", |retries| {
+                observed_retries = retries;
+                if retries == 1 {
+                    reader_retry_observed.wait();
+                    reader_writer_released.wait();
+                }
+            });
+            (value, observed_retries)
         });
 
-        // Writer: hold the lock briefly to create contention.
-        {
-            let _guard = sl.write_lock.lock();
-            sl.seq.fetch_add(1, Ordering::Release); // odd = writing
-            writer_done.store(true, Ordering::Release);
-            // Hold for 10ms so reader definitely sees odd sequence.
-            thread::sleep(Duration::from_millis(10));
-            sl.value.store(999, Ordering::Release);
-            sl.seq.fetch_add(1, Ordering::Release); // even = done
-        }
+        retry_observed.wait();
+        sl.value.store(999, Ordering::Release);
+        sl.seq.fetch_add(1, Ordering::Release); // even = done
+        drop(guard);
+        writer_released.wait();
 
-        let result = reader.join().unwrap();
+        let (result, retries) = reader.join().unwrap();
         assert_eq!(result, Some(999), "reader should see final value");
-
-        // The reader should have retried at least once while sequence was odd.
-        let retries = reader_retries.load(Ordering::Acquire);
         assert!(
             retries > 0,
             "bd-3wop3.6: reader should have retried during writer hold, got {retries} retries"

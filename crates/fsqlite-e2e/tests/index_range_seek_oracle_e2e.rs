@@ -168,9 +168,11 @@ fn index_range_seek_matches_sqlite() {
         "SELECT id, w FROM t WHERE k BETWEEN 2 AND 5",
         "SELECT rr, w FROM t WHERE k > 5",
         // Declines that must still be correct: text literal on a numeric column (NUMERIC
-        // affinity but not a numeric literal -> scan), NOT INDEXED, DISTINCT.
+        // affinity but not a numeric literal -> scan), explicit index directives, DISTINCT.
         "SELECT id FROM t WHERE k > '3'",
         "SELECT id FROM t NOT INDEXED WHERE k BETWEEN 2 AND 5",
+        "SELECT id FROM t INDEXED BY idx_t_w WHERE k BETWEEN 2 AND 5",
+        "SELECT id FROM t INDEXED BY idx_t_w WHERE id BETWEEN 2 AND 5",
         // TEXT column range on a BINARY-collated index (bd-xiojw): now seeks; must stay exact.
         "SELECT id FROM t WHERE w > 'r05'",
         "SELECT id FROM t WHERE w BETWEEN 'r03' AND 'r08'",
@@ -243,10 +245,12 @@ fn index_range_seek_emits_seek_for_numeric_literals() {
         );
     }
 
-    // Declined shapes keep the correct full scan (no index walk): NOT INDEXED, and a text literal
-    // on a numeric column (a literal is not coerced, so it stays a scan).
+    // Declined shapes keep the correct full scan (no unhinted index walk): NOT INDEXED,
+    // a forced unrelated index, and a text literal on a numeric column. In particular,
+    // INDEXED BY idx_t_w must not be silently replaced by the idx_t_k range heuristic.
     for sql in [
         "SELECT id FROM t NOT INDEXED WHERE k BETWEEN 2 AND 5",
+        "SELECT id FROM t INDEXED BY idx_t_w WHERE k BETWEEN 2 AND 5",
         "SELECT id FROM t WHERE k > '3'",
     ] {
         let ops = opcodes(&f, sql);

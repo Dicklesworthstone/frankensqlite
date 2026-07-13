@@ -29,6 +29,31 @@
 
 The current runnable engine is already real, but still hybrid. Compatibility mode over standard SQLite files is the live runtime path today; Native mode / ECS sections below describe the longer-term design plus partial implementation work. See "Current Implementation Status" before treating every section as present-day behavior.
 
+### Install the CLI
+
+Linux and macOS:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.sh?$(date +%s)" | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/install.ps1?$([DateTime]::UtcNow.Ticks)" | iex
+```
+
+The installers select the native release artifact, require its SHA-256 entry,
+authenticate the signed checksum manifest when `minisign` is available, and
+run exact-version plus SQL smoke tests before reporting success. The Linux
+artifacts are fully static so the same downloads work on glibc- and musl-based
+distributions. Exact-version, air-gapped, custom-destination, source-build, and
+post-install verification controls are documented by `install.sh --help` and
+`Get-Help ./install.ps1 -Detailed`. Rust users can instead install the CLI with
+`cargo install fsqlite-cli --locked`. Prebuilt installer support begins with
+v0.1.16; when `minisign` is present, a missing or invalid signature fails
+closed rather than silently downgrading authenticity.
+
 ### Why FrankenSQLite?
 
 | Feature | C SQLite | FrankenSQLite |

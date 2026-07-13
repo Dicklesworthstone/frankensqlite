@@ -23,6 +23,15 @@ Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
 two low-level helper APIs now expose failure explicitly instead of fabricating
 lossy values.
 
+### Added
+
+- Production Unix and Windows installers now select the native release asset,
+  require its SHA-256 entry, optionally authenticate the signed checksum
+  manifest with the embedded minisign trust anchor, validate candidates before
+  atomic replacement, and run bounded exact-version and SQL smoke tests by
+  default. Exact-tag source and air-gapped fallbacks are explicit, mutually
+  exclusive modes; the generic Linux assets are fully static musl binaries.
+
 ### Fixed
 
 - **`INSERT ... ON CONFLICT DO UPDATE` no longer reopens a leaf page freed by
@@ -100,6 +109,9 @@ lossy values.
   equality prefix or prefix-plus-range constraint. Integer, text, and bound
   parameter residuals are evaluated for every candidate row, preserving
   `COUNT`/`SUM` correctness while retaining the bounded seek plan.
+- Explicit `NOT INDEXED` table hints now disable the pre-directive covering
+  range fast path as well as ordinary planner-selected indexes. The optimized
+  path can no longer emit `IdxRowid`/`SeekGE` behind a caller's scan directive.
 - `MIN`/`MAX` over the trailing term of a composite index now seeks with a true
   partial equality-prefix key. It no longer fabricates an integer sentinel
   that skips the NULL region on ascending indexes or points at the wrong
@@ -148,13 +160,20 @@ lossy values.
   explicitly requested. Ordinary parallel unit tests no longer rewrite tracked
   evidence with wall-clock timing or process-global metric noise.
 - Pager fault-injection scenarios now own a serialized, panic-safe session.
-  Only explicitly enrolled worker threads can consume an armed one-shot hook,
-  so parallel tests cannot steal another scenario's fault or evidence record.
+  Every one-shot hook is tagged with its owner generation, only explicitly
+  enrolled worker threads can consume it, and teardown revokes the generation
+  atomically with clearing hook state. Parallel tests and late participants can
+  neither steal another scenario's fault nor leak it as a global hook.
 - MVCC reclamation registries now own independent epoch collectors, and
   process-global tracing, telemetry, SSI evidence, logical-clock, pager-profile,
   and runtime-obligation tests isolate their mutable state. The default-parallel
   MVCC suite and release gates are deterministic instead of cross-blocking or
   consuming another test's observations.
+- Release verification no longer assumes every runner has `rch`: the feature
+  coverage dashboard selects remote compilation when available and otherwise
+  runs Cargo locally. Parallel benchmark reporting also treats utilization,
+  throughput, and worker-count samples as gauges rather than subtracting them
+  as unsigned counters.
 - The WASM workflow executes the binding suite in headless Chrome in addition
   to host tests and wasm32 compilation, so browser-only runtime panics are
   release-blocking.
