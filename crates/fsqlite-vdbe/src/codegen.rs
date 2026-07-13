@@ -1902,9 +1902,19 @@ pub fn codegen_select(
     } else {
         extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
             |(col_name, range)| {
-                let idx = table
-                    .index_for_column(&col_name)
-                    .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+                // All-index search: a composite `(col, …)` index declared before `idx_col` shadows it
+                // in `index_for_column`, and filtering that result with `?` would decline even though a
+                // usable single-column index exists — full-scanning `WHERE col <range>` (non-aggregate
+                // mirror of bd-agg-range-shadowed-index). Search every index instead.
+                let idx = table.indexes.iter().find(|idx| {
+                    idx.supports_direct_column_lookup()
+                        && idx.key_term_count() == 1
+                        && !idx.key_term_descending(0)
+                        && idx
+                            .columns
+                            .first()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+                })?;
                 // bd-wimmv/bd-ss48y follow-up: the single-column range seek streams in `(col, rowid)`
                 // order (single-key index), so it satisfies a deterministic `ORDER BY col, <rowid>`
                 // (or bare `ORDER BY col` when the index is UNIQUE — no ties) without a sorter —
@@ -2084,9 +2094,17 @@ pub fn codegen_select(
     {
         extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
             |(col_name, range)| {
-                let idx = table
-                    .index_for_column(&col_name)
-                    .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))?;
+                // All-index search (see the ascending `index_range` above): don't let a composite
+                // `(col, …)` index shadow a usable single-column one and force a full scan.
+                let idx = table.indexes.iter().find(|idx| {
+                    idx.supports_direct_column_lookup()
+                        && idx.key_term_count() == 1
+                        && !idx.key_term_descending(0)
+                        && idx
+                            .columns
+                            .first()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+                })?;
                 if !range_order_by_is_deterministic(
                     &col_name,
                     &stmt.order_by,
