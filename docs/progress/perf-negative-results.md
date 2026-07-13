@@ -18739,3 +18739,46 @@ test is on the executed path, not merely linked into it.
   retry the standalone adjacent-cell equality probe inside `try_table_seek_cache`. Reconsider only
   with a new profile showing dense cached leaf search as a dominant cost and a broader batched-run
   design that removes per-probe search and cache-maintenance work together.
+
+## 2026-07-13 - GROUP BY COUNT(*) index-stream walk vs sorter (bd-group-by-count-index-walk)
+
+- Target: the `bd-5310l` distinct/group-by profile hypothesis that `SELECT <col>, COUNT(*) FROM t
+  GROUP BY <col>` over an indexed column is served by a full table scan into an ephemeral sorter
+  (O(n log n) sort + two passes) and that streaming the pre-sorted index would win. Candidate: replace
+  that path, when the group column carries a single-column ASC BINARY index, with a single covering
+  index walk — open the index, count each run of adjacent-equal keys (`Ne` with NULLEQ `0x80` so NULLs
+  group like the sorter's own boundary test), emit `(key, count)` per group. No ephemeral sorter, no
+  table read (COUNT(*) is covering), one pass. Direct mirror of the shipped `bd-count-distinct-index-walk`
+  / `bd-minmax-index-seek` machinery.
+- Candidate touched `crates/fsqlite-vdbe/src/codegen.rs` (`group_by_count_index_walk_plan` +
+  `codegen_select_group_by_count_index_walk`, dispatched at the top of
+  `codegen_select_group_by_aggregate` behind a new `allow_index_seek` thread) plus a
+  `group_by_count_index_walk_oracle` test. Landed briefly at `7279c295`, then reverted here after the
+  freshness-validated bench came back flat.
+- Correctness proof (byte-exact, rusqlite oracle, `cargo test`): 3/3 across INTEGER/TEXT group columns
+  with NULLs, single-index and composite-shadow schemas, both `<col>,COUNT(*)` and `COUNT(*),<col>`
+  orders, `ORDER BY <col>`, and the empty/all-NULL/all-same/all-distinct/single-row edges; a NOCASE
+  column declines to the sorter, still byte-exact. Golden bytecode snapshots unchanged. A fresh debug
+  EXPLAIN confirmed the walk fires (`sorter=false`) for the indexed INT and TEXT queries and declines
+  (`sorter=true`) for the non-indexed column.
+- Bench trap and correction: the first two release-perf runs read a STALE remote artifact (the walk
+  was not in the timed binary — EXPLAIN showed `sorter=true` on the indexed column), so their apparent
+  "parity" was sorter-vs-sorter and meaningless. Re-run with `cargo clean -p fsqlite-vdbe` in the same
+  invocation and an in-test freshness gate that asserts `!uses_sorter` on the indexed query before
+  timing (panics rather than mislead). :memory:, 200k rows / 60 groups, n=200, warmup 5:
+
+  | query | plan (verified) | ns/query |
+  |---|---|---:|
+  | INT  GROUP BY ki COUNT | walk (`sorter=false`) | `19,105,380` |
+  | INT  GROUP BY ui COUNT | sorter (`sorter=true`) | `18,852,338` |
+  | TEXT GROUP BY kt COUNT | walk (`sorter=false`) | `52,438,013` |
+  | TEXT GROUP BY ut COUNT | sorter (`sorter=true`) | `53,205,628` |
+
+- Result: rejected. The covering walk is byte-exact but perf-flat versus the vectorized sorter — INT is
+  ~1.3% slower, TEXT ~1.4% faster, both inside run-to-run noise. The `bd-5310l` premise (that the
+  pre-sorted index stream would beat the sort-then-group path) does not hold in memory: the vectorized
+  sorter already handles 200k integer/text group keys at parity, and the walk's per-row `Ne`/`Copy`/
+  `AddImm` offsets its single-pass advantage. Reconsider only for a large ON-DISK table with a cold
+  page cache, where the covering walk reads only the narrow index and the sorter must scan the full
+  wide table — a covering-I/O win the in-memory harness cannot expose — and gate the retry on that
+  disk-bound benchmark, not this one.
