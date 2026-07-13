@@ -14,7 +14,10 @@ fn render(v: &SqliteValue) -> String {
         SqliteValue::Integer(n) => n.to_string(),
         SqliteValue::Float(f) => format!("{f:?}"),
         SqliteValue::Text(s) => format!("'{s}'"),
-        SqliteValue::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        SqliteValue::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
     }
 }
 
@@ -42,7 +45,10 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
                     rusqlite::types::Value::Real(f) => format!("{f:?}"),
                     rusqlite::types::Value::Text(s) => format!("'{s}'"),
                     rusqlite::types::Value::Blob(b) => {
-                        format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>())
+                        format!(
+                            "X'{}'",
+                            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                        )
                     }
                 });
             }
@@ -78,15 +84,27 @@ fn insert_both(f: &Connection, r: &rusqlite::Connection, sql: &str) {
 }
 
 fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, label: &str) {
-    assert_eq!(frank_rows(f, sql), sqlite_rows(r, sql), "[{label}] diverged: `{sql}`");
+    assert_eq!(
+        frank_rows(f, sql),
+        sqlite_rows(r, sql),
+        "[{label}] diverged: `{sql}`"
+    );
 }
 
 #[test]
 fn rowid_range_before_directive_matches_sqlite() {
     let (f, r) = setup(&["CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, x TEXT);"]);
     for i in 1..=400_i64 {
-        let a = if i % 11 == 0 { "NULL".to_owned() } else { format!("{}", i % 50) };
-        insert_both(&f, &r, &format!("INSERT INTO t VALUES ({i}, {a}, 'v{}');", i % 30));
+        let a = if i % 11 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}", i % 50)
+        };
+        insert_both(
+            &f,
+            &r,
+            &format!("INSERT INTO t VALUES ({i}, {a}, 'v{}');", i % 30),
+        );
     }
     // Rowid ranges read the table slice, so non-covering columns (a, x, *) are fine.
     let cases = [
@@ -104,8 +122,14 @@ fn rowid_range_before_directive_matches_sqlite() {
         cmp(&f, &r, sql, "rowid-range");
     }
     // Lower-bound query must position with a Seek (proves the seek fired, not a full scan).
-    assert!(has_seek(&f, "SELECT id FROM t WHERE id > 300"), "lower-bound rowid range must Seek");
-    assert!(has_seek(&f, "SELECT id, a FROM t WHERE id BETWEEN 120 AND 180"), "between must Seek");
+    assert!(
+        has_seek(&f, "SELECT id FROM t WHERE id > 300"),
+        "lower-bound rowid range must Seek"
+    );
+    assert!(
+        has_seek(&f, "SELECT id, a FROM t WHERE id BETWEEN 120 AND 180"),
+        "between must Seek"
+    );
 }
 
 #[test]
@@ -120,6 +144,14 @@ fn rowid_range_edge_cases() {
     cmp(&f, &r, "SELECT id FROM t WHERE id >= 5", "ge-boundary");
     cmp(&f, &r, "SELECT id FROM t WHERE id <= 1", "single-low");
     cmp(&f, &r, "SELECT id FROM t WHERE id > 10", "empty-high");
-    cmp(&f, &r, "SELECT id FROM t WHERE id BETWEEN 3 AND 7", "between");
-    assert!(has_seek(&f, "SELECT id FROM t WHERE id >= 5"), "edge: lower-bound must Seek");
+    cmp(
+        &f,
+        &r,
+        "SELECT id FROM t WHERE id BETWEEN 3 AND 7",
+        "between",
+    );
+    assert!(
+        has_seek(&f, "SELECT id FROM t WHERE id >= 5"),
+        "edge: lower-bound must Seek"
+    );
 }
