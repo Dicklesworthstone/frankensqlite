@@ -17497,11 +17497,16 @@ pub fn codegen_update(
     // bd-update-rowid-eq-residual: `UPDATE ... WHERE <rowid> = <const> AND <residual>` seeks the single
     // target row and applies the residual — the common optimistic-lock shape (`WHERE id = ? AND version =
     // ?`), routed through the two-pass collect so the RowSet path (and its Halloween safety) is reused.
-    let rowid_eq_residual = if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
-        extract_rowid_eq_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
-    } else {
-        None
-    };
+    let rowid_eq_residual =
+        if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
+            extract_rowid_eq_residual_target(
+                stmt.where_clause.as_ref(),
+                table,
+                stmt.table.alias.as_deref(),
+            )
+        } else {
+            None
+        };
     // bd-update-index-eq(-residual): `UPDATE ... WHERE <single-col-int-indexed> = <int> [AND <residual>]`
     // seeks the index for the candidate rowids (fresh read cursor), applies the residual per candidate,
     // instead of full-scanning. After all rowid cases decline.
@@ -18587,9 +18592,6 @@ fn codegen_update_from(
 // DELETE codegen
 // ---------------------------------------------------------------------------
 
-/// Generate VDBE bytecode for a DELETE statement.
-///
-/// Handles both rowid-equality WHERE and general column-based WHERE via
 /// True when every present bound of `range` is an integer literal — so a Pass-1 rowid-range collection
 /// emits the bounds as constants (no anonymous placeholders) and the seek+stop bounds are exact (no WHERE
 /// filter needed). bd-delete-rowid-range / bd-update-rowid-range.
@@ -18713,7 +18715,10 @@ fn index_eq_seek_target<'a, 't>(
         idx.supports_direct_column_lookup()
             && idx.key_term_count() == 1
             && !idx.key_term_descending(0)
-            && idx.columns.first().is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
     })?;
     // A TEXT column's seek comparison depends on collation; only BINARY agrees with the coerced probe and
     // the full-scan filter, so a NOCASE/RTRIM index declines (a numeric column has no collation concern).
@@ -18803,7 +18808,14 @@ fn emit_index_eq_rowset_collect(
     }
     b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
     let probe_record_reg = b.alloc_reg();
-    b.emit_op(Opcode::MakeRecord, probe_key_regs, 2, probe_record_reg, P4::None, 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        probe_key_regs,
+        2,
+        probe_record_reg,
+        P4::None,
+        0,
+    );
     b.emit_op(
         Opcode::OpenRead,
         idx_read_cursor,
@@ -18834,14 +18846,27 @@ fn emit_index_eq_rowset_collect(
         0x10,
     );
     b.emit_op(Opcode::IdxRowid, idx_read_cursor, rowid_reg, 0, P4::None, 0);
-    if residual_filter
-        && let Some(where_expr) = where_clause
-    {
+    if residual_filter && let Some(where_expr) = where_clause {
         // Position the table cursor on the candidate row and apply the full WHERE; a residual miss skips
         // to the next index entry (skip_label = the Next).
-        b.emit_jump_to_label(Opcode::SeekRowid, table_cursor, rowid_reg, skip_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            table_cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
         b.set_next_anon_placeholder(where_placeholder_base);
-        emit_where_filter(b, where_expr, table_cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            table_cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
     b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
     b.resolve_label(skip_label);
@@ -18852,10 +18877,11 @@ fn emit_index_eq_rowset_collect(
     b.emit_op(Opcode::Close, idx_read_cursor, 0, 0, P4::None, 0);
 }
 
-/// a full table scan with filter.
+/// Generate VDBE bytecode for a DELETE statement.
 ///
-/// Init → Transaction(write) → OpenWrite → Rewind → [WHERE filter] →
-/// Delete → Next → Close → Halt
+/// Uses a two-pass plan: collect exact matching rowids without mutating the table, then revisit those
+/// rowids to maintain indexes, emit `RETURNING`, and delete. Equality, literal-IN, and lower-bounded
+/// literal-range predicates use direct seeks; all other predicates use the general filtered table scan.
 pub fn codegen_delete(
     b: &mut ProgramBuilder,
     stmt: &DeleteStatement,
@@ -18960,11 +18986,16 @@ pub fn codegen_delete(
     };
     // bd-delete-rowid-eq-residual: `DELETE ... WHERE <rowid> = <const> AND <residual>` seeks the single
     // target row and applies the residual, instead of full-scanning — the common compare-and-delete shape.
-    let rowid_eq_residual = if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
-        extract_rowid_eq_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
-    } else {
-        None
-    };
+    let rowid_eq_residual =
+        if rowid_target.is_none() && rowid_in_list.is_none() && rowid_range.is_none() {
+            extract_rowid_eq_residual_target(
+                stmt.where_clause.as_ref(),
+                table,
+                stmt.table.alias.as_deref(),
+            )
+        } else {
+            None
+        };
     // bd-delete-index-eq(-residual): `DELETE ... WHERE <single-col-int-indexed> = <int> [AND <residual>]`
     // seeks the index for the candidate rowids (fresh read cursor), applies the residual per candidate,
     // instead of full-scanning. After all rowid cases decline.
