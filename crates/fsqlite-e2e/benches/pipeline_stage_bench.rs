@@ -79,6 +79,31 @@ fn setup_fsqlite_file_backed() -> (fsqlite::Connection, NamedTempFile) {
     (conn, database)
 }
 
+fn setup_csqlite_file_backed() -> (rusqlite::Connection, NamedTempFile) {
+    let database = NamedTempFile::new().unwrap();
+    let conn = rusqlite::Connection::open(database.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER, label TEXT); BEGIN;",
+    )
+    .unwrap();
+    {
+        let mut insert = conn
+            .prepare("INSERT INTO bench VALUES (?1, ?2, ?3)")
+            .unwrap();
+        for id in 0..SEED_ROWS {
+            insert
+                .execute(rusqlite::params![
+                    id,
+                    id * 17 + 31,
+                    format!("label_{id:04}")
+                ])
+                .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT; BEGIN;").unwrap();
+    (conn, database)
+}
+
 // ─── Prepare-only: parse + compile, no execution ─────────────────────
 
 // BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
@@ -211,38 +236,59 @@ fn bench_btree_seek(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=csqlite, lifecycle=prepared, storage=file, concurrency=sequential
 // BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=file, concurrency=sequential
 fn bench_btree_seek_file_clustered_in(c: &mut Criterion) {
     let mut group = c.benchmark_group("pipeline/btree_seek_file_clustered_in");
 
-    let (conn, _database) = setup_fsqlite_file_backed();
-    let stmt = conn
-        .prepare(
-            "SELECT id FROM bench WHERE id IN (
+    let (fconn, _fdatabase) = setup_fsqlite_file_backed();
+    let (cconn, _cdatabase) = setup_csqlite_file_backed();
+    let sql = "SELECT id FROM bench WHERE id IN (
                 480, 481, 482, 483, 484, 485, 486, 487,
                 488, 489, 490, 491, 492, 493, 494, 495,
                 496, 497, 498, 499, 500, 501, 502, 503,
                 504, 505, 506, 507, 508, 509, 510, 511
-            )",
-        )
-        .unwrap();
-    let expected_rows = stmt.query().unwrap();
-    let expected_ids: Vec<i64> = expected_rows
+            )";
+    let f_stmt = fconn.prepare(sql).unwrap();
+    let mut c_stmt = cconn.prepare(sql).unwrap();
+
+    let expected_rows = f_stmt.query().unwrap();
+    let mut f_expected_ids: Vec<i64> = expected_rows
         .iter()
         .filter_map(|row| match row.values().first() {
             Some(SqliteValue::Integer(id)) => Some(*id),
             _ => None,
         })
         .collect();
-    assert_eq!(expected_rows.len(), 32);
-    assert_eq!(expected_ids.len(), 32);
-    assert_eq!(expected_ids.iter().sum::<i64>(), 15_856);
+    f_expected_ids.sort_unstable();
+    let mut c_expected_ids = c_stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    c_expected_ids.sort_unstable();
+    let exact_expected_ids = (480..=511).collect::<Vec<_>>();
+    assert_eq!(f_expected_ids, exact_expected_ids);
+    assert_eq!(c_expected_ids, exact_expected_ids);
+    assert_eq!(f_expected_ids.iter().sum::<i64>(), 15_856);
 
     group.bench_function("fsqlite", |b| {
         b.iter(|| {
-            let rows = stmt.query().unwrap();
+            let rows = f_stmt.query().unwrap();
             assert_eq!(rows.len(), 32);
             black_box(rows);
+        });
+    });
+
+    group.bench_function("csqlite", |b| {
+        b.iter(|| {
+            let ids = c_stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(ids.len(), 32);
+            black_box(ids);
         });
     });
 
