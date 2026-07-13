@@ -17,6 +17,7 @@ use std::path::Path;
 
 const EXECUTE_STAGE_OP_REPEATS: [usize; 3] = [64, 256, 1024];
 const COMMIT_STAGE_DIRTY_PAGES: [usize; 3] = [2, 8, 32];
+const RESET_STAGE_REGISTER_COUNTS: [i32; 2] = [4, 16];
 
 fn decode_stage_row(column_count: usize) -> Vec<SqliteValue> {
     (0..column_count)
@@ -2975,6 +2976,28 @@ fn bench_vdbe_execute_next_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_engine_reset_for_reuse(c: &mut Criterion) {
+    let execution_cx = Cx::new();
+    let mut group = c.benchmark_group("vdbe_engine_reset_for_reuse");
+
+    for register_count in RESET_STAGE_REGISTER_COUNTS {
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(register_count, &execution_cx, PageSize::DEFAULT);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(register_count),
+            &register_count,
+            |b, register_count| {
+                b.iter(|| {
+                    engine.reset_for_reuse(*register_count, &execution_cx, PageSize::DEFAULT);
+                    black_box(&engine);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_vdbe_decode_stage,
@@ -3028,6 +3051,7 @@ criterion_group!(
     bench_vdbe_execute_rowid_stage,
     bench_vdbe_execute_idx_rowid_stage,
     bench_vdbe_execute_next_stage,
+    bench_vdbe_engine_reset_for_reuse,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);

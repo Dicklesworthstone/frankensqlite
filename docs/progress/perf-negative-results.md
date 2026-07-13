@@ -18565,3 +18565,37 @@ test is on the executed path, not merely linked into it.
   `assert!(index_integer_in_list_residual_target(Some(&<a IN(1,2) AND x=3>), &table, None).is_some())`.
   The rest of the re-apply plan (above) is correct; the byte-exact correctness is proven, only the
   seek-routing needs fixing.
+
+## 2026-07-12 - WIN (shipped): preserve opcode-trace configuration across VDBE engine reuse
+
+- Target: `VdbeEngine::reset_for_reuse_impl`. The earlier DELETE-tail audit correctly rejected this
+  family because prepared DELETE bypasses VDBE entirely, but explicitly allowed a retry on a workload
+  where `reset_for_reuse` executes. The new `vdbe_engine_reset_for_reuse/{4,16}` Criterion seam times
+  that method directly, satisfying the executed-path gate instead of reviving the invalid DELETE gate.
+- Files: `crates/fsqlite-vdbe/src/engine.rs` and
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`. Engine reuse now preserves the opcode-trace setting
+  sampled when that engine was constructed, rather than re-reading and parsing
+  `FSQLITE_VDBE_TRACE_OPCODES` on every cached statement. Newly constructed engines still sample the
+  environment. Query ordering, values, floating-point behavior, and opcode execution are unchanged;
+  only diagnostic trace configuration is latched per engine. The repository has no code that mutates
+  this environment variable in process.
+- PERF (strict remote-only RCH, same worker `vmi1264463`, 30 samples, identical command/profile):
+  4-register reset median `196.24 ns` (`185.76..205.57 ns`) -> `82.374 ns`
+  (`79.768..84.566 ns`), a `58.0%` reduction / `2.38x` throughput equivalent; Criterion change interval
+  `-58.545%..-54.165%`, `p=0.00`. The 16-register row moved `264.36 ns`
+  (`252.85..279.86 ns`) -> `146.36 ns` (`141.31..151.22 ns`), a `44.6%` reduction / `1.81x`
+  throughput equivalent; Criterion interval `-50.348%..-41.079%`, `p=0.00`.
+- Command: `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1264463 ... rch exec -- cargo bench --config
+  'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile
+  release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages --
+  '^vdbe_engine_reset_for_reuse/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`.
+  Both sides were proven remote on `vmi1264463`; RCH invalidated the graph during each sync, producing
+  comparable cold builds (10m24s control, 10m35s candidate). No local Cargo command was substituted.
+- GATE (strict remote RCH, `vmi1264463`): `cargo test -p fsqlite-vdbe --lib reset_for_reuse --
+  --nocapture` passed `4/4`, including the new per-engine trace-preservation guard plus existing result,
+  row-cap, and scratch-state reset tests. `cargo check --workspace --all-targets` passed on the measured
+  base. After rebasing onto the latest `origin/main`, strict workspace Clippy again reached the
+  candidate with no finding in changed code, then stopped on the newly landed peer-owned aggregate-IN
+  expression at `codegen.rs:11875` (`unnecessary_lazy_evaluations`: use `then_some`). The earlier
+  peer-owned `codegen.rs` dead-code warning appeared in the control, candidate, test, and check builds
+  and was fixed upstream before the final rebase; neither finding is related to this lever.

@@ -5530,7 +5530,7 @@ pub struct VdbeEngine {
     execution_cx: Cx,
     /// Page size for this database (bd-zjisk.2).
     page_size: PageSize,
-    /// Whether opcode-level tracing is enabled.
+    /// Whether opcode-level tracing is enabled, latched when the engine is constructed.
     trace_opcodes: bool,
     /// Execute-scoped metrics flag latched once per statement.
     collect_vdbe_metrics: bool,
@@ -6318,7 +6318,7 @@ impl VdbeEngine {
         self.bindings.clear();
         self.execution_cx = execution_cx.clone();
         self.page_size = page_size;
-        self.trace_opcodes = opcode_trace_enabled();
+        // Opcode tracing is engine configuration; reuse preserves the construction-time setting.
         self.collect_vdbe_metrics = false;
         self.results.clear();
         if retain_cursors {
@@ -6394,8 +6394,9 @@ impl VdbeEngine {
     /// re-allocations.
     ///
     /// After `reset()` the engine is equivalent to a freshly constructed one
-    /// with the same `register_count` — but all `Vec`/`HashMap`/`SmallVec`
-    /// retain their heap capacity.
+    /// with the same `register_count`, apart from construction-time engine
+    /// configuration such as opcode tracing — but all
+    /// `Vec`/`HashMap`/`SmallVec` retain their heap capacity.
     /// Reset engine state for reuse from the cached-engine pool.
     ///
     /// When `retain_cursors` is true, storage cursors and their root-page
@@ -20650,6 +20651,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(22)]]
         );
+    }
+
+    #[test]
+    fn test_reset_for_reuse_preserves_engine_trace_setting() {
+        let reset_cx = Cx::new();
+        let mut engine = VdbeEngine::new_with_execution_cx(4, &reset_cx, PageSize::DEFAULT);
+
+        engine.trace_opcodes = false;
+        engine.reset_for_reuse(4, &reset_cx, PageSize::DEFAULT);
+        assert!(!engine.trace_opcodes);
+
+        engine.trace_opcodes = true;
+        engine.reset_for_reuse_preserving_runtime_setup(4, &reset_cx, PageSize::DEFAULT, false);
+        assert!(engine.trace_opcodes);
     }
 
     #[test]
