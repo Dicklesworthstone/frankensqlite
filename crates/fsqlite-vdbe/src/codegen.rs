@@ -2005,11 +2005,25 @@ pub fn codegen_select(
         && group_by.is_empty()
         && having.is_none()
         && !table.without_rowid;
+    // bd-nonagg-rowid-in-order: the rowid IN seek emits in ascending-rowid order (the values are sorted
+    // and deduped), so it can serve `ORDER BY <rowid> ASC` for free — and `DESC` by reversing the emit
+    // order — instead of declining to a full-scan-plus-sort. `rowid_order` (computed above) is `Some`
+    // ONLY for a single ORDER BY term that resolves to the rowid; the IPK is unique so no tiebreaker is
+    // needed. Unlike the index IN seek (value-then-rowid order), the rowid seek's order is exactly rowid
+    // order, so this relaxation is rowid-IN-specific — `in_list_seek_allowed` stays strict for index_in.
+    let rowid_in_seek_allowed = !is_aggregate
+        && from_index_hint.is_none()
+        && (stmt.order_by.is_empty() || rowid_order.is_some())
+        && stmt.limit.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !table.without_rowid;
     // bd-2dgf5: `WHERE <rowid> IN (<int literals>)` — one SeekRowid per distinct value.
     // bd-nonagg-rowid-in-residual: also admit `rowid IN (ints) AND <residual>` — the residual variant
     // returns `has_residual = true`; the SeekRowid probes visit only the listed rows and the emitter
     // re-applies the whole WHERE per row. The table is always open, so the residual reads any column.
-    let rowid_in = if in_list_seek_allowed {
+    let rowid_in = if rowid_in_seek_allowed {
         extract_rowid_in_list_residual_target(where_clause.as_deref(), table, table_alias)
     } else {
         None
@@ -2058,6 +2072,7 @@ pub fn codegen_select(
             &values,
             where_clause.as_deref(),
             has_residual,
+            matches!(rowid_order, Some(SortDirection::Desc)),
         );
     }
 
@@ -3384,7 +3399,8 @@ fn codegen_select_index_in_scan(
 /// bd-2dgf5. Rowid is unique, so each distinct value is a single `SeekRowid` — no index
 /// cursor, no duplicate-run loop. Values are ascending (matching C SQLite's IN order), and a
 /// `SeekRowid` miss skips to the next value. Integer-literal gate makes each seek exact. The
-/// caller gates out ORDER BY / LIMIT / DISTINCT / WITHOUT ROWID.
+/// caller gates out LIMIT / DISTINCT / WITHOUT ROWID. bd-nonagg-rowid-in-order: `ORDER BY <rowid>`
+/// is served by this seek (ascending is the natural order; `descending` reverses the emit order).
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_rowid_in_scan(
     b: &mut ProgramBuilder,
@@ -3405,6 +3421,10 @@ fn codegen_select_rowid_in_scan(
     // exact-`rowid IN` caller → byte-identical. Placeholder base reset per lookup so a `?` in the
     // residual numbers identically. bd-nonagg-rowid-in-residual.
     residual_filter: bool,
+    // When true, emit the seeks in DESCENDING rowid order (for `ORDER BY <rowid> DESC`); `values` are
+    // ascending, so we reverse. `false` emits ascending — the natural order and byte-identical to the
+    // no-ORDER-BY callers. bd-nonagg-rowid-in-order.
+    descending: bool,
 ) -> Result<(), CodegenError> {
     // Captured before any placeholder-emitting op (rowid values are integer literals).
     let where_placeholder_base = b.current_anon_placeholder();
@@ -3416,7 +3436,13 @@ fn codegen_select_rowid_in_scan(
         P4::Table(table.name.clone()),
         0,
     );
-    for &value in values {
+    // `values` are ascending; reverse for `ORDER BY <rowid> DESC`. Ascending path clones in-order, so it
+    // stays byte-identical to the pre-order callers.
+    let mut ordered = values.to_vec();
+    if descending {
+        ordered.reverse();
+    }
+    for &value in &ordered {
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
         let next_value = b.emit_label();
