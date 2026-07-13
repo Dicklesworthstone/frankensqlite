@@ -18830,3 +18830,24 @@ test is on the executed path, not merely linked into it.
   `agg_leading_eq_residual_oracle`, the full `-p fsqlite` suite). Only after that emitter fix does the
   heuristic-chain fallback become correct+useful. Do NOT retry the fallback alone (proven insufficient);
   start with the emitter covering-decision fix, on a healthy fleet.
+- FOLLOW-UP 2 (same day, DEFINITIVE — 5th distinct defect): a data-driven diagnostic confirmed the
+  fallback DOES fire for genuinely NON-covering outputs (`SELECT *` / `SELECT x` / `SELECT id, x`:
+  seek=true, idx opened; `SELECT id` / `SELECT a`: correctly declined as covering). Gated to non-covering
+  outputs, a bench showed `SELECT x WHERE a=5 AND cc=7` at 0.33ms vs 22.5ms full scan (~67×) — BUT the
+  oracle then FAILED on CORRECTNESS: `SELECT * WHERE a=5 AND c=5` returned WRONG rows. Root cause:
+  `codegen_select_index_equality_scan`'s FAST seek path (the duplicate-run loop) emits every eq-block row
+  via `emit_column_reads` → `ResultRow` with **NO residual filter** — `emit_where_filter(where_clause)`
+  lives only on the affinity scan-FALLBACK path, not the fast path. Every existing caller passes a
+  filter that is REDUNDANT with the seek (`a=5` filter on an `a=5` seek), so the missing fast-path filter
+  was never observable; a non-redundant residual (`c=5`) is silently dropped → extra rows. The 67× bench
+  was timing incorrect output — a reminder that a bench is worthless before a passing oracle.
+- Result: rejected, definitively, as an emitter-reuse. The emitter cannot serve eq+residual until its
+  fast seek path applies the residual filter. THE REAL FIX (supersedes the covering-decision note above,
+  which is necessary but not sufficient): give `codegen_select_index_equality_scan` a residual-filter
+  parameter (or detect a non-redundant `where_clause`) and emit `emit_where_filter(where_clause)` before
+  the fast-path `ResultRow`, gated so pure-`col=lit` callers (redundant filter) get NO added per-row cost
+  or bytecode change (else golden snapshots churn). Plus the covering-decision fix so covering outputs
+  (`SELECT id`) also open the table. Re-validate `eq_seek_exact_oracle`, `agg_leading_eq_residual_oracle`,
+  golden snapshots, and the full `-p fsqlite` suite, on a healthy fleet. This lever consumed five
+  attempts, each uncovering a distinct emitter/planner interaction; treat it as an emitter project, not a
+  seek-routing tweak.
