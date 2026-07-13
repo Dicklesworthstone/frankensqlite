@@ -18665,3 +18665,40 @@ test is on the executed path, not merely linked into it.
   both register-count rows. Do not retry the standalone equal-length `fill` branch on this synthetic
   reset seam. Reconsider only with production evidence that cached-statement reuse is dominated by
   tiny (four-register) programs and a real statement-level benchmark that reproduces the win.
+
+## 2026-07-12 - VDBE Once-state sized by actual `Opcode::Once` usage
+
+- Target: interpreter setup in `VdbeEngine::execute_with_borrowed_bindings_internal`. Programs longer
+  than 256 instructions allocate and zero an address-indexed `once_heap` on every execution even when
+  they contain no `Opcode::Once`. Negative-ledger-first review found no exact measured attempt. Bead
+  `bd-db300.2.2` comments 2435-2436 record an uncommitted March 17 draft of the same highest-Once-PC
+  metadata shape, but it was never remotely validated, benchmarked, committed, or retained in current
+  source; this row closes that evidence gap.
+- Candidate touched `crates/fsqlite-vdbe/src/lib.rs`, `crates/fsqlite-vdbe/src/engine.rs`, and
+  `crates/fsqlite-vdbe/benches/pipeline_stages.rs`. `ProgramBuilder::finish` recorded the word count
+  required by the highest finalized `Once` PC; execution allocated exactly that count and kept the
+  four-word stack path otherwise. Boundary tests covered no Once, PC 0, PC 255, and PC 256; a semantic
+  test looped twice through a `Once` beyond PC 256 and required the guarded increment to fire once.
+  Opcode ordering, jump targets, values, floating-point behavior, and per-execution zeroing were
+  unchanged. The source, tests, and benchmark were manually unwound after measurement.
+- Causal seam: `vdbe_pipeline_execute_long_no_once/{258,1026}` built programs containing only a Goto,
+  unreachable Noop padding, and a final Halt. Each timed iteration executed exactly Goto + Halt, so
+  program-length-dependent setup isolated the eager Once-state allocation instead of dispatch work.
+- Evidence (strict remote-only RCH, same worker `vmi1264463`, 30 samples, identical command/profile):
+  the 258-op row moved from `318.28 ns` (`298.69..334.92 ns`) to `299.29 ns`
+  (`278.67..325.34 ns`), a raw `5.97%` median reduction / `1.06x` throughput equivalent, but Criterion
+  found no change (`-5.4929%..+7.4021%`, `p=0.81`). The 1026-op row moved from `1.0899 us`
+  (`1.0578..1.1226 us`) to `945.21 ns` (`926.11..966.07 ns`), a `13.3%` median reduction / `1.15x`
+  throughput equivalent; Criterion confirmed improvement (`-18.871%..-8.8364%`, `p=0.00`).
+- Command: `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1264463 ... rch exec -- cargo bench --config
+  'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile
+  release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages --
+  '^vdbe_pipeline_execute_long_no_once/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30
+  --noplot`. Both jobs were proven remote on `vmi1264463`; RCH invalidated the graph during each sync,
+  producing comparable cold builds (9m43s baseline, 9m41s candidate). No local Cargo command was
+  substituted.
+- Result: rejected because the predeclared keep gate required decisive improvement on both long-program
+  rows, and the 258-op confidence interval crossed zero. Do not retry highest-Once-PC metadata on this
+  synthetic setup seam alone. Reconsider only if a production profile attributes material execution
+  time to Once-state allocation in real programs above 1024 instructions and a statement-level
+  workload reproduces the win without regressing high-PC `Once` programs.
