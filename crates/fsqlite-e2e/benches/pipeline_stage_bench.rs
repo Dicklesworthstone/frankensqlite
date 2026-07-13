@@ -9,7 +9,11 @@
 //!
 //! Each benchmark runs both FrankenSQLite and C SQLite (rusqlite) side by side.
 
+use std::hint::black_box;
+
 use criterion::{Criterion, criterion_group, criterion_main};
+use fsqlite_types::SqliteValue;
+use tempfile::NamedTempFile;
 
 fn criterion_config() -> Criterion {
     Criterion::default().configure_from_args()
@@ -49,6 +53,30 @@ fn setup_csqlite() -> rusqlite::Connection {
     }
     conn.execute_batch("COMMIT;").unwrap();
     conn
+}
+
+fn setup_fsqlite_file_backed() -> (fsqlite::Connection, NamedTempFile) {
+    let database = NamedTempFile::new().unwrap();
+    let path = database.path().to_string_lossy().into_owned();
+    let conn = fsqlite::Connection::open(path).unwrap();
+    conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER, label TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let insert = conn
+        .prepare("INSERT INTO bench VALUES (?1, ?2, ?3)")
+        .unwrap();
+    for id in 0..SEED_ROWS {
+        insert
+            .execute_with_params(&[
+                SqliteValue::Integer(id),
+                SqliteValue::Integer(id * 17 + 31),
+                SqliteValue::Text(format!("label_{id:04}").into()),
+            ])
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("BEGIN").unwrap();
+    (conn, database)
 }
 
 // ─── Prepare-only: parse + compile, no execution ─────────────────────
@@ -183,6 +211,44 @@ fn bench_btree_seek(c: &mut Criterion) {
     group.finish();
 }
 
+// BENCH-META: engine=frankensqlite, lifecycle=prepared, storage=file, concurrency=sequential
+fn bench_btree_seek_file_clustered_in(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pipeline/btree_seek_file_clustered_in");
+
+    let (conn, _database) = setup_fsqlite_file_backed();
+    let stmt = conn
+        .prepare(
+            "SELECT id FROM bench WHERE id IN (
+                480, 481, 482, 483, 484, 485, 486, 487,
+                488, 489, 490, 491, 492, 493, 494, 495,
+                496, 497, 498, 499, 500, 501, 502, 503,
+                504, 505, 506, 507, 508, 509, 510, 511
+            )",
+        )
+        .unwrap();
+    let expected_rows = stmt.query().unwrap();
+    let expected_ids: Vec<i64> = expected_rows
+        .iter()
+        .filter_map(|row| match row.values().first() {
+            Some(SqliteValue::Integer(id)) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(expected_rows.len(), 32);
+    assert_eq!(expected_ids.len(), 32);
+    assert_eq!(expected_ids.iter().sum::<i64>(), 15_856);
+
+    group.bench_function("fsqlite", |b| {
+        b.iter(|| {
+            let rows = stmt.query().unwrap();
+            assert_eq!(rows.len(), 32);
+            black_box(rows);
+        });
+    });
+
+    group.finish();
+}
+
 // ─── Full table scan ─────────────────────────────────────────────────
 
 // BENCH-META: engine=csqlite, lifecycle=prepared, storage=memory, concurrency=sequential
@@ -290,6 +356,7 @@ criterion_group! {
         bench_execute_only,
         bench_full_pipeline,
         bench_btree_seek,
+        bench_btree_seek_file_clustered_in,
         bench_full_scan,
         bench_aggregate,
         bench_insert_single,

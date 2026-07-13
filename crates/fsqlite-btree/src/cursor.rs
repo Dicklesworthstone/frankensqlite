@@ -3756,49 +3756,73 @@ impl<P: PageReader> BtCursor<P> {
             // (`balance_for_delete` skips rebalancing; `balance_for_insert`
             // pushes the true root down). See the rootless-stack guards in
             // `delete` and `table_insert`.
-            let entry = self.load_page(cx, cached.page_no)?;
-            if !(entry.header.page_type.is_leaf() && entry.header.page_type.is_table()) {
-                continue;
-            }
+            let reuse_current = self
+                .stack
+                .last()
+                .is_some_and(|entry| entry.page_no == cached.page_no)
+                && !self.pager.is_dirty(cached.page_no);
+            let mut loaded_entry = if reuse_current {
+                // Match `load_page`'s cancellation and visit accounting while
+                // borrowing the resident immutable page for the search.
+                observe_cursor_cancellation(cx)?;
+                self.note_page_visit(cached.page_no);
+                None
+            } else {
+                Some(self.load_page(cx, cached.page_no)?)
+            };
 
-            let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
-            match result {
-                BinarySearchResult::Found(idx) => {
-                    self.stack.clear();
-                    let mut entry = entry;
-                    entry.cell_idx = idx;
-                    self.stack.push(entry);
-                    self.at_eof = false;
-                    self.remember_table_seek(target_rowid, cached.page_no, idx);
-                    self.record_point_witness(
-                        cx,
-                        WitnessKey::Cell {
-                            btree_root: self.root_page,
-                            leaf_page: cached.page_no,
-                            tag: Self::cell_tag_from_rowid(target_rowid),
-                        },
-                    );
-                    return Ok(Some(SeekResult::Found));
+            let (result, cell_count) = {
+                let entry = loaded_entry
+                    .as_ref()
+                    .or_else(|| self.stack.last())
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "cached table seek lost resident page {}",
+                            cached.page_no.get()
+                        ),
+                    })?;
+                if !(entry.header.page_type.is_leaf() && entry.header.page_type.is_table()) {
+                    continue;
                 }
-                BinarySearchResult::NotFound(idx) if idx < entry.header.cell_count && idx > 0 => {
-                    self.stack.clear();
-                    let mut entry = entry;
-                    entry.cell_idx = idx;
-                    self.stack.push(entry);
-                    self.at_eof = false;
-                    self.remember_table_seek(target_rowid, cached.page_no, idx);
-                    self.record_point_witness(
-                        cx,
-                        WitnessKey::Cell {
-                            btree_root: self.root_page,
-                            leaf_page: cached.page_no,
-                            tag: Self::cell_tag_from_rowid(target_rowid),
-                        },
-                    );
-                    return Ok(Some(SeekResult::NotFound));
+                (
+                    Self::search_integer_key_table_leaf(cx, entry, target_rowid)?,
+                    entry.header.cell_count,
+                )
+            };
+            let landing = match result {
+                BinarySearchResult::Found(idx) => Some((idx, SeekResult::Found)),
+                BinarySearchResult::NotFound(idx) if idx < cell_count && idx > 0 => {
+                    Some((idx, SeekResult::NotFound))
                 }
-                BinarySearchResult::NotFound(_) => {}
-            }
+                BinarySearchResult::NotFound(_) => None,
+            };
+            let Some((idx, seek_result)) = landing else {
+                continue;
+            };
+
+            let mut entry = loaded_entry
+                .take()
+                .or_else(|| self.stack.pop())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "cached table seek lost landing page {}",
+                        cached.page_no.get()
+                    ),
+                })?;
+            self.stack.clear();
+            entry.cell_idx = idx;
+            self.stack.push(entry);
+            self.at_eof = false;
+            self.remember_table_seek(target_rowid, cached.page_no, idx);
+            self.record_point_witness(
+                cx,
+                WitnessKey::Cell {
+                    btree_root: self.root_page,
+                    leaf_page: cached.page_no,
+                    tag: Self::cell_tag_from_rowid(target_rowid),
+                },
+            );
+            return Ok(Some(seek_result));
         }
 
         Ok(None)

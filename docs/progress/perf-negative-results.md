@@ -18471,3 +18471,33 @@ test is on the executed path, not merely linked into it.
 - GATE: `agg_rowid_range_residual_oracle` — literal byte-exact battery unchanged; opcode gates that
   `id > 500 AND x = ?` SeekGTs and a parameterized rowid bound declines. No-reg: agg_leading_eq_residual,
   agg_index_range byte-exact.
+## 2026-07-12 - WIN (shipped): reuse the resident clean B-tree seek-cache entry
+
+- Result type: WIN / shipped. Negative-ledger-first scouting excluded the mined DELETE materialization,
+  freed-page, and root-descent families. The remaining measured read-path cost was
+  `BtCursor::try_table_seek_cache` cloning the current clean `StackEntry` through `load_page()` even
+  when the cached landing page was already the top stack entry.
+- FILES: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-e2e/benches/pipeline_stage_bench.rs`. The latter adds the causal file-backed prepared
+  `pipeline/btree_seek_file_clustered_in/fsqlite` seam: one 32-row clustered `IN` query repeatedly hits
+  the table-seek cache and asserts the returned row count and seed checksum before measurement.
+- FIX: when the cached page is the resident clean top entry, search it by reference, preserve
+  `load_page()` cancellation and page-visit accounting, and pop/reuse its ownership only after a valid
+  landing. Dirty pages and non-resident pages retain the original `load_page()` path. Ordering,
+  tie-breaking, floating-point behavior, witness recording, and the rootless one-leaf stack invariant
+  are unchanged.
+- PERF (strict remote RCH, same worker `vmi1264463`, 30 samples): with `release-perf` opt-level 3 but
+  `lto=false` and `codegen-units=16` for a bounded quick A/B, baseline median `31.936 us`
+  (`29.944..34.132 us`) versus candidate median `26.361 us` (`25.249..27.455 us`): `0.825x` elapsed,
+  a `17.5%` median reduction / `1.21x` throughput equivalent. Criterion independently reported a
+  significant improvement, change interval `-18.704%..-5.151%`, `p=0.00`.
+- COMMAND: `RCH_REQUIRE_REMOTE=1 ... rch exec -- cargo bench --config
+  'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile
+  release-perf -j3 -p fsqlite-e2e --bench pipeline_stage_bench --
+  '^pipeline/btree_seek_file_clustered_in/fsqlite$' --warm-up-time 0.5 --measurement-time 2
+  --sample-size 30 --noplot`. A full inherited-LTO baseline on `vmi1156319` hit RCH-E104's 1800-second
+  SSH timeout with fail-closed local fallback; no local Cargo command was substituted.
+- GATE (strict remote RCH, `vmi1264463`): `cargo test -p fsqlite-btree table_seek_cache` PASS — the
+  four-slot LRU test, hot-set root-descent counter test, and forced-full-descent property comparison all
+  passed (`3/3`). The candidate benchmark build also compiled the changed B-tree and downstream
+  e2e/core surface successfully.
