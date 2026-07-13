@@ -86,7 +86,8 @@ fn opens_table(conn: &Connection, sql: &str, table: &str) -> bool {
         .iter()
         .any(|row| {
             let vals = row.values();
-            let is_open = matches!(vals.get(1), Some(SqliteValue::Text(op)) if op.to_string() == "OpenRead");
+            let is_open =
+                matches!(vals.get(1), Some(SqliteValue::Text(op)) if op.to_string() == "OpenRead");
             is_open
                 && vals
                     .iter()
