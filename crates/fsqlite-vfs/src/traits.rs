@@ -17,8 +17,24 @@ use crate::shm::ShmRegion;
 /// boots.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileIdentity {
+    kind: FileIdentityKind,
     namespace: u64,
     object: [u8; 16],
+}
+
+/// Representation domain for an opaque [`FileIdentity`].
+///
+/// The discriminator is part of equality and ordering so a legacy Windows
+/// 64-bit file index can never compare equal to a 128-bit `FILE_ID_INFO`
+/// value that happens to contain the same bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum FileIdentityKind {
+    #[cfg(unix)]
+    Unix,
+    #[cfg(windows)]
+    WindowsFileId128,
+    #[cfg(windows)]
+    WindowsFileIndex64,
 }
 
 impl FileIdentity {
@@ -41,34 +57,13 @@ impl FileIdentity {
 
         #[cfg(windows)]
         {
-            use std::mem::size_of;
             use std::os::windows::io::AsRawHandle as _;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-            };
 
-            let mut identity = FILE_ID_INFO::default();
-            let identity_size = u32::try_from(size_of::<FILE_ID_INFO>()).map_err(|_| {
-                std::io::Error::other("FILE_ID_INFO size does not fit in a Windows DWORD")
-            })?;
-            // SAFETY: `file` owns a live Windows file handle, `identity` is a
-            // correctly sized writable `FILE_ID_INFO` buffer, and both remain
-            // valid for the duration of the synchronous system call.
-            let succeeded = unsafe {
-                GetFileInformationByHandleEx(
-                    file.as_raw_handle(),
-                    FileIdInfo,
-                    std::ptr::from_mut(&mut identity).cast(),
-                    identity_size,
-                )
-            };
-            if succeeded == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(Self::from_windows_parts(
-                identity.VolumeSerialNumber,
-                identity.FileId.Identifier,
-            ))
+            let handle = file.as_raw_handle();
+            let file_id_result = query_windows_file_id(handle);
+            Self::from_windows_query_result(file_id_result, || {
+                query_windows_legacy_file_index(handle)
+            })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -83,6 +78,7 @@ impl FileIdentity {
         let mut object = [0_u8; 16];
         object[..8].copy_from_slice(&inode.to_be_bytes());
         Self {
+            kind: FileIdentityKind::Unix,
             namespace: device,
             object,
         }
@@ -98,10 +94,169 @@ impl FileIdentity {
             return None;
         }
         Some(Self {
+            kind: FileIdentityKind::WindowsFileId128,
             namespace: volume_serial_number,
             object: file_id,
         })
     }
+
+    #[cfg(windows)]
+    fn from_windows_legacy_parts(
+        volume_serial_number: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    ) -> Self {
+        let file_index = (u64::from(file_index_high) << 32) | u64::from(file_index_low);
+        let mut object = [0_u8; 16];
+        object[..8].copy_from_slice(&file_index.to_be_bytes());
+        Self {
+            kind: FileIdentityKind::WindowsFileIndex64,
+            namespace: u64::from(volume_serial_number),
+            object,
+        }
+    }
+
+    #[cfg(windows)]
+    fn from_windows_query_result<F>(
+        file_id_result: std::io::Result<(u64, [u8; 16])>,
+        legacy_query: F,
+    ) -> std::io::Result<Option<Self>>
+    where
+        F: FnOnce() -> std::io::Result<(u32, u32, u32)>,
+    {
+        match file_id_result {
+            Ok((volume_serial_number, file_id)) => {
+                Ok(Self::from_windows_parts(volume_serial_number, file_id))
+            }
+            Err(err) if is_windows_file_id_unsupported(&err) => {
+                let (volume_serial_number, file_index_high, file_index_low) = legacy_query()?;
+                Ok(Some(Self::from_windows_legacy_parts(
+                    volume_serial_number,
+                    file_index_high,
+                    file_index_low,
+                )))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Encode this identity for a namespace record.
+    ///
+    /// Byte 0 is the representation tag, bytes 1..9 are the big-endian
+    /// namespace, and bytes 9..25 are the exact object identifier.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn to_namespace_bytes(self) -> [u8; 25] {
+        let tag = match self.kind {
+            #[cfg(unix)]
+            FileIdentityKind::Unix => 1,
+            #[cfg(windows)]
+            FileIdentityKind::WindowsFileId128 => 2,
+            #[cfg(windows)]
+            FileIdentityKind::WindowsFileIndex64 => 3,
+        };
+        let mut encoded = [0_u8; 25];
+        encoded[0] = tag;
+        encoded[1..9].copy_from_slice(&self.namespace.to_be_bytes());
+        encoded[9..].copy_from_slice(&self.object);
+        encoded
+    }
+
+    /// Decode and validate a namespace-record identity.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn from_namespace_bytes(encoded: [u8; 25]) -> Option<Self> {
+        let mut namespace_bytes = [0_u8; 8];
+        namespace_bytes.copy_from_slice(&encoded[1..9]);
+        let namespace = u64::from_be_bytes(namespace_bytes);
+        let mut object = [0_u8; 16];
+        object.copy_from_slice(&encoded[9..]);
+
+        match encoded[0] {
+            #[cfg(unix)]
+            1 if object[8..].iter().all(|byte| *byte == 0) => Some(Self {
+                kind: FileIdentityKind::Unix,
+                namespace,
+                object,
+            }),
+            #[cfg(windows)]
+            2 => Self::from_windows_parts(namespace, object),
+            #[cfg(windows)]
+            3 if namespace <= u64::from(u32::MAX) && object[8..].iter().all(|byte| *byte == 0) => {
+                Some(Self {
+                    kind: FileIdentityKind::WindowsFileIndex64,
+                    namespace,
+                    object,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn query_windows_file_id(
+    handle: std::os::windows::io::RawHandle,
+) -> std::io::Result<(u64, [u8; 16])> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut identity = FILE_ID_INFO::default();
+    let identity_size = u32::try_from(size_of::<FILE_ID_INFO>())
+        .map_err(|_| std::io::Error::other("FILE_ID_INFO size does not fit in a Windows DWORD"))?;
+    // SAFETY: the caller supplies a live Windows file handle, `identity` is a
+    // correctly sized writable `FILE_ID_INFO` buffer, and both remain valid
+    // for the duration of this synchronous system call.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            std::ptr::from_mut(&mut identity).cast(),
+            identity_size,
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((identity.VolumeSerialNumber, identity.FileId.Identifier))
+}
+
+#[cfg(windows)]
+fn query_windows_legacy_file_index(
+    handle: std::os::windows::io::RawHandle,
+) -> std::io::Result<(u32, u32, u32)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the caller supplies a live Windows file handle and `identity`
+    // is a correctly sized writable buffer that remains valid for the
+    // duration of this synchronous system call.
+    let succeeded = unsafe { GetFileInformationByHandle(handle, &raw mut identity) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((
+        identity.dwVolumeSerialNumber,
+        identity.nFileIndexHigh,
+        identity.nFileIndexLow,
+    ))
+}
+
+#[cfg(windows)]
+fn is_windows_file_id_unsupported(err: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SUPPORTED,
+    };
+
+    err.raw_os_error().is_some_and(|raw_error| {
+        raw_error == ERROR_INVALID_FUNCTION as i32
+            || raw_error == ERROR_NOT_SUPPORTED as i32
+            || raw_error == ERROR_INVALID_PARAMETER as i32
+            || raw_error == ERROR_CALL_NOT_IMPLEMENTED as i32
+    })
 }
 
 impl std::fmt::Debug for FileIdentity {
@@ -110,9 +265,44 @@ impl std::fmt::Debug for FileIdentity {
     }
 }
 
+#[cfg(all(test, unix))]
+mod unix_file_identity_codec_tests {
+    use super::FileIdentity;
+
+    #[test]
+    fn unix_namespace_bytes_round_trip_exactly() {
+        let identity = FileIdentity::from_unix_parts(0x0102_0304_0506_0708, 0x1122_3344_5566_7788);
+        let encoded = identity.to_namespace_bytes();
+
+        assert_eq!(encoded[0], 1);
+        assert_eq!(&encoded[1..9], &0x0102_0304_0506_0708_u64.to_be_bytes());
+        assert_eq!(&encoded[9..17], &0x1122_3344_5566_7788_u64.to_be_bytes());
+        assert_eq!(&encoded[17..], &[0_u8; 8]);
+        assert_eq!(FileIdentity::from_namespace_bytes(encoded), Some(identity));
+    }
+
+    #[test]
+    fn unix_namespace_bytes_reject_unknown_and_noncanonical_records() {
+        let identity = FileIdentity::from_unix_parts(7, 11);
+        let mut unknown_tag = identity.to_namespace_bytes();
+        unknown_tag[0] = u8::MAX;
+        assert_eq!(FileIdentity::from_namespace_bytes(unknown_tag), None);
+
+        let mut nonzero_tail = identity.to_namespace_bytes();
+        nonzero_tail[24] = 1;
+        assert_eq!(FileIdentity::from_namespace_bytes(nonzero_tail), None);
+    }
+}
+
 #[cfg(all(test, windows))]
 mod file_identity_tests {
     use super::FileIdentity;
+    use std::cell::Cell;
+    use std::io;
+    use windows_sys::Win32::Foundation::{
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_SUPPORTED,
+    };
 
     #[test]
     fn windows_identity_compares_all_file_id_bits() {
@@ -130,6 +320,128 @@ mod file_identity_tests {
     fn windows_identity_rejects_reserved_sentinels() {
         assert_eq!(FileIdentity::from_windows_parts(7, [0_u8; 16]), None);
         assert_eq!(FileIdentity::from_windows_parts(7, [u8::MAX; 16]), None);
+    }
+
+    #[test]
+    fn windows_identity_prefers_full_file_id_without_legacy_query() {
+        let expected = [0x3c_u8; 16];
+        let legacy_queried = Cell::new(false);
+
+        let actual = FileIdentity::from_windows_query_result(Ok((19, expected)), || {
+            legacy_queried.set(true);
+            Ok((19, 0, 7))
+        })
+        .expect("full FileIdInfo result should succeed");
+
+        assert_eq!(actual, FileIdentity::from_windows_parts(19, expected));
+        assert!(!legacy_queried.get());
+    }
+
+    #[test]
+    fn windows_identity_falls_back_for_unsupported_file_id_queries() {
+        for code in [
+            ERROR_INVALID_FUNCTION,
+            ERROR_NOT_SUPPORTED,
+            ERROR_INVALID_PARAMETER,
+            ERROR_CALL_NOT_IMPLEMENTED,
+        ] {
+            let actual = FileIdentity::from_windows_query_result(
+                Err(io::Error::from_raw_os_error(code as i32)),
+                || Ok((23, 0x1122_3344, 0x5566_7788)),
+            )
+            .expect("unsupported FileIdInfo should use the legacy query")
+            .expect("legacy file index should produce an identity");
+
+            assert_eq!(
+                actual,
+                FileIdentity::from_windows_legacy_parts(23, 0x1122_3344, 0x5566_7788)
+            );
+        }
+    }
+
+    #[test]
+    fn windows_identity_does_not_fallback_for_real_io_errors() {
+        let legacy_queried = Cell::new(false);
+        let err =
+            FileIdentity::from_windows_query_result(Err(io::Error::from_raw_os_error(6)), || {
+                legacy_queried.set(true);
+                Ok((1, 2, 3))
+            })
+            .expect_err("invalid handles must remain hard errors");
+
+        assert_eq!(err.raw_os_error(), Some(6));
+        assert!(!legacy_queried.get());
+    }
+
+    #[test]
+    fn windows_identity_separates_full_and_legacy_representation_domains() {
+        let file_index = 0x1122_3344_5566_7788_u64;
+        let mut full_file_id = [0_u8; 16];
+        full_file_id[..8].copy_from_slice(&file_index.to_be_bytes());
+
+        assert_ne!(
+            FileIdentity::from_windows_parts(23, full_file_id).expect("non-sentinel full file ID"),
+            FileIdentity::from_windows_legacy_parts(23, 0x1122_3344, 0x5566_7788),
+        );
+    }
+
+    #[test]
+    fn windows_namespace_bytes_round_trip_both_identity_domains() {
+        let full_object = [0x5a_u8; 16];
+        let full = FileIdentity::from_windows_parts(0x0102_0304_0506_0708, full_object)
+            .expect("non-sentinel full file ID");
+        let full_encoded = full.to_namespace_bytes();
+        assert_eq!(full_encoded[0], 2);
+        assert_eq!(
+            &full_encoded[1..9],
+            &0x0102_0304_0506_0708_u64.to_be_bytes()
+        );
+        assert_eq!(&full_encoded[9..], &full_object);
+        assert_eq!(FileIdentity::from_namespace_bytes(full_encoded), Some(full));
+
+        let legacy = FileIdentity::from_windows_legacy_parts(0x0102_0304, 0x1122_3344, 0x5566_7788);
+        let legacy_encoded = legacy.to_namespace_bytes();
+        assert_eq!(legacy_encoded[0], 3);
+        assert_eq!(&legacy_encoded[1..9], &0x0102_0304_u64.to_be_bytes());
+        assert_eq!(
+            &legacy_encoded[9..17],
+            &0x1122_3344_5566_7788_u64.to_be_bytes()
+        );
+        assert_eq!(&legacy_encoded[17..], &[0_u8; 8]);
+        assert_eq!(
+            FileIdentity::from_namespace_bytes(legacy_encoded),
+            Some(legacy)
+        );
+    }
+
+    #[test]
+    fn windows_namespace_bytes_reject_noncanonical_records() {
+        let mut unknown_tag = [0_u8; 25];
+        unknown_tag[0] = u8::MAX;
+        assert_eq!(FileIdentity::from_namespace_bytes(unknown_tag), None);
+
+        let mut full_zero_sentinel = [0_u8; 25];
+        full_zero_sentinel[0] = 2;
+        assert_eq!(FileIdentity::from_namespace_bytes(full_zero_sentinel), None);
+
+        let mut full_ones_sentinel = [u8::MAX; 25];
+        full_ones_sentinel[0] = 2;
+        assert_eq!(FileIdentity::from_namespace_bytes(full_ones_sentinel), None);
+
+        let legacy = FileIdentity::from_windows_legacy_parts(7, 11, 13);
+        let mut legacy_nonzero_tail = legacy.to_namespace_bytes();
+        legacy_nonzero_tail[24] = 1;
+        assert_eq!(
+            FileIdentity::from_namespace_bytes(legacy_nonzero_tail),
+            None
+        );
+
+        let mut legacy_wide_namespace = legacy.to_namespace_bytes();
+        legacy_wide_namespace[1..9].copy_from_slice(&(u64::from(u32::MAX) + 1).to_be_bytes());
+        assert_eq!(
+            FileIdentity::from_namespace_bytes(legacy_wide_namespace),
+            None
+        );
     }
 }
 

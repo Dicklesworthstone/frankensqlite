@@ -55,6 +55,27 @@ fn resolve_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn stable_full_path(path: &Path) -> Result<PathBuf> {
+    let absolute = resolve_path(path)?;
+
+    match absolute.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = absolute.parent().ok_or_else(|| FrankenError::CannotOpen {
+                path: absolute.clone(),
+            })?;
+            let file_name = absolute
+                .file_name()
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: absolute.clone(),
+                })?;
+            let canonical_parent = parent.canonicalize()?;
+            Ok(canonical_parent.join(file_name))
+        }
+        Err(error) => Err(FrankenError::Io(error)),
+    }
+}
+
 fn sqlite_shm_path(path: &Path) -> PathBuf {
     let mut shm: OsString = path.as_os_str().to_owned();
     shm.push("-shm");
@@ -763,7 +784,7 @@ impl Vfs for WindowsVfs {
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
-        resolve_path(path)
+        stable_full_path(path)
     }
 }
 

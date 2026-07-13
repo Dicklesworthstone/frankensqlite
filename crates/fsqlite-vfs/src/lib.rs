@@ -1,5 +1,7 @@
 pub mod memory;
 pub mod metrics;
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub mod namespace;
 pub mod shm;
 pub mod traits;
 #[cfg(all(feature = "native", unix))]
@@ -95,6 +97,11 @@ pub mod host_fs {
 
 pub use memory::{MemoryFile, MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
 pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
+#[cfg(all(feature = "native", any(unix, windows)))]
+pub use namespace::{
+    DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
+    validate_reserved_database_artifacts,
+};
 pub use shm::ShmRegion;
 pub use traits::{AsyncVfsDataPath, FileIdentity, SyncKind, Vfs, VfsFile};
 #[cfg(all(feature = "native", unix))]

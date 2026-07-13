@@ -28,7 +28,7 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::shm::ShmRegion;
-use fsqlite_vfs::traits::{Vfs, VfsFile};
+use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile};
 use tracing::{debug, debug_span};
 
 /// Bead identifier for tracing/log correlation.
@@ -509,6 +509,14 @@ impl<V: Vfs> FaultInjectingVfs<V> {
             Path::to_path_buf,
         )
     }
+
+    fn wrap_opened_file(&self, inner: V::File, path: Option<&Path>) -> FaultInjectingFile<V::File> {
+        FaultInjectingFile {
+            inner,
+            state: Arc::clone(&self.state),
+            path: self.resolve_open_path(path),
+        }
+    }
 }
 
 impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
@@ -526,15 +534,35 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
     ) -> Result<(<Self as Vfs>::File, VfsOpenFlags)> {
         self.check_power()?;
         let (inner_file, out_flags) = self.inner.open(cx, path, flags)?;
-        let file_path = self.resolve_open_path(path);
-        Ok((
-            FaultInjectingFile {
-                inner: inner_file,
-                state: Arc::clone(&self.state),
-                path: file_path,
-            },
-            out_flags,
-        ))
+        Ok((self.wrap_opened_file(inner_file, path), out_flags))
+    }
+
+    fn open_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        self.check_power()?;
+        let (inner_file, out_flags) =
+            self.inner
+                .open_with_expected_identity(cx, path, flags, expected_identity)?;
+        Ok((self.wrap_opened_file(inner_file, Some(path)), out_flags))
+    }
+
+    fn open_reserved_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        self.check_power()?;
+        let (inner_file, out_flags) =
+            self.inner
+                .open_reserved_with_expected_identity(cx, path, flags, expected_identity)?;
+        Ok((self.wrap_opened_file(inner_file, Some(path)), out_flags))
     }
 
     fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
@@ -547,6 +575,11 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
         self.inner.access(cx, path, flags)
     }
 
+    fn path_entry_exists(&self, cx: &Cx, path: &Path) -> Result<bool> {
+        self.check_power()?;
+        self.inner.path_entry_exists(cx, path)
+    }
+
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
         self.inner.full_pathname(cx, path)
     }
@@ -557,6 +590,10 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
 
     fn current_time(&self, cx: &Cx) -> f64 {
         self.inner.current_time(cx)
+    }
+
+    fn is_memory(&self) -> bool {
+        self.inner.is_memory()
     }
 }
 
@@ -578,6 +615,10 @@ pub struct FaultInjectingFile<F: VfsFile> {
 impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         self.inner.close(cx)
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -1256,12 +1297,31 @@ mod tests {
     use super::*;
     use fsqlite_types::cx::Cx;
     use fsqlite_vfs::MemoryVfs;
+    #[cfg(unix)]
+    use fsqlite_vfs::UnixVfs;
+    #[cfg(windows)]
+    use fsqlite_vfs::WindowsVfs;
     use std::path::Path;
+
+    #[cfg(unix)]
+    type NativeVfs = UnixVfs;
+    #[cfg(windows)]
+    type NativeVfs = WindowsVfs;
 
     const TEST_BEAD: &str = "bd-3go.2";
 
     fn test_cx() -> Cx {
         Cx::default()
+    }
+
+    #[cfg(unix)]
+    fn native_vfs() -> NativeVfs {
+        UnixVfs::new()
+    }
+
+    #[cfg(windows)]
+    fn native_vfs() -> NativeVfs {
+        WindowsVfs::new()
     }
 
     #[test]
@@ -1364,6 +1424,8 @@ mod tests {
         let cx = test_cx();
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
 
+        assert!(vfs.is_memory(), "decorator must preserve memory semantics");
+
         let (mut file, _out_flags) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
         let data = b"hello world";
@@ -1375,6 +1437,109 @@ mod tests {
         assert_eq!(&buf, data);
 
         file.close(&cx).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn test_fault_vfs_preserves_expected_identity_open_contracts() {
+        let cx = test_cx();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing_path = dir.path().join("existing.db");
+        std::fs::write(&existing_path, b"existing database bytes").expect("seed database");
+        let identity_source = std::fs::File::open(&existing_path).expect("open identity source");
+        let expected_identity = FileIdentity::from_file(&identity_source)
+            .expect("query identity")
+            .expect("native file identity");
+
+        let vfs = FaultInjectingVfs::new(native_vfs());
+        let requested_flags = VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::EXCLUSIVE;
+        let (mut file, out_flags) = vfs
+            .open_with_expected_identity(&cx, &existing_path, requested_flags, expected_identity)
+            .expect("matching identity should survive the decorator");
+
+        assert_eq!(
+            file.file_identity().expect("wrapped identity"),
+            Some(expected_identity)
+        );
+        assert!(!out_flags.intersects(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE));
+        file.close(&cx).expect("close decorated file");
+
+        let other_path = dir.path().join("other.db");
+        std::fs::write(&other_path, b"other database bytes").expect("seed other database");
+        let other_source = std::fs::File::open(&other_path).expect("open other identity source");
+        let other_identity = FileIdentity::from_file(&other_source)
+            .expect("query other identity")
+            .expect("native file identity");
+        let before = std::fs::metadata(&existing_path)
+            .expect("existing metadata")
+            .len();
+
+        assert!(
+            vfs.open_with_expected_identity(&cx, &existing_path, requested_flags, other_identity,)
+                .is_err(),
+            "mismatched identity must fail through the decorator"
+        );
+        assert_eq!(
+            std::fs::metadata(&existing_path)
+                .expect("existing metadata after refusal")
+                .len(),
+            before,
+            "identity refusal must not mutate the database"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn test_fault_vfs_preserves_reserved_identity_open_contract() {
+        let cx = test_cx();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reserved.db");
+        let identity_source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create empty reservation");
+        let expected_identity = FileIdentity::from_file(&identity_source)
+            .expect("query identity")
+            .expect("native file identity");
+        drop(identity_source);
+
+        let vfs = FaultInjectingVfs::new(native_vfs());
+        let requested_flags = VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::EXCLUSIVE;
+        let (mut file, out_flags) = vfs
+            .open_reserved_with_expected_identity(&cx, &path, requested_flags, expected_identity)
+            .expect("matching reservation should survive the decorator");
+
+        assert_eq!(
+            file.file_identity().expect("wrapped identity"),
+            Some(expected_identity)
+        );
+        assert!(!out_flags.intersects(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE));
+        file.close(&cx).expect("close decorated file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fault_vfs_preserves_no_follow_path_entry_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let cx = test_cx();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dangling = dir.path().join("dangling-journal");
+        symlink(dir.path().join("missing-target"), &dangling).expect("create dangling symlink");
+        let vfs = FaultInjectingVfs::new(UnixVfs::new());
+
+        assert!(
+            vfs.path_entry_exists(&cx, &dangling)
+                .expect("forward no-follow entry check")
+        );
     }
 
     #[test]

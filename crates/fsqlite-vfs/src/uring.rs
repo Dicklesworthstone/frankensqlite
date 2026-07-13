@@ -370,6 +370,55 @@ impl IoUringVfs {
     pub fn status_snapshot(&self) -> IoUringRuntimeStatus {
         self.runtime.snapshot()
     }
+
+    fn wrap_unix_file(
+        &self,
+        cx: &Cx,
+        path: Option<&Path>,
+        requested_flags: VfsOpenFlags,
+        file: UnixFile,
+        out_flags: VfsOpenFlags,
+    ) -> Result<(IoUringFile, VfsOpenFlags)> {
+        #[cfg(feature = "linux-asupersync-uring")]
+        // Lock-sensitive SQLite opens must stay on the canonical Unix fd.
+        // Opening a second same-inode fd for the io_uring backend breaks the
+        // invariant that `UnixVfs` relies on to keep process-scoped locks
+        // stable across multiple file handles.
+        let asupersync_backend = if self.runtime.is_available()
+            && path.is_some()
+            && !uses_sqlite_lock_sensitive_fd_topology(requested_flags)
+        {
+            if let Some(requested_path) = path {
+                let full_path = self.unix.full_pathname(cx, requested_path)?;
+                match open_asupersync_backend(&full_path, out_flags) {
+                    Ok(backend) => Some(backend),
+                    Err(err) => {
+                        self.runtime.disable(IO_URING_ASUPERSYNC_INIT_FAILED_MSG);
+                        warn!(
+                            path = %full_path.display(),
+                            error = %err,
+                            "asupersync io_uring backend init failed; falling back to unix path"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok((
+            IoUringFile {
+                inner: file,
+                runtime: Arc::clone(&self.runtime),
+                #[cfg(feature = "linux-asupersync-uring")]
+                asupersync_backend,
+            },
+            out_flags,
+        ))
+    }
 }
 
 impl Default for IoUringVfs {
@@ -666,46 +715,33 @@ impl Vfs for IoUringVfs {
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)> {
         let (file, out_flags) = self.unix.open(cx, path, flags)?;
+        self.wrap_unix_file(cx, path, flags, file, out_flags)
+    }
 
-        #[cfg(feature = "linux-asupersync-uring")]
-        // Lock-sensitive SQLite opens must stay on the canonical Unix fd.
-        // Opening a second same-inode fd for the io_uring backend breaks the
-        // invariant that `UnixVfs` relies on to keep process-scoped locks
-        // stable across multiple file handles.
-        let asupersync_backend = if self.runtime.is_available()
-            && path.is_some()
-            && !uses_sqlite_lock_sensitive_fd_topology(flags)
-        {
-            if let Some(requested_path) = path {
-                let full_path = self.unix.full_pathname(cx, requested_path)?;
-                match open_asupersync_backend(&full_path, out_flags) {
-                    Ok(backend) => Some(backend),
-                    Err(err) => {
-                        self.runtime.disable(IO_URING_ASUPERSYNC_INIT_FAILED_MSG);
-                        warn!(
-                            path = %full_path.display(),
-                            error = %err,
-                            "asupersync io_uring backend init failed; falling back to unix path"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+    fn open_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (file, out_flags) =
+            self.unix
+                .open_with_expected_identity(cx, path, flags, expected_identity)?;
+        self.wrap_unix_file(cx, Some(path), flags, file, out_flags)
+    }
 
-        Ok((
-            IoUringFile {
-                inner: file,
-                runtime: Arc::clone(&self.runtime),
-                #[cfg(feature = "linux-asupersync-uring")]
-                asupersync_backend,
-            },
-            out_flags,
-        ))
+    fn open_reserved_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (file, out_flags) =
+            self.unix
+                .open_reserved_with_expected_identity(cx, path, flags, expected_identity)?;
+        self.wrap_unix_file(cx, Some(path), flags, file, out_flags)
     }
 
     fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
@@ -730,6 +766,10 @@ impl Vfs for IoUringVfs {
 
     fn current_time(&self, cx: &Cx) -> f64 {
         self.unix.current_time(cx)
+    }
+
+    fn is_memory(&self) -> bool {
+        self.unix.is_memory()
     }
 }
 
@@ -1040,6 +1080,84 @@ mod tests {
         let vfs = IoUringVfs::new();
         assert_eq!(vfs.name(), "io_uring");
         assert!(!vfs.status().is_empty());
+        assert_eq!(vfs.is_memory(), vfs.unix.is_memory());
+    }
+
+    #[test]
+    fn test_io_uring_vfs_forwards_expected_identity_open() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("uring_identity.db");
+        std::fs::write(&path, b"existing database bytes").expect("seed existing file");
+        let identity_source = std::fs::File::open(&path).expect("open identity source");
+        let expected_identity = FileIdentity::from_file(&identity_source)
+            .expect("query identity")
+            .expect("Unix files have stable identities");
+
+        let requested_flags = VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::EXCLUSIVE;
+        let (mut file, out_flags) = vfs
+            .open_with_expected_identity(&cx, &path, requested_flags, expected_identity)
+            .expect("matching identity should open through io_uring decorator");
+
+        assert_eq!(
+            file.file_identity().expect("wrapped identity"),
+            Some(expected_identity)
+        );
+        assert!(!out_flags.intersects(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE));
+        file.close(&cx).expect("close decorated file");
+    }
+
+    #[test]
+    fn test_io_uring_vfs_forwards_reserved_identity_open() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("uring_reserved.db");
+        let identity_source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create reservation");
+        let expected_identity = FileIdentity::from_file(&identity_source)
+            .expect("query identity")
+            .expect("Unix files have stable identities");
+        drop(identity_source);
+
+        let requested_flags = VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::EXCLUSIVE;
+        let (mut file, out_flags) = vfs
+            .open_reserved_with_expected_identity(&cx, &path, requested_flags, expected_identity)
+            .expect("matching empty reservation should open through io_uring decorator");
+
+        assert_eq!(
+            file.file_identity().expect("wrapped identity"),
+            Some(expected_identity)
+        );
+        assert!(!out_flags.intersects(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE));
+        file.close(&cx).expect("close decorated file");
+    }
+
+    #[test]
+    fn test_io_uring_vfs_forwards_no_follow_path_entry_check() {
+        use std::os::unix::fs::symlink;
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dangling = dir.path().join("dangling-wal");
+        symlink(dir.path().join("missing-target"), &dangling).expect("create dangling symlink");
+
+        assert!(
+            vfs.path_entry_exists(&cx, &dangling)
+                .expect("forward no-follow entry check")
+        );
     }
 
     #[test]

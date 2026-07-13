@@ -858,11 +858,29 @@ impl Vfs for UnixVfs {
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
         } else {
-            let cwd = std::env::current_dir().map_err(FrankenError::Io)?;
-            Ok(cwd.join(path))
+            std::env::current_dir()
+                .map_err(FrankenError::Io)?
+                .join(path)
+        };
+
+        match absolute.canonicalize() {
+            Ok(canonical) => Ok(canonical),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = absolute.parent().ok_or_else(|| FrankenError::CannotOpen {
+                    path: absolute.clone(),
+                })?;
+                let file_name = absolute
+                    .file_name()
+                    .ok_or_else(|| FrankenError::CannotOpen {
+                        path: absolute.clone(),
+                    })?;
+                let canonical_parent = parent.canonicalize().map_err(FrankenError::Io)?;
+                Ok(canonical_parent.join(file_name))
+            }
+            Err(error) => Err(FrankenError::Io(error)),
         }
     }
 
