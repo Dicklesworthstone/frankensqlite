@@ -163,7 +163,11 @@ fn agg_leading_eq_residual_matches_sqlite() {
     );
     // The single-column index range seek anchors with SeekGE (exclusive lower handled by a Le skip).
     assert!(
-        has_op(&f, "SELECT COUNT(*) FROM t WHERE s > 'k1' AND x = 3", "SeekGE"),
+        has_op(
+            &f,
+            "SELECT COUNT(*) FROM t WHERE s > 'k1' AND x = 3",
+            "SeekGE"
+        ),
         "TEXT range + residual on a BINARY-indexed column must seek the range (SeekGE)"
     );
 }

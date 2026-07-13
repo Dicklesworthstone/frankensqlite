@@ -11842,7 +11842,15 @@ fn codegen_select_aggregate(
         let range_skip_label = b.emit_label();
         // Residual: re-apply the whole (placeholder-free) WHERE; the rowid range is a superset.
         if has_residual && let Some(where_expr) = where_clause {
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, range_skip_label);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                range_skip_label,
+            );
         }
         emit_aggregate_accumulate_body(
             b,
