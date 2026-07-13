@@ -18814,6 +18814,19 @@ test is on the executed path, not merely linked into it.
   the strictly-better rowid/range paths still win. That is a planner-chain change, not the one-line
   hoist the range levers were, and each fix here uncovered a new planner interaction (covering-ignores-
   residual → directive-is-IndexEquality → IndexEquality-bypasses) — a signal the shape is not yet fully
-  understood. Retry as the heuristic-chain fallback (keep the exact-literal + non-covering-output gates,
-  reuse `codegen_select_index_equality_scan`), with an oracle that asserts a Seek AND a full
-  `-p fsqlite` suite, when the remote fleet is healthy enough to iterate.
+  understood.
+- FOLLOW-UP (same day): the heuristic-chain fallback was implemented and ALSO did not fire — third miss.
+  Correctness stayed byte-set-identical, but the seek never engaged for the common `SELECT id ... WHERE
+  a=5 AND c=5`. Root cause is the **non-covering-output gate rejecting `SELECT id`**:
+  `resolve_covering_output_sources` treats the rowid as coverable (a secondary index entry carries the
+  rowid), so `SELECT id` counts as COVERING and the gate declines it. But the gate is *necessary* —
+  `codegen_select_index_equality_scan` decides `needs_table_lookup` from the OUTPUT columns only, so a
+  covering output skips the table and the residual column (`c`) becomes unreadable. So the two constraints
+  are in direct conflict: to serve `SELECT id`/covering-output eq+residual, the seek must open the table
+  for the residual even though the output is "covering". THE REAL FIX is to modify
+  `codegen_select_index_equality_scan`'s covering decision to force `needs_table_lookup = true` when the
+  `where_clause` residual references any column not in the index — a change to a core emitter shared by
+  the IndexEquality directive path and others, so it must re-validate ALL callers (`eq_seek_exact_oracle`,
+  `agg_leading_eq_residual_oracle`, the full `-p fsqlite` suite). Only after that emitter fix does the
+  heuristic-chain fallback become correct+useful. Do NOT retry the fallback alone (proven insufficient);
+  start with the emitter covering-decision fix, on a healthy fleet.
