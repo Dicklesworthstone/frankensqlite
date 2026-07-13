@@ -2837,12 +2837,16 @@ pub fn codegen_select(
         // covers it), so we would otherwise sort every row. Route to the plain scan, which applies
         // LIMIT/OFFSET and stops early under a LIMIT. `rowid_range_allowed` is exactly the safe gate
         // (non-aggregate, no GROUP BY/HAVING/DISTINCT, and — since rowid_order is Some — the ORDER BY is
-        // a single rowid term). Restricted to `where_clause.is_none()` for this cut: a WHERE could carry
-        // MATCH / a subquery / other predicates whose interaction with the plain scan is not oracle-
-        // proven here (a filtered variant is a follow-up).
+        // a single rowid term). A WHERE is allowed only when `where_is_plain_scan_safe` proves it carries
+        // no MATCH and no subquery — `codegen_select_full_scan` applies it via the SAME per-row filter
+        // the sorter path uses, so scan and sort are byte-identical there (the sort is just elided). The
+        // MATCH / subquery cases keep the sorter (they churned golden snapshots and are not oracle-proven
+        // equivalent here).
         if matches!(rowid_order, Some(SortDirection::Asc))
             && rowid_range_allowed
-            && where_clause.is_none()
+            && where_clause
+                .as_deref()
+                .map_or(true, where_is_plain_scan_safe)
         {
             return codegen_select_full_scan(
                 b,
@@ -2865,7 +2869,9 @@ pub fn codegen_select(
         // `codegen_select_full_scan` is ascending-only, so reuse `codegen_select_rowid_range_scan` with an
         // UNBOUNDED range (`RowidRangeTarget::default()`, both bounds None) and `descending = true`: with
         // no upper bound it emits `Last`, with no lower bound it walks to exhaustion via `Prev`, applying
-        // LIMIT/OFFSET (stops early). Same no-WHERE gate as the ASC route.
+        // LIMIT/OFFSET (stops early). Kept to `where_clause.is_none()`: the descending range scan's
+        // residual-filter + LIMIT placeholder ordering is not yet exercised, so a filtered DESC variant
+        // is a follow-up (the ASC route reuses the well-tested `codegen_select_full_scan` for filters).
         if matches!(rowid_order, Some(SortDirection::Desc))
             && rowid_range_allowed
             && where_clause.is_none()
@@ -7214,6 +7220,86 @@ fn has_window_columns(columns: &[ResultColumn]) -> bool {
 }
 
 /// Recursive check for window function calls in an expression.
+/// True when `expr` is safe to evaluate during a plain rowid-order scan instead of the sorter path.
+///
+/// The forward-scan (`codegen_select_full_scan`) and sorter (`codegen_select_ordered_scan`) paths use
+/// the SAME per-row WHERE evaluation, so a tree built only of the scalar nodes below is byte-identical
+/// between them (the only difference being the elided sort). The two constructs that are NOT proven
+/// equivalent here — and that would need vtab / subquery machinery — are declined: a `MATCH` operator
+/// (FTS virtual table) and any subquery (`EXISTS`, scalar `Subquery`, `IN (SELECT ...)` / `IN table`).
+/// This is a conservative WHITELIST: any variant not explicitly listed (or a declined child) returns
+/// false, so an unrecognized future `Expr` shape keeps the safe sorter path. bd-nonagg-rowid-order-scan
+/// (filtered ASC variant).
+fn where_is_plain_scan_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) | Expr::Column(..) | Expr::Placeholder(..) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            where_is_plain_scan_safe(left) && where_is_plain_scan_safe(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => where_is_plain_scan_safe(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            where_is_plain_scan_safe(inner)
+                && where_is_plain_scan_safe(low)
+                && where_is_plain_scan_safe(high)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            where_is_plain_scan_safe(inner)
+                && matches!(set, fsqlite_ast::InSet::List(items) if items.iter().all(where_is_plain_scan_safe))
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            op,
+            ..
+        } => {
+            *op != fsqlite_ast::LikeOp::Match
+                && where_is_plain_scan_safe(inner)
+                && where_is_plain_scan_safe(pattern)
+                && escape
+                    .as_deref()
+                    .map_or(true, where_is_plain_scan_safe)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().map_or(true, where_is_plain_scan_safe)
+                && whens.iter().all(|(when_expr, then_expr)| {
+                    where_is_plain_scan_safe(when_expr) && where_is_plain_scan_safe(then_expr)
+                })
+                && else_expr.as_deref().map_or(true, where_is_plain_scan_safe)
+        }
+        Expr::FunctionCall {
+            over: None,
+            filter: None,
+            args,
+            ..
+        } => {
+            matches!(args, fsqlite_ast::FunctionArgs::List(items) if items.iter().all(where_is_plain_scan_safe))
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => where_is_plain_scan_safe(inner) && where_is_plain_scan_safe(path),
+        Expr::RowValue(items, _) => items.iter().all(where_is_plain_scan_safe),
+        // Declined: Exists, Subquery, Raise, IN (subquery/table), MATCH, window/filtered functions,
+        // and any unrecognized variant — all keep the safe sorter path.
+        _ => false,
+    }
+}
+
 fn expr_has_window(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { over: Some(_), .. } => true,
