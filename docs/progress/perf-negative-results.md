@@ -18904,3 +18904,31 @@ test is on the executed path, not merely linked into it.
   they merely reorder an O(n) pass. Reconsider only for a large ON-DISK cold-cache table where the walk
   reads only the narrow index while the sorter must scan+spill the full table, and gate the retry on that
   disk-bound benchmark.
+
+## 2026-07-13 - WIN: `SoftNull` skips redundant physical NULL replacement
+
+- Target: the existing `vdbe_pipeline_execute_softnull/{64,256,1024}` dispatch benchmark. The prior
+  rejected SoftNull experiment removed its hot-dispatch arm entirely; this distinct lever retains both
+  dispatch arms and specializes only the register write. `SoftNull` still performs logical-write
+  bookkeeping, but an already-NULL physical register no longer passes NULL through
+  `replace_register_value` and the reusable-buffer return path.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` adds `set_reg_null`, routes both `SoftNull` dispatch
+  arms through it, exercises a repeated NULL write in the existing unit test, and adds an oracle for
+  the subtle already-NULL case. The oracle proves `MakeRecord` sideband invalidation and subtype
+  clearing are retained even when the physical replacement is skipped. Non-NULL registers still use
+  the original replacement path; invalid-register and growth behavior are unchanged. Ordering, tie,
+  floating-point, and RNG behavior are not involved.
+- Same-worker foreground bench on remote worker `vmi1156319`, base and candidate both cold-built from
+  base commit `81a66d3f` with
+  `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1156319 RCH_WORKERS=vmi1156319 env -u CARGO_TARGET_DIR rch exec -- cargo bench --config 'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_softnull/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`:
+  - 64 ops: `959.84 ns` -> `799.75 ns` point estimate (16.7% lower); Criterion change
+    `[-22.967%, -17.383%, -11.707%]`, `p = 0.00`.
+  - 256 ops: `3.7372 us` -> `3.0542 us` (18.3% lower); Criterion change
+    `[-30.543%, -21.913%, -12.570%]`, `p = 0.00`.
+  - 1024 ops: `13.719 us` -> `11.704 us` (14.7% lower); Criterion change
+    `[-26.201%, -21.089%, -15.694%]`, `p = 0.00`.
+  Criterion evidence is under `target/criterion/vdbe_pipeline_execute_softnull/{64,256,1024}`; the
+  frozen baseline copy is `/data/tmp/frankensqlite-softnull-baseline-vmi1156319-81a66d3f`.
+- Result: KEEP. Every measured size improved significantly on the same worker, and the all-sizes gate
+  clears comfortably. Revisit only if register representation changes make NULL carry reusable storage
+  or introduce new logical-write metadata; in that case, extend `set_reg_null` before reusing it.
