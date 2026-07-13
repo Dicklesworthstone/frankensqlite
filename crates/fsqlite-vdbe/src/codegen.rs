@@ -1999,8 +1999,13 @@ pub fn codegen_select(
     } else {
         None
     };
+    // bd-nonagg-in-list-residual: also admit `col IN (ints) AND <residual>` — the residual variant
+    // returns `has_residual = true`, and the IN scan re-applies the whole WHERE per row (the seek
+    // visits the IN runs, a superset; the residual narrows to exact). The IN emitter always opens the
+    // table, so the residual reads any column and no covering gate is needed; IN is not a single-eq
+    // prefix, so it does not collide with the composite-prefix-range path.
     let index_in = if in_list_seek_allowed && rowid_in.is_none() {
-        index_integer_in_list_target(where_clause.as_deref(), table, table_alias)
+        index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
     } else {
         None
     };
@@ -2026,7 +2031,7 @@ pub fn codegen_select(
             &values,
         );
     }
-    if let Some((idx_schema, values)) = index_in {
+    if let Some((idx_schema, values, has_residual)) = index_in {
         return codegen_select_index_in_scan(
             b,
             cursor,
@@ -2040,6 +2045,8 @@ pub fn codegen_select(
             end_label,
             idx_schema,
             &values,
+            where_clause.as_deref(),
+            has_residual,
         );
     }
 
@@ -3141,8 +3148,19 @@ fn codegen_select_index_in_scan(
     end_label: crate::Label,
     idx_schema: &IndexSchema,
     values: &[i64],
+    where_clause: Option<&Expr>,
+    // When true, the full `where_clause` is applied as a per-row residual filter after positioning on
+    // each IN-list run — for `col IN (ints) AND <residual>`. The seek visits a SUPERSET (the IN runs)
+    // and the residual narrows to the exact matches; the table is always open here (SeekRowid below), so
+    // the residual can read any column. `false` for the exact-IN caller → byte-identical. Placeholder
+    // numbering is reset before each run's filter so a `?` in the residual numbers the same on every
+    // run. bd-nonagg-in-list-residual.
+    residual_filter: bool,
 ) -> Result<(), CodegenError> {
     let idx_cursor = 1_i32;
+    // Captured before any placeholder-emitting op (IN values are integer literals) so each residual
+    // filter can reset to it and number a `?` in the residual identically across runs.
+    let where_placeholder_base = b.current_anon_placeholder();
     b.emit_op(
         Opcode::OpenRead,
         cursor,
@@ -3207,6 +3225,13 @@ fn codegen_select_index_in_scan(
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+        // bd-nonagg-in-list-residual: narrow the IN run to the exact matches with the full WHERE.
+        if residual_filter
+            && let Some(where_expr) = where_clause
+        {
+            b.set_next_anon_placeholder(where_placeholder_base);
+            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
+        }
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
         b.resolve_label(skip_row);
