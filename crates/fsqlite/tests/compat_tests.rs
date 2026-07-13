@@ -886,6 +886,11 @@ fn upsert_do_update_after_leaf_split_does_not_double_free_page() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("upsert_leaf_split.db");
     let db = db_path.to_str().unwrap();
+    let shape_class = format!("roofline-v6:1:run={}:op=1", "a".repeat(64));
+    let machine: std::sync::Arc<[u8]> = vec![0_u8; 40].into();
+    let updated_kernel = "simd-axpy-f64";
+    let kernels = [updated_kernel, "simd-dot-f64", "simd-sum-f64"];
+    let measured_lengths = [1_265_usize, 1_264, 1_265];
 
     {
         let conn = Connection::open(db).unwrap();
@@ -901,10 +906,6 @@ fn upsert_do_update_after_leaf_split_does_not_double_free_page() {
         )
         .unwrap();
 
-        let shape_class = format!("roofline-v6:1:run={}:op=1", "a".repeat(64));
-        let machine: std::sync::Arc<[u8]> = vec![0_u8; 40].into();
-        let kernels = ["simd-axpy-f64", "simd-dot-f64", "simd-sum-f64"];
-        let measured_lengths = [1_265_usize, 1_264, 1_265];
         let insert = conn
             .prepare(
                 "INSERT INTO tune(kernel, shape_class, machine, params, measured)
@@ -935,9 +936,9 @@ fn upsert_do_update_after_leaf_split_does_not_double_free_page() {
         assert_eq!(
             update
                 .execute_with_params(&[
-                    SqliteValue::Text(kernels[0].into()),
-                    SqliteValue::Text(shape_class.into()),
-                    SqliteValue::Blob(machine),
+                    SqliteValue::Text(updated_kernel.into()),
+                    SqliteValue::Text(shape_class.clone().into()),
+                    SqliteValue::Blob(std::sync::Arc::clone(&machine)),
                     SqliteValue::Text(padded_json(574).into()),
                     SqliteValue::Text("{}".into()),
                 ])
@@ -961,6 +962,44 @@ fn upsert_do_update_after_leaf_split_does_not_double_free_page() {
         .query_row("SELECT COUNT(*) FROM tune", [], |row| row.get(0))
         .unwrap();
     assert_eq!(row_count, 3);
+
+    let mut statement = stock
+        .prepare(
+            "SELECT kernel, shape_class, machine, params, measured
+             FROM tune ORDER BY kernel",
+        )
+        .unwrap();
+    let stock_rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let expected_rows = kernels
+        .iter()
+        .zip(measured_lengths)
+        .map(|(kernel, measured_len)| {
+            (
+                (*kernel).to_owned(),
+                shape_class.clone(),
+                machine.as_ref().to_vec(),
+                padded_json(574),
+                if *kernel == updated_kernel {
+                    "{}".to_owned()
+                } else {
+                    padded_json(measured_len)
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stock_rows, expected_rows);
 }
 
 // ===========================================================================

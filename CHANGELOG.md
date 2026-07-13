@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.16] -- 2026-07-12 (UPSERT page-retirement corruption fix and complete workspace release)
+## [0.1.16] -- 2026-07-13 (UPSERT page-retirement corruption fix and complete workspace release)
 
 Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
 two low-level helper APIs now expose failure explicitly instead of fabricating
@@ -141,6 +141,15 @@ lossy values.
 - The MVCC concurrent-writer Criterion benchmark now releases its validation
   guard before abort cleanup re-locks the same session. `cargo test
   --workspace --all-targets` no longer self-deadlocks in the benchmark harness.
+- The file-backed clustered-seek pipeline benchmark now exercises equivalent
+  prepared FrankenSQLite and C SQLite lifecycles, with an exact preflight row
+  oracle before either engine is measured.
+- Planner replay artifacts are emitted only when the dedicated artifact path is
+  explicitly requested. Ordinary parallel unit tests no longer rewrite tracked
+  evidence with wall-clock timing or process-global metric noise.
+- Pager fault-injection scenarios now own a serialized, panic-safe session.
+  Only explicitly enrolled worker threads can consume an armed one-shot hook,
+  so parallel tests cannot steal another scenario's fault or evidence record.
 - MVCC reclamation registries now own independent epoch collectors, and
   process-global tracing, telemetry, SSI evidence, logical-clock, pager-profile,
   and runtime-obligation tests isolate their mutable state. The default-parallel
