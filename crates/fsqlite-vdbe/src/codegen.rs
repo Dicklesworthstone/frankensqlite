@@ -2012,6 +2012,18 @@ pub fn codegen_select(
     } else {
         None
     };
+    // bd-nonagg-rowid-eq-residual: `rowid = <const> AND <residual>` — one SeekRowid on the target row,
+    // then the whole WHERE re-applied to it. The planner emits a RowidLookup directive (it sees the eq)
+    // but codegen's bare `rowid_target` extraction declines the conjunction, so the directive bypasses
+    // (`rowid_lookup_target_missing`) and the shape falls through to a full scan. Route it here, before
+    // the directive. The bare `rowid = <const>` (single conjunct) is declined by the detector and keeps
+    // its existing directive path. Same narrow gate as the IN seeks. `codegen_select_rowid_lookup`
+    // always opens the table, so the residual reads any column and all outputs work.
+    let rowid_eq_residual = if in_list_seek_allowed && rowid_in.is_none() {
+        extract_rowid_eq_residual_target(where_clause.as_deref(), table, table_alias)
+    } else {
+        None
+    };
 
     // bd-2dgf5: route a seekable integer IN-list BEFORE the planner directive. The connection
     // emits a `FullTableScan` directive for `rowid IN (...)` (it does not model IN as a
@@ -2034,6 +2046,27 @@ pub fn codegen_select(
             &values,
             where_clause.as_deref(),
             has_residual,
+        );
+    }
+
+    // bd-nonagg-rowid-eq-residual: single SeekRowid + full-WHERE residual, ahead of the directive.
+    if let Some(target_expr) = rowid_eq_residual {
+        return codegen_select_rowid_lookup(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            stmt.limit.as_ref(),
+            target_expr,
+            where_clause.as_deref(),
+            true,
         );
     }
 
@@ -2308,6 +2341,8 @@ pub fn codegen_select(
                             end_label,
                             stmt.limit.as_ref(),
                             target_expr,
+                            None,
+                            false,
                         );
                     }
                     None => Some("rowid_lookup_target_missing"),
@@ -2539,6 +2574,8 @@ pub fn codegen_select(
             end_label,
             stmt.limit.as_ref(),
             target_expr,
+            None,
+            false,
         )
     } else if let Some(rowid_range) = rowid_range {
         codegen_select_rowid_range_scan(
@@ -2776,7 +2813,17 @@ fn codegen_select_rowid_lookup(
     end_label: crate::Label,
     limit_clause: Option<&LimitClause>,
     target_expr: &Expr,
+    where_clause: Option<&Expr>,
+    // When true, the full `where_clause` is applied as a residual filter after `SeekRowid` — for
+    // `rowid = <const> AND <residual>`. The single lookup visits only the target row; the residual
+    // decides whether to emit it. The table is always open here, so the residual reads any column.
+    // `false` for the exact-`rowid = const` callers → byte-identical. bd-nonagg-rowid-eq-residual.
+    residual_filter: bool,
 ) -> Result<(), CodegenError> {
+    // Captured before `emit_expr(target_expr)`, which may consume an anon placeholder (`rowid = ?`).
+    // The residual re-applies the whole WHERE, so it must re-number from this base (else the `id = ?`
+    // conjunct would double-consume). Unused when `residual_filter` is false.
+    let where_placeholder_base = b.current_anon_placeholder();
     let limit_reg = limit_clause.map(|lc| {
         let r = b.alloc_reg();
         emit_limit_expr(b, &lc.limit, r);
@@ -2813,6 +2860,14 @@ fn codegen_select_rowid_lookup(
         P4::None,
         0,
     );
+    // bd-nonagg-rowid-eq-residual: narrow the single seeked row with the full WHERE. A residual miss
+    // jumps to `done_label` (Close + Halt) — there is only ever one row on this path.
+    if residual_filter
+        && let Some(where_expr) = where_clause
+    {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, done_label);
+    }
     let skip_label = b.emit_label();
     if let Some(off_r) = offset_reg {
         b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
@@ -22434,6 +22489,32 @@ fn extract_rowid_target_expr<'a>(
         }
         if is_rowid_expr(right, table, table_alias) && is_simple_constant(left) {
             return Some(left);
+        }
+    }
+    None
+}
+
+/// The `rowid = <const>` target when it is a conjunct alongside OTHER predicates the SeekRowid cannot
+/// enforce — `rowid = <const> AND <residual>`. Returns the const RHS; the caller does one SeekRowid and
+/// re-applies the whole WHERE per the single row (the target row is a SUPERSET of size 1, the residual
+/// narrows to exact). Declines the BARE `rowid = <const>` (single conjunct) so that shape keeps flowing
+/// through the existing RowidLookup directive path unchanged (golden snapshots stable). The residual
+/// sibling of [`extract_rowid_target_expr`], mirroring [`extract_rowid_in_list_residual_target`].
+/// bd-nonagg-rowid-eq-residual.
+fn extract_rowid_eq_residual_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<&'a Expr> {
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    for term in conjuncts {
+        if let Some(expr) = extract_rowid_target_expr(Some(term), Some(table), table_alias) {
+            return Some(expr);
         }
     }
     None
