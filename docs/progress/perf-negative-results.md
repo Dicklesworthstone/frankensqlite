@@ -18862,3 +18862,19 @@ test is on the executed path, not merely linked into it.
   references a column not in the index, so the table opens and the residual reads it. Also open: prefer a
   single-column index over a shadowing composite in the eq-residual detector (it currently returns the
   first matching index), and generalize past `prefix.len() == 1` to composite eq prefixes.
+- COVERING-OUTPUT ATTEMPT (reverted, not landed): implemented `needs_table_lookup = covering_output
+  .is_none() || residual_filter` (a no-op for pure-`col=lit` callers — golden snapshots + eq oracles
+  stayed byte-identical) and dropped the non-covering gate, so `SELECT id`/`SELECT a` seek too. It was
+  correct (oracle 2/2 incl. covering outputs) and ~72× on `SELECT id WHERE a=5 AND cc=7` (0.32ms vs
+  22.6ms) — but the FULL `-p fsqlite` suite caught a CROSS-FEATURE regression:
+  `composite_prefix_range_residual_oracle` asserts `SELECT id FROM t WHERE a=5 AND b>10 AND c=1` declines
+  the composite prefix-range seek (residual `c=1` it cannot enforce → falls to a scan; asserts NO
+  `IdxGT`). Dropping the gate makes eq_residual claim that COVERING query and seek the `a=5` block
+  (equality seek, which emits `IdxGT`) — actually BETTER than the full scan it declined to, but it
+  violates that test's decline assertion. Correct results (the `cmp` passed); the conflict is purely the
+  opcode assertion of a feature a concurrent agent is actively developing (`542160a3` residual
+  enforcement). Reverted to the landed base lever rather than race a cross-feature change on a degraded
+  fleet. Retry: coordinate with composite-prefix-range — either gate eq_residual off when a composite
+  index offers a trailing-range prefix for the same WHERE (let the composite path own it / decline
+  together), or update the composite test to accept the better eq-seek plan — on a healthy fleet with no
+  concurrent edits in that region. The non-covering base lever (`e7f8cbaf`) is unaffected and stands.
