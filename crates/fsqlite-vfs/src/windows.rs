@@ -874,9 +874,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn file_identity(&self) -> Result<Option<FileIdentity>> {
-        // Rust's stable Windows metadata API does not yet expose the
-        // volume-serial/file-index pair needed for a handle-bound identity.
-        Ok(None)
+        Ok(FileIdentity::from_file(self.file_ref()?)?)
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -1222,6 +1220,40 @@ mod tests {
         let n = file.read(&cx, &mut buf, 0).expect("read");
         assert_eq!(n, 13);
         assert_eq!(&buf, b"hello windows");
+    }
+
+    #[test]
+    fn test_windowsvfs_file_identity_is_handle_bound() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("identity.db");
+        let other_path = dir.path().join("other.db");
+        let vfs = WindowsVfs::new();
+        let (file_a, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open first handle");
+        let (file_b, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open second handle");
+        let (other_file, _) = vfs
+            .open(&cx, Some(&other_path), open_flags_create())
+            .expect("open distinct file");
+
+        let identity_a = file_a
+            .file_identity()
+            .expect("read first identity")
+            .expect("Windows file identity should be available");
+        let identity_b = file_b
+            .file_identity()
+            .expect("read second identity")
+            .expect("Windows file identity should be available");
+        let other_identity = other_file
+            .file_identity()
+            .expect("read distinct identity")
+            .expect("Windows file identity should be available");
+
+        assert_eq!(identity_a, identity_b);
+        assert_ne!(identity_a, other_identity);
     }
 
     #[test]

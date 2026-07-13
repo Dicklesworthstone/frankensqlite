@@ -22,10 +22,11 @@ pub struct FileIdentity {
 impl FileIdentity {
     /// Read the identity of an independently opened filesystem descriptor.
     ///
-    /// On Unix this uses descriptor metadata (`st_dev`, `st_ino`), so a later
-    /// rename or pathname replacement does not change the result. Platforms
-    /// without a stable descriptor identity exposed by this crate return
-    /// `Ok(None)`.
+    /// On Unix this uses descriptor metadata (`st_dev`, `st_ino`). On Windows
+    /// it uses the volume serial number and file index associated with the
+    /// open handle. A later rename or pathname replacement therefore does not
+    /// change the result. Platforms without a stable descriptor identity
+    /// exposed by this crate return `Ok(None)`.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_file(file: &std::fs::File) -> std::io::Result<Option<Self>> {
         #[cfg(unix)]
@@ -36,7 +37,21 @@ impl FileIdentity {
             Ok(Some(Self::from_unix_parts(metadata.dev(), metadata.ino())))
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+
+            let metadata = file.metadata()?;
+            Ok(metadata
+                .volume_serial_number()
+                .zip(metadata.file_index())
+                .map(|(volume, index)| Self {
+                    namespace: u64::from(volume),
+                    object: index,
+                }))
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = file;
             Ok(None)
