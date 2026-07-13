@@ -1948,6 +1948,38 @@ pub fn codegen_select(
         extract_column_eq_target(where_clause.as_deref(), table, table_alias)
     };
 
+    // bd-nonagg-eq-residual: `SELECT <non-covering cols> FROM t WHERE <int/text-indexed col> = <lit>
+    // AND <residual on a non-indexed col>` (e.g. `SELECT * ... WHERE a = 5 AND c = 7`). The planner
+    // emits an IndexEquality directive for the `col=lit` conjunct which bypasses on the residual it
+    // cannot enforce (or emits none), reaching the heuristic chain below — where `index_eq`'s bare-`Eq`
+    // detection misses the conjunction and the query full-scans. Detect the exact eq-literal prefix (via
+    // the residual-safe `aggregate_index_prefix_literal_residual_target`, which requires ≥1 residual
+    // conjunct so pure `col=lit` still routes through the directive) and seek the `col=lit` block,
+    // filtering the FULL WHERE per row (`codegen_select_index_equality_scan` with `residual_filter =
+    // true`, so its fast path narrows to the exact matches). Dispatched as a heuristic fallback (AFTER
+    // rowid/range/index_eq, before the full scan) so strictly-better rowid/range paths still win. Single
+    // eq column only. NON-covering output only: the emitter opens the table (needs_table_lookup is
+    // output-driven) so the residual can read any column — a covering output (SELECT id: the rowid is in
+    // the index entry; SELECT a: the indexed column) would skip the table and correctly declines to the
+    // full scan (lifting that needs the covering-decision fix, see the negative-results ledger). The
+    // `col=lit` rows come back in rowid order — the full scan's order within that block — so byte-identical.
+    let eq_residual: Option<(&IndexSchema, &Expr)> = if is_aggregate
+        || !stmt.order_by.is_empty()
+        || distinct != Distinctness::All
+        || !group_by.is_empty()
+        || having.is_some()
+        || table.without_rowid
+    {
+        None
+    } else {
+        aggregate_index_prefix_literal_residual_target(where_clause.as_deref(), table, table_alias)
+            .filter(|(_idx, prefix)| prefix.len() == 1)
+            .filter(|(idx, _prefix)| {
+                resolve_covering_output_sources(columns, table, table_alias, idx).is_none()
+            })
+            .map(|(idx, prefix)| (idx, prefix[0]))
+    };
+
     // bd-2dgf5: non-aggregate `SELECT ... FROM t WHERE <int col> IN (<int literals>)` seeks
     // the index once per distinct value instead of full-scanning. Same INTEGER-affinity +
     // integer-literal safe subset as the aggregate IN path; declined for ORDER BY (the seek
@@ -2310,6 +2342,7 @@ pub fn codegen_select(
                                                 end_label,
                                                 idx_schema,
                                                 directive_target_expr,
+                                                false,
                                             );
                                         }
                                         Some(_) => Some("index_equality_target_mismatch"),
@@ -2346,6 +2379,7 @@ pub fn codegen_select(
                                         end_label,
                                         idx_schema,
                                         target_expr,
+                                        false,
                                     );
                                 }
                             } else {
@@ -2545,6 +2579,7 @@ pub fn codegen_select(
                 end_label,
                 idx_schema,
                 target_expr,
+                false,
             )
         } else {
             // Fallback to full scan.
@@ -2564,6 +2599,28 @@ pub fn codegen_select(
                 end_label,
             )
         }
+    } else if let Some((idx_schema, target_expr)) = eq_residual {
+        // --- Eq-prefix + residual seek (bd-nonagg-eq-residual) ---
+        // Reached when the IndexEquality directive bypassed on the residual (or none was emitted) and
+        // `index_eq`'s bare-`Eq` detection missed the conjunction. Seek the `col = lit` block and filter
+        // the FULL WHERE per row (`residual_filter = true`) instead of scanning every row.
+        codegen_select_index_equality_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            target_expr,
+            true,
+        )
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
         // --- Aggregate query WITH GROUP BY ---
         codegen_select_group_by_aggregate(
@@ -2776,6 +2833,12 @@ fn codegen_select_index_equality_scan(
     end_label: crate::Label,
     idx_schema: &IndexSchema,
     target_expr: &Expr,
+    // When true, the FAST duplicate-run path also applies the full `where_clause` as a per-row residual
+    // filter (the fast path otherwise emits every eq-block row unfiltered, correct only when the WHERE is
+    // exactly the eq prefix). Callers whose WHERE is just `col = lit` pass `false` — their codegen is then
+    // byte-identical. Only the bd-nonagg-eq-residual caller, whose WHERE is `col = lit AND <residual>`,
+    // passes `true`. bd-nonagg-eq-residual.
+    residual_filter: bool,
 ) -> Result<(), CodegenError> {
     let idx_cursor = 1_i32;
     let full_scan_fallback = b.emit_label();
@@ -2962,6 +3025,18 @@ fn codegen_select_index_equality_scan(
         } else {
             emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
         }
+    }
+    // bd-nonagg-eq-residual: apply the full WHERE as a per-row residual filter on the fast seek path
+    // when the caller has a residual beyond the eq prefix. The seek already pins `col = lit` (so that
+    // conjunct is redundant here) and the row is positioned (table cursor for the non-covering caller
+    // this flag is gated to), so the residual (e.g. `c = 7`) narrows the eq block to the exact matches.
+    // The placeholder base is reset exactly as the fallback below does, so a `?` in the residual numbers
+    // identically on both runtime paths.
+    if residual_filter
+        && let Some(where_expr) = where_clause
+    {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, idx_skip_label);
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     if let Some(lim_r) = limit_reg {
@@ -32389,6 +32464,7 @@ mod tests {
             end_label,
             idx_schema,
             &placeholder(1),
+            false,
         )
         .unwrap();
         b.resolve_label(done_label);
