@@ -10,23 +10,25 @@ use crate::shm::ShmRegion;
 
 /// Opaque identity of an already-open filesystem object.
 ///
-/// Identities are intended only for equality comparisons while the relevant
-/// file handles remain open. They are not persistent database identifiers and
-/// must not be serialized or compared across machines or boots.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// Identities are intended only as opaque comparison keys while the relevant
+/// file handles remain open. Their ordering carries no filesystem meaning;
+/// it exists only for ordered collections. They are not persistent database
+/// identifiers and must not be serialized or compared across machines or
+/// boots.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileIdentity {
     namespace: u64,
-    object: u64,
+    object: [u8; 16],
 }
 
 impl FileIdentity {
     /// Read the identity of an independently opened filesystem descriptor.
     ///
     /// On Unix this uses descriptor metadata (`st_dev`, `st_ino`). On Windows
-    /// it uses the volume serial number and file index associated with the
-    /// open handle. A later rename or pathname replacement therefore does not
-    /// change the result. Platforms without a stable descriptor identity
-    /// exposed by this crate return `Ok(None)`.
+    /// it uses the volume serial number and full 128-bit file identifier
+    /// associated with the open handle. A later rename or pathname replacement
+    /// therefore does not change the result. Platforms without a stable
+    /// descriptor identity exposed by this crate return `Ok(None)`.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_file(file: &std::fs::File) -> std::io::Result<Option<Self>> {
         #[cfg(unix)]
@@ -39,16 +41,34 @@ impl FileIdentity {
 
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt as _;
+            use std::mem::size_of;
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+            };
 
-            let metadata = file.metadata()?;
-            Ok(metadata
-                .volume_serial_number()
-                .zip(metadata.file_index())
-                .map(|(volume, index)| Self {
-                    namespace: u64::from(volume),
-                    object: index,
-                }))
+            let mut identity = FILE_ID_INFO::default();
+            let identity_size = u32::try_from(size_of::<FILE_ID_INFO>()).map_err(|_| {
+                std::io::Error::other("FILE_ID_INFO size does not fit in a Windows DWORD")
+            })?;
+            // SAFETY: `file` owns a live Windows file handle, `identity` is a
+            // correctly sized writable `FILE_ID_INFO` buffer, and both remain
+            // valid for the duration of the synchronous system call.
+            let succeeded = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileIdInfo,
+                    std::ptr::from_mut(&mut identity).cast(),
+                    identity_size,
+                )
+            };
+            if succeeded == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self::from_windows_parts(
+                identity.VolumeSerialNumber,
+                identity.FileId.Identifier,
+            ))
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -59,17 +79,57 @@ impl FileIdentity {
     }
 
     #[cfg(unix)]
-    pub(crate) const fn from_unix_parts(device: u64, inode: u64) -> Self {
+    pub(crate) fn from_unix_parts(device: u64, inode: u64) -> Self {
+        let mut object = [0_u8; 16];
+        object[..8].copy_from_slice(&inode.to_be_bytes());
         Self {
             namespace: device,
-            object: inode,
+            object,
         }
+    }
+
+    #[cfg(windows)]
+    fn from_windows_parts(volume_serial_number: u64, file_id: [u8; 16]) -> Option<Self> {
+        // MS-FSCC 2.1.10 reserves all-zero for filesystems without a
+        // 128-bit file ID and all-ones for files whose unique ID cannot be
+        // established. Both values MUST be ignored, so neither can safely
+        // participate in an expected-identity comparison.
+        if file_id.iter().all(|byte| *byte == 0) || file_id.iter().all(|byte| *byte == u8::MAX) {
+            return None;
+        }
+        Some(Self {
+            namespace: volume_serial_number,
+            object: file_id,
+        })
     }
 }
 
 impl std::fmt::Debug for FileIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("FileIdentity(..)")
+    }
+}
+
+#[cfg(all(test, windows))]
+mod file_identity_tests {
+    use super::FileIdentity;
+
+    #[test]
+    fn windows_identity_compares_all_file_id_bits() {
+        let file_id = [0x5a_u8; 16];
+        let mut different_high_byte = file_id;
+        different_high_byte[15] ^= 0xff;
+
+        assert_ne!(
+            FileIdentity::from_windows_parts(7, file_id),
+            FileIdentity::from_windows_parts(7, different_high_byte),
+        );
+    }
+
+    #[test]
+    fn windows_identity_rejects_reserved_sentinels() {
+        assert_eq!(FileIdentity::from_windows_parts(7, [0_u8; 16]), None);
+        assert_eq!(FileIdentity::from_windows_parts(7, [u8::MAX; 16]), None);
     }
 }
 
@@ -123,6 +183,65 @@ pub trait Vfs: Send + Sync {
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)>;
 
+    /// Open an existing file only if its handle has `expected_identity`.
+    ///
+    /// The default implementation verifies the identity immediately after
+    /// opening. Filesystem backends whose normal open path can mutate related
+    /// artifacts should override this method and perform an earlier,
+    /// side-effect-free identity preflight as well. Because an expected
+    /// identity can only belong to an existing object, `CREATE` and
+    /// `EXCLUSIVE` are stripped before the open.
+    fn open_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let mut existing_flags = flags;
+        existing_flags.remove(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE);
+        let (file, actual_flags) = self.open(cx, Some(path), existing_flags)?;
+        if file.file_identity()? != Some(expected_identity) {
+            return Err(fsqlite_error::FrankenError::CannotOpen {
+                path: path.to_owned(),
+            });
+        }
+        Ok((file, actual_flags))
+    }
+
+    /// Open a caller-reserved empty file without creating it or recovering
+    /// any pre-existing database artifacts.
+    ///
+    /// Backends whose ordinary open path creates auxiliary files must
+    /// override this method so the identity, zero-length, and recovery-
+    /// artifact checks all occur before those side effects.
+    fn open_reserved_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (file, actual_flags) =
+            self.open_with_expected_identity(cx, path, flags, expected_identity)?;
+        if file.file_size(cx)? != 0 {
+            return Err(fsqlite_error::FrankenError::CannotOpen {
+                path: path.to_owned(),
+            });
+        }
+
+        for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
+            let mut artifact_path = path.as_os_str().to_owned();
+            artifact_path.push(suffix);
+            if self.path_entry_exists(cx, Path::new(&artifact_path))? {
+                return Err(fsqlite_error::FrankenError::CannotOpen {
+                    path: path.to_owned(),
+                });
+            }
+        }
+        Ok((file, actual_flags))
+    }
+
     /// Delete a file.
     ///
     /// If `sync_dir` is true, the directory entry removal should be synced
@@ -134,6 +253,16 @@ pub trait Vfs: Send + Sync {
     /// Returns true if the file at `path` satisfies the access check
     /// described by `flags`.
     fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool>;
+
+    /// Return whether a directory entry exists without following its final
+    /// symlink component.
+    ///
+    /// This is stricter than [`Path::exists`] and is required for gates that
+    /// must refuse dangling recovery-artifact symlinks. Virtual filesystems
+    /// without symlink semantics may delegate to [`Self::access`].
+    fn path_entry_exists(&self, cx: &Cx, path: &Path) -> Result<bool> {
+        self.access(cx, path, AccessFlags::EXISTS)
+    }
 
     /// Resolve a potentially relative path into an absolute path.
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf>;

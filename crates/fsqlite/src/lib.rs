@@ -53,6 +53,66 @@ mod tests {
         row.values().to_vec()
     }
 
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn native_suffixed_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut suffixed = path.as_os_str().to_owned();
+        suffixed.push(suffix);
+        std::path::PathBuf::from(suffixed)
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn native_database_artifacts(path: &std::path::Path) -> [std::path::PathBuf; 8] {
+        [
+            path.to_owned(),
+            native_suffixed_path(path, "-journal"),
+            native_suffixed_path(path, "-wal"),
+            native_suffixed_path(path, "-wal-fec"),
+            native_suffixed_path(path, "-shm"),
+            native_suffixed_path(path, "-lock-shared"),
+            native_suffixed_path(path, "-lock-reserved"),
+            native_suffixed_path(path, "-lock-pending"),
+        ]
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn snapshot_native_artifacts(paths: &[std::path::PathBuf]) -> Vec<Option<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|path| match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("snapshot {}: {error}", path.display()),
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    fn seed_windows_database(path: &std::path::Path) {
+        let seed = rusqlite::Connection::open(path).expect("create valid SQLite database");
+        seed.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE identity_probe(value INTEGER NOT NULL);
+             INSERT INTO identity_probe VALUES (1);",
+        )
+        .expect("seed valid SQLite database");
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    fn windows_file_identity(path: &std::path::Path) -> FileIdentity {
+        let file = std::fs::File::open(path).expect("open Windows identity handle");
+        FileIdentity::from_file(&file)
+            .expect("query Windows identity handle")
+            .expect("Windows file identity must be available")
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    fn seed_windows_auxiliary_sentinels(artifacts: &[std::path::PathBuf; 8]) {
+        std::fs::write(&artifacts[1], b"journal sentinel").expect("seed journal sentinel");
+        std::fs::write(&artifacts[2], b"WAL sentinel").expect("seed WAL sentinel");
+        std::fs::write(&artifacts[3], b"WAL-FEC sentinel").expect("seed WAL-FEC sentinel");
+        std::fs::write(&artifacts[4], b"SHM sentinel").expect("seed SHM sentinel");
+    }
+
     #[test]
     fn test_connection_open_and_path() {
         let conn = Connection::open(":memory:").expect("in-memory connection should open");
@@ -63,6 +123,154 @@ mod tests {
     fn in_memory_connection_has_no_filesystem_identity() {
         let conn = Connection::open(":memory:").expect("in-memory connection should open");
         assert_eq!(conn.file_identity().unwrap(), None);
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_identity_open_never_synthesizes_a_missing_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let identity_path = dir.path().join("existing-identity.db");
+        let missing_path = dir.path().join("missing-reservation.db");
+        drop(std::fs::File::create(&identity_path).expect("create identity source"));
+        let identity_file = std::fs::File::open(&identity_path).expect("open identity source");
+        let expected_identity = FileIdentity::from_file(&identity_file)
+            .expect("query filesystem identity")
+            .expect("native filesystem identity must be available");
+
+        let artifacts = [
+            missing_path.clone(),
+            native_suffixed_path(&missing_path, "-journal"),
+            native_suffixed_path(&missing_path, "-wal"),
+            native_suffixed_path(&missing_path, "-wal-fec"),
+            native_suffixed_path(&missing_path, "-shm"),
+            native_suffixed_path(&missing_path, "-lock-shared"),
+            native_suffixed_path(&missing_path, "-lock-reserved"),
+            native_suffixed_path(&missing_path, "-lock-pending"),
+        ];
+        assert!(artifacts.iter().all(|path| !path.exists()));
+
+        let error = Connection::open_reserved_with_expected_identity(
+            missing_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect_err("missing reservation must not be created");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert!(
+            artifacts.iter().all(|path| !path.exists()),
+            "identity-bound reserved open must leave the missing main path and every sidecar absent"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_identity_open_refuses_a_preexisting_recovery_artifact_without_mutation() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("reserved-empty.db");
+        let artifacts = native_database_artifacts(&database_path);
+        drop(std::fs::File::create(&database_path).expect("reserve empty database path"));
+        let reservation = std::fs::File::open(&database_path).expect("open reservation handle");
+        let expected_identity = FileIdentity::from_file(&reservation)
+            .expect("query reservation identity")
+            .expect("native filesystem identity must be available");
+        std::fs::write(&artifacts[1], b"reserved journal sentinel")
+            .expect("seed recovery artifact");
+        let before = snapshot_native_artifacts(&artifacts);
+        assert!(
+            before[2..].iter().all(Option::is_none),
+            "every unseeded recovery and advisory-lock sidecar must start absent"
+        );
+
+        let error = Connection::open_reserved_with_expected_identity(
+            database_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect_err("a reserved-empty open must refuse a pre-existing recovery artifact");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            snapshot_native_artifacts(&artifacts),
+            before,
+            "refusal must leave main, recovery artifacts, and advisory-lock sidecars unchanged"
+        );
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn reserved_identity_open_refuses_dangling_recovery_artifact_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        for (index, suffix) in ["-journal", "-wal", "-wal-fec", "-shm"]
+            .into_iter()
+            .enumerate()
+        {
+            let database_path = dir.path().join(format!("reserved-dangling-{index}.db"));
+            drop(std::fs::File::create(&database_path).expect("reserve empty database path"));
+            let reservation = std::fs::File::open(&database_path).expect("open reservation handle");
+            let expected_identity = FileIdentity::from_file(&reservation)
+                .expect("query reservation identity")
+                .expect("Unix filesystem identity must be available");
+            let dangling_target = dir.path().join(format!("missing-target-{index}"));
+            let artifact_path = native_suffixed_path(&database_path, suffix);
+            symlink(&dangling_target, &artifact_path).expect("seed dangling artifact symlink");
+
+            let error = Connection::open_reserved_with_expected_identity(
+                database_path.to_string_lossy().into_owned(),
+                expected_identity,
+            )
+            .expect_err("a dangling recovery-artifact symlink must refuse initialization");
+
+            assert!(matches!(error, FrankenError::CannotOpen { .. }));
+            assert_eq!(
+                std::fs::metadata(&database_path).unwrap().len(),
+                0,
+                "refusal must leave the reserved main file empty"
+            );
+            assert!(
+                std::fs::symlink_metadata(&artifact_path)
+                    .expect("refusal must preserve the dangling artifact")
+                    .file_type()
+                    .is_symlink(),
+                "refusal must preserve the {suffix} symlink itself"
+            );
+            assert!(
+                !dangling_target.exists(),
+                "refusal must not create the dangling symlink target"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn reserved_identity_open_refuses_a_nonempty_file_without_artifact_mutation() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("reserved-nonempty.db");
+        std::fs::write(&database_path, b"nonempty reservation sentinel")
+            .expect("seed nonempty reserved file");
+        let reservation = std::fs::File::open(&database_path).expect("open reservation handle");
+        let expected_identity = FileIdentity::from_file(&reservation)
+            .expect("query reservation identity")
+            .expect("native filesystem identity must be available");
+        let artifacts = native_database_artifacts(&database_path);
+        let before = snapshot_native_artifacts(&artifacts);
+        assert!(
+            before[1..].iter().all(Option::is_none),
+            "every database sidecar must start absent"
+        );
+
+        let error = Connection::open_reserved_with_expected_identity(
+            database_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect_err("a reserved-empty open must refuse a nonempty file");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            snapshot_native_artifacts(&artifacts),
+            before,
+            "nonempty refusal must leave the main file and every sidecar unchanged"
+        );
     }
 
     #[cfg(all(feature = "native", unix))]
@@ -227,6 +435,182 @@ mod tests {
                 || std::fs::read(&control_journal_path).unwrap().is_empty(),
             "control recovery must consume or invalidate the hot journal"
         );
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    #[test]
+    fn windows_expected_identity_refuses_before_any_database_artifact_mutation() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let identity_path = dir.path().join("identity.db");
+        let candidate_path = dir.path().join("candidate.db");
+        for path in [&identity_path, &candidate_path] {
+            seed_windows_database(path);
+        }
+
+        let expected_identity = windows_file_identity(&identity_path);
+        let candidate_identity = windows_file_identity(&candidate_path);
+        assert_ne!(expected_identity, candidate_identity);
+
+        let artifacts = native_database_artifacts(&candidate_path);
+        seed_windows_auxiliary_sentinels(&artifacts);
+        let before = snapshot_native_artifacts(&artifacts);
+        assert!(
+            before[5..].iter().all(Option::is_none),
+            "advisory lock sidecars must start absent"
+        );
+
+        let error = Connection::open_existing_with_expected_identity(
+            candidate_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect_err("wrong expected identity must refuse the candidate database");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            snapshot_native_artifacts(&artifacts),
+            before,
+            "identity refusal must leave main, journal, WAL, SHM, and advisory sidecars unchanged"
+        );
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    #[test]
+    fn windows_schema_only_identity_mismatch_precedes_artifact_mutation() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let identity_path = dir.path().join("schema-identity.db");
+        let candidate_path = dir.path().join("schema-candidate.db");
+        seed_windows_database(&identity_path);
+        seed_windows_database(&candidate_path);
+
+        let expected_identity = windows_file_identity(&identity_path);
+        assert_ne!(expected_identity, windows_file_identity(&candidate_path));
+
+        let artifacts = native_database_artifacts(&candidate_path);
+        seed_windows_auxiliary_sentinels(&artifacts);
+        let before = snapshot_native_artifacts(&artifacts);
+        assert!(
+            before[5..].iter().all(Option::is_none),
+            "advisory lock sidecars must start absent"
+        );
+
+        let error = Connection::open_schema_only_with_expected_identity(
+            candidate_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect_err("wrong expected identity must refuse schema-only open");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            snapshot_native_artifacts(&artifacts),
+            before,
+            "schema-only refusal must leave every database artifact unchanged"
+        );
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    #[test]
+    fn windows_existing_expected_identity_accepts_matching_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("existing-matching-identity.db");
+        seed_windows_database(&database_path);
+
+        let leased_file =
+            std::fs::File::open(&database_path).expect("retain existing database handle");
+        let expected_identity = FileIdentity::from_file(&leased_file)
+            .expect("query existing database identity")
+            .expect("Windows file identity must be available");
+        let conn = Connection::open_existing_with_expected_identity(
+            database_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect("matching identity must open the existing database");
+
+        assert_eq!(conn.file_identity().unwrap(), Some(expected_identity));
+        let rows = conn
+            .query("SELECT COUNT(*) FROM identity_probe;")
+            .expect("matching identity connection must query the seeded table");
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+        drop(conn);
+        drop(leased_file);
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    #[test]
+    fn windows_schema_only_expected_identity_accepts_matching_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let database_path = dir.path().join("schema-matching-identity.db");
+        seed_windows_database(&database_path);
+
+        let leased_file =
+            std::fs::File::open(&database_path).expect("retain schema database handle");
+        let expected_identity = FileIdentity::from_file(&leased_file)
+            .expect("query schema database identity")
+            .expect("Windows file identity must be available");
+        let conn = Connection::open_schema_only_with_expected_identity(
+            database_path.to_string_lossy().into_owned(),
+            expected_identity,
+        )
+        .expect("matching identity must open the schema-only connection");
+
+        assert_eq!(conn.file_identity().unwrap(), Some(expected_identity));
+        let rows = conn
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'identity_probe';")
+            .expect("matching identity schema connection must load the seeded schema");
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+        drop(conn);
+        drop(leased_file);
+    }
+
+    #[cfg(all(feature = "native", windows))]
+    #[test]
+    fn windows_reserved_empty_open_is_identity_bound() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let identity_path = dir.path().join("reservation-identity.db");
+        let candidate_path = dir.path().join("reservation-candidate.db");
+        let accepted_path = dir.path().join("reservation-accepted.db");
+        for path in [&identity_path, &candidate_path, &accepted_path] {
+            drop(std::fs::File::create(path).expect("reserve empty database path"));
+        }
+
+        let wrong_identity = windows_file_identity(&identity_path);
+        assert_ne!(wrong_identity, windows_file_identity(&candidate_path));
+        let candidate_artifacts = native_database_artifacts(&candidate_path);
+        seed_windows_auxiliary_sentinels(&candidate_artifacts);
+        let candidate_before = snapshot_native_artifacts(&candidate_artifacts);
+        assert!(
+            candidate_before[5..].iter().all(Option::is_none),
+            "advisory lock sidecars must start absent"
+        );
+
+        let error = Connection::open_reserved_with_expected_identity(
+            candidate_path.to_string_lossy().into_owned(),
+            wrong_identity,
+        )
+        .expect_err("wrong reservation identity must refuse initialization");
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(
+            snapshot_native_artifacts(&candidate_artifacts),
+            candidate_before,
+            "wrong reservation identity must leave the empty file and sidecars untouched"
+        );
+
+        let accepted_reservation =
+            std::fs::File::open(&accepted_path).expect("retain accepted reservation handle");
+        let accepted_identity = FileIdentity::from_file(&accepted_reservation)
+            .expect("query accepted reservation identity")
+            .expect("Windows file identity must be available");
+        let conn = Connection::open_reserved_with_expected_identity(
+            accepted_path.to_string_lossy().into_owned(),
+            accepted_identity,
+        )
+        .expect("matching reservation identity must initialize the database");
+        assert_eq!(conn.file_identity().unwrap(), Some(accepted_identity));
+        assert!(
+            std::fs::metadata(&accepted_path).unwrap().len() > 0,
+            "matching reservation must initialize the empty database image"
+        );
+        conn.execute("CREATE TABLE reservation_probe(value INTEGER NOT NULL);")
+            .expect("initialized reservation must accept SQL");
     }
 
     #[test]

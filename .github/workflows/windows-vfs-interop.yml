@@ -5,10 +5,18 @@ on:
   push:
     branches: [main]
     paths:
+      - "Cargo.lock"
+      - "crates/fsqlite/**"
+      - "crates/fsqlite-core/**"
+      - "crates/fsqlite-pager/**"
       - "crates/fsqlite-vfs/**"
       - ".github/workflows/windows-vfs-interop.yml"
   pull_request:
     paths:
+      - "Cargo.lock"
+      - "crates/fsqlite/**"
+      - "crates/fsqlite-core/**"
+      - "crates/fsqlite-pager/**"
       - "crates/fsqlite-vfs/**"
       - ".github/workflows/windows-vfs-interop.yml"
 
@@ -83,6 +91,36 @@ jobs:
       - name: Run full fsqlite-vfs tests
         shell: pwsh
         run: cargo test -p fsqlite-vfs -- --nocapture 2>&1 | Tee-Object -FilePath artifacts/cargo-test-fsqlite-vfs.txt
+
+      - name: Prove descriptor-bound facade opens exactly on Windows
+        shell: pwsh
+        run: |
+          $tests = @(
+            "tests::reserved_identity_open_never_synthesizes_a_missing_path",
+            "tests::reserved_identity_open_refuses_a_preexisting_recovery_artifact_without_mutation",
+            "tests::reserved_identity_open_refuses_a_nonempty_file_without_artifact_mutation",
+            "tests::windows_expected_identity_refuses_before_any_database_artifact_mutation",
+            "tests::windows_schema_only_identity_mismatch_precedes_artifact_mutation",
+            "tests::windows_existing_expected_identity_accepts_matching_file",
+            "tests::windows_schema_only_expected_identity_accepts_matching_file",
+            "tests::windows_reserved_empty_open_is_identity_bound"
+          )
+          $logPath = "artifacts/cargo-test-descriptor-identity.txt"
+          foreach ($test in $tests) {
+            "=== $test ===" | Tee-Object -FilePath $logPath -Append
+            $testOutput = & cargo test --locked -p fsqlite --features native $test -- --exact --nocapture 2>&1
+            $testExitCode = $LASTEXITCODE
+            $testOutput | Tee-Object -FilePath $logPath -Append
+            if ($testExitCode -ne 0) {
+              throw "descriptor-bound facade proof failed: $test"
+            }
+            $testOutputText = $testOutput -join "`n"
+            $oneTestRuns = ([regex]::Matches($testOutputText, "(?m)^running 1 test$")).Count
+            $oneTestPassed = $testOutputText -match "(?m)^test result: ok\. 1 passed; 0 failed; 0 ignored;"
+            if ($oneTestRuns -ne 1 -or -not $oneTestPassed) {
+              throw "expected exactly one executed and passing test for ${test}; observed running-count=${oneTestRuns}"
+            }
+          }
 
       - name: Run Windows interop E2E test
         shell: pwsh

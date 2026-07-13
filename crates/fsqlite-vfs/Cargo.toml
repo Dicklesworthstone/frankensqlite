@@ -31,6 +31,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 advisory-lock = "0.3.0"
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -849,6 +849,14 @@ impl Vfs for UnixVfs {
         }
     }
 
+    fn path_entry_exists(&self, _cx: &Cx, path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(FrankenError::Io(error)),
+        }
+    }
+
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
         if path.is_absolute() {
             Ok(path.to_path_buf())

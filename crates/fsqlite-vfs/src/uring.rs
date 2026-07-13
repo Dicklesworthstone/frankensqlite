@@ -716,6 +716,10 @@ impl Vfs for IoUringVfs {
         self.unix.access(cx, path, flags)
     }
 
+    fn path_entry_exists(&self, cx: &Cx, path: &Path) -> Result<bool> {
+        self.unix.path_entry_exists(cx, path)
+    }
+
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
         self.unix.full_pathname(cx, path)
     }

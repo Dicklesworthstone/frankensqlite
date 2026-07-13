@@ -4458,6 +4458,7 @@ pub struct SimplePager<V: Vfs> {
 enum ReadWriteOpenDisposition {
     CreateIfMissing,
     ExistingOnly,
+    ReservedEmpty,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -5746,6 +5747,33 @@ where
         )
     }
 
+    /// Initialize a caller-reserved empty file only if the opened VFS handle
+    /// has `expected_identity`.
+    ///
+    /// This keeps create-new workflows bound to the descriptor that reserved
+    /// the pathname. A missing or non-empty file is refused, as is a
+    /// pre-existing rollback journal, WAL, WAL-FEC, or shared-memory sidecar.
+    /// The identity and sidecar checks precede database initialization, and
+    /// this path never performs recovery.
+    pub fn open_reserved_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        expected_identity: FileIdentity,
+        page_buffer_max: Option<usize>,
+    ) -> Result<Self> {
+        Self::open_readwrite_with_cx_and_page_buffer_max(
+            cx,
+            vfs,
+            path,
+            requested_page_size,
+            Some(expected_identity),
+            page_buffer_max,
+            ReadWriteOpenDisposition::ReservedEmpty,
+        )
+    }
+
     /// Open an existing database for reading and writing without creating or
     /// initializing the main database file.
     ///
@@ -5789,14 +5817,20 @@ where
         if disposition == ReadWriteOpenDisposition::CreateIfMissing {
             flags |= VfsOpenFlags::CREATE;
         }
-        let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
-        if let Some(expected_identity) = expected_identity
-            && db_file.file_identity()? != Some(expected_identity)
-        {
-            return Err(FrankenError::CannotOpen {
-                path: path.to_owned(),
-            });
-        }
+        let (mut db_file, _actual_flags) = match (disposition, expected_identity) {
+            (ReadWriteOpenDisposition::ReservedEmpty, Some(expected_identity)) => {
+                vfs.open_reserved_with_expected_identity(cx, path, flags, expected_identity)?
+            }
+            (_, Some(expected_identity)) => {
+                vfs.open_with_expected_identity(cx, path, flags, expected_identity)?
+            }
+            (ReadWriteOpenDisposition::ReservedEmpty, None) => {
+                return Err(FrankenError::CannotOpen {
+                    path: path.to_owned(),
+                });
+            }
+            (_, None) => vfs.open(cx, Some(path), flags)?,
+        };
 
         // Probe for existing page size BEFORE hot journal recovery.
         // Recovery requires the correct page size to correctly parse records.
@@ -5806,6 +5840,7 @@ where
                 path: path.to_owned(),
             });
         }
+        let journal_path = Self::journal_path(path);
         let page_size = if file_size >= DATABASE_HEADER_SIZE as u64 {
             let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
             let header_read = db_file.read(cx, &mut header_bytes, 0)?;
@@ -5850,8 +5885,8 @@ where
             requested_page_size
         };
 
-        let journal_path = Self::journal_path(path);
-        let rollback_journal_exists = vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
+        let rollback_journal_exists = disposition != ReadWriteOpenDisposition::ReservedEmpty
+            && vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
         if rollback_journal_exists {
             // bd-yfdb6 / bd-ma5m2.1: acquire the per-path recovery fence only
             // when there is a rollback journal to recover. Clean WAL-mode
@@ -6102,7 +6137,6 @@ where
     ///
     /// See [`open_with_cx_and_page_buffer_max`](Self::open_with_cx_and_page_buffer_max)
     /// for parameter semantics.
-    #[allow(clippy::too_many_lines)]
     pub fn open_readonly_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
@@ -6110,9 +6144,55 @@ where
         _requested_page_size: PageSize,
         page_buffer_max: Option<usize>,
     ) -> Result<Self> {
+        Self::open_readonly_with_optional_expected_identity(
+            cx,
+            vfs,
+            path,
+            _requested_page_size,
+            None,
+            page_buffer_max,
+        )
+    }
+
+    /// Open an existing database read-only only if its VFS handle has
+    /// `expected_identity`.
+    ///
+    /// The identity-bound VFS open occurs before the header or any live-WAL
+    /// sidecar is inspected.
+    pub fn open_readonly_with_expected_identity_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        _requested_page_size: PageSize,
+        expected_identity: FileIdentity,
+        page_buffer_max: Option<usize>,
+    ) -> Result<Self> {
+        Self::open_readonly_with_optional_expected_identity(
+            cx,
+            vfs,
+            path,
+            _requested_page_size,
+            Some(expected_identity),
+            page_buffer_max,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_readonly_with_optional_expected_identity(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        _requested_page_size: PageSize,
+        expected_identity: Option<FileIdentity>,
+        page_buffer_max: Option<usize>,
+    ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
+        let (db_file, _actual_flags) = if let Some(expected_identity) = expected_identity {
+            vfs.open_with_expected_identity(cx, path, flags, expected_identity)?
+        } else {
+            vfs.open(cx, Some(path), flags)?
+        };
 
         let file_size = db_file.file_size(cx)?;
         if file_size == 0 {

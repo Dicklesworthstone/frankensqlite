@@ -461,6 +461,10 @@ impl Vfs for MemoryVfs {
             .contains_key(path))
     }
 
+    fn path_entry_exists(&self, cx: &Cx, path: &Path) -> Result<bool> {
+        self.access(cx, path, AccessFlags::EXISTS)
+    }
+
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
         if path.is_absolute() {
             Ok(path.to_path_buf())

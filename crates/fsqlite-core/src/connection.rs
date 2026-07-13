@@ -2520,6 +2520,26 @@ impl PagerBackend {
             path,
             cx,
             PageSize::DEFAULT,
+            None,
+            page_buffer_max,
+            memory_vfs_config,
+        )
+    }
+
+    /// Initialize an existing caller-reserved empty file after binding its
+    /// open handle to `expected_identity`.
+    fn open_reserved_with_page_buffer_max(
+        path: &str,
+        cx: &Cx,
+        expected_identity: FileIdentity,
+        page_buffer_max: Option<usize>,
+        memory_vfs_config: Option<MemoryVfsConfig>,
+    ) -> Result<Self> {
+        Self::open_with_requested_page_size_and_page_buffer_max(
+            path,
+            cx,
+            PageSize::DEFAULT,
+            Some(expected_identity),
             page_buffer_max,
             memory_vfs_config,
         )
@@ -2529,19 +2549,31 @@ impl PagerBackend {
         path: &str,
         cx: &Cx,
         requested_page_size: PageSize,
+        expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
     ) -> Result<Self> {
         if path == ":memory:" {
             let vfs = memory_vfs_config.map_or_else(MemoryVfs::new, MemoryVfs::new_with_config);
             let db_path = PathBuf::from("/:memory:");
-            let mut pager = SimplePager::open_with_cx_and_page_buffer_max(
-                cx,
-                vfs,
-                &db_path,
-                requested_page_size,
-                page_buffer_max,
-            )?;
+            let mut pager = if let Some(expected_identity) = expected_identity {
+                SimplePager::open_reserved_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    requested_page_size,
+                    expected_identity,
+                    page_buffer_max,
+                )?
+            } else {
+                SimplePager::open_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    requested_page_size,
+                    page_buffer_max,
+                )?
+            };
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Memory(Arc::new(pager)))
         } else {
@@ -2549,39 +2581,72 @@ impl PagerBackend {
             {
                 let vfs = IoUringVfs::new();
                 let db_path = PathBuf::from(path);
-                let pager = SimplePager::open_with_cx_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    requested_page_size,
-                    page_buffer_max,
-                )?;
+                let pager = if let Some(expected_identity) = expected_identity {
+                    SimplePager::open_reserved_with_cx_and_page_buffer_max(
+                        cx,
+                        vfs,
+                        &db_path,
+                        requested_page_size,
+                        expected_identity,
+                        page_buffer_max,
+                    )?
+                } else {
+                    SimplePager::open_with_cx_and_page_buffer_max(
+                        cx,
+                        vfs,
+                        &db_path,
+                        requested_page_size,
+                        page_buffer_max,
+                    )?
+                };
                 Ok(Self::IoUring(Arc::new(pager)))
             }
             #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
             {
                 let vfs = UnixVfs::new();
                 let db_path = PathBuf::from(path);
-                let pager = SimplePager::open_with_cx_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    requested_page_size,
-                    page_buffer_max,
-                )?;
+                let pager = if let Some(expected_identity) = expected_identity {
+                    SimplePager::open_reserved_with_cx_and_page_buffer_max(
+                        cx,
+                        vfs,
+                        &db_path,
+                        requested_page_size,
+                        expected_identity,
+                        page_buffer_max,
+                    )?
+                } else {
+                    SimplePager::open_with_cx_and_page_buffer_max(
+                        cx,
+                        vfs,
+                        &db_path,
+                        requested_page_size,
+                        page_buffer_max,
+                    )?
+                };
                 Ok(Self::Unix(Arc::new(pager)))
             }
             #[cfg(all(feature = "native", target_os = "windows"))]
             {
                 let vfs = fsqlite_vfs::WindowsVfs::new();
                 let db_path = PathBuf::from(path);
-                let pager = SimplePager::open_with_cx_and_page_buffer_max(
-                    cx,
-                    vfs,
-                    &db_path,
-                    requested_page_size,
-                    page_buffer_max,
-                )?;
+                let pager = if let Some(expected_identity) = expected_identity {
+                    SimplePager::open_reserved_with_cx_and_page_buffer_max(
+                        cx,
+                        vfs,
+                        &db_path,
+                        requested_page_size,
+                        expected_identity,
+                        page_buffer_max,
+                    )?
+                } else {
+                    SimplePager::open_with_cx_and_page_buffer_max(
+                        cx,
+                        vfs,
+                        &db_path,
+                        requested_page_size,
+                        page_buffer_max,
+                    )?
+                };
                 Ok(Self::Windows(Arc::new(pager)))
             }
             #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
@@ -2663,23 +2728,40 @@ impl PagerBackend {
     fn open_readonly_with_page_buffer_max(
         path: &str,
         cx: &Cx,
+        expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
         memory_vfs_config: Option<MemoryVfsConfig>,
     ) -> Result<Self> {
         if path == ":memory:" {
+            if expected_identity.is_some() {
+                return Err(FrankenError::CannotOpen {
+                    path: PathBuf::from(path),
+                });
+            }
             return Self::open_with_page_buffer_max(path, cx, page_buffer_max, memory_vfs_config);
         }
         #[cfg(all(feature = "native", target_os = "linux"))]
         {
             let vfs = IoUringVfs::new();
             let db_path = PathBuf::from(path);
-            let mut pager = SimplePager::open_readonly_with_cx_and_page_buffer_max(
-                cx,
-                vfs,
-                &db_path,
-                PageSize::DEFAULT,
-                page_buffer_max,
-            )?;
+            let mut pager = if let Some(expected_identity) = expected_identity {
+                SimplePager::open_readonly_with_expected_identity_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    PageSize::DEFAULT,
+                    expected_identity,
+                    page_buffer_max,
+                )?
+            } else {
+                SimplePager::open_readonly_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    PageSize::DEFAULT,
+                    page_buffer_max,
+                )?
+            };
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::IoUring(Arc::new(pager)))
         }
@@ -2687,13 +2769,24 @@ impl PagerBackend {
         {
             let vfs = UnixVfs::new();
             let db_path = PathBuf::from(path);
-            let mut pager = SimplePager::open_readonly_with_cx_and_page_buffer_max(
-                cx,
-                vfs,
-                &db_path,
-                PageSize::DEFAULT,
-                page_buffer_max,
-            )?;
+            let mut pager = if let Some(expected_identity) = expected_identity {
+                SimplePager::open_readonly_with_expected_identity_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    PageSize::DEFAULT,
+                    expected_identity,
+                    page_buffer_max,
+                )?
+            } else {
+                SimplePager::open_readonly_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    PageSize::DEFAULT,
+                    page_buffer_max,
+                )?
+            };
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Unix(Arc::new(pager)))
         }
@@ -2701,18 +2794,30 @@ impl PagerBackend {
         {
             let vfs = fsqlite_vfs::WindowsVfs::new();
             let db_path = PathBuf::from(path);
-            let mut pager = SimplePager::open_readonly_with_cx_and_page_buffer_max(
-                cx,
-                vfs,
-                &db_path,
-                PageSize::DEFAULT,
-                page_buffer_max,
-            )?;
+            let mut pager = if let Some(expected_identity) = expected_identity {
+                SimplePager::open_readonly_with_expected_identity_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    PageSize::DEFAULT,
+                    expected_identity,
+                    page_buffer_max,
+                )?
+            } else {
+                SimplePager::open_readonly_with_cx_and_page_buffer_max(
+                    cx,
+                    vfs,
+                    &db_path,
+                    PageSize::DEFAULT,
+                    page_buffer_max,
+                )?
+            };
             let _ = pager.enable_single_connection_cache_fast_path();
             Ok(Self::Windows(Arc::new(pager)))
         }
         #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
         {
+            let _ = expected_identity;
             Err(FrankenError::NotImplemented(
                 "file-backed pager not available on this platform".to_owned(),
             ))
@@ -9094,16 +9199,43 @@ impl Connection {
     /// handle has `expected_identity`.
     ///
     /// The identity comparison happens before any database read, rollback
-    /// journal probe, or recovery action. This binds recovery to a file leased
-    /// by the caller even if the pathname is concurrently renamed or replaced.
-    /// It is an object-identity guarantee rather than a pathname-spelling
-    /// guarantee: a symlink resolving to the same leased object is accepted
-    /// because it cannot redirect recovery to different database bytes.
+    /// journal probe, or recovery action, so the main database handle is bound
+    /// to the object leased by the caller. The expected identity binds only the
+    /// main database handle: journal, WAL, WAL-FEC, and shared-memory artifacts
+    /// are still resolved from `path`. Callers must therefore pass the exact
+    /// cooperative database pathname, not a symlink or hard-link alias, and
+    /// retain the descriptor used to derive `expected_identity` until this
+    /// method returns. They must also prevent namespace replacement for the
+    /// duration of open and recovery (for example with a cooperative writer
+    /// lease in a trusted parent directory).
     pub fn open_existing_with_expected_identity(
         path: impl Into<String>,
         expected_identity: FileIdentity,
     ) -> Result<Self> {
         Self::open_existing_with_expected_identity_and_env(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+    }
+
+    /// Initialize a caller-reserved empty database file only if its VFS
+    /// handle has `expected_identity`.
+    ///
+    /// The path must already exist and be empty when opened. This is the create-new
+    /// counterpart to [`Self::open_existing_with_expected_identity`]: it binds
+    /// initialization to the descriptor that reserved the pathname rather
+    /// than dropping that descriptor and trusting a later path lookup. The
+    /// caller must retain that descriptor until this method returns and pass
+    /// the exact cooperative database pathname, not a symlink or hard-link
+    /// alias, because auxiliary artifacts are derived from this pathname. The
+    /// containing namespace must remain protected from replacement throughout
+    /// initialization.
+    pub fn open_reserved_with_expected_identity(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+    ) -> Result<Self> {
+        Self::open_reserved_with_expected_identity_and_env(
             path,
             expected_identity,
             ConnectionEnv::default(),
@@ -9164,13 +9296,60 @@ impl Connection {
         Self::open_schema_only_with_env(path, ConnectionEnv::default())
     }
 
+    /// Open a schema-only connection only if the read-only VFS handle has
+    /// `expected_identity`.
+    ///
+    /// Identity verification occurs before the database header, live WAL, or
+    /// platform advisory sidecars are inspected. The caller must pass the exact
+    /// cooperative database pathname, not a symlink or hard-link alias, and
+    /// retain the descriptor used to derive `expected_identity` until this
+    /// method returns, because auxiliary artifacts are derived from `path` and
+    /// filesystem identities may be recycled after the last handle closes. The
+    /// containing namespace must remain protected from replacement throughout
+    /// the open.
+    pub fn open_schema_only_with_expected_identity(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_expected_identity_and_env(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+    }
+
     /// Open a schema-only connection with an explicit runtime environment.
     ///
     /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
     /// specifying a custom [`ConnectionEnv`].
     pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env)
+    }
+
+    /// Open an identity-bound schema-only connection with an explicit runtime
+    /// environment.
+    ///
+    /// The exact cooperative-path and no-alias requirements documented on
+    /// [`Self::open_schema_only_with_expected_identity`] also apply here.
+    pub fn open_schema_only_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(
+            path,
+            Some(expected_identity),
+            env,
+        )
+    }
+
+    fn open_schema_only_with_optional_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: Option<FileIdentity>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
         let path = path.into();
-        if path.is_empty() {
+        if path.is_empty() || (expected_identity.is_some() && path == ":memory:") {
             return Err(FrankenError::CannotOpen {
                 path: std::path::PathBuf::from(path),
             });
@@ -9186,6 +9365,7 @@ impl Connection {
             PagerBackend::open_readonly_with_page_buffer_max(
                 &path,
                 &bootstrap_cx,
+                expected_identity,
                 env.page_buffer_max(),
                 env.memory_vfs_config(),
             )
@@ -9409,6 +9589,9 @@ impl Connection {
     /// Open an existing file-backed database with an explicit runtime
     /// environment only if its already-open VFS handle has
     /// `expected_identity`.
+    ///
+    /// The exact cooperative-path and no-alias requirements documented on
+    /// [`Self::open_existing_with_expected_identity`] also apply here.
     pub fn open_existing_with_expected_identity_and_env(
         path: impl Into<String>,
         expected_identity: FileIdentity,
@@ -9419,6 +9602,40 @@ impl Connection {
             Some(expected_identity),
             env,
         )
+    }
+
+    /// Initialize an identity-bound caller-reserved empty file with an
+    /// explicit runtime environment.
+    ///
+    /// The exact cooperative-path and no-alias requirements documented on
+    /// [`Self::open_reserved_with_expected_identity`] also apply here.
+    pub fn open_reserved_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        let path = path.into();
+        if path.is_empty() || path == ":memory:" {
+            return Err(FrankenError::CannotOpen {
+                path: std::path::PathBuf::from(path),
+            });
+        }
+
+        let bootstrap_cx =
+            env.runtime()
+                .root_cx
+                .create_child()
+                .with_trace_context(next_trace_id(), 0, 0);
+        let pager = retry_busy_connection_bootstrap(|| {
+            PagerBackend::open_reserved_with_page_buffer_max(
+                &path,
+                &bootstrap_cx,
+                expected_identity,
+                env.page_buffer_max(),
+                env.memory_vfs_config(),
+            )
+        })?;
+        Self::open_with_env_and_pager(path, env, pager, true)
     }
 
     fn open_existing_with_optional_expected_identity_and_env(
@@ -9492,6 +9709,7 @@ impl Connection {
                 &path,
                 &bootstrap_cx,
                 requested_page_size,
+                None,
                 env.page_buffer_max(),
                 env.memory_vfs_config(),
             )

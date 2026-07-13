@@ -61,6 +61,12 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
     PathBuf::from(shm)
 }
 
+fn sqlite_companion_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut companion: OsString = path.as_os_str().to_owned();
+    companion.push(suffix);
+    PathBuf::from(companion)
+}
+
 fn sqlite_shared_lock_path(path: &Path) -> PathBuf {
     let mut p: OsString = path.as_os_str().to_owned();
     p.push("-lock-shared");
@@ -87,6 +93,27 @@ fn windows_lock_sidecar_paths(path: &Path) -> [PathBuf; 3] {
         sqlite_reserved_lock_path(path),
         sqlite_pending_lock_path(path),
     ]
+}
+
+fn reserved_database_artifact_paths(path: &Path) -> [PathBuf; 7] {
+    let [shared, reserved, pending] = windows_lock_sidecar_paths(path);
+    [
+        sqlite_companion_path(path, "-journal"),
+        sqlite_companion_path(path, "-wal"),
+        sqlite_companion_path(path, "-wal-fec"),
+        sqlite_shm_path(path),
+        shared,
+        reserved,
+        pending,
+    ]
+}
+
+fn filesystem_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(FrankenError::Io(err)),
+    }
 }
 
 // Best-effort removal of the three advisory-lock sidecars alongside `path`.
@@ -600,6 +627,106 @@ impl Vfs for WindowsVfs {
         ))
     }
 
+    fn open_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        checkpoint_or_abort(cx)?;
+        let resolved = resolve_path(path)?;
+
+        // Query through a read-only handle before `open` reaches
+        // `WindowsOsLockFiles::open`, which creates the advisory sidecars.
+        // Our share mode deliberately omits FILE_SHARE_DELETE, so retaining
+        // this guard also prevents a pathname replacement between the
+        // preflight and the final read-write handle verification.
+        let mut options = windows_open_options();
+        let identity_guard = options.read(true).open(&resolved).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                FrankenError::CannotOpen {
+                    path: resolved.clone(),
+                }
+            } else {
+                FrankenError::Io(err)
+            }
+        })?;
+        if FileIdentity::from_file(&identity_guard)? != Some(expected_identity) {
+            return Err(FrankenError::CannotOpen { path: resolved });
+        }
+
+        let mut existing_flags = flags;
+        existing_flags.remove(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE);
+        let (file, actual_flags) = self.open(cx, Some(&resolved), existing_flags)?;
+        if file.file_identity()? != Some(expected_identity) {
+            return Err(FrankenError::CannotOpen { path: resolved });
+        }
+        drop(identity_guard);
+        Ok((file, actual_flags))
+    }
+
+    fn open_reserved_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        checkpoint_or_abort(cx)?;
+        let resolved = resolve_path(path)?;
+        let mut existing_flags = flags;
+        existing_flags.remove(VfsOpenFlags::CREATE | VfsOpenFlags::EXCLUSIVE);
+
+        // Open the final main-database handle directly. Ordinary `open`
+        // cannot be used here because it creates the advisory lock sidecars
+        // before returning the handle to its caller.
+        let mut options = windows_open_options();
+        options.read(true);
+        if existing_flags.contains(VfsOpenFlags::READWRITE) {
+            options.write(true);
+        }
+        let file = options.open(&resolved).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                FrankenError::CannotOpen {
+                    path: resolved.clone(),
+                }
+            } else {
+                FrankenError::Io(err)
+            }
+        })?;
+        if FileIdentity::from_file(&file)? != Some(expected_identity) || file.metadata()?.len() != 0
+        {
+            return Err(FrankenError::CannotOpen { path: resolved });
+        }
+        for artifact_path in reserved_database_artifact_paths(&resolved) {
+            if filesystem_entry_exists(&artifact_path)? {
+                return Err(FrankenError::CannotOpen { path: resolved });
+            }
+        }
+
+        // Only an accepted reservation may create the Windows advisory-lock
+        // sidecars. The live main handle above omits FILE_SHARE_DELETE, so the
+        // pathname cannot be replaced between verification and construction.
+        let os_locks = WindowsOsLockFiles::open(&resolved)?;
+        let owner_id = next_owner_id();
+        let shm_path = sqlite_shm_path(&resolved);
+        let delete_on_close = existing_flags.contains(VfsOpenFlags::DELETEONCLOSE);
+        Ok((
+            WindowsFile {
+                path: resolved,
+                file: Some(file),
+                os_locks: Some(os_locks),
+                owner_id,
+                lock_level: LockLevel::None,
+                delete_on_close,
+                shm_path,
+                shm_state: None,
+            },
+            existing_flags,
+        ))
+    }
+
     fn delete(&self, _cx: &Cx, path: &Path, _sync_dir: bool) -> Result<()> {
         let resolved = resolve_path(path)?;
         if resolved.exists() {
@@ -629,6 +756,10 @@ impl Vfs for WindowsVfs {
                 Ok(options.read(true).write(true).open(resolved).is_ok())
             }
         }
+    }
+
+    fn path_entry_exists(&self, _cx: &Cx, path: &Path) -> Result<bool> {
+        filesystem_entry_exists(&resolve_path(path)?)
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
@@ -1205,6 +1336,12 @@ mod tests {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
     }
 
+    fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut suffixed = path.as_os_str().to_owned();
+        suffixed.push(suffix);
+        PathBuf::from(suffixed)
+    }
+
     #[test]
     fn test_windowsvfs_create_and_write() {
         let cx = Cx::new();
@@ -1223,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_windowsvfs_file_identity_is_handle_bound() {
+    fn test_windowsvfs_full_file_identity_is_handle_bound() {
         let cx = Cx::new();
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("identity.db");
@@ -1254,6 +1391,63 @@ mod tests {
 
         assert_eq!(identity_a, identity_b);
         assert_ne!(identity_a, other_identity);
+    }
+
+    #[test]
+    fn test_windowsvfs_expected_identity_mismatch_precedes_side_effects() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("identity-guard.db");
+        let other_path = dir.path().join("other.db");
+        let journal_path = path_with_suffix(&path, "-journal");
+        let wal_path = path_with_suffix(&path, "-wal");
+        let shm_path = sqlite_shm_path(&path);
+
+        fs::write(&path, b"main sentinel").expect("seed main sentinel");
+        fs::write(&other_path, b"other sentinel").expect("seed other file");
+        fs::write(&journal_path, b"journal sentinel").expect("seed journal sentinel");
+        fs::write(&wal_path, b"wal sentinel").expect("seed WAL sentinel");
+        fs::write(&shm_path, b"shm sentinel").expect("seed SHM sentinel");
+
+        let expected_identity =
+            FileIdentity::from_file(&File::open(&other_path).expect("open other identity handle"))
+                .expect("query other identity")
+                .expect("Windows file identity must be available");
+        let actual_identity =
+            FileIdentity::from_file(&File::open(&path).expect("open main identity handle"))
+                .expect("query main identity")
+                .expect("Windows file identity must be available");
+        assert_ne!(expected_identity, actual_identity);
+
+        let main_before = fs::read(&path).expect("snapshot main sentinel");
+        let journal_before = fs::read(&journal_path).expect("snapshot journal sentinel");
+        let wal_before = fs::read(&wal_path).expect("snapshot WAL sentinel");
+        let shm_before = fs::read(&shm_path).expect("snapshot SHM sentinel");
+        for sidecar in windows_lock_sidecar_paths(&path) {
+            assert!(!sidecar.exists(), "lock sidecar must start absent");
+        }
+
+        let error = WindowsVfs::new()
+            .open_with_expected_identity(
+                &cx,
+                &path,
+                VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE,
+                expected_identity,
+            )
+            .expect_err("wrong expected identity must refuse the open");
+
+        assert!(matches!(error, FrankenError::CannotOpen { .. }));
+        assert_eq!(fs::read(&path).unwrap(), main_before);
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(fs::read(&wal_path).unwrap(), wal_before);
+        assert_eq!(fs::read(&shm_path).unwrap(), shm_before);
+        for sidecar in windows_lock_sidecar_paths(&path) {
+            assert!(
+                !sidecar.exists(),
+                "identity refusal must not create {}",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]
