@@ -61,7 +61,12 @@ fn update_rowid_in_matches_sqlite() {
     check_update("UPDATE t SET x = 'none' WHERE id IN (99999, 88888)", true);      // all absent -> no-op
     check_update("UPDATE t SET id = id + 10000 WHERE id IN (5, 25, 45)", true);    // updates the ROWID itself
     check_update("UPDATE t SET c = c + 1 WHERE id IN (1, 2, 3, 298, 299, 300)", true); // boundary rowids
-    // Controls: non-rowid IN and a residual conjunction must still full-scan (Rewind), and stay correct.
+    // bd-update-rowid-in-residual: `rowid IN (ints) AND <residual>` now seeks the listed rows and filters.
+    check_update("UPDATE t SET x = 'r' WHERE id IN (5, 25, 45) AND c = 5", true);        // eq residual
+    check_update("UPDATE t SET a = a + 1 WHERE id IN (10, 20, 30, 40) AND c > 3", true); // range residual + expr SET
+    check_update("UPDATE t SET x = 'm' WHERE id IN (100, 200, 300) AND c != 5 AND x = 'v3'", true); // multi
+    check_update("UPDATE t SET x = 'n' WHERE id IN (5, 25, 45) AND c = 999", true);      // residual matches nothing
+    check_update("UPDATE t SET id = id + 5000 WHERE id IN (5, 25, 45) AND c = 5", true); // residual + ROWID rewrite
+    // Control: a non-rowid IN must still full-scan (Rewind), and stay correct.
     check_update("UPDATE t SET x = 'ctl' WHERE a IN (3, 5)", false);               // a is not the rowid
-    check_update("UPDATE t SET x = 'ctl' WHERE id IN (5, 25, 45) AND c = 5", false); // residual -> not bare rowid IN
 }

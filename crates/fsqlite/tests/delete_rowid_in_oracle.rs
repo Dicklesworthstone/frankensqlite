@@ -62,7 +62,12 @@ fn delete_rowid_in_matches_sqlite() {
     check_delete("DELETE FROM t WHERE id IN (1, 2, 3, 298, 299, 300)", true); // boundary rowids
     // rowid on the RHS is still a rowid IN.
     check_delete("DELETE FROM t WHERE id IN (7, 8, 9)", true);
-    // Controls: non-rowid IN and a residual conjunction must still full-scan (Rewind), and stay correct.
+    // bd-delete-rowid-in-residual: `rowid IN (ints) AND <residual>` now seeks the listed rows and filters.
+    check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 5", true);       // eq residual
+    check_delete("DELETE FROM t WHERE id IN (10, 20, 30, 40) AND c > 3", true);  // range residual
+    check_delete("DELETE FROM t WHERE id IN (100, 200, 300) AND c != 5 AND x = 'v3'", true); // multi-conjunct
+    check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 999", true);     // residual matches nothing
+    check_delete("DELETE FROM t WHERE id IN (99999, 5, 25) AND c IS NOT NULL", true); // absent + residual
+    // Control: a non-rowid IN must still full-scan (Rewind), and stay correct.
     check_delete("DELETE FROM t WHERE a IN (3, 5)", false);               // a is not the rowid
-    check_delete("DELETE FROM t WHERE id IN (5, 25, 45) AND c = 5", false); // residual -> not bare rowid IN
 }

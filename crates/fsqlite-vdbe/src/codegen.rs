@@ -17435,10 +17435,11 @@ pub fn codegen_update(
     register_table_index_meta(b, table, table_cursor);
 
     let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
-    // bd-update-rowid-in: `UPDATE ... WHERE <rowid> IN (<int literals>)` collects the listed rows with one
-    // `SeekRowid` each (Pass 1) instead of full-scanning. Bare form only (no residual), after `rowid = const`.
+    // bd-update-rowid-in / bd-update-rowid-in-residual: `UPDATE ... WHERE <rowid> IN (<int literals>)
+    // [AND <residual>]` collects the listed rows with one `SeekRowid` each (Pass 1) instead of
+    // full-scanning; a residual is re-applied per seeked row. After `rowid = const`.
     let rowid_in_list = if rowid_target.is_none() {
-        extract_rowid_in_list_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        extract_rowid_in_list_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
     } else {
         None
     };
@@ -17484,11 +17485,11 @@ pub fn codegen_update(
         let collect_done_label = b.emit_label();
 
         // Pass 1: collect matching rowids before mutating the table cursor.
-        if let Some(values) = &rowid_in_list {
-            // bd-update-rowid-in: one `SeekRowid` per listed value; a miss skips to the next value. The
-            // values are sorted+deduped and the RowSet dedups again, so the collected set is exactly the
-            // existing listed rows — the same set the full scan below would gather. No WHERE filter (and
-            // thus no anon placeholders) here: the seek IS the membership test.
+        if let Some((values, has_residual)) = &rowid_in_list {
+            // bd-update-rowid-in: one `SeekRowid` per listed value; a miss skips to the next value. When a
+            // residual is present it is re-applied per seeked row, numbered from `set_placeholder_count + 1`
+            // (after the SET placeholders, which are emitted in Pass 2) and reset each iteration so a `?`
+            // in the residual numbers identically. The values are sorted+deduped and the RowSet dedups again.
             for &value in values {
                 let next_value = b.emit_label();
                 b.emit_op(Opcode::Int64, 0, matched_rowid_reg, 0, P4::Int64(value), 0);
@@ -17500,6 +17501,20 @@ pub fn codegen_update(
                     P4::None,
                     0,
                 );
+                if *has_residual
+                    && let Some(where_expr) = &stmt.where_clause
+                {
+                    b.set_next_anon_placeholder(set_placeholder_count + 1);
+                    emit_where_filter(
+                        b,
+                        where_expr,
+                        table_cursor,
+                        table,
+                        stmt.table.alias.as_deref(),
+                        schema,
+                        next_value,
+                    );
+                }
                 b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
                 b.resolve_label(next_value);
             }
@@ -18623,11 +18638,11 @@ pub fn codegen_delete(
     // --- Pass 1: collect matching rowids ---
     let collect_done_label = b.emit_label();
     let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
-    // bd-delete-rowid-in: `DELETE ... WHERE <rowid> IN (<int literals>)` collects the listed rows with one
-    // `SeekRowid` each instead of full-scanning the whole table. Only the bare form (no residual) is
-    // admitted, and only after the bare `rowid = const` case declines.
+    // bd-delete-rowid-in / bd-delete-rowid-in-residual: `DELETE ... WHERE <rowid> IN (<int literals>)
+    // [AND <residual>]` collects the listed rows with one `SeekRowid` each instead of full-scanning; when a
+    // residual is present it is re-applied per seeked row before adding to the RowSet. After `rowid = const`.
     let rowid_in_list = if rowid_target.is_none() {
-        extract_rowid_in_list_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        extract_rowid_in_list_residual_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
     } else {
         None
     };
@@ -18653,10 +18668,12 @@ pub fn codegen_delete(
             0,
         );
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
-    } else if let Some(values) = rowid_in_list {
-        // One `SeekRowid` per listed value; a miss skips to the next value. The listed values are already
-        // sorted+deduped, and the RowSet dedups again, so the collected set is exactly the existing listed
-        // rows — the same set the full scan below would gather. Pass 2 is unchanged.
+    } else if let Some((values, has_residual)) = rowid_in_list {
+        // One `SeekRowid` per listed value; a miss skips to the next value. When there is a residual, the
+        // full WHERE is re-applied per seeked row (the placeholder base is reset each iteration so a `?` in
+        // the residual numbers identically). The listed values are sorted+deduped and the RowSet dedups
+        // again. Pass 2 is unchanged.
+        let where_base = b.current_anon_placeholder();
         for &value in &values {
             let next_value = b.emit_label();
             b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
@@ -18668,6 +18685,20 @@ pub fn codegen_delete(
                 P4::None,
                 0,
             );
+            if has_residual
+                && let Some(where_expr) = &stmt.where_clause
+            {
+                b.set_next_anon_placeholder(where_base);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    table_cursor,
+                    table,
+                    stmt.table.alias.as_deref(),
+                    schema,
+                    next_value,
+                );
+            }
             b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
             b.resolve_label(next_value);
         }
