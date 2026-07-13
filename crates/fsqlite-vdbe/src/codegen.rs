@@ -11027,42 +11027,14 @@ fn aggregate_index_range_seek_target<'t, 'e>(
     None
 }
 
-/// Conservatively whether `expr` might contain a bound parameter. Only provably-literal shapes
-/// (literals, column refs, and binary trees over them) return `false`; ANYTHING else returns `true`.
-/// Used to gate the leading-eq + residual-filter seek, which re-emits the whole WHERE per seeked row:
-/// a fully-literal WHERE consumes no anonymous placeholders, so the seek's prefix probe and the
-/// residual filter cannot mis-number bound parameters.
-fn expr_has_placeholder(expr: &Expr) -> bool {
-    match expr {
-        Expr::Placeholder(..) => true,
-        Expr::Literal(..) | Expr::Column(..) => false,
-        Expr::BinaryOp { left, right, .. } => {
-            expr_has_placeholder(left) || expr_has_placeholder(right)
-        }
-        Expr::UnaryOp { expr, .. } => expr_has_placeholder(expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => expr_has_placeholder(expr) || expr_has_placeholder(low) || expr_has_placeholder(high),
-        Expr::In {
-            expr,
-            set: InSet::List(items),
-            ..
-        } => expr_has_placeholder(expr) || items.iter().any(expr_has_placeholder),
-        // Subqueries, function calls, CASE, CAST, COLLATE, etc. may hide a placeholder in a position
-        // we do not walk; decline conservatively so the residual filter is only ever re-emitted for a
-        // WHERE we have fully proven placeholder-free.
-        _ => true,
-    }
-}
-
 /// The index and equality prefix a `COUNT(*)/SUM(...) WHERE a = <int> AND <residual>` aggregate can
 /// seek: pin the leading key column(s) with an integer-literal equality, walk that block, and apply
-/// the FULL (placeholder-free) WHERE as a residual filter per row. Gated tight so it is byte-exact and
-/// safe: (1) the prefix is INTEGER-affinity + integer literal, so the seek matches exactly with no
-/// affinity fallback; (2) the WHERE is placeholder-free (see [`expr_has_placeholder`]), so re-emitting
-/// it per row cannot mis-number bound parameters; (3) there is at least one residual conjunct beyond
-/// the prefix (otherwise the exact eq-seek already handles it). The residual filter enforces the whole
-/// predicate, so a dropped-predicate class of bug cannot occur.
+/// the FULL WHERE as a residual filter per row. Gated tight so it is byte-exact and safe: (1) the
+/// prefix is INTEGER-affinity + integer literal, so the seek matches exactly with no affinity
+/// fallback; (2) the literal probe consumes no placeholders, so bound parameters in the residual keep
+/// the same numbering as the scan path; (3) there is at least one residual conjunct beyond the prefix
+/// (otherwise the exact eq-seek already handles it). The residual filter enforces the whole predicate,
+/// so a dropped-predicate class of bug cannot occur.
 fn aggregate_index_prefix_literal_residual_target<'t, 'e>(
     where_clause: Option<&'e Expr>,
     table: &'t TableSchema,
@@ -22230,7 +22202,7 @@ fn extract_rowid_range_residual_target<'a>(
                 && is_rowid_range_constant(low)
                 && is_rowid_range_constant(high) =>
             {
-                if !assign_rowid_range_bound(
+                let bounds_assigned = assign_rowid_range_bound(
                     &mut target,
                     RowidRangeSlot::Lower,
                     RowidRangeBound {
@@ -22238,7 +22210,7 @@ fn extract_rowid_range_residual_target<'a>(
                         expr: low,
                         inclusive: true,
                     },
-                ) || !assign_rowid_range_bound(
+                ) && assign_rowid_range_bound(
                     &mut target,
                     RowidRangeSlot::Upper,
                     RowidRangeBound {
@@ -22246,7 +22218,8 @@ fn extract_rowid_range_residual_target<'a>(
                         expr: high,
                         inclusive: true,
                     },
-                ) {
+                );
+                if !bounds_assigned {
                     return None;
                 }
             }
