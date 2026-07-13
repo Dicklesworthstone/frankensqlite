@@ -22724,10 +22724,20 @@ fn extract_count_indexed_in_target<'a>(
     };
 
     let column_name = column_name(operand, table, table_alias)?;
-    let idx_schema = table.index_for_column(&column_name)?;
-    if idx_schema.key_term_count() != 1 || idx_schema.key_term_descending(0) {
-        return None;
-    }
+    // All-index search for a single-column ascending index: `index_for_column` returns the first
+    // leading-column match, which may be a COMPOSITE `(col, …)` index declared before the single-column
+    // one; the `key_term_count() != 1` decline would then full-scan `COUNT(*) WHERE col IN (…)` whenever
+    // a composite `(col, …)` index shadows `idx_col` (bd-agg-range-shadowed-index, COUNT-IN mirror —
+    // reachable once the list reaches the once-materialized threshold and the per-value seek engages).
+    let idx_schema = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&column_name))
+    })?;
     if !collation_names_equivalent(
         effective_collation_ctx(operand, Some(scan_ctx)),
         idx_schema.key_term_collation(0),
