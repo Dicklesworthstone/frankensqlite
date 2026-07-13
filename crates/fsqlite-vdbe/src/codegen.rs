@@ -10460,6 +10460,7 @@ fn codegen_select_minmax_index_seek(
 /// ASC index, skip the leading NULL run (DISTINCT ignores NULLs), and increment the count once per
 /// key-change. No ephemeral dedup B-tree and no table read. Byte-identical to the full-scan DISTINCT
 /// path because the BINARY index groups equal values adjacently. bd-count-distinct-index-walk.
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
 fn codegen_select_count_distinct_index_walk(
     b: &mut ProgramBuilder,
     idx_cursor: i32,
@@ -12279,7 +12280,7 @@ fn codegen_select_aggregate(
         // when every aggregate reads only the indexed column or is COUNT(*)/SUM(rowid).
         let idx_cursor = 1_i32;
         let covering = !has_residual && aggregate_seek_is_covering(&agg_columns, idx_schema, table);
-        let residual_where = has_residual.then(|| where_clause).flatten();
+        let residual_where = has_residual.then_some(where_clause).flatten();
         if !covering {
             b.emit_op(
                 Opcode::OpenRead,
