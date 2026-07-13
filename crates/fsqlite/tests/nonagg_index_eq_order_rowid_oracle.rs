@@ -1,8 +1,8 @@
-//! bd-nonagg-index-eq-order-rowid: `SELECT ... WHERE <single-col-indexed> = <val> ORDER BY <rowid> ASC
-//! [LIMIT k]` is served by the index-EQUALITY seek (which returns the eq value's rows in rowid-ascending
-//! order — it positions at `(val, i64::MIN)` and walks forward) WITHOUT a sorter and WITHOUT full-scanning
-//! every row. A composite index would order by its trailing column, and a DESC index reverses the walk,
-//! so both decline. Compared IN OUTPUT ORDER against C SQLite.
+//! bd-nonagg-index-eq-order-rowid: `SELECT ... WHERE <single-col-indexed> = <val> ORDER BY <rowid>
+//! [ASC|DESC] [LIMIT k]` is served by the index-EQUALITY seek — for the one eq value its index entries
+//! ARE rowid order, so ASC seeks `(val, i64::MIN)` + walks forward and DESC seeks `(val, i64::MAX)` +
+//! walks backward (Prev) — WITHOUT a sorter and WITHOUT full-scanning every row. A COMPOSITE index would
+//! order by its trailing key column, so it declines. Compared IN OUTPUT ORDER against C SQLite.
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 fn render(v: &SqliteValue) -> String {
@@ -45,8 +45,9 @@ fn nonagg_index_eq_order_rowid_matches_sqlite() {
         let c = if i % 19 == 0 { "NULL".to_owned() } else { format!("{}", i % 12) };
         ins(&f, &r, &format!("INSERT INTO t VALUES ({i}, {a}, {c}, 'v{}');", i % 7));
     }
-    // Single-col-indexed eq + ORDER BY rowid ASC: index seek, NO sorter, verified in output order.
+    // Single-col-indexed eq + ORDER BY rowid (ASC or DESC): index seek, NO sorter, verified in output order.
     let seeks = [
+        // ASC (seek `(val, MIN)` + walk forward)
         "SELECT * FROM t WHERE c = 5 ORDER BY id",
         "SELECT * FROM t WHERE c = 3 ORDER BY id LIMIT 3",
         "SELECT id, c FROM t WHERE c = 7 ORDER BY id",
@@ -54,17 +55,24 @@ fn nonagg_index_eq_order_rowid_matches_sqlite() {
         "SELECT * FROM t WHERE c = 0 ORDER BY id ASC",
         "SELECT id FROM t WHERE c = 4 ORDER BY rowid",           // explicit rowid keyword
         "SELECT * FROM t WHERE c = 11 ORDER BY id LIMIT 100",    // limit > match count
+        // DESC (seek `(val, MAX)` + walk backward with Prev)
+        "SELECT * FROM t WHERE c = 5 ORDER BY id DESC",
+        "SELECT * FROM t WHERE c = 3 ORDER BY id DESC LIMIT 3",  // latest-3 matching
+        "SELECT id, c FROM t WHERE c = 7 ORDER BY id DESC",
+        "SELECT c FROM t WHERE c = 2 ORDER BY id DESC LIMIT 5",  // covering output, DESC
+        "SELECT id FROM t WHERE c = 4 ORDER BY rowid DESC",
+        "SELECT * FROM t WHERE c = 99 ORDER BY id DESC",         // zero-match value, DESC
     ];
     for sql in seeks {
         cmp_ord(&f, &r, sql, "idx-eq-order");
-        assert!(has_seek(&f, sql), "index-eq + ORDER BY rowid ASC must seek: `{sql}`");
-        assert!(!has_sorter(&f, sql), "index-eq + ORDER BY rowid ASC must NOT sort: `{sql}`");
+        assert!(has_seek(&f, sql), "index-eq + ORDER BY rowid must seek: `{sql}`");
+        assert!(!has_sorter(&f, sql), "index-eq + ORDER BY rowid must NOT sort: `{sql}`");
     }
-    // Declines (still correct): DESC (walk is ascending-only), ORDER BY the eq column, ORDER BY non-rowid.
+    // Declines (still correct): ORDER BY the eq column, ORDER BY non-rowid.
     for sql in [
-        "SELECT * FROM t WHERE c = 5 ORDER BY id DESC",
         "SELECT * FROM t WHERE c = 5 ORDER BY c",
         "SELECT * FROM t WHERE c = 5 ORDER BY x",
+        "SELECT * FROM t WHERE c = 5 ORDER BY x DESC",
     ] {
         cmp_ord(&f, &r, sql, "idx-eq-declines");
     }
@@ -78,7 +86,12 @@ fn nonagg_index_eq_order_rowid_matches_sqlite() {
         // dd deliberately anti-correlated with id so a (cc,dd)-ordered walk would diverge from id order.
         ins(&f2, &r2, &format!("INSERT INTO u VALUES ({i}, {}, {}, 'w{}');", i % 8, (400 - i) % 50, i % 3));
     }
-    for sql in ["SELECT * FROM u WHERE cc = 3 ORDER BY id", "SELECT id, dd FROM u WHERE cc = 1 ORDER BY id LIMIT 7"] {
+    for sql in [
+        "SELECT * FROM u WHERE cc = 3 ORDER BY id",
+        "SELECT id, dd FROM u WHERE cc = 1 ORDER BY id LIMIT 7",
+        "SELECT * FROM u WHERE cc = 3 ORDER BY id DESC",         // composite must not walk backward either
+        "SELECT id, dd FROM u WHERE cc = 1 ORDER BY id DESC LIMIT 7",
+    ] {
         cmp_ord(&f2, &r2, sql, "composite-declines");
     }
 }

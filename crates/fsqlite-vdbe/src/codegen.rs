@@ -2454,6 +2454,7 @@ pub fn codegen_select(
                                                 idx_schema,
                                                 directive_target_expr,
                                                 false,
+                                                false,
                                             );
                                         }
                                         Some(_) => Some("index_equality_target_mismatch"),
@@ -2490,6 +2491,7 @@ pub fn codegen_select(
                                         end_label,
                                         idx_schema,
                                         target_expr,
+                                        false,
                                         false,
                                     );
                                 }
@@ -2698,19 +2700,20 @@ pub fn codegen_select(
             planner_index_range_target_from_column_range(&index_range),
         )
     } else if let Some((col_name, target_expr)) = index_eq.filter(|(col_name, _)| {
-        // bd-nonagg-index-eq-order-rowid: the index-equality seek returns rows in index-key order —
-        // for a SINGLE-column ASCENDING index that is exactly rowid-ascending WITHIN the one eq value
-        // (the seek positions at `(val, i64::MIN)` and walks forward), so it also satisfies
-        // `ORDER BY <rowid> ASC` for free, seeking only the matching rows instead of full-scanning +
-        // sorting. A composite index would order by its trailing key column, and a DESC index reverses
-        // the walk, so both decline (and keep the sorter / plain scan). No ORDER BY is always fine.
+        // bd-nonagg-index-eq-order-rowid: the index-equality seek returns rows in index-key order — for a
+        // SINGLE-column ASCENDING index that is exactly rowid order WITHIN the one eq value (ascending
+        // seeks `(val, i64::MIN)` + walk forward; descending seeks `(val, i64::MAX)` + `Prev`), so it
+        // also satisfies `ORDER BY <rowid>` ASC or DESC for free, seeking only the matching rows instead
+        // of full-scanning + sorting. A composite index would order by its trailing key column, so it
+        // declines and keeps the sorter / plain scan. No ORDER BY is always fine.
         stmt.order_by.is_empty()
-            || (matches!(rowid_order, Some(SortDirection::Asc))
+            || (rowid_order.is_some()
                 && table
                     .index_for_column(col_name)
                     .is_some_and(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0)))
     }) {
-        // --- Index-seek SELECT: no ORDER BY, or `ORDER BY <rowid> ASC` served by the seek's key order.
+        // --- Index-seek SELECT: no ORDER BY, or `ORDER BY <rowid>` served by the seek's key order.
+        let idx_desc = matches!(rowid_order, Some(SortDirection::Desc));
         if let Some(idx_schema) = table.index_for_column(&col_name) {
             codegen_select_index_equality_scan(
                 b,
@@ -2728,9 +2731,10 @@ pub fn codegen_select(
                 idx_schema,
                 target_expr,
                 false,
+                idx_desc,
             )
         } else {
-            // Fallback to full scan.
+            // Fallback to full scan (respect the ORDER BY rowid direction).
             codegen_select_full_scan(
                 b,
                 cursor,
@@ -2745,7 +2749,7 @@ pub fn codegen_select(
                 out_col_count,
                 done_label,
                 end_label,
-                false,
+                idx_desc,
             )
         }
     } else if let Some((idx_schema, target_expr)) = eq_residual {
@@ -2769,6 +2773,7 @@ pub fn codegen_select(
             idx_schema,
             target_expr,
             true,
+            false,
         )
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
         // --- Aggregate query WITH GROUP BY ---
@@ -3045,6 +3050,12 @@ fn codegen_select_index_equality_scan(
     // byte-identical. Only the bd-nonagg-eq-residual caller, whose WHERE is `col = lit AND <residual>`,
     // passes `true`. bd-nonagg-eq-residual.
     residual_filter: bool,
+    // When true, walk the eq value's rows in DESCENDING rowid order — seek to `(val, i64::MAX)` with
+    // `SeekLE` and step with `Prev` (and the affinity full-scan fallback uses `Last`+`Prev`) — to serve
+    // `ORDER BY <rowid> DESC`. The single-column ASC path's key-equality (`Ne`) check is
+    // direction-agnostic, so the value block is detected the same way. `false` is byte-identical to the
+    // ascending emission. Gated by the caller to a single-column ASC index. bd-nonagg-index-eq-order-rowid.
+    descending: bool,
 ) -> Result<(), CodegenError> {
     let idx_cursor = 1_i32;
     let full_scan_fallback = b.emit_label();
@@ -3131,7 +3142,16 @@ fn codegen_select_index_equality_scan(
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
 
-    b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    // Ascending seeks to `(val, i64::MIN)` (lowest rowid of the value) then walks up; descending seeks to
+    // `(val, i64::MAX)` (highest rowid) then walks down with `Prev`.
+    b.emit_op(
+        Opcode::Int64,
+        0,
+        min_rowid_reg,
+        0,
+        P4::Int64(if descending { i64::MAX } else { i64::MIN }),
+        0,
+    );
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
@@ -3161,7 +3181,11 @@ fn codegen_select_index_equality_scan(
         0,
     );
     b.emit_jump_to_label(
-        Opcode::SeekGE,
+        if descending {
+            Opcode::SeekLE
+        } else {
+            Opcode::SeekGE
+        },
         idx_cursor,
         probe_record_reg,
         seek_miss_label,
@@ -3259,7 +3283,18 @@ fn codegen_select_index_equality_scan(
     b.resolve_label(idx_skip_label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let idx_loop_body = idx_loop_top as i32;
-    b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+    b.emit_op(
+        if descending {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
+        idx_cursor,
+        idx_loop_body,
+        0,
+        P4::None,
+        0,
+    );
     b.emit_jump_to_label(Opcode::Goto, 0, 0, fast_path_done_label, P4::None, 0);
 
     b.resolve_label(duplicate_run_done);
@@ -3286,7 +3321,21 @@ fn codegen_select_index_equality_scan(
         );
     }
     let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+    // Affinity safety-net scan: mirror the seek's direction so `ORDER BY <rowid> DESC` stays descending
+    // even on this fallback path (it is only reached for non-exact seeks; exact integer seeks resolve a
+    // 0-match authoritatively without it).
+    b.emit_jump_to_label(
+        if descending {
+            Opcode::Last
+        } else {
+            Opcode::Rewind
+        },
+        cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
@@ -3311,7 +3360,18 @@ fn codegen_select_index_equality_scan(
     b.resolve_label(skip_label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+    b.emit_op(
+        if descending {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
+        cursor,
+        loop_body,
+        0,
+        P4::None,
+        0,
+    );
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
@@ -32890,6 +32950,7 @@ mod tests {
             end_label,
             idx_schema,
             &placeholder(1),
+            false,
             false,
         )
         .unwrap();
