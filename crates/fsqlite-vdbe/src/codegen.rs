@@ -17435,6 +17435,13 @@ pub fn codegen_update(
     register_table_index_meta(b, table, table_cursor);
 
     let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
+    // bd-update-rowid-in: `UPDATE ... WHERE <rowid> IN (<int literals>)` collects the listed rows with one
+    // `SeekRowid` each (Pass 1) instead of full-scanning. Bare form only (no residual), after `rowid = const`.
+    let rowid_in_list = if rowid_target.is_none() {
+        extract_rowid_in_list_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+    } else {
+        None
+    };
 
     let set_placeholder_count: u32 = stmt
         .assignments
@@ -17468,50 +17475,71 @@ pub fn codegen_update(
         let collect_done_label = b.emit_label();
 
         // Pass 1: collect matching rowids before mutating the table cursor.
-        let collect_start = b.current_addr();
-        b.emit_jump_to_label(
-            Opcode::Rewind,
-            table_cursor,
-            0,
-            collect_done_label,
-            P4::None,
-            0,
-        );
-
-        let collect_skip_label = b.emit_label();
-        if let Some(where_expr) = &stmt.where_clause {
-            b.set_next_anon_placeholder(set_placeholder_count + 1);
-            emit_where_filter(
-                b,
-                where_expr,
+        if let Some(values) = &rowid_in_list {
+            // bd-update-rowid-in: one `SeekRowid` per listed value; a miss skips to the next value. The
+            // values are sorted+deduped and the RowSet dedups again, so the collected set is exactly the
+            // existing listed rows — the same set the full scan below would gather. No WHERE filter (and
+            // thus no anon placeholders) here: the seek IS the membership test.
+            for &value in values {
+                let next_value = b.emit_label();
+                b.emit_op(Opcode::Int64, 0, matched_rowid_reg, 0, P4::Int64(value), 0);
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    table_cursor,
+                    matched_rowid_reg,
+                    next_value,
+                    P4::None,
+                    0,
+                );
+                b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
+                b.resolve_label(next_value);
+            }
+        } else {
+            let collect_start = b.current_addr();
+            b.emit_jump_to_label(
+                Opcode::Rewind,
                 table_cursor,
-                table,
-                stmt.table.alias.as_deref(),
-                schema,
-                collect_skip_label,
+                0,
+                collect_done_label,
+                P4::None,
+                0,
             );
-        }
 
-        b.emit_op(
-            Opcode::Rowid,
-            table_cursor,
-            matched_rowid_reg,
-            0,
-            P4::None,
-            0,
-        );
-        b.emit_op(
-            Opcode::RowSetAdd,
-            rowset_reg,
-            matched_rowid_reg,
-            0,
-            P4::None,
-            0,
-        );
-        b.resolve_label(collect_skip_label);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let collect_body = (collect_start + 1) as i32;
-        b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
+            let collect_skip_label = b.emit_label();
+            if let Some(where_expr) = &stmt.where_clause {
+                b.set_next_anon_placeholder(set_placeholder_count + 1);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    table_cursor,
+                    table,
+                    stmt.table.alias.as_deref(),
+                    schema,
+                    collect_skip_label,
+                );
+            }
+
+            b.emit_op(
+                Opcode::Rowid,
+                table_cursor,
+                matched_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
+            b.emit_op(
+                Opcode::RowSetAdd,
+                rowset_reg,
+                matched_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
+            b.resolve_label(collect_skip_label);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let collect_body = (collect_start + 1) as i32;
+            b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
+        }
         b.resolve_label(collect_done_label);
 
         // Pass 2: revisit each matched rowid and perform the delete+insert rewrite.
