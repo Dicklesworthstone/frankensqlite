@@ -18851,3 +18851,14 @@ test is on the executed path, not merely linked into it.
   golden snapshots, and the full `-p fsqlite` suite, on a healthy fleet. This lever consumed five
   attempts, each uncovering a distinct emitter/planner interaction; treat it as an emitter project, not a
   seek-routing tweak.
+- RESOLVED (landed `e7f8cbaf`): the residual-filter parameter fix above was implemented exactly as
+  scoped and the NON-COVERING case now LANDS — `SELECT <non-covering cols> ... WHERE col=<lit> AND
+  <residual>` seeks the eq block and filters per row, ~62× (0.35ms vs 21.8ms) with byte-set-identical
+  results (oracle 2/2 across single + composite-shadow schemas, all bound types, NULLs, zero-match), the
+  four existing callers byte-identical (`false` flag), and the full `-p fsqlite` suite + golden snapshots
+  green. STILL OPEN (documented follow-up, kept in this ledger as the covering-decision fix): COVERING
+  outputs (`SELECT id`/`SELECT a`, and `SELECT x` on a composite that covers `x`) still decline to the
+  full scan because `needs_table_lookup` is output-driven — make it also true when the residual
+  references a column not in the index, so the table opens and the residual reads it. Also open: prefer a
+  single-column index over a shadowing composite in the eq-residual detector (it currently returns the
+  first matching index), and generalize past `prefix.len() == 1` to composite eq prefixes.
