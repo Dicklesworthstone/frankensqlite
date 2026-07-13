@@ -18550,3 +18550,18 @@ test is on the executed path, not merely linked into it.
 - Result: rejected as within noise. Do not retry the standalone slot-0 early return from a cold read.
   Reconsider only if a new profile attributes material self-time to `remember_table_seek`/LRU rebuild,
   and require a same-worker confidence interval that excludes zero on the real clustered-seek workload.
+
+### bd-agg-in-list-residual — gated on a clean worker; byte-exact PASSED but COUNT(*) does not seek (needs a routing fix)
+
+- Re-applied the full change and gated on a consistently-synced worker: the byte-exact battery PASSED
+  (results correct), but the opcode gate `COUNT(*) WHERE a IN (3,7,11) AND x=5` -> SeekGE FAILED — it
+  produces correct rows via a SCAN, i.e. `simple_count_star` is NOT yielding to `codegen_select_aggregate`
+  for the IN-list + residual case (so no perf gain for COUNT(*); SUM was not reached, assert panicked first).
+- LIKELY CAUSE (for next session — add a codegen unit test on `index_integer_in_list_residual_target`
+  FIRST, no full build): either (a) `index_integer_in_list_residual_target` returns None for
+  `a IN (list) AND <residual>` (so neither the yield nor `index_in_seek` fires), or (b) the
+  `simple_count_star` yield edit didn't take effect / a `for term in &conjuncts` double-ref
+  (`&&Expr`) mis-passes to `index_integer_in_list_target(Some(term))`. Verify with:
+  `assert!(index_integer_in_list_residual_target(Some(&<a IN(1,2) AND x=3>), &table, None).is_some())`.
+  The rest of the re-apply plan (above) is correct; the byte-exact correctness is proven, only the
+  seek-routing needs fixing.
