@@ -17460,6 +17460,17 @@ pub fn codegen_update(
     } else {
         None
     };
+    // bd-update-index-eq: `UPDATE ... WHERE <single-col-int-indexed> = <int literal>` seeks the index for
+    // the matching rowids (fresh read cursor) instead of full-scanning. After all rowid cases decline.
+    let index_eq = if rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_range.is_none()
+        && rowid_eq_residual.is_none()
+    {
+        index_eq_int_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+    } else {
+        None
+    };
 
     let set_placeholder_count: u32 = stmt
         .assignments
@@ -17565,6 +17576,11 @@ pub fn codegen_update(
                 );
             }
             b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
+        } else if let Some((idx_schema, value)) = index_eq {
+            // Fresh read cursor beyond the table + registered index-maintenance cursors.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
+            emit_index_eq_rowset_collect(b, idx_read_cursor, idx_schema, value, rowset_reg, matched_rowid_reg);
         } else {
             let collect_start = b.current_addr();
             b.emit_jump_to_label(
@@ -18597,6 +18613,90 @@ fn emit_rowid_range_rowset_collect(
     b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
 }
 
+/// `(index, value)` for a DELETE/UPDATE `WHERE <col> = <int literal>` that a single-column ASCENDING
+/// integer index can serve as an EXACT seek — so the seek is authoritative and no affinity full-scan
+/// fallback is needed. Bare eq only (`extract_column_eq_target` requires a top-level `col = <expr>`); a
+/// residual conjunction declines. The rowid case is handled earlier, and the IPK has no secondary index,
+/// so this never fires for it. bd-delete-index-eq / bd-update-index-eq.
+fn index_eq_int_seek_target<'t>(
+    where_clause: Option<&Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, i64)> {
+    let (col_name, target_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
+    let Expr::Literal(Literal::Integer(value), _) = target_expr else {
+        return None;
+    };
+    let col_idx = table.column_index(&col_name)?;
+    if table.columns.get(col_idx)?.affinity != 'D' {
+        return None;
+    }
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx.columns.first().is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    })?;
+    Some((idx, *value))
+}
+
+/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <int literal>`: open a
+/// FRESH read cursor on the index (distinct from the table cursor and the registered index-maintenance
+/// cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run adding each rowid
+/// to the RowSet, then close the cursor. The exact integer seek is authoritative, so there is no affinity
+/// fallback. Control falls through to `collect_done` (resolved by the caller). bd-delete-index-eq /
+/// bd-update-index-eq.
+fn emit_index_eq_rowset_collect(
+    b: &mut ProgramBuilder,
+    idx_read_cursor: i32,
+    idx_schema: &IndexSchema,
+    target_value: i64,
+    rowset_reg: i32,
+    rowid_reg: i32,
+) {
+    let probe_key_regs = b.alloc_regs(2);
+    let min_rowid_reg = probe_key_regs + 1;
+    b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(target_value), 0);
+    b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    let probe_record_reg = b.alloc_reg();
+    b.emit_op(Opcode::MakeRecord, probe_key_regs, 2, probe_record_reg, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_read_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    let close_label = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_read_cursor,
+        probe_record_reg,
+        close_label,
+        P4::None,
+        0,
+    );
+    let loop_top = b.current_addr();
+    let idx_key_reg = b.alloc_reg();
+    b.emit_op(Opcode::Column, idx_read_cursor, 0, idx_key_reg, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        probe_key_regs,
+        idx_key_reg,
+        close_label,
+        direct_lookup_index_comparison_p4(idx_schema),
+        0x10,
+    );
+    b.emit_op(Opcode::IdxRowid, idx_read_cursor, rowid_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Next, idx_read_cursor, loop_body, 0, P4::None, 0);
+    b.resolve_label(close_label);
+    b.emit_op(Opcode::Close, idx_read_cursor, 0, 0, P4::None, 0);
+}
+
 /// a full table scan with filter.
 ///
 /// Init → Transaction(write) → OpenWrite → Rewind → [WHERE filter] →
@@ -18698,6 +18798,17 @@ pub fn codegen_delete(
     } else {
         None
     };
+    // bd-delete-index-eq: `DELETE ... WHERE <single-col-int-indexed> = <int literal>` seeks the index for
+    // the matching rowids (fresh read cursor) instead of full-scanning. After all rowid cases decline.
+    let index_eq = if rowid_target.is_none()
+        && rowid_in_list.is_none()
+        && rowid_range.is_none()
+        && rowid_eq_residual.is_none()
+    {
+        index_eq_int_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+    } else {
+        None
+    };
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
@@ -18783,6 +18894,11 @@ pub fn codegen_delete(
             );
         }
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+    } else if let Some((idx_schema, value)) = index_eq {
+        // Fresh read cursor beyond the table + registered index-maintenance cursors.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
+        emit_index_eq_rowset_collect(b, idx_read_cursor, idx_schema, value, rowset_reg, rowid_reg);
     } else {
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
