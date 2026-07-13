@@ -13,7 +13,7 @@
     {
       "fixture_id": "002_null_handling",
       "parser_blake3": "84f67cf0d4f03cda1efe3c64e92945e7cef5620586ae7d9490efd802ecb62cf8",
-      "planner_blake3": "b009c3b75f98dfa01fca59ccb221d42ea9cc1a2c1d4462e531f7c5684ed25c6f",
+      "planner_blake3": "8ba194531b7c16f1ff2cb8186320da3ff9a2b15831dd70afbdb11cd1daa9bc19",
       "execution_blake3": "9a027096109544da5bd12cefdda3360a0c74c007c214b140553f11246b41597c",
       "statement_count": 7,
       "query_count": 3
@@ -61,7 +61,7 @@
     {
       "fixture_id": "008_update_delete",
       "parser_blake3": "0acd557dbf424325af8073fca937f421b4cf4557ce98eaa0fac2dcb993cf5104",
-      "planner_blake3": "62c80dbd3eeb918a8ef8fe7d0949f9f5f6e48198bf1d44cb90918ceb86714579",
+      "planner_blake3": "854809bda8f310958d87a310137750175bdbbaceedf4d44a92a48bd1560156ce",
       "execution_blake3": "dbe5922456e8d359e0709403b5f15dee776bff951e669d4ddeab4e28fb6eb27a",
       "statement_count": 7,
       "query_count": 1
@@ -165,7 +165,7 @@
     {
       "fixture_id": "021_transaction_edge_cases",
       "parser_blake3": "fd50d4383672ad704eac9038b879cd737910b5bd6ee3fbd3755bf3983d6e0b20",
-      "planner_blake3": "b1b2ab19b33da132c43d65e8264b1a30bc28fe0b02192ab128e570eeab7360d5",
+      "planner_blake3": "1f9733e075460dadb3870dfdd2ecf49c788f22fd1c7d5d67387c61f6e5bf0ba8",
       "execution_blake3": "af877fd93a504e70a839a5e0dc3cc1fd1c5d594ce2e2eea70a00f528f2dda34c",
       "statement_count": 12,
       "query_count": 1
@@ -197,7 +197,7 @@
     {
       "fixture_id": "025_expression_operators",
       "parser_blake3": "8e8af24437d4c7fd4911a84422c67bdf52a2dde123851c4e922d7c1fcb817f02",
-      "planner_blake3": "16c3fdc3f940be145fb9f4e3623fd5f61c9f6e883f0468ba36867bcd70735a1a",
+      "planner_blake3": "92b4abf2220c367b946510d39543649b5349677a32d06f2fa9bc303953e4010d",
       "execution_blake3": "13edf63e825b01b7d4c3ee8a1c02f9ef86ad282ddc0e62ae068acc2b0d4503aa",
       "statement_count": 34,
       "query_count": 32
@@ -253,7 +253,7 @@
     {
       "fixture_id": "032_alter_table",
       "parser_blake3": "85c0e685328675738a3d70e9841ca9006f7f36d187d86e909b32ec811c12ceaf",
-      "planner_blake3": "5a525363394492aa3d5bab38895338fb541e184117e6e73d28286d6f3125b7a0",
+      "planner_blake3": "0537a3aa6a120e9063c3527f7ce8778663d829198571e7d0020fb82595960b3b",
       "execution_blake3": "f2e59881fd0b73e58e3e985bcafdee03f383eb6637df3c0fb862da281b155952",
       "statement_count": 10,
       "query_count": 4

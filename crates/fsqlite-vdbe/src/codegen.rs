@@ -1898,13 +1898,14 @@ pub fn codegen_select(
     // bare range (no residual) is owned by `rowid_range` above; this handles ONLY the conjunction case
     // (`has_residual`). Gated to no-LIMIT so nothing before the residual filter emits a placeholder (the
     // detector already requires integer-literal bounds), keeping the residual `?` numbering trivial.
-    let rowid_range_residual = if rowid_range_allowed && rowid_range.is_none() && stmt.limit.is_none() {
-        extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
-            .filter(|(_, has_residual)| *has_residual)
-            .map(|(range, _)| range)
-    } else {
-        None
-    };
+    let rowid_range_residual =
+        if rowid_range_allowed && rowid_range.is_none() && stmt.limit.is_none() {
+            extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
+                .filter(|(_, has_residual)| *has_residual)
+                .map(|(range, _)| range)
+        } else {
+            None
+        };
     let index_range = if is_aggregate
         || from_index_hint.is_some()
         || time_travel.is_some()
@@ -2057,9 +2058,10 @@ pub fn codegen_select(
     // bd-2dgf5: route a seekable integer IN-list BEFORE the planner directive. The connection
     // emits a `FullTableScan` directive for `rowid IN (...)` (it does not model IN as a
     // seekable access path), which would otherwise bypass these seeks. The gate is narrow
-    // (INTEGER-affinity + integer literals + IN, no ORDER BY / LIMIT / DISTINCT) and the seek
-    // is differential-proven bit-identical to SQLite, so preferring it over a full scan is
-    // always correct and strictly faster.
+    // (INTEGER-affinity + integer literals + IN, no unsupported ORDER BY / LIMIT / DISTINCT):
+    // a single rowid ASC/DESC ordering is served directly by the sorted seek sequence. The
+    // seek is differential-proven bit-identical to SQLite, so preferring it over a full scan
+    // is always correct and strictly faster.
     if let Some((values, has_residual)) = rowid_in {
         return codegen_select_rowid_in_scan(
             b,
@@ -2867,10 +2869,7 @@ pub fn codegen_select(
         // (`Rewind`+`Next`) or descending (`Last`+`Prev`) and applies the WHERE + LIMIT/OFFSET the same
         // way the sorter path would, so it is byte-identical output with the sort elided.
         if let Some(dir) = rowid_order.filter(|_| {
-            rowid_range_allowed
-                && where_clause
-                    .as_deref()
-                    .map_or(true, where_is_plain_scan_safe)
+            rowid_range_allowed && where_clause.as_deref().is_none_or(where_is_plain_scan_safe)
         }) {
             return codegen_select_full_scan(
                 b,
@@ -3008,11 +3007,17 @@ fn codegen_select_rowid_lookup(
     );
     // bd-nonagg-rowid-eq-residual: narrow the single seeked row with the full WHERE. A residual miss
     // jumps to `done_label` (Close + Halt) — there is only ever one row on this path.
-    if residual_filter
-        && let Some(where_expr) = where_clause
-    {
+    if residual_filter && let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, done_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            done_label,
+        );
     }
     let skip_label = b.emit_label();
     if let Some(off_r) = offset_reg {
@@ -3265,11 +3270,17 @@ fn codegen_select_index_equality_scan(
     // this flag is gated to), so the residual (e.g. `c = 7`) narrows the eq block to the exact matches.
     // The placeholder base is reset exactly as the fallback below does, so a `?` in the residual numbers
     // identically on both runtime paths.
-    if residual_filter
-        && let Some(where_expr) = where_clause
-    {
+    if residual_filter && let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, idx_skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            idx_skip_label,
+        );
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     if let Some(lim_r) = limit_reg {
@@ -3488,9 +3499,7 @@ fn codegen_select_index_in_scan(
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
         // bd-nonagg-in-list-residual: narrow the IN run to the exact matches with the full WHERE.
-        if residual_filter
-            && let Some(where_expr) = where_clause
-        {
+        if residual_filter && let Some(where_expr) = where_clause {
             b.set_next_anon_placeholder(where_placeholder_base);
             emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
         }
@@ -3570,11 +3579,17 @@ fn codegen_select_rowid_in_scan(
             0,
         );
         // bd-nonagg-rowid-in-residual: narrow the listed rows with the full WHERE.
-        if residual_filter
-            && let Some(where_expr) = where_clause
-        {
+        if residual_filter && let Some(where_expr) = where_clause {
             b.set_next_anon_placeholder(where_placeholder_base);
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, next_value);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                next_value,
+            );
         }
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -3642,7 +3657,11 @@ fn codegen_select_full_scan(
     // done if the table is empty.
     let loop_start = b.current_addr();
     b.emit_jump_to_label(
-        if descending { Opcode::Last } else { Opcode::Rewind },
+        if descending {
+            Opcode::Last
+        } else {
+            Opcode::Rewind
+        },
         cursor,
         0,
         done_label,
@@ -3688,7 +3707,11 @@ fn codegen_select_full_scan(
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = (loop_start + 1) as i32;
     b.emit_op(
-        if descending { Opcode::Prev } else { Opcode::Next },
+        if descending {
+            Opcode::Prev
+        } else {
+            Opcode::Next
+        },
         cursor,
         loop_body,
         0,
@@ -3929,11 +3952,17 @@ fn codegen_select_rowid_range_scan(
     // miss jumps to `skip_label` (the Next), so the walk continues to the next row. Applied before the
     // OFFSET count so OFFSET skips only matching rows (the residual hoist gates on no-LIMIT, so
     // offset_reg is None here anyway).
-    if residual_filter
-        && let Some(where_expr) = where_clause
-    {
+    if residual_filter && let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
 
     if let Some(off_r) = offset_reg {
@@ -7337,9 +7366,7 @@ fn where_is_plain_scan_safe(expr: &Expr) -> bool {
             *op != fsqlite_ast::LikeOp::Match
                 && where_is_plain_scan_safe(inner)
                 && where_is_plain_scan_safe(pattern)
-                && escape
-                    .as_deref()
-                    .map_or(true, where_is_plain_scan_safe)
+                && escape.as_deref().is_none_or(where_is_plain_scan_safe)
         }
         Expr::Case {
             operand,
@@ -7347,11 +7374,11 @@ fn where_is_plain_scan_safe(expr: &Expr) -> bool {
             else_expr,
             ..
         } => {
-            operand.as_deref().map_or(true, where_is_plain_scan_safe)
+            operand.as_deref().is_none_or(where_is_plain_scan_safe)
                 && whens.iter().all(|(when_expr, then_expr)| {
                     where_is_plain_scan_safe(when_expr) && where_is_plain_scan_safe(then_expr)
                 })
-                && else_expr.as_deref().map_or(true, where_is_plain_scan_safe)
+                && else_expr.as_deref().is_none_or(where_is_plain_scan_safe)
         }
         Expr::FunctionCall {
             over: None,
@@ -29858,8 +29885,10 @@ mod tests {
     }
 
     /// bd-2dgf5: `SELECT <cols> FROM t WHERE <rowid> IN (<int literals>)` does one `SeekRowid`
-    /// per distinct value and never full-scans; declines (Rewind-scans) for ORDER BY / LIMIT /
-    /// DISTINCT / non-integer or negative elements / NOT IN. Covered by `rowid_in_list_matches_sqlite`.
+    /// per distinct value and never full-scans. A single rowid ASC/DESC ordering is served by
+    /// the sorted seek sequence; LIMIT / DISTINCT / unsupported ORDER BY / non-integer or
+    /// negative elements / NOT IN decline to a Rewind scan. Covered by
+    /// `rowid_in_list_matches_sqlite`.
     #[test]
     fn bd_2dgf5_rowid_in_list_point_lookups() {
         let seek_rowids = |sql: &str| -> usize {
@@ -29885,7 +29914,29 @@ mod tests {
         assert_eq!(seek_rowids("SELECT id FROM t WHERE id IN (5, 5, 10)"), 2);
 
         for sql in [
-            "SELECT id FROM t WHERE id IN (5, 10) ORDER BY id",
+            "SELECT id FROM t WHERE id IN (5, 10) ORDER BY id ASC",
+            "SELECT id FROM t WHERE id IN (5, 10) ORDER BY id DESC",
+        ] {
+            let ordered_ops = bd_2dgf5_program(sql);
+            assert_eq!(
+                ordered_ops
+                    .iter()
+                    .filter(|op| op.opcode == Opcode::SeekRowid)
+                    .count(),
+                2,
+                "`{sql}` must seek each distinct rowid"
+            );
+            assert!(
+                !ordered_ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must not full-scan"
+            );
+            assert!(
+                !ordered_ops.iter().any(|op| op.opcode == Opcode::SorterOpen),
+                "`{sql}` must not open a sorter"
+            );
+        }
+
+        for sql in [
             "SELECT id FROM t WHERE id IN (5, 10) LIMIT 1",
             "SELECT DISTINCT id FROM t WHERE id IN (5, 10)",
             "SELECT id FROM t WHERE id IN (2.0, 5)",

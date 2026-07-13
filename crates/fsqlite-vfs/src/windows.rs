@@ -1364,14 +1364,19 @@ mod tests {
         let cx = Cx::new();
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("identity.db");
+        let alias_path = dir.path().join("identity-alias.db");
         let other_path = dir.path().join("other.db");
         let vfs = WindowsVfs::new();
         let (file_a, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open first handle");
+        fs::hard_link(&path, &alias_path).expect("create hard-link alias");
         let (file_b, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open second handle");
+        let (alias_file, _) = vfs
+            .open(&cx, Some(&alias_path), open_flags_create())
+            .expect("open hard-link alias");
         let (other_file, _) = vfs
             .open(&cx, Some(&other_path), open_flags_create())
             .expect("open distinct file");
@@ -1384,12 +1389,17 @@ mod tests {
             .file_identity()
             .expect("read second identity")
             .expect("Windows file identity should be available");
+        let alias_identity = alias_file
+            .file_identity()
+            .expect("read alias identity")
+            .expect("Windows file identity should be available");
         let other_identity = other_file
             .file_identity()
             .expect("read distinct identity")
             .expect("Windows file identity should be available");
 
         assert_eq!(identity_a, identity_b);
+        assert_eq!(identity_a, alias_identity);
         assert_ne!(identity_a, other_identity);
     }
 
