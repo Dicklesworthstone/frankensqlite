@@ -2831,6 +2831,36 @@ pub fn codegen_select(
             );
         }
 
+        // bd-nonagg-rowid-order-scan: `ORDER BY <rowid> ASC` needs NO sorter — a table scan (Rewind +
+        // Next) already visits rows in ascending rowid order, and the rowid is unique so there are no
+        // ties to resolve. `resolve_order_by_index_plan` returns None for the rowid (no secondary index
+        // covers it), so we would otherwise sort every row. Route to the plain scan, which applies
+        // LIMIT/OFFSET and stops early under a LIMIT. `rowid_range_allowed` is exactly the safe gate
+        // (non-aggregate, no GROUP BY/HAVING/DISTINCT, and — since rowid_order is Some — the ORDER BY is
+        // a single rowid term). Restricted to `where_clause.is_none()` for this cut: a WHERE could carry
+        // MATCH / a subquery / other predicates whose interaction with the plain scan is not oracle-
+        // proven here (a filtered variant is a follow-up). DESC (Last + Prev) is also a follow-up.
+        if matches!(rowid_order, Some(SortDirection::Asc))
+            && rowid_range_allowed
+            && where_clause.is_none()
+        {
+            return codegen_select_full_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                time_travel,
+                schema,
+                columns,
+                where_clause.as_deref(),
+                stmt.limit.as_ref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+            );
+        }
+
         // --- Full table scan with ORDER BY (sorter path) ---
         codegen_select_ordered_scan(
             b,
