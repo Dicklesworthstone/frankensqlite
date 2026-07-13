@@ -1881,16 +1881,28 @@ pub fn codegen_select(
     let rowid_order = (!stmt.order_by.is_empty())
         .then(|| resolve_order_by_rowid_direction(table, table_alias, columns, &stmt.order_by))
         .flatten();
-    let rowid_range = if (is_aggregate && !simple_count_star)
+    let rowid_range_allowed = !((is_aggregate && !simple_count_star)
         || distinct != Distinctness::All
         || !group_by.is_empty()
         || having.is_some()
-        || (!stmt.order_by.is_empty() && rowid_order.is_none())
-    {
-        None
-    } else {
+        || (!stmt.order_by.is_empty() && rowid_order.is_none()));
+    let rowid_range = if rowid_range_allowed {
         extract_rowid_range_target(where_clause.as_deref(), Some(table), table_alias)
             .and_then(|range| rowid_range_fast_path_is_safe(range).then_some(range))
+    } else {
+        None
+    };
+    // bd-nonagg-rowid-range-residual: `rowid <range> AND <residual>` — walk only the [lower, upper] slice
+    // (rowid order = full-scan order) and re-apply the whole WHERE per row, instead of full-scanning. The
+    // bare range (no residual) is owned by `rowid_range` above; this handles ONLY the conjunction case
+    // (`has_residual`). Gated to no-LIMIT so nothing before the residual filter emits a placeholder (the
+    // detector already requires integer-literal bounds), keeping the residual `?` numbering trivial.
+    let rowid_range_residual = if rowid_range_allowed && rowid_range.is_none() && stmt.limit.is_none() {
+        extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
+            .filter(|(_, has_residual)| *has_residual)
+            .map(|(range, _)| range)
+    } else {
+        None
     };
     let index_range = if is_aggregate
         || time_travel.is_some()
@@ -2251,6 +2263,41 @@ pub fn codegen_select(
             end_label,
             rr,
             matches!(rowid_order, Some(SortDirection::Desc)),
+            None,
+            false,
+        );
+    }
+
+    // bd-nonagg-rowid-range-residual: same pre-directive hoist as the bare range above, but for
+    // `rowid <range> AND <residual on a column the planner cannot seek>`. The planner still emits a
+    // `FullTableScan` directive (it models neither the rowid range nor the non-indexed residual as
+    // seekable), which would full-scan every row. The residual walk visits only the [lower, upper] slice
+    // in rowid order and filters per row — byte-identical to the full scan, always ≤ it, so no covering
+    // gate. (When the residual IS on an indexed column the planner emits an IndexEquality directive
+    // instead and that path — with its own residual filter — owns the query; this hoist declines.)
+    if let Some(rr) = rowid_range_residual
+        && ctx.planner_select_directive.as_ref().is_some_and(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+        })
+    {
+        return codegen_select_rowid_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            rr,
+            matches!(rowid_order, Some(SortDirection::Desc)),
+            where_clause.as_deref(),
+            true,
         );
     }
 
@@ -2593,6 +2640,30 @@ pub fn codegen_select(
             end_label,
             rowid_range,
             matches!(rowid_order, Some(SortDirection::Desc)),
+            None,
+            false,
+        )
+    } else if let Some(rr) = rowid_range_residual {
+        // bd-nonagg-rowid-range-residual: the planner SUPPRESSES the directive for an IPK range (returns
+        // None) so the VDBE picks its bounded seek here in the heuristic fallback — same path the bare
+        // range uses. Walk the [lower, upper] slice and re-apply the whole WHERE per row.
+        codegen_select_rowid_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            rr,
+            matches!(rowid_order, Some(SortDirection::Desc)),
+            where_clause.as_deref(),
+            true,
         )
     } else if let Some((_index_column_name, idx_schema, index_range)) = index_range {
         codegen_select_index_range_scan(
@@ -3551,7 +3622,18 @@ fn codegen_select_rowid_range_scan(
     end_label: crate::Label,
     rowid_range: RowidRangeTarget<'_>,
     descending: bool,
+    where_clause: Option<&Expr>,
+    // When true, the full `where_clause` is applied as a per-row residual filter inside the walk — for
+    // `rowid <range> AND <residual>`. The walk visits the `[lower, upper]` slice (a superset of the
+    // matches) in rowid order; the residual narrows it. Byte-identical to the full scan (same rows, same
+    // order, fewer visited). `false` for the plain-range callers → byte-identical. The residual hoist
+    // requires integer-literal bounds and no LIMIT, so nothing before the filter emits a placeholder.
+    // bd-nonagg-rowid-range-residual.
+    residual_filter: bool,
 ) -> Result<(), CodegenError> {
+    // Captured before any placeholder-emitting op so the re-applied WHERE re-numbers a residual `?` from
+    // this base. Unused when `residual_filter` is false.
+    let where_placeholder_base = b.current_anon_placeholder();
     let limit_reg = limit_clause.map(|lc| {
         let r = b.alloc_reg();
         emit_limit_expr(b, &lc.limit, r);
@@ -3679,6 +3761,17 @@ fn codegen_select_rowid_range_scan(
                 .as_ref()
                 .map_or(0, |comparison| comparison.cmp_p5),
         );
+    }
+
+    // bd-nonagg-rowid-range-residual: narrow the [lower, upper] slice with the full WHERE. A residual
+    // miss jumps to `skip_label` (the Next), so the walk continues to the next row. Applied before the
+    // OFFSET count so OFFSET skips only matching rows (the residual hoist gates on no-LIMIT, so
+    // offset_reg is None here anyway).
+    if residual_filter
+        && let Some(where_expr) = where_clause
+    {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
 
     if let Some(off_r) = offset_reg {
