@@ -11199,7 +11199,15 @@ fn emit_aggregate_index_value_seek(
             0,
         );
         if let Some(where_expr) = residual_where {
-            emit_where_filter(b, where_expr, table_cursor, table, table_alias, schema, skip_row);
+            emit_where_filter(
+                b,
+                where_expr,
+                table_cursor,
+                table,
+                table_alias,
+                schema,
+                skip_row,
+            );
         }
         emit_aggregate_accumulate_body(
             b,
