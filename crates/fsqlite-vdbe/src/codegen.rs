@@ -10320,7 +10320,7 @@ fn codegen_select_count_distinct_index_walk(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
-) -> Result<(), CodegenError> {
+) {
     // Count accumulates directly in the output register (COUNT is never NULL; wrappers are declined).
     let count_reg = out_regs;
     let prev_reg = b.alloc_reg();
@@ -10366,7 +10366,6 @@ fn codegen_select_count_distinct_index_walk(
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
-    Ok(())
 }
 
 /// Emit `SELECT MIN(col), MAX(col)` over one indexed column as TWO seeks to the two index ends — the
@@ -11550,7 +11549,7 @@ fn codegen_select_aggregate(
         && having.is_none()
         && let Some(walk) = count_distinct_index_walk_plan(&agg_columns, columns, table)
     {
-        return codegen_select_count_distinct_index_walk(
+        codegen_select_count_distinct_index_walk(
             b,
             cursor,
             &walk,
@@ -11559,6 +11558,7 @@ fn codegen_select_aggregate(
             done_label,
             end_label,
         );
+        return Ok(());
     }
 
     // `SELECT MIN(col), MAX(col)` over one indexed column: two seeks (one per index end) instead of a
