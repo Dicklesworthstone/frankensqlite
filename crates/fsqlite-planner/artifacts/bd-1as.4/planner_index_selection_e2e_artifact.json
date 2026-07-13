@@ -6,7 +6,7 @@
   "seed": 20260219,
   "overall_status": "pass",
   "timing": {
-    "selection_elapsed_us": 61
+    "selection_elapsed_us": 461
   },
   "checks": [
     {
@@ -27,7 +27,7 @@
   ],
   "metric_delta": {
     "covering_index_scan": 0,
-    "full_table_scan": 43,
+    "full_table_scan": 2,
     "index_scan_equality": 4,
     "index_scan_range": 0,
     "rowid_lookup": 0

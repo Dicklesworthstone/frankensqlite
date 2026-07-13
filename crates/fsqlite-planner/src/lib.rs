@@ -10515,18 +10515,12 @@ mod tests {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_SEED);
 
-        let artifact_path = std::env::var("FSQLITE_PLANNER_INDEX_E2E_ARTIFACT").map_or_else(
-            |_| {
-                PathBuf::from("artifacts")
-                    .join(BEAD_ID)
-                    .join("planner_index_selection_e2e_artifact.json")
-            },
-            PathBuf::from,
-        );
-        if let Some(parent) = artifact_path.parent() {
-            std::fs::create_dir_all(parent)
-                .expect("bead_id={BEAD_ID} artifact directory should be writable");
-        }
+        // Ordinary parallel unit-test runs must not rewrite the checked-in replay
+        // artifact with wall-clock timing and process-global metric noise.  The
+        // dedicated E2E driver sets this variable explicitly when it wants a
+        // durable artifact.
+        let artifact_path =
+            std::env::var_os("FSQLITE_PLANNER_INDEX_E2E_ARTIFACT").map(PathBuf::from);
 
         let started = Instant::now();
         let mut cracking_hints = CrackingHintStore::default();
@@ -10641,13 +10635,13 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         let elapsed_us = started.elapsed().as_micros().max(1);
+        let replay_artifact_path = artifact_path.as_ref().map_or_else(
+            || "$FSQLITE_PLANNER_INDEX_E2E_ARTIFACT".to_owned(),
+            |path| path.display().to_string(),
+        );
         let replay_command = format!(
             "RUN_ID='{}' TRACE_ID={} SCENARIO_ID='{}' SEED={} FSQLITE_PLANNER_INDEX_E2E_ARTIFACT='{}' cargo test -p fsqlite-planner planner_index_selection_e2e_replay_emits_artifact -- --exact --nocapture",
-            run_id,
-            trace_id,
-            scenario_id,
-            seed,
-            artifact_path.display(),
+            run_id, trace_id, scenario_id, seed, replay_artifact_path,
         );
 
         let plan_fingerprint = blake3::hash(
@@ -10710,12 +10704,18 @@ mod tests {
         });
         let artifact_bytes = serde_json::to_vec_pretty(&artifact)
             .expect("bead_id={BEAD_ID} artifact serialization should succeed");
-        std::fs::write(&artifact_path, artifact_bytes)
-            .expect("bead_id={BEAD_ID} artifact write should succeed");
-        assert!(
-            artifact_path.exists(),
-            "bead_id={BEAD_ID} e2e artifact path should exist"
-        );
+        if let Some(artifact_path) = artifact_path {
+            if let Some(parent) = artifact_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .expect("bead_id={BEAD_ID} artifact directory should be writable");
+            }
+            std::fs::write(&artifact_path, artifact_bytes)
+                .expect("bead_id={BEAD_ID} artifact write should succeed");
+            assert!(
+                artifact_path.exists(),
+                "bead_id={BEAD_ID} e2e artifact path should exist"
+            );
+        }
     }
 
     #[test]
