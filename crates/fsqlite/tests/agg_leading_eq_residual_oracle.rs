@@ -1,7 +1,8 @@
 //! bd-agg-leading-eq-residual: `SELECT COUNT(*)/SUM(...) FROM t WHERE a = <int> AND <residual>` seeks
 //! the integer-exact equality-prefix block on an index and applies the FULL (placeholder-free) WHERE
 //! as a residual filter per row, instead of full-scanning. HARD GATE: byte-identical to C SQLite across
-//! residual equality/range/OR/multi-term predicates, a multi-column equality prefix, absent keys
+//! residual equality/range/OR/multi-term predicates (including a rowid residual), a multi-column
+//! equality prefix, absent keys
 //! (→ COUNT=0 / SUM=NULL), COALESCE, and both aggregates. The residual filter enforces the WHOLE
 //! predicate, so nothing is dropped. Opcode gate: an all-literal WHERE SeekGEs the index; a WHERE with
 //! a bound parameter DECLINES the seek (falls to a scan that binds it).
@@ -98,6 +99,13 @@ fn agg_leading_eq_residual_matches_sqlite() {
         "SELECT COUNT(*) FROM t WHERE a = 7 AND (x = 5 OR x = 6)",
         // Multiple residuals.
         "SELECT COUNT(*) FROM t WHERE a = 7 AND x = 5 AND y = 1",
+        // Rowid residual: matching, reversed-conjunct, and rejection cases.  The
+        // rejection is load-bearing proof that the full WHERE is re-applied after
+        // the index probe instead of silently dropping the residual.
+        "SELECT COUNT(*) FROM t WHERE a = 7 AND id = 7",
+        "SELECT SUM(x) FROM t WHERE id = 7 AND a = 7",
+        "SELECT COUNT(*) FROM t WHERE a = 7 AND id = 8",
+        "SELECT SUM(x) FROM t WHERE a = 7 AND id = 8",
         // Multi-column equality prefix (a, b) + residual on x.
         "SELECT COUNT(*) FROM t WHERE a = 7 AND b = 3 AND x = 5",
         "SELECT SUM(x) FROM t WHERE a = 7 AND b = 3 AND x > 2",
@@ -129,6 +137,19 @@ fn agg_leading_eq_residual_matches_sqlite() {
     assert!(
         has_op(&f, "SELECT COUNT(*) FROM t WHERE a = 7 AND x = 5", "SeekGE"),
         "leading eq + literal residual must seek the prefix (SeekGE)"
+    );
+    let rowid_residual_sql = "SELECT COUNT(*) FROM t WHERE a = 7 AND id = 7";
+    assert!(
+        has_op(&f, rowid_residual_sql, "SeekGE"),
+        "leading eq + rowid residual must seek the index prefix"
+    );
+    assert!(
+        has_op(&f, rowid_residual_sql, "SeekRowid"),
+        "leading eq + rowid residual must visit the candidate table row"
+    );
+    assert!(
+        !has_op(&f, rowid_residual_sql, "Rewind"),
+        "leading eq + rowid residual must not full-scan the table"
     );
     assert!(
         has_op(

@@ -28596,15 +28596,44 @@ mod tests {
             );
         }
 
-        // Shapes the seek MUST decline — each must fall back to a Rewind/Next scan so the
-        // scan's correct semantics apply. `id = -5` parses as unary-negate over an integer
-        // literal (not `Literal::Integer`), so it declines too; optimizing negative rowids
-        // is a clean follow-up, and the differential oracle confirms the scan is correct.
+        // A secondary-index equality plus a rowid residual takes the later
+        // equality-prefix residual path.  It must seek the index, visit the table row,
+        // re-apply the full WHERE, and never fall back to a table scan.
+        let residual_ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE id = 2 AND k = 3");
+        assert!(
+            residual_ops
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_t_k")),
+            "indexed residual path must open idx_t_k"
+        );
+        for required in [
+            Opcode::SeekGE,
+            Opcode::IdxRowid,
+            Opcode::SeekRowid,
+            Opcode::AggStep,
+            Opcode::Next,
+        ] {
+            assert!(
+                residual_ops.iter().any(|op| op.opcode == required),
+                "indexed residual path must emit {required:?}"
+            );
+        }
+        assert!(
+            !residual_ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "indexed residual path must not full-scan the table"
+        );
+
+        // Shapes the direct rowid seek MUST decline — each must fall back to a
+        // Rewind/Next scan so the scan's correct semantics apply. `id = -5` parses as
+        // unary-negate over an integer literal (not `Literal::Integer`), so it declines
+        // too; optimizing negative rowids is a clean follow-up, and the differential
+        // oracle confirms the scan is correct.  The residual case uses unindexed `v`
+        // so no independent index path can legitimately claim it.
         for sql in [
             "SELECT SUM(v) FROM t WHERE id = 2.5",
             "SELECT SUM(v) FROM t WHERE id = '2'",
             "SELECT SUM(v) FROM t WHERE id = -5",
-            "SELECT SUM(v) FROM t WHERE id = 2 AND k = 3",
+            "SELECT SUM(v) FROM t WHERE id = 2 AND v = '3'",
             "SELECT SUM(v) FROM t NOT INDEXED WHERE id = 2",
         ] {
             let ops = bd_2dgf5_program(sql);
