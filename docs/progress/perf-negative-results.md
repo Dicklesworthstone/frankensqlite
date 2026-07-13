@@ -18702,3 +18702,40 @@ test is on the executed path, not merely linked into it.
   synthetic setup seam alone. Reconsider only if a production profile attributes material execution
   time to Once-state allocation in real programs above 1024 instructions and a statement-level
   workload reproduces the win without regressing high-PC `Once` programs.
+
+## 2026-07-13 - B-tree seek-cache adjacent-rowid probe
+
+- Target: the file-backed prepared `pipeline/btree_seek_file_clustered_in/fsqlite` workload, which
+  issues 32 ascending `SeekRowid` probes for rowids 480 through 511 on one clean cursor. The first
+  probe descends the tree; the remaining probes exercise resident table-seek-cache hits. Ledger and
+  history review found no exact prior adjacent-cell attempt. The shipped resident-entry reuse
+  (`5e19484d`) and rejected slot-0 MRU refresh (`962b7c39`) are adjacent but distinct levers; the
+  latter's noisy 3.19% reduction established a local floor below the predeclared 5% keep gate.
+- Candidate touched `crates/fsqlite-btree/src/cursor.rs`. On a clean resident cached page, when the
+  next target was `cached.rowid + 1` and the adjacent cell was in bounds, it decoded that one cell and
+  synthesized `Found(adjacent_idx)` only on exact equality; every miss, gap, leaf boundary, dirty or
+  non-resident page, and integer overflow retained the full leaf search. Success flowed through the
+  existing landing, LRU, witness, EOF, and rootless-stack finalization. A focused inline test covered
+  same-leaf success, sparse-miss successor positioning, a preceding miss, cross-leaf fallback, and
+  `i64` overflow. The source and test patch were manually unwound after measurement.
+- Correctness proof: strict remote RCH on `vmi1152480` ran
+  `test_table_seek_cache_consecutive_rowids_preserve_fallbacks` successfully (`1/1`). Direct
+  `rustfmt --edition 2024 --check` and `git diff --check` also passed before measurement.
+- Evidence artifacts: `target/criterion/pipeline_btree_seek_file_clustered_in/fsqlite/{base,new}/`
+  and `target/criterion/pipeline_btree_seek_file_clustered_in/fsqlite/change/estimates.json` in the
+  isolated A/B worktree.
+- Evidence (strict remote-only RCH, same worker `vmi1264463`, 30 samples, identical command/profile):
+  baseline `25.147 us` (`24.120..26.384 us`) versus candidate `27.262 us`
+  (`26.198..28.265 us`), an `8.41%` center-time regression / `0.92x` throughput equivalent.
+  Criterion confirmed a significant regression: `+3.1127%..+13.320%`, `p=0.00`.
+- Command: `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1264463 env -u CARGO_TARGET_DIR rch exec -- cargo
+  bench --config 'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16'
+  --profile release-perf -j3 -p fsqlite-e2e --bench pipeline_stage_bench --
+  '^pipeline/btree_seek_file_clustered_in/fsqlite$' --warm-up-time 0.5 --measurement-time 2
+  --sample-size 30 --noplot`. Both jobs selected and executed on `vmi1264463`; RCH invalidated the
+  graph for each sync, producing comparable cold builds (24m52s baseline, 23m42s candidate). No local
+  Cargo command was substituted.
+- Result: rejected at the primary row, so the optional sparse-miss control was unnecessary. Do not
+  retry the standalone adjacent-cell equality probe inside `try_table_seek_cache`. Reconsider only
+  with a new profile showing dense cached leaf search as a dominant cost and a broader batched-run
+  design that removes per-probe search and cache-maintenance work together.
