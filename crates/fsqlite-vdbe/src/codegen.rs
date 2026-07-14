@@ -17577,7 +17577,7 @@ pub fn codegen_update(
                 );
             }
             b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
-        } else if let Some((idx_schema, target, has_residual)) = index_eq {
+        } else if let Some((idx_schema, target, aff, has_residual)) = index_eq {
             // Fresh read cursor beyond the table + registered index-maintenance cursors. The probe and the
             // residual (if any) number from set_placeholder_count + 1, after the SET placeholders (Pass 2).
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -17587,6 +17587,7 @@ pub fn codegen_update(
                 idx_read_cursor,
                 idx_schema,
                 target,
+                aff,
                 rowset_reg,
                 matched_rowid_reg,
                 table,
@@ -18640,13 +18641,17 @@ fn index_eq_seek_target<'a, 't>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
-) -> Option<(&'t IndexSchema, &'a Expr)> {
+) -> Option<(&'t IndexSchema, &'a Expr, char)> {
     let (col_name, target_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
     if !is_simple_constant(target_expr) {
         return None;
     }
     let col_idx = table.column_index(&col_name)?;
-    if table.columns.get(col_idx)?.affinity != 'D' {
+    // INTEGER ('D') or TEXT ('B') affinity: the collect coerces the probe to this affinity so a
+    // runtime-typed bound seeks like the affinity-applying full-scan filter. (Numeric 'C'/'E' would work
+    // the same way but are deferred until oracled.)
+    let affinity = table.columns.get(col_idx)?.affinity;
+    if !matches!(affinity, 'D' | 'B') {
         return None;
     }
     let idx = table.indexes.iter().find(|idx| {
@@ -18655,20 +18660,29 @@ fn index_eq_seek_target<'a, 't>(
             && !idx.key_term_descending(0)
             && idx.columns.first().is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
     })?;
-    Some((idx, target_expr))
+    // A TEXT column's seek comparison depends on collation; only BINARY agrees with the coerced probe and
+    // the full-scan filter, so a NOCASE/RTRIM index declines (a numeric column has no collation concern).
+    if affinity == 'B'
+        && !idx
+            .key_term_collation(0)
+            .map_or(true, |c| c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+    Some((idx, target_expr, affinity))
 }
 
-/// `(index, target, has_residual)` — like [`index_eq_seek_target`] but also admits the eq as a CONJUNCT
-/// alongside other predicates the index seek cannot enforce: `<col> = <value> AND <residual>`. The caller
-/// applies the full WHERE per candidate (via the table row) before adding it. `has_residual == false` is
-/// the bare eq. bd-delete-index-eq-residual / bd-update-index-eq-residual.
+/// `(index, target, affinity, has_residual)` — like [`index_eq_seek_target`] but also admits the eq as a
+/// CONJUNCT alongside other predicates the index seek cannot enforce: `<col> = <value> AND <residual>`.
+/// The caller applies the full WHERE per candidate (via the table row) before adding it.
+/// `has_residual == false` is the bare eq. bd-delete-index-eq-residual / bd-update-index-eq-residual.
 fn index_eq_residual_seek_target<'a, 't>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
-) -> Option<(&'t IndexSchema, &'a Expr, bool)> {
-    if let Some((idx, target)) = index_eq_seek_target(where_clause, table, table_alias) {
-        return Some((idx, target, false));
+) -> Option<(&'t IndexSchema, &'a Expr, char, bool)> {
+    if let Some((idx, target, aff)) = index_eq_seek_target(where_clause, table, table_alias) {
+        return Some((idx, target, aff, false));
     }
     let where_expr = where_clause?;
     let mut conjuncts = Vec::new();
@@ -18677,8 +18691,8 @@ fn index_eq_residual_seek_target<'a, 't>(
         return None;
     }
     for term in conjuncts {
-        if let Some((idx, target)) = index_eq_seek_target(Some(term), table, table_alias) {
-            return Some((idx, target, true));
+        if let Some((idx, target, aff)) = index_eq_seek_target(Some(term), table, table_alias) {
+            return Some((idx, target, aff, true));
         }
     }
     None
@@ -18700,6 +18714,8 @@ fn emit_index_eq_rowset_collect(
     idx_read_cursor: i32,
     idx_schema: &IndexSchema,
     target_expr: &Expr,
+    // The indexed column's affinity ('D' integer or 'B' text) — coerced onto a runtime-typed probe.
+    affinity: char,
     rowset_reg: i32,
     rowid_reg: i32,
     table: &TableSchema,
@@ -18719,8 +18735,15 @@ fn emit_index_eq_rowset_collect(
     // to the column's INTEGER affinity so the seek positions like the affinity-applying comparison would.
     b.set_next_anon_placeholder(where_placeholder_base);
     emit_expr(b, target_expr, probe_key_regs, None);
-    if !bound_matches_affinity('D', target_expr) {
-        b.emit_op(Opcode::Affinity, probe_key_regs, 1, 0, P4::Affinity("D".to_owned()), 0);
+    if !bound_matches_affinity(affinity, target_expr) {
+        b.emit_op(
+            Opcode::Affinity,
+            probe_key_regs,
+            1,
+            0,
+            P4::Affinity(affinity.to_string()),
+            0,
+        );
     }
     b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
     let probe_record_reg = b.alloc_reg();
@@ -18971,7 +18994,7 @@ pub fn codegen_delete(
             );
         }
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
-    } else if let Some((idx_schema, target, has_residual)) = index_eq {
+    } else if let Some((idx_schema, target, aff, has_residual)) = index_eq {
         // Fresh read cursor beyond the table + registered index-maintenance cursors.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
@@ -18981,6 +19004,7 @@ pub fn codegen_delete(
             idx_read_cursor,
             idx_schema,
             target,
+            aff,
             rowset_reg,
             rowid_reg,
             table,
