@@ -4469,6 +4469,13 @@ enum ReadWriteOpenDisposition {
     ReservedEmpty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadWriteOpenPolicy {
+    disposition: ReadWriteOpenDisposition,
+    expected_identity: Option<FileIdentity>,
+    finish_namespace_bootstrap: bool,
+}
+
 /// Pager-open intent used by the SQL connection layer while it retains the
 /// native namespace bootstrap lease through its higher-level initialization.
 ///
@@ -5808,10 +5815,12 @@ where
                     vfs,
                     path,
                     requested_page_size,
-                    None,
                     page_buffer_max,
-                    ReadWriteOpenDisposition::CreateIfMissing,
-                    false,
+                    ReadWriteOpenPolicy {
+                        disposition: ReadWriteOpenDisposition::CreateIfMissing,
+                        expected_identity: None,
+                        finish_namespace_bootstrap: false,
+                    },
                 )
             }
             ConnectionPagerOpenMode::ExistingOnly(expected_identity) => {
@@ -5820,10 +5829,12 @@ where
                     vfs,
                     path,
                     requested_page_size,
-                    expected_identity,
                     page_buffer_max,
-                    ReadWriteOpenDisposition::ExistingOnly,
-                    false,
+                    ReadWriteOpenPolicy {
+                        disposition: ReadWriteOpenDisposition::ExistingOnly,
+                        expected_identity,
+                        finish_namespace_bootstrap: false,
+                    },
                 )
             }
             ConnectionPagerOpenMode::ReservedEmpty(expected_identity) => {
@@ -5832,10 +5843,12 @@ where
                     vfs,
                     path,
                     requested_page_size,
-                    Some(expected_identity),
                     page_buffer_max,
-                    ReadWriteOpenDisposition::ReservedEmpty,
-                    false,
+                    ReadWriteOpenPolicy {
+                        disposition: ReadWriteOpenDisposition::ReservedEmpty,
+                        expected_identity: Some(expected_identity),
+                        finish_namespace_bootstrap: false,
+                    },
                 )
             }
             ConnectionPagerOpenMode::ReadOnly(expected_identity) => {
@@ -5891,10 +5904,12 @@ where
             vfs,
             path,
             requested_page_size,
-            None,
             page_buffer_max,
-            ReadWriteOpenDisposition::CreateIfMissing,
-            true,
+            ReadWriteOpenPolicy {
+                disposition: ReadWriteOpenDisposition::CreateIfMissing,
+                expected_identity: None,
+                finish_namespace_bootstrap: true,
+            },
         )
     }
 
@@ -5919,10 +5934,12 @@ where
             vfs,
             path,
             requested_page_size,
-            Some(expected_identity),
             page_buffer_max,
-            ReadWriteOpenDisposition::ReservedEmpty,
-            true,
+            ReadWriteOpenPolicy {
+                disposition: ReadWriteOpenDisposition::ReservedEmpty,
+                expected_identity: Some(expected_identity),
+                finish_namespace_bootstrap: true,
+            },
         )
     }
 
@@ -5948,10 +5965,12 @@ where
             vfs,
             path,
             requested_page_size,
-            expected_identity,
             page_buffer_max,
-            ReadWriteOpenDisposition::ExistingOnly,
-            true,
+            ReadWriteOpenPolicy {
+                disposition: ReadWriteOpenDisposition::ExistingOnly,
+                expected_identity,
+                finish_namespace_bootstrap: true,
+            },
         )
     }
 
@@ -5961,11 +5980,14 @@ where
         vfs: V,
         path: &Path,
         requested_page_size: PageSize,
-        expected_identity: Option<FileIdentity>,
         page_buffer_max: Option<usize>,
-        disposition: ReadWriteOpenDisposition,
-        finish_namespace_bootstrap: bool,
+        policy: ReadWriteOpenPolicy,
     ) -> Result<Self> {
+        let ReadWriteOpenPolicy {
+            disposition,
+            expected_identity,
+            finish_namespace_bootstrap,
+        } = policy;
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
         #[cfg(all(feature = "native", any(unix, windows)))]
