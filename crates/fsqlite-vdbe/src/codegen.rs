@@ -5382,7 +5382,7 @@ fn codegen_select_count_star(
         && let Some(values) = extract_rowid_in_list_target(where_clause, table, table_alias)
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, out_regs, done_label, end_label, &values,
+            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &values, None, false,
         );
         return Ok(());
     }
@@ -5397,13 +5397,34 @@ fn codegen_select_count_star(
         && let Expr::Literal(Literal::Integer(value), _) = target
     {
         codegen_select_count_star_rowid_in(
-            b,
-            cursor,
-            table,
-            out_regs,
-            done_label,
-            end_label,
-            &[*value],
+            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &[*value], None, false,
+        );
+        return Ok(());
+    }
+    // bd-count-rowid-in-residual: `COUNT(*) WHERE <rowid> IN (<ints>) AND <residual>` — SeekRowid per value,
+    // re-applying the full WHERE per hit. Reached only when no `simple_count_star` diverter matched (a
+    // residual on an indexed column routes to the aggregate seek instead; the rowid IN itself has no index
+    // so `index_integer_in_list_residual_target` never diverts it).
+    if !table.without_rowid
+        && let Some((values, true)) =
+            extract_rowid_in_list_residual_target(where_clause, table, table_alias)
+    {
+        codegen_select_count_star_rowid_in(
+            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &values, where_clause,
+            true,
+        );
+        return Ok(());
+    }
+    // bd-count-rowid-eq-residual: `COUNT(*) WHERE <rowid> = <int> AND <residual>` — one SeekRowid + residual.
+    // `extract_rowid_eq_residual_target` returns the const only when `rowid = const` is a conjunct alongside
+    // others (declines the bare eq, handled above). Integer literal only.
+    if !table.without_rowid
+        && let Some(target) = extract_rowid_eq_residual_target(where_clause, table, table_alias)
+        && let Expr::Literal(Literal::Integer(value), _) = target
+    {
+        codegen_select_count_star_rowid_in(
+            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &[*value], where_clause,
+            true,
         );
         return Ok(());
     }
@@ -5550,17 +5571,26 @@ fn codegen_select_count_star(
     Ok(())
 }
 
-/// `SELECT COUNT(*) FROM t WHERE <rowid> IN (<int literals>)`: one `SeekRowid` per listed value, counting
-/// the hits, instead of a full scan. `values` are sorted+deduped, so each existing row is counted once.
-/// bd-count-rowid-in.
+/// `SELECT COUNT(*) FROM t WHERE <rowid> IN (<int literals>) [AND <residual>]` / `<rowid> = <int> [AND
+/// <residual>]`: one `SeekRowid` per listed value, counting the hits, instead of a full scan. `values`
+/// are sorted+deduped, so each existing row is counted once. When `residual_filter` is true, the full
+/// `where_clause` is re-applied after each hit (a miss skips to the next value), so a rowid seek that
+/// coexists with a predicate it cannot enforce still counts exactly; the residual's `?` placeholders
+/// re-number to the same base each iteration. `false` (bare IN/eq) emits no filter → byte-identical.
+/// bd-count-rowid-in / bd-count-rowid-eq (+ -residual).
+#[allow(clippy::too_many_arguments)]
 fn codegen_select_count_star_rowid_in(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
     out_regs: i32,
     done_label: crate::Label,
     end_label: crate::Label,
     values: &[i64],
+    where_clause: Option<&Expr>,
+    residual_filter: bool,
 ) {
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
@@ -5574,6 +5604,9 @@ fn codegen_select_count_star_rowid_in(
     );
     b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
     let rowid_reg = b.alloc_reg();
+    // Residual `?` placeholders re-number to this base each iteration (the IN values are integer literals,
+    // so nothing before the filter consumes a placeholder). Read even when there is no residual.
+    let where_placeholder_base = b.current_anon_placeholder();
     for &value in values {
         let skip_label = b.emit_label();
         b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
@@ -5585,6 +5618,12 @@ fn codegen_select_count_star_rowid_in(
             P4::None,
             0,
         );
+        if residual_filter
+            && let Some(where_expr) = where_clause
+        {
+            b.set_next_anon_placeholder(where_placeholder_base);
+            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        }
         b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
         b.resolve_label(skip_label);
     }
