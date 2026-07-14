@@ -5374,6 +5374,17 @@ fn codegen_select_count_star(
             in_target,
         );
     }
+    // bd-count-rowid-in: `COUNT(*) WHERE <rowid> IN (<int literals>)` counts existing rows with one
+    // SeekRowid per listed value instead of a full scan. Bare rowid IN only (`extract_rowid_in_list_target`
+    // requires the whole WHERE be the IN); a residual falls through to the scan below. The rowid slice is
+    // sorted+deduped, so each hit is counted at most once.
+    if !table.without_rowid
+        && let Some(values) = extract_rowid_in_list_target(where_clause, table, table_alias)
+    {
+        return codegen_select_count_star_rowid_in(
+            b, cursor, table, out_regs, done_label, end_label, &values,
+        );
+    }
 
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
@@ -5509,6 +5520,45 @@ fn codegen_select_count_star(
     let loop_body = loop_top as i32;
     b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
 
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// `SELECT COUNT(*) FROM t WHERE <rowid> IN (<int literals>)`: one `SeekRowid` per listed value, counting
+/// the hits, instead of a full scan. `values` are sorted+deduped, so each existing row is counted once.
+/// bd-count-rowid-in.
+fn codegen_select_count_star_rowid_in(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    out_regs: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    values: &[i64],
+) -> Result<(), CodegenError> {
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+    let rowid_reg = b.alloc_reg();
+    for &value in values {
+        let skip_label = b.emit_label();
+        b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+        b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+        b.resolve_label(skip_label);
+    }
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
