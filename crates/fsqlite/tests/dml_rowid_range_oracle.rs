@@ -69,10 +69,15 @@ fn assert_range_plan(c: &Connection, sql: &str, expected_range_ops: Option<(&str
     assert_eq!(op_count(&ops, "RowSetRead"), 1, "plan: {ops:?}");
     assert_eq!(op_count(&ops, "RowSetAdd"), 1, "plan: {ops:?}");
     assert_eq!(op_count(&ops, "Next"), 1, "plan: {ops:?}");
+
+    let rowset_read = ops
+        .iter()
+        .position(|op| op == "RowSetRead")
+        .expect("the exact RowSetRead count was checked above");
     assert_eq!(
-        op_count(&ops, "SeekRowid"),
-        1,
-        "Pass 2 must contain exactly one static rowid seek: {ops:?}"
+        ops.get(rowset_read + 1).map(String::as_str),
+        Some("SeekRowid"),
+        "Pass 2 must reseek each collected rowid immediately after RowSetRead: {ops:?}"
     );
 
     if let Some((lower_seek, upper_stop)) = expected_range_ops {
@@ -239,13 +244,15 @@ fn dml_rowid_range_matches_sqlite() {
     ); // empty range -> no-op
 
     // Controls: UPPER-ONLY ranges (no lower bound to seek to) decline to the Rewind walk this cut, as do
-    // a non-rowid range, a residual conjunction, parameter bounds, and unary-negative bounds.
+    // a non-rowid range, an unindexed residual conjunction, parameter bounds, and unary-negative
+    // bounds. Use `a` for the residual control: `c` has an index and is intentionally eligible for
+    // the independent indexed-equality DML lane.
     check("DELETE FROM t WHERE id < 20", None); // upper-only -> Rewind
     check("DELETE FROM t WHERE id <= 3", None); // upper-only
     check("DELETE FROM t WHERE a BETWEEN 5 AND 10", None); // a is not the rowid
-    check("DELETE FROM t WHERE id BETWEEN 50 AND 100 AND c = 5", None); // residual -> not bare range
+    check("DELETE FROM t WHERE id BETWEEN 50 AND 100 AND a = 5", None); // residual -> not bare range
     check(
-        "UPDATE t SET x = 'c' WHERE id BETWEEN 50 AND 100 AND c = 5",
+        "UPDATE t SET x = 'c' WHERE id BETWEEN 50 AND 100 AND a = 5",
         None,
     );
     check("UPDATE t SET x = 'neg' WHERE id > -2", None); // unary-negative lower bound

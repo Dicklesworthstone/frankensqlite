@@ -115,7 +115,9 @@ fn dml_rowid_eq_residual_matches_sqlite() {
         true,
     ); // range residual
     check("UPDATE t SET id = id + 5000 WHERE id = 60 AND c = 0", true); // ROWID rewrite + residual
-    // Controls: a non-rowid eq must still full-scan (Rewind), and stay correct.
-    check("DELETE FROM t WHERE a = 5 AND c = 1", false); // a is not the rowid
-    check("UPDATE t SET x = 'c' WHERE a = 5 AND c = 1", false);
+    // Controls: predicates over two unindexed, non-rowid columns must still
+    // full-scan (Rewind), and stay correct. `c` is deliberately excluded here
+    // because it has an index and belongs to the indexed-equality DML lane.
+    check("DELETE FROM t WHERE a = 5 AND x = 'v1'", false);
+    check("UPDATE t SET x = 'c' WHERE a = 5 AND x = 'v1'", false);
 }
