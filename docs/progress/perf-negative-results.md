@@ -19064,3 +19064,44 @@ test is on the executed path, not merely linked into it.
   both larger streams regressed. Do not retry result-matching plus `set_reg_int` for `Opcode::Add`
   as a standalone lever. Reconsider only if arithmetic representation changes eliminate construction
   of the intermediate `SqliteValue` itself; gate that different design at all three stream sizes.
+
+## 2026-07-13 - WIN: single-register `Opcode::Copy` writes integer payload in place
+
+- Target: the existing `vdbe_pipeline_execute_copy/{64,256,1024}` benchmark, whose stable integer
+  source is repeatedly copied into one pre-sized destination. The May 25 rejection removed the Copy
+  hot-dispatch arm; this distinct lever retains both dispatch paths and specializes only the
+  single-register body. Opportunity score before implementation was 12
+  (`impact 3 * confidence 4 / effort 1`).
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` materializes the source MakeRecord sideband first,
+  then copies an integer payload by value through `set_reg_int` without constructing or cloning an
+  intermediate `SqliteValue`. Non-integer sources and invalid or growing destinations retain the
+  original clone plus `set_reg_fast` path. `SCopy`, `IntCopy`, and multi-register Copy are unchanged.
+  The focused strict-remote Copy family passed `4/4`, covering the new same-variant integer write,
+  destination subtype clearing, self-copy, growing-destination fallback, MakeRecord materialization,
+  overlapping range snapshots, and heap-carrying Text values.
+- Same-worker reverse-control proof on actual remote worker `vmi1152480`, from base commit
+  `2481847f`. Candidate and manually restored base used the same compiler/profile and identical Cargo
+  payload except for build parallelism (`-j3` candidate, `-j6` restored base), which does not affect
+  the optimized benchmark binary:
+  `cargo bench --config 'profile.release-perf.lto=false' --config
+  'profile.release-perf.codegen-units=16' --profile release-perf -p fsqlite-vdbe --bench
+  pipeline_stages -- '^vdbe_pipeline_execute_copy/' --warm-up-time 0.5 --measurement-time 2
+  --sample-size 30 --noplot`, under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`.
+  The reverse run measured candidate -> restored base, so positive Criterion changes are the cost of
+  removing the specialization:
+  - 64 ops: `805.45 ns` -> `1.0637 us` (restored base 34.8% slower); Criterion change
+    `[+26.159%, +34.803%, +43.063%]`, `p = 0.00`.
+  - 256 ops: `3.1007 us` -> `4.1848 us` (restored base 22.2% slower); Criterion change
+    `[+9.1422%, +22.235%, +35.971%]`, `p = 0.00`.
+  - 1024 ops: `10.781 us` -> `17.592 us` (restored base 48.7% slower); Criterion change
+    `[+36.428%, +48.676%, +59.308%]`, `p = 0.00`.
+  The first baseline was intentionally excluded from the shipping comparison because it ran amid
+  heavier worker slot contention and had broad intervals. Frozen evidence is at
+  `/data/tmp/frankensqlite-copy-intstore-baseline-vmi1152480-2481847f`,
+  `/data/tmp/frankensqlite-copy-intstore-candidate-vmi1152480-2481847f`, and
+  `/data/tmp/frankensqlite-copy-intstore-base-control-vmi1152480-2481847f`.
+- Result: KEEP. The restored base regressed significantly at every measured size despite receiving
+  the larger build-slot reservation, and every reverse-control confidence interval excludes zero.
+  Revisit only if register representation or Copy sideband semantics change; preserve materialization
+  before source inspection and the generic fallback for non-integer or growing destinations.

@@ -12797,8 +12797,7 @@ impl VdbeEngine {
             // copies while leaving the single-reg case a straight line.
             Opcode::Copy => {
                 if op.p3 == 0 {
-                    let value = self.clone_reg_materialized(op.p1);
-                    self.set_reg_fast(op.p2, value);
+                    self.copy_single_reg(op.p1, op.p2);
                 } else {
                     self.copy_reg_range(op.p1, op.p2, op.p3);
                 }
@@ -14155,6 +14154,25 @@ impl VdbeEngine {
         }
     }
 
+    /// Copy one register while avoiding an intermediate enum for the common
+    /// integer-to-pre-sized-register case.
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
+    fn copy_single_reg(&mut self, src: i32, dst: i32) {
+        self.materialize_make_record_sideband(src);
+
+        let dst_is_pre_sized = usize::try_from(dst)
+            .is_ok_and(|idx| u16::try_from(idx).is_ok() && idx < self.registers.len());
+        if dst_is_pre_sized && let SqliteValue::Integer(value) = self.get_reg(src) {
+            let value = *value;
+            self.set_reg_int(dst, value);
+            return;
+        }
+
+        let value = self.get_reg(src).clone();
+        self.set_reg_fast(dst, value);
+    }
+
     #[inline]
     fn copy_reg_range(&mut self, src_start: i32, dst_start: i32, additional: i32) {
         let Ok(additional) = usize::try_from(additional) else {
@@ -14165,8 +14183,7 @@ impl VdbeEngine {
         };
 
         if count == 1 {
-            let value = self.clone_reg_materialized(src_start);
-            self.set_reg_fast(dst_start, value);
+            self.copy_single_reg(src_start, dst_start);
             return;
         }
 
@@ -23139,6 +23156,27 @@ mod tests {
         });
         assert_eq!(rows[0], vec![SqliteValue::Text("copy_me".into())]);
         assert_eq!(rows[1], vec![SqliteValue::Text("copy_me".into())]);
+    }
+
+    #[test]
+    fn test_copy_integer_updates_payload_and_preserves_write_bookkeeping() {
+        let mut engine = VdbeEngine::new(4);
+        engine.set_reg(1, SqliteValue::Integer(41));
+        engine.set_reg(2, SqliteValue::Integer(7));
+        engine.set_register_subtype(2, 74);
+
+        engine.copy_single_reg(1, 2);
+        assert_eq!(engine.get_reg(2), &SqliteValue::Integer(41));
+        assert!(engine.register_subtype(2).is_none());
+
+        engine.set_register_subtype(1, 74);
+        engine.copy_single_reg(1, 1);
+        assert_eq!(engine.get_reg(1), &SqliteValue::Integer(41));
+        assert!(engine.register_subtype(1).is_none());
+
+        let growing_dst = i32::try_from(engine.registers.len()).expect("small register file");
+        engine.copy_single_reg(1, growing_dst);
+        assert_eq!(engine.get_reg(growing_dst), &SqliteValue::Integer(41));
     }
 
     #[test]
