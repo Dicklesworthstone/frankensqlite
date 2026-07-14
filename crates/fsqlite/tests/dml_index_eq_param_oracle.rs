@@ -142,3 +142,56 @@ fn dml_index_eq_param_text_matches_sqlite() {
     check_text(" COLLATE NOCASE", "DELETE FROM ut WHERE name = ?1", &[SqliteValue::Text("N5".into())], false);
     check_text(" COLLATE NOCASE", "DELETE FROM ut WHERE name = ?1", &[SqliteValue::Integer(5)], false);
 }
+
+// REAL ('E') and NUMERIC ('C') affinity indexed columns.
+fn fresh_num() -> (Connection, rusqlite::Connection) {
+    let f = Connection::open(":memory:").unwrap(); let r = rusqlite::Connection::open_in_memory().unwrap();
+    for s in [
+        "CREATE TABLE nt (id INTEGER PRIMARY KEY, amt REAL, qty NUMERIC, a INTEGER);",
+        "CREATE INDEX idx_amt ON nt(amt);", "CREATE INDEX idx_qty ON nt(qty);",
+    ] { f.execute(s).unwrap(); r.execute_batch(s).unwrap(); }
+    for i in 1..=200_i64 {
+        let amt = format!("{}.{}", i % 10, if i % 2 == 0 { 0 } else { 5 }); // '0.0','1.5',... incl. whole reals
+        let s = format!("INSERT INTO nt VALUES ({i}, {amt}, {}, {});", i % 15, i % 7);
+        f.execute(&s).unwrap(); r.execute_batch(&s).unwrap();
+    }
+    (f, r)
+}
+fn nt_state_f(c: &Connection) -> Vec<Vec<String>> {
+    let mut r: Vec<Vec<String>> = c.query("SELECT id, amt, qty, a FROM nt").unwrap().iter().map(|row| row.values().iter().map(render).collect()).collect();
+    r.sort(); r
+}
+fn nt_state_r(c: &rusqlite::Connection) -> Vec<Vec<String>> {
+    let mut stmt = c.prepare("SELECT id, amt, qty, a FROM nt").unwrap();
+    let mut r: Vec<Vec<String>> = stmt.query_map([], |row| {
+        Ok((0..4).map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+            rusqlite::types::Value::Null => "NULL".to_owned(), rusqlite::types::Value::Integer(x) => x.to_string(),
+            rusqlite::types::Value::Real(f) => format!("{f:?}"), rusqlite::types::Value::Text(s) => format!("'{s}'"),
+            rusqlite::types::Value::Blob(b) => format!("X'{}'", b.iter().map(|x| format!("{x:02X}")).collect::<String>()),
+        }).collect::<Vec<_>>())
+    }).unwrap().map(Result::unwrap).collect();
+    r.sort(); r
+}
+fn check_num(dml: &str, params: &[SqliteValue], no_rewind: bool) {
+    let (f, r) = fresh_num();
+    if no_rewind { assert!(!has_op(&f, dml, "Rewind"), "numeric index-eq must not full-scan: `{dml}`"); }
+    f.execute_with_params(dml, params).unwrap_or_else(|e| panic!("frank `{dml}`: {e}"));
+    let rparams: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
+    r.execute(dml, rusqlite::params_from_iter(rparams.iter())).unwrap();
+    assert_eq!(nt_state_f(&f), nt_state_r(&r), "state diverged after `{dml}` params {params:?}");
+}
+#[test]
+fn dml_index_eq_param_numeric_matches_sqlite() {
+    // REAL ('E'): whole-number and fractional reals, plus int/text bounds coerced to REAL.
+    check_num("DELETE FROM nt WHERE amt = ?1", &[SqliteValue::Float(3.0)], true);   // real 3.0 (whole)
+    check_num("DELETE FROM nt WHERE amt = ?1", &[SqliteValue::Integer(3)], true);   // int 3 -> REAL 3.0
+    check_num("DELETE FROM nt WHERE amt = ?1", &[SqliteValue::Float(3.5)], true);   // fractional
+    check_num("DELETE FROM nt WHERE amt = ?1", &[SqliteValue::Text("3.0".into())], true); // text -> 3.0
+    check_num("DELETE FROM nt WHERE amt = ?1", &[SqliteValue::Float(99.9)], true);  // no match
+    check_num("DELETE FROM nt WHERE amt = ?1", &[SqliteValue::Null], true);         // NULL -> none
+    check_num("UPDATE nt SET a = a + 1 WHERE amt = ?1", &[SqliteValue::Float(2.0)], true);
+    // NUMERIC ('C'): whole numbers stored as integers.
+    check_num("DELETE FROM nt WHERE qty = ?1", &[SqliteValue::Integer(5)], true);   // int 5
+    check_num("DELETE FROM nt WHERE qty = ?1", &[SqliteValue::Float(5.0)], true);   // real 5.0 -> NUMERIC 5
+    check_num("DELETE FROM nt WHERE qty = ?1 AND a > ?2", &[SqliteValue::Integer(3), SqliteValue::Integer(2)], true); // + residual
+}

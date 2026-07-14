@@ -18647,11 +18647,10 @@ fn index_eq_seek_target<'a, 't>(
         return None;
     }
     let col_idx = table.column_index(&col_name)?;
-    // INTEGER ('D') or TEXT ('B') affinity: the collect coerces the probe to this affinity so a
-    // runtime-typed bound seeks like the affinity-applying full-scan filter. (Numeric 'C'/'E' would work
-    // the same way but are deferred until oracled.)
+    // INTEGER ('D'), NUMERIC ('C'), REAL ('E'), or BINARY-TEXT ('B') affinity: the collect coerces the
+    // probe to this affinity so a runtime-typed bound seeks like the affinity-applying full-scan filter.
     let affinity = table.columns.get(col_idx)?.affinity;
-    if !matches!(affinity, 'D' | 'B') {
+    if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
         return None;
     }
     let idx = table.indexes.iter().find(|idx| {
@@ -18714,7 +18713,8 @@ fn emit_index_eq_rowset_collect(
     idx_read_cursor: i32,
     idx_schema: &IndexSchema,
     target_expr: &Expr,
-    // The indexed column's affinity ('D' integer or 'B' text) — coerced onto a runtime-typed probe.
+    // The indexed column's affinity ('D' integer / 'C' numeric / 'E' real / 'B' binary-text) — coerced
+    // onto a runtime-typed probe so it seeks like the affinity-applying comparison would.
     affinity: char,
     rowset_reg: i32,
     rowid_reg: i32,
