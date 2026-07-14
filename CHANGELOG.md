@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.16] -- 2026-07-13 (UPSERT page-retirement corruption fix and complete workspace release)
+## [0.1.16] -- 2026-07-13 (corruption fixes and namespace-generation hardening)
 
 Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
 two low-level helper APIs now expose failure explicitly instead of fabricating
@@ -124,6 +124,16 @@ lossy values.
 - Write-existing VFS opens are strictly non-creating, and open handles expose a
   stable file identity so pager/runtime layers can distinguish backing files
   without weakening create-vs-open semantics.
+- Native Unix and Windows file-backed connections now bind one stable absolute
+  database path to one descriptor-derived file identity for the full pager
+  lifetime. Persistent gate/use lock sidecars serialize namespace generations;
+  new and caller-reserved empty databases retain exclusive admission through
+  pager, schema, journal, and WAL bootstrap before becoming joinable. Existing
+  peers must open the recorded identity without `CREATE`, while pathname
+  replacement, identity drift, or unexpected reserved-bootstrap companions fail
+  before recovery or mutation. The protocol deliberately assumes a trusted
+  parent directory and cooperating FrankenSQLite processes; raw external
+  unlink/rename and hard-link aliases remain outside its advisory-lock boundary.
 
 ### Security
 

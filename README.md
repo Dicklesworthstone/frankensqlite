@@ -176,6 +176,25 @@ This README describes the target end-state architecture. The runnable code today
 - Extensions: extension crates are present and feature-gated in the workspace/public API crate, but extension virtual table/function wiring is still in progress.
 - Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` are wired into default runtime execution. Remaining work focuses on removing residual fallback paths, closing opcode/behavior gaps, and finishing parity/certification tracks.
 
+### Native File Namespace Safety
+
+On native Unix and Windows file VFSes, each live file-backed connection binds a
+single stable absolute database path to the identity obtained from its opened
+main-file descriptor. Persistent `-fsqlite-ns-gate` and `-fsqlite-ns-use`
+sidecars serialize admission to that namespace; they are never unlinked because
+unlinking a locked sidecar would split the advisory-lock domain on Unix. A new
+or caller-reserved empty database retains exclusive admission through pager,
+schema, rollback-journal, and WAL initialization. Only the successfully
+initialized `Connection` boundary publishes that generation for shared use.
+
+Connections joining an existing generation omit `CREATE` and must open the
+recorded file identity before inspecting recovery companions. Path replacement,
+identity drift, and unexpected reserved-bootstrap companions therefore fail
+before recovery or mutation. This is a cooperative trusted-parent protocol:
+native processes that bypass FrankenSQLite can ignore advisory locks, Unix can
+unlink or rename an open file, and the same database must not be opened through
+multiple hard-link aliases.
+
 ---
 
 ## Transaction Lifecycle Introspection (bd-t6sv2.5)
