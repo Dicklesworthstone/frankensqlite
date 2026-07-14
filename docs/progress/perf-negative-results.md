@@ -18998,3 +18998,35 @@ test is on the executed path, not merely linked into it.
   interval excludes zero. Revisit only if integer register representation gains reusable storage or
   new logical-write metadata; preserve the cross-variant replacement path and extend `set_reg_int`
   bookkeeping first.
+
+## 2026-07-13 - WIN: `set_reg_real` mutates an existing float payload in place
+
+- Target: the existing `vdbe_pipeline_execute_real/{64,256,1024}` dispatch benchmark, whose stable
+  target register receives repeated `P4::Real(42.75)` writes. The May 24 rejected experiment removed
+  `Opcode::Real` from the hot dispatcher; this distinct lever retains both dispatch arms and specializes
+  only the physical register write.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` routes both `Opcode::Real` arms through a dedicated
+  `set_reg_real`. Finite Float-to-Float writes update the existing `f64` payload; NaN still normalizes to
+  NULL, invalid/growing-register behavior is unchanged, and MakeRecord-sideband invalidation plus
+  subtype clearing still run before the physical write. Null/Integer/Text/Blob registers retain the
+  original replacement path, so reusable Text/Blob storage still returns to the pool. The focused
+  strict-remote oracle passed `1/1` and proves two distinct finite values, exact negative-zero bits,
+  stale-subtype clearing, and NaN-to-NULL normalization. Ordering and tie-breaking are unchanged; finite
+  floating-point bits are assigned exactly; RNG behavior is not involved.
+- Same-worker foreground bench on actual remote worker `vmi1156319`, with base and candidate both
+  cold-built from base commit `c74fb3d3`. Both used
+  `cargo bench --config 'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_real/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`
+  under `RCH_REQUIRE_REMOTE=1 ... rch --no-self-healing exec --`:
+  - 64 ops: `1.1507 us` -> `794.86 ns` point estimate (30.9% lower); Criterion change
+    `[-34.472%, -31.062%, -27.356%]`, `p = 0.00`.
+  - 256 ops: `4.4006 us` -> `3.1112 us` (29.3% lower); Criterion change
+    `[-35.356%, -31.440%, -27.543%]`, `p = 0.00`.
+  - 1024 ops: `16.026 us` -> `12.121 us` (24.4% lower); Criterion change
+    `[-26.507%, -22.694%, -19.029%]`, `p = 0.00`.
+  Frozen Criterion evidence is at
+  `/data/tmp/frankensqlite-real-inplace-baseline-vmi1156319-c74fb3d3` and
+  `/data/tmp/frankensqlite-real-inplace-candidate-vmi1156319-c74fb3d3`.
+- Result: KEEP. Every measured size improved significantly on the same worker and every confidence
+  interval excludes zero. Revisit only if Float representation gains reusable storage or new
+  logical-write metadata; preserve NaN normalization and the cross-variant replacement path when
+  extending `set_reg_real`.

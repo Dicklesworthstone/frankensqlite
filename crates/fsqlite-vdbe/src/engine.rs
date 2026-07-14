@@ -8071,7 +8071,7 @@ impl VdbeEngine {
                         P4::Real(v) => *v,
                         _ => 0.0,
                     };
-                    self.set_reg_fast(op.p2, SqliteValue::Float(val));
+                    self.set_reg_real(op.p2, val);
                     pc += 1;
                 }
 
@@ -13200,7 +13200,7 @@ impl VdbeEngine {
                     P4::Real(v) => *v,
                     _ => 0.0,
                 };
-                self.set_reg_fast(op.p2, SqliteValue::Float(val));
+                self.set_reg_real(op.p2, val);
                 *pc += 1;
                 Ok(true)
             }
@@ -14376,6 +14376,31 @@ impl VdbeEngine {
             } else {
                 self.replace_register_value(idx, SqliteValue::Integer(val));
             }
+        }
+    }
+
+    /// Float-specialized register write with NaN -> Null normalization.
+    ///
+    /// Repeated real constants can update the existing payload directly, while
+    /// cross-variant writes retain the buffer-return behavior of replacement.
+    #[inline(always)]
+    #[allow(clippy::inline_always, clippy::cast_sign_loss)]
+    fn set_reg_real(&mut self, r: i32, val: f64) {
+        if !(0..=65535).contains(&r) {
+            return;
+        }
+        let idx = r as usize;
+        if idx >= self.registers.len() {
+            self.registers.resize(idx + 1, SqliteValue::Null);
+        }
+        self.invalidate_make_record_sideband_if_overwritten(r);
+        self.clear_register_subtype(r);
+        if val.is_nan() {
+            self.replace_register_value(idx, SqliteValue::Null);
+        } else if let SqliteValue::Float(current) = &mut self.registers[idx] {
+            *current = val;
+        } else {
+            self.replace_register_value(idx, SqliteValue::Float(val));
         }
     }
 
@@ -19924,6 +19949,28 @@ mod tests {
             "an in-place integer write must clear stale subtype metadata"
         );
         assert_eq!(engine.take_reg(1), SqliteValue::Integer(9_876_543_210));
+        assert_eq!(engine.get_reg(1), &SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_register_value_f64_store_and_retrieve() {
+        let mut engine = VdbeEngine::new(2);
+        engine.set_reg_real(1, 1.25);
+
+        assert_eq!(engine.get_reg(1), &SqliteValue::Float(1.25));
+        engine.set_register_subtype(1, 74);
+        engine.set_reg_real(1, -0.0);
+
+        let SqliteValue::Float(value) = engine.get_reg(1) else {
+            panic!("register should contain a float");
+        };
+        assert_eq!(value.to_bits(), (-0.0_f64).to_bits());
+        assert!(
+            engine.register_subtype(1).is_none(),
+            "an in-place real write must clear stale subtype metadata"
+        );
+
+        engine.set_reg_real(1, f64::NAN);
         assert_eq!(engine.get_reg(1), &SqliteValue::Null);
     }
 
