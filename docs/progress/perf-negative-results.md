@@ -18964,3 +18964,37 @@ test is on the executed path, not merely linked into it.
 - Result: KEEP. Every measured size improved significantly on the same worker, and every confidence
   interval excludes zero. Revisit only if NULL gains reusable physical storage or new logical-write
   metadata; extend `set_reg_null` first in that case.
+
+## 2026-07-13 - WIN: `set_reg_int` mutates an existing integer payload in place
+
+- Target: the existing `vdbe_pipeline_execute_integer/{64,256,1024}` dispatch benchmark, whose stable
+  target register receives a changing stream of integer immediates. The May 25 rejected experiment
+  removed `Opcode::Integer` from the hot dispatcher; this distinct lever retains both dispatch arms and
+  specializes only the physical register write.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` updates the `i64` payload directly when `set_reg_int`
+  finds an existing `SqliteValue::Integer`. MakeRecord-sideband invalidation and subtype clearing still
+  run before the branch. Null/Float/Text/Blob registers retain the original `replace_register_value`
+  path, so reusable Text/Blob storage is still returned to the pool. A focused oracle performs two
+  different integer writes and proves the second value is visible and stale subtype metadata is
+  cleared; its strict-remote test passed `1/1`. Ordering, tie, floating-point, and RNG behavior are not
+  involved.
+- Same-worker foreground bench on actual remote worker `vmi1227854`, with base and candidate both
+  cold-built from base commit `42b08fc7`. Both used
+  `cargo bench --config 'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile release-perf -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_integer/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`
+  under `RCH_REQUIRE_REMOTE=1 ... rch --no-self-healing exec --`; baseline build parallelism was `-j3`
+  and the candidate used `-j1` to secure the same busy worker, which does not change the resulting
+  optimized benchmark binary. An earlier candidate admission selected `vmi1149989` and was cancelled
+  before remote execution, so it contributed no timing evidence.
+  - 64 ops: `500.03 ns` -> `407.94 ns` point estimate (18.4% lower); Criterion change
+    `[-17.955%, -14.334%, -9.9987%]`, `p = 0.00`.
+  - 256 ops: `1.9061 us` -> `1.4074 us` (26.2% lower); Criterion change
+    `[-26.294%, -22.282%, -18.095%]`, `p = 0.00`.
+  - 1024 ops: `7.2231 us` -> `5.5188 us` (23.6% lower); Criterion change
+    `[-18.427%, -14.082%, -8.6289%]`, `p = 0.00`.
+  Frozen Criterion evidence is at
+  `/data/tmp/frankensqlite-integer-inplace-baseline-vmi1227854-42b08fc7` and
+  `/data/tmp/frankensqlite-integer-inplace-candidate-vmi1227854-42b08fc7`.
+- Result: KEEP. Every measured size improved significantly on the same worker and every confidence
+  interval excludes zero. Revisit only if integer register representation gains reusable storage or
+  new logical-write metadata; preserve the cross-variant replacement path and extend `set_reg_int`
+  bookkeeping first.

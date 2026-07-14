@@ -14371,7 +14371,11 @@ impl VdbeEngine {
         if idx < self.registers.len() {
             self.invalidate_make_record_sideband_if_overwritten(r);
             self.clear_register_subtype(r);
-            self.replace_register_value(idx, SqliteValue::Integer(val));
+            if let SqliteValue::Integer(current) = &mut self.registers[idx] {
+                *current = val;
+            } else {
+                self.replace_register_value(idx, SqliteValue::Integer(val));
+            }
         }
     }
 
@@ -19911,7 +19915,15 @@ mod tests {
         engine.set_reg_int(1, -9_876_543_210);
 
         assert_eq!(engine.get_reg(1), &SqliteValue::Integer(-9_876_543_210));
-        assert_eq!(engine.take_reg(1), SqliteValue::Integer(-9_876_543_210));
+        engine.set_register_subtype(1, 74);
+        engine.set_reg_int(1, 9_876_543_210);
+
+        assert_eq!(engine.get_reg(1), &SqliteValue::Integer(9_876_543_210));
+        assert!(
+            engine.register_subtype(1).is_none(),
+            "an in-place integer write must clear stale subtype metadata"
+        );
+        assert_eq!(engine.take_reg(1), SqliteValue::Integer(9_876_543_210));
         assert_eq!(engine.get_reg(1), &SqliteValue::Null);
     }
 
