@@ -17515,7 +17515,11 @@ pub fn codegen_update(
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        index_eq_residual_seek_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
     } else {
         None
     };
@@ -17628,7 +17632,14 @@ pub fn codegen_update(
                     collect_done_label,
                 );
             }
-            b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::RowSetAdd,
+                rowset_reg,
+                matched_rowid_reg,
+                0,
+                P4::None,
+                0,
+            );
         } else if let Some((idx_schema, target, aff, has_residual)) = index_eq {
             // Fresh read cursor beyond the table + registered index-maintenance cursors. The probe and the
             // residual (if any) number from set_placeholder_count + 1, after the SET placeholders (Pass 2).
@@ -18597,9 +18608,7 @@ fn codegen_update_from(
 /// filter needed). bd-delete-rowid-range / bd-update-rowid-range.
 fn rowid_range_bounds_are_int_literals(range: &RowidRangeTarget<'_>) -> bool {
     let is_int = |bound: Option<RowidRangeBound<'_>>| {
-        bound.map_or(true, |b| {
-            matches!(b.expr, Expr::Literal(Literal::Integer(_), _))
-        })
+        bound.is_none_or(|b| matches!(b.expr, Expr::Literal(Literal::Integer(_), _)))
     };
     is_int(range.lower) && is_int(range.upper)
 }
@@ -18725,7 +18734,7 @@ fn index_eq_seek_target<'a, 't>(
     if affinity == 'B'
         && !idx
             .key_term_collation(0)
-            .map_or(true, |c| c.eq_ignore_ascii_case("BINARY"))
+            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
     {
         return None;
     }
@@ -19004,7 +19013,11 @@ pub fn codegen_delete(
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        index_eq_residual_seek_target(
+            stmt.where_clause.as_ref(),
+            table,
+            stmt.table.alias.as_deref(),
+        )
     } else {
         None
     };
