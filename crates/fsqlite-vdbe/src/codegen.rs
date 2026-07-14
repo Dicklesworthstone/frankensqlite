@@ -5401,6 +5401,18 @@ fn codegen_select_count_star(
         );
         return Ok(());
     }
+    // bd-count-rowid-eq-coerced: `COUNT(*) WHERE <rowid> = <non-integer-literal constant>` (a placeholder,
+    // real, or text constant) counts the single row via `MustBeInt` (INTEGER-affinity coerce: a non-exact
+    // integer — 2.5, 'abc', NULL — rejects to count 0, exactly as SQLite; '5' / 5.0 coerce to 5) then one
+    // SeekRowid, instead of a full scan. The integer-literal case is served above (no MustBeInt needed).
+    if !table.without_rowid
+        && let Some(target) = extract_rowid_target_expr(where_clause, Some(table), table_alias)
+    {
+        codegen_select_count_star_rowid_eq_coerced(
+            b, cursor, table, out_regs, done_label, end_label, target,
+        );
+        return Ok(());
+    }
     // bd-count-rowid-in-residual: `COUNT(*) WHERE <rowid> IN (<ints>) AND <residual>` — SeekRowid per value,
     // re-applying the full WHERE per hit. Reached only when no `simple_count_star` diverter matched (a
     // residual on an indexed column routes to the aggregate seek instead; the rowid IN itself has no index
@@ -5627,6 +5639,44 @@ fn codegen_select_count_star_rowid_in(
         b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
         b.resolve_label(skip_label);
     }
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+}
+
+/// `SELECT COUNT(*) FROM t WHERE <rowid> = <non-integer-literal constant>` (placeholder / real / text):
+/// `MustBeInt` coerces the bound value to INTEGER affinity — a non-exact integer (`2.5`, `'abc'`, NULL)
+/// rejects to `skip` (count stays 0, exactly as SQLite), while `'5'` / `5.0` coerce to `5` — then one
+/// `SeekRowid` counts the hit. bd-count-rowid-eq-coerced.
+fn codegen_select_count_star_rowid_eq_coerced(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    out_regs: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    target_expr: &Expr,
+) {
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+    let rowid_reg = b.alloc_reg();
+    let skip = b.emit_label();
+    emit_expr(b, target_expr, rowid_reg, None);
+    b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, skip, P4::None, 0);
+    b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip, P4::None, 0);
+    b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+    b.resolve_label(skip);
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
