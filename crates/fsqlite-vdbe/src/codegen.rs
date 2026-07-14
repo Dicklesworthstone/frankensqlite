@@ -17468,7 +17468,7 @@ pub fn codegen_update(
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_int_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        index_eq_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
     } else {
         None
     };
@@ -17577,16 +17577,16 @@ pub fn codegen_update(
                 );
             }
             b.emit_op(Opcode::RowSetAdd, rowset_reg, matched_rowid_reg, 0, P4::None, 0);
-        } else if let Some((idx_schema, value, has_residual)) = index_eq {
-            // Fresh read cursor beyond the table + registered index-maintenance cursors. The residual (if
-            // any) numbers from set_placeholder_count + 1, after the SET placeholders emitted in Pass 2.
+        } else if let Some((idx_schema, target, has_residual)) = index_eq {
+            // Fresh read cursor beyond the table + registered index-maintenance cursors. The probe and the
+            // residual (if any) number from set_placeholder_count + 1, after the SET placeholders (Pass 2).
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
             emit_index_eq_rowset_collect(
                 b,
                 idx_read_cursor,
                 idx_schema,
-                value,
+                target,
                 rowset_reg,
                 matched_rowid_reg,
                 table,
@@ -18629,20 +18629,22 @@ fn emit_rowid_range_rowset_collect(
     b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
 }
 
-/// `(index, value)` for a DELETE/UPDATE `WHERE <col> = <int literal>` that a single-column ASCENDING
-/// integer index can serve as an EXACT seek — so the seek is authoritative and no affinity full-scan
-/// fallback is needed. Bare eq only (`extract_column_eq_target` requires a top-level `col = <expr>`); a
-/// residual conjunction declines. The rowid case is handled earlier, and the IPK has no secondary index,
-/// so this never fires for it. bd-delete-index-eq / bd-update-index-eq.
-fn index_eq_int_seek_target<'t>(
-    where_clause: Option<&Expr>,
+/// `(index, target)` for a DELETE/UPDATE `WHERE <col> = <value>` served by a single-column ASCENDING
+/// INTEGER-affinity ('D') index. The value is a literal OR a placeholder (`is_simple_constant`): the
+/// collect coerces the probe to the column's affinity (`Opcode::Affinity`, like the index-range path) so
+/// a runtime-typed bound seeks identically to the full-scan filter — the seek is then authoritative with
+/// no affinity fallback. Bare eq only (`extract_column_eq_target` needs a top-level `col = <expr>`). The
+/// rowid case is handled earlier and the IPK has no secondary index, so this never fires for it.
+/// bd-delete-index-eq / bd-update-index-eq.
+fn index_eq_seek_target<'a, 't>(
+    where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
-) -> Option<(&'t IndexSchema, i64)> {
+) -> Option<(&'t IndexSchema, &'a Expr)> {
     let (col_name, target_expr) = extract_column_eq_target(where_clause, table, table_alias)?;
-    let Expr::Literal(Literal::Integer(value), _) = target_expr else {
+    if !is_simple_constant(target_expr) {
         return None;
-    };
+    }
     let col_idx = table.column_index(&col_name)?;
     if table.columns.get(col_idx)?.affinity != 'D' {
         return None;
@@ -18653,20 +18655,20 @@ fn index_eq_int_seek_target<'t>(
             && !idx.key_term_descending(0)
             && idx.columns.first().is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
     })?;
-    Some((idx, *value))
+    Some((idx, target_expr))
 }
 
-/// `(index, value, has_residual)` — like [`index_eq_int_seek_target`] but also admits the eq as a CONJUNCT
-/// alongside other predicates the index seek cannot enforce: `<col> = <int> AND <residual>`. The caller
+/// `(index, target, has_residual)` — like [`index_eq_seek_target`] but also admits the eq as a CONJUNCT
+/// alongside other predicates the index seek cannot enforce: `<col> = <value> AND <residual>`. The caller
 /// applies the full WHERE per candidate (via the table row) before adding it. `has_residual == false` is
 /// the bare eq. bd-delete-index-eq-residual / bd-update-index-eq-residual.
-fn index_eq_int_residual_seek_target<'t>(
-    where_clause: Option<&Expr>,
+fn index_eq_residual_seek_target<'a, 't>(
+    where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
     table_alias: Option<&str>,
-) -> Option<(&'t IndexSchema, i64, bool)> {
-    if let Some((idx, value)) = index_eq_int_seek_target(where_clause, table, table_alias) {
-        return Some((idx, value, false));
+) -> Option<(&'t IndexSchema, &'a Expr, bool)> {
+    if let Some((idx, target)) = index_eq_seek_target(where_clause, table, table_alias) {
+        return Some((idx, target, false));
     }
     let where_expr = where_clause?;
     let mut conjuncts = Vec::new();
@@ -18675,27 +18677,29 @@ fn index_eq_int_residual_seek_target<'t>(
         return None;
     }
     for term in conjuncts {
-        if let Some((idx, value)) = index_eq_int_seek_target(Some(term), table, table_alias) {
-            return Some((idx, value, true));
+        if let Some((idx, target)) = index_eq_seek_target(Some(term), table, table_alias) {
+            return Some((idx, target, true));
         }
     }
     None
 }
 
-/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <int literal> [AND
+/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <value> [AND
 /// <residual>]`: open a FRESH read cursor on the index (distinct from the table cursor and the registered
 /// index-maintenance cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run
-/// adding each rowid to the RowSet, then close the cursor. The exact integer seek is authoritative, so
-/// there is no affinity fallback. When `residual_filter` is true, each candidate is positioned on the
-/// table cursor and the full WHERE is applied before `RowSetAdd` (there is no covering decision in a DML
-/// collect — the table row is always read for the residual). Control falls through to `collect_done`
-/// (resolved by the caller). bd-delete-index-eq(-residual) / bd-update-index-eq(-residual).
+/// adding each rowid to the RowSet, then close the cursor. The probe is coerced to the column's 'D'
+/// affinity (`Opcode::Affinity`) when it is not already a numeric literal — so a runtime-typed placeholder
+/// bound seeks identically to the full-scan filter and the seek is authoritative (no affinity fallback).
+/// When `residual_filter` is true, each candidate is positioned on the table cursor and the full WHERE is
+/// applied before `RowSetAdd` (no covering decision in a DML collect — the row is always read). Control
+/// falls through to `collect_done` (resolved by the caller). bd-delete-index-eq(-residual) /
+/// bd-update-index-eq(-residual).
 #[allow(clippy::too_many_arguments)]
 fn emit_index_eq_rowset_collect(
     b: &mut ProgramBuilder,
     idx_read_cursor: i32,
     idx_schema: &IndexSchema,
-    target_value: i64,
+    target_expr: &Expr,
     rowset_reg: i32,
     rowid_reg: i32,
     table: &TableSchema,
@@ -18703,14 +18707,21 @@ fn emit_index_eq_rowset_collect(
     schema: &[TableSchema],
     table_cursor: i32,
     where_clause: Option<&Expr>,
-    // Reset target for the residual's anon placeholders (`current_anon_placeholder()` for DELETE,
-    // `set_placeholder_count + 1` for UPDATE). Ignored when `residual_filter` is false.
+    // Reset target for the probe's / residual's anon placeholders (`current_anon_placeholder()` for
+    // DELETE, `set_placeholder_count + 1` for UPDATE). The probe `col = ?` and the re-applied residual
+    // both number from this base.
     where_placeholder_base: u32,
     residual_filter: bool,
 ) {
     let probe_key_regs = b.alloc_regs(2);
     let min_rowid_reg = probe_key_regs + 1;
-    b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(target_value), 0);
+    // Emit the probe value, numbering an anon placeholder from the base, and coerce a runtime-typed bound
+    // to the column's INTEGER affinity so the seek positions like the affinity-applying comparison would.
+    b.set_next_anon_placeholder(where_placeholder_base);
+    emit_expr(b, target_expr, probe_key_regs, None);
+    if !bound_matches_affinity('D', target_expr) {
+        b.emit_op(Opcode::Affinity, probe_key_regs, 1, 0, P4::Affinity("D".to_owned()), 0);
+    }
     b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
     let probe_record_reg = b.alloc_reg();
     b.emit_op(Opcode::MakeRecord, probe_key_regs, 2, probe_record_reg, P4::None, 0);
@@ -18871,7 +18882,7 @@ pub fn codegen_delete(
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_int_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
+        index_eq_residual_seek_target(stmt.where_clause.as_ref(), table, stmt.table.alias.as_deref())
     } else {
         None
     };
@@ -18960,7 +18971,7 @@ pub fn codegen_delete(
             );
         }
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
-    } else if let Some((idx_schema, value, has_residual)) = index_eq {
+    } else if let Some((idx_schema, target, has_residual)) = index_eq {
         // Fresh read cursor beyond the table + registered index-maintenance cursors.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
@@ -18969,7 +18980,7 @@ pub fn codegen_delete(
             b,
             idx_read_cursor,
             idx_schema,
-            value,
+            target,
             rowset_reg,
             rowid_reg,
             table,

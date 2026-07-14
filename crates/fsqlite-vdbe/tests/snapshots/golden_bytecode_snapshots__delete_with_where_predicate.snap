@@ -5,43 +5,52 @@ expression: delete_where
 case: delete_with_where_predicate
 sql: DELETE FROM docs WHERE category_id = ?1 AND score < ?2
 status: ok
-registers: 8
+registers: 12
 bind_parameters: 2
 requires_attached_memdb: false
 requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     33    0                        0 
+0     Init             0     42    0                        0 
 1     Transaction      0     1     0                        0 
 2     OpenWrite        0     2     0     (tbl)docs          0 
 3     OpenWrite        1     10    0     (tbl)idx_docs_category  0 
 4     OpenWrite        2     11    0     (tbl)idx_docs_title  0 
 5     Null             0     1     0                        0 
-6     Rewind           0     19    0                        0 
-7     Column           0     1     3                        0 
-8     Variable         1     4     0                        0 
-9     IsNull           4     18    0                        0 
-10    Ne               4     18    3                        128
-11    Column           0     4     3                        0 
-12    Variable         2     4     0                        0 
-13    IsNull           4     18    0                        0 
-14    IsNull           3     18    0                        0 
-15    Ge               4     18    3                        128
-16    Rowid            0     2     0                        0 
-17    RowSetAdd        1     2     0                        0 
-18    Next             0     7     0                        0 
-19    RowSetRead       1     29    2                        0 
-20    SeekRowid        0     28    2                        0 
-21    Column           0     1     5                        0 
-22    Rowid            0     6     0                        0 
-23    IdxDelete        1     5     2     (tbl)idx_docs_category  0 
-24    Column           0     2     7                        0 
-25    Rowid            0     8     0                        0 
-26    IdxDelete        2     7     2     (tbl)idx_docs_title  0 
-27    Delete           0     0     0     (tbl)docs          1 
-28    Goto             0     19    0                        0 
-29    Close            0     0     0                        0 
-30    Close            1     0     0                        0 
-31    Close            2     0     0                        0 
-32    Halt             0     0     0                        0
+6     Variable         1     3     0                        0 
+7     Affinity         3     1     0     (aff)D             0 
+8     Int64            0     4     0     (i64)-9223372036854775808  0 
+9     MakeRecord       3     2     5                        0 
+10    OpenRead         3     10    0     (idx)idx_docs_category  0 
+11    SeekGE           3     27    5                        0 
+12    Column           3     0     6                        0 
+13    Ne               3     27    6                        16
+14    IdxRowid         3     2     0                        0 
+15    SeekRowid        0     26    2                        0 
+16    Column           0     1     7                        0 
+17    Variable         1     8     0                        0 
+18    IsNull           8     26    0                        0 
+19    Ne               8     26    7                        128
+20    Column           0     4     7                        0 
+21    Variable         2     8     0                        0 
+22    IsNull           8     26    0                        0 
+23    IsNull           7     26    0                        0 
+24    Ge               8     26    7                        128
+25    RowSetAdd        1     2     0                        0 
+26    Next             3     12    0                        0 
+27    Close            3     0     0                        0 
+28    RowSetRead       1     38    2                        0 
+29    SeekRowid        0     37    2                        0 
+30    Column           0     1     9                        0 
+31    Rowid            0     10    0                        0 
+32    IdxDelete        1     9     2     (tbl)idx_docs_category  0 
+33    Column           0     2     11                       0 
+34    Rowid            0     12    0                        0 
+35    IdxDelete        2     11    2     (tbl)idx_docs_title  0 
+36    Delete           0     0     0     (tbl)docs          1 
+37    Goto             0     28    0                        0 
+38    Close            0     0     0                        0 
+39    Close            1     0     0                        0 
+40    Close            2     0     0                        0 
+41    Halt             0     0     0                        0
