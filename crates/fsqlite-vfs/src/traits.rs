@@ -180,7 +180,7 @@ impl FileIdentity {
             #[cfg(windows)]
             2 => Self::from_windows_parts(namespace, object),
             #[cfg(windows)]
-            3 if namespace <= u64::from(u32::MAX) && object[8..].iter().all(|byte| *byte == 0) => {
+            3 if u32::try_from(namespace).is_ok() && object[8..].iter().all(|byte| *byte == 0) => {
                 Some(Self {
                     kind: FileIdentityKind::WindowsFileIndex64,
                     namespace,

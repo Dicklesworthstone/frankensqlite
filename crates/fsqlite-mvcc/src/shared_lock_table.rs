@@ -32,6 +32,7 @@ const DRAINING_NONE: u32 = 0xFFFF_FFFF;
 
 /// Default rebuild lease duration in seconds.
 const DEFAULT_LEASE_SECS: u64 = 5;
+#[cfg(unix)]
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 const OCCUPANCY_STRIPE_COUNT: usize = 16;
 const REBUILD_DRAIN_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(100);
