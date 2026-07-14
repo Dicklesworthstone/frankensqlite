@@ -78,6 +78,20 @@ fn agg_rowid_in_matches_sqlite() {
     cmp(&f, &r, "SELECT COUNT(v) FROM t WHERE id IN (41, 82, 5)", Some(true)); // 2 NULL + 1 non-null -> 1
     cmp(&f, &r, "SELECT MAX(v) FROM t WHERE 7 = id OR id = 8", Some(true)); // OR-of-rowid-eq (an IN)
 
+    // bd-agg-rowid-in-residual: rowid IN (<ints>) AND <non-indexed residual> — seek per value + re-apply
+    // the WHERE per hit, no Rewind, value byte-exact. `x = i % 7` (x[5]=5, x[25]=4, x[45]=3).
+    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id IN (5, 25, 45) AND x > 0", Some(true)); // all 3 -> 150
+    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id IN (5, 25, 45) AND x = 5", Some(true)); // only id=5 -> 10
+    cmp(&f, &r, "SELECT COUNT(v) FROM t WHERE id IN (5, 25, 45) AND x = 5", Some(true)); // -> 1
+    cmp(&f, &r, "SELECT MAX(v) FROM t WHERE id IN (5, 25, 45) AND x < 5", Some(true)); // id=25,45 -> 90
+    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id IN (5, 25) AND x = 999", Some(true)); // none -> NULL
+    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id IN (5, 99999) AND x = 5", Some(true)); // residual + absent -> 10
+    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id IN (41, 5) AND x >= 0", Some(true)); // NULL v row + real -> 10
+    assert!(
+        !has_op(&f, "SELECT SUM(v) FROM t WHERE id IN (5, 25) AND x = ?", "Rewind"),
+        "param agg rowid-IN residual should seek (no Rewind)"
+    );
+
     // Control: a non-rowid, non-indexed predicate still full-scans.
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE x = 3", Some(false));
 }

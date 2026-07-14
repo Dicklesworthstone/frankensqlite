@@ -12493,7 +12493,7 @@ fn codegen_select_aggregate(
         && !table.without_rowid
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        extract_rowid_in_list_target(where_clause, table, table_alias)
+        extract_rowid_in_list_residual_target(where_clause, table, table_alias)
     } else {
         None
     };
@@ -13357,11 +13357,15 @@ fn codegen_select_aggregate(
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         b.resolve_label(duplicate_run_done);
         skip_scan = true;
-    } else if let Some(values) = rowid_in_seek {
-        // bd-agg-rowid-in: SeekRowid per distinct listed value, accumulating each hit into the aggregate.
-        // A miss skips to the next value; an all-miss leaves the accumulators Null (the empty-scan result).
-        // Mirrors the proven `rowid_eq_seek` block as a per-value loop; `emit_aggregate_accumulate_body`
-        // reads the seeked row into `AggStep`. Values are sorted+deduped so each row accumulates once.
+    } else if let Some((values, has_residual)) = rowid_in_seek {
+        // bd-agg-rowid-in [+ residual]: SeekRowid per distinct listed value, accumulating each hit into the
+        // aggregate. A miss skips to the next value; an all-miss leaves the accumulators Null (the
+        // empty-scan result). Mirrors the proven `rowid_eq_seek` block as a per-value loop;
+        // `emit_aggregate_accumulate_body` reads the seeked row into `AggStep`. Values are sorted+deduped
+        // so each row accumulates once. With a residual (rowid IN coexisting with a predicate the seek
+        // cannot enforce) the full WHERE is re-applied per hit — its `?` placeholders re-numbered to a
+        // fixed base each iteration (the IN values are integer literals, so nothing before the filter
+        // consumes a placeholder); a residual miss skips to the next value. bd-agg-rowid-in-residual.
         b.emit_op(
             Opcode::OpenRead,
             cursor,
@@ -13371,6 +13375,7 @@ fn codegen_select_aggregate(
             0,
         );
         let rowid_reg = b.alloc_reg();
+        let where_placeholder_base = b.current_anon_placeholder();
         for value in &values {
             let skip_label = b.emit_label();
             b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(*value), 0);
@@ -13382,6 +13387,12 @@ fn codegen_select_aggregate(
                 P4::None,
                 0,
             );
+            if has_residual
+                && let Some(where_expr) = where_clause
+            {
+                b.set_next_anon_placeholder(where_placeholder_base);
+                emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+            }
             emit_aggregate_accumulate_body(
                 b,
                 cursor,
