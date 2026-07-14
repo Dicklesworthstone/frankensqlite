@@ -12475,6 +12475,29 @@ fn codegen_select_aggregate(
         None
     };
 
+    // bd-agg-rowid-in: aggregate over `WHERE <rowid> IN (<int literals>)` by SeekRowid per distinct value,
+    // accumulating each hit, instead of a full scan. The rowid analogue of `index_in_seek` (COUNT(*) is
+    // served by count_star's own rowid-IN; this serves SUM/AVG/MIN/MAX/COUNT(col)). Gated LAST so no
+    // existing seek gate changes — a rowid IN is mutually exclusive with every shape above. Integer
+    // literals only (SeekRowid coerces via to_integer()); sorted+deduped so each row accumulates once; an
+    // all-miss leaves the accumulators Null (the empty-scan result).
+    let rowid_in_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_range_seek.is_none()
+        && index_in_seek.is_none()
+        && index_range_seek.is_none()
+        && composite_prefix_range_seek.is_none()
+        && index_prefix_residual_seek.is_none()
+        && !table.without_rowid
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        extract_rowid_in_list_target(where_clause, table, table_alias)
+    } else {
+        None
+    };
+
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
@@ -13333,6 +13356,43 @@ fn codegen_select_aggregate(
         b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         b.resolve_label(duplicate_run_done);
+        skip_scan = true;
+    } else if let Some(values) = rowid_in_seek {
+        // bd-agg-rowid-in: SeekRowid per distinct listed value, accumulating each hit into the aggregate.
+        // A miss skips to the next value; an all-miss leaves the accumulators Null (the empty-scan result).
+        // Mirrors the proven `rowid_eq_seek` block as a per-value loop; `emit_aggregate_accumulate_body`
+        // reads the seeked row into `AggStep`. Values are sorted+deduped so each row accumulates once.
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        let rowid_reg = b.alloc_reg();
+        for value in &values {
+            let skip_label = b.emit_label();
+            b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(*value), 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                skip_label,
+                P4::None,
+                0,
+            );
+            emit_aggregate_accumulate_body(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                &agg_columns,
+                accum_base,
+            );
+            b.resolve_label(skip_label);
+        }
         skip_scan = true;
     }
 
