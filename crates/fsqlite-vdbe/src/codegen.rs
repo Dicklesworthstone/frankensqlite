@@ -12498,6 +12498,29 @@ fn codegen_select_aggregate(
         None
     };
 
+    // bd-agg-rowid-eq-residual: aggregate over `WHERE <rowid> = <int> AND <residual>` by seeking the single
+    // row and re-applying the residual before AggStep. `extract_rowid_eq_residual_target` returns the const
+    // only when `rowid = const` is a conjunct alongside others (the bare eq is served by rowid_eq_seek).
+    // Integer literal only; gated after every other seek so no existing gate changes.
+    let rowid_eq_residual_seek = if allow_index_seek
+        && having.is_none()
+        && index_eq_seek.is_none()
+        && rowid_eq_seek.is_none()
+        && rowid_range_seek.is_none()
+        && index_in_seek.is_none()
+        && index_range_seek.is_none()
+        && composite_prefix_range_seek.is_none()
+        && index_prefix_residual_seek.is_none()
+        && rowid_in_seek.is_none()
+        && !table.without_rowid
+        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
+    {
+        extract_rowid_eq_residual_target(where_clause, table, table_alias)
+            .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
+    } else {
+        None
+    };
+
     let finalize_label = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
     let mut skip_scan = false;
@@ -13404,6 +13427,41 @@ fn codegen_select_aggregate(
             );
             b.resolve_label(skip_label);
         }
+        skip_scan = true;
+    } else if let Some(rowid_rhs) = rowid_eq_residual_seek {
+        // bd-agg-rowid-eq-residual: seek the single `rowid = <int>` row and re-apply the residual; a
+        // SeekRowid miss OR a residual miss jumps to finalize (Null accumulators = the empty-scan result).
+        // The residual is emitted once (single seek), so its `?` placeholders number naturally.
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        let rowid_reg = b.alloc_reg();
+        emit_expr(b, rowid_rhs, rowid_reg, None);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            finalize_label,
+            P4::None,
+            0,
+        );
+        if let Some(where_expr) = where_clause {
+            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, finalize_label);
+        }
+        emit_aggregate_accumulate_body(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            &agg_columns,
+            accum_base,
+        );
         skip_scan = true;
     }
 
