@@ -19105,3 +19105,38 @@ test is on the executed path, not merely linked into it.
   the larger build-slot reservation, and every reverse-control confidence interval excludes zero.
   Revisit only if register representation or Copy sideband semantics change; preserve materialization
   before source inspection and the generic fallback for non-integer or growing destinations.
+
+## 2026-07-14 - WIN: `Opcode::SCopy` reuses the integer-aware single-register body
+
+- Target: the existing `vdbe_pipeline_execute_scopy/{64,256,1024}` benchmark, whose stable integer
+  source is shallow-copied into one pre-sized destination. The May 24 rejection removed the SCopy
+  hot-dispatch arm; this distinct lever retains that arm and specializes only its transfer body.
+  Opportunity score before implementation was 12 (`impact 3 * confidence 4 / effort 1`).
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` routes both SCopy arms through `copy_single_reg`,
+  reusing the immediately preceding Copy win. The helper materializes a MakeRecord sideband before
+  inspecting the source, copies a pre-sized integer destination through `set_reg_int` without an
+  intermediate `SqliteValue`, and preserves the original clone plus `set_reg_fast` fallback for
+  non-integer or growing destinations. Existing focused coverage pins SCopy sideband materialization
+  and heap-carrying Text values, while the helper coverage pins destination subtype clearing,
+  self-copy, and the growing-destination fallback. The strict-remote focused Copy/SCopy family passed
+  `11/11`. Ordering, tie-breaking, floating-point, and RNG behavior are not involved.
+- Same-worker foreground proof on actual remote worker `vmi1156319`, from base commit `8ca351d9`.
+  Base and candidate used the identical Cargo payload
+  `cargo bench -j2 --config 'profile.release-perf.lto=false' --config
+  'profile.release-perf.codegen-units=16' --profile release-perf -p fsqlite-vdbe --bench
+  pipeline_stages -- '^vdbe_pipeline_execute_scopy/' --warm-up-time 0.5 --measurement-time 2
+  --sample-size 30 --noplot`, under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`:
+  - 64 ops: `1.3928 us` -> `987.75 ns` point estimate (29.1% lower); Criterion change
+    `[-31.261%, -27.587%, -23.354%]`, `p = 0.00`.
+  - 256 ops: `5.1349 us` -> `3.4816 us` (32.2% lower); Criterion change
+    `[-35.260%, -32.606%, -29.616%]`, `p = 0.00`.
+  - 1024 ops: `21.533 us` -> `15.004 us` (30.3% lower); Criterion change
+    `[-35.079%, -30.579%, -25.499%]`, `p = 0.00`.
+  Frozen Criterion evidence is at
+  `/data/tmp/frankensqlite-scopy-copy-helper-20260714T0417Z-base-vmi1156319` and
+  `/data/tmp/frankensqlite-scopy-copy-helper-20260714T0434Z-candidate-vmi1156319`.
+- Result: KEEP. Every measured size improved significantly on the same worker and every confidence
+  interval excludes zero. Revisit only if SCopy diverges from Copy's register or MakeRecord-sideband
+  semantics; preserve source materialization and the generic fallback for non-integer or growing
+  destinations.

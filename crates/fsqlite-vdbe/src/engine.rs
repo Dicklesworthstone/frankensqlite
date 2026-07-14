@@ -8137,8 +8137,7 @@ impl VdbeEngine {
 
                 Opcode::SCopy => {
                     // Shallow copy register p1 to p2.
-                    let val = self.clone_reg_materialized(op.p1);
-                    self.set_reg_fast(op.p2, val);
+                    self.copy_single_reg(op.p1, op.p2);
                     pc += 1;
                 }
 
@@ -12805,11 +12804,10 @@ impl VdbeEngine {
                 Ok(true)
             }
             // SCopy is the shallow single-register copy. A MakeRecord sideband
-            // is still the source register's logical value, so materialize it
-            // before cloning just like single-register Copy.
+            // is still the source register's logical value, so use the same
+            // sideband-safe transfer body as single-register Copy.
             Opcode::SCopy => {
-                let val = self.clone_reg_materialized(op.p1);
-                self.set_reg_fast(op.p2, val);
+                self.copy_single_reg(op.p1, op.p2);
                 *pc += 1;
                 Ok(true)
             }
