@@ -19030,3 +19030,37 @@ test is on the executed path, not merely linked into it.
   interval excludes zero. Revisit only if Float representation gains reusable storage or new
   logical-write metadata; preserve NaN normalization and the cross-variant replacement path when
   extending `set_reg_real`.
+
+## 2026-07-13 - REJECT: `Opcode::Add` integer-result in-place register write
+
+- Target: the existing `vdbe_pipeline_execute_add/{64,256,1024}` benchmark, whose stable output
+  register receives repeated integer additions. The May 25 rejection removed the `Opcode::Add`
+  hot-dispatch arm; this distinct candidate retained both dispatch arms and changed only result
+  storage. Opportunity score before implementation was 15 (`impact 3 * confidence 5 / effort 1`),
+  based on the immediately preceding `set_reg_int` win and the purpose-built integer Add stream.
+- Reverted candidate: `crates/fsqlite-vdbe/src/engine.rs` matched the unchanged `sql_add` result in
+  both the main interpreter and hot dispatcher, routing `SqliteValue::Integer(value)` through
+  `set_reg_int` and leaving Float/Null/Text/Blob results on `set_reg_fast`. Ordering, tie-breaking,
+  floating-point calculation, NaN normalization, RNG behavior, MakeRecord sideband invalidation,
+  subtype clearing, and cross-variant buffer return behavior were unchanged. The source patch was
+  manually unwound after the benchmark matrix failed the all-sizes gate.
+- Strict same-worker foreground proof: base and candidate were cold-built from base commit
+  `8714bdbe` and both actually executed on remote worker `vmi1152480` with
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo bench --config
+  'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile
+  release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_add/'
+  --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`:
+  - 64 ops: `1.1716 us` -> `1.1058 us` point estimate (5.6% lower), but Criterion reported no
+    significant change: `[-6.0153%, +29.417%]`, `p = 0.31`.
+  - 256 ops: `3.9566 us` -> `4.2794 us` (8.2% slower), with no significant change:
+    `[-13.422%, +16.719%]`, `p = 0.96`.
+  - 1024 ops: `15.127 us` -> `15.459 us` (2.2% slower), with no significant change:
+    `[-3.6306%, +25.936%]`, `p = 0.19`.
+  An earlier candidate admission routed to `vmi1156319` despite the worker hint and was canceled
+  before compilation, so it contributed no timing evidence. Frozen Criterion evidence is at
+  `/data/tmp/frankensqlite-add-intstore-baseline-vmi1152480-8714bdbe` and
+  `/data/tmp/frankensqlite-add-intstore-candidate-vmi1152480-8714bdbe`.
+- Result: REJECT. The only favorable point estimate was small and statistically unresolved, while
+  both larger streams regressed. Do not retry result-matching plus `set_reg_int` for `Opcode::Add`
+  as a standalone lever. Reconsider only if arithmetic representation changes eliminate construction
+  of the intermediate `SqliteValue` itself; gate that different design at all three stream sizes.
