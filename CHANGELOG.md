@@ -191,6 +191,11 @@ lossy values.
 
 ### CI / Release
 
+- The Unix installer now guards empty proxy-argument expansion under
+  `set -u`, preserving zero arguments on macOS's system Bash 3.2 while still
+  forwarding configured HTTP(S) proxies unchanged. Native arm64, Rosetta
+  x86-64, explicit-version, and latest-release installation paths are covered
+  by live signed-release smoke tests.
 - The unstable prefetch-intrinsic feature gate is now enabled only on x86-64,
   where the optimized pager and B-tree paths use it. Arm64 release builds no
   longer fail strict warning gates on an otherwise unused crate feature.

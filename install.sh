@@ -218,8 +218,11 @@ setup_proxy() {
 }
 
 curl_fetch() {
+  # Bash 3.2 treats a declared-but-empty array as unset under `set -u`.
+  # The `+` guard preserves zero arguments when no proxy is configured.
   curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    --connect-timeout 10 --retry 3 --retry-delay 1 "${PROXY_ARGS[@]}" "$1" --output "$2"
+    --connect-timeout 10 --retry 3 --retry-delay 1 \
+    ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} "$1" --output "$2"
 }
 
 resolve_version() {
@@ -232,11 +235,13 @@ resolve_version() {
   [[ -n "$OFFLINE_ARCHIVE" ]] && die "--offline requires --version vX.Y.Z"
   local api="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" tag=""
   tag=$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    --connect-timeout 5 "${PROXY_ARGS[@]}" -H 'Accept: application/vnd.github+json' "$api" \
+    --connect-timeout 5 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    -H 'Accept: application/vnd.github+json' "$api" \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
   if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
     tag=$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-      --connect-timeout 5 "${PROXY_ARGS[@]}" --output /dev/null --write-out '%{url_effective}' \
+      --connect-timeout 5 ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+      --output /dev/null --write-out '%{url_effective}' \
       "https://github.com/${OWNER}/${REPO}/releases/latest" | sed -E 's|.*/tag/||') || true
   fi
   [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
