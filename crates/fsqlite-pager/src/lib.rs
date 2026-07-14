@@ -1,5 +1,5 @@
-#![allow(internal_features)]
-#![feature(core_intrinsics)]
+#![cfg_attr(target_arch = "x86_64", allow(internal_features))]
+#![cfg_attr(target_arch = "x86_64", feature(core_intrinsics))]
 
 pub mod arc_cache;
 #[cfg(feature = "encryption")]

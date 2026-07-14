@@ -155,6 +155,9 @@ lossy values.
 
 ### CI / Release
 
+- The unstable prefetch-intrinsic feature gate is now enabled only on x86-64,
+  where the optimized pager and B-tree paths use it. Arm64 release builds no
+  longer fail strict warning gates on an otherwise unused crate feature.
 - The crates.io release plan now contains all 25 publishable workspace crates,
   including `fsqlite-cli`, `fsqlite-c-api`, and `fsqlite-wasm`. It derives the
   public package set from Cargo metadata and fails before publishing if the
