@@ -8101,7 +8101,7 @@ impl VdbeEngine {
                     let start = op.p2;
                     let end = if op.p3 > 0 { op.p3 } else { start };
                     for r in start..=end {
-                        self.set_reg_fast(r, SqliteValue::Null);
+                        self.set_reg_null(r);
                     }
                     pc += 1;
                 }
@@ -12665,10 +12665,10 @@ impl VdbeEngine {
                 let target = op.p2;
                 if op.p3 > 0 {
                     for reg in target..=op.p3 {
-                        self.set_reg(reg, SqliteValue::Null);
+                        self.set_reg_null(reg);
                     }
                 } else {
-                    self.set_reg(target, SqliteValue::Null);
+                    self.set_reg_null(target);
                 }
                 *pc += 1;
                 Ok(true)
@@ -14331,7 +14331,7 @@ impl VdbeEngine {
         self.replace_register_value(idx, normalized);
     }
 
-    /// Null-specialized register write used by `SoftNull`.
+    /// Null-specialized register write used by null-writing opcodes.
     ///
     /// Logical-write bookkeeping must run even when the register is already
     /// NULL, but replacing NULL with NULL only feeds a non-reusable value
@@ -22885,6 +22885,8 @@ mod tests {
             b.emit_op(Opcode::Integer, 3, r3, 0, P4::None, 0);
             // Null range: p2=r1, p3=r3 → set r1..=r3 to NULL (absolute end register).
             b.emit_op(Opcode::Null, 0, r1, r3, P4::None, 0);
+            // Repeat the range write to exercise the already-NULL path.
+            b.emit_op(Opcode::Null, 0, r1, r3, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
@@ -22892,6 +22894,44 @@ mod tests {
         assert_eq!(
             rows[0],
             vec![SqliteValue::Null, SqliteValue::Null, SqliteValue::Null]
+        );
+    }
+
+    #[test]
+    fn test_null_clears_already_null_sideband_and_subtype() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_subtype = b.alloc_reg();
+            let r_observed_subtype = b.alloc_reg();
+
+            // MakeRecord leaves a logical record in the lookaside sideband
+            // while the physical destination register remains NULL.
+            b.emit_op(Opcode::Integer, 42, r_value, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::Integer, 74, r_subtype, 0, P4::None, 0);
+            b.emit_op(Opcode::SetSubtype, r_subtype, r_record, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Null, 0, r_record, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::GetSubtype,
+                r_record,
+                r_observed_subtype,
+                0,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_observed_subtype, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Null], vec![SqliteValue::Integer(0)],]
         );
     }
 

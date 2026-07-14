@@ -18932,3 +18932,35 @@ test is on the executed path, not merely linked into it.
 - Result: KEEP. Every measured size improved significantly on the same worker, and the all-sizes gate
   clears comfortably. Revisit only if register representation changes make NULL carry reusable storage
   or introduce new logical-write metadata; in that case, extend `set_reg_null` before reusing it.
+
+## 2026-07-13 - WIN: `Opcode::Null` skips redundant physical NULL replacement
+
+- Target: the existing `vdbe_pipeline_execute_null/{64,256,1024}` dispatch benchmark. The May 25
+  rejected experiment removed the `Opcode::Null` hot-dispatch arm and regressed every size; this
+  distinct lever retains both dispatch arms and specializes only the register write. Repeated writes
+  to an already-NULL physical register still perform logical-write bookkeeping but skip
+  `replace_register_value` and the reusable-buffer return path.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` routes the main-interpreter and hot-dispatch
+  `Opcode::Null` arms through the already-landed `set_reg_null`. Single-register (`p3 == 0`) and
+  inclusive-range (`p2..=p3`) semantics are unchanged. The range test repeats the NULL fill, and a
+  focused oracle proves `MakeRecord` sideband invalidation and subtype clearing remain intact. Non-NULL
+  replacement, invalid-register, and register-growth behavior are unchanged. Focused strict-remote
+  tests passed `3/3`. Ordering, tie, floating-point, and RNG behavior are not involved.
+- Same-worker foreground bench on actual remote worker `vmi1152480`, base and candidate both cold-built
+  from base commit `a9a95427`. The baseline routing hint named `vmi1156319`, but RCH selected
+  `vmi1152480`; the candidate was then admitted on that same actual worker with routing hints set to
+  `vmi1152480`. Both used the identical Cargo payload
+  `cargo bench --config 'profile.release-perf.lto=false' --config 'profile.release-perf.codegen-units=16' --profile release-perf -j3 -p fsqlite-vdbe --bench pipeline_stages -- '^vdbe_pipeline_execute_null/' --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot`
+  under `RCH_REQUIRE_REMOTE=1 ... rch --no-self-healing exec --`:
+  - 64 ops: `773.88 ns` -> `482.34 ns` point estimate (37.7% lower); Criterion change
+    `[-41.846%, -35.559%, -28.972%]`, `p = 0.00`.
+  - 256 ops: `3.0183 us` -> `2.0209 us` (33.0% lower); Criterion change
+    `[-36.319%, -32.017%, -27.111%]`, `p = 0.00`.
+  - 1024 ops: `11.533 us` -> `7.5028 us` (34.9% lower); Criterion change
+    `[-46.285%, -40.415%, -35.281%]`, `p = 0.00`.
+  Criterion evidence is frozen at
+  `/data/tmp/frankensqlite-null-baseline-vmi1152480-a9a95427` and
+  `/data/tmp/frankensqlite-null-candidate-vmi1152480-a9a95427`.
+- Result: KEEP. Every measured size improved significantly on the same worker, and every confidence
+  interval excludes zero. Revisit only if NULL gains reusable physical storage or new logical-write
+  metadata; extend `set_reg_null` first in that case.
