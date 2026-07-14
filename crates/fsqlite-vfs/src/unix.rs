@@ -40,7 +40,7 @@ use crate::shm::{
     SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_NREADER_USIZE, WAL_TOTAL_LOCKS,
     WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
 };
-use crate::traits::{FileIdentity, Vfs, VfsFile};
+use crate::traits::{FileIdentity, SyncKind, Vfs, VfsFile};
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -421,8 +421,10 @@ struct InodeInfo {
     /// Canonical file descriptor for this inode.
     ///
     /// POSIX fcntl locks are per-process, and closing *any* fd for the file can
-    /// release the process' locks. To avoid that, we keep exactly one fd per
-    /// inode in-process and share it across handles via `Arc`.
+    /// release the process' locks. To avoid that, we keep exactly one canonical
+    /// fd per inode for I/O/locking and share it across handles via `Arc`.
+    /// Racing redundant opens remain inert in `deferred_close_files` until no
+    /// process lock claim survives.
     file: Arc<File>,
     /// Total number of open file handles referencing this inode.
     n_ref: u32,
@@ -435,6 +437,13 @@ struct InodeInfo {
     n_pending: u32,
     /// Number of handles holding an EXCLUSIVE lock.
     n_exclusive: u32,
+    /// Extra descriptors opened by racing/repeated opens while this process
+    /// already held a POSIX record lock on the inode.
+    ///
+    /// Closing *any* descriptor for an inode drops all classic `fcntl` locks
+    /// held by the process. These descriptors therefore remain open until the
+    /// last coalesced lock claim has been released.
+    deferred_close_files: Vec<Arc<File>>,
 }
 
 impl InodeInfo {
@@ -446,6 +455,19 @@ impl InodeInfo {
             n_reserved: 0,
             n_pending: 0,
             n_exclusive: 0,
+            deferred_close_files: Vec::new(),
+        }
+    }
+
+    fn has_lock_claims(&self) -> bool {
+        self.n_shared != 0 || self.n_reserved != 0 || self.n_pending != 0 || self.n_exclusive != 0
+    }
+
+    /// Close redundant descriptors only while the inode mutex proves that no
+    /// thread can establish a new process-wide record lock concurrently.
+    fn close_deferred_files_if_unlocked(&mut self) {
+        if !self.has_lock_claims() {
+            self.deferred_close_files.clear();
         }
     }
 }
@@ -477,6 +499,7 @@ impl InodeTable {
     }
 
     /// Get the inode info for the given key if present.
+    #[cfg(test)]
     fn get(&self, key: InodeKey) -> Option<Arc<Mutex<InodeInfo>>> {
         let map = self.shards[self.shard_idx(key)]
             .lock()
@@ -484,15 +507,72 @@ impl InodeTable {
         map.get(&key).cloned()
     }
 
-    /// Get or create the inode info for the given key.
-    fn get_or_create(&self, key: InodeKey, file: Arc<File>) -> Arc<Mutex<InodeInfo>> {
+    /// Register an opened descriptor in the inode's one process-wide lock
+    /// domain and return its canonical descriptor.
+    ///
+    /// Lookup, `n_ref` publication, and final-generation removal all take the
+    /// shard mutex before the inode mutex. This prevents a last close from
+    /// evicting an entry between a reopen's lookup and registration. When a
+    /// racing open produced a redundant descriptor while locks are held, that
+    /// descriptor is retained until the final lock claim is released; closing
+    /// it earlier would silently erase every classic POSIX lock for the inode.
+    fn register_opened_file(
+        &self,
+        key: InodeKey,
+        opened: File,
+    ) -> Result<(Arc<Mutex<InodeInfo>>, Arc<File>)> {
+        self.register_opened_file_with(key, opened, || {})
+    }
+
+    fn register_opened_file_with(
+        &self,
+        key: InodeKey,
+        opened: File,
+        before_register: impl FnOnce(),
+    ) -> Result<(Arc<Mutex<InodeInfo>>, Arc<File>)> {
+        let opened = Arc::new(opened);
         let mut map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(InodeInfo::new(file)))),
-        )
+        if let Some(existing) = map.get(&key) {
+            let inode_info = Arc::clone(existing);
+            before_register();
+            let canonical = {
+                let mut info = inode_info
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(next_ref) = info.n_ref.checked_add(1) else {
+                    if info.has_lock_claims() {
+                        info.deferred_close_files.push(opened);
+                    } else {
+                        drop(opened);
+                    }
+                    return Err(FrankenError::internal(
+                        "Unix inode-table open-reference count overflow",
+                    ));
+                };
+                info.n_ref = next_ref;
+                let canonical = Arc::clone(&info.file);
+                if info.has_lock_claims() {
+                    info.deferred_close_files.push(opened);
+                } else {
+                    // Keep the inode mutex held while the redundant descriptor
+                    // closes, so no thread can establish a record lock in the
+                    // close-vs-lock window.
+                    drop(opened);
+                }
+                canonical
+            };
+            return Ok((inode_info, canonical));
+        }
+
+        before_register();
+        let canonical = opened;
+        let mut info = InodeInfo::new(Arc::clone(&canonical));
+        info.n_ref = 1;
+        let inode_info = Arc::new(Mutex::new(info));
+        map.insert(key, Arc::clone(&inode_info));
+        Ok((inode_info, canonical))
     }
 
     /// Remove the exact inode generation once it is truly quiescent.
@@ -501,28 +581,61 @@ impl InodeTable {
     /// surviving `Arc<File>` clones can still keep the canonical fd alive. If we
     /// evict the table entry too early, a concurrent reopen can install a second
     /// canonical fd generation for the same inode.
-    fn maybe_remove_exact_when_idle(
+    fn finish_handle_drop(
         &self,
         key: InodeKey,
-        inode_info: &Arc<Mutex<InodeInfo>>,
-        file: &Arc<File>,
+        inode_info: Arc<Mutex<InodeInfo>>,
+        file: Arc<File>,
     ) {
         let mut map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(current) = map.get(&key) {
-            if !Arc::ptr_eq(current, inode_info) {
+            if !Arc::ptr_eq(current, &inode_info) {
+                // A stale descriptor for the same inode can erase locks held by
+                // the current generation when it closes. Defer it into the
+                // current lock domain if any claim is live; otherwise close it
+                // under the shard+inode critical section.
+                let mut current_guard = current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if current_guard.has_lock_claims() {
+                    current_guard.deferred_close_files.push(file);
+                } else {
+                    drop(file);
+                }
+                drop(current_guard);
+                drop(inode_info);
                 return;
             }
 
-            let guard = current
+            let mut guard = current
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.n_ref == 0 && Arc::strong_count(file) == 2 {
-                drop(guard);
-                map.remove(&key);
+            if guard.n_ref == 0 {
+                guard.close_deferred_files_if_unlocked();
             }
+            let remove = guard.n_ref == 0
+                && !guard.has_lock_claims()
+                && guard.deferred_close_files.is_empty()
+                && Arc::ptr_eq(&guard.file, &file)
+                && Arc::strong_count(&file) == 2
+                && Arc::strong_count(&inode_info) == 2;
+            drop(guard);
+
+            // The closing handle's descriptor must disappear before the table
+            // entry becomes reusable. Otherwise a new generation could lock a
+            // second descriptor and then lose that lock when this Drop closes.
+            drop(file);
+            if remove {
+                let removed = map.remove(&key);
+                drop(removed);
+                drop(inode_info);
+            }
+        } else {
+            drop(file);
+            drop(inode_info);
         }
     }
 }
@@ -602,39 +715,68 @@ impl ShmTable {
         }
     }
 
-    fn get_or_create(&self, path: PathBuf) -> Result<Arc<Mutex<ShmInfo>>> {
+    fn get_or_create_and_register(
+        &self,
+        path: PathBuf,
+        owner_id: u64,
+    ) -> Result<Arc<Mutex<ShmInfo>>> {
+        self.get_or_create_and_register_with(path, owner_id, || {})
+    }
+
+    fn get_or_create_and_register_with(
+        &self,
+        path: PathBuf,
+        owner_id: u64,
+        before_register: impl FnOnce(),
+    ) -> Result<Arc<Mutex<ShmInfo>>> {
         // IMPORTANT: POSIX fcntl locks are per-process. If we open and then close a new
         // fd to an already-locked `*-shm` file, we can drop all locks held by this
         // process on that file. To avoid that, only ever open `*-shm` while holding
         // this mutex and only when we're definitely creating the canonical entry.
+        // Owner registration is covered by the same table lock. Otherwise the
+        // last old owner could remove the entry after a new opener cloned it but
+        // before that opener made its ownership visible, splitting the in-process
+        // SHM lock domain.
         let mut map = self
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = map.get(&path) {
-            return Ok(Arc::clone(existing));
+        let info = if let Some(existing) = map.get(&path) {
+            Arc::clone(existing)
+        } else {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(FrankenError::Io)?;
+
+            let info = Arc::new(Mutex::new(ShmInfo::new(Arc::new(file))));
+            map.insert(path, Arc::clone(&info));
+            info
+        };
+
+        before_register();
+        {
+            let mut guard = info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard.owner_refs.entry(owner_id).or_insert(0) += 1;
         }
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(FrankenError::Io)?;
-
-        let info = Arc::new(Mutex::new(ShmInfo::new(Arc::new(file))));
-        map.insert(path, Arc::clone(&info));
         drop(map);
         Ok(info)
     }
 
-    fn remove_if_orphaned(&self, path: &Path) {
+    fn remove_if_orphaned(&self, path: &Path, expected: &Arc<Mutex<ShmInfo>>) {
         let mut map = self
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = map.get(path) {
+            if !Arc::ptr_eq(entry, expected) {
+                return;
+            }
             let info = entry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -715,43 +857,6 @@ impl Vfs for UnixVfs {
         let create_new = is_temp
             || (flags.contains(VfsOpenFlags::CREATE) && flags.contains(VfsOpenFlags::EXCLUSIVE));
 
-        // Try to reuse the in-process canonical fd if the file already exists
-        // and we're not creating a new exclusive file.
-        if !create_new {
-            if let Some(inode_key) = inode_key_from_path(&resolved)? {
-                if let Some(inode_info) = global_inode_table().get(inode_key) {
-                    let file = {
-                        let mut info = inode_info
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        info.n_ref += 1;
-                        Arc::clone(&info.file)
-                    };
-                    let shm_path = sqlite_shm_path(&resolved);
-
-                    let unix_file = UnixFile {
-                        file,
-                        path: resolved,
-                        lock_level: LockLevel::None,
-                        delete_on_close,
-                        closed: false,
-                        inode_key,
-                        inode_info,
-                        shm_owner_id: next_shm_owner_id(),
-                        shm_path,
-                        shm_info: None,
-                        busy_timeout_ms: 0,
-                    };
-
-                    let mut out_flags = flags;
-                    if flags.contains(VfsOpenFlags::CREATE) {
-                        out_flags |= VfsOpenFlags::READWRITE;
-                    }
-                    return Ok((unix_file, out_flags));
-                }
-            }
-        }
-
         let is_create = is_temp || flags.contains(VfsOpenFlags::CREATE);
         let requested_rw = is_temp || flags.contains(VfsOpenFlags::READWRITE) || is_create;
         let promote_readonly_to_rw = !requested_rw
@@ -780,17 +885,23 @@ impl Vfs for UnixVfs {
                 }
             })?;
 
-        // Install / reuse inode identity for per-process lock coalescing.
-        let opened = Arc::new(file);
-        let inode_key = inode_key_from_file(opened.as_ref())?;
-        let inode_info = global_inode_table().get_or_create(inode_key, Arc::clone(&opened));
-        let file = {
-            let mut info = inode_info
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            info.n_ref += 1;
-            Arc::clone(&info.file)
+        // Derive identity from the descriptor that was actually opened, then
+        // atomically register it with the process-wide canonical lock domain.
+        // Always opening first avoids the path-stat/open TOCTOU where a renamed
+        // file could otherwise make us return a descriptor for the wrong inode.
+        let inode_key = match inode_key_from_file(&file) {
+            Ok(key) => key,
+            Err(error) => {
+                // Once an fd is open, closing it without knowing its inode can
+                // erase unrelated process-wide fcntl locks on that inode. A
+                // failed descriptor-identity query is exceptional; leak this
+                // one fd fail-closed rather than risk silently unlocking a
+                // live database generation.
+                std::mem::forget(file);
+                return Err(error);
+            }
         };
+        let (inode_info, file) = global_inode_table().register_opened_file(inode_key, file)?;
 
         let mut out_flags = flags;
         if is_create {
@@ -803,13 +914,13 @@ impl Vfs for UnixVfs {
         let shm_path = sqlite_shm_path(&resolved);
 
         let unix_file = UnixFile {
-            file,
+            file: Some(file),
             path: resolved,
             lock_level: LockLevel::None,
             delete_on_close,
             closed: false,
             inode_key,
-            inode_info,
+            inode_info: Some(inode_info),
             shm_owner_id: next_shm_owner_id(),
             shm_path,
             shm_info: None,
@@ -823,14 +934,26 @@ impl Vfs for UnixVfs {
         fs::remove_file(path).map_err(FrankenError::Io)?;
 
         if sync_dir {
-            if let Some(parent) = path.parent() {
-                // Open the directory and fsync it.
-                if let Ok(dir) = File::open(parent) {
-                    drop(dir.sync_all());
-                }
-            }
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            // A caller requesting a durable namespace deletion must learn if
+            // the directory barrier failed. Silently swallowing this error
+            // can leave a supposedly-removed rollback journal present after
+            // a crash and turn a committed image into a rollback candidate.
+            File::open(parent)?.sync_all()?;
         }
 
+        Ok(())
+    }
+
+    fn sync_parent_directory(&self, _cx: &Cx, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -916,18 +1039,6 @@ fn inode_key_from_file(file: &File) -> Result<InodeKey> {
     Ok(FileIdentity::from_unix_parts(meta.dev(), meta.ino()))
 }
 
-/// Extract the (device, inode) pair from a path without opening the file.
-///
-/// Returns `Ok(None)` if the file does not exist.
-fn inode_key_from_path(path: &Path) -> Result<Option<InodeKey>> {
-    use std::os::unix::fs::MetadataExt;
-    match fs::metadata(path) {
-        Ok(meta) => Ok(Some(FileIdentity::from_unix_parts(meta.dev(), meta.ino()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(FrankenError::Io(e)),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // UnixFile
 // ---------------------------------------------------------------------------
@@ -935,13 +1046,13 @@ fn inode_key_from_path(path: &Path) -> Result<Option<InodeKey>> {
 /// A file handle opened by [`UnixVfs`].
 #[derive(Debug)]
 pub struct UnixFile {
-    file: Arc<File>,
+    file: Option<Arc<File>>,
     path: PathBuf,
     lock_level: LockLevel,
     delete_on_close: bool,
     closed: bool,
     inode_key: InodeKey,
-    inode_info: Arc<Mutex<InodeInfo>>,
+    inode_info: Option<Arc<Mutex<InodeInfo>>>,
     shm_owner_id: u64,
     shm_path: PathBuf,
     shm_info: Option<Arc<Mutex<ShmInfo>>>,
@@ -952,18 +1063,25 @@ pub struct UnixFile {
 }
 
 impl UnixFile {
+    fn file_ref(&self) -> &File {
+        self.file
+            .as_deref()
+            .expect("open UnixFile must retain its canonical descriptor")
+    }
+
+    fn inode_info_ref(&self) -> &Arc<Mutex<InodeInfo>> {
+        self.inode_info
+            .as_ref()
+            .expect("open UnixFile must retain its inode state")
+    }
+
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<ShmInfo>>> {
         if let Some(info) = &self.shm_info {
             return Ok(Arc::clone(info));
         }
 
-        let info = global_shm_table().get_or_create(self.shm_path.clone())?;
-        {
-            let mut guard = info
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
-        }
+        let info = global_shm_table()
+            .get_or_create_and_register(self.shm_path.clone(), self.shm_owner_id)?;
         self.shm_info = Some(Arc::clone(&info));
         Ok(info)
     }
@@ -1123,7 +1241,7 @@ impl UnixFile {
         if delete {
             drop(fs::remove_file(&self.shm_path));
         }
-        global_shm_table().remove_if_orphaned(&self.shm_path);
+        global_shm_table().remove_if_orphaned(&self.shm_path, &info_arc);
         Ok(())
     }
 
@@ -1645,7 +1763,7 @@ impl UnixFile {
 
         let mut db_hdr = [0_u8; 100];
         let hdr_read = self
-            .file
+            .file_ref()
             .read_at(&mut db_hdr, 0)
             .map_err(FrankenError::Io)?;
         if hdr_read != db_hdr.len() {
@@ -1656,7 +1774,7 @@ impl UnixFile {
             });
         }
         let page_size = sqlite_page_size_from_db_header(&db_hdr)?;
-        let db_len = self.file.metadata().map_err(FrankenError::Io)?.len();
+        let db_len = self.file_ref().metadata().map_err(FrankenError::Io)?.len();
         let n_page_u64 = db_len / u64::from(page_size);
         let n_page = u32::try_from(n_page_u64).unwrap_or(u32::MAX);
 
@@ -1712,8 +1830,8 @@ impl VfsFile for UnixFile {
 
         // Decrement refcount.
         {
-            let mut info = self
-                .inode_info
+            let inode_info = Arc::clone(self.inode_info_ref());
+            let mut info = inode_info
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             info.n_ref = info.n_ref.saturating_sub(1);
@@ -1738,7 +1856,7 @@ impl VfsFile for UnixFile {
         while total < buf.len() {
             let off = checked_io_offset(offset, total, "read")?;
             let n = self
-                .file
+                .file_ref()
                 .read_at(&mut buf[total..], off)
                 .map_err(FrankenError::Io)?;
             if n == 0 {
@@ -1761,7 +1879,7 @@ impl VfsFile for UnixFile {
         let mut total = 0_usize;
         while total < buf.len() {
             let off = checked_io_offset(offset, total, "write")?;
-            match self.file.write_at(&buf[total..], off) {
+            match self.file_ref().write_at(&buf[total..], off) {
                 Ok(0) => {
                     return Err(FrankenError::Io(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -1778,20 +1896,44 @@ impl VfsFile for UnixFile {
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
-        self.file.set_len(size).map_err(FrankenError::Io)?;
+        self.file_ref().set_len(size).map_err(FrankenError::Io)?;
         Ok(())
     }
 
     fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
         if flags.contains(SyncFlags::DATAONLY) {
-            self.file.sync_data().map_err(FrankenError::Io)
+            self.file_ref().sync_data().map_err(FrankenError::Io)
         } else {
-            self.file.sync_all().map_err(FrankenError::Io)
+            self.file_ref().sync_all().map_err(FrankenError::Io)
+        }
+    }
+
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        #[cfg(target_os = "macos")]
+        if kind == SyncKind::FullDurable {
+            // fsync(2) does not guarantee that drive write caches are flushed
+            // on macOS. F_FULLFSYNC is the durability barrier SQLite uses for
+            // transactions that request full-fsync semantics.
+            // SAFETY: fcntl receives this live file descriptor and the
+            // argument-less F_FULLFSYNC command documented by Darwin.
+            let result = unsafe { libc::fcntl(self.file_ref().as_raw_fd(), libc::F_FULLFSYNC) };
+            if result == 0 {
+                return Ok(());
+            }
+            return Err(FrankenError::Io(std::io::Error::last_os_error()));
+        }
+
+        match kind {
+            SyncKind::DataOnly => self.file_ref().sync_data().map_err(FrankenError::Io),
+            SyncKind::DataAndMetadata | SyncKind::FullDurable => {
+                self.file_ref().sync_all().map_err(FrankenError::Io)
+            }
         }
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {
-        let meta = self.file.metadata().map_err(FrankenError::Io)?;
+        let meta = self.file_ref().metadata().map_err(FrankenError::Io)?;
         Ok(meta.len())
     }
 
@@ -1802,8 +1944,8 @@ impl VfsFile for UnixFile {
 
         let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
-        let mut info = self
-            .inode_info
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let mut info = inode_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rollback = |info: &mut InodeInfo, lock_level: &mut LockLevel| -> Result<()> {
@@ -1829,11 +1971,18 @@ impl VfsFile for UnixFile {
             }
 
             *lock_level = prior_level;
+            info.close_deferred_files_if_unlocked();
             Ok(())
         };
 
         // None -> Shared: acquire F_RDLCK on the shared byte range.
         if self.lock_level < LockLevel::Shared && level >= LockLevel::Shared {
+            // Classic fcntl locks do not conflict with locks already held by
+            // this process. Enforce SQLite's pending/exclusive exclusion in
+            // the coalesced in-process state before consulting the kernel.
+            if info.n_pending > 0 || info.n_exclusive > 0 {
+                return Err(FrankenError::Busy);
+            }
             if info.n_shared == 0 {
                 // Readers must pass through the PENDING byte so a waiting
                 // writer can block new SHARED acquisitions while upgrading.
@@ -1893,6 +2042,14 @@ impl VfsFile for UnixFile {
         // replacing the existing shared read lock. This will only succeed when
         // all other processes have released their shared locks.
         if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
+            // The kernel sees all classic record locks from this process as a
+            // single owner, so it would happily grant WRLCK even while another
+            // local handle still has a SHARED claim. Refuse that false upgrade
+            // and unwind PENDING (plus any levels acquired by this request).
+            if info.n_shared > 1 {
+                rollback(&mut info, &mut self.lock_level)?;
+                return Err(FrankenError::Busy);
+            }
             if !posix_lock_with_timeout(
                 &*info.file,
                 libc::F_WRLCK,
@@ -1915,8 +2072,8 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
-        let mut info = self
-            .inode_info
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let mut info = inode_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -1955,11 +2112,32 @@ impl VfsFile for UnixFile {
         }
 
         self.lock_level = level;
+        info.close_deferred_files_if_unlocked();
         Ok(())
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        let flock = posix_getlk(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
+        // F_GETLK never reports classic fcntl locks owned by this process.
+        // Consult the coalesced inode state first so a different connection in
+        // this process observes RESERVED, PENDING, or EXCLUSIVE exactly as
+        // SQLite's xCheckReservedLock contract requires. Keep the inode mutex
+        // through F_GETLK so a local writer cannot enter the gap between the
+        // process-local and kernel-level checks.
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let self_reserved = u32::from(self.lock_level >= LockLevel::Reserved);
+        let self_pending = u32::from(self.lock_level >= LockLevel::Pending);
+        let self_exclusive = u32::from(self.lock_level >= LockLevel::Exclusive);
+        if info.n_reserved > self_reserved
+            || info.n_pending > self_pending
+            || info.n_exclusive > self_exclusive
+        {
+            return Ok(true);
+        }
+
+        let flock = posix_getlk(&info.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
         #[allow(clippy::cast_possible_truncation)]
         let unlocked: libc::c_short = libc::F_UNLCK as libc::c_short;
         Ok(flock.l_type != unlocked)
@@ -2153,11 +2331,9 @@ impl Drop for UnixFile {
             let _ = self.close(&cx);
         }
 
-        global_inode_table().maybe_remove_exact_when_idle(
-            self.inode_key,
-            &self.inode_info,
-            &self.file,
-        );
+        if let (Some(inode_info), Some(file)) = (self.inode_info.take(), self.file.take()) {
+            global_inode_table().finish_handle_drop(self.inode_key, inode_info, file);
+        }
     }
 }
 
@@ -2171,6 +2347,214 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as _};
     use std::process::{Child, Stdio};
     use std::process::{Command, Output};
+
+    #[test]
+    fn shm_table_registration_and_orphan_removal_preserve_one_lock_domain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("registration-race-shm");
+        let table = ShmTable::new();
+
+        let old = table
+            .get_or_create_and_register(path.clone(), 1)
+            .expect("register initial owner");
+        old.lock().expect("old SHM state").owner_refs.remove(&1);
+
+        // Model the exact last-close/new-open interleaving: the old owner has
+        // become invisible but has not removed the table entry yet. The new
+        // opener must publish its owner while the table mutex is still held,
+        // so orphan removal cannot pass between lookup and registration.
+        let reopened = table
+            .get_or_create_and_register_with(path.clone(), 2, || {
+                assert!(matches!(
+                    table.map.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            })
+            .expect("register replacement owner");
+        assert!(Arc::ptr_eq(&old, &reopened));
+        table.remove_if_orphaned(&path, &old);
+
+        let mapped = {
+            let map = table.map.lock().expect("SHM table");
+            Arc::clone(map.get(&path).expect("registered state remains mapped"))
+        };
+        assert!(Arc::ptr_eq(&mapped, &reopened));
+        assert_eq!(
+            mapped.lock().expect("mapped SHM state").owner_refs.get(&2),
+            Some(&1)
+        );
+
+        // Also prove that a delayed cleanup from an older file generation can
+        // never erase a newer generation that reused the same pathname.
+        mapped
+            .lock()
+            .expect("mapped SHM state")
+            .owner_refs
+            .remove(&2);
+        table.remove_if_orphaned(&path, &mapped);
+        let replacement = table
+            .get_or_create_and_register(path.clone(), 3)
+            .expect("register new generation");
+        assert!(!Arc::ptr_eq(&old, &replacement));
+        replacement
+            .lock()
+            .expect("replacement SHM state")
+            .owner_refs
+            .remove(&3);
+        table.remove_if_orphaned(&path, &old);
+
+        let map = table.map.lock().expect("SHM table");
+        assert!(Arc::ptr_eq(
+            map.get(&path).expect("new generation remains mapped"),
+            &replacement
+        ));
+    }
+
+    #[test]
+    fn inode_registration_and_final_removal_preserve_one_canonical_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("inode-registration-race.db");
+        fs::write(&path, b"inode").expect("seed inode");
+        let table = InodeTable::new();
+
+        let opened = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open initial descriptor");
+        let key = inode_key_from_file(&opened).expect("initial identity");
+        let (old_info, old_file) = table
+            .register_opened_file(key, opened)
+            .expect("register initial descriptor");
+        old_info.lock().expect("old inode state").n_ref = 0;
+
+        let reopened = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open racing descriptor");
+        let shard_idx = table.shard_idx(key);
+        let (reopened_info, reopened_file) = table
+            .register_opened_file_with(key, reopened, || {
+                assert!(matches!(
+                    table.shards[shard_idx].try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            })
+            .expect("atomically register reopen");
+        assert!(Arc::ptr_eq(&old_info, &reopened_info));
+
+        // Delayed finalization from the old handle must observe the published
+        // reopen and retain the exact canonical generation.
+        table.finish_handle_drop(key, old_info, old_file);
+        let mapped = table.get(key).expect("reopened generation remains mapped");
+        assert!(Arc::ptr_eq(&mapped, &reopened_info));
+        assert_eq!(mapped.lock().expect("mapped inode state").n_ref, 1);
+
+        reopened_info.lock().expect("reopened inode state").n_ref = 0;
+        drop(mapped);
+        table.finish_handle_drop(key, reopened_info, reopened_file);
+        assert!(table.get(key).is_none());
+    }
+
+    #[test]
+    fn redundant_descriptor_close_is_deferred_until_posix_locks_are_gone() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("deferred-redundant-fd.db");
+        setup_sqlite_delete_journal_db(&path);
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+
+        let (mut locked, _) = vfs.open(&cx, Some(&path), flags).expect("open locker");
+        locked
+            .lock(&cx, LockLevel::Shared)
+            .expect("acquire process SHARED");
+        let (mut reopened, _) = vfs.open(&cx, Some(&path), flags).expect("racing reopen");
+
+        {
+            let info = locked.inode_info_ref().lock().expect("shared inode state");
+            assert_eq!(info.n_ref, 2);
+            assert_eq!(
+                info.deferred_close_files.len(),
+                1,
+                "the redundant descriptor must remain open while fcntl locks exist"
+            );
+        }
+
+        if sqlite3_available() {
+            let blocked = sqlite3_exec(&path, "PRAGMA busy_timeout=0; BEGIN EXCLUSIVE; ROLLBACK;");
+            assert!(
+                !blocked.status.success(),
+                "opening the second handle must not silently release the first handle's SHARED lock"
+            );
+        }
+
+        locked
+            .unlock(&cx, LockLevel::None)
+            .expect("release final lock claim");
+        assert!(
+            locked
+                .inode_info_ref()
+                .lock()
+                .expect("shared inode state")
+                .deferred_close_files
+                .is_empty(),
+            "the redundant descriptor should close synchronously with the final unlock"
+        );
+        reopened.close(&cx).expect("close reopen");
+        locked.close(&cx).expect("close locker");
+    }
+
+    #[test]
+    fn same_process_readers_block_exclusive_and_exclusive_blocks_new_readers() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("same-process-lock-conflict.db");
+        let (mut reader, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("create database");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut writer, _) = vfs.open(&cx, Some(&path), flags).expect("open writer");
+
+        reader
+            .lock(&cx, LockLevel::Shared)
+            .expect("acquire local reader");
+        assert!(matches!(
+            writer.lock(&cx, LockLevel::Exclusive),
+            Err(FrankenError::Busy)
+        ));
+        assert_eq!(writer.lock_level, LockLevel::None);
+        {
+            let info = reader.inode_info_ref().lock().expect("shared inode state");
+            assert_eq!(info.n_shared, 1);
+            assert_eq!(info.n_reserved, 0);
+            assert_eq!(info.n_pending, 0);
+            assert_eq!(info.n_exclusive, 0);
+        }
+
+        reader
+            .unlock(&cx, LockLevel::None)
+            .expect("release local reader");
+        writer
+            .lock(&cx, LockLevel::Exclusive)
+            .expect("exclusive succeeds after reader drains");
+
+        let (mut late_reader, _) = vfs.open(&cx, Some(&path), flags).expect("open late reader");
+        assert!(matches!(
+            late_reader.lock(&cx, LockLevel::Shared),
+            Err(FrankenError::Busy)
+        ));
+        writer
+            .unlock(&cx, LockLevel::None)
+            .expect("release exclusive");
+        late_reader
+            .lock(&cx, LockLevel::Shared)
+            .expect("reader succeeds after exclusive drains");
+
+        late_reader.close(&cx).expect("close late reader");
+        writer.close(&cx).expect("close writer");
+        reader.close(&cx).expect("close reader");
+    }
 
     fn assert_invalid_input_error(err: FrankenError, expected_detail: &str) {
         match err {
@@ -2446,7 +2830,7 @@ mod tests {
         file.write(&cx, b"x", 0).unwrap();
 
         let inode_key = file.inode_key;
-        let stale_fd_clone = Arc::clone(&file.file);
+        let stale_fd_clone = Arc::clone(file.file.as_ref().expect("open canonical descriptor"));
         let stale_fd_raw = stale_fd_clone.as_raw_fd();
 
         file.close(&cx).unwrap();
@@ -2687,24 +3071,36 @@ mod tests {
     }
 
     #[test]
-    fn test_unix_vfs_check_reserved_lock() {
+    fn test_unix_vfs_check_reserved_lock_across_same_process_handles() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("check_reserved.db");
 
-        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
-        file.write(&cx, b"data", 0).unwrap();
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        writer.write(&cx, b"data", 0).unwrap();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut observer, _) = vfs.open(&cx, Some(&path), flags).unwrap();
 
-        // No reserved lock held by others.
-        assert!(!file.check_reserved_lock(&cx).unwrap());
+        assert!(!writer.check_reserved_lock(&cx).unwrap());
+        assert!(!observer.check_reserved_lock(&cx).unwrap());
 
-        // If we hold reserved, check_reserved_lock returns false (it's us).
-        file.lock(&cx, LockLevel::Shared).unwrap();
-        file.lock(&cx, LockLevel::Reserved).unwrap();
-        assert!(!file.check_reserved_lock(&cx).unwrap());
+        writer.lock(&cx, LockLevel::Reserved).unwrap();
+        assert!(!writer.check_reserved_lock(&cx).unwrap());
+        assert!(observer.check_reserved_lock(&cx).unwrap());
 
-        file.unlock(&cx, LockLevel::None).unwrap();
-        file.close(&cx).unwrap();
+        writer.lock(&cx, LockLevel::Pending).unwrap();
+        assert!(!writer.check_reserved_lock(&cx).unwrap());
+        assert!(observer.check_reserved_lock(&cx).unwrap());
+
+        writer.lock(&cx, LockLevel::Exclusive).unwrap();
+        assert!(!writer.check_reserved_lock(&cx).unwrap());
+        assert!(observer.check_reserved_lock(&cx).unwrap());
+
+        writer.unlock(&cx, LockLevel::None).unwrap();
+        assert!(!writer.check_reserved_lock(&cx).unwrap());
+        assert!(!observer.check_reserved_lock(&cx).unwrap());
+        observer.close(&cx).unwrap();
+        writer.close(&cx).unwrap();
     }
 
     #[test]

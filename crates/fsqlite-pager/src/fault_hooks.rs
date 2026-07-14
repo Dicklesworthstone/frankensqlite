@@ -70,7 +70,72 @@ struct PagerFaultHookState {
     after_flush_before_publish: Option<OwnedFaultHookArm>,
     during_phase_c: Option<OwnedFaultHookArm>,
     drop_condvar_notify: Option<OwnedFaultHookArm>,
+    vacuum_after_target_page: Option<OwnedFaultHookArm>,
+    vacuum_before_commit_marker: Option<OwnedFaultHookArm>,
     records: Vec<FaultInjectionRecord>,
+}
+
+/// Arm a one-shot failure after VACUUM has overwritten one target page while
+/// the complete rollback journal is hot.
+pub fn arm_vacuum_after_target_page(arm: FaultHookArm) {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(owner_session_id) = current_fault_hook_session_id() else {
+        return;
+    };
+    state.vacuum_after_target_page = Some(OwnedFaultHookArm::new(owner_session_id, arm));
+}
+
+pub(crate) fn maybe_inject_vacuum_after_target_page(page_number: u32) -> Result<()> {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(arm) = take_owned_hook_for_current_thread(&mut state.vacuum_after_target_page) else {
+        return Ok(());
+    };
+    record_trigger(
+        &mut state,
+        &arm,
+        "vacuum_after_target_page",
+        format!("page_number={page_number}"),
+    );
+    Err(FrankenError::Io(std::io::Error::other(format!(
+        "fault_inject:vacuum_after_target_page run_id={} scenario_id={} invariant_family={}",
+        arm.run_id, arm.scenario_id, arm.invariant_family
+    ))))
+}
+
+/// Arm a one-shot failure after the replacement image is fully durable and
+/// verified but before the hot journal is invalidated as the commit marker.
+pub fn arm_vacuum_before_commit_marker(arm: FaultHookArm) {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(owner_session_id) = current_fault_hook_session_id() else {
+        return;
+    };
+    state.vacuum_before_commit_marker = Some(OwnedFaultHookArm::new(owner_session_id, arm));
+}
+
+pub(crate) fn maybe_inject_vacuum_before_commit_marker() -> Result<()> {
+    let mut state = PAGER_FAULT_HOOK_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(arm) = take_owned_hook_for_current_thread(&mut state.vacuum_before_commit_marker)
+    else {
+        return Ok(());
+    };
+    record_trigger(
+        &mut state,
+        &arm,
+        "vacuum_before_commit_marker",
+        "replacement image durable and verified".to_owned(),
+    );
+    Err(FrankenError::Io(std::io::Error::other(format!(
+        "fault_inject:vacuum_before_commit_marker run_id={} scenario_id={} invariant_family={}",
+        arm.run_id, arm.scenario_id, arm.invariant_family
+    ))))
 }
 
 static PAGER_FAULT_HOOK_STATE: LazyLock<Mutex<PagerFaultHookState>> =

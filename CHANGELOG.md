@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.16] -- 2026-07-13 (corruption fixes and namespace-generation hardening)
+## [0.1.16] -- 2026-07-14 (corruption fixes and namespace-generation hardening)
 
 Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
 two low-level helper APIs now expose failure explicitly instead of fabricating
@@ -46,6 +46,42 @@ lossy values.
   regression reproduces the reported leaf geometry, closes FrankenSQLite,
   reopens the database with stock SQLite, and requires all rows plus
   `PRAGMA integrity_check = 'ok'`.
+- **`VACUUM` is now failure-atomic for explicit reserved-prefix indexes and
+  database-image replacement**
+  ([#138](https://github.com/Dicklesworthstone/frankensqlite/issues/138)).
+  `sqlite_autoindex_*` entries are considered implicit only when their stored
+  SQL is `NULL` and their name canonically identifies an autoindex owned by
+  that table, preserving explicit index definitions even under
+  reserved-looking names. Rebuilt images are receipt-bound, reopened, and
+  required to pass both `quick_check` and `integrity_check` before publication.
+  Repeated, shrinking, and non-empty-WAL `VACUUM` operations reopen
+  successfully with both FrankenSQLite and stock SQLite.
+- **Rollback-journal publication and recovery now fail closed under partial
+  writes, silent corruption, cancellation, and cleanup failures.** Candidate
+  images are published in place under cross-process maintenance fencing with a
+  durable rollback journal whose magic remains zero until every preimage is
+  durable. Recovery validates the complete journal before its first database
+  write, then retains the hot journal until the restored database is re-read
+  page-for-page and any caller-specific whole-image receipt is proven. A failed
+  verification preserves the recovery record for a fresh-open retry; a
+  successful recovery invalidates it only after durable restoration.
+- **Native lock registries can no longer split one database generation into
+  two in-process lock domains during a last-close/new-open race.** Unix inode
+  opens publish their reference while holding the table shard and defer closing
+  redundant descriptors until all process-wide `fcntl` claims have drained.
+  Reserved-lock probes consult that coalesced process state before `F_GETLK`,
+  so sibling connections observe local writers as well as other processes.
+  Unix and Windows register SHM owners atomically with table lookup and remove
+  an orphan only when the table still names that exact state object. MemoryVfs
+  uses monotonic process-local file-generation identities and applies the same
+  exact-generation rule during Drop cleanup, so a detached old handle cannot
+  erase a replacement's SHM state or group-commit coordination.
+- Windows rollback-mode connections and full-image maintenance now contend on
+  stock SQLite's real main-file lock ranges; WAL maintenance additionally
+  fences the real `-shm` write/checkpoint bytes and unwinds every acquired
+  range after partial failure. Ordinary Windows WAL `shm_lock` remains
+  process-local and is tracked separately in
+  [#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139).
 - **INSERT OR REPLACE churn rebuilds rootless cursor stacks before structural
   mutation** (bd-kwei8), preventing empty child leaves and stale parent links
   from producing a database image rejected by stock SQLite.

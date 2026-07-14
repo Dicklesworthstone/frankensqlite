@@ -18,8 +18,12 @@ pub mod windows;
 /// helpers rather than calling `std::fs` directly.
 #[cfg(feature = "native")]
 pub mod host_fs {
+    use std::fs::{File, OpenOptions};
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     use fsqlite_error::Result;
 
@@ -38,6 +42,33 @@ pub mod host_fs {
 
     pub fn metadata(path: &Path) -> Result<std::fs::Metadata> {
         Ok(std::fs::metadata(path)?)
+    }
+
+    /// Atomically reserve a new, empty, read-write file at `path`.
+    ///
+    /// This never creates parent directories and never follows or replaces an
+    /// existing final path component: regular files, directories, and both
+    /// live and dangling symlinks all make `create_new` fail. On Unix the
+    /// initial mode is owner-only; the process umask may narrow it further.
+    pub fn reserve_new_file(path: &Path) -> Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        Ok(options.open(path)?)
+    }
+
+    pub fn open_file(path: &Path) -> Result<File> {
+        Ok(File::open(path)?)
+    }
+
+    pub fn rename(from: &Path, to: &Path) -> Result<()> {
+        std::fs::rename(from, to)?;
+        Ok(())
+    }
+
+    pub fn read_link(path: &Path) -> Result<PathBuf> {
+        Ok(std::fs::read_link(path)?)
     }
 
     pub fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -100,7 +131,7 @@ pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub use namespace::{
     DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
-    validate_reserved_database_artifacts,
+    cleanup_abandoned_private_database, validate_reserved_database_artifacts,
 };
 pub use shm::ShmRegion;
 pub use traits::{AsyncVfsDataPath, FileIdentity, SyncKind, Vfs, VfsFile};

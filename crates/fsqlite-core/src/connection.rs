@@ -102,6 +102,7 @@ use fsqlite_func::{
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_pager::ConnectionPagerOpenMode;
+use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
@@ -2413,6 +2414,74 @@ impl PagerBackend {
             Self::Unix(p) => p.finish_namespace_bootstrap(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.finish_namespace_bootstrap(),
+        }
+    }
+
+    fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.capture_vacuum_source_image(cx),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.capture_vacuum_source_image(cx),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.capture_vacuum_source_image(cx),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.capture_vacuum_source_image(cx),
+        }
+    }
+
+    fn inspect_database_image(&self, cx: &Cx, path: &Path) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.inspect_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.inspect_database_image(cx, path),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.inspect_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.inspect_database_image(cx, path),
+        }
+    }
+
+    fn restore_vacuum_candidate_change_counter(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        expected: &DatabaseImageReceipt,
+        change_counter: u32,
+    ) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => {
+                p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+            }
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => {
+                p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+            }
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => {
+                p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+            }
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => {
+                p.restore_vacuum_candidate_change_counter(cx, path, expected, change_counter)
+            }
+        }
+    }
+
+    fn publish_validated_database_image(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        source: &DatabaseImageReceipt,
+        candidate: &DatabaseImageReceipt,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.publish_validated_database_image(cx, path, source, candidate),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.publish_validated_database_image(cx, path, source, candidate),
         }
     }
 
@@ -8960,6 +9029,25 @@ pub struct Connection {
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
+    /// Permanent fail-closed marker installed when an in-place VACUUM has
+    /// durably published its new main-database image but this live connection
+    /// could not rebuild its schema/cache bindings to that committed image.
+    /// Returning the post-commit reload error without poisoning would leave
+    /// stale root-page mappings available to later statements.
+    post_vacuum_rebind_failure: RefCell<Option<String>>,
+    /// One-shot test hook that fails an in-place VACUUM after the rebuilt
+    /// image has reopened and passed both integrity checks but before it is
+    /// published over the source database.
+    #[cfg(test)]
+    fail_vacuum_rebuild_validation_once: Cell<bool>,
+    /// One-shot injection after durable VACUUM publication but before the
+    /// masked connection rebind begins.
+    #[cfg(test)]
+    cancel_vacuum_after_publish_once: Cell<bool>,
+    /// One-shot injection proving a post-publication reload failure poisons
+    /// the old connection while leaving the committed image reopenable.
+    #[cfg(test)]
+    fail_vacuum_rebind_once: Cell<bool>,
     // ── Cx capability context (bd-2g5.6) ──────────────────────────────────────
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
@@ -9531,6 +9619,13 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             pending_local_live_vtab_preserve_once: Cell::new(false),
             closed: RefCell::new(false),
+            post_vacuum_rebind_failure: RefCell::new(None),
+            #[cfg(test)]
+            fail_vacuum_rebuild_validation_once: Cell::new(false),
+            #[cfg(test)]
+            cancel_vacuum_after_publish_once: Cell::new(false),
+            #[cfg(test)]
+            fail_vacuum_rebind_once: Cell::new(false),
             root_cx,
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
@@ -9933,6 +10028,13 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             pending_local_live_vtab_preserve_once: Cell::new(false),
             closed: RefCell::new(false),
+            post_vacuum_rebind_failure: RefCell::new(None),
+            #[cfg(test)]
+            fail_vacuum_rebuild_validation_once: Cell::new(false),
+            #[cfg(test)]
+            cancel_vacuum_after_publish_once: Cell::new(false),
+            #[cfg(test)]
+            fail_vacuum_rebind_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
             eprocess_oracle,
@@ -10036,6 +10138,9 @@ impl Connection {
     /// looking up [`Self::path`]. File-backed Unix connections return `Some`;
     /// memory and backends without a stable descriptor identity return `None`.
     pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        if matches!(&self.pager, PagerBackend::Memory(_)) {
+            return Ok(None);
+        }
         self.pager.file_identity()
     }
 
@@ -10119,6 +10224,11 @@ impl Connection {
 
     /// Return the background-runtime health for this connection's database.
     pub fn background_status(&self) -> Result<()> {
+        if let Some(detail) = self.post_vacuum_rebind_failure.borrow().as_deref() {
+            return Err(FrankenError::Internal(format!(
+                "connection is unusable after a committed VACUUM image could not be rebound: {detail}"
+            )));
+        }
         self._shared_mvcc_state.background_status()
     }
 
@@ -38467,6 +38577,64 @@ impl Connection {
         Ok(())
     }
 
+    fn update_sqlite_master_typed_name_tbl_name_and_sql(
+        &self,
+        type_: &str,
+        old_name: &str,
+        new_name: &str,
+        new_tbl_name: &str,
+        new_sql: &str,
+    ) -> Result<()> {
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, PageNumber::ONE, true)?;
+            if !cursor.first(cx)? {
+                return Err(FrankenError::Internal(format!(
+                    "sqlite_master {type_} entry not found: {old_name}"
+                )));
+            }
+            loop {
+                let rowid = cursor.rowid(cx)?;
+                let payload = cursor.payload(cx)?;
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if let (Some(SqliteValue::Text(row_type)), Some(SqliteValue::Text(row_name))) =
+                    (values.first(), values.get(1))
+                    && row_type.eq_ignore_ascii_case(type_)
+                    && row_name.eq_ignore_ascii_case(old_name)
+                {
+                    let mut updated = values.clone();
+                    if updated.len() < 5 {
+                        updated.resize(5, SqliteValue::Null);
+                    }
+                    updated[1] = SqliteValue::Text(new_name.into());
+                    updated[2] = SqliteValue::Text(new_tbl_name.into());
+                    updated[4] = SqliteValue::Text(new_sql.into());
+                    let record = serialize_record(&updated);
+
+                    cursor.delete(cx)?;
+                    cursor.table_insert(cx, rowid, &record)?;
+                    return Ok(());
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+            Err(FrankenError::Internal(format!(
+                "sqlite_master {type_} entry not found: {old_name}"
+            )))
+        })?;
+        if !type_.eq_ignore_ascii_case("trigger") {
+            let mut ddl_cache = self.original_ddl_sql.borrow_mut();
+            ddl_cache.remove(&old_name.to_ascii_lowercase());
+            ddl_cache.insert(new_name.to_ascii_lowercase(), new_sql.to_owned());
+        }
+        Ok(())
+    }
+
     fn sqlite_sequence_root_page(&self) -> Option<i32> {
         let idx = self.schema_index_of("sqlite_sequence")?;
         self.schema.borrow().get(idx).map(|t| t.root_page)
@@ -40661,6 +40829,9 @@ impl Connection {
                 }
                 renamed_table.name.clone_from(new_name);
                 for index in &mut renamed_table.indexes {
+                    if !self.index_is_implicit_autoindex(&index.name, &old_name) {
+                        continue;
+                    }
                     let Some(ordinal) = parse_autoindex_ordinal(&index.name, &old_name) else {
                         continue;
                     };
@@ -41104,18 +41275,21 @@ impl Connection {
             }
         }
 
-        let create_sql =
-            render_create_table_sql(&new_schema, self.is_autoincrement_table(&new_schema.name));
+        let create_sql = render_create_table_sql(
+            &new_schema,
+            self.is_autoincrement_table(&new_schema.name),
+            |index| self.index_is_implicit_autoindex(&index.name, &new_schema.name),
+        );
 
         if matches!(alter.action, AlterTableAction::RenameTo(_)) {
-            // RENAME TO changes the name/tbl_name columns, so we must
-            // delete the old row and insert a new one.
-            self.delete_sqlite_master_typed_row("table", &old_name)?;
-            self.insert_sqlite_master_row(
+            // Preserve the table rowid while changing name/tbl_name/sql.
+            // Re-inserting the table after its index rows makes stock SQLite
+            // parse CREATE INDEX before CREATE TABLE on the next reopen.
+            self.update_sqlite_master_typed_name_tbl_name_and_sql(
                 "table",
+                &old_name,
                 &new_schema.name,
                 &new_schema.name,
-                new_schema.root_page,
                 &create_sql,
             )?;
 
@@ -41132,7 +41306,7 @@ impl Connection {
                     )?;
                 }
                 for index in &new_schema.indexes {
-                    if is_implicit_autoindex_name(&index.name) {
+                    if self.index_is_implicit_autoindex(&index.name, new_name) {
                         continue;
                     }
                     let idx_sql = render_create_index_sql(index, new_name);
@@ -41154,7 +41328,7 @@ impl Connection {
             self.update_sqlite_master_typed_sql("table", &old_name, &create_sql)?;
             if matches!(alter.action, AlterTableAction::RenameColumn { .. }) {
                 for index in &new_schema.indexes {
-                    if is_implicit_autoindex_name(&index.name) {
+                    if self.index_is_implicit_autoindex(&index.name, &new_schema.name) {
                         continue;
                     }
                     let idx_sql = render_create_index_sql(index, &new_schema.name);
@@ -41166,6 +41340,7 @@ impl Connection {
             let create_sql = render_create_table_sql(
                 dependent_table,
                 self.is_autoincrement_table(&dependent_table.name),
+                |index| self.index_is_implicit_autoindex(&index.name, &dependent_table.name),
             );
             self.update_sqlite_master_typed_sql("table", &dependent_table.name, &create_sql)?;
         }
@@ -41602,6 +41777,114 @@ impl Connection {
             .map(|_| ())
     }
 
+    fn validate_vacuum_rebuild(
+        &self,
+        rebuild_target: &crate::vacuum::VacuumTargetReservation,
+    ) -> Result<()> {
+        let rebuild_path_text =
+            rebuild_target
+                .path()
+                .to_str()
+                .ok_or_else(|| FrankenError::CannotOpen {
+                    path: rebuild_target.path().to_owned(),
+                })?;
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let validation_conn = Self::open_schema_only_with_expected_identity(
+            rebuild_path_text.to_owned(),
+            rebuild_target.identity(),
+        )
+        .map_err(|err| {
+            FrankenError::Internal(format!(
+                "VACUUM rebuilt image failed identity-bound pre-publication schema reload: {err}"
+            ))
+        })?;
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        let validation_conn =
+            Self::open_schema_only(rebuild_path_text.to_owned()).map_err(|err| {
+                FrankenError::Internal(format!(
+                    "VACUUM rebuilt image failed pre-publication schema reload: {err}"
+                ))
+            })?;
+
+        let validation_result = (|| {
+            for pragma in ["quick_check", "integrity_check"] {
+                let rows = validation_conn.query(&format!("PRAGMA {pragma};"))?;
+                let passed = rows.len() == 1
+                    && matches!(
+                        rows[0].values().first(),
+                        Some(SqliteValue::Text(message)) if message.eq_ignore_ascii_case("ok")
+                    );
+                if !passed {
+                    let details = rows
+                        .iter()
+                        .map(|row| {
+                            row.values()
+                                .first()
+                                .map_or_else(|| "<empty row>".to_owned(), SqliteValue::to_text)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "VACUUM rebuilt image failed pre-publication {pragma}: {details}"
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        })();
+        let close_result = validation_conn.close();
+        validation_result?;
+        close_result?;
+
+        #[cfg(test)]
+        if self.fail_vacuum_rebuild_validation_once.replace(false) {
+            return Err(FrankenError::Internal(
+                "injected VACUUM rebuilt-image validation failure".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Rebind every connection-local cache and schema mapping after the new
+    /// VACUUM image is already durable. Cancellation is masked because the
+    /// operation is no longer optional: exposing stale root-page bindings
+    /// after publication is more dangerous than delaying cancellation until
+    /// the connection is coherent again.
+    fn rebind_after_committed_vacuum(
+        &self,
+        parent_cx: &Cx,
+        restore_hydrated_rows: bool,
+    ) -> Result<()> {
+        let rebind_cx = parent_cx.create_child();
+        let _rebind_mask = rebind_cx.masked();
+        self.clear_compilation_reuse_caches();
+        self.invalidate_cached_read_snapshot(&rebind_cx);
+        self.invalidate_cached_write_txn(&rebind_cx);
+
+        #[cfg(test)]
+        let rebind_result = if self.fail_vacuum_rebind_once.replace(false) {
+            Err(FrankenError::Internal(
+                "injected post-publication VACUUM rebind failure".to_owned(),
+            ))
+        } else {
+            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows)
+        };
+        #[cfg(not(test))]
+        let rebind_result =
+            self.reload_memdb_from_pager_with_mode(&rebind_cx, restore_hydrated_rows);
+
+        if let Err(error) = rebind_result {
+            let detail = error.to_string();
+            *self.post_vacuum_rebind_failure.borrow_mut() = Some(detail.clone());
+            return Err(FrankenError::Internal(format!(
+                "VACUUM committed successfully, but the live connection could not be rebound and has been poisoned: {detail}"
+            )));
+        }
+        Ok(())
+    }
+
     fn execute_vacuum(
         &self,
         vacuum_stmt: &fsqlite_ast::VacuumStatement,
@@ -41645,7 +41928,11 @@ impl Connection {
             self.pager.checkpoint(&cx, CheckpointMode::Truncate)?;
         }
 
-        let target_path = if let Some(into_expr) = vacuum_stmt.into.as_ref() {
+        // Evaluate the INTO expression before touching the source, but defer
+        // filesystem reservation until every source-side read has succeeded.
+        // Otherwise an unrelated schema/header failure could strand an empty
+        // user-visible output file.
+        let target_value = if let Some(into_expr) = vacuum_stmt.into.as_ref() {
             let mut bound_expr = into_expr.clone();
             if let Some(bound_params) = params {
                 let mut bind_state = BindParamState::default();
@@ -41656,55 +41943,200 @@ impl Connection {
             let empty_col_map: Vec<(String, String, bool)> = Vec::new();
             let target_value =
                 self.eval_expr_with_subqueries(&bound_expr, &empty_row, &empty_col_map, None)?;
-            let target_path = crate::vacuum::resolve_vacuum_into_target(&self.path, &target_value)?;
-            Some(target_path)
+            Some(target_value)
         } else {
             None
         };
 
+        let source_receipt = if target_value.is_none() && self.path != ":memory:" {
+            Some(self.pager.capture_vacuum_source_image(&cx)?)
+        } else {
+            None
+        };
         let restore_hydrated_rows = self.memdb_rows_loaded.get();
-        let source_header = self.current_database_header(&cx)?;
+        let source_header = match source_receipt.as_ref() {
+            Some(receipt) => receipt.header().clone(),
+            None => self.current_database_header(&cx)?,
+        };
         self.reload_memdb_from_pager_with_mode(&cx, true)?;
         let extra_master_entries = self.vacuum_extra_sqlite_master_entries();
+        let target_reservation = target_value
+            .as_ref()
+            .map(|target_value| {
+                crate::vacuum::resolve_vacuum_into_target(&cx, &self.path, target_value)
+            })
+            .transpose()?;
+        let rebuild_target = if target_reservation.is_none() && self.path != ":memory:" {
+            Some(crate::vacuum::reserve_temp_rebuild_target(
+                &cx,
+                Path::new(&self.path),
+            )?)
+        } else {
+            None
+        };
 
-        {
+        let persistence_result = {
             let schema = self.schema.borrow();
             let db = self.db.borrow();
             let ddl = self.original_ddl_sql.borrow();
 
-            if let Some(target_path) = target_path.as_ref() {
+            if let Some(target) = target_reservation.as_ref() {
                 crate::vacuum::persist_compacted_database(
                     &cx,
-                    target_path,
+                    target,
                     &schema,
                     &db,
                     &source_header,
                     &extra_master_entries,
                     &ddl,
-                )?;
-            } else if self.path != ":memory:" {
+                )
+            } else if let Some(rebuild_target) = rebuild_target.as_ref() {
                 let mut rebuilt_header = source_header.clone();
                 rebuilt_header.change_counter =
                     rebuilt_header.change_counter.wrapping_add(1).max(1);
                 rebuilt_header.schema_cookie = rebuilt_header.schema_cookie.wrapping_add(1).max(1);
                 rebuilt_header.version_valid_for = rebuilt_header.change_counter;
-                let rebuild_path = crate::vacuum::temp_rebuild_path(Path::new(&self.path));
                 crate::vacuum::persist_compacted_database(
                     &cx,
-                    &rebuild_path,
+                    rebuild_target,
                     &schema,
                     &db,
                     &rebuilt_header,
                     &extra_master_entries,
                     &ddl,
-                )?;
-                crate::vacuum::replace_database_file(Path::new(&self.path), &rebuild_path)?;
+                )
+            } else {
+                Ok(())
+            }
+        };
+
+        if let Err(error) = persistence_result {
+            if let Some(target) = target_reservation.as_ref().or(rebuild_target.as_ref())
+                && let Err(cleanup_error) = target.cleanup_if_owned(&cx)
+            {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    path = %target.path().display(),
+                    "VACUUM persistence failed and exact-reservation cleanup also failed"
+                );
+            }
+            return Err(error);
+        }
+
+        if let Some(target) = target_reservation.as_ref() {
+            match target.kind() {
+                crate::vacuum::VacuumTargetKind::UserOutput => {
+                    if let Err(error) = self.validate_vacuum_rebuild(target) {
+                        if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                            tracing::warn!(
+                                error = %cleanup_error,
+                                path = %target.path().display(),
+                                "VACUUM INTO validation failed and exact-reservation cleanup also failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+                    if let Err(error) = target.finish_user_output(&cx) {
+                        if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                            tracing::warn!(
+                                error = %cleanup_error,
+                                path = %target.path().display(),
+                                "VACUUM INTO finalization failed and exact-reservation cleanup also failed"
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
+                crate::vacuum::VacuumTargetKind::Discard => {
+                    if !target.cleanup_if_owned(&cx)? {
+                        return Err(FrankenError::CannotOpen {
+                            path: target.path().to_owned(),
+                        });
+                    }
+                }
+                crate::vacuum::VacuumTargetKind::InternalRebuild => {
+                    return Err(FrankenError::internal(
+                        "internal VACUUM rebuild target used as an INTO output",
+                    ));
+                }
             }
         }
 
-        if target_path.is_none() && self.path != ":memory:" {
-            self.clear_compilation_reuse_caches();
+        if let Some(rebuild_target) = rebuild_target.as_ref() {
+            let source_receipt = source_receipt.as_ref().ok_or_else(|| {
+                FrankenError::internal("VACUUM source image receipt was not captured")
+            })?;
+            let persisted_candidate = self
+                .pager
+                .inspect_database_image(&cx, rebuild_target.path())?;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            if persisted_candidate.identity() != rebuild_target.identity() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM rebuilt image no longer has its reserved identity".to_owned(),
+                });
+            }
+            let expected_change_counter = source_receipt
+                .header()
+                .change_counter
+                .wrapping_add(1)
+                .max(1);
+            let restored_candidate = self.pager.restore_vacuum_candidate_change_counter(
+                &cx,
+                rebuild_target.path(),
+                &persisted_candidate,
+                expected_change_counter,
+            )?;
+            self.validate_vacuum_rebuild(rebuild_target)?;
+            let candidate_receipt = self
+                .pager
+                .inspect_database_image(&cx, rebuild_target.path())?;
+            if candidate_receipt != restored_candidate {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM rebuilt image changed during semantic validation".to_owned(),
+                });
+            }
+            if candidate_receipt.header().change_counter != expected_change_counter
+                || candidate_receipt.header().version_valid_for != expected_change_counter
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM rebuilt image lost source-derived change-counter provenance: change_counter={}, version_valid_for={}, expected={expected_change_counter}",
+                        candidate_receipt.header().change_counter,
+                        candidate_receipt.header().version_valid_for
+                    ),
+                });
+            }
+            self.pager.publish_validated_database_image(
+                &cx,
+                rebuild_target.path(),
+                source_receipt,
+                &candidate_receipt,
+            )?;
+
+            #[cfg(test)]
+            if self.cancel_vacuum_after_publish_once.replace(false) {
+                cx.cancel();
+            }
+
+            let cleanup_cx = cx.create_child();
+            let _cleanup_mask = cleanup_cx.masked();
+            match rebuild_target.cleanup_if_owned(&cleanup_cx) {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    path = %rebuild_target.path().display(),
+                    "VACUUM committed but the rebuild pathname no longer names its reserved identity; preserving the replacement"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    path = %rebuild_target.path().display(),
+                    "VACUUM committed but could not remove its identity-bound rebuild image"
+                ),
+            }
+            drop(_cleanup_mask);
+            self.rebind_after_committed_vacuum(&cx, restore_hydrated_rows)?;
+            return Ok(());
         }
+
         self.invalidate_cached_read_snapshot(&cx);
         self.invalidate_cached_write_txn(&cx);
         self.reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows)?;
@@ -44165,7 +44597,16 @@ impl Connection {
             let table_sql = ddl_cache
                 .get(&table.name.to_ascii_lowercase())
                 .cloned()
-                .unwrap_or_else(|| render_create_table_sql(table, is_autoincrement));
+                .unwrap_or_else(|| {
+                    render_create_table_sql(table, is_autoincrement, |index| {
+                        let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                        is_implicit_autoindex_entry(
+                            &index.name,
+                            &table.name,
+                            original_sql.map(String::as_str),
+                        )
+                    })
+                });
 
             rows.push(vec![
                 SqliteValue::Text("table".into()),
@@ -44176,12 +44617,16 @@ impl Connection {
             ]);
 
             for index in &table.indexes {
-                let index_sql = if is_implicit_autoindex_name(&index.name) {
+                let original_sql = ddl_cache.get(&index.name.to_ascii_lowercase());
+                let index_sql = if is_implicit_autoindex_entry(
+                    &index.name,
+                    &table.name,
+                    original_sql.map(String::as_str),
+                ) {
                     SqliteValue::Null
                 } else {
                     // Prefer cached original SQL for explicit indexes.
-                    let sql = ddl_cache
-                        .get(&index.name.to_ascii_lowercase())
+                    let sql = original_sql
                         .cloned()
                         .unwrap_or_else(|| render_create_index_sql(index, &table.name));
                     SqliteValue::Text(sql.into())
@@ -44221,6 +44666,12 @@ impl Connection {
         }
 
         rows
+    }
+
+    fn index_is_implicit_autoindex(&self, index_name: &str, table_name: &str) -> bool {
+        let ddl_cache = self.original_ddl_sql.borrow();
+        let original_sql = ddl_cache.get(&index_name.to_ascii_lowercase());
+        is_implicit_autoindex_entry(index_name, table_name, original_sql.map(String::as_str))
     }
 
     #[cfg(test)]
@@ -49135,7 +49586,8 @@ impl Connection {
                             .rev()
                             .enumerate()
                             .map(|(seq, idx)| {
-                                let origin = if idx.name.starts_with("sqlite_autoindex_") {
+                                let origin = if self.index_is_implicit_autoindex(&idx.name, &t.name)
+                                {
                                     let is_pk = t.primary_key_constraints.iter().any(|pk_cols| {
                                         pk_cols.len() == idx.columns.len()
                                             && pk_cols
@@ -66371,7 +66823,14 @@ pub(crate) fn maybe_quote_ident(name: &str) -> String {
     }
 }
 
-fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> String {
+fn render_create_table_sql<F>(
+    table: &TableSchema,
+    is_autoincrement: bool,
+    is_implicit_autoindex: F,
+) -> String
+where
+    F: Fn(&IndexSchema) -> bool,
+{
     let is_single_column_primary_key = |column_name: &str| {
         table
             .primary_key_constraints
@@ -66437,6 +66896,9 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
             continue;
         }
         if primary_key_matches_index(index) {
+            continue;
+        }
+        if !is_implicit_autoindex(index) {
             continue;
         }
         // Single-column UNIQUE constraints are already rendered inline above.
@@ -73738,11 +74200,12 @@ fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> 
     let index_name_lower = index_name.to_ascii_lowercase();
     let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
     let suffix = index_name_lower.strip_prefix(&prefix)?;
-    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+    if suffix.is_empty() || suffix.starts_with('0') || !suffix.chars().all(|ch| ch.is_ascii_digit())
+    {
         return None;
     }
     let ordinal = suffix.parse::<usize>().ok()?;
-    if ordinal == 0 { None } else { Some(ordinal) }
+    (ordinal.to_string() == suffix).then_some(ordinal)
 }
 
 fn implicit_index_definitions_from_create_table_sql(
@@ -84281,8 +84744,8 @@ fn sqlite_master_sql_text(row: &[SqliteValue]) -> Result<Option<&str>> {
     }
 }
 
-fn is_implicit_autoindex_name(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("sqlite_autoindex_")
+fn is_implicit_autoindex_entry(name: &str, table_name: &str, sql: Option<&str>) -> bool {
+    sql.is_none() && parse_autoindex_ordinal(name, table_name).is_some()
 }
 
 fn is_virtual_table_sql(sql: &str) -> bool {
@@ -84485,16 +84948,15 @@ fn is_without_rowid_table_sql(sql: &str) -> bool {
 }
 
 fn should_ignore_expected_master_row_for_integrity(row: &[SqliteValue]) -> Result<bool> {
-    let (entry_type, name, _, _) = sqlite_master_signature(row)?;
-    Ok(entry_type == "index" && is_implicit_autoindex_name(&name))
+    let (entry_type, name, table_name, _) = sqlite_master_signature(row)?;
+    Ok(entry_type == "index"
+        && is_implicit_autoindex_entry(&name, &table_name, sqlite_master_sql_text(row)?))
 }
 
 fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<bool> {
-    let (entry_type, name, _, _) = sqlite_master_signature(row)?;
-    if entry_type == "index" && is_implicit_autoindex_name(&name) {
-        return Ok(true);
-    }
-    Ok(false)
+    let (entry_type, name, table_name, _) = sqlite_master_signature(row)?;
+    Ok(entry_type == "index"
+        && is_implicit_autoindex_entry(&name, &table_name, sqlite_master_sql_text(row)?))
 }
 
 /// Live, transaction-backed [`Fts5OnDiskReader`]: point/range reads of a
@@ -91670,7 +92132,7 @@ mod tests {
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
         PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
         SharedRuntimeState, SimplePager, Snapshot, init_global_runtime,
-        is_sqlite_master_entry_missing, join_hidden_rowid_projection,
+        is_implicit_autoindex_entry, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
         join_table_supports_hidden_rowid, lock_unpoisoned, memdb_row_matches_like_fast_path,
         statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
@@ -92011,6 +92473,51 @@ mod tests {
         fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
             vec![("label".to_owned(), 'T'), ("score".to_owned(), 'I')]
         }
+    }
+
+    #[test]
+    fn test_implicit_autoindex_classification_requires_provenance_and_canonical_mapping() {
+        assert!(is_implicit_autoindex_entry(
+            "sqlite_autoindex_link_table_1",
+            "link_table",
+            None
+        ));
+        assert!(!is_implicit_autoindex_entry(
+            "sqlite_autoindex_link_table_1",
+            "link_table",
+            Some("CREATE UNIQUE INDEX explicit_name ON link_table(a,b)")
+        ));
+        assert!(!is_implicit_autoindex_entry(
+            "sqlite_autoindex_link_table_v23_1",
+            "link_table",
+            None
+        ));
+        assert!(!is_implicit_autoindex_entry(
+            "sqlite_autoindex_other_table_1",
+            "link_table",
+            None
+        ));
+        assert!(!is_implicit_autoindex_entry(
+            "sqlite_autoindex_link_table_0",
+            "link_table",
+            None
+        ));
+        for noncanonical in [
+            "sqlite_autoindex_link_table_01",
+            "sqlite_autoindex_link_table_+1",
+            "sqlite_autoindex_link_table_١",
+        ] {
+            assert!(
+                !is_implicit_autoindex_entry(noncanonical, "link_table", None),
+                "{noncanonical} must not be classified as a canonical implicit autoindex"
+            );
+        }
+        let overflowing = format!("sqlite_autoindex_link_table_{}0", usize::MAX);
+        assert!(!is_implicit_autoindex_entry(
+            &overflowing,
+            "link_table",
+            None
+        ));
     }
 
     #[test]
@@ -108381,6 +108888,63 @@ mod tests {
 
     // ── VACUUM / ANALYZE / REINDEX coverage ──
 
+    const LEGACY_RESERVED_INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
+    const LEGACY_RESERVED_INDEX_SQL: &str = "CREATE UNIQUE INDEX \
+        \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)";
+    const CANONICAL_RESERVED_INDEX_NAME: &str = "sqlite_autoindex_link_table_1";
+    const CANONICAL_RESERVED_INDEX_SQL: &str = "CREATE UNIQUE INDEX \
+        \"sqlite_autoindex_link_table_1\" ON \"link_table\"(b)";
+
+    fn create_explicit_reserved_prefix_index_fixture(
+        path: &Path,
+        table_sql: &str,
+        index_columns: &str,
+        index_name: &str,
+        index_sql: &str,
+    ) {
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        sqlite
+            .execute_batch(&format!(
+                r"
+                {table_sql};
+                CREATE UNIQUE INDEX legacy_unique ON link_table({index_columns});
+                INSERT INTO link_table VALUES (1,2), (3,4);
+                PRAGMA writable_schema=ON;
+                UPDATE sqlite_master
+                   SET name='{index_name}',
+                       sql='{index_sql}'
+                 WHERE type='index' AND name='legacy_unique';
+                PRAGMA schema_version=2;
+                "
+            ))
+            .unwrap();
+        drop(sqlite);
+
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+    }
+
+    fn create_legacy_reserved_prefix_index_fixture(path: &Path) {
+        create_explicit_reserved_prefix_index_fixture(
+            path,
+            "CREATE TABLE link_table(\
+                a INTEGER NOT NULL,\
+                b INTEGER NOT NULL,\
+                PRIMARY KEY(a,b)\
+            )",
+            "a,b",
+            LEGACY_RESERVED_INDEX_NAME,
+            LEGACY_RESERVED_INDEX_SQL,
+        );
+    }
+
     #[test]
     fn test_vacuum() {
         let conn = Connection::open(":memory:").unwrap();
@@ -108391,6 +108955,623 @@ mod tests {
         // Data should be unaffected.
         let rows = conn.query("SELECT * FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_vacuum_preserves_explicit_reserved_prefix_index_across_reopen() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-reserved-prefix.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        create_legacy_reserved_prefix_index_fixture(&db_path);
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        let schema_rows = conn
+            .query(&format!(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='{LEGACY_RESERVED_INDEX_NAME}';"
+            ))
+            .unwrap();
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(
+            schema_rows[0].values()[0],
+            SqliteValue::Text(LEGACY_RESERVED_INDEX_SQL.into())
+        );
+
+        conn.execute("VACUUM;").unwrap();
+        let quick_check = conn.query("PRAGMA quick_check;").unwrap();
+        let integrity_check = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(quick_check[0].values()[0], SqliteValue::Text("ok".into()));
+        assert_eq!(
+            integrity_check[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let stored_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1;",
+                [LEGACY_RESERVED_INDEX_NAME],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored_sql, LEGACY_RESERVED_INDEX_SQL);
+        assert_eq!(row_count, 2);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        drop(sqlite);
+
+        let reopened = Connection::open_schema_only(&db_path_text).unwrap();
+        let rows = reopened.query("SELECT COUNT(*) FROM link_table;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        let schema_rows = reopened
+            .query(&format!(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='{LEGACY_RESERVED_INDEX_NAME}';"
+            ))
+            .unwrap();
+        assert_eq!(
+            schema_rows[0].values()[0],
+            SqliteValue::Text(LEGACY_RESERVED_INDEX_SQL.into())
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_alter_table_updates_explicit_reserved_prefix_index_definition() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alter-reserved-prefix.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        create_legacy_reserved_prefix_index_fixture(&db_path);
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        let index_list = conn.query("PRAGMA index_list('link_table');").unwrap();
+        let explicit_entry = index_list
+            .iter()
+            .find(|row| row.values()[1].to_text() == LEGACY_RESERVED_INDEX_NAME)
+            .expect("reserved-prefix explicit index must be listed");
+        assert_eq!(explicit_entry.values()[3], SqliteValue::Text("c".into()));
+        conn.execute("ALTER TABLE link_table RENAME COLUMN a TO left_id;")
+            .unwrap();
+        conn.execute("ALTER TABLE link_table RENAME TO renamed_link;")
+            .unwrap();
+        let schema_rows = conn
+            .query(&format!(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name='{LEGACY_RESERVED_INDEX_NAME}';"
+            ))
+            .unwrap();
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(
+            schema_rows[0].values()[0],
+            SqliteValue::Text("renamed_link".into())
+        );
+        let SqliteValue::Text(index_sql) = &schema_rows[0].values()[1] else {
+            panic!("explicit reserved-prefix index lost its CREATE INDEX definition");
+        };
+        assert!(index_sql.contains("renamed_link"), "{index_sql}");
+        assert!(index_sql.contains("left_id"), "{index_sql}");
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let stored: (String, String) = sqlite
+            .query_row(
+                "SELECT tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?1;",
+                [LEGACY_RESERVED_INDEX_NAME],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored.0, "renamed_link");
+        assert!(stored.1.contains("renamed_link"), "{}", stored.1);
+        assert!(stored.1.contains("left_id"), "{}", stored.1);
+        assert_eq!(integrity_check, "ok");
+    }
+
+    #[test]
+    fn test_alter_table_rename_preserves_explicit_canonical_autoindex_definition() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alter-canonical-reserved-prefix.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        create_explicit_reserved_prefix_index_fixture(
+            &db_path,
+            "CREATE TABLE link_table(a INTEGER PRIMARY KEY, b INTEGER NOT NULL)",
+            "b",
+            CANONICAL_RESERVED_INDEX_NAME,
+            CANONICAL_RESERVED_INDEX_SQL,
+        );
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        let index_list = conn.query("PRAGMA index_list('link_table');").unwrap();
+        let explicit_entry = index_list
+            .iter()
+            .find(|row| row.values()[1].to_text() == CANONICAL_RESERVED_INDEX_NAME)
+            .expect("canonical reserved-name explicit index must be listed");
+        assert_eq!(explicit_entry.values()[3], SqliteValue::Text("c".into()));
+
+        conn.execute("ALTER TABLE link_table RENAME TO renamed_link;")
+            .unwrap();
+        let schema_rows = conn
+            .query(&format!(
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index' AND name='{CANONICAL_RESERVED_INDEX_NAME}';"
+            ))
+            .unwrap();
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(
+            schema_rows[0].values()[0],
+            SqliteValue::Text(CANONICAL_RESERVED_INDEX_NAME.into())
+        );
+        assert_eq!(
+            schema_rows[0].values()[1],
+            SqliteValue::Text("renamed_link".into())
+        );
+        let SqliteValue::Text(index_sql) = &schema_rows[0].values()[2] else {
+            panic!("explicit canonical reserved-name index lost its CREATE INDEX definition");
+        };
+        assert!(
+            index_sql.contains(CANONICAL_RESERVED_INDEX_NAME),
+            "{index_sql}"
+        );
+        assert!(index_sql.contains("renamed_link"), "{index_sql}");
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let stored: (String, String, String) = sqlite
+            .query_row(
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index' AND name=?1;",
+                [CANONICAL_RESERVED_INDEX_NAME],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored.0, CANONICAL_RESERVED_INDEX_NAME);
+        assert_eq!(stored.1, "renamed_link");
+        assert!(stored.2.contains("renamed_link"), "{}", stored.2);
+        assert_eq!(integrity_check, "ok");
+    }
+
+    #[test]
+    fn test_vacuum_validation_failure_keeps_source_main_file_byte_identical() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-validation-failure.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        create_legacy_reserved_prefix_index_fixture(&db_path);
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        let before = std::fs::read(&db_path).unwrap();
+        let before_hash = blake3::hash(&before);
+        let before_header = fsqlite_types::DatabaseHeader::from_bytes(
+            before[..fsqlite_types::DATABASE_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        conn.fail_vacuum_rebuild_validation_once.set(true);
+        let err = conn
+            .execute("VACUUM;")
+            .expect_err("injected rebuilt-image validation must fail VACUUM");
+        assert!(
+            err.to_string()
+                .contains("injected VACUUM rebuilt-image validation failure"),
+            "unexpected validation failure: {err}"
+        );
+
+        let rebuild_prefix = format!(
+            "{}.fsqlite-vacuum-rebuild-",
+            db_path.file_name().unwrap().to_string_lossy()
+        );
+        let retained_rebuilds = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(&rebuild_prefix) && name.ends_with(".tmp")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_rebuilds.len(), 1, "{retained_rebuilds:?}");
+        let rebuild_path = &retained_rebuilds[0];
+        let rebuilt = std::fs::read(rebuild_path).unwrap();
+        let rebuilt_header = fsqlite_types::DatabaseHeader::from_bytes(
+            rebuilt[..fsqlite_types::DATABASE_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let expected_change_counter = before_header.change_counter.wrapping_add(1).max(1);
+        assert_eq!(rebuilt_header.change_counter, expected_change_counter);
+        assert_eq!(rebuilt_header.version_valid_for, expected_change_counter);
+
+        let after = std::fs::read(&db_path).unwrap();
+        let after_hash = blake3::hash(&after);
+        assert_eq!(after_hash, before_hash);
+        assert_eq!(after, before);
+        let rows = conn.query("SELECT COUNT(*) FROM link_table;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        assert!(
+            conn.execute("INSERT INTO link_table VALUES (1,2);")
+                .is_err(),
+            "the source database must retain its effective uniqueness constraints"
+        );
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        assert_eq!(row_count, 2);
+    }
+
+    #[test]
+    fn test_vacuum_into_validation_failure_removes_only_exact_reserved_output() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-into-validation-source.db");
+        let target_path = dir.path().join("vacuum-into-validation-output.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let target_path_text = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+        conn.fail_vacuum_rebuild_validation_once.set(true);
+        let error = conn
+            .execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_text.into())],
+            )
+            .expect_err("an output that fails semantic validation must not report success");
+        assert!(
+            error
+                .to_string()
+                .contains("injected VACUUM rebuilt-image validation failure"),
+            "{error}"
+        );
+        assert!(
+            !target_path.exists(),
+            "failed output validation must remove the exact reservation"
+        );
+        let rows = conn.query("SELECT COUNT(*) FROM items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_vacuum_masks_cancellation_after_publication_and_rebinds_live_connection() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-postcommit-cancel.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+        conn.cancel_vacuum_after_publish_once.set(true);
+
+        conn.execute("VACUUM;")
+            .expect("post-publication cancellation must not interrupt mandatory rebind");
+        {
+            // Operation contexts clone the connection root, so the injected
+            // cancellation remains observable to later work. Mask it only for
+            // this assertion that the live connection was nevertheless fully
+            // rebound to the committed image.
+            let _inspection_mask = conn.root_cx().masked();
+            let rows = conn
+                .query("SELECT id, value FROM items ORDER BY id;")
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+            assert!(conn.post_vacuum_rebind_failure.borrow().is_none());
+        }
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        let count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM items;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(count, 2);
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".fsqlite-vacuum-rebuild-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn test_vacuum_postcommit_rebind_failure_poison_is_fail_closed_but_image_is_valid() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-postcommit-poison.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+        conn.fail_vacuum_rebind_once.set(true);
+
+        let error = conn
+            .execute("VACUUM;")
+            .expect_err("injected committed-image rebind failure must poison the old connection");
+        let message = error.to_string();
+        assert!(
+            message.contains("VACUUM committed successfully"),
+            "{message}"
+        );
+        assert!(message.contains("poisoned"), "{message}");
+        let subsequent = conn
+            .query("SELECT COUNT(*) FROM items;")
+            .expect_err("a stale post-VACUUM connection must reject all later statements");
+        assert!(
+            subsequent
+                .to_string()
+                .contains("connection is unusable after a committed VACUUM image"),
+            "{subsequent}"
+        );
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        let count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM items;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(count, 2);
+
+        let reopened = Connection::open(&db_path_text).unwrap();
+        let rows = reopened.query("SELECT COUNT(*) FROM items;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_vacuum_twice_on_same_live_connection_reopens_in_both_engines() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-twice-live.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta'),(3,'gamma');")
+            .unwrap();
+
+        for cycle in 1..=2 {
+            conn.execute("VACUUM;").unwrap();
+            let rows = conn
+                .query("SELECT id, value FROM items ORDER BY id;")
+                .unwrap();
+            assert_eq!(rows.len(), 3, "VACUUM cycle {cycle}");
+            let quick_check = conn.query("PRAGMA quick_check;").unwrap();
+            let integrity_check = conn.query("PRAGMA integrity_check;").unwrap();
+            assert_eq!(
+                quick_check[0].values()[0],
+                SqliteValue::Text("ok".into()),
+                "VACUUM cycle {cycle}"
+            );
+            assert_eq!(
+                integrity_check[0].values()[0],
+                SqliteValue::Text("ok".into()),
+                "VACUUM cycle {cycle}"
+            );
+        }
+        conn.execute("INSERT INTO items VALUES (4,'delta');")
+            .unwrap();
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM items;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 4);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        drop(sqlite);
+
+        let reopened = Connection::open_schema_only(&db_path_text).unwrap();
+        let rows = reopened
+            .query("SELECT id, value FROM items ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].values()[1], SqliteValue::Text("delta".into()));
+        assert_eq!(
+            reopened.query("PRAGMA quick_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        assert_eq!(
+            reopened.query("PRAGMA integrity_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_vacuum_shrinks_file_and_live_connection_remains_usable() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-shrink-live.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open_with_page_size(&db_path_text, 1024).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute("PRAGMA journal_mode = 'delete';").unwrap();
+        conn.execute("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        let payload = "x".repeat(1_800);
+        for id in 1..=400_i64 {
+            conn.execute_with_params(
+                "INSERT INTO payloads(id, payload) VALUES (?1, ?2);",
+                &[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(payload.clone().into()),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+        conn.execute("DELETE FROM payloads WHERE id <= 390;")
+            .unwrap();
+        let before_size = std::fs::metadata(&db_path).unwrap().len();
+
+        conn.execute("VACUUM;").unwrap();
+        let after_size = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after_size < before_size,
+            "VACUUM must shrink the main file: before={before_size} after={after_size}"
+        );
+        let rows = conn.query("SELECT COUNT(*) FROM payloads;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        conn.execute("INSERT INTO payloads(id, payload) VALUES (1000, 'still-live');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT payload FROM payloads WHERE id=1000;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("still-live".into()));
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM payloads;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 11);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        drop(sqlite);
+
+        let reopened = Connection::open_schema_only(&db_path_text).unwrap();
+        let rows = reopened.query("SELECT COUNT(*) FROM payloads;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(11));
+        assert_eq!(
+            reopened.query("PRAGMA integrity_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn test_vacuum_wal_mode_with_nonempty_wal_reopens_in_both_engines() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-wal-nonempty.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let wal_path = PathBuf::from(format!("{db_path_text}-wal"));
+
+        let conn = Connection::open(&db_path_text).unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute("PRAGMA journal_mode=WAL;").unwrap();
+        conn.execute("CREATE TABLE events(id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO events VALUES (1,'one'),(2,'two'),(3,'three');")
+            .unwrap();
+        let wal_size = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            wal_size > 32,
+            "VACUUM must exercise its own checkpoint with committed WAL frames present, got {wal_size} bytes"
+        );
+
+        conn.execute("VACUUM;").unwrap();
+        let rows = conn
+            .query("SELECT id, value FROM events ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        conn.execute("INSERT INTO events VALUES (4,'four');")
+            .unwrap();
+        assert_eq!(
+            conn.query("PRAGMA quick_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        assert_eq!(
+            conn.query("PRAGMA integrity_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM events;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 4);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        drop(sqlite);
+
+        let reopened = Connection::open_schema_only(&db_path_text).unwrap();
+        let rows = reopened.query("SELECT COUNT(*) FROM events;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(4));
+        assert_eq!(
+            reopened.query("PRAGMA quick_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        assert_eq!(
+            reopened.query("PRAGMA integrity_check;").unwrap()[0].values()[0],
+            SqliteValue::Text("ok".into())
+        );
+        reopened.close().unwrap();
     }
 
     #[test]
@@ -122475,6 +123656,10 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "read_write_wal_install_probe"
+        }
+
+        fn is_memory(&self) -> bool {
+            true
         }
 
         fn open(

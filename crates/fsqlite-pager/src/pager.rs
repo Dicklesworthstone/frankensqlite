@@ -31,10 +31,10 @@ use fsqlite_vfs::{
     DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, WindowsLockSidecarPolicy,
     validate_reserved_database_artifacts,
 };
-use fsqlite_vfs::{FileIdentity, Vfs, VfsFile};
+use fsqlite_vfs::{FileIdentity, SyncKind, Vfs, VfsFile};
 use smallvec::SmallVec;
 
-use crate::journal::{JournalHeader, JournalPageRecord};
+use crate::journal::{JOURNAL_MAGIC, JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::{
     PageCacheEvictionPolicy, PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache,
@@ -679,7 +679,7 @@ fn log_checkpoint_coordination(
 }
 
 fn pager_group_commit_queue<V: Vfs>(pager: &SimplePager<V>) -> GroupCommitQueueRef {
-    group_commit_queue_for_backend(pager.vfs.as_ref(), &pager.db_path)
+    Arc::clone(&pager.group_commit_queue)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1414,6 +1414,8 @@ fn has_wal_backend(wal_backend: &SharedWalBackend) -> Result<bool> {
 
 static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>>> =
     OnceLock::new();
+static GROUP_COMMIT_IDENTITY_QUEUES: OnceLock<Mutex<IdentityWeakRegistry<GroupCommitQueue>>> =
+    OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // bd-yfdb6: Recovery fence registry
@@ -1425,6 +1427,224 @@ static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>
 // with bounded backoff (100 ms × 10 = 1 s) before surfacing a soft
 // `BusyRecovery` to the caller.
 static RECOVERY_FENCES: OnceLock<Mutex<HashMap<PathBuf, Arc<RecoveryFence>>>> = OnceLock::new();
+static RECOVERY_IDENTITY_FENCES: OnceLock<Mutex<IdentityWeakRegistry<RecoveryFence>>> =
+    OnceLock::new();
+
+// VACUUM publication mutates the already-open database inode in place. Native
+// file locks exclude other processes, but POSIX record locks are process-wide:
+// a second pager in this process must therefore be fenced explicitly.  The
+// gate also covers pager bootstrap so a same-process opener cannot discover
+// and replay the publisher's deliberately-hot rollback journal.
+static MAINTENANCE_GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<PagerMaintenanceGate>>>> =
+    OnceLock::new();
+static MAINTENANCE_IDENTITY_GATES: OnceLock<Mutex<IdentityWeakRegistry<PagerMaintenanceGate>>> =
+    OnceLock::new();
+
+/// Process-local coordination keyed by a concrete open-file generation.
+///
+/// Weak values prevent an identity registry from extending the lifetime of a
+/// pager's coordination state. Expired keys are reclaimed by a geometrically
+/// spaced sweep, keeping insertion amortized O(1) instead of scanning every
+/// live database on every open.
+#[derive(Debug)]
+struct IdentityWeakRegistry<T> {
+    entries: HashMap<FileIdentity, Weak<T>>,
+    mutations_since_sweep: usize,
+    sweep_after_mutations: usize,
+}
+
+impl<T> Default for IdentityWeakRegistry<T> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            mutations_since_sweep: 0,
+            sweep_after_mutations: 64,
+        }
+    }
+}
+
+impl<T> IdentityWeakRegistry<T> {
+    fn get_or_insert_with(
+        &mut self,
+        identity: FileIdentity,
+        create: impl FnOnce() -> Arc<T>,
+    ) -> Arc<T> {
+        if let Some(value) = self.entries.get(&identity).and_then(Weak::upgrade) {
+            return value;
+        }
+
+        let value = create();
+        self.entries.insert(identity, Arc::downgrade(&value));
+        self.mutations_since_sweep = self.mutations_since_sweep.saturating_add(1);
+        if self.mutations_since_sweep >= self.sweep_after_mutations {
+            self.entries.retain(|_, entry| entry.strong_count() > 0);
+            self.mutations_since_sweep = 0;
+            self.sweep_after_mutations = self.entries.len().max(64);
+        }
+        value
+    }
+}
+
+#[derive(Debug, Default)]
+struct PagerMaintenanceState {
+    active_openers: usize,
+    active_transactions: usize,
+    maintenance_active: bool,
+}
+
+#[derive(Debug, Default)]
+struct PagerMaintenanceGate {
+    state: Mutex<PagerMaintenanceState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PagerMaintenanceLeaseKind {
+    Open,
+    Transaction,
+    Exclusive,
+}
+
+#[derive(Debug)]
+struct PagerMaintenanceLease {
+    gate: Arc<PagerMaintenanceGate>,
+    kind: PagerMaintenanceLeaseKind,
+}
+
+impl PagerMaintenanceGate {
+    fn enter_open(self: &Arc<Self>) -> Result<PagerMaintenanceLease> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if state.maintenance_active {
+            return Err(FrankenError::Busy);
+        }
+        state.active_openers = state.active_openers.saturating_add(1);
+        drop(state);
+        Ok(PagerMaintenanceLease {
+            gate: Arc::clone(self),
+            kind: PagerMaintenanceLeaseKind::Open,
+        })
+    }
+
+    fn enter_transaction(self: &Arc<Self>) -> Result<PagerMaintenanceLease> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if state.maintenance_active {
+            return Err(FrankenError::Busy);
+        }
+        state.active_transactions = state.active_transactions.saturating_add(1);
+        drop(state);
+        Ok(PagerMaintenanceLease {
+            gate: Arc::clone(self),
+            kind: PagerMaintenanceLeaseKind::Transaction,
+        })
+    }
+
+    fn enter_exclusive_maintenance(self: &Arc<Self>) -> Result<PagerMaintenanceLease> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if state.maintenance_active || state.active_openers != 0 || state.active_transactions != 0 {
+            return Err(FrankenError::Busy);
+        }
+        state.maintenance_active = true;
+        drop(state);
+        Ok(PagerMaintenanceLease {
+            gate: Arc::clone(self),
+            kind: PagerMaintenanceLeaseKind::Exclusive,
+        })
+    }
+}
+
+impl PagerMaintenanceLease {
+    /// Temporarily turn this lease into the sole same-process maintenance
+    /// owner. Recovery callers use this only after releasing every VFS lock,
+    /// so the cross-process acquisition can follow the canonical
+    /// WAL-slots-before-main-file order.
+    fn upgrade_to_exclusive(&mut self) -> Result<PagerMaintenanceLeaseKind> {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if state.maintenance_active {
+            return Err(FrankenError::BusyRecovery);
+        }
+
+        let prior = self.kind;
+        let sole_owner = match prior {
+            PagerMaintenanceLeaseKind::Open => {
+                state.active_openers == 1 && state.active_transactions == 0
+            }
+            PagerMaintenanceLeaseKind::Transaction => {
+                state.active_transactions == 1 && state.active_openers == 0
+            }
+            PagerMaintenanceLeaseKind::Exclusive => return Ok(prior),
+        };
+        if !sole_owner {
+            return Err(FrankenError::BusyRecovery);
+        }
+
+        match prior {
+            PagerMaintenanceLeaseKind::Open => state.active_openers = 0,
+            PagerMaintenanceLeaseKind::Transaction => state.active_transactions = 0,
+            PagerMaintenanceLeaseKind::Exclusive => unreachable!(),
+        }
+        state.maintenance_active = true;
+        self.kind = PagerMaintenanceLeaseKind::Exclusive;
+        Ok(prior)
+    }
+
+    fn downgrade_from_exclusive(&mut self, prior: PagerMaintenanceLeaseKind) -> Result<()> {
+        if !matches!(self.kind, PagerMaintenanceLeaseKind::Exclusive)
+            || matches!(prior, PagerMaintenanceLeaseKind::Exclusive)
+        {
+            return Ok(());
+        }
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        state.maintenance_active = false;
+        match prior {
+            PagerMaintenanceLeaseKind::Open => {
+                state.active_openers = state.active_openers.saturating_add(1);
+            }
+            PagerMaintenanceLeaseKind::Transaction => {
+                state.active_transactions = state.active_transactions.saturating_add(1);
+            }
+            PagerMaintenanceLeaseKind::Exclusive => unreachable!(),
+        }
+        self.kind = prior;
+        Ok(())
+    }
+}
+
+impl Drop for PagerMaintenanceLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.kind {
+            PagerMaintenanceLeaseKind::Open => {
+                state.active_openers = state.active_openers.saturating_sub(1);
+            }
+            PagerMaintenanceLeaseKind::Transaction => {
+                state.active_transactions = state.active_transactions.saturating_sub(1);
+            }
+            PagerMaintenanceLeaseKind::Exclusive => {
+                state.maintenance_active = false;
+            }
+        }
+    }
+}
 
 fn lexical_normalize_path(path: PathBuf) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -1480,6 +1700,68 @@ fn recovery_fence_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<RecoveryFe
     }
 }
 
+fn recovery_fence_for_identity(identity: FileIdentity) -> Arc<RecoveryFence> {
+    let fences =
+        RECOVERY_IDENTITY_FENCES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
+    let mut fences = fences
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fences.get_or_insert_with(identity, || Arc::new(RecoveryFence::new()))
+}
+
+fn identity_bound_recovery_fence<V: Vfs>(
+    vfs: &V,
+    db_path: &Path,
+    file: &V::File,
+) -> Result<Arc<RecoveryFence>> {
+    file.file_identity()?.map_or_else(
+        || Ok(recovery_fence_for_backend(vfs, db_path)),
+        |identity| Ok(recovery_fence_for_identity(identity)),
+    )
+}
+
+fn maintenance_gate_for_path(db_path: &Path) -> Arc<PagerMaintenanceGate> {
+    let key = shared_file_state_key(db_path);
+    let gates = MAINTENANCE_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        gates
+            .entry(key)
+            .or_insert_with(|| Arc::new(PagerMaintenanceGate::default())),
+    )
+}
+
+fn maintenance_gate_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<PagerMaintenanceGate> {
+    if vfs.is_memory() {
+        Arc::new(PagerMaintenanceGate::default())
+    } else {
+        maintenance_gate_for_path(db_path)
+    }
+}
+
+fn maintenance_gate_for_identity(identity: FileIdentity) -> Arc<PagerMaintenanceGate> {
+    let gates =
+        MAINTENANCE_IDENTITY_GATES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.get_or_insert_with(identity, || Arc::new(PagerMaintenanceGate::default()))
+}
+
+fn identity_bound_maintenance_gate<V: Vfs>(
+    vfs: &V,
+    path_gate: &Arc<PagerMaintenanceGate>,
+    file: &V::File,
+) -> Result<Arc<PagerMaintenanceGate>> {
+    let _ = vfs;
+    file.file_identity()?.map_or_else(
+        || Ok(Arc::clone(path_gate)),
+        |identity| Ok(maintenance_gate_for_identity(identity)),
+    )
+}
+
 fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
     let key = shared_file_state_key(db_path);
     let queues = GROUP_COMMIT_QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1502,6 +1784,28 @@ fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommi
     } else {
         group_commit_queue_for_path(db_path)
     }
+}
+
+fn group_commit_queue_for_identity(identity: FileIdentity) -> GroupCommitQueueRef {
+    let queues =
+        GROUP_COMMIT_IDENTITY_QUEUES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
+    let mut queues = queues
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queues.get_or_insert_with(identity, || {
+        Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))
+    })
+}
+
+fn identity_bound_group_commit_queue<V: Vfs>(
+    vfs: &V,
+    db_path: &Path,
+    file: &V::File,
+) -> Result<GroupCommitQueueRef> {
+    file.file_identity()?.map_or_else(
+        || Ok(group_commit_queue_for_backend(vfs, db_path)),
+        |identity| Ok(group_commit_queue_for_identity(identity)),
+    )
 }
 
 /// Remove the group commit queue for the given database path.
@@ -1548,13 +1852,194 @@ impl PagerAccessMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RollbackJournalRecoveryState {
     Clean,
-    Pending,
+    /// A locally failed commit may have changed main-database bytes and still
+    /// requires a hot-journal replay.
+    ReplayPending,
+    /// Replay durably restored the main image, but connection-local metadata
+    /// has not yet been rebuilt and must be retried without requiring the now
+    /// non-hot journal to remain present.
+    MetadataRefreshPending,
 }
 
 impl RollbackJournalRecoveryState {
     #[must_use]
     const fn is_pending(self) -> bool {
-        matches!(self, Self::Pending)
+        !matches!(self, Self::Clean)
+    }
+
+    #[must_use]
+    const fn needs_replay(self) -> bool {
+        matches!(self, Self::ReplayPending)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackJournalPrefixState {
+    NonHot,
+    Hot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackJournalReplayOutcome {
+    NonHot,
+    Replayed(PageSize),
+}
+
+const LOCAL_JOURNAL_MARKER: [u8; 16] = *b"FSQLITE-JRNL-v1\0";
+
+fn mark_local_journal_header(header: &mut [u8]) {
+    let marker_start = crate::journal::JOURNAL_HEADER_SIZE;
+    let marker_end = marker_start + LOCAL_JOURNAL_MARKER.len();
+    debug_assert!(header.len() >= marker_end);
+    header[marker_start..marker_end].copy_from_slice(&LOCAL_JOURNAL_MARKER);
+}
+
+fn local_journal_marker_present<F: VfsFile>(
+    cx: &Cx,
+    journal_file: &F,
+    padded_header_size: u64,
+) -> Result<bool> {
+    let marker_start =
+        u64::try_from(crate::journal::JOURNAL_HEADER_SIZE).expect("journal header size fits u64");
+    let marker_span =
+        u64::try_from(LOCAL_JOURNAL_MARKER.len()).expect("journal marker size fits u64");
+    if padded_header_size < marker_start + marker_span {
+        return Ok(false);
+    }
+    let mut marker = [0_u8; LOCAL_JOURNAL_MARKER.len()];
+    let bytes_read = journal_file.read(cx, &mut marker, marker_start)?;
+    if bytes_read != marker.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "short rollback-journal local marker read: got {bytes_read} of {} bytes",
+                marker.len()
+            ),
+        });
+    }
+    Ok(marker == LOCAL_JOURNAL_MARKER)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JournalInvalidation {
+    ZeroMagic,
+    Truncate,
+}
+
+fn durable_invalidate_journal<F: VfsFile>(
+    cx: &Cx,
+    journal_file: &mut F,
+    invalidation: JournalInvalidation,
+) -> Result<()> {
+    match invalidation {
+        JournalInvalidation::ZeroMagic => {
+            journal_file.write(cx, &[0_u8; JOURNAL_MAGIC.len()], 0)?;
+            journal_file.durable_sync(cx, SyncKind::FullDurable)?;
+            let mut observed = [0_u8; JOURNAL_MAGIC.len()];
+            let bytes_read = journal_file.read(cx, &mut observed, 0)?;
+            if bytes_read != observed.len() || observed.iter().any(|byte| *byte != 0) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "rollback-journal invalidation did not persist zero magic: read {bytes_read} bytes, prefix={observed:02x?}"
+                    ),
+                });
+            }
+        }
+        JournalInvalidation::Truncate => {
+            journal_file.truncate(cx, 0)?;
+            journal_file.durable_sync(cx, SyncKind::FullDurable)?;
+            let observed_size = journal_file.file_size(cx)?;
+            if observed_size != 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "rollback-journal truncation reported success but retained {observed_size} bytes"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn durable_write_and_verify_journal_header<F: VfsFile>(
+    cx: &Cx,
+    journal_file: &mut F,
+    header: &[u8],
+) -> Result<()> {
+    journal_file.write(cx, header, 0)?;
+    journal_file.durable_sync(cx, SyncKind::FullDurable)?;
+    let mut observed = vec![0_u8; header.len()];
+    let bytes_read = journal_file.read(cx, &mut observed, 0)?;
+    if bytes_read != header.len() || observed != header {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "rollback-journal hot-header write was not durable: read {bytes_read} of {} bytes",
+                header.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn classify_rollback_journal_prefix<F: VfsFile>(
+    cx: &Cx,
+    journal_file: &F,
+) -> Result<(RollbackJournalPrefixState, u64)> {
+    let journal_size = journal_file.file_size(cx)?;
+    if journal_size == 0 {
+        return Ok((RollbackJournalPrefixState::NonHot, 0));
+    }
+
+    let prefix_len = usize::try_from(journal_size.min(JOURNAL_MAGIC.len() as u64))
+        .expect("rollback-journal magic length fits usize");
+    let mut prefix = [0_u8; JOURNAL_MAGIC.len()];
+    let bytes_read = journal_file.read(cx, &mut prefix[..prefix_len], 0)?;
+    if bytes_read != prefix_len {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "short rollback-journal magic read: got {bytes_read} of {prefix_len} bytes"
+            ),
+        });
+    }
+    // SQLite's PERSIST commit marker is the first journal-header byte. Once
+    // that byte is zero the journal is non-hot, even if a torn sector write
+    // left later bytes from the old magic in place. A nonzero malformed
+    // prefix remains fail-closed.
+    if prefix[0] == 0 {
+        return Ok((RollbackJournalPrefixState::NonHot, journal_size));
+    }
+    if prefix_len < JOURNAL_MAGIC.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("rollback journal has a nonzero truncated magic: {journal_size} bytes"),
+        });
+    }
+    if prefix == JOURNAL_MAGIC {
+        Ok((RollbackJournalPrefixState::Hot, journal_size))
+    } else {
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!("rollback journal has invalid magic: {prefix:02x?}"),
+        })
+    }
+}
+
+fn with_main_shared_lock<F, T>(
+    cx: &Cx,
+    db_file: &mut F,
+    operation: impl FnOnce(&F) -> Result<T>,
+) -> Result<T>
+where
+    F: VfsFile,
+{
+    db_file.lock_external_shared_snapshot(cx)?;
+    let operation_result = operation(&*db_file);
+    let cleanup_cx = cleanup_child_cx(cx);
+    let _cleanup_mask = cleanup_cx.masked();
+    let unlock_result = db_file.unlock_external_shared_snapshot(&cleanup_cx);
+    match (operation_result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(operation_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+            "database snapshot failed and could not release the main-file SHARED lock: operation={operation_error}; unlock={unlock_error}"
+        ))),
     }
 }
 
@@ -1657,6 +2142,15 @@ pub(crate) struct PagerInner<F: VfsFile> {
 struct CommittedStateRefresh {
     wal_snapshot_initialized: bool,
     page_cache_invalidated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommittedStateRefreshMode {
+    Normal,
+    /// A hot rollback journal has already restored the durable bytes. Cached
+    /// candidate metadata is never authoritative in this mode: bypass the
+    /// identity fast path and allow the database extent to shrink exactly.
+    PostRecovery,
 }
 
 impl<F: VfsFile> PagerInner<F> {
@@ -1797,6 +2291,10 @@ impl<F: VfsFile> PagerInner<F> {
         let previous_db_change_counter = self.committed_db_change_counter;
         let previous_wal_generation = self.committed_wal_generation;
         let previous_wal_visible_commit_count = self.committed_wal_visible_commit_count;
+        let previous_base_commit_seq = self
+            .commit_seq
+            .get()
+            .saturating_sub(previous_wal_visible_commit_count);
         let (wal_visible_commit_count, wal_generation) = if self.journal_mode == JournalMode::Wal {
             with_wal_backend(wal_backend, |wal| {
                 wal.begin_transaction(cx)?;
@@ -1811,44 +2309,55 @@ impl<F: VfsFile> PagerInner<F> {
         let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
 
         let cached_wal_base_is_current = self.journal_mode == JournalMode::Wal
+            // With no visible WAL frames, the main header is authoritative and
+            // may have been replaced at the same length by another process
+            // (notably WAL-mode VACUUM). File size + WAL generation alone
+            // cannot prove that base unchanged.
+            && wal_visible_commit_count != 0
             && file_size == self.committed_db_file_size_bytes
             && wal_generation.is_some()
             && self.committed_wal_generation == wal_generation;
-        let base_change_counter = if cached_wal_base_is_current {
-            self.committed_db_change_counter
+        let (base_commit_seq, raw_base_change_counter) = if cached_wal_base_is_current {
+            (previous_base_commit_seq, self.committed_db_change_counter)
         } else {
             let base_header_bytes = self.read_database_file_header_bytes(cx, file_size)?;
-            let base_change_counter = if self.journal_mode == JournalMode::Wal {
+            let raw_base_change_counter = if self.journal_mode == JournalMode::Wal {
                 match DatabaseHeader::from_bytes(&base_header_bytes) {
-                    Ok(base_header) => u64::from(base_header.change_counter),
-                    Err(error) => {
+                    Ok(base_header) => base_header.change_counter,
+                    Err(error) => u32::try_from(
                         stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
                             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                                 detail: format!(
                                     "invalid database-file header during WAL refresh: {error}"
                                 ),
-                            })?
-                    }
+                            })?,
+                    )
+                    .map_err(|_| {
+                        FrankenError::internal("stale WAL header change counter did not fit u32")
+                    })?,
                 }
             } else {
-                u64::from(
-                    DatabaseHeader::from_bytes(&base_header_bytes)
-                        .map_err(|error| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "invalid database header during pager refresh: {error}"
-                            ),
-                        })?
-                        .change_counter,
-                )
+                DatabaseHeader::from_bytes(&base_header_bytes)
+                    .map_err(|error| FrankenError::DatabaseCorrupt {
+                        detail: format!("invalid database header during pager refresh: {error}"),
+                    })?
+                    .change_counter
             };
-            self.committed_db_change_counter = base_change_counter;
+            let previous_raw_change_counter =
+                u32::try_from(previous_db_change_counter).map_err(|_| {
+                    FrankenError::internal("cached database change counter did not fit u32")
+                })?;
+            let base_commit_seq = previous_base_commit_seq.saturating_add(u64::from(
+                raw_base_change_counter.wrapping_sub(previous_raw_change_counter),
+            ));
+            self.committed_db_change_counter = u64::from(raw_base_change_counter);
             self.committed_wal_generation = wal_generation;
-            base_change_counter
+            (base_commit_seq, u64::from(raw_base_change_counter))
         };
         let visible_commit_seq =
-            CommitSeq::new(base_change_counter.saturating_add(wal_visible_commit_count));
+            CommitSeq::new(base_commit_seq.saturating_add(wal_visible_commit_count));
         let durable_identity_changed = file_size != previous_file_size
-            || base_change_counter != previous_db_change_counter
+            || raw_base_change_counter != previous_db_change_counter
             || wal_generation != previous_wal_generation
             || wal_visible_commit_count != previous_wal_visible_commit_count;
         self.committed_wal_visible_commit_count = wal_visible_commit_count;
@@ -1898,12 +2407,42 @@ impl<F: VfsFile> PagerInner<F> {
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
     ) -> Result<CommittedStateRefresh> {
+        self.refresh_committed_state_with_mode(
+            cx,
+            cache,
+            wal_backend,
+            CommittedStateRefreshMode::Normal,
+        )
+    }
+
+    fn refresh_committed_state_after_recovery(
+        &mut self,
+        cx: &Cx,
+        cache: &ShardedPageCache,
+        wal_backend: &SharedWalBackend,
+    ) -> Result<CommittedStateRefresh> {
+        self.refresh_committed_state_with_mode(
+            cx,
+            cache,
+            wal_backend,
+            CommittedStateRefreshMode::PostRecovery,
+        )
+    }
+
+    fn refresh_committed_state_with_mode(
+        &mut self,
+        cx: &Cx,
+        cache: &ShardedPageCache,
+        wal_backend: &SharedWalBackend,
+        mode: CommittedStateRefreshMode,
+    ) -> Result<CommittedStateRefresh> {
         let previous_committed_db_change_counter = self.committed_db_change_counter;
         let previous_committed_wal_generation = self.committed_wal_generation;
         let previous_committed_wal_visible_commit_count = self.committed_wal_visible_commit_count;
         let (new_commit_seq, current_file_size, wal_snapshot_initialized, durable_identity_changed) =
             self.probe_visible_commit_seq(cx, wal_backend)?;
-        if new_commit_seq == self.commit_seq
+        if mode == CommittedStateRefreshMode::Normal
+            && new_commit_seq == self.commit_seq
             && current_file_size == self.committed_db_file_size_bytes
             && !durable_identity_changed
         {
@@ -1936,6 +2475,15 @@ impl<F: VfsFile> PagerInner<F> {
                     detail: format!("invalid database header during pager refresh: {error}"),
                 }
             })?;
+            if header.page_size != self.page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database page size changed from {} to {} while this pager was open; reopen the database before continuing",
+                        self.page_size.get(),
+                        header.page_size.get()
+                    ),
+                });
+            }
 
             // Always cross-check header.page_count against the actual file size.
             // A crash between growing the file and updating the header leaves
@@ -1980,7 +2528,13 @@ impl<F: VfsFile> PagerInner<F> {
         // committed extent; overwriting back to the header value turns those
         // pages into phantom reads and causes `page N > snapshot db_size`
         // BusySnapshot errors in peer readers.
-        self.db_size = self.db_size.max(db_size);
+        self.db_size = if mode == CommittedStateRefreshMode::PostRecovery
+            || self.journal_mode != JournalMode::Wal
+        {
+            db_size
+        } else {
+            self.db_size.max(db_size)
+        };
         let effective_db_size = self.db_size;
         self.next_page = if effective_db_size >= 2 {
             effective_db_size.saturating_add(1)
@@ -4028,6 +4582,29 @@ impl PublishedPagerState {
         self.db_size.store(update.db_size, AtomicOrdering::Release);
     }
 
+    /// Publish a wholesale, already-durable replacement of the database
+    /// image. Unlike ordinary commits, VACUUM is authoritative for shrink as
+    /// well as growth, and every previously published page is stale.
+    fn publish_replaced_image(&self, cx: &Cx, update: PublishedPagerUpdate) {
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let start = Instant::now();
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
+        self.pages.clear();
+        self.finalize_publish(cx, update, 0, start, true);
+        // The exclusive maintenance fence makes this the one publication path
+        // allowed to authoritatively shrink the visible database image.
+        self.visible_commit_seq
+            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
+        self.page_plane_visible_commit_seq
+            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
+        self.db_size.store(update.db_size, AtomicOrdering::Release);
+    }
+
     /// Publish commit: retain pages up to db_size, then bulk insert from write_set.
     fn publish_commit<S: std::hash::BuildHasher>(
         &self,
@@ -4439,6 +5016,15 @@ pub struct SimplePager<V: Vfs> {
     /// Native namespace generation retained for the pager lifetime.
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
+    /// Same-path in-process fence for bootstrap, transactions, and exclusive
+    /// maintenance publication.
+    maintenance_gate: Arc<PagerMaintenanceGate>,
+    /// Identity-bound in-process recovery serialization. Unlike the
+    /// maintenance gate, this bounded fence lets competing recovery attempts
+    /// queue without ever waiting while holding a main-file lock.
+    recovery_fence: Arc<RecoveryFence>,
+    /// Retains the opener lease through SQL-layer namespace bootstrap.
+    maintenance_open_lease: Mutex<Option<PagerMaintenanceLease>>,
     /// Shared mutable state used by transactions.
     inner: Arc<Mutex<PagerInner<V::File>>>,
     /// Parks single-writer waiters for bounded baton handoff.
@@ -4460,6 +5046,134 @@ pub struct SimplePager<V: Vfs> {
     /// Same-path connection counter injected by the SQL connection layer.
     /// Unset pagers keep the legacy publication path.
     shared_connection_count: OnceLock<Arc<AtomicUsize>>,
+    /// Identity-bound WAL publication queue shared by every pager that opened
+    /// the same underlying file, including cloned MemoryVfs handles.
+    group_commit_queue: GroupCommitQueueRef,
+}
+
+/// Identity-bound digest of a complete SQLite main-database image.
+///
+/// The digest covers the page size, exact file length, page numbers, and all
+/// logical database pages. SQLite's reserved lock-byte page is deliberately
+/// excluded because it is process-lock state rather than database content.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DatabaseImageReceipt {
+    identity: FileIdentity,
+    file_size: u64,
+    header: DatabaseHeader,
+    logical_hash: [u8; 32],
+}
+
+impl DatabaseImageReceipt {
+    #[must_use]
+    pub const fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn header(&self) -> &DatabaseHeader {
+        &self.header
+    }
+
+    #[must_use]
+    pub const fn logical_hash(&self) -> [u8; 32] {
+        self.logical_hash
+    }
+}
+
+fn exact_database_page_count(file_size: u64, page_size: PageSize) -> Result<u32> {
+    let page_size_bytes = u64::from(page_size.get());
+    if file_size == 0 || file_size % page_size_bytes != 0 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "database image length {file_size} is not a positive multiple of page size {page_size_bytes}"
+            ),
+        });
+    }
+    let page_count = file_size / page_size_bytes;
+    u32::try_from(page_count).map_err(|_| FrankenError::OutOfRange {
+        what: "database image page count".to_owned(),
+        value: page_count.to_string(),
+    })
+}
+
+fn database_image_receipt_for_open_file<F: VfsFile>(
+    cx: &Cx,
+    file: &F,
+    expected_page_size: Option<PageSize>,
+) -> Result<DatabaseImageReceipt> {
+    let identity = file.file_identity()?.ok_or_else(|| {
+        FrankenError::internal("database image VFS did not provide a stable file identity")
+    })?;
+    let file_size = file.file_size(cx)?;
+    let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+    let header_read = file.read(cx, &mut header_bytes, 0)?;
+    if header_read != DATABASE_HEADER_SIZE {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "short database header while capturing image receipt: got {header_read} of {DATABASE_HEADER_SIZE}"
+            ),
+        });
+    }
+    let header =
+        DatabaseHeader::from_bytes(&header_bytes).map_err(|err| FrankenError::DatabaseCorrupt {
+            detail: format!("invalid database image header: {err}"),
+        })?;
+    if let Some(expected_page_size) = expected_page_size
+        && header.page_size != expected_page_size
+    {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "database image page size mismatch: image={} expected={}",
+                header.page_size.get(),
+                expected_page_size.get()
+            ),
+        });
+    }
+    let page_count = exact_database_page_count(file_size, header.page_size)?;
+    if header.page_count != page_count {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "database image header page count {} does not match file length page count {page_count}",
+                header.page_count
+            ),
+        });
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"FrankenSQLite logical database image v1\0");
+    hasher.update(&header.page_size.get().to_be_bytes());
+    hasher.update(&file_size.to_be_bytes());
+    let page_size = header.page_size.as_usize();
+    let lock_byte_page = crate::journal::lock_byte_page(header.page_size);
+    let mut page = vec![0_u8; page_size];
+    for page_no in 1..=page_count {
+        if page_no == lock_byte_page {
+            continue;
+        }
+        let offset = u64::from(page_no - 1) * u64::from(header.page_size.get());
+        let bytes_read = file.read(cx, &mut page, offset)?;
+        if bytes_read != page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short database page {page_no} while hashing image: got {bytes_read} of {page_size}"
+                ),
+            });
+        }
+        hasher.update(&page_no.to_be_bytes());
+        hasher.update(&page);
+    }
+    Ok(DatabaseImageReceipt {
+        identity,
+        file_size,
+        header,
+        logical_hash: *hasher.finalize().as_bytes(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4731,6 +5445,7 @@ where
     type Txn = SimpleTransaction<V>;
 
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
+        let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
             .inner
@@ -4756,6 +5471,9 @@ where
         }
 
         let eager_writer = transaction_mode_is_eager_writer(mode);
+        if eager_writer && inner.access_mode.is_readonly() {
+            return Err(FrankenError::ReadOnly);
+        }
         if eager_writer {
             inner = wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
         }
@@ -4770,45 +5488,23 @@ where
         // sharing the same `MemoryVfs` can mutate the durable image or the
         // shared WAL backend between transactions.
         if self.vfs.is_memory() {
-            let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
             let commit_seq_before_refresh = inner.commit_seq;
-            let mut journal_visibility_invalidation = false;
-            let mut refresh_page_cache_invalidated = false;
-            if active_transactions_before_begin == 0 {
-                let journal_path = Self::journal_path(&self.db_path);
-                let journal_exists = self.vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
-                journal_visibility_invalidation = had_recovery_pending || journal_exists;
-                {
-                    if inner.rollback_journal_recovery_state.is_pending() || journal_exists {
-                        let page_size = inner.page_size;
-                        match Self::recover_rollback_journal_if_present_locked(
-                            cx,
-                            &*self.vfs,
-                            &mut inner.db_file,
-                            &journal_path,
-                            page_size,
-                            LockLevel::None,
-                        ) {
-                            Ok(false) if had_recovery_pending => {
-                                return Err(FrankenError::internal(
-                                    "rollback journal missing while local recovery was pending",
-                                ));
-                            }
-                            Ok(_) => {}
-                            Err(err) => return Err(err),
-                        }
-                        self.cache.clear();
-                        inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
-                    }
-                    let refresh =
-                        inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
-                    refresh_page_cache_invalidated = refresh.page_cache_invalidated;
-                }
-            }
+            let (committed_refresh, journal_visibility_invalidation) =
+                if active_transactions_before_begin == 0 {
+                    self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?
+                } else {
+                    (
+                        CommittedStateRefresh {
+                            wal_snapshot_initialized: false,
+                            page_cache_invalidated: false,
+                        },
+                        false,
+                    )
+                };
 
             if active_transactions_before_begin == 0 {
                 let clear_published_pages = journal_visibility_invalidation
-                    || refresh_page_cache_invalidated
+                    || committed_refresh.page_cache_invalidated
                     || inner.commit_seq != commit_seq_before_refresh;
                 // D1-CRITICAL Change 3: Use sharded publish_clear_if.
                 self.published.publish_clear_if(
@@ -4852,10 +5548,7 @@ where
                 journal_path: Self::journal_path(&self.db_path),
                 #[cfg(all(feature = "native", any(unix, windows)))]
                 namespace_binding: self.namespace_binding.clone(),
-                group_commit_queue: group_commit_queue_for_backend(
-                    self.vfs.as_ref(),
-                    &self.db_path,
-                ),
+                group_commit_queue: Arc::clone(&self.group_commit_queue),
                 inner: Arc::clone(&self.inner),
                 writer_idle: Arc::clone(&self.writer_idle),
                 cache: Arc::clone(&self.cache),
@@ -4863,6 +5556,9 @@ where
                 wal_backend: Arc::clone(&self.wal_backend),
                 committed_snapshot: Arc::clone(&self.committed_snapshot),
                 shared_connection_count: self.shared_connection_count.get().cloned(),
+                maintenance_lease: Some(maintenance_lease),
+                recovery_fence: Arc::clone(&self.recovery_fence),
+                read_only_pager: inner.access_mode.is_readonly(),
                 published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                 published_db_size: Cell::new(bound_db_size),
                 write_set: PagePageMap::default(),
@@ -4891,70 +5587,25 @@ where
         }
 
         // ── File-backed path (full locking + recovery) ──────────────
-        let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
         let commit_seq_before_refresh = inner.commit_seq;
-
-        // Acquire a SHARED lock on the database file for cross-process
-        // reader/writer exclusion. The file handle lock is shared across all
-        // local transactions, so only the first active transaction should
-        // acquire it.
-        if active_transactions_before_begin == 0 {
-            inner.db_file.lock(cx, LockLevel::Shared)?;
-        }
-
-        let mut journal_visibility_invalidation = false;
-        let committed_refresh = if active_transactions_before_begin == 0 {
-            let journal_path = Self::journal_path(&self.db_path);
-            let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
-                Ok(exists) => exists,
-                Err(err) => {
-                    let _ = inner.db_file.unlock(cx, LockLevel::None);
-                    return Err(err);
-                }
+        let (committed_refresh, journal_visibility_invalidation) =
+            if active_transactions_before_begin == 0 {
+                self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?
+            } else {
+                (
+                    CommittedStateRefresh {
+                        wal_snapshot_initialized: false,
+                        page_cache_invalidated: false,
+                    },
+                    false,
+                )
             };
-            journal_visibility_invalidation = had_recovery_pending || journal_exists;
-            if inner.rollback_journal_recovery_state.is_pending() || journal_exists {
-                let page_size = inner.page_size;
-                match Self::recover_rollback_journal_if_present_locked(
-                    cx,
-                    &*self.vfs,
-                    &mut inner.db_file,
-                    &journal_path,
-                    page_size,
-                    LockLevel::Shared,
-                ) {
-                    Ok(false) if inner.rollback_journal_recovery_state.is_pending() => {
-                        inner.db_file.unlock(cx, LockLevel::None)?;
-                        return Err(FrankenError::internal(
-                            "rollback journal missing while local recovery was pending",
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        let _ = inner.db_file.unlock(cx, LockLevel::None);
-                        return Err(err);
-                    }
-                }
-                // Any leftover rollback journal means the durable image may
-                // have changed behind this pager, even when the journal had
-                // already been invalidated to zero bytes. Drop cached state and
-                // rebuild from disk before serving reads.
-                self.cache.clear();
-                inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
-            }
-            match inner.refresh_committed_state(cx, &self.cache, &self.wal_backend) {
-                Ok(v) => v,
-                Err(err) => {
-                    let _ = inner.db_file.unlock(cx, LockLevel::None);
-                    return Err(err);
-                }
-            }
-        } else {
-            CommittedStateRefresh {
-                wal_snapshot_initialized: false,
-                page_cache_invalidated: false,
-            }
-        };
+        if active_transactions_before_begin == 0 {
+            // Retain one stock-visible SHARED snapshot fence for the lifetime
+            // of the first local transaction. Later local transactions share
+            // this file handle and the last one releases it.
+            inner.db_file.lock_external_shared_snapshot(cx)?;
+        }
 
         if active_transactions_before_begin == 0 {
             let clear_published_pages = journal_visibility_invalidation
@@ -5006,7 +5657,17 @@ where
 
         if eager_writer && inner.writer_active {
             if active_transactions_before_begin == 0 {
-                inner.db_file.unlock(cx, LockLevel::None)?;
+                let busy = FrankenError::Busy;
+                return match release_snapshot_after_failed_begin(
+                    cx,
+                    &mut inner,
+                    active_transactions_before_begin,
+                ) {
+                    Ok(()) => Err(busy),
+                    Err(cleanup_error) => Err(FrankenError::internal(format!(
+                        "writer admission was busy and could not release its snapshot fence: admission={busy}; cleanup={cleanup_error}"
+                    ))),
+                };
             }
             return Err(FrankenError::Busy);
         }
@@ -5016,12 +5677,16 @@ where
         // prevents multiple processes from writing simultaneously.
         if eager_writer {
             if let Err(err) = inner.db_file.lock(cx, LockLevel::Reserved) {
-                let preserve_level = retained_lock_level_after_txn_exit(
+                return match release_snapshot_after_failed_begin(
+                    cx,
+                    &mut inner,
                     active_transactions_before_begin,
-                    inner.writer_active,
-                );
-                inner.db_file.unlock(cx, preserve_level)?;
-                return Err(err);
+                ) {
+                    Ok(()) => Err(err),
+                    Err(cleanup_error) => Err(FrankenError::internal(format!(
+                        "writer lock acquisition failed and could not restore the retained snapshot lock: lock={err}; cleanup={cleanup_error}"
+                    ))),
+                };
             }
             inner.writer_active = true;
         }
@@ -5031,16 +5696,21 @@ where
                 with_wal_backend(&self.wal_backend, |wal| wal.begin_transaction(cx));
             if let Err(err) = wal_begin_result {
                 let notify_writer_idle = eager_writer && release_single_writer_baton(&mut inner);
-                let preserve_level = retained_lock_level_after_txn_exit(
+                let cleanup_result = release_snapshot_after_failed_begin(
+                    cx,
+                    &mut inner,
                     active_transactions_before_begin,
-                    inner.writer_active,
                 );
-                inner.db_file.unlock(cx, preserve_level)?;
                 drop(inner);
                 if notify_writer_idle {
                     self.writer_idle.notify_one();
                 }
-                return Err(err);
+                return match cleanup_result {
+                    Ok(()) => Err(err),
+                    Err(cleanup_error) => Err(FrankenError::internal(format!(
+                        "WAL snapshot acquisition failed and could not restore the retained snapshot lock: wal={err}; cleanup={cleanup_error}"
+                    ))),
+                };
             }
         }
 
@@ -5051,6 +5721,7 @@ where
         let published_snapshot = self.published.snapshot();
         let cleanup_cx = cleanup_child_cx(cx);
         let memory_db_bump_alloc = self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
+        let read_only_pager = inner.access_mode.is_readonly();
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -5058,7 +5729,7 @@ where
             journal_path: Self::journal_path(&self.db_path),
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding: self.namespace_binding.clone(),
-            group_commit_queue: group_commit_queue_for_backend(self.vfs.as_ref(), &self.db_path),
+            group_commit_queue: Arc::clone(&self.group_commit_queue),
             inner: Arc::clone(&self.inner),
             writer_idle: Arc::clone(&self.writer_idle),
             cache: Arc::clone(&self.cache),
@@ -5066,6 +5737,9 @@ where
             wal_backend: Arc::clone(&self.wal_backend),
             committed_snapshot: Arc::clone(&self.committed_snapshot),
             shared_connection_count: self.shared_connection_count.get().cloned(),
+            maintenance_lease: Some(maintenance_lease),
+            recovery_fence: Arc::clone(&self.recovery_fence),
+            read_only_pager,
             published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
             published_db_size: Cell::new(published_snapshot.db_size),
             write_set: PagePageMap::default(),
@@ -5106,6 +5780,7 @@ where
     }
 
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
             .inner
@@ -5180,6 +5855,7 @@ where
     }
 
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
+        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         let inner = self
             .inner
             .lock()
@@ -5204,6 +5880,171 @@ where
     V::File: Send + Sync,
 {
     const EXPORT_COPY_CHUNK_SIZE: usize = 64 * 1024;
+
+    fn prepare_fresh_journal_for_maintenance(&self, cx: &Cx) -> Result<()> {
+        let journal_path = Self::journal_path(&self.db_path);
+        if !self.vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+            return Ok(());
+        }
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal, _) = self.vfs.open(cx, Some(&journal_path), flags)?;
+        let result = classify_rollback_journal_prefix(cx, &journal).and_then(|(state, _)| {
+            if state == RollbackJournalPrefixState::NonHot {
+                Ok(())
+            } else {
+                Err(FrankenError::Busy)
+            }
+        });
+        let close_result = journal.close(cx);
+        result?;
+        close_result?;
+
+        // Remove an accepted non-hot leftover before the publisher creates a
+        // new EXCLUSIVE journal. This prevents following a pre-existing
+        // symlink or truncating an attacker-controlled hard link.
+        self.vfs.delete(cx, &journal_path, true)?;
+        if self.vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+            return Err(FrankenError::CannotOpen { path: journal_path });
+        }
+        Ok(())
+    }
+
+    fn with_exclusive_maintenance<T>(
+        &self,
+        cx: &Cx,
+        operation: impl FnOnce(&mut PagerInner<V::File>) -> Result<T>,
+    ) -> Result<T> {
+        let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
+        self.validate_namespace_binding()?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        if inner.access_mode.is_readonly()
+            || inner.active_transactions != 0
+            || inner.writer_active
+            || inner.checkpoint_active
+            || inner.rollback_journal_recovery_state.is_pending()
+        {
+            return Err(FrankenError::Busy);
+        }
+
+        inner.checkpoint_active = true;
+        self.published.publish_metadata_only(
+            cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: true,
+            },
+        );
+
+        let mut wal_guard = if inner.journal_mode == JournalMode::Wal {
+            match self.wal_backend.write() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    inner.checkpoint_active = false;
+                    self.published.publish_metadata_only(
+                        cx,
+                        PublishedPagerUpdate {
+                            visible_commit_seq: inner.commit_seq,
+                            db_size: inner.db_size,
+                            journal_mode: inner.journal_mode,
+                            freelist_count: inner.freelist.len(),
+                            checkpoint_active: false,
+                        },
+                    );
+                    return Err(FrankenError::internal("SharedWalBackend lock poisoned"));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Acquire one VFS-defined fence over every lock surface relevant to a
+        // whole-image replacement. Unix composes the stock main/SHM locks in
+        // the default hook; Windows additionally takes the real byte ranges
+        // used by stock SQLite rather than relying on FrankenSQLite sidecars.
+        let wal_mode = inner.journal_mode == JournalMode::Wal;
+        if let Err(err) = inner.db_file.lock_external_maintenance(cx, wal_mode) {
+            inner.checkpoint_active = false;
+            self.published.publish_metadata_only(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: false,
+                },
+            );
+            return Err(err);
+        }
+
+        let preflight = (|| -> Result<()> {
+            self.prepare_fresh_journal_for_maintenance(cx)?;
+            if let Some(wal_guard) = wal_guard.as_mut() {
+                let wal = wal_guard.as_deref_mut().ok_or_else(|| {
+                    FrankenError::internal("WAL mode active but no WAL backend installed")
+                })?;
+                // Refresh from the durable WAL while the main-file EXCLUSIVE
+                // lock prevents external SQLite readers/writers from entering.
+                wal.begin_transaction(cx)?;
+                if wal.frame_count() != 0 {
+                    return Err(FrankenError::Busy);
+                }
+            }
+            Ok(())
+        })();
+
+        let operation_result = match preflight {
+            Ok(()) => operation(&mut inner),
+            Err(err) => Err(err),
+        };
+
+        // Releasing the cross-process maintenance fence is cleanup, not
+        // cancellable application work. In particular, VACUUM may have had
+        // to synchronously replay a hot rollback journal after its caller was
+        // cancelled. Keep the final main/SHM unlocks in an independently
+        // masked child so inherited cancellation cannot strand either lock.
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
+        let unlock_result = inner
+            .db_file
+            .unlock_external_maintenance(&cleanup_cx, wal_mode);
+        inner.checkpoint_active = false;
+        self.published.publish_metadata_only(
+            cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: false,
+            },
+        );
+        self.publish_committed_snapshot_from_inner(&inner);
+        drop(wal_guard);
+
+        match (operation_result, unlock_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), Ok(())) | (Ok(_), Err(err)) => Err(err),
+            (operation_result, unlock_result) => {
+                let operation_detail = operation_result
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |err| err.to_string());
+                let unlock_detail = unlock_result
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |err| err.to_string());
+                Err(FrankenError::internal(format!(
+                    "exclusive maintenance cleanup failed: operation={operation_detail}; external_unlock={unlock_detail}"
+                )))
+            }
+        }
+    }
 
     /// Return the database path used by this pager.
     #[must_use]
@@ -5231,18 +6072,27 @@ where
         Ok(())
     }
 
+    fn release_maintenance_open_lease(&self) {
+        self.maintenance_open_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
     #[cfg(all(feature = "native", any(unix, windows)))]
     #[doc(hidden)]
     pub fn finish_namespace_bootstrap(&self) -> Result<()> {
         if let Some(binding) = &self.namespace_binding {
             binding.finish_bootstrap()?;
         }
+        self.release_maintenance_open_lease();
         Ok(())
     }
 
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     #[doc(hidden)]
     pub fn finish_namespace_bootstrap(&self) -> Result<()> {
+        self.release_maintenance_open_lease();
         Ok(())
     }
 
@@ -5280,6 +6130,10 @@ where
     where
         B: WalBackend + 'static,
     {
+        let _maintenance_lease = match self.maintenance_gate.enter_transaction() {
+            Ok(lease) => lease,
+            Err(err) => return Err((err, backend)),
+        };
         let inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => {
@@ -5316,6 +6170,7 @@ where
 
     /// Configure whether WAL-mode commits sync the WAL file immediately.
     pub fn set_wal_commit_sync_policy(&self, policy: WalCommitSyncPolicy) -> Result<()> {
+        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         let mut inner = self
             .inner
             .lock()
@@ -5324,11 +6179,685 @@ where
         Ok(())
     }
 
+    /// Inspect a fully-written candidate database image without creating any
+    /// SQLite sidecars. Callers should perform semantic validation first, then
+    /// retain this receipt for identity/hash verification at publication.
+    pub fn inspect_database_image(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+    ) -> Result<DatabaseImageReceipt> {
+        let full_path = self.vfs.full_pathname(cx, image_path)?;
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = self.vfs.open(cx, Some(&full_path), flags)?;
+        let result = database_image_receipt_for_open_file(cx, &file, Some(self.page_size()));
+        let close_result = file.close(cx);
+        let receipt = result?;
+        close_result?;
+        Ok(receipt)
+    }
+
+    /// Install source-derived change-counter provenance on a private VACUUM
+    /// candidate without trusting its pathname between inspection and write.
+    ///
+    /// The full provisional receipt is recomputed from the identity-bound open
+    /// handle while an exclusive file lock is held. The method writes one
+    /// complete page-1 image, durably syncs it, verifies that every byte outside
+    /// offsets 24..28 and 92..96 is unchanged, and returns the final full-image
+    /// receipt for later semantic validation and publication CAS.
+    pub fn restore_vacuum_candidate_change_counter(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        provisional: &DatabaseImageReceipt,
+        change_counter: u32,
+    ) -> Result<DatabaseImageReceipt> {
+        let full_path = self.vfs.full_pathname(cx, image_path)?;
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) =
+            self.vfs
+                .open_with_expected_identity(cx, &full_path, flags, provisional.identity)?;
+
+        let mut lock_held = false;
+        let update_result = (|| -> Result<DatabaseImageReceipt> {
+            file.lock(cx, LockLevel::Exclusive)?;
+            lock_held = true;
+
+            let current = database_image_receipt_for_open_file(
+                cx,
+                &file,
+                Some(provisional.header.page_size),
+            )?;
+            if current != *provisional {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages:
+                        "VACUUM candidate changed before change-counter provenance repair"
+                            .to_owned(),
+                });
+            }
+
+            let page_size = provisional.header.page_size.as_usize();
+            let mut page_one = vec![0_u8; page_size];
+            let bytes_read = file.read(cx, &mut page_one, 0)?;
+            if bytes_read != page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM candidate page 1 is truncated: read {bytes_read} of {page_size} bytes"
+                    ),
+                });
+            }
+            let mut expected_page_one = page_one.clone();
+            let counter_bytes = change_counter.to_be_bytes();
+            expected_page_one[24..28].copy_from_slice(&counter_bytes);
+            expected_page_one[92..96].copy_from_slice(&counter_bytes);
+
+            file.write(cx, &expected_page_one, 0)?;
+            file.durable_sync(cx, SyncKind::FullDurable)?;
+
+            let mut verified_page_one = vec![0_u8; page_size];
+            let verified_read = file.read(cx, &mut verified_page_one, 0)?;
+            if verified_read != page_size || verified_page_one != expected_page_one {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM candidate page 1 changed outside the intended counter fields"
+                        .to_owned(),
+                });
+            }
+
+            let final_receipt = database_image_receipt_for_open_file(
+                cx,
+                &file,
+                Some(provisional.header.page_size),
+            )?;
+            let mut expected_header = provisional.header.clone();
+            expected_header.change_counter = change_counter;
+            expected_header.version_valid_for = change_counter;
+            if final_receipt.identity != provisional.identity
+                || final_receipt.file_size != provisional.file_size
+                || final_receipt.header != expected_header
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM candidate provenance repair changed its identity, length, or unrelated header fields"
+                        .to_owned(),
+                });
+            }
+            Ok(final_receipt)
+        })();
+
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
+        let unlock_result = if lock_held {
+            file.unlock(&cleanup_cx, LockLevel::None)
+        } else {
+            Ok(())
+        };
+        let close_result = file.close(&cleanup_cx);
+        match (update_result, unlock_result, close_result) {
+            (Ok(receipt), Ok(()), Ok(())) => Ok(receipt),
+            (Err(error), Ok(()), Ok(()))
+            | (Ok(_), Err(error), Ok(()))
+            | (Ok(_), Ok(()), Err(error)) => Err(error),
+            (update_result, unlock_result, close_result) => Err(FrankenError::internal(format!(
+                "VACUUM candidate provenance cleanup failed: update={}; unlock={}; close={}",
+                update_result
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |error| error.to_string()),
+                unlock_result
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |error| error.to_string()),
+                close_result
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |error| error.to_string()),
+            ))),
+        }
+    }
+
+    /// Capture the exact post-checkpoint source image used to build VACUUM's
+    /// candidate. Publication later recomputes this logical digest under the
+    /// same exclusive maintenance protocol and aborts if any page changed.
+    pub fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+        self.with_exclusive_maintenance(cx, |inner| {
+            database_image_receipt_for_open_file(cx, &inner.db_file, Some(inner.page_size))
+        })
+    }
+
+    fn ensure_vacuum_candidate_is_self_contained(&self, cx: &Cx, image_path: &Path) -> Result<()> {
+        for suffix in ["-journal", "-wal", "-shm", "-wal-fec"] {
+            let mut sidecar = image_path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if self.vfs.access(cx, &sidecar, AccessFlags::EXISTS)? {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM candidate is not self-contained: companion {} exists",
+                        sidecar.display()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a semantically-validated VACUUM image over the already-open
+    /// database inode using a durable rollback journal.
+    ///
+    /// `source` is a full-image compare-and-swap token captured before the
+    /// rebuild began. `candidate` is captured only after schema reload,
+    /// `quick_check`, and `integrity_check` succeeded. Both receipts are
+    /// recomputed from their original open handles inside the exclusive
+    /// maintenance epoch before any durable source byte is changed.
+    #[allow(clippy::too_many_lines)]
+    pub fn publish_validated_database_image(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+        source: &DatabaseImageReceipt,
+        candidate: &DatabaseImageReceipt,
+    ) -> Result<()> {
+        if self.vfs.is_memory() {
+            return Err(FrankenError::Unsupported);
+        }
+
+        let image_full_path = self.vfs.full_pathname(cx, image_path)?;
+        self.ensure_vacuum_candidate_is_self_contained(cx, &image_full_path)?;
+        let journal_path = self
+            .vfs
+            .full_pathname(cx, &Self::journal_path(&self.db_path))?;
+        if image_full_path == journal_path || candidate.identity == source.identity {
+            return Err(FrankenError::CannotOpen {
+                path: image_full_path,
+            });
+        }
+        let candidate_flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
+        let (mut candidate_file, _) = self.vfs.open_with_expected_identity(
+            cx,
+            &image_full_path,
+            candidate_flags,
+            candidate.identity,
+        )?;
+
+        let publication_result = self.with_exclusive_maintenance(cx, |inner| {
+            self.ensure_vacuum_candidate_is_self_contained(cx, &image_full_path)?;
+            let current_source =
+                database_image_receipt_for_open_file(cx, &inner.db_file, Some(inner.page_size))?;
+            if current_source != *source {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: "VACUUM source image changed while rebuilding".to_owned(),
+                });
+            }
+
+            let current_candidate = database_image_receipt_for_open_file(
+                cx,
+                &candidate_file,
+                Some(inner.page_size),
+            )?;
+            if current_candidate != *candidate {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "VACUUM candidate identity or content changed after validation"
+                        .to_owned(),
+                });
+            }
+
+            let expected_format_version = if inner.journal_mode == JournalMode::Wal {
+                2
+            } else {
+                1
+            };
+            if candidate.header.write_version != expected_format_version
+                || candidate.header.read_version != expected_format_version
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM candidate file-format versions ({}, {}) do not match {:?} mode",
+                        candidate.header.write_version,
+                        candidate.header.read_version,
+                        inner.journal_mode
+                    ),
+                });
+            }
+            let expected_change_counter = source.header.change_counter.wrapping_add(1).max(1);
+            if candidate.header.change_counter != expected_change_counter
+                || candidate.header.version_valid_for != expected_change_counter
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "VACUUM candidate change-counter provenance mismatch: source={}, candidate={}, version_valid_for={}, expected={expected_change_counter}",
+                        source.header.change_counter,
+                        candidate.header.change_counter,
+                        candidate.header.version_valid_for
+                    ),
+                });
+            }
+
+            let old_page_count = source.header.page_count;
+            let new_page_count = candidate.header.page_count;
+            let page_size = inner.page_size;
+            let page_size_bytes = u64::from(page_size.get());
+            let page_size_usize = page_size.as_usize();
+            let lock_byte_page = crate::journal::lock_byte_page(page_size);
+            let journal_record_count = old_page_count
+                .checked_sub(u32::from(lock_byte_page <= old_page_count))
+                .ok_or_else(|| FrankenError::internal("VACUUM journal page count underflow"))?;
+            // SQLite's -1 sentinel derives the record count from the exact
+            // journal length and supports databases whose page count exceeds
+            // the positive i32 range.
+            let journal_page_count = i32::try_from(journal_record_count).unwrap_or(-1);
+
+            let mut nonce_bytes = [0_u8; 4];
+            self.vfs.randomness(cx, &mut nonce_bytes);
+            let nonce = u32::from_be_bytes(nonce_bytes);
+            let journal_path = Self::journal_path(&self.db_path);
+            let journal_flags = VfsOpenFlags::CREATE
+                | VfsOpenFlags::EXCLUSIVE
+                | VfsOpenFlags::READWRITE
+                | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut journal_file, _) = self.vfs.open(cx, Some(&journal_path), journal_flags)?;
+            let journal_identity = journal_file.file_identity()?.ok_or_else(|| {
+                FrankenError::internal(
+                    "rollback-journal VFS did not provide a stable file identity",
+                )
+            })?;
+            if journal_identity == source.identity || journal_identity == candidate.identity {
+                return Err(FrankenError::CannotOpen { path: journal_path });
+            }
+            let mut journal_is_hot = false;
+            let mut journal_is_recoverable = true;
+            let cleanup_cx = cleanup_child_cx(cx);
+            // This guard deliberately outlives the inner publication closure.
+            // Once the hot header is durable, failures unwind into the replay
+            // path below; dropping the mask at the closure boundary would let
+            // a cancelled parent abort that replay and expose a partial main
+            // image while the maintenance fence is still held.
+            let _cleanup_mask = cleanup_cx.masked();
+
+            let mut publish_result = (|| -> Result<Vec<PageNumber>> {
+                journal_file.truncate(cx, 0)?;
+                let requested_sector_size = inner
+                    .db_file
+                    .sector_size()
+                    .max(journal_file.sector_size());
+                let sector_size = if (512..=65_536).contains(&requested_sector_size)
+                    && requested_sector_size.is_power_of_two()
+                {
+                    requested_sector_size
+                } else {
+                    4096
+                };
+                let initial_header = JournalHeader {
+                    page_count: 0,
+                    nonce,
+                    initial_db_size: old_page_count,
+                    sector_size,
+                    page_size: page_size.get(),
+                };
+                let mut initial_header_bytes = initial_header.encode_padded();
+                mark_local_journal_header(&mut initial_header_bytes);
+                // A rollback journal becomes hot only after every pre-image
+                // record is durable. Keep the magic zero through construction
+                // so a crash or I/O failure cannot advertise an incomplete
+                // journal as recoverable while the source database is still
+                // untouched. The complete, magic-bearing header is installed
+                // and synced immediately before the first database write.
+                initial_header_bytes[..JOURNAL_MAGIC.len()].fill(0);
+                journal_file.write(cx, &initial_header_bytes, 0)?;
+
+                let mut journal_offset = u64::try_from(initial_header_bytes.len()).map_err(|_| {
+                    FrankenError::OutOfRange {
+                        what: "VACUUM rollback-journal header length".to_owned(),
+                        value: initial_header_bytes.len().to_string(),
+                    }
+                })?;
+                let mut page = vec![0_u8; page_size_usize];
+                let mut records_written = 0_u32;
+                for raw_page_no in 1..=old_page_count {
+                    if raw_page_no == lock_byte_page {
+                        continue;
+                    }
+                    let offset = u64::from(raw_page_no - 1)
+                        .checked_mul(page_size_bytes)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "VACUUM source page offset".to_owned(),
+                            value: raw_page_no.to_string(),
+                        })?;
+                    let bytes_read = inner.db_file.read(cx, &mut page, offset)?;
+                    if bytes_read != page_size_usize {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short source read while journaling VACUUM page {raw_page_no}: got {bytes_read} of {page_size_usize}"
+                            ),
+                        });
+                    }
+                    let record = JournalPageRecord::new(raw_page_no, page.clone(), nonce);
+                    let encoded = record.encode();
+                    journal_file.write(cx, &encoded, journal_offset)?;
+                    journal_offset = journal_offset
+                        .checked_add(u64::try_from(encoded.len()).map_err(|_| {
+                            FrankenError::OutOfRange {
+                                what: "VACUUM rollback-journal record length".to_owned(),
+                                value: encoded.len().to_string(),
+                            }
+                        })?)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "VACUUM rollback-journal file length".to_owned(),
+                            value: raw_page_no.to_string(),
+                        })?;
+                    records_written = records_written.checked_add(1).ok_or_else(|| {
+                        FrankenError::OutOfRange {
+                            what: "VACUUM rollback-journal records written".to_owned(),
+                            value: raw_page_no.to_string(),
+                        }
+                    })?;
+                }
+                if records_written != journal_record_count {
+                    return Err(FrankenError::internal(format!(
+                        "VACUUM rollback-journal record mismatch: wrote {records_written}, expected {journal_record_count}"
+                    )));
+                }
+                journal_file.truncate(cx, journal_offset)?;
+                let durable_journal_size = journal_file.file_size(cx)?;
+                if durable_journal_size != journal_offset {
+                    return Err(FrankenError::internal(format!(
+                        "VACUUM rollback-journal length mismatch: got {durable_journal_size}, expected {journal_offset}"
+                    )));
+                }
+                journal_file.durable_sync(cx, SyncKind::FullDurable)?;
+                self.vfs.sync_parent_directory(cx, &journal_path)?;
+
+                // The final record count is the commit point for the journal,
+                // not for the database. Once this barrier succeeds, recovery
+                // can restore every original logical page and exact length.
+                let final_header = JournalHeader {
+                    page_count: journal_page_count,
+                    ..initial_header
+                };
+                let mut final_header_bytes = final_header.encode_padded();
+                mark_local_journal_header(&mut final_header_bytes);
+                durable_write_and_verify_journal_header(
+                    cx,
+                    &mut journal_file,
+                    &final_header_bytes,
+                )?;
+                journal_is_hot = true;
+                inner.rollback_journal_recovery_state =
+                    RollbackJournalRecoveryState::ReplayPending;
+
+                // Once the main image starts changing, inherited cancellation
+                // must not strand a half-published image. The outer mask stays
+                // live through this closure and any synchronous replay below.
+                let mut candidate_page = vec![0_u8; page_size_usize];
+                for raw_page_no in 1..=new_page_count {
+                    if raw_page_no == lock_byte_page {
+                        continue;
+                    }
+                    let offset = u64::from(raw_page_no - 1)
+                        .checked_mul(page_size_bytes)
+                        .ok_or_else(|| FrankenError::OutOfRange {
+                            what: "VACUUM candidate page offset".to_owned(),
+                            value: raw_page_no.to_string(),
+                        })?;
+                    let bytes_read =
+                        candidate_file.read(&cleanup_cx, &mut candidate_page, offset)?;
+                    if bytes_read != page_size_usize {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short candidate read while publishing VACUUM page {raw_page_no}: got {bytes_read} of {page_size_usize}"
+                            ),
+                        });
+                    }
+                    inner.db_file.write(&cleanup_cx, &candidate_page, offset)?;
+                    #[cfg(any(test, feature = "fault-injection"))]
+                    crate::fault_hooks::maybe_inject_vacuum_after_target_page(raw_page_no)?;
+                }
+                inner
+                    .db_file
+                    .truncate(&cleanup_cx, candidate.file_size)?;
+                inner
+                    .db_file
+                    .durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
+
+                let published_receipt = database_image_receipt_for_open_file(
+                    &cleanup_cx,
+                    &inner.db_file,
+                    Some(inner.page_size),
+                )?;
+                if published_receipt.identity != source.identity
+                    || published_receipt.file_size != candidate.file_size
+                    || published_receipt.header != candidate.header
+                    || published_receipt.logical_hash != candidate.logical_hash
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "VACUUM target verification did not match the validated candidate"
+                            .to_owned(),
+                    });
+                }
+
+                let rebuilt_freelist = load_freelist_from_disk(
+                    &cleanup_cx,
+                    &inner.db_file,
+                    page_size,
+                    new_page_count,
+                    candidate.header.freelist_trunk,
+                    candidate.header.freelist_count,
+                )?;
+                if rebuilt_freelist.len()
+                    != usize::try_from(candidate.header.freelist_count).map_err(|_| {
+                        FrankenError::OutOfRange {
+                            what: "VACUUM candidate freelist count".to_owned(),
+                            value: candidate.header.freelist_count.to_string(),
+                        }
+                    })?
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "VACUUM candidate freelist contains {} valid unique pages but header declares {}",
+                            rebuilt_freelist.len(),
+                            candidate.header.freelist_count
+                        ),
+                    });
+                }
+
+                // Persist mode: make the hot journal non-hot by durably
+                // clearing its magic. If that barrier fails, restore the full
+                // header and roll back. A truncate+sync fallback is used only
+                // when restoring the hot header itself fails; that fallback
+                // durably selects the already-synced candidate as committed.
+                #[cfg(any(test, feature = "fault-injection"))]
+                crate::fault_hooks::maybe_inject_vacuum_before_commit_marker()?;
+                let invalidate_result = durable_invalidate_journal(
+                    &cleanup_cx,
+                    &mut journal_file,
+                    JournalInvalidation::ZeroMagic,
+                );
+                if let Err(invalidate_err) = invalidate_result {
+                    let restore_result = durable_write_and_verify_journal_header(
+                        &cleanup_cx,
+                        &mut journal_file,
+                        &final_header_bytes,
+                    );
+                    if let Err(restore_err) = restore_result {
+                        let truncate_commit_result = durable_invalidate_journal(
+                            &cleanup_cx,
+                            &mut journal_file,
+                            JournalInvalidation::Truncate,
+                        );
+                        if let Err(truncate_err) = truncate_commit_result {
+                            journal_is_recoverable = false;
+                            return Err(FrankenError::internal(format!(
+                                "VACUUM publication outcome is indeterminate after rollback-journal invalidation failure: invalidate={invalidate_err}; restore={restore_err}; truncate_commit={truncate_err}"
+                            )));
+                        }
+                    } else {
+                        return Err(FrankenError::internal(format!(
+                            "VACUUM could not commit its rollback journal; restored the hot journal for rollback: {invalidate_err}"
+                        )));
+                    }
+                }
+
+                // The zero-magic barrier above is the durable database commit
+                // point. Shrinking the now-non-hot journal is cleanup only.
+                let _ = journal_file.truncate(&cleanup_cx, 0);
+                let _ = journal_file.durable_sync(&cleanup_cx, SyncKind::FullDurable);
+                Ok(rebuilt_freelist)
+            })();
+
+            if publish_result.is_err() && !journal_is_hot {
+                let pre_hot_cleanup = durable_invalidate_journal(
+                    &cleanup_cx,
+                    &mut journal_file,
+                    JournalInvalidation::ZeroMagic,
+                );
+                if let Err(cleanup_err) = pre_hot_cleanup {
+                    let publication_err = publish_result
+                        .expect_err("pre-hot cleanup only runs after publication failure");
+                    publish_result = Err(FrankenError::internal(format!(
+                        "VACUUM publication failed before the journal became hot and its zero-magic cleanup also failed: publication={publication_err}; cleanup={cleanup_err}"
+                    )));
+                }
+            }
+
+            let close_result = journal_file.close(&cleanup_cx);
+            let rebuilt_freelist = match publish_result {
+                Ok(freelist) => {
+                    match close_result {
+                        Ok(()) => {
+                            if let Err(delete_err) =
+                                self.vfs.delete(&cleanup_cx, &journal_path, true)
+                            {
+                                tracing::warn!(
+                                    error = %delete_err,
+                                    journal = %journal_path.display(),
+                                    "VACUUM committed with a non-hot rollback-journal leftover"
+                                );
+                            }
+                        }
+                        Err(close_err) => {
+                            tracing::error!(
+                                error = %close_err,
+                                journal = %journal_path.display(),
+                                "VACUUM committed but rollback-journal close failed"
+                            );
+                        }
+                    }
+                    freelist
+                }
+                Err(publication_err) if journal_is_hot && journal_is_recoverable => {
+                    let rollback_result = Self::replay_journal_with_validator(
+                        &cleanup_cx,
+                        self.vfs.as_ref(),
+                        &mut inner.db_file,
+                        &journal_path,
+                        page_size,
+                        |restored_file, _journal_page_size| {
+                            let restored = database_image_receipt_for_open_file(
+                                &cleanup_cx,
+                                restored_file,
+                                Some(page_size),
+                            )?;
+                            if restored != *source {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "VACUUM rollback completed but the source receipt did not match: publication={publication_err}"
+                                    ),
+                                });
+                            }
+                            Ok(())
+                        },
+                    );
+                    match rollback_result {
+                        Ok(()) => {
+                            inner.rollback_journal_recovery_state =
+                                RollbackJournalRecoveryState::Clean;
+                            let _ = self.vfs.delete(&cleanup_cx, &journal_path, true);
+                            return Err(publication_err);
+                        }
+                        Err(rollback_err) => {
+                            return Err(FrankenError::internal(format!(
+                                "VACUUM publication failed and rollback did not restore the source image: publication={publication_err}; rollback={rollback_err}; close={}",
+                                close_result
+                                    .err()
+                                    .map_or_else(|| "ok".to_owned(), |err| err.to_string())
+                            )));
+                        }
+                    }
+                }
+                Err(publication_err) => {
+                    if !journal_is_hot {
+                        inner.rollback_journal_recovery_state =
+                            RollbackJournalRecoveryState::Clean;
+                        if close_result.is_ok() {
+                            let _ = self.vfs.delete(&cleanup_cx, &journal_path, true);
+                        }
+                    }
+                    return Err(match close_result {
+                        Ok(()) => publication_err,
+                        Err(close_err) => FrankenError::internal(format!(
+                            "VACUUM publication failed and rollback-journal close also failed: publication={publication_err}; close={close_err}"
+                        )),
+                    });
+                }
+            };
+
+            let next_commit_seq = inner.commit_seq.next();
+            self.cache.clear();
+            inner.page_size = candidate.header.page_size;
+            inner.db_size = new_page_count;
+            inner.next_page = if new_page_count >= 2 {
+                new_page_count.saturating_add(1)
+            } else {
+                2
+            };
+            inner.freelist = rebuilt_freelist;
+            // The durable SQLite header counter is a wrapping u32, whereas
+            // the pager visibility clock is monotonic u64. VACUUM is exactly
+            // one logical commit, so advance the latter rather than replacing
+            // it with a potentially smaller wrapped header value.
+            inner.commit_seq = next_commit_seq;
+            inner.committed_db_file_size_bytes = candidate.file_size;
+            inner.committed_db_change_counter = u64::from(candidate.header.change_counter);
+            inner.committed_wal_generation = None;
+            inner.committed_wal_visible_commit_count = 0;
+            inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
+            self.published.publish_replaced_image(
+                &cleanup_cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: true,
+                },
+            );
+            self.publish_committed_snapshot_from_inner(inner);
+            remove_group_commit_queue(&self.db_path);
+            Ok(())
+        });
+
+        let close_result = candidate_file.close(cx);
+        match publication_result {
+            Ok(()) => {
+                if let Err(close_err) = close_result {
+                    tracing::error!(
+                        error = %close_err,
+                        candidate = %image_full_path.display(),
+                        "VACUUM committed but candidate close failed"
+                    );
+                }
+                Ok(())
+            }
+            Err(publication_err) => match close_result {
+                Ok(()) => Err(publication_err),
+                Err(close_err) => Err(FrankenError::internal(format!(
+                    "VACUUM publication failed and candidate close also failed: publication={publication_err}; close={close_err}"
+                ))),
+            },
+        }
+    }
+
     /// Export the pager's main database image as a self-contained SQLite file.
     ///
     /// The pager must be quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the returned bytes contain the durable main image.
     pub fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
 
@@ -5388,6 +6917,7 @@ where
     /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the destination contains a self-contained main DB.
     pub fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
         let source_full = self.vfs.full_pathname(cx, &source_path)?;
@@ -5502,6 +7032,7 @@ where
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
     pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+        let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
             .inner
@@ -5512,61 +7043,13 @@ where
             return Ok(self.published.snapshot());
         }
 
-        inner.db_file.lock(cx, LockLevel::Shared)?;
-
         let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
         let commit_seq_before_refresh = inner.commit_seq;
-        let journal_path = Self::journal_path(&self.db_path);
-
-        let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
-            Ok(exists) => exists,
-            Err(err) => {
-                let _ = inner.db_file.unlock(cx, LockLevel::None);
-                return Err(err);
-            }
-        };
-
-        let mut recovered_or_invalidated_journal = false;
-        if inner.rollback_journal_recovery_state.is_pending() || journal_exists {
-            let page_size = inner.page_size;
-            match Self::recover_rollback_journal_if_present_locked(
-                cx,
-                &*self.vfs,
-                &mut inner.db_file,
-                &journal_path,
-                page_size,
-                LockLevel::Shared,
-            ) {
-                Ok(false) if inner.rollback_journal_recovery_state.is_pending() => {
-                    inner.db_file.unlock(cx, LockLevel::None)?;
-                    return Err(FrankenError::internal(
-                        "rollback journal missing while local recovery was pending",
-                    ));
-                }
-                Ok(_) => {
-                    recovered_or_invalidated_journal = true;
-                    inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
-                }
-                Err(err) => {
-                    let _ = inner.db_file.unlock(cx, LockLevel::None);
-                    return Err(err);
-                }
-            }
-        }
-
-        if recovered_or_invalidated_journal {
-            self.cache.clear();
-        }
-        let refresh = match inner.refresh_committed_state(cx, &self.cache, &self.wal_backend) {
-            Ok(refresh) => refresh,
-            Err(err) => {
-                let _ = inner.db_file.unlock(cx, LockLevel::None);
-                return Err(err);
-            }
-        };
+        let (refresh, journal_visibility_invalidation) =
+            self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?;
 
         let clear_published_pages = had_recovery_pending
-            || journal_exists
+            || journal_visibility_invalidation
             || refresh.page_cache_invalidated
             || inner.commit_seq != commit_seq_before_refresh;
         // D1-CRITICAL Change 3: Use sharded publish_clear_if.
@@ -5581,7 +7064,6 @@ where
             },
             clear_published_pages,
         );
-        inner.db_file.unlock(cx, LockLevel::None)?;
 
         Ok(self.published.snapshot())
     }
@@ -5598,38 +7080,7 @@ where
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
-        self.validate_namespace_binding()?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-
-        if inner.active_transactions > 0 || inner.checkpoint_active {
-            return Ok(self.published.snapshot());
-        }
-
-        if inner.journal_mode != JournalMode::Wal
-            || inner.rollback_journal_recovery_state.is_pending()
-        {
-            drop(inner);
-            return self.refresh_published_snapshot(cx);
-        }
-
-        let commit_seq_before_refresh = inner.commit_seq;
-        let refresh = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
-        self.published.publish_clear_if(
-            cx,
-            PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            },
-            refresh.page_cache_invalidated || inner.commit_seq != commit_seq_before_refresh,
-        );
-
-        Ok(self.published.snapshot())
+        self.refresh_published_snapshot(cx)
     }
 
     /// Number of snapshot retries steady-state readers have taken.
@@ -5688,7 +7139,6 @@ where
     /// This mirrors the transaction commit helper so pager-level tests can
     /// exercise publication/reclamation invariants without manufacturing a
     /// full commit path.
-    #[cfg(test)]
     fn publish_committed_snapshot_from_inner(&self, inner: &PagerInner<V::File>) {
         let snapshot = Arc::new(PagerCommittedSnapshot::from_inner(inner));
         let mut guard = self
@@ -5752,44 +7202,317 @@ where
         Ok(())
     }
 
-    fn recover_rollback_journal_if_present(
+    /// Recover one runtime pager while its identity-bound maintenance lease is
+    /// exclusive and no VFS lock is held by the caller.
+    ///
+    /// The cross-process order is always WAL write/checkpoint slots followed
+    /// by main-file EXCLUSIVE. Replay and the exact metadata rebuild occur in
+    /// the same epoch. If the rebuild fails after durable replay, the distinct
+    /// `MetadataRefreshPending` state makes a later attempt retry metadata
+    /// without requiring the already-invalidated journal.
+    fn recover_runtime_rollback_journal(
         cx: &Cx,
         vfs: &V,
-        db_file: &mut V::File,
+        inner: &mut PagerInner<V::File>,
         journal_path: &Path,
-        page_size: PageSize,
+        cache: &ShardedPageCache,
+        wal_backend: &SharedWalBackend,
     ) -> Result<bool> {
-        if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
-            return Ok(false);
-        }
+        let wal_mode = inner.journal_mode == JournalMode::Wal;
+        inner.db_file.lock_external_maintenance(cx, wal_mode)?;
+        let recovery_result = (|| -> Result<bool> {
+            let journal_exists = vfs.access(cx, journal_path, AccessFlags::EXISTS)?;
+            if inner.rollback_journal_recovery_state.needs_replay() && !journal_exists {
+                return Err(FrankenError::internal(
+                    "rollback journal missing while failed commit replay was pending",
+                ));
+            }
 
-        Self::replay_journal(cx, vfs, db_file, journal_path, page_size)?;
-        let _ = vfs.delete(cx, journal_path, true);
-        Ok(true)
+            let mut journal_observed = false;
+            if journal_exists {
+                journal_observed = true;
+                let outcome = Self::replay_journal_with_optional_page_size_validator(
+                    cx,
+                    vfs,
+                    &mut inner.db_file,
+                    journal_path,
+                    Some(inner.page_size),
+                    |_, _| Ok(()),
+                )?;
+                match outcome {
+                    RollbackJournalReplayOutcome::Replayed(_) => {
+                        inner.rollback_journal_recovery_state =
+                            RollbackJournalRecoveryState::MetadataRefreshPending;
+                    }
+                    RollbackJournalReplayOutcome::NonHot
+                        if inner.rollback_journal_recovery_state.needs_replay() =>
+                    {
+                        return Err(FrankenError::internal(
+                            "rollback journal became non-hot before pending replay completed",
+                        ));
+                    }
+                    RollbackJournalReplayOutcome::NonHot => {}
+                }
+            }
+
+            if matches!(
+                inner.rollback_journal_recovery_state,
+                RollbackJournalRecoveryState::MetadataRefreshPending
+            ) {
+                cache.clear();
+                inner.refresh_committed_state_after_recovery(cx, cache, wal_backend)?;
+                inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
+            }
+
+            if journal_observed
+                && matches!(
+                    inner.rollback_journal_recovery_state,
+                    RollbackJournalRecoveryState::Clean
+                )
+                && let Err(error) = vfs.delete(cx, journal_path, true)
+            {
+                tracing::warn!(
+                    %error,
+                    journal = %journal_path.display(),
+                    "runtime recovery left a durable non-hot rollback journal"
+                );
+            }
+            Ok(journal_observed)
+        })();
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
+        let unlock_result = inner
+            .db_file
+            .unlock_external_maintenance(&cleanup_cx, wal_mode);
+        match (recovery_result, unlock_result) {
+            (Ok(recovered), Ok(())) => Ok(recovered),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(recovery_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                "runtime rollback recovery failed and could not release the maintenance lock: recovery={recovery_error}; unlock={unlock_error}"
+            ))),
+        }
     }
 
-    fn recover_rollback_journal_if_present_locked(
+    fn recover_rollback_journal_for_open(
         cx: &Cx,
         vfs: &V,
         db_file: &mut V::File,
         journal_path: &Path,
-        page_size: PageSize,
-        restore_lock_level: LockLevel,
-    ) -> Result<bool> {
+    ) -> Result<Option<RollbackJournalReplayOutcome>> {
         if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
-            return Ok(false);
+            return Ok(None);
         }
 
-        db_file.lock(cx, LockLevel::Exclusive)?;
-        let recovery_result =
-            Self::recover_rollback_journal_if_present(cx, vfs, db_file, journal_path, page_size);
-        let restore_result = db_file.unlock(cx, restore_lock_level);
-        match (recovery_result, restore_result) {
-            (Ok(recovered), Ok(())) => Ok(recovered),
-            (Err(recovery_err), Ok(())) => Err(recovery_err),
-            (Ok(_), Err(restore_err)) => Err(restore_err),
-            (Err(recovery_err), Err(restore_err)) => Err(FrankenError::internal(format!(
-                "hot journal recovery failed and could not restore lock level {restore_lock_level:?}: recovery={recovery_err}; restore={restore_err}"
+        // Open-time recovery has not yet established a trustworthy journal
+        // mode. Conservatively exclude WAL writers/checkpointers as well as
+        // main-file users; this is safe for rollback-mode files and prevents a
+        // crashed WAL-mode whole-image publication racing recovery.
+        db_file.lock_external_maintenance(cx, true)?;
+        let recovery_result = (|| -> Result<Option<RollbackJournalReplayOutcome>> {
+            if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
+                return Ok(None);
+            }
+            let outcome = Self::replay_journal_with_optional_page_size_validator(
+                cx,
+                vfs,
+                db_file,
+                journal_path,
+                None,
+                |restored_file, journal_page_size| {
+                    let restored_size = restored_file.file_size(cx)?;
+                    if restored_size == 0 {
+                        return Ok(());
+                    }
+                    if restored_size < DATABASE_HEADER_SIZE as u64 {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "rollback recovery restored a {restored_size}-byte main file, too short for its database header"
+                            ),
+                        });
+                    }
+                    let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                    let bytes_read = restored_file.read(cx, &mut header_bytes, 0)?;
+                    if bytes_read != DATABASE_HEADER_SIZE {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short database-header read after rollback recovery: got {bytes_read} of {DATABASE_HEADER_SIZE} bytes"
+                            ),
+                        });
+                    }
+                    let restored_header =
+                        DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "rollback recovery restored an invalid database header: {error}"
+                                ),
+                            }
+                        })?;
+                    if restored_header.page_size != journal_page_size {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "rollback recovery restored page size {}, but the hot journal used {}",
+                                restored_header.page_size.get(),
+                                journal_page_size.get()
+                            ),
+                        });
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Err(error) = vfs.delete(cx, journal_path, true) {
+                tracing::warn!(
+                    %error,
+                    journal = %journal_path.display(),
+                    "open-time recovery left a durable non-hot rollback journal"
+                );
+            } else if vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
+                return Err(FrankenError::CannotOpen {
+                    path: journal_path.to_owned(),
+                });
+            }
+            Ok(Some(outcome))
+        })();
+
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
+        let unlock_result = db_file.unlock_external_maintenance(&cleanup_cx, true);
+        match (recovery_result, unlock_result) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(recovery_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                "open-time rollback recovery failed and could not release the maintenance lock: recovery={recovery_error}; unlock={unlock_error}"
+            ))),
+        }
+    }
+
+    fn verify_readonly_rollback_journal_state(cx: &Cx, vfs: &V, journal_path: &Path) -> Result<()> {
+        if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
+            return Ok(());
+        }
+
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal_file, _) = vfs.open(cx, Some(journal_path), flags)?;
+        let classification = classify_rollback_journal_prefix(cx, &journal_file);
+        let close_result = journal_file.close(cx);
+        match (classification, close_result) {
+            (Ok((RollbackJournalPrefixState::NonHot, _)), Ok(())) => Ok(()),
+            (Ok((RollbackJournalPrefixState::Hot, _)), Ok(())) => Err(FrankenError::BusyRecovery),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(classification_error), Err(close_error)) => Err(FrankenError::internal(format!(
+                "read-only rollback-journal classification failed and the journal handle could not close: classification={classification_error}; close={close_error}"
+            ))),
+        }
+    }
+
+    /// Bind a transaction/read boundary to one coherent durable state.
+    ///
+    /// Every caller enters with exactly one transaction maintenance lease and
+    /// no active transaction in this pager. A hot journal is first discovered
+    /// under main-file SHARED, then SHARED is released before the lease is
+    /// upgraded and the canonical WAL-slots -> main-EXCLUSIVE recovery epoch
+    /// begins. Read-only pagers only classify and fail closed.
+    fn refresh_runtime_committed_state(
+        &self,
+        cx: &Cx,
+        maintenance_lease: &mut PagerMaintenanceLease,
+        inner: &mut PagerInner<V::File>,
+    ) -> Result<(CommittedStateRefresh, bool)> {
+        let journal_path = Self::journal_path(&self.db_path);
+        inner.db_file.lock_external_shared_snapshot(cx)?;
+
+        let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
+            Ok(exists) => exists,
+            Err(error) => {
+                let cleanup_cx = cleanup_child_cx(cx);
+                let _cleanup_mask = cleanup_cx.masked();
+                return match inner.db_file.unlock_external_shared_snapshot(&cleanup_cx) {
+                    Ok(()) => Err(error),
+                    Err(unlock_error) => Err(FrankenError::internal(format!(
+                        "rollback-journal probe failed and could not release SHARED: probe={error}; unlock={unlock_error}"
+                    ))),
+                };
+            }
+        };
+        let had_pending = inner.rollback_journal_recovery_state.is_pending();
+
+        if inner.access_mode.is_readonly() {
+            let operation_result = if had_pending {
+                Err(FrankenError::BusyRecovery)
+            } else {
+                Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
+                    .and_then(|()| {
+                        inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)
+                    })
+            };
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            let unlock_result = inner.db_file.unlock_external_shared_snapshot(&cleanup_cx);
+            return match (operation_result, unlock_result) {
+                (Ok(refresh), Ok(())) => Ok((refresh, journal_exists)),
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                (Err(operation_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                    "read-only durable snapshot failed and could not release SHARED: operation={operation_error}; unlock={unlock_error}"
+                ))),
+            };
+        }
+
+        if had_pending || journal_exists {
+            // Never wait for the recovery fence or acquire WAL slots while
+            // retaining main SHARED: maintenance publishers use the opposite,
+            // canonical order.
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)?;
+            let _recovery_guard = self.recovery_fence.acquire_for_recovery()?;
+            let prior_kind = maintenance_lease.upgrade_to_exclusive()?;
+            let recovery_result = Self::recover_runtime_rollback_journal(
+                cx,
+                &*self.vfs,
+                inner,
+                &journal_path,
+                &self.cache,
+                &self.wal_backend,
+            );
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            let downgrade_result = maintenance_lease.downgrade_from_exclusive(prior_kind);
+            match (recovery_result, downgrade_result) {
+                (Ok(_), Ok(())) => {}
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                (Err(recovery_error), Err(downgrade_error)) => {
+                    return Err(FrankenError::internal(format!(
+                        "runtime recovery failed and could not restore its maintenance lease: recovery={recovery_error}; downgrade={downgrade_error}"
+                    )));
+                }
+            }
+
+            inner.db_file.lock_external_shared_snapshot(cx)?;
+            // A non-hot leftover is harmless if deletion failed. A new hot
+            // record here means another process won a publication race after
+            // our recovery epoch; fail closed instead of reading through it.
+            if let Err(error) =
+                Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
+            {
+                let cleanup_cx = cleanup_child_cx(cx);
+                let _cleanup_mask = cleanup_cx.masked();
+                return match inner.db_file.unlock_external_shared_snapshot(&cleanup_cx) {
+                    Ok(()) => Err(error),
+                    Err(unlock_error) => Err(FrankenError::internal(format!(
+                        "post-recovery journal verification failed and could not release SHARED: verification={error}; unlock={unlock_error}"
+                    ))),
+                };
+            }
+        }
+
+        let refresh_result = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend);
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
+        let unlock_result = inner.db_file.unlock_external_shared_snapshot(&cleanup_cx);
+        match (refresh_result, unlock_result) {
+            (Ok(refresh), Ok(())) => Ok((refresh, had_pending || journal_exists)),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(refresh_error), Err(unlock_error)) => Err(FrankenError::internal(format!(
+                "durable pager refresh failed and could not release SHARED: refresh={refresh_error}; unlock={unlock_error}"
             ))),
         }
     }
@@ -5990,6 +7713,8 @@ where
         } = policy;
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
+        let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
+        let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
         let pending_namespace = if vfs.is_memory() {
             None
@@ -6037,6 +7762,17 @@ where
             }
             (_, None) => vfs.open(cx, Some(&db_path), flags)?,
         };
+        let maintenance_gate =
+            identity_bound_maintenance_gate(&*vfs, &path_maintenance_gate, &db_file)?;
+        let recovery_fence = identity_bound_recovery_fence(&*vfs, &db_path, &db_file)?;
+        let group_commit_queue = identity_bound_group_commit_queue(&*vfs, &db_path, &db_file)?;
+        let mut maintenance_open_lease = if Arc::ptr_eq(&maintenance_gate, &path_maintenance_gate) {
+            path_maintenance_lease
+        } else {
+            let identity_lease = maintenance_gate.enter_open()?;
+            drop(path_maintenance_lease);
+            identity_lease
+        };
 
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_binding = if let Some(pending) = pending_namespace {
@@ -6052,46 +7788,117 @@ where
             None
         };
 
-        // Probe for existing page size BEFORE hot journal recovery.
-        // Recovery requires the correct page size to correctly parse records.
-        let mut file_size = db_file.file_size(cx)?;
-        if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
+        let journal_path = Self::journal_path(&db_path);
+        if disposition == ReadWriteOpenDisposition::ExistingOnly
+            && with_main_shared_lock(cx, &mut db_file, |db_file| db_file.file_size(cx))? == 0
+        {
+            // Existing-only open never lets a sidecar bootstrap an empty main
+            // file, even if that sidecar looks like a valid hot journal.
             return Err(FrankenError::CannotOpen { path: db_path });
         }
-        let journal_path = Self::journal_path(&db_path);
-        let page_size = if file_size >= DATABASE_HEADER_SIZE as u64 {
-            let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
-            let header_read = db_file.read(cx, &mut header_bytes, 0)?;
-            if header_read >= DATABASE_HEADER_SIZE {
-                match DatabaseHeader::from_bytes(&header_bytes) {
-                    Ok(header) => header.page_size,
-                    Err(error)
-                        if stale_main_header_can_be_recovered_from_live_wal(
-                            cx,
-                            &*vfs,
-                            &db_path,
-                            &header_bytes,
-                            &error,
-                            false,
-                        )? =>
-                    {
-                        page_size_from_header_bytes(&header_bytes).unwrap_or(requested_page_size)
+
+        let (mut file_size, coherent_header_bytes, accept_proven_non_hot_leftover) = if disposition
+            == ReadWriteOpenDisposition::ReservedEmpty
+        {
+            (db_file.file_size(cx)?, None, false)
+        } else {
+            let mut accept_proven_non_hot_leftover = false;
+            loop {
+                // Never wait for the recovery fence while holding main
+                // SHARED: another opener may own the fence while trying to
+                // upgrade to EXCLUSIVE. An unlocked existence probe is only
+                // a routing hint; every decision is rechecked under a lock.
+                if vfs.access(cx, &journal_path, AccessFlags::EXISTS)?
+                    && !accept_proven_non_hot_leftover
+                {
+                    let _recovery_guard = recovery_fence.acquire_for_recovery()?;
+                    let prior_kind = maintenance_open_lease.upgrade_to_exclusive()?;
+                    let recovery_result = Self::recover_rollback_journal_for_open(
+                        cx,
+                        &*vfs,
+                        &mut db_file,
+                        &journal_path,
+                    );
+                    let cleanup_cx = cleanup_child_cx(cx);
+                    let _cleanup_mask = cleanup_cx.masked();
+                    let downgrade_result =
+                        maintenance_open_lease.downgrade_from_exclusive(prior_kind);
+                    match (recovery_result, downgrade_result) {
+                        (Ok(outcome), Ok(())) => {
+                            accept_proven_non_hot_leftover = outcome.is_some();
+                        }
+                        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+                        (Err(recovery_error), Err(downgrade_error)) => {
+                            return Err(FrankenError::internal(format!(
+                                "open-time rollback recovery failed and could not restore its maintenance lease: recovery={recovery_error}; downgrade={downgrade_error}"
+                            )));
+                        }
                     }
-                    Err(error) if disposition == ReadWriteOpenDisposition::ExistingOnly => {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!("invalid database header: {error}"),
+                    continue;
+                }
+
+                let snapshot = with_main_shared_lock(cx, &mut db_file, |db_file| {
+                    if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+                        if !accept_proven_non_hot_leftover {
+                            return Ok(None);
+                        }
+                        match Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)
+                        {
+                            Ok(()) => {}
+                            Err(FrankenError::BusyRecovery) => return Ok(None),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let file_size = db_file.file_size(cx)?;
+                    if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
+                        return Err(FrankenError::CannotOpen {
+                            path: db_path.clone(),
                         });
                     }
-                    Err(_) => requested_page_size,
+                    let header_bytes = if file_size >= DATABASE_HEADER_SIZE as u64 {
+                        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                        let bytes_read = db_file.read(cx, &mut header_bytes, 0)?;
+                        if bytes_read != DATABASE_HEADER_SIZE {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "short read fetching database header: got {bytes_read} of {DATABASE_HEADER_SIZE}"
+                                ),
+                            });
+                        }
+                        Some(header_bytes)
+                    } else {
+                        None
+                    };
+                    Ok(Some((file_size, header_bytes)))
+                })?;
+                if let Some((file_size, header_bytes)) = snapshot {
+                    break (file_size, header_bytes, accept_proven_non_hot_leftover);
                 }
-            } else if disposition == ReadWriteOpenDisposition::ExistingOnly {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "short read fetching database header: got {header_read} of {DATABASE_HEADER_SIZE}"
-                    ),
-                });
-            } else {
-                requested_page_size
+                accept_proven_non_hot_leftover = false;
+            }
+        };
+
+        let page_size = if let Some(header_bytes) = coherent_header_bytes.as_ref() {
+            match DatabaseHeader::from_bytes(header_bytes) {
+                Ok(header) => header.page_size,
+                Err(error)
+                    if stale_main_header_can_be_recovered_from_live_wal(
+                        cx,
+                        &*vfs,
+                        &db_path,
+                        header_bytes,
+                        &error,
+                        false,
+                    )? =>
+                {
+                    page_size_from_header_bytes(header_bytes).unwrap_or(requested_page_size)
+                }
+                Err(error) if disposition == ReadWriteOpenDisposition::ExistingOnly => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!("invalid database header: {error}"),
+                    });
+                }
+                Err(_) => requested_page_size,
             }
         } else if disposition == ReadWriteOpenDisposition::ExistingOnly {
             return Err(FrankenError::DatabaseCorrupt {
@@ -6103,32 +7910,6 @@ where
             requested_page_size
         };
 
-        let rollback_journal_exists = disposition != ReadWriteOpenDisposition::ReservedEmpty
-            && vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
-        if rollback_journal_exists {
-            // bd-yfdb6 / bd-ma5m2.1: acquire the per-path recovery fence only
-            // when there is a rollback journal to recover. Clean WAL-mode
-            // shared-file startup storms should not serialize every opener
-            // through a recovery fence just to rediscover "no journal".
-            let recovery_fence = recovery_fence_for_backend(&*vfs, &db_path);
-            let _recovery_guard = recovery_fence.acquire_for_recovery()?;
-
-            // Hot journal recovery writes the database image back to its durable
-            // pre-commit state, so acquire EXCLUSIVE before replay even during
-            // initial open. The recovery helper re-checks journal existence
-            // after the fence in case another opener completed recovery first.
-            let _ = Self::recover_rollback_journal_if_present_locked(
-                cx,
-                &*vfs,
-                &mut db_file,
-                &journal_path,
-                page_size,
-                LockLevel::None,
-            )?;
-        }
-
-        // Refresh file size after potential recovery.
-        file_size = db_file.file_size(cx)?;
         let (header, bootstrapped_from_live_wal_stub) = if file_size == 0 {
             if disposition == ReadWriteOpenDisposition::ExistingOnly {
                 return Err(FrankenError::CannotOpen { path: db_path });
@@ -6211,15 +7992,9 @@ where
                 });
             }
 
-            let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
-            let header_read = db_file.read(cx, &mut header_bytes, 0)?;
-            if header_read < DATABASE_HEADER_SIZE {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "short read fetching database header: got {header_read} of {DATABASE_HEADER_SIZE}"
-                    ),
-                });
-            }
+            let header_bytes = coherent_header_bytes.ok_or_else(|| FrankenError::CannotOpen {
+                path: db_path.clone(),
+            })?;
             let (header, bootstrapped_from_live_wal_stub) =
                 match DatabaseHeader::from_bytes(&header_bytes) {
                     Ok(header) => (header, false),
@@ -6285,14 +8060,37 @@ where
         let freelist = if bootstrapped_from_live_wal_stub {
             Vec::new()
         } else {
-            load_freelist_from_disk(
-                cx,
-                &db_file,
-                page_size,
-                db_size,
-                header.freelist_trunk,
-                header.freelist_count,
-            )?
+            let expected_header_bytes = header.to_bytes().map_err(|error| {
+                FrankenError::internal(format!(
+                    "validated database header could not be re-encoded: {error}"
+                ))
+            })?;
+            with_main_shared_lock(cx, &mut db_file, |db_file| {
+                if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+                    if !accept_proven_non_hot_leftover {
+                        return Err(FrankenError::BusyRecovery);
+                    }
+                    Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)?;
+                }
+                if db_file.file_size(cx)? != file_size {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                let mut observed_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                let bytes_read = db_file.read(cx, &mut observed_header_bytes, 0)?;
+                if bytes_read != DATABASE_HEADER_SIZE
+                    || observed_header_bytes != expected_header_bytes
+                {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                load_freelist_from_disk(
+                    cx,
+                    db_file,
+                    page_size,
+                    db_size,
+                    header.freelist_trunk,
+                    header.freelist_count,
+                )
+            })?
         };
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
@@ -6309,6 +8107,9 @@ where
             db_path,
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
+            maintenance_gate,
+            recovery_fence,
+            maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
                 page_size,
@@ -6348,6 +8149,7 @@ where
                 db_file_size_bytes: file_size,
             }))),
             shared_connection_count: OnceLock::new(),
+            group_commit_queue,
         };
         if finish_namespace_bootstrap {
             pager.finish_namespace_bootstrap()?;
@@ -6454,6 +8256,8 @@ where
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let db_path = vfs.full_pathname(cx, path)?;
+        let path_maintenance_gate = maintenance_gate_for_backend(&*vfs, &db_path);
+        let path_maintenance_lease = path_maintenance_gate.enter_open()?;
         #[cfg(all(feature = "native", any(unix, windows)))]
         let pending_namespace = if vfs.is_memory() {
             None
@@ -6480,11 +8284,22 @@ where
         #[cfg(not(all(feature = "native", any(unix, windows))))]
         let effective_expected_identity = expected_identity;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (db_file, _actual_flags) = if let Some(expected_identity) = effective_expected_identity
-        {
-            vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
+        let (mut db_file, _actual_flags) =
+            if let Some(expected_identity) = effective_expected_identity {
+                vfs.open_with_expected_identity(cx, &db_path, flags, expected_identity)?
+            } else {
+                vfs.open(cx, Some(&db_path), flags)?
+            };
+        let maintenance_gate =
+            identity_bound_maintenance_gate(&*vfs, &path_maintenance_gate, &db_file)?;
+        let recovery_fence = identity_bound_recovery_fence(&*vfs, &db_path, &db_file)?;
+        let group_commit_queue = identity_bound_group_commit_queue(&*vfs, &db_path, &db_file)?;
+        let maintenance_open_lease = if Arc::ptr_eq(&maintenance_gate, &path_maintenance_gate) {
+            path_maintenance_lease
         } else {
-            vfs.open(cx, Some(&db_path), flags)?
+            let identity_lease = maintenance_gate.enter_open()?;
+            drop(path_maintenance_lease);
+            identity_lease
         };
 
         #[cfg(all(feature = "native", any(unix, windows)))]
@@ -6501,27 +8316,37 @@ where
             None
         };
 
-        let file_size = db_file.file_size(cx)?;
-        if file_size == 0 {
-            return Err(FrankenError::CannotOpen { path: db_path });
-        }
-        if file_size < DATABASE_HEADER_SIZE as u64 {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
-                ),
-            });
-        }
+        let journal_path = Self::journal_path(&db_path);
+        let (file_size, header_bytes) = with_main_shared_lock(cx, &mut db_file, |db_file| {
+            // Read-only and schema-only opens cannot replay. They may accept a
+            // proven non-hot construction leftover, but they must never cache
+            // a database image for which recovery is required or ambiguous.
+            Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)?;
+            let file_size = db_file.file_size(cx)?;
+            if file_size == 0 {
+                return Err(FrankenError::CannotOpen {
+                    path: db_path.clone(),
+                });
+            }
+            if file_size < DATABASE_HEADER_SIZE as u64 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
+                    ),
+                });
+            }
 
-        let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
-        let header_read = db_file.read(cx, &mut header_bytes, 0)?;
-        if header_read < DATABASE_HEADER_SIZE {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "short read fetching database header: got {header_read} of {DATABASE_HEADER_SIZE}"
-                ),
-            });
-        }
+            let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+            let bytes_read = db_file.read(cx, &mut header_bytes, 0)?;
+            if bytes_read != DATABASE_HEADER_SIZE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short read fetching database header: got {bytes_read} of {DATABASE_HEADER_SIZE}"
+                    ),
+                });
+            }
+            Ok((file_size, header_bytes))
+        })?;
         let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
             Ok(header) => {
                 let page_size = header.page_size;
@@ -6592,6 +8417,9 @@ where
             db_path,
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
+            maintenance_gate,
+            recovery_fence,
+            maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
                 page_size,
@@ -6633,6 +8461,7 @@ where
                 db_file_size_bytes: file_size,
             }))),
             shared_connection_count: OnceLock::new(),
+            group_commit_queue,
         };
         if finish_namespace_bootstrap {
             pager.finish_namespace_bootstrap()?;
@@ -6649,6 +8478,7 @@ where
     }
 
     /// Replay a hot journal by writing original pages back to the database.
+    #[cfg(test)]
     fn replay_journal(
         cx: &Cx,
         vfs: &V,
@@ -6656,39 +8486,107 @@ where
         journal_path: &Path,
         page_size: PageSize,
     ) -> Result<()> {
+        Self::replay_journal_with_validator(
+            cx,
+            vfs,
+            db_file,
+            journal_path,
+            page_size,
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Replay a hot journal, verify the durable restored image, and only then
+    /// invalidate the recovery record.
+    ///
+    /// The page-by-page verifier protects every recovery caller against a VFS
+    /// that reports a successful but misdirected or silently corrupted write.
+    /// `validate_restored` adds any caller-specific whole-image invariant while
+    /// the same hot-journal handle is still open. A validation error closes the
+    /// handle without invalidating it, leaving recovery retryable and fail-closed.
+    fn replay_journal_with_validator<Validate>(
+        cx: &Cx,
+        vfs: &V,
+        db_file: &mut V::File,
+        journal_path: &Path,
+        page_size: PageSize,
+        validate_restored: Validate,
+    ) -> Result<()>
+    where
+        Validate: FnOnce(&V::File, PageSize) -> Result<()>,
+    {
+        Self::replay_journal_with_optional_page_size_validator(
+            cx,
+            vfs,
+            db_file,
+            journal_path,
+            Some(page_size),
+            validate_restored,
+        )
+        .map(|_| ())
+    }
+
+    fn replay_journal_with_optional_page_size_validator<Validate>(
+        cx: &Cx,
+        vfs: &V,
+        db_file: &mut V::File,
+        journal_path: &Path,
+        expected_page_size: Option<PageSize>,
+        validate_restored: Validate,
+    ) -> Result<RollbackJournalReplayOutcome>
+    where
+        Validate: FnOnce(&V::File, PageSize) -> Result<()>,
+    {
         let jrnl_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
-        let Ok((mut jrnl_file, _)) = vfs.open(cx, Some(journal_path), jrnl_flags) else {
-            return Ok(()); // Cannot open journal — treat as no journal.
-        };
+        let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
 
-        let jrnl_size = jrnl_file.file_size(cx)?;
-        if jrnl_size < crate::journal::JOURNAL_HEADER_SIZE as u64 {
-            return Ok(()); // Truncated/empty journal — nothing to replay.
+        let (prefix_state, jrnl_size) = classify_rollback_journal_prefix(cx, &jrnl_file)?;
+        if prefix_state == RollbackJournalPrefixState::NonHot {
+            jrnl_file.close(cx)?;
+            return Ok(RollbackJournalReplayOutcome::NonHot);
         }
-
-        // Read and parse the journal header.
-        let mut hdr_buf = vec![0u8; crate::journal::JOURNAL_HEADER_SIZE];
-        let _ = jrnl_file.read(cx, &mut hdr_buf, 0)?;
-        let Ok(header) = JournalHeader::decode(&hdr_buf) else {
-            return Ok(()); // Corrupt header — nothing to replay.
-        };
-        if header.page_size != page_size.get() {
+        if jrnl_size < crate::journal::JOURNAL_HEADER_SIZE as u64 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "hot journal page size mismatch: header={} expected={}",
-                    header.page_size,
-                    page_size.get()
+                    "rollback journal is truncated: {jrnl_size} bytes is shorter than its header"
                 ),
             });
         }
 
-        let page_count = if header.page_count < 0 {
-            header.compute_page_count_from_file_size(jrnl_size)
-        } else {
-            #[allow(clippy::cast_sign_loss)]
-            let c = header.page_count as u32;
-            c
-        };
+        // Read and parse the journal header.
+        let mut hdr_buf = vec![0u8; crate::journal::JOURNAL_HEADER_SIZE];
+        let header_read = jrnl_file.read(cx, &mut hdr_buf, 0)?;
+        if header_read != hdr_buf.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short rollback-journal header read: got {header_read} of {} bytes",
+                    hdr_buf.len()
+                ),
+            });
+        }
+        let header =
+            JournalHeader::decode(&hdr_buf).map_err(|error| FrankenError::DatabaseCorrupt {
+                detail: format!("invalid rollback-journal header: {error}"),
+            })?;
+        if !(512..=65_536).contains(&header.sector_size) || !header.sector_size.is_power_of_two() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("hot journal has invalid sector size {}", header.sector_size),
+            });
+        }
+        let page_size =
+            PageSize::new(header.page_size).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("hot journal has invalid page size {}", header.page_size),
+            })?;
+        if expected_page_size.is_some_and(|expected| expected != page_size) {
+            let expected_page_size = expected_page_size.expect("checked as present");
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "hot journal page size mismatch: header={} expected={}",
+                    header.page_size,
+                    expected_page_size.get()
+                ),
+            });
+        }
 
         let header_size = u64::try_from(crate::journal::JOURNAL_HEADER_SIZE)
             .expect("journal header size should fit in u64");
@@ -6697,22 +8595,164 @@ where
         let record_size = 4 + ps + 4;
         let mut offset = hdr_padded;
 
+        if jrnl_size < hdr_padded {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "hot journal is shorter than its {}-byte padded header: {jrnl_size} bytes",
+                    hdr_padded
+                ),
+            });
+        }
+        let is_local_journal = local_journal_marker_present(cx, &jrnl_file, hdr_padded)?;
+        let record_size_u64 = u64::try_from(record_size).expect("journal record size fits u64");
+        if header.page_count < 0 && (jrnl_size - hdr_padded) % record_size_u64 != 0 {
+            if is_local_journal {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "local hot journal has a partial trailing page record".to_owned(),
+                });
+            }
+            tracing::warn!(
+                journal = %journal_path.display(),
+                "refusing unsupported external rollback journal with a trailing section or master-journal payload"
+            );
+            return Err(FrankenError::Unsupported);
+        }
+        let page_count = if header.page_count < 0 {
+            header.compute_page_count_from_file_size(jrnl_size)
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let c = header.page_count as u32;
+            c
+        };
+        let required_size = hdr_padded
+            .checked_add(
+                u64::from(page_count)
+                    .checked_mul(record_size_u64)
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "rollback-journal record span".to_owned(),
+                        value: page_count.to_string(),
+                    })?,
+            )
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "rollback-journal required length".to_owned(),
+                value: page_count.to_string(),
+            })?;
+        if jrnl_size < required_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "hot journal is truncated at {jrnl_size} bytes, expected {required_size}"
+                ),
+            });
+        }
+        if jrnl_size > required_size {
+            if is_local_journal {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "local hot journal length is {jrnl_size} bytes, expected exactly {required_size}"
+                    ),
+                });
+            }
+            tracing::warn!(
+                journal = %journal_path.display(),
+                trailing_bytes = jrnl_size - required_size,
+                "refusing unsupported external rollback journal with additional sections or a master-journal payload"
+            );
+            return Err(FrankenError::Unsupported);
+        }
+
+        // Validate the complete recovery surface before changing the first
+        // database byte. A checksum or page-number failure in a later record
+        // must not leave a prefix of pre-images applied to the live file.
+        // The caller holds the database EXCLUSIVE lock throughout recovery,
+        // so no legitimate SQLite writer can replace this journal between the
+        // validation and application passes.
+        let mut validation_offset = hdr_padded;
+        // Do not reserve from attacker-controlled nRec. Capacity grows only
+        // after each record has been read, decoded, and checksum-validated.
+        let mut validated_pages = HashSet::new();
+        for _ in 0..page_count {
+            let mut rec_buf = vec![0u8; record_size];
+            let bytes_read = jrnl_file.read(cx, &mut rec_buf, validation_offset)?;
+            if bytes_read != record_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short rollback-journal record during validation: got {bytes_read} of {record_size} bytes"
+                    ),
+                });
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|err| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid rollback-journal record: {err}"),
+                }
+            })?;
+            record
+                .verify_checksum(header.nonce)
+                .map_err(|err| FrankenError::DatabaseCorrupt {
+                    detail: format!("rollback-journal checksum mismatch: {err}"),
+                })?;
+            let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "hot journal contains invalid page number {}",
+                        record.page_number
+                    ),
+                }
+            })?;
+            if page_no.get() == crate::journal::lock_byte_page(page_size) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "rollback journal contains the reserved lock-byte page".to_owned(),
+                });
+            }
+            if page_no.get() > header.initial_db_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "rollback journal page {} exceeds its initial database size {}",
+                        page_no.get(),
+                        header.initial_db_size
+                    ),
+                });
+            }
+            if !validated_pages.insert(page_no) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "rollback journal contains duplicate page record {}",
+                        page_no.get()
+                    ),
+                });
+            }
+            validation_offset = validation_offset
+                .checked_add(u64::try_from(record_size).expect("journal record size fits u64"))
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "rollback-journal validation offset".to_owned(),
+                    value: validation_offset.to_string(),
+                })?;
+        }
+
         for _ in 0..page_count {
             let mut rec_buf = vec![0u8; record_size];
             let bytes_read = jrnl_file.read(cx, &mut rec_buf, offset)?;
             if bytes_read < record_size {
-                break; // Torn record — stop replay.
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short rollback-journal record: got {bytes_read} of {record_size} bytes"
+                    ),
+                });
             }
 
             #[allow(clippy::cast_possible_truncation)]
-            let Ok(record) = JournalPageRecord::decode(&rec_buf, ps as u32) else {
-                break; // Corrupt record — stop replay.
-            };
+            let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|err| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid rollback-journal record: {err}"),
+                }
+            })?;
 
             // Verify checksum before applying.
-            if record.verify_checksum(header.nonce).is_err() {
-                break; // Checksum failure — stop replay at this point.
-            }
+            record
+                .verify_checksum(header.nonce)
+                .map_err(|err| FrankenError::DatabaseCorrupt {
+                    detail: format!("rollback-journal checksum mismatch: {err}"),
+                })?;
 
             // Write the pre-image back to the database file.
             let Some(page_no) = PageNumber::new(record.page_number) else {
@@ -6723,6 +8763,14 @@ where
                     ),
                 });
             };
+            if page_no.get() == crate::journal::lock_byte_page(page_size) {
+                // SQLite reserves this page number as the super-journal
+                // sentinel. It is never database content and must never be
+                // replayed over the process-lock byte range.
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "rollback journal contains the reserved lock-byte page".to_owned(),
+                });
+            }
             let page_offset = u64::from(page_no.get() - 1) * ps as u64;
             db_file.write(cx, &record.content, page_offset)?;
 
@@ -6730,26 +8778,125 @@ where
         }
 
         // Sync the database after replaying.
-        db_file.sync(cx, SyncFlags::NORMAL)?;
+        db_file.durable_sync(cx, SyncKind::FullDurable)?;
 
         // Truncate the database to the original size from the journal header.
-        if header.initial_db_size > 0 {
-            let target_size = u64::from(header.initial_db_size) * ps as u64;
-            let current_size = db_file.file_size(cx)?;
-            if current_size > target_size {
-                db_file.truncate(cx, target_size)?;
-                // Sync after truncation to ensure durability of the new file size.
-                db_file.sync(cx, SyncFlags::NORMAL)?;
-            }
+        let target_size = u64::from(header.initial_db_size) * ps as u64;
+        let current_size = db_file.file_size(cx)?;
+        if current_size != target_size {
+            db_file.truncate(cx, target_size)?;
+            // Exact-size restoration is required after both growth and
+            // shrink publication failures, including rollback to an empty
+            // source image.
+            db_file.durable_sync(cx, SyncKind::FullDurable)?;
         }
 
-        // Recovery is complete. Invalidate the journal before best-effort
-        // deletion so a later delete failure does not keep replaying the same
-        // rollback journal on every open.
-        jrnl_file.truncate(cx, 0)?;
-        jrnl_file.sync(cx, SyncFlags::NORMAL)?;
+        // Do not destroy the only recovery record until the durable database
+        // has been re-read and proven to equal every pre-image in this journal.
+        // Growth pages deliberately have no records; exact file-size
+        // verification proves they were removed by rollback.
+        let verification_result = (|| -> Result<()> {
+            let restored_size = db_file.file_size(cx)?;
+            if restored_size != target_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "rollback recovery restored file length {restored_size}, expected {target_size}"
+                    ),
+                });
+            }
 
-        Ok(())
+            let mut verification_offset = hdr_padded;
+            let mut restored_page = vec![0_u8; ps];
+            for _ in 0..page_count {
+                let mut rec_buf = vec![0_u8; record_size];
+                let bytes_read = jrnl_file.read(cx, &mut rec_buf, verification_offset)?;
+                if bytes_read != record_size {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "short rollback-journal record during restored-image verification: got {bytes_read} of {record_size} bytes"
+                        ),
+                    });
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let record = JournalPageRecord::decode(&rec_buf, ps as u32).map_err(|error| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "invalid rollback-journal record during restored-image verification: {error}"
+                        ),
+                    }
+                })?;
+                record
+                    .verify_checksum(header.nonce)
+                    .map_err(|error| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rollback-journal checksum mismatch during restored-image verification: {error}"
+                        ),
+                    })?;
+                let page_no = PageNumber::new(record.page_number).ok_or_else(|| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rollback journal contains invalid page number {} during restored-image verification",
+                            record.page_number
+                        ),
+                    }
+                })?;
+                if page_no.get() == crate::journal::lock_byte_page(page_size) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "rollback journal contains the reserved lock-byte page".to_owned(),
+                    });
+                }
+                let page_offset = u64::from(page_no.get() - 1)
+                    .checked_mul(u64::try_from(ps).map_err(|_| FrankenError::OutOfRange {
+                        what: "rollback recovery page size".to_owned(),
+                        value: ps.to_string(),
+                    })?)
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "rollback recovery verification page offset".to_owned(),
+                        value: page_no.get().to_string(),
+                    })?;
+                let restored_read = db_file.read(cx, &mut restored_page, page_offset)?;
+                if restored_read != ps || restored_page != record.content {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rollback recovery verification mismatch on page {}",
+                            page_no.get()
+                        ),
+                    });
+                }
+                verification_offset = verification_offset
+                    .checked_add(u64::try_from(record_size).expect("journal record size fits u64"))
+                    .ok_or_else(|| FrankenError::OutOfRange {
+                        what: "rollback recovery verification record offset".to_owned(),
+                        value: verification_offset.to_string(),
+                    })?;
+            }
+
+            validate_restored(db_file, page_size)
+        })();
+
+        if let Err(verification_error) = verification_result {
+            let close_result = jrnl_file.close(cx);
+            return match close_result {
+                Ok(()) => Err(verification_error),
+                Err(close_error) => Err(FrankenError::internal(format!(
+                    "rollback recovery verification failed while preserving the hot journal: verification={verification_error}; close={close_error}"
+                ))),
+            };
+        }
+
+        // Recovery is now durably and independently verified. Invalidate the
+        // journal before best-effort deletion so a later delete failure does
+        // not replay the same pre-images on every open.
+        let invalidate_result =
+            durable_invalidate_journal(cx, &mut jrnl_file, JournalInvalidation::Truncate);
+        let close_result = jrnl_file.close(cx);
+        match (invalidate_result, close_result) {
+            (Ok(()), Ok(())) => Ok(RollbackJournalReplayOutcome::Replayed(page_size)),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(invalidate_error), Err(close_error)) => Err(FrankenError::internal(format!(
+                "rollback recovery was verified but journal invalidation and close failed: invalidate={invalidate_error}; close={close_error}"
+            ))),
+        }
     }
 }
 
@@ -7087,6 +9234,13 @@ pub struct SimpleTransaction<V: Vfs> {
     committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
     /// Shared connection counter for single-connection fast path.
     shared_connection_count: Option<Arc<AtomicUsize>>,
+    /// Same-path transaction lease. Released as soon as commit/rollback
+    /// finishes, before the transaction value itself is dropped.
+    maintenance_lease: Option<PagerMaintenanceLease>,
+    recovery_fence: Arc<RecoveryFence>,
+    /// The physical pager was opened read-only. This is stronger than a
+    /// read-only transaction mode and must reject every later writer upgrade.
+    read_only_pager: bool,
     /// Visible commit sequence at snapshot capture. This remains fixed during
     /// reads; transaction-owned commit paths may advance it after publishing
     /// their own writes.
@@ -7215,6 +9369,100 @@ impl<V: Vfs> SimpleTransaction<V> {
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     fn validate_namespace_binding(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Finish a locally failed rollback-journal commit through the same
+    /// identity-bound recovery epoch used by pager begin/refresh. The
+    /// transaction's retained snapshot lock is released before the recovery
+    /// fence and maintenance lease are acquired, then restored before return
+    /// so ordinary transaction finalization still owns exactly one snapshot
+    /// fence to release.
+    fn recover_pending_rollback_journal(&mut self, cx: &Cx) -> Result<bool> {
+        if !self.is_writer || self.journal_mode == JournalMode::Wal {
+            return Ok(false);
+        }
+
+        let inner_arc = Arc::clone(&self.inner);
+        let mut inner = inner_arc
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        if !inner.rollback_journal_recovery_state.is_pending() {
+            return Ok(false);
+        }
+
+        inner.db_file.unlock_external_shared_snapshot(cx)?;
+        let recovery_guard = match self.recovery_fence.acquire_for_recovery() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return match inner.db_file.lock_external_shared_snapshot(cx) {
+                    Ok(()) => Err(error),
+                    Err(relock_error) => Err(FrankenError::internal(format!(
+                        "could not enter rollback recovery or restore the transaction snapshot lock: recovery={error}; relock={relock_error}"
+                    ))),
+                };
+            }
+        };
+        let maintenance_lease = self.maintenance_lease.as_mut().ok_or_else(|| {
+            FrankenError::internal("pending rollback recovery lost its maintenance lease")
+        })?;
+        let prior_kind = match maintenance_lease.upgrade_to_exclusive() {
+            Ok(prior_kind) => prior_kind,
+            Err(error) => {
+                return match inner.db_file.lock_external_shared_snapshot(cx) {
+                    Ok(()) => Err(error),
+                    Err(relock_error) => Err(FrankenError::internal(format!(
+                        "could not exclude same-process pagers for rollback recovery or restore the transaction snapshot lock: recovery={error}; relock={relock_error}"
+                    ))),
+                };
+            }
+        };
+
+        let recovery_result = SimplePager::<V>::recover_runtime_rollback_journal(
+            cx,
+            &*self.vfs,
+            &mut inner,
+            &self.journal_path,
+            &self.cache,
+            &self.wal_backend,
+        );
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
+        let downgrade_result = maintenance_lease.downgrade_from_exclusive(prior_kind);
+        let relock_result = inner.db_file.lock_external_shared_snapshot(&cleanup_cx);
+        let operation_result = match (recovery_result, downgrade_result, relock_result) {
+            (Ok(recovered), Ok(()), Ok(())) => Ok(recovered),
+            (Err(error), Ok(()), Ok(()))
+            | (Ok(_), Err(error), Ok(()))
+            | (Ok(_), Ok(()), Err(error)) => Err(error),
+            (recovery, downgrade, relock) => Err(FrankenError::internal(format!(
+                "rollback recovery cleanup failed: recovery={recovery:?}; downgrade={downgrade:?}; relock={relock:?}"
+            ))),
+        };
+        let _journal_observed = operation_result?;
+
+        // The external maintenance lock was released before the snapshot lock
+        // was reacquired. Reclassify a surviving/new journal while the shared
+        // snapshot is held; a new hot journal is a retry boundary, never a
+        // state that may be published through.
+        SimplePager::<V>::verify_readonly_rollback_journal_state(
+            &cleanup_cx,
+            &*self.vfs,
+            &self.journal_path,
+        )?;
+        drop(recovery_guard);
+        self.published.publish_clear_if(
+            &cleanup_cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            },
+            true,
+        );
+        self.publish_committed_snapshot_from_inner(&inner);
+        Ok(true)
     }
 
     /// Whether this transaction has been upgraded to a writer.
@@ -7986,9 +10234,7 @@ where
     V::File: Send + Sync,
 {
     fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
-        journal_file.truncate(cx, 0)?;
-        journal_file.sync(cx, SyncFlags::NORMAL)?;
-        Ok(())
+        durable_invalidate_journal(cx, journal_file, JournalInvalidation::ZeroMagic)
     }
 
     /// Commit using the rollback journal protocol.
@@ -8013,9 +10259,28 @@ where
             // written pages during the commit.
             inner.db_file.lock(cx, LockLevel::Exclusive)?;
 
-            let nonce = 0x4652_414E; // "FRAN" — deterministic nonce.
+            let mut nonce_bytes = [0_u8; 4];
+            vfs.randomness(cx, &mut nonce_bytes);
+            let nonce = u32::from_be_bytes(nonce_bytes);
             let page_size = inner.page_size;
             let ps = page_size.as_usize();
+            let lock_byte_page = crate::journal::lock_byte_page(page_size);
+            if write_set
+                .keys()
+                .any(|page_no| page_no.get() == lock_byte_page)
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail:
+                        "rollback-journal commit attempted to write the reserved lock-byte page"
+                            .to_owned(),
+                });
+            }
+            let mut journal_pages: Vec<PageNumber> = write_set
+                .keys()
+                .copied()
+                .filter(|page_no| page_no.get() <= original_db_size)
+                .collect();
+            journal_pages.sort_unstable_by_key(|page_no| page_no.get());
 
             // bd-9inpb / am#152: cross-connection page-allocation conflict
             // detection for rollback-journal mode.
@@ -8141,23 +10406,37 @@ where
             };
 
             // Phase 1: Write rollback journal with pre-images.
-            let jrnl_flags =
-                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let jrnl_flags = VfsOpenFlags::CREATE
+                | VfsOpenFlags::EXCLUSIVE
+                | VfsOpenFlags::READWRITE
+                | VfsOpenFlags::MAIN_JOURNAL;
             let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
 
+            let requested_sector_size = inner.db_file.sector_size().max(jrnl_file.sector_size());
+            let sector_size = if (512..=65_536).contains(&requested_sector_size)
+                && requested_sector_size.is_power_of_two()
+            {
+                requested_sector_size
+            } else {
+                4096
+            };
             let header = JournalHeader {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                page_count: write_set.len() as i32,
+                // The -1 sentinel derives the count from the exact file
+                // length when the positive i32 field cannot represent it.
+                page_count: i32::try_from(journal_pages.len()).unwrap_or(-1),
                 nonce,
                 initial_db_size: original_db_size,
-                sector_size: 512,
+                sector_size,
                 page_size: page_size.get(),
             };
-            let hdr_bytes = header.encode_padded();
+            let mut hdr_bytes = header.encode_padded();
+            mark_local_journal_header(&mut hdr_bytes);
+            hdr_bytes[..JOURNAL_MAGIC.len()].fill(0);
+            jrnl_file.truncate(cx, 0)?;
             jrnl_file.write(cx, &hdr_bytes, 0)?;
 
             let mut jrnl_offset = hdr_bytes.len() as u64;
-            for &page_no in write_set.keys() {
+            for &page_no in &journal_pages {
                 // Read current on-disk content as the pre-image. Rollback only
                 // needs images for pages that existed when this transaction
                 // began; pages allocated later may not exist on disk yet even
@@ -8170,17 +10449,15 @@ where
                     image
                 } else {
                     let mut pre_image = vec![0u8; ps];
-                    if page_no.get() <= original_db_size {
-                        let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
-                        let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
-                        if bytes_read < ps {
-                            return Err(FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "short read while journaling pre-image for page {}: got {bytes_read} of {ps}",
-                                    page_no.get()
-                                ),
-                            });
-                        }
+                    let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
+                    let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
+                    if bytes_read < ps {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short read while journaling pre-image for page {}: got {bytes_read} of {ps}",
+                                page_no.get()
+                            ),
+                        });
                     }
                     pre_image
                 };
@@ -8191,44 +10468,83 @@ where
                 jrnl_offset += rec_bytes.len() as u64;
             }
 
-            // Sync journal to ensure durability before modifying database.
-            jrnl_file.sync(cx, SyncFlags::NORMAL)?;
-            inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Pending;
+            // First make the complete pre-image payload durable while the
+            // zero magic keeps the journal non-hot. Then durably install the
+            // final header and directory entry before touching the database.
+            jrnl_file.durable_sync(cx, SyncKind::FullDurable)?;
+            vfs.sync_parent_directory(cx, journal_path)?;
+            let mut final_hdr_bytes = header.encode_padded();
+            mark_local_journal_header(&mut final_hdr_bytes);
+            durable_write_and_verify_journal_header(cx, &mut jrnl_file, &final_hdr_bytes)?;
+            inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::ReplayPending;
 
-            // Phase 2: Write dirty pages to database.
+            // Phase 2: Write dirty pages to database. Once the journal is hot,
+            // cancellation must not interrupt the write, rollback selection,
+            // or durable commit decision.
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _mask = cleanup_cx.masked();
             let saved_db_size = inner.db_size;
             for (page_no, staged) in write_set {
-                if let Err(e) = inner.flush_page(cx, *page_no, staged.as_page_bytes()) {
+                if let Err(e) = inner.flush_page(&cleanup_cx, *page_no, staged.as_page_bytes()) {
                     inner.db_size = saved_db_size;
                     return Err(e);
                 }
                 inner.db_size = inner.db_size.max(page_no.get());
             }
 
-            inner.db_file.sync(cx, SyncFlags::NORMAL)?;
+            inner
+                .db_file
+                .durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
 
             // Phase 3: Make the journal non-hot before best-effort deletion.
-            //
-            // If directory-entry deletion fails after the database sync, a
-            // leftover valid journal must not roll back the committed pages on
-            // the next open.
-            let cleanup_result = match Self::invalidate_journal_after_commit(cx, &mut jrnl_file) {
-                Ok(()) => {
-                    let _ = vfs.delete(cx, journal_path, true);
-                    Ok(())
+            // If invalidation fails, restore and sync the complete hot header
+            // so rollback is definite. Only if restoration itself fails may a
+            // truncate+sync choose the already-durable database as committed.
+            if let Err(invalidate_err) =
+                Self::invalidate_journal_after_commit(&cleanup_cx, &mut jrnl_file)
+            {
+                let restore_result = durable_write_and_verify_journal_header(
+                    &cleanup_cx,
+                    &mut jrnl_file,
+                    &final_hdr_bytes,
+                );
+                if let Err(restore_err) = restore_result {
+                    let truncate_commit_result = durable_invalidate_journal(
+                        &cleanup_cx,
+                        &mut jrnl_file,
+                        JournalInvalidation::Truncate,
+                    );
+                    if let Err(truncate_err) = truncate_commit_result {
+                        return Err(FrankenError::internal(format!(
+                            "rollback-journal commit outcome is indeterminate: invalidate={invalidate_err}; restore={restore_err}; truncate_commit={truncate_err}"
+                        )));
+                    }
+                } else {
+                    return Err(FrankenError::internal(format!(
+                        "could not commit rollback journal; restored the hot journal for rollback: {invalidate_err}"
+                    )));
                 }
-                Err(invalidate_err) => {
-                    if let Err(delete_err) = vfs.delete(cx, journal_path, true) {
-                        Err(FrankenError::internal(format!(
-                            "committed database but failed to invalidate or delete rollback journal: invalidate={invalidate_err}; delete={delete_err}"
-                        )))
-                    } else {
-                        Ok(())
+            }
+
+            inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
+            match jrnl_file.close(&cleanup_cx) {
+                Ok(()) => {
+                    if let Err(delete_err) = vfs.delete(&cleanup_cx, journal_path, true) {
+                        tracing::warn!(
+                            error = %delete_err,
+                            journal = %journal_path.display(),
+                            "rollback-journal commit left a durable non-hot journal"
+                        );
                     }
                 }
-            };
-            inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
-            cleanup_result?;
+                Err(close_err) => {
+                    tracing::warn!(
+                        error = %close_err,
+                        journal = %journal_path.display(),
+                        "rollback-journal commit succeeded but journal close failed"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -9357,6 +11673,9 @@ where
     }
 
     fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
+        if self.read_only_pager {
+            return Err(FrankenError::ReadOnly);
+        }
         if self.is_writer {
             return Ok(());
         }
@@ -9385,7 +11704,10 @@ where
                     );
                     return Err(FrankenError::Busy);
                 }
-                // Concurrent writers don't acquire the global writer_active lock.
+                // Concurrent writers do not acquire the pager-global writer
+                // baton or rollback-mode RESERVED lock. Their page-level MVCC
+                // conflict surface and WAL publication protocol remain the
+                // source of truth, including across pagers sharing MemoryVfs.
                 drop(inner);
                 self.is_writer = true;
                 Ok(())
@@ -9456,6 +11778,39 @@ const fn retained_lock_level_after_txn_exit(
         LockLevel::Reserved
     } else {
         LockLevel::Shared
+    }
+}
+
+fn release_snapshot_after_failed_begin<F: VfsFile>(
+    cx: &Cx,
+    inner: &mut PagerInner<F>,
+    active_transactions_before_begin: u32,
+) -> Result<()> {
+    let cleanup_cx = cleanup_child_cx(cx);
+    let _cleanup_mask = cleanup_cx.masked();
+    if active_transactions_before_begin == 0 {
+        inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)
+    } else {
+        let preserve_level = retained_lock_level_after_txn_exit(
+            active_transactions_before_begin,
+            inner.writer_active,
+        );
+        inner.db_file.unlock(&cleanup_cx, preserve_level)
+    }
+}
+
+fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
+    cx: &Cx,
+    inner: &mut PagerInner<F>,
+) -> Result<()> {
+    let cleanup_cx = cleanup_child_cx(cx);
+    let _cleanup_mask = cleanup_cx.masked();
+    if inner.active_transactions == 0 {
+        inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)
+    } else {
+        let preserve_level =
+            retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
+        inner.db_file.unlock(&cleanup_cx, preserve_level)
     }
 }
 
@@ -9945,11 +12300,10 @@ where
             // be reused by other transactions.
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let preserve_level =
-                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-            let _ = inner.db_file.unlock(cx, preserve_level);
+            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
             drop(inner);
             self.committed = true;
+            self.maintenance_lease.take();
             self.finished = true;
             // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
             self.scratch_arena.reset();
@@ -9985,14 +12339,13 @@ where
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let notify_writer_idle =
                 self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
-            let preserve_level =
-                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-            let _ = inner.db_file.unlock(cx, preserve_level);
+            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
             drop(inner);
             if notify_writer_idle {
                 self.writer_idle.notify_one();
             }
             self.committed = true;
+            self.maintenance_lease.take();
             self.finished = true;
             // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
             self.scratch_arena.reset();
@@ -10298,10 +12651,8 @@ where
             // still held so any later multi-connection readers inherit the
             // committed metadata even if this commit skipped page-plane publish.
             self.publish_committed_snapshot_from_inner(&inner);
-            let preserve_level =
-                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
-            let _ = inner.db_file.unlock(cx, preserve_level);
+            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
             record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
             drop(inner);
             if notify_writer_idle {
@@ -10400,6 +12751,7 @@ where
             }
             self.retained_memory_overlay_dirty_pages.clear();
             self.committed = true;
+            self.maintenance_lease.take();
             self.finished = true;
             // IMPL-3 / AG-4B: reset scratch arena after successful commit so
             // transient per-transaction allocations do not linger. The arena
@@ -10852,6 +13204,13 @@ where
             return Ok(());
         }
         self.validate_namespace_binding()?;
+
+        // Rollback is mandatory cleanup. A caller may reach it precisely
+        // because its parent context was cancelled during a commit, so every
+        // recovery, refresh, unlock, and journal cleanup below must run from a
+        // masked child rather than inherit that cancellation.
+        let cleanup_cx = cleanup_child_cx(cx);
+        let _cleanup_mask = cleanup_cx.masked();
         if self.vfs.is_memory()
             && self.memory_db_bump_alloc
             && !self.retained_memory_overlay_dirty_pages.is_empty()
@@ -10862,7 +13221,7 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             Self::flush_retained_memory_overlay_pages_to_db_file(
-                cx,
+                &cleanup_cx,
                 &mut inner,
                 self.original_db_size,
                 &overlay_pages,
@@ -10879,38 +13238,14 @@ where
         // explicitly discarded, so a subsequent commit entry with an empty
         // write_set must not trip the defensive assertion.
         self.writes_observed = false;
+        let restored_from_journal = self.recover_pending_rollback_journal(&cleanup_cx)?;
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        let restored_from_journal = if self.is_writer
-            && self.journal_mode != JournalMode::Wal
-            && inner.rollback_journal_recovery_state.is_pending()
-        {
-            let page_size = inner.page_size;
-            if !SimplePager::<V>::recover_rollback_journal_if_present(
-                cx,
-                &*self.vfs,
-                &mut inner.db_file,
-                &self.journal_path,
-                page_size,
-            )? {
-                return Err(FrankenError::internal(
-                    "rollback journal missing while failed commit recovery was pending",
-                ));
-            }
-            true
-        } else {
-            false
-        };
-
         let mut notify_writer_idle = false;
         if restored_from_journal {
-            // ShardedPageCache uses per-shard internal locking
-            self.cache.clear();
-            inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
-            inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
             self.allocated_from_freelist.clear();
             self.allocated_from_eof.clear();
             // Lease pages were EOF allocations that were never written to
@@ -10960,18 +13295,17 @@ where
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
-        let preserve_level =
-            retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-        let _ = inner.db_file.unlock(cx, preserve_level);
+        let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner);
         drop(inner);
         if notify_writer_idle {
             self.writer_idle.notify_one();
         }
         if self.is_writer {
             // Delete any partial journal file.
-            let _ = self.vfs.delete(cx, &self.journal_path, true);
+            let _ = self.vfs.delete(&cleanup_cx, &self.journal_path, true);
         }
         self.committed = false;
+        self.maintenance_lease.take();
         self.finished = true;
         // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
         // carry across transaction boundaries.
@@ -11127,43 +13461,88 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             return;
         }
         let mut notify_writer_idle = false;
+        // Drop is the last fail-safe after a caller abandons a failed commit.
+        // Keep recovery and lock release alive even if that caller's context
+        // was cancelled while the journal was hot.
+        let cleanup_cx = self.cleanup_cx.clone();
+        let _cleanup_mask = cleanup_cx.masked();
+        let recovery_was_pending = self
+            .inner
+            .lock()
+            .map(|inner| {
+                self.is_writer
+                    && self.journal_mode != JournalMode::Wal
+                    && inner.rollback_journal_recovery_state.is_pending()
+            })
+            .unwrap_or(false);
+        let restored_from_journal = if recovery_was_pending {
+            match self.recover_pending_rollback_journal(&cleanup_cx) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "drop-time recovery could not finish the pending rollback journal"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if let Ok(mut inner) = self.inner.lock() {
-            // Restore freelist allocations.
-            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
-
-            if self.is_writer && self.mode != TransactionMode::Concurrent {
-                // Non-concurrent: next_page will be reset, so lease pages
-                // are re-issued naturally. Just drop them to avoid holes.
+            if restored_from_journal {
+                // The refreshed durable freelist is authoritative; transaction
+                // allocations belong to the discarded candidate image.
+                self.allocated_from_freelist.clear();
+                self.allocated_from_eof.clear();
                 self.page_lease.clear();
-
-                inner.db_size = self.original_db_size;
-
-                // Reset next_page to avoid holes if we allocated pages that are now discarded.
-                // Logic matches SimplePager::open and SimpleTransaction::rollback.
-                let db_size = inner.db_size;
-                inner.next_page = if db_size >= 2 {
-                    db_size.saturating_add(1)
-                } else {
-                    2
-                };
-
-                notify_writer_idle = release_single_writer_baton(&mut inner);
-            } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                // Concurrent: next_page stays advanced, so return lease
-                // pages and EOF allocations to the freelist.
-                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+                if self.mode != TransactionMode::Concurrent {
+                    notify_writer_idle = release_single_writer_baton(&mut inner);
+                }
+            } else if recovery_was_pending {
+                // Never merge transaction-local allocation state into an
+                // image whose recovery failed. Keep Pending set so every
+                // subsequent begin retries or fails closed.
+                self.cache.clear();
+                self.allocated_from_freelist.clear();
+                self.allocated_from_eof.clear();
+                self.page_lease.clear();
+                if self.mode != TransactionMode::Concurrent {
+                    notify_writer_idle = release_single_writer_baton(&mut inner);
+                }
             } else {
-                // Read-only: lease should be empty, clear defensively.
-                self.page_lease.clear();
+                // Ordinary uncommitted drop: restore freelist allocations.
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.allocated_from_freelist.drain(..),
+                );
+
+                if self.is_writer && self.mode != TransactionMode::Concurrent {
+                    // Non-concurrent: next_page will be reset, so lease pages
+                    // are re-issued naturally. Just drop them to avoid holes.
+                    self.page_lease.clear();
+                    inner.db_size = self.original_db_size;
+                    inner.next_page = if inner.db_size >= 2 {
+                        inner.db_size.saturating_add(1)
+                    } else {
+                        2
+                    };
+                    notify_writer_idle = release_single_writer_baton(&mut inner);
+                } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                    // Concurrent: next_page stays advanced, so return lease
+                    // pages and EOF allocations to the freelist.
+                    return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                    return_pages_to_freelist(
+                        &mut inner.freelist,
+                        self.allocated_from_eof.drain(..),
+                    );
+                } else {
+                    // Read-only: lease should be empty, clear defensively.
+                    self.page_lease.clear();
+                }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let preserve_level =
-                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-            // Final unlock should preserve caller lineage without letting
-            // inherited cancellation strand the file lock during drop cleanup.
-            let _mask = self.cleanup_cx.masked();
-            let _ = inner.db_file.unlock(&self.cleanup_cx, preserve_level);
+            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner);
         }
         if notify_writer_idle {
             self.writer_idle.notify_one();
@@ -11409,6 +13788,7 @@ where
         cx: &Cx,
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
+        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let cleanup_cx = cleanup_child_cx(cx);
         let checkpoint_gate_state;
@@ -11462,46 +13842,6 @@ where
                 return Err(FrankenError::Busy);
             }
 
-            // Fast path — WAL has no frames, so there is nothing to
-            // checkpoint. We've already held `inner.lock()` long enough
-            // to confirm no reader/writer is active (preserving the
-            // existing Busy semantics exercised by
-            // `test_checkpoint_busy_with_active_{reader,writer}`), but
-            // we can skip the rest of the heavy machinery that would
-            // otherwise run on an empty WAL: marking
-            // `checkpoint_active = true`, taking `wal_backend.write()`
-            // to pull the backend out of the shared RwLock, publishing
-            // pre-checkpoint metadata, constructing the drop guard, and
-            // re-publishing + re-installing at drop time. Each of
-            // those blocks concurrent readers/writers on the
-            // SharedWalBackend RwLock for no actual work.
-            //
-            // Attribution: the post-commit auto-checkpoint advisor
-            // (`Connection::maybe_run_adaptive_autocheckpoint`) already
-            // early-exits when `wal_frames_estimate < adaptive_target`,
-            // so the bulk of "nothing to checkpoint" calls never reach
-            // here. But explicit `PRAGMA wal_checkpoint[(mode)]` calls
-            // and the right-after-truncate advisor re-entry do land
-            // here with an empty WAL, and previously each one took
-            // `wal_backend.write()` exclusively — a serialization
-            // bubble for every concurrent commit on this pager.
-            let wal_is_empty =
-                with_wal_backend_read(&self.wal_backend, |wal| Ok(wal.frame_count())).unwrap_or(0)
-                    == 0;
-            if wal_is_empty {
-                drop(inner);
-                return Ok(traits::CheckpointResult {
-                    total_frames: 0,
-                    frames_backfilled: 0,
-                    completed: true,
-                    wal_was_reset: false,
-                    requested_mode: mode,
-                    effective_mode: mode,
-                });
-            }
-
-            inner.checkpoint_active = true;
-            checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
             let mut wal_guard = self
                 .wal_backend
                 .write()
@@ -11512,6 +13852,19 @@ where
                     "WAL mode active but no WAL backend installed",
                 ));
             };
+
+            // Participate in the same VFS-defined whole-image fence used by
+            // VACUUM. On Windows this includes stock SQLite's real main-file
+            // and -shm byte ranges in addition to FrankenSQLite's cooperative
+            // sidecars; on Unix the default hook is the native lock protocol.
+            let cross_process_fence_result = inner.db_file.lock_external_maintenance(cx, true);
+            if let Err(err) = cross_process_fence_result {
+                *wal_guard = Some(wal);
+                return Err(err);
+            }
+
+            inner.checkpoint_active = true;
+            checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
             // D1-CRITICAL Change 3: Use sharded publish_metadata_only.
             self.published.publish_metadata_only(
                 cx,
@@ -11544,18 +13897,31 @@ where
             wal_backend: &'a SharedWalBackend,
             wal: Option<Box<dyn WalBackend>>,
             cleanup_cx: Cx,
+            cross_process_fence_held: bool,
         }
 
         impl<F: VfsFile> Drop for CheckpointGuard<'_, F> {
             fn drop(&mut self) {
                 if let Ok(mut inner) = self.inner.lock() {
+                    let _mask = self.cleanup_cx.masked();
                     if let Some(wal) = self.wal.take() {
                         if let Ok(mut wal_guard) = self.wal_backend.write() {
                             *wal_guard = Some(wal);
                         }
                     }
+                    if self.cross_process_fence_held {
+                        if let Err(error) = inner
+                            .db_file
+                            .unlock_external_maintenance(&self.cleanup_cx, true)
+                        {
+                            tracing::error!(
+                                %error,
+                                "checkpoint could not release its external maintenance fence"
+                            );
+                        }
+                        self.cross_process_fence_held = false;
+                    }
                     inner.checkpoint_active = false;
-                    let _mask = self.cleanup_cx.masked();
                     // D1-CRITICAL Change 3: Use sharded publish_metadata_only.
                     self.published.publish_metadata_only(
                         &self.cleanup_cx,
@@ -11577,6 +13943,7 @@ where
             wal_backend: &self.wal_backend,
             wal: Some(wal),
             cleanup_cx,
+            cross_process_fence_held: true,
         };
 
         // Create a checkpoint writer that writes directly to the database file.
@@ -11722,6 +14089,75 @@ mod tests {
         let path = PathBuf::from("/test.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, path)
+    }
+
+    #[test]
+    fn identity_registries_replace_expired_same_generation_state() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (file, _) = vfs
+            .open(&cx, Some(Path::new("/identity-registry.db")), flags)
+            .unwrap();
+        let identity = file
+            .file_identity()
+            .unwrap()
+            .expect("MemoryVfs exposes a stable storage identity");
+
+        let old_fence = recovery_fence_for_identity(identity);
+        let old_gate = maintenance_gate_for_identity(identity);
+        let old_queue = group_commit_queue_for_identity(identity);
+        assert!(Arc::ptr_eq(
+            &old_fence,
+            &recovery_fence_for_identity(identity)
+        ));
+        assert!(Arc::ptr_eq(
+            &old_gate,
+            &maintenance_gate_for_identity(identity)
+        ));
+        assert!(Arc::ptr_eq(
+            &old_queue,
+            &group_commit_queue_for_identity(identity)
+        ));
+
+        let old_fence_weak = Arc::downgrade(&old_fence);
+        let old_gate_weak = Arc::downgrade(&old_gate);
+        let old_queue_weak = Arc::downgrade(&old_queue);
+        drop(old_fence);
+        drop(old_gate);
+        drop(old_queue);
+        assert!(old_fence_weak.upgrade().is_none());
+        assert!(old_gate_weak.upgrade().is_none());
+        assert!(old_queue_weak.upgrade().is_none());
+
+        let replacement_fence = recovery_fence_for_identity(identity);
+        let replacement_gate = maintenance_gate_for_identity(identity);
+        let replacement_queue = group_commit_queue_for_identity(identity);
+        assert!(!Weak::ptr_eq(
+            &old_fence_weak,
+            &Arc::downgrade(&replacement_fence)
+        ));
+        assert!(!Weak::ptr_eq(
+            &old_gate_weak,
+            &Arc::downgrade(&replacement_gate)
+        ));
+        assert!(!Weak::ptr_eq(
+            &old_queue_weak,
+            &Arc::downgrade(&replacement_queue)
+        ));
+
+        let mut local_registry = IdentityWeakRegistry::<usize>::default();
+        for index in 0..65_u32 {
+            let path = PathBuf::from(format!("/identity-registry-{index}.db"));
+            let (unique_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+            let unique_identity = unique_file.file_identity().unwrap().unwrap();
+            let value = local_registry.get_or_insert_with(unique_identity, || Arc::new(1));
+            drop(value);
+        }
+        assert!(
+            local_registry.entries.len() <= 2,
+            "amortized sweeps must bound expired identity keys"
+        );
     }
 
     #[cfg(all(feature = "native", unix))]
@@ -12271,16 +14707,27 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct JournalDeleteFailVfs {
         inner: MemoryVfs,
+        memory_fast_path: Arc<AtomicBool>,
+        journal_delete_attempts: Arc<AtomicUsize>,
     }
 
     impl JournalDeleteFailVfs {
         fn new() -> Self {
             Self {
                 inner: MemoryVfs::new(),
+                memory_fast_path: Arc::new(AtomicBool::new(true)),
+                journal_delete_attempts: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn open_file_backed_pager(&self, path: &Path) -> Result<SimplePager<Self>> {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+            let result = SimplePager::open(self.clone(), path, PageSize::DEFAULT);
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+            result
         }
     }
 
@@ -12302,6 +14749,13 @@ mod tests {
 
         fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
             if path.to_string_lossy().ends_with("-journal") {
+                let prior_attempts = self
+                    .journal_delete_attempts
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                assert!(
+                    prior_attempts < 8,
+                    "open-time recovery must not spin on a proven non-hot journal whose cleanup delete fails"
+                );
                 return Err(FrankenError::internal(
                     "simulated journal delete failure".to_owned(),
                 ));
@@ -12315,6 +14769,10 @@ mod tests {
 
         fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
             self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            self.memory_fast_path.load(AtomicOrdering::Acquire)
         }
     }
 
@@ -12385,6 +14843,7 @@ mod tests {
         observed_lock_level: ObservedLockLevel,
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
         fail_unlock_on_checkpoint_error: bool,
+        memory_fast_path: Arc<AtomicBool>,
     }
 
     impl ObservedLockVfs {
@@ -12394,7 +14853,15 @@ mod tests {
                 observed_lock_level: Arc::new(Mutex::new(LockLevel::None)),
                 observed_unlock_trace_ids: Arc::new(Mutex::new(Vec::new())),
                 fail_unlock_on_checkpoint_error: false,
+                memory_fast_path: Arc::new(AtomicBool::new(true)),
             }
+        }
+
+        fn open_file_backed_pager(&self, path: &Path) -> Result<SimplePager<Self>> {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+            let result = SimplePager::open(self.clone(), path, PageSize::DEFAULT);
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+            result
         }
 
         fn observed_lock_level(&self) -> ObservedLockLevel {
@@ -12455,6 +14922,10 @@ mod tests {
 
         fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
             self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            self.memory_fast_path.load(AtomicOrdering::Acquire)
         }
     }
 
@@ -12546,7 +15017,7 @@ mod tests {
         let vfs = ObservedLockVfs::new();
         let observed_lock_level = vfs.observed_lock_level();
         let path = PathBuf::from("/observed-lock.db");
-        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         (pager, observed_lock_level)
     }
 
@@ -12555,7 +15026,7 @@ mod tests {
         let observed_lock_level = vfs.observed_lock_level();
         let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
         let path = PathBuf::from("/observed-lock-checkpoint.db");
-        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         (pager, observed_lock_level, observed_unlock_trace_ids)
     }
 
@@ -12574,6 +15045,7 @@ mod tests {
         observed_lock_level: Arc<Mutex<LockLevel>>,
         next_handle_id: StdArc<AtomicU64>,
         exclusive_metrics: StdArc<(StdMutex<ExclusiveLockMetrics>, StdCondvar)>,
+        memory_fast_path: Arc<AtomicBool>,
     }
 
     impl BlockingObservedLockVfs {
@@ -12586,7 +15058,15 @@ mod tests {
                     StdMutex::new(ExclusiveLockMetrics::default()),
                     StdCondvar::new(),
                 )),
+                memory_fast_path: Arc::new(AtomicBool::new(true)),
             }
+        }
+
+        fn open_file_backed_pager(&self, path: &Path) -> Result<SimplePager<Self>> {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+            let result = SimplePager::open(self.clone(), path, PageSize::DEFAULT);
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+            result
         }
 
         fn observed_lock_level(&self) -> Arc<Mutex<LockLevel>> {
@@ -12678,6 +15158,10 @@ mod tests {
 
         fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
             self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            self.memory_fast_path.load(AtomicOrdering::Acquire)
         }
     }
 
@@ -12796,6 +15280,7 @@ mod tests {
     struct DbWriteFailOnceVfs {
         inner: MemoryVfs,
         state: Arc<Mutex<DbWriteFailState>>,
+        memory_fast_path: Arc<AtomicBool>,
     }
 
     impl DbWriteFailOnceVfs {
@@ -12807,7 +15292,15 @@ mod tests {
                     armed: false,
                     remaining_successful_db_writes: 0,
                 })),
+                memory_fast_path: Arc::new(AtomicBool::new(true)),
             }
+        }
+
+        fn open_file_backed_pager(&self, path: &Path) -> Result<SimplePager<Self>> {
+            self.memory_fast_path.store(true, AtomicOrdering::Release);
+            let result = SimplePager::open(self.clone(), path, PageSize::DEFAULT);
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+            result
         }
 
         fn arm_after_db_writes(&self, successful_db_writes_before_failure: usize) {
@@ -12869,6 +15362,10 @@ mod tests {
         fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
             self.inner.full_pathname(cx, path)
         }
+
+        fn is_memory(&self) -> bool {
+            self.memory_fast_path.load(AtomicOrdering::Acquire)
+        }
     }
 
     impl VfsFile for DbWriteFailOnceFile {
@@ -12916,6 +15413,229 @@ mod tests {
         }
 
         fn unlock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn device_characteristics(&self) -> u32 {
+            self.inner.device_characteristics()
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct JournalDurabilityFaultPlan {
+        ignore_zero_magic_write: bool,
+        ignore_truncate: bool,
+        corrupt_hot_header_restore: bool,
+    }
+
+    #[derive(Debug)]
+    struct JournalDurabilityFaultState {
+        target_journal: PathBuf,
+        plan: JournalDurabilityFaultPlan,
+        armed: bool,
+        hot_header_writes: usize,
+    }
+
+    #[derive(Clone)]
+    struct JournalDurabilityFaultVfs {
+        inner: MemoryVfs,
+        state: Arc<Mutex<JournalDurabilityFaultState>>,
+        memory_fast_path: Arc<AtomicBool>,
+    }
+
+    impl JournalDurabilityFaultVfs {
+        fn new(target_journal: PathBuf) -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                state: Arc::new(Mutex::new(JournalDurabilityFaultState {
+                    target_journal,
+                    plan: JournalDurabilityFaultPlan::default(),
+                    armed: false,
+                    hot_header_writes: 0,
+                })),
+                memory_fast_path: Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        fn enable_file_backed_protocol(&self) {
+            self.memory_fast_path.store(false, AtomicOrdering::Release);
+        }
+
+        fn arm(&self, plan: JournalDurabilityFaultPlan) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.plan = plan;
+            state.armed = true;
+            state.hot_header_writes = 0;
+        }
+
+        fn disarm(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.armed = false;
+            state.plan = JournalDurabilityFaultPlan::default();
+            state.hot_header_writes = 0;
+        }
+    }
+
+    #[derive(Debug)]
+    struct JournalDurabilityFaultFile {
+        inner: MemoryFile,
+        state: Arc<Mutex<JournalDurabilityFaultState>>,
+        is_target_journal: bool,
+    }
+
+    impl Vfs for JournalDurabilityFaultVfs {
+        type File = JournalDurabilityFaultFile;
+
+        fn name(&self) -> &'static str {
+            "journal-durability-fault"
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
+            let is_target_journal = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                path == Some(state.target_journal.as_path())
+                    && flags.contains(VfsOpenFlags::MAIN_JOURNAL)
+            };
+            Ok((
+                JournalDurabilityFaultFile {
+                    inner,
+                    state: Arc::clone(&self.state),
+                    is_target_journal,
+                },
+                actual_flags,
+            ))
+        }
+
+        fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            self.memory_fast_path.load(AtomicOrdering::Acquire)
+        }
+    }
+
+    impl VfsFile for JournalDurabilityFaultFile {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.close(cx)
+        }
+
+        fn file_identity(&self) -> Result<Option<FileIdentity>> {
+            self.inner.file_identity()
+        }
+
+        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset)
+        }
+
+        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            let mut corrupted = None;
+            if self.is_target_journal && offset == 0 {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.armed {
+                    if state.plan.ignore_zero_magic_write
+                        && buf.len() == JOURNAL_MAGIC.len()
+                        && buf.iter().all(|byte| *byte == 0)
+                    {
+                        return Ok(());
+                    }
+                    if buf.starts_with(&JOURNAL_MAGIC) {
+                        state.hot_header_writes = state.hot_header_writes.saturating_add(1);
+                        if state.plan.corrupt_hot_header_restore && state.hot_header_writes == 2 {
+                            let mut damaged = buf.to_vec();
+                            damaged[crate::journal::JOURNAL_HEADER_SIZE] ^= 0x80;
+                            corrupted = Some(damaged);
+                        }
+                    }
+                }
+            }
+
+            self.inner
+                .write(cx, corrupted.as_deref().unwrap_or(buf), offset)
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            if self.is_target_journal && size == 0 {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.armed && state.plan.ignore_truncate {
+                    return Ok(());
+                }
+            }
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
             self.inner.unlock(cx, level)
         }
 
@@ -13664,6 +16384,108 @@ mod tests {
     // ── Journal crash recovery tests ────────────────────────────────────
 
     #[test]
+    fn journal_invalidation_detects_vfs_operations_that_lie_about_durability() {
+        let cx = Cx::new();
+        let journal_path = PathBuf::from("/lying-journal.db-journal");
+        let vfs = JournalDurabilityFaultVfs::new(journal_path.clone());
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal, _) = vfs.open(&cx, Some(&journal_path), flags).unwrap();
+        let mut header = JournalHeader {
+            page_count: 0,
+            nonce: 0x1234_5678,
+            initial_db_size: 1,
+            sector_size: 4096,
+            page_size: PageSize::DEFAULT.get(),
+        }
+        .encode_padded();
+        mark_local_journal_header(&mut header);
+        journal.write(&cx, &header, 0).unwrap();
+
+        vfs.arm(JournalDurabilityFaultPlan {
+            ignore_zero_magic_write: true,
+            ..JournalDurabilityFaultPlan::default()
+        });
+        let zero_error =
+            durable_invalidate_journal(&cx, &mut journal, JournalInvalidation::ZeroMagic)
+                .unwrap_err();
+        assert!(
+            matches!(zero_error, FrankenError::DatabaseCorrupt { .. }),
+            "a successful zero-magic write must be rejected when readback remains hot"
+        );
+        let mut observed_magic = [0_u8; JOURNAL_MAGIC.len()];
+        journal.read(&cx, &mut observed_magic, 0).unwrap();
+        assert_eq!(observed_magic, JOURNAL_MAGIC);
+
+        vfs.arm(JournalDurabilityFaultPlan {
+            ignore_truncate: true,
+            ..JournalDurabilityFaultPlan::default()
+        });
+        let truncate_error =
+            durable_invalidate_journal(&cx, &mut journal, JournalInvalidation::Truncate)
+                .unwrap_err();
+        assert!(
+            matches!(truncate_error, FrankenError::DatabaseCorrupt { .. }),
+            "a successful truncate must be rejected when bytes remain"
+        );
+        assert_eq!(journal.file_size(&cx).unwrap(), header.len() as u64);
+    }
+
+    #[test]
+    fn rollback_commit_reports_indeterminate_when_all_marker_proofs_lie() {
+        let cx = Cx::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lying-journal-commit.db");
+        let journal_path = SimplePager::<JournalDurabilityFaultVfs>::journal_path(&path);
+        let vfs = JournalDurabilityFaultVfs::new(journal_path.clone());
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        vfs.enable_file_backed_protocol();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page_two = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page_two, &vec![0x31; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            page_two
+        };
+
+        vfs.arm(JournalDurabilityFaultPlan {
+            ignore_zero_magic_write: true,
+            ignore_truncate: true,
+            corrupt_hot_header_restore: true,
+        });
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x73; ps]).unwrap();
+        let commit_error = txn.commit(&cx).unwrap_err();
+        assert!(
+            commit_error
+                .to_string()
+                .contains("commit outcome is indeterminate"),
+            "all three failed readback proofs must surface an indeterminate outcome: {commit_error}"
+        );
+
+        let journal_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut retained_journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        let mut observed_magic = [0_u8; JOURNAL_MAGIC.len()];
+        retained_journal.read(&cx, &mut observed_magic, 0).unwrap();
+        assert_eq!(
+            observed_magic, JOURNAL_MAGIC,
+            "failed marker proofs must leave a replay-selecting hot journal"
+        );
+        retained_journal.close(&cx).unwrap();
+
+        // Once the lying behavior is disabled, canonical rollback recovery
+        // must restore the pre-transaction image and durably clear the journal.
+        vfs.disarm();
+        txn.rollback(&cx).unwrap();
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x31; ps]
+        );
+    }
+
+    #[test]
     fn test_commit_journal_short_preimage_read_errors() {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/short_preimage.db");
@@ -13715,7 +16537,7 @@ mod tests {
         let path = PathBuf::from("/rollback_after_failed_commit.db");
         let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
         let vfs = DbWriteFailOnceVfs::new(path.clone());
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
 
@@ -13743,6 +16565,41 @@ mod tests {
             "bead_id={BEAD_ID} case=partial_commit_surfaces_io_error"
         );
 
+        // MemoryVfs reports a 4 KiB device sector. The complete preimage
+        // payload must begin after that sector so publishing the magic-bearing
+        // header can never share a physical sector with a record.
+        let journal_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut hot_journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        let mut raw_header = vec![0_u8; crate::journal::JOURNAL_HEADER_SIZE];
+        hot_journal.read(&cx, &mut raw_header, 0).unwrap();
+        let hot_header = JournalHeader::decode(&raw_header).unwrap();
+        assert_eq!(hot_header.sector_size, 4096);
+        // The two user pages plus page 1's commit-counter update all require
+        // preimages; the header count must match the exact encoded records.
+        assert_eq!(hot_header.page_count, 3);
+        let record_size = 4 + ps + 4;
+        assert_eq!(
+            hot_journal.file_size(&cx).unwrap(),
+            4096 + 3 * record_size as u64
+        );
+        let mut preimages = HashMap::new();
+        for record_index in 0..3_u64 {
+            let mut raw_record = vec![0_u8; record_size];
+            hot_journal
+                .read(
+                    &cx,
+                    &mut raw_record,
+                    4096 + record_index * record_size as u64,
+                )
+                .unwrap();
+            let record = JournalPageRecord::decode(&raw_record, ps as u32).unwrap();
+            record.verify_checksum(hot_header.nonce).unwrap();
+            preimages.insert(record.page_number, record.content);
+        }
+        hot_journal.close(&cx).unwrap();
+        assert_eq!(preimages.get(&page_two.get()), Some(&original_two));
+        assert_eq!(preimages.get(&page_three.get()), Some(&original_three));
+
         txn.rollback(&cx).unwrap();
 
         let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
@@ -13760,7 +16617,7 @@ mod tests {
             "bead_id={BEAD_ID} case=rollback_removes_failed_commit_journal"
         );
 
-        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened = vfs.open_file_backed_pager(&path).unwrap();
         let reopened_reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         assert_eq!(
             reopened_reader.get_page(&cx, page_two).unwrap().into_vec(),
@@ -13780,7 +16637,7 @@ mod tests {
         let path = PathBuf::from("/begin_recovers_failed_commit.db");
         let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
         let vfs = DbWriteFailOnceVfs::new(path.clone());
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
 
@@ -13824,7 +16681,7 @@ mod tests {
             "bead_id={BEAD_ID} case=next_begin_cleans_abandoned_failed_commit_journal"
         );
 
-        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened = vfs.open_file_backed_pager(&path).unwrap();
         let reopened_reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         assert_eq!(
             reopened_reader.get_page(&cx, page_two).unwrap().into_vec(),
@@ -13844,7 +16701,7 @@ mod tests {
         let vfs = JournalDeleteFailVfs::new();
         let path = PathBuf::from("/journal_delete_failure_commit.db");
         let journal_path = SimplePager::<JournalDeleteFailVfs>::journal_path(&path);
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
 
@@ -13855,8 +16712,9 @@ mod tests {
             txn.commit(&cx).unwrap();
             page_two
         };
+        drop(pager);
 
-        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened = vfs.open_file_backed_pager(&path).unwrap();
         let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         assert_eq!(
             reader.get_page(&cx, page_two).unwrap().into_vec(),
@@ -13870,10 +16728,33 @@ mod tests {
 
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
         let (journal_file, _) = vfs.open(&cx, Some(&journal_path), flags).unwrap();
+        assert!(
+            journal_file.file_size(&cx).unwrap() >= JOURNAL_MAGIC.len() as u64,
+            "bead_id={BEAD_ID} case=delete_failure_retains_persist_journal_inode"
+        );
+        let mut commit_marker = [0xFF_u8; 1];
+        assert_eq!(journal_file.read(&cx, &mut commit_marker, 0).unwrap(), 1);
         assert_eq!(
-            journal_file.file_size(&cx).unwrap(),
-            0,
-            "bead_id={BEAD_ID} case=delete_failure_still_invalidates_journal"
+            commit_marker[0], 0,
+            "bead_id={BEAD_ID} case=delete_failure_still_durably_invalidates_journal"
+        );
+        assert_eq!(
+            classify_rollback_journal_prefix(&cx, &journal_file)
+                .unwrap()
+                .0,
+            RollbackJournalPrefixState::NonHot,
+            "bead_id={BEAD_ID} case=retained_persist_journal_is_proven_non_hot"
+        );
+
+        drop(journal_file);
+        drop(reader);
+        drop(reopened);
+        let fresh_reopen = vfs.open_file_backed_pager(&path).unwrap();
+        let fresh_reader = fresh_reopen.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            fresh_reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0xAB; ps],
+            "bead_id={BEAD_ID} case=repeated_reopen_accepts_only_revalidated_non_hot_leftover"
         );
     }
 
@@ -13886,7 +16767,7 @@ mod tests {
         let ps = PageSize::DEFAULT.as_usize();
 
         {
-            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let pager = vfs.open_file_backed_pager(&path).unwrap();
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
             let page_two = txn.allocate_page(&cx).unwrap();
             txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
@@ -13906,6 +16787,7 @@ mod tests {
             let jrnl_flags =
                 VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
             let (mut jrnl_file, _) = vfs.open(&cx, Some(&journal_path), jrnl_flags).unwrap();
+            jrnl_file.truncate(&cx, 0).unwrap();
             jrnl_file.write(&cx, &hdr_bytes, 0).unwrap();
             let record = JournalPageRecord::new(2, vec![0x11; ps], header.nonce);
             jrnl_file
@@ -13918,7 +16800,7 @@ mod tests {
             db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
         }
 
-        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened = vfs.open_file_backed_pager(&path).unwrap();
         let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         let page_two = PageNumber::new(2).unwrap();
         assert_eq!(
@@ -13937,6 +16819,17 @@ mod tests {
             journal_file.file_size(&cx).unwrap(),
             0,
             "bead_id={BEAD_ID} case=recovery_delete_failure_still_invalidates_journal"
+        );
+
+        drop(journal_file);
+        drop(reader);
+        drop(reopened);
+        let fresh_reopen = vfs.open_file_backed_pager(&path).unwrap();
+        let fresh_reader = fresh_reopen.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            fresh_reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x11; ps],
+            "bead_id={BEAD_ID} case=fresh_reopen_observes_exact_recovered_preimage"
         );
     }
 
@@ -14294,18 +17187,23 @@ mod tests {
             jrnl.write(&cx, &rec2_bytes[..trunc_len], offset).unwrap();
         }
 
-        // Reopen — first record replays, second skipped.
-        {
-            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
-            let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
-            let page_no_2 = PageNumber::new(2).unwrap();
-            let data2 = txn.get_page(&cx, page_no_2).unwrap();
-            assert_eq!(
-                data2.as_ref()[0],
-                0xFF,
-                "bead_id={BEAD_ID} case=truncated_journal_page2_not_restored"
-            );
-        }
+        // Recovery validates the complete record surface before the first
+        // source write. A truncated hot journal therefore fails closed and
+        // does not partially replay its valid prefix.
+        assert!(
+            SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).is_err(),
+            "bead_id={BEAD_ID} case=truncated_journal_rejected_before_replay"
+        );
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let mut page_two = vec![0_u8; ps];
+        db_file
+            .read(&cx, &mut page_two, u64::from(2_u32 - 1) * ps as u64)
+            .unwrap();
+        assert_eq!(
+            page_two[0], 0xFF,
+            "bead_id={BEAD_ID} case=truncated_journal_does_not_partially_replay"
+        );
     }
 
     #[test]
@@ -14356,18 +17254,414 @@ mod tests {
             jrnl.write(&cx, &rec_bytes, hdr_bytes.len() as u64).unwrap();
         }
 
-        // Reopen — bad checksum stops replay.
-        {
-            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
-            let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
-            let page_no_2 = PageNumber::new(2).unwrap();
-            let data = txn.get_page(&cx, page_no_2).unwrap();
+        // A checksum mismatch is corruption, not an ignorable suffix. The
+        // opener must fail closed and leave the target image untouched.
+        assert!(
+            SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).is_err(),
+            "bead_id={BEAD_ID} case=bad_checksum_rejected"
+        );
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let mut page_two = vec![0_u8; ps];
+        db_file
+            .read(&cx, &mut page_two, u64::from(2_u32 - 1) * ps as u64)
+            .unwrap();
+        assert_eq!(
+            page_two[0], 0xEE,
+            "bead_id={BEAD_ID} case=bad_checksum_does_not_replay"
+        );
+    }
+
+    #[test]
+    fn test_truncated_zero_magic_is_non_hot_but_nonzero_prefix_fails_closed() {
+        for journal_size in 1_usize..JOURNAL_MAGIC.len() {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from(format!("/short_magic_{journal_size}.db"));
+            let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+            let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut db_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let original_size = db_file.file_size(&cx).unwrap();
+            let mut original_page_one = vec![0_u8; PageSize::DEFAULT.as_usize()];
+            db_file.read(&cx, &mut original_page_one, 0).unwrap();
+
+            let journal_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut zero_journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+            zero_journal.truncate(&cx, 0).unwrap();
+            zero_journal
+                .write(&cx, &vec![0_u8; journal_size], 0)
+                .unwrap();
+            zero_journal.close(&cx).unwrap();
+            SimplePager::<MemoryVfs>::replay_journal(
+                &cx,
+                &vfs,
+                &mut db_file,
+                &journal_path,
+                PageSize::DEFAULT,
+            )
+            .unwrap();
+            let readonly =
+                SimplePager::open_readonly_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+                    .unwrap();
+            drop(readonly);
+            let (mut preserved_zero_journal, _) =
+                vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
             assert_eq!(
-                data.as_ref()[0],
-                0xEE,
-                "bead_id={BEAD_ID} case=bad_checksum_stops_replay"
+                preserved_zero_journal.file_size(&cx).unwrap(),
+                journal_size as u64
             );
+            preserved_zero_journal.close(&cx).unwrap();
+            pager.with_exclusive_maintenance(&cx, |_| Ok(())).unwrap();
+            assert!(
+                !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+                "bead_id={BEAD_ID} case=maintenance_removes_zero_short_magic size={journal_size}"
+            );
+
+            let (mut nonzero_journal, _) =
+                vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+            nonzero_journal.truncate(&cx, 0).unwrap();
+            let mut nonzero_prefix = vec![0_u8; journal_size];
+            nonzero_prefix[0] = 1;
+            nonzero_journal.write(&cx, &nonzero_prefix, 0).unwrap();
+            nonzero_journal.close(&cx).unwrap();
+            assert!(
+                SimplePager::<MemoryVfs>::replay_journal(
+                    &cx,
+                    &vfs,
+                    &mut db_file,
+                    &journal_path,
+                    PageSize::DEFAULT,
+                )
+                .is_err(),
+                "bead_id={BEAD_ID} case=nonzero_short_magic_rejected size={journal_size}"
+            );
+            let Err(readonly_error) =
+                SimplePager::open_readonly_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+            else {
+                panic!("read-only open accepted nonzero short journal magic size={journal_size}");
+            };
+            assert!(matches!(
+                readonly_error,
+                FrankenError::DatabaseCorrupt { .. }
+            ));
+            let nonzero_before = nonzero_prefix.clone();
+            assert!(
+                pager.with_exclusive_maintenance(&cx, |_| Ok(())).is_err(),
+                "bead_id={BEAD_ID} case=maintenance_rejects_nonzero_short_magic size={journal_size}"
+            );
+            let (mut preserved_journal, _) =
+                vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+            let mut nonzero_after = vec![0_u8; journal_size];
+            assert_eq!(
+                preserved_journal.read(&cx, &mut nonzero_after, 0).unwrap(),
+                journal_size
+            );
+            preserved_journal.close(&cx).unwrap();
+            assert_eq!(nonzero_after, nonzero_before);
+
+            let mut final_page_one = vec![0_u8; PageSize::DEFAULT.as_usize()];
+            db_file.read(&cx, &mut final_page_one, 0).unwrap();
+            assert_eq!(db_file.file_size(&cx).unwrap(), original_size);
+            assert_eq!(final_page_one, original_page_one);
         }
+    }
+
+    #[test]
+    fn test_first_zero_magic_byte_marks_full_length_journal_non_hot() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/partial_zero_magic.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let mut partial_magic = JOURNAL_MAGIC;
+        partial_magic[0] = 0;
+        let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal, _) = vfs.open(&cx, Some(&journal_path), flags).unwrap();
+        journal.write(&cx, &partial_magic, 0).unwrap();
+
+        assert_eq!(
+            classify_rollback_journal_prefix(&cx, &journal).unwrap(),
+            (
+                RollbackJournalPrefixState::NonHot,
+                JOURNAL_MAGIC.len() as u64
+            ),
+            "a torn PERSIST marker with byte zero cleared must never be replayed"
+        );
+    }
+
+    #[test]
+    fn test_existing_open_recovers_torn_main_header_from_hot_journal_page_size() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/torn_main_header_hot_journal.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        {
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            assert_eq!(page_two.get(), 2);
+            txn.write_page(&cx, page_two, &vec![0x11; page_size])
+                .unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut original_page_one = vec![0_u8; page_size];
+        let mut original_page_two = vec![0_u8; page_size];
+        assert_eq!(
+            db_file.read(&cx, &mut original_page_one, 0).unwrap(),
+            page_size
+        );
+        assert_eq!(
+            db_file
+                .read(&cx, &mut original_page_two, page_size as u64)
+                .unwrap(),
+            page_size
+        );
+
+        let header = JournalHeader {
+            page_count: 2,
+            nonce: 0x1380_0001,
+            initial_db_size: 2,
+            sector_size: 512,
+            page_size: PageSize::DEFAULT.get(),
+        };
+        let header_bytes = header.encode_padded();
+        let journal_flags =
+            VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal_file, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        journal_file.truncate(&cx, 0).unwrap();
+        journal_file.write(&cx, &header_bytes, 0).unwrap();
+        let page_one_record =
+            JournalPageRecord::new(1, original_page_one.clone(), header.nonce).encode();
+        let page_two_record =
+            JournalPageRecord::new(2, original_page_two.clone(), header.nonce).encode();
+        journal_file
+            .write(&cx, &page_one_record, header_bytes.len() as u64)
+            .unwrap();
+        journal_file
+            .write(
+                &cx,
+                &page_two_record,
+                (header_bytes.len() + page_one_record.len()) as u64,
+            )
+            .unwrap();
+        journal_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        journal_file.close(&cx).unwrap();
+
+        let mut torn_page_one = original_page_one.clone();
+        let original_header_bytes: &[u8; DATABASE_HEADER_SIZE] = original_page_one
+            [..DATABASE_HEADER_SIZE]
+            .try_into()
+            .unwrap();
+        let mut syntactically_valid_wrong_header =
+            DatabaseHeader::from_bytes(original_header_bytes).unwrap();
+        syntactically_valid_wrong_header.page_size = PageSize::new(8192).unwrap();
+        torn_page_one[..DATABASE_HEADER_SIZE]
+            .copy_from_slice(&syntactically_valid_wrong_header.to_bytes().unwrap());
+        let torn_header_bytes: &[u8; DATABASE_HEADER_SIZE] =
+            torn_page_one[..DATABASE_HEADER_SIZE].try_into().unwrap();
+        assert_eq!(
+            DatabaseHeader::from_bytes(torn_header_bytes)
+                .unwrap()
+                .page_size
+                .get(),
+            8192
+        );
+        db_file.write(&cx, &torn_page_one, 0).unwrap();
+        db_file
+            .write(&cx, &vec![0x99; page_size], page_size as u64)
+            .unwrap();
+        db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        db_file.close(&cx).unwrap();
+
+        let recovered = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            &cx,
+            vfs.clone(),
+            &path,
+            PageSize::DEFAULT,
+            None,
+            None,
+        )
+        .expect("hot journal must repair a torn main header before final parsing");
+        drop(recovered);
+
+        let (mut restored_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut restored_page_one = vec![0_u8; page_size];
+        let mut restored_page_two = vec![0_u8; page_size];
+        restored_file.read(&cx, &mut restored_page_one, 0).unwrap();
+        restored_file
+            .read(&cx, &mut restored_page_two, page_size as u64)
+            .unwrap();
+        restored_file.close(&cx).unwrap();
+        assert_eq!(restored_page_one, original_page_one);
+        assert_eq!(restored_page_two, original_page_two);
+        assert!(!vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap());
+    }
+
+    #[test]
+    fn test_existing_open_rejects_malformed_hot_journal_without_mutating_torn_main() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/torn_main_malformed_hot_journal.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        {
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x33; page_size])
+                .unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        db_file.write(&cx, &vec![0xA5; page_size], 0).unwrap();
+        db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        let db_size = db_file.file_size(&cx).unwrap() as usize;
+        let mut main_before = vec![0_u8; db_size];
+        db_file.read(&cx, &mut main_before, 0).unwrap();
+        db_file.close(&cx).unwrap();
+
+        let malformed_header = JournalHeader {
+            page_count: 1,
+            nonce: 0x1380_0003,
+            initial_db_size: 2,
+            sector_size: 512,
+            page_size: 123,
+        }
+        .encode_padded();
+        let journal_flags =
+            VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal_file, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        journal_file.truncate(&cx, 0).unwrap();
+        journal_file.write(&cx, &malformed_header, 0).unwrap();
+        journal_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        journal_file.close(&cx).unwrap();
+
+        let Err(error) = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            &cx,
+            vfs.clone(),
+            &path,
+            PageSize::DEFAULT,
+            None,
+            None,
+        ) else {
+            panic!("malformed hot journal unexpectedly opened a torn main file");
+        };
+        assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+
+        let (mut main_after_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut main_after = vec![0_u8; db_size];
+        main_after_file.read(&cx, &mut main_after, 0).unwrap();
+        main_after_file.close(&cx).unwrap();
+        assert_eq!(main_after, main_before);
+        let (mut journal_after_file, _) =
+            vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        let mut journal_after = vec![0_u8; malformed_header.len()];
+        journal_after_file.read(&cx, &mut journal_after, 0).unwrap();
+        journal_after_file.close(&cx).unwrap();
+        assert_eq!(journal_after, malformed_header);
+    }
+
+    #[test]
+    fn test_readonly_open_rejects_hot_journal_without_mutation_then_rw_recovers() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/readonly_hot_journal.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        {
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x22; page_size])
+                .unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut original_page_two = vec![0_u8; page_size];
+        db_file
+            .read(&cx, &mut original_page_two, page_size as u64)
+            .unwrap();
+
+        let header = JournalHeader {
+            page_count: 1,
+            nonce: 0x1380_0002,
+            initial_db_size: 2,
+            sector_size: 512,
+            page_size: PageSize::DEFAULT.get(),
+        };
+        let header_bytes = header.encode_padded();
+        let record = JournalPageRecord::new(2, original_page_two.clone(), header.nonce).encode();
+        let journal_flags =
+            VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal_file, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        journal_file.truncate(&cx, 0).unwrap();
+        journal_file.write(&cx, &header_bytes, 0).unwrap();
+        journal_file
+            .write(&cx, &record, header_bytes.len() as u64)
+            .unwrap();
+        journal_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        let journal_size = journal_file.file_size(&cx).unwrap() as usize;
+        let mut journal_before = vec![0_u8; journal_size];
+        journal_file.read(&cx, &mut journal_before, 0).unwrap();
+        journal_file.close(&cx).unwrap();
+
+        db_file
+            .write(&cx, &vec![0x99; page_size], page_size as u64)
+            .unwrap();
+        db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        db_file.close(&cx).unwrap();
+
+        let Err(readonly_error) =
+            SimplePager::open_readonly_with_cx(&cx, vfs.clone(), &path, PageSize::DEFAULT)
+        else {
+            panic!("read-only open must fail closed while a hot journal exists");
+        };
+        assert!(matches!(readonly_error, FrankenError::BusyRecovery));
+
+        let (mut unchanged_db, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut corrupted_page_two = vec![0_u8; page_size];
+        unchanged_db
+            .read(&cx, &mut corrupted_page_two, page_size as u64)
+            .unwrap();
+        unchanged_db.close(&cx).unwrap();
+        assert_eq!(corrupted_page_two, vec![0x99; page_size]);
+        let (mut unchanged_journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        let mut journal_after = vec![0_u8; journal_size];
+        unchanged_journal.read(&cx, &mut journal_after, 0).unwrap();
+        unchanged_journal.close(&cx).unwrap();
+        assert_eq!(journal_after, journal_before);
+
+        let recovered = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            &cx,
+            vfs.clone(),
+            &path,
+            PageSize::DEFAULT,
+            None,
+            None,
+        )
+        .expect("read-write open must recover the retained hot journal");
+        drop(recovered);
+        let (mut restored_db, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut restored_page_two = vec![0_u8; page_size];
+        restored_db
+            .read(&cx, &mut restored_page_two, page_size as u64)
+            .unwrap();
+        restored_db.close(&cx).unwrap();
+        assert_eq!(restored_page_two, original_page_two);
+        assert!(!vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap());
     }
 
     #[test]
@@ -14425,6 +17719,206 @@ mod tests {
                 .unwrap(),
             "bead_id={BEAD_ID} case=journal_deleted_for_readonly"
         );
+    }
+
+    #[test]
+    fn physically_readonly_pager_rejects_every_writer_entry_path() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/physically_readonly_writer_rejection.db");
+        drop(SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap());
+        let pager = SimplePager::open_readonly_with_cx(&cx, vfs, &path, PageSize::DEFAULT).unwrap();
+
+        assert!(matches!(
+            pager.begin(&cx, TransactionMode::Immediate),
+            Err(FrankenError::ReadOnly)
+        ));
+        assert!(matches!(
+            pager.begin(&cx, TransactionMode::Exclusive),
+            Err(FrankenError::ReadOnly)
+        ));
+
+        let mut deferred = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        assert!(matches!(
+            deferred.allocate_page(&cx),
+            Err(FrankenError::ReadOnly)
+        ));
+        deferred.rollback(&cx).unwrap();
+
+        let mut concurrent = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        assert!(matches!(
+            concurrent.allocate_page(&cx),
+            Err(FrankenError::ReadOnly)
+        ));
+        concurrent.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn malformed_hot_journal_is_fully_validated_before_first_database_write() {
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let malformed_cases = [
+            ("duplicate", vec![1_u32, 1_u32], Vec::new()),
+            ("beyond_initial", vec![2_u32], Vec::new()),
+            ("trailing_bytes", vec![1_u32], vec![0xA5]),
+        ];
+
+        for (name, record_pages, trailing) in malformed_cases {
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from(format!("/malformed_hot_journal_{name}.db"));
+            let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+            drop(SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap());
+
+            let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut before_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let before_len = usize::try_from(before_file.file_size(&cx).unwrap()).unwrap();
+            let mut before = vec![0_u8; before_len];
+            before_file.read(&cx, &mut before, 0).unwrap();
+            before_file.close(&cx).unwrap();
+
+            let nonce = 0xA11C_E000_u32.wrapping_add(record_pages.len() as u32);
+            let header = JournalHeader {
+                page_count: i32::try_from(record_pages.len()).unwrap(),
+                nonce,
+                initial_db_size: 1,
+                sector_size: 4096,
+                page_size: PageSize::DEFAULT.get(),
+            };
+            let mut header_bytes = header.encode_padded();
+            if name == "trailing_bytes" {
+                mark_local_journal_header(&mut header_bytes);
+            }
+            let journal_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+            journal.truncate(&cx, 0).unwrap();
+            journal.write(&cx, &header_bytes, 0).unwrap();
+            let mut offset = header_bytes.len() as u64;
+            for page_no in record_pages {
+                let record = JournalPageRecord::new(page_no, vec![0x5A; ps], nonce).encode();
+                journal.write(&cx, &record, offset).unwrap();
+                offset += record.len() as u64;
+            }
+            if !trailing.is_empty() {
+                journal.write(&cx, &trailing, offset).unwrap();
+            }
+            journal.close(&cx).unwrap();
+
+            let error = SimplePager::open_existing_with_cx_and_page_buffer_max(
+                &cx,
+                vfs.clone(),
+                &path,
+                PageSize::DEFAULT,
+                None,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("malformed case {name} unexpectedly opened"));
+            assert!(matches!(error, FrankenError::DatabaseCorrupt { .. }));
+
+            let (mut after_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+            let mut after = vec![0_u8; before_len];
+            after_file.read(&cx, &mut after, 0).unwrap();
+            after_file.close(&cx).unwrap();
+            assert_eq!(after, before, "case={name} changed the main file");
+        }
+    }
+
+    #[test]
+    fn external_journal_with_additional_structure_is_refused_without_replay() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/external_multisection_journal.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        drop(SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap());
+
+        let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut main_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let main_len = usize::try_from(main_file.file_size(&cx).unwrap()).unwrap();
+        let mut before = vec![0_u8; main_len];
+        main_file.read(&cx, &mut before, 0).unwrap();
+        main_file.close(&cx).unwrap();
+
+        let header = JournalHeader {
+            page_count: 0,
+            nonce: 0xA11C_E222,
+            initial_db_size: 1,
+            sector_size: 4096,
+            page_size: PageSize::DEFAULT.get(),
+        };
+        let header_bytes = header.encode_padded();
+        let journal_flags =
+            VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        journal.write(&cx, &header_bytes, 0).unwrap();
+        journal
+            .write(&cx, &vec![0_u8; 4096], header_bytes.len() as u64)
+            .unwrap();
+        journal.close(&cx).unwrap();
+
+        let error = SimplePager::open_existing_with_cx_and_page_buffer_max(
+            &cx,
+            vfs.clone(),
+            &path,
+            PageSize::DEFAULT,
+            None,
+            None,
+        )
+        .err()
+        .expect("external multi-section journal must be refused");
+        assert!(matches!(error, FrankenError::Unsupported));
+
+        let (mut after_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        let mut after = vec![0_u8; main_len];
+        after_file.read(&cx, &mut after, 0).unwrap();
+        after_file.close(&cx).unwrap();
+        assert_eq!(after, before);
+        assert!(vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap());
+    }
+
+    #[test]
+    fn zero_record_hot_journal_rolls_back_pure_growth_by_truncation() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/zero_record_growth_rollback.db");
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+        let ps = PageSize::DEFAULT.as_usize();
+        drop(SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap());
+
+        let db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        assert_eq!(db_file.file_size(&cx).unwrap(), ps as u64);
+        db_file.write(&cx, &vec![0xCC; ps], ps as u64).unwrap();
+        db_file.close(&cx).unwrap();
+
+        let header = JournalHeader {
+            page_count: 0,
+            nonce: 0xA11C_E111,
+            initial_db_size: 1,
+            sector_size: 4096,
+            page_size: PageSize::DEFAULT.get(),
+        };
+        let journal_flags =
+            VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (mut journal, _) = vfs.open(&cx, Some(&journal_path), journal_flags).unwrap();
+        journal.write(&cx, &header.encode_padded(), 0).unwrap();
+        journal.close(&cx).unwrap();
+
+        drop(
+            SimplePager::open_existing_with_cx_and_page_buffer_max(
+                &cx,
+                vfs.clone(),
+                &path,
+                PageSize::DEFAULT,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let (mut restored, _) = vfs.open(&cx, Some(&path), db_flags).unwrap();
+        assert_eq!(restored.file_size(&cx).unwrap(), ps as u64);
+        restored.close(&cx).unwrap();
+        assert!(!vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap());
     }
 
     #[test]
@@ -15880,11 +19374,11 @@ mod tests {
             dirty_pages
         ));
 
-        let seed_pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let seed_pager = vfs.open_file_backed_pager(&db_path).unwrap();
         track_c_seed_existing_pages_blocking(&seed_pager, &cx, dirty_pages);
         drop(seed_pager);
 
-        let pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&db_path).unwrap();
         let backend = TrackCPublishWindowBenchWalBackend::new(&vfs, &cx, &wal_path, mode);
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
@@ -15937,12 +19431,12 @@ mod tests {
             dirty_pages
         ));
         let seed_cx = Cx::new();
-        let seed_pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let seed_pager = vfs.open_file_backed_pager(&db_path).unwrap();
         track_c_seed_existing_pages_blocking(&seed_pager, &seed_cx, dirty_pages.saturating_mul(2));
         drop(seed_pager);
 
-        let pager_a = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
-        let pager_b = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let pager_a = vfs.open_file_backed_pager(&db_path).unwrap();
+        let pager_b = vfs.open_file_backed_pager(&db_path).unwrap();
         let cx_a = Cx::new();
         let cx_b = Cx::new();
         pager_a
@@ -16874,6 +20368,7 @@ mod tests {
         // would block if the fast path still extracted the backend.
         init_publication_test_tracing();
         let (pager, _frames) = wal_pager();
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
         let cx = Cx::new();
 
         for mode in [
@@ -17318,7 +20813,7 @@ mod tests {
         let vfs = BlockingObservedLockVfs::new();
         let observed_lock_level = vfs.observed_lock_level();
         let path = PathBuf::from("/wal_group_commit_failure_restores_reserved.db");
-        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
         let (backend, _append_frames_calls) = FailingGroupCommitWalBackend::new();
         pager.set_wal_backend(Box::new(backend)).unwrap();
@@ -20940,6 +24435,46 @@ mod tests {
             frames_before,
             "bead_id={BEAD_ID} case=wal_net_zero_eof_allocate_free_appends_no_frames"
         );
+    }
+
+    #[test]
+    fn shared_memory_pagers_commit_disjoint_concurrent_writers_without_file_locking() {
+        let (pager1, pager2, frames) = wal_pager_pair_with_shared_backend();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let (page_two, page_three) = {
+            let mut seed = pager1.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let page_two = seed.allocate_page(&cx).unwrap();
+            let page_three = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            seed.write_page(&cx, page_three, &vec![0x22; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            (page_two, page_three)
+        };
+
+        let mut first = pager1.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut second = pager2.begin(&cx, TransactionMode::Concurrent).unwrap();
+        first.write_page(&cx, page_two, &vec![0x31; ps]).unwrap();
+        second.write_page(&cx, page_three, &vec![0x42; ps]).unwrap();
+        first.commit(&cx).unwrap();
+        second.commit(&cx).unwrap();
+
+        let committed = frames.lock().unwrap();
+        assert!(
+            committed.iter().any(|(page, bytes, _)| {
+                *page == page_two.get() && bytes.first() == Some(&0x31)
+            })
+        );
+        assert!(
+            committed.iter().any(|(page, bytes, _)| {
+                *page == page_three.get() && bytes.first() == Some(&0x42)
+            })
+        );
+        assert!(Arc::ptr_eq(
+            &pager1.group_commit_queue,
+            &pager2.group_commit_queue
+        ));
     }
 
     #[test]
@@ -25063,7 +28598,7 @@ mod tests {
         let path = PathBuf::from("/track_u_dirty_bitmap_crash_recovery.db");
         let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
         let vfs = DbWriteFailOnceVfs::new(path.clone());
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
 
         let original_pages = {
@@ -25097,7 +28632,7 @@ mod tests {
 
         drop(pager);
 
-        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened = vfs.open_file_backed_pager(&path).unwrap();
         let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         for (page, original) in &original_pages {
             assert_eq!(
@@ -25198,7 +28733,7 @@ mod tests {
         let path = PathBuf::from("/track_u_dirty_bitmap_double_write_crash.db");
         let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
         let vfs = DbWriteFailOnceVfs::new(path.clone());
-        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager = vfs.open_file_backed_pager(&path).unwrap();
         let cx = Cx::new();
 
         let (page, original) = {
@@ -25225,7 +28760,7 @@ mod tests {
 
         drop(pager);
 
-        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened = vfs.open_file_backed_pager(&path).unwrap();
         let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         assert_eq!(
             reader.get_page(&cx, page).unwrap().as_ref(),
@@ -26697,6 +30232,162 @@ mod tests {
             0x22,
             "bead_id={BEAD_ID} case=publication_refresh_reads_latest_committed_page"
         );
+    }
+
+    #[test]
+    fn external_page_size_change_fails_closed_until_reopen() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/external_page_size_drift.db");
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+        let replacement_vfs = MemoryVfs::new();
+        let replacement_path = PathBuf::from("/replacement_page_size.db");
+        let replacement_page_size = PageSize::new(8192).unwrap();
+        drop(
+            SimplePager::open(
+                replacement_vfs.clone(),
+                &replacement_path,
+                replacement_page_size,
+            )
+            .unwrap(),
+        );
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut replacement, _) = replacement_vfs
+            .open(&cx, Some(&replacement_path), flags)
+            .unwrap();
+        let mut replacement_bytes = vec![0_u8; replacement_page_size.as_usize()];
+        replacement.read(&cx, &mut replacement_bytes, 0).unwrap();
+        replacement.close(&cx).unwrap();
+
+        let (mut live_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        live_file.write(&cx, &replacement_bytes, 0).unwrap();
+        live_file.close(&cx).unwrap();
+
+        let error = pager.refresh_published_snapshot(&cx).unwrap_err();
+        assert!(
+            matches!(error, FrankenError::DatabaseCorrupt { ref detail }
+                if detail.contains("page size changed") && detail.contains("reopen")),
+            "unexpected page-size drift error: {error}"
+        );
+        assert_eq!(pager.page_size(), PageSize::DEFAULT);
+        assert!(matches!(
+            pager.begin(&cx, TransactionMode::ReadOnly),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+
+        let reopened = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        assert_eq!(reopened.page_size(), replacement_page_size);
+    }
+
+    #[test]
+    fn zero_frame_wal_refresh_observes_same_size_main_header_replacement() {
+        use crate::traits::{WalBackend, WalPublicationSnapshot};
+
+        struct ZeroFrameWalBackend {
+            snapshot: WalPublicationSnapshot,
+        }
+
+        impl WalBackend for ZeroFrameWalBackend {
+            fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
+                Ok(())
+            }
+
+            fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+                Some(self.snapshot)
+            }
+
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                0
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                })
+            }
+        }
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/same_size_zero_frame_wal_refresh.db");
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 1,
+            salts: fsqlite_wal::WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            },
+        };
+        pager
+            .set_wal_backend(Box::new(ZeroFrameWalBackend {
+                snapshot: WalPublicationSnapshot {
+                    publication_seq: 0,
+                    generation,
+                    last_commit_frame: None,
+                    commit_count: 0,
+                    latest_frame_entries: 0,
+                    index_is_partial: false,
+                },
+            }))
+            .unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        let before = pager.refresh_published_snapshot(&cx).unwrap();
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let mut page_one = vec![0_u8; PageSize::DEFAULT.as_usize()];
+        db_file.read(&cx, &mut page_one, 0).unwrap();
+        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+        header_bytes.copy_from_slice(&page_one[..DATABASE_HEADER_SIZE]);
+        let mut header = DatabaseHeader::from_bytes(&header_bytes).unwrap();
+        header.change_counter = header.change_counter.wrapping_add(1).max(1);
+        header.version_valid_for = header.change_counter;
+        page_one[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
+        db_file.write(&cx, &page_one, 0).unwrap();
+        db_file.close(&cx).unwrap();
+
+        let after = pager
+            .refresh_published_snapshot_for_clean_wal_read(&cx)
+            .unwrap();
+        assert!(after.visible_commit_seq > before.visible_commit_seq);
+        let inner = pager.inner.lock().unwrap();
+        assert_eq!(
+            inner.committed_db_change_counter,
+            u64::from(header.change_counter)
+        );
+        assert_eq!(inner.committed_wal_visible_commit_count, 0);
+        assert_eq!(inner.committed_wal_generation, Some(generation));
     }
 
     #[test]

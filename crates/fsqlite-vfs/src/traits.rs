@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
-use crate::shm::ShmRegion;
+use crate::shm::{
+    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_UNLOCK, ShmRegion, WAL_CKPT_LOCK,
+    WAL_WRITE_LOCK,
+};
 
 /// Opaque identity of an already-open filesystem object.
 ///
@@ -29,6 +32,8 @@ pub struct FileIdentity {
 /// value that happens to contain the same bytes.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum FileIdentityKind {
+    /// Stable identity for one file generation inside an in-process VFS.
+    Memory,
     #[cfg(unix)]
     Unix,
     #[cfg(windows)]
@@ -38,6 +43,22 @@ enum FileIdentityKind {
 }
 
 impl FileIdentity {
+    /// Construct an identity for a file owned by an in-process VFS.
+    ///
+    /// Both components are opaque process-local tokens. They only need to be
+    /// stable while the corresponding VFS/file storage objects are alive; the
+    /// identity is used to coalesce pager coordination gates, never persisted.
+    #[must_use]
+    pub(crate) fn from_memory_parts(namespace: u64, object: u64) -> Self {
+        let mut object_bytes = [0_u8; 16];
+        object_bytes[..8].copy_from_slice(&object.to_ne_bytes());
+        Self {
+            kind: FileIdentityKind::Memory,
+            namespace,
+            object: object_bytes,
+        }
+    }
+
     /// Read the identity of an independently opened filesystem descriptor.
     ///
     /// On Unix this uses descriptor metadata (`st_dev`, `st_ino`). On Windows
@@ -147,6 +168,10 @@ impl FileIdentity {
     #[cfg(any(unix, windows))]
     pub(crate) fn to_namespace_bytes(self) -> [u8; 25] {
         let tag = match self.kind {
+            // Memory identities are process-local. The tag round-trips for
+            // in-process coordination/tests only; callers must never persist
+            // it as a reusable cross-process namespace identity.
+            FileIdentityKind::Memory => 4,
             #[cfg(unix)]
             FileIdentityKind::Unix => 1,
             #[cfg(windows)]
@@ -171,6 +196,11 @@ impl FileIdentity {
         object.copy_from_slice(&encoded[9..]);
 
         match encoded[0] {
+            4 if object[8..].iter().all(|byte| *byte == 0) => Some(Self {
+                kind: FileIdentityKind::Memory,
+                namespace,
+                object,
+            }),
             #[cfg(unix)]
             1 if object[8..].iter().all(|byte| *byte == 0) => Some(Self {
                 kind: FileIdentityKind::Unix,
@@ -189,6 +219,30 @@ impl FileIdentity {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod memory_file_identity_codec_tests {
+    use super::FileIdentity;
+
+    #[test]
+    fn memory_namespace_bytes_round_trip_with_distinct_tag() {
+        let identity = FileIdentity::from_memory_parts(17, 29);
+        let encoded = identity.to_namespace_bytes();
+
+        assert_eq!(encoded[0], 4);
+        assert_eq!(FileIdentity::from_namespace_bytes(encoded), Some(identity));
+        assert_ne!(
+            identity,
+            FileIdentity::from_memory_parts(18, 29),
+            "independent MemoryVfs instances must remain isolated"
+        );
+        assert_ne!(
+            identity,
+            FileIdentity::from_memory_parts(17, 30),
+            "distinct named files in one MemoryVfs must remain isolated"
+        );
     }
 }
 
@@ -560,6 +614,16 @@ pub trait Vfs: Send + Sync {
     /// to ensure durability.
     fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()>;
 
+    /// Synchronize the parent directory containing `path`.
+    ///
+    /// Durable create-before-mutate protocols (notably rollback journals)
+    /// must make the newly-created directory entry stable before they modify
+    /// the protected file.  Filesystems that do not require or support an
+    /// explicit directory sync may keep the default no-op implementation.
+    fn sync_parent_directory(&self, _cx: &Cx, _path: &Path) -> Result<()> {
+        Ok(())
+    }
+
     /// Check file access.
     ///
     /// Returns true if the file at `path` satisfies the access check
@@ -690,6 +754,85 @@ pub trait VfsFile: Send + Sync {
 
     /// Release the file lock to the given level.
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()>;
+
+    /// Acquire the cross-process SHARED fence used while capturing a coherent
+    /// main-database snapshot.
+    ///
+    /// Native Unix locks already use stock SQLite's main-file byte ranges, so
+    /// the default is the ordinary SHARED lock. Platform VFSes whose ordinary
+    /// locks are private coordination surfaces must additionally fence the
+    /// byte ranges used by the system SQLite VFS.
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.lock(cx, LockLevel::Shared)
+    }
+
+    /// Release a fence acquired by [`Self::lock_external_shared_snapshot`].
+    fn unlock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.unlock(cx, LockLevel::None)
+    }
+
+    /// Acquire the cross-process fence for an operation that replaces the
+    /// complete main-database image in place.
+    ///
+    /// The default implementation composes the ordinary SQLite lock surfaces:
+    /// in WAL mode it first excludes writers and checkpointers through the
+    /// adjacent WAL write/checkpoint slots, then obtains the main-database
+    /// EXCLUSIVE lock. Platform VFSes whose ordinary locks are not visible to
+    /// the system SQLite VFS must override this hook with a stock-compatible
+    /// external fence.
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        if wal_mode {
+            self.shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )?;
+        }
+
+        if let Err(lock_error) = self.lock(cx, LockLevel::Exclusive) {
+            if wal_mode
+                && let Err(unlock_error) = self.shm_lock(
+                    cx,
+                    WAL_WRITE_LOCK,
+                    WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
+                    SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+            {
+                return Err(FrankenError::internal(format!(
+                    "external maintenance could not acquire the main database lock or release WAL maintenance locks: lock={lock_error}; unlock={unlock_error}"
+                )));
+            }
+            return Err(lock_error);
+        }
+        Ok(())
+    }
+
+    /// Release a fence acquired by [`Self::lock_external_maintenance`].
+    ///
+    /// Both lock surfaces are attempted even if one release fails, so a
+    /// cleanup error cannot silently strand the other cross-process lock.
+    fn unlock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        let main_result = self.unlock(cx, LockLevel::None);
+        let wal_result = if wal_mode {
+            self.shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                WAL_CKPT_LOCK - WAL_WRITE_LOCK + 1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+        } else {
+            Ok(())
+        };
+
+        match (main_result, wal_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(main_error), Err(wal_error)) => Err(FrankenError::internal(format!(
+                "external maintenance could not release all locks: main={main_error}; wal={wal_error}"
+            ))),
+        }
+    }
 
     /// Check if another process holds a reserved lock.
     ///

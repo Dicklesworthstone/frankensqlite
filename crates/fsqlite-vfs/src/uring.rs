@@ -748,6 +748,10 @@ impl Vfs for IoUringVfs {
         self.unix.delete(cx, path, sync_dir)
     }
 
+    fn sync_parent_directory(&self, cx: &Cx, path: &Path) -> Result<()> {
+        self.unix.sync_parent_directory(cx, path)
+    }
+
     fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
         self.unix.access(cx, path, flags)
     }
@@ -856,6 +860,10 @@ impl VfsFile for IoUringFile {
 
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
         self.inner.sync(cx, flags)
+    }
+
+    fn durable_sync(&mut self, cx: &Cx, kind: crate::SyncKind) -> Result<()> {
+        self.inner.durable_sync(cx, kind)
     }
 
     fn file_size(&self, cx: &Cx) -> Result<u64> {

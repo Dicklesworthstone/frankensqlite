@@ -46,7 +46,6 @@ use fsqlite_types::value::SqliteValue;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
-#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
@@ -55,7 +54,7 @@ use fsqlite_vfs::UnixVfs as PlatformVfs;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs as PlatformVfs;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-use fsqlite_vfs::host_fs;
+use fsqlite_vfs::{FileIdentity, host_fs};
 
 /// SQLite file header magic bytes (first 16 bytes).
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -68,6 +67,45 @@ const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
 /// Owned sqlite_master row payload used when persistence must preserve
 /// non-table entries such as views and triggers during file rebuilds.
 pub type SqliteMasterEntry = (String, String, String, u32, Option<String>);
+
+/// Select the SQL text persisted for an index entry in `sqlite_master`.
+///
+/// A stored, non-NULL SQL definition is authoritative: it identifies an
+/// explicit index even when a legacy database gave that index a reserved
+/// `sqlite_autoindex_*`-looking name. Only an index without preserved DDL whose
+/// name canonically maps to its table and a positive decimal ordinal may be
+/// classified as an implicit autoindex and serialized with NULL SQL.
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn index_sql_for_persistence<S, F>(
+    index_name: &str,
+    table_name: &str,
+    original_ddl: &HashMap<String, String, S>,
+    synthesize: F,
+) -> Option<String>
+where
+    S: BuildHasher,
+    F: FnOnce() -> String,
+{
+    if let Some(original) = original_ddl.get(&index_name.to_ascii_lowercase()) {
+        return Some(original.clone());
+    }
+    if parse_autoindex_ordinal(index_name, table_name).is_some() {
+        return None;
+    }
+    Some(synthesize())
+}
+
+fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
+    let index_name_lower = index_name.to_ascii_lowercase();
+    let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
+    let suffix = index_name_lower.strip_prefix(&prefix)?;
+    if suffix.is_empty() || suffix.starts_with('0') || !suffix.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    let ordinal = suffix.parse::<usize>().ok()?;
+    (ordinal.to_string() == suffix).then_some(ordinal)
+}
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)> {
@@ -204,15 +242,78 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
     extra_master_entries: &[SqliteMasterEntry],
     original_ddl: &HashMap<String, String, S>,
 ) -> Result<()> {
-    // Remove existing file so the pager creates a fresh one.
-    if path.exists() {
-        // Truncate to empty so the pager treats it as a fresh DB, without
-        // requiring delete permissions on the parent directory.
+    persist_to_sqlite_with_header_and_master_entries_impl(
+        cx,
+        path,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+        None,
+    )
+}
+
+/// Persist into an atomically caller-reserved empty file.
+///
+/// The path is opened only through the pager's identity-bound `ReservedEmpty`
+/// mode. A missing, replaced, non-empty, or sidecar-bearing reservation is
+/// rejected before any database byte is initialized.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+pub fn persist_to_reserved_sqlite_with_header_and_master_entries<S: BuildHasher>(
+    cx: &Cx,
+    path: &Path,
+    expected_identity: FileIdentity,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+) -> Result<()> {
+    persist_to_sqlite_with_header_and_master_entries_impl(
+        cx,
+        path,
+        schema,
+        db,
+        header_template,
+        extra_master_entries,
+        original_ddl,
+        Some(expected_identity),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
+    cx: &Cx,
+    path: &Path,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String, S>,
+    expected_empty_identity: Option<FileIdentity>,
+) -> Result<()> {
+    if expected_empty_identity.is_none() && path.exists() {
+        // Legacy overwrite callers deliberately replace their own target.
+        // Identity-sensitive exports must use the reserved entry point above.
         host_fs::create_empty_file(path)?;
     }
 
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open_with_cx(cx, vfs, path, header_template.page_size)?;
+    let pager = if let Some(expected_identity) = expected_empty_identity {
+        SimplePager::open_reserved_with_cx_and_page_buffer_max(
+            cx,
+            vfs,
+            path,
+            header_template.page_size,
+            expected_identity,
+            None,
+        )?
+    } else {
+        SimplePager::open_with_cx(cx, vfs, path, header_template.page_size)?
+    };
     let mut txn = pager.begin(cx, TransactionMode::Immediate)?;
 
     let page_size = header_template.page_size;
@@ -260,7 +361,12 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
         let create_sql = original_ddl
             .get(&table.name.to_ascii_lowercase())
             .cloned()
-            .unwrap_or_else(|| build_create_table_sql(table));
+            .unwrap_or_else(|| {
+                build_create_table_sql_with_implicit_index_predicate(table, |index| {
+                    parse_autoindex_ordinal(&index.name, &table.name).is_some()
+                        && !original_ddl.contains_key(&index.name.to_ascii_lowercase())
+                })
+            });
         let table_name = table.name.clone();
         master_entries.push((
             "table".to_owned(),
@@ -369,45 +475,48 @@ pub fn persist_to_sqlite_with_header_and_master_entries<S: BuildHasher>(
                 }
             }
 
-            // Build CREATE INDEX SQL — but autoindexes (sqlite_autoindex_*)
-            // must have NULL sql in sqlite_master, matching stock SQLite.
-            // Stock SQLite rejects CREATE INDEX with reserved sqlite_ prefix,
-            // so a non-NULL sql here would be an invalid schema entry.
-            let idx_sql = if index.name.starts_with("sqlite_autoindex_") {
-                None
-            } else if let Some(orig) = original_ddl.get(&index.name.to_ascii_lowercase()) {
-                // Prefer original DDL for the same reasons as tables: preserves
-                // exact WHERE clause formatting, collation names, etc.
-                Some(orig.clone())
-            } else if is_expression_index {
-                Some(build_create_expression_index_sql(
-                    &index.name,
-                    &table_name,
-                    index.is_unique,
-                    &index.key_expressions,
-                    &index.key_collations,
-                    &index.key_sort_directions,
-                    index.where_clause.as_deref(),
-                ))
-            } else {
-                let terms: Vec<CreateIndexSqlTerm<'_>> = index
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| CreateIndexSqlTerm {
-                        column_name: col.as_str(),
-                        collation: index.key_collations.get(i).and_then(|c| c.as_deref()),
-                        direction: index.key_sort_directions.get(i).copied(),
-                    })
-                    .collect();
-                let sql =
-                    build_create_index_sql(&index.name, &table_name, index.is_unique, &terms, None);
-                Some(if let Some(ref wc) = index.where_clause {
-                    format!("{sql} WHERE {wc}")
+            // Preserve stored non-NULL DDL before considering the reserved
+            // prefix. Legacy databases can contain explicit indexes with a
+            // sqlite_autoindex_* name; erasing their SQL turns them into
+            // unreconstructable implicit entries. Only names that canonically
+            // map to this table and a positive ordinal, with no preserved DDL,
+            // are genuine implicit autoindexes.
+            let idx_sql = index_sql_for_persistence(&index.name, &table_name, original_ddl, || {
+                if is_expression_index {
+                    build_create_expression_index_sql(
+                        &index.name,
+                        &table_name,
+                        index.is_unique,
+                        &index.key_expressions,
+                        &index.key_collations,
+                        &index.key_sort_directions,
+                        index.where_clause.as_deref(),
+                    )
                 } else {
-                    sql
-                })
-            };
+                    let terms: Vec<CreateIndexSqlTerm<'_>> = index
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, col)| CreateIndexSqlTerm {
+                            column_name: col.as_str(),
+                            collation: index.key_collations.get(i).and_then(|c| c.as_deref()),
+                            direction: index.key_sort_directions.get(i).copied(),
+                        })
+                        .collect();
+                    let sql = build_create_index_sql(
+                        &index.name,
+                        &table_name,
+                        index.is_unique,
+                        &terms,
+                        None,
+                    );
+                    if let Some(ref wc) = index.where_clause {
+                        format!("{sql} WHERE {wc}")
+                    } else {
+                        sql
+                    }
+                }
+            });
             master_entries.push((
                 "index".to_owned(),
                 index.name.clone(),
@@ -814,11 +923,6 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             _ => continue,
         };
 
-        // Skip sqlite_autoindex_* (already handled via UNIQUE constraints).
-        if index_name.starts_with("sqlite_autoindex_") {
-            continue;
-        }
-
         let root_page_u32 = validate_sqlite_master_root_page(&index_name, root_page_num)?;
         let root_page_i32 =
             i32::try_from(root_page_u32).map_err(|_| FrankenError::DatabaseCorrupt {
@@ -1082,6 +1186,18 @@ fn quote_identifier(identifier: &str) -> String {
 
 /// Reconstruct a `CREATE TABLE` statement from a `TableSchema`.
 pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
+    build_create_table_sql_with_implicit_index_predicate(table, |index| {
+        parse_autoindex_ordinal(&index.name, &table.name).is_some()
+    })
+}
+
+fn build_create_table_sql_with_implicit_index_predicate<F>(
+    table: &TableSchema,
+    is_implicit_autoindex: F,
+) -> String
+where
+    F: Fn(&IndexSchema) -> bool,
+{
     use std::fmt::Write as _;
     let mut sql = format!("CREATE TABLE {} (", quote_identifier(&table.name));
     let is_single_column_primary_key = |column_name: &str| {
@@ -1167,7 +1283,7 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
         // separate CREATE INDEX entries in sqlite_master; emitting them
         // here as well would create a phantom sqlite_autoindex that stock
         // SQLite tries to populate, causing "wrong # of entries" errors.
-        if !index.name.starts_with("sqlite_autoindex_") {
+        if !is_implicit_autoindex(index) {
             continue;
         }
         if index.columns.len() == 1
@@ -4601,6 +4717,226 @@ PRAGMA integrity_check;
             sql,
             "CREATE UNIQUE INDEX \"idx\"\"q\" ON \"ta\"\"ble\" (\"na\"\"me\" COLLATE \"NO\"\"CASE\" DESC)"
         );
+    }
+
+    #[test]
+    fn test_index_sql_preserves_explicit_reserved_prefix_definition() {
+        let mut original_ddl = HashMap::new();
+        original_ddl.insert(
+            "sqlite_autoindex_link_table_v23_1".to_owned(),
+            "CREATE UNIQUE INDEX \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)"
+                .to_owned(),
+        );
+
+        let sql = index_sql_for_persistence(
+            "sqlite_autoindex_link_table_v23_1",
+            "link_table",
+            &original_ddl,
+            || panic!("preserved explicit DDL must win over prefix classification"),
+        );
+
+        assert_eq!(
+            sql.as_deref(),
+            Some(
+                "CREATE UNIQUE INDEX \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_index_sql_keeps_true_implicit_autoindex_null() {
+        let original_ddl = HashMap::<String, String>::new();
+
+        let sql = index_sql_for_persistence(
+            "sqlite_autoindex_link_table_1",
+            "link_table",
+            &original_ddl,
+            || panic!("implicit autoindex SQL must not be synthesized"),
+        );
+
+        assert_eq!(sql, None);
+    }
+
+    #[test]
+    fn test_autoindex_ordinal_requires_canonical_positive_ascii_decimal() {
+        assert_eq!(
+            parse_autoindex_ordinal("sqlite_autoindex_link_table_1", "link_table"),
+            Some(1)
+        );
+        for noncanonical in [
+            "sqlite_autoindex_link_table_0",
+            "sqlite_autoindex_link_table_01",
+            "sqlite_autoindex_link_table_+1",
+            "sqlite_autoindex_link_table_١",
+            "sqlite_autoindex_other_table_1",
+        ] {
+            assert_eq!(
+                parse_autoindex_ordinal(noncanonical, "link_table"),
+                None,
+                "{noncanonical} must not classify as an implicit autoindex"
+            );
+        }
+        let overflowing = format!("sqlite_autoindex_link_table_{}0", usize::MAX);
+        assert_eq!(parse_autoindex_ordinal(&overflowing, "link_table"), None);
+    }
+
+    #[test]
+    fn test_index_sql_synthesizes_unrecorded_explicit_index() {
+        let original_ddl = HashMap::<String, String>::new();
+
+        let sql =
+            index_sql_for_persistence("idx_link_table_a", "link_table", &original_ddl, || {
+                "CREATE INDEX idx_link_table_a ON link_table(a)".to_owned()
+            });
+
+        assert_eq!(
+            sql.as_deref(),
+            Some("CREATE INDEX idx_link_table_a ON link_table(a)")
+        );
+    }
+
+    #[test]
+    fn test_index_sql_synthesizes_noncanonical_reserved_prefix_without_ddl() {
+        let original_ddl = HashMap::<String, String>::new();
+
+        let sql = index_sql_for_persistence(
+            "sqlite_autoindex_link_table_v23_1",
+            "link_table",
+            &original_ddl,
+            || {
+                "CREATE UNIQUE INDEX \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)"
+                    .to_owned()
+            },
+        );
+
+        assert_eq!(
+            sql.as_deref(),
+            Some(
+                "CREATE UNIQUE INDEX \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_reserved_prefix_explicit_index_survives_without_original_table_ddl() {
+        const TABLE_SQL: &str = "CREATE TABLE link_table(\
+            a INTEGER NOT NULL,\
+            b INTEGER NOT NULL,\
+            PRIMARY KEY(a,b)\
+        )";
+        const INDEX_NAME: &str = "sqlite_autoindex_link_table_v23_1";
+        const INDEX_SQL: &str = "CREATE UNIQUE INDEX \
+            \"sqlite_autoindex_link_table_v23_1\" ON \"link_table\"(a,b)";
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("reserved-prefix-source.db");
+        let rebuilt_path = dir.path().join("reserved-prefix-rebuilt.db");
+
+        {
+            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+            sqlite
+                .execute_batch(&format!(
+                    r"
+                    {TABLE_SQL};
+                    CREATE UNIQUE INDEX legacy_unique ON link_table(a,b);
+                    INSERT INTO link_table VALUES (1,2), (3,4);
+                    PRAGMA writable_schema=ON;
+                    UPDATE sqlite_master
+                       SET name='{INDEX_NAME}', sql='{INDEX_SQL}'
+                     WHERE type='index' AND name='legacy_unique';
+                    PRAGMA schema_version=2;
+                    "
+                ))
+                .unwrap();
+        }
+
+        {
+            let sqlite = rusqlite::Connection::open(&source_path).unwrap();
+            let quick_check: String = sqlite
+                .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(quick_check, "ok");
+            assert_eq!(integrity_check, "ok");
+        }
+
+        let loaded = load_test_db(&source_path).unwrap();
+        let table = loaded
+            .schema
+            .iter()
+            .find(|table| table.name == "link_table")
+            .unwrap();
+        assert!(
+            table.indexes.iter().any(|index| index.name == INDEX_NAME),
+            "a non-NULL CREATE INDEX entry is explicit even with a reserved-prefix name"
+        );
+
+        let mut original_ddl = HashMap::new();
+        // Deliberately omit the table DDL so persistence must reconstruct it
+        // from TableSchema. The explicit reserved-prefix index DDL remains the
+        // provenance signal that prevents a phantom UNIQUE table constraint.
+        original_ddl.insert(INDEX_NAME.to_owned(), INDEX_SQL.to_owned());
+        let header = DatabaseHeader {
+            page_size: DEFAULT_PAGE_SIZE,
+            schema_cookie: loaded.schema_cookie,
+            change_counter: loaded.change_counter,
+            version_valid_for: loaded.change_counter,
+            ..DatabaseHeader::default()
+        };
+        persist_to_sqlite_with_header_and_master_entries(
+            &Cx::new(),
+            &rebuilt_path,
+            &loaded.schema,
+            &loaded.db,
+            &header,
+            &[],
+            &original_ddl,
+        )
+        .unwrap();
+
+        let sqlite = rusqlite::Connection::open(&rebuilt_path).unwrap();
+        let stored_table_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='link_table';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1;",
+                [INDEX_NAME],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let row_count: i64 = sqlite
+            .query_row("SELECT COUNT(*) FROM link_table;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !stored_table_sql.to_ascii_uppercase().contains("UNIQUE"),
+            "reconstructed table DDL must not duplicate the explicit reserved-prefix index: {stored_table_sql}"
+        );
+        assert_eq!(stored_sql, INDEX_SQL);
+        assert_eq!(row_count, 2);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
+        drop(sqlite);
+
+        let reopened = load_test_db(&rebuilt_path).unwrap();
+        let table = reopened
+            .schema
+            .iter()
+            .find(|table| table.name == "link_table")
+            .unwrap();
+        assert!(table.indexes.iter().any(|index| index.name == INDEX_NAME));
     }
 
     #[test]

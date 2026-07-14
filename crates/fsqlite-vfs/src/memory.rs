@@ -21,9 +21,10 @@ const WASM_LINEAR_MEMORY_PAGE_BYTES: usize = 64 * 1024;
 ///
 /// Each file is stored as a named byte vector. Multiple `MemoryFile` handles
 /// can reference the same underlying storage via `Arc<Mutex<..>>`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FileStorage {
     data: Vec<u8>,
+    identity_id: u64,
 }
 
 impl FileStorage {
@@ -33,7 +34,10 @@ impl FileStorage {
             data.try_reserve_exact(bytes)
                 .map_err(|_| FrankenError::OutOfMemory)?;
         }
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            identity_id: next_memory_identity_id(),
+        })
     }
 }
 
@@ -156,11 +160,12 @@ impl MemoryVfsUsageState {
 }
 
 /// Shared state for the entire memory VFS.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MemoryVfsInner {
     files: HashMap<PathBuf, Arc<Mutex<FileStorage>>>,
     shm: HashMap<PathBuf, Arc<Mutex<MemoryShmInfo>>>,
     next_temp_id: u64,
+    namespace_id: u64,
     config: MemoryVfsConfig,
     usage: MemoryVfsUsageState,
 }
@@ -199,9 +204,14 @@ impl MemoryShmInfo {
 }
 
 static SHM_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
+static MEMORY_IDENTITY_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn next_shm_owner_id() -> u64 {
     SHM_OWNER_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_memory_identity_id() -> u64 {
+    MEMORY_IDENTITY_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 fn sqlite_shm_path(path: &Path) -> PathBuf {
@@ -214,9 +224,15 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
 ///
 /// All files are stored in memory with no persistence. Multiple connections
 /// can share the same `MemoryVfs` instance to access the same files.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MemoryVfs {
     inner: Arc<Mutex<MemoryVfsInner>>,
+}
+
+impl Default for MemoryVfs {
+    fn default() -> Self {
+        Self::new_with_config(MemoryVfsConfig::default())
+    }
 }
 
 impl MemoryVfs {
@@ -232,6 +248,7 @@ impl MemoryVfs {
                 files: HashMap::new(),
                 shm: HashMap::new(),
                 next_temp_id: 0,
+                namespace_id: next_memory_identity_id(),
                 config,
                 usage: MemoryVfsUsageState::default(),
             })),
@@ -578,7 +595,7 @@ impl MemoryFile {
         };
 
         let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let orphaned = {
+        let orphaned_accounting = {
             let mut info = info_arc.lock().map_err(|_| lock_err())?;
 
             for slot_state in &mut info.slots {
@@ -596,17 +613,48 @@ impl MemoryFile {
                 }
             }
 
-            info.owner_refs.is_empty()
+            info.owner_refs
+                .is_empty()
+                .then(|| shm_region_accounting(&info))
         };
 
-        if orphaned {
-            inner.shm.remove(&self.shm_path);
-        } else if delete {
+        let still_names_this_generation = inner
+            .shm
+            .get(&self.shm_path)
+            .is_some_and(|mapped| Arc::ptr_eq(mapped, &info_arc));
+        if let Some((live_bytes, reserved_bytes)) = orphaned_accounting {
+            if still_names_this_generation {
+                inner.shm.remove(&self.shm_path);
+                inner
+                    .usage
+                    .apply_shm_change(live_bytes, reserved_bytes, 0, 0);
+            }
+        } else if delete && still_names_this_generation {
             // Match SQLite's xShmUnmap(deleteFlag): the shared backing only
             // disappears when the last reference goes away.
             debug_assert!(inner.shm.contains_key(&self.shm_path));
         }
 
+        Ok(())
+    }
+
+    fn remove_delete_on_close_storage(&mut self) -> Result<()> {
+        if !self.delete_on_close {
+            return Ok(());
+        }
+
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+        let still_names_this_file = inner
+            .files
+            .get(&self.path)
+            .is_some_and(|storage| Arc::ptr_eq(storage, &self.storage));
+        if still_names_this_file && let Some(storage) = inner.files.remove(&self.path) {
+            let storage = storage.lock().map_err(|_| lock_err())?;
+            inner
+                .usage
+                .apply_file_change(storage.data.len(), storage.data.capacity(), 0, 0);
+        }
+        self.delete_on_close = false;
         Ok(())
     }
 
@@ -739,26 +787,38 @@ impl MemoryFile {
     }
 }
 
+impl Drop for MemoryFile {
+    fn drop(&mut self) {
+        // `VfsFile::close` is explicit because native backends can report I/O
+        // failures, but Rust callers are not required to invoke it before a
+        // handle leaves scope. Never strand WAL-index ownership or SHM locks
+        // in that common path. Drop cannot return an error, so cleanup is
+        // deliberately best-effort and non-panicking.
+        self.lock_level = LockLevel::None;
+        let _ = self.release_shm_owner_state(self.delete_on_close);
+        let _ = self.remove_delete_on_close_storage();
+    }
+}
+
 impl VfsFile for MemoryFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         // Release any file locks.
         self.unlock(cx, LockLevel::None)?;
 
         self.release_shm_owner_state(self.delete_on_close)?;
-        if self.delete_on_close {
-            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-            if let Some(storage) = inner.files.remove(&self.path) {
-                let storage = storage.lock().map_err(|_| lock_err())?;
-                inner
-                    .usage
-                    .apply_file_change(storage.data.len(), storage.data.capacity(), 0, 0);
-            }
-        }
+        self.remove_delete_on_close_storage()?;
         Ok(())
     }
 
     fn file_identity(&self) -> Result<Option<FileIdentity>> {
-        Ok(None)
+        // Cloned VFS handles share monotonic process-local namespace/object
+        // tokens, while independent VFS instances and delete/recreate cycles
+        // receive fresh tokens. Unlike pointer-derived identities, these
+        // cannot alias after allocator address reuse. They remain strictly
+        // in-process coordination values.
+        let namespace = self.vfs.lock().map_err(|_| lock_err())?.namespace_id;
+        let object = self.storage.lock().map_err(|_| lock_err())?.identity_id;
+        Ok(Some(FileIdentity::from_memory_parts(namespace, object)))
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
@@ -900,9 +960,10 @@ impl VfsFile for MemoryFile {
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        // FrankenSQLite does not use SQLite-style file-lock escalation to serialize writers.
-        // MVCC provides concurrency at the page level; MemoryVfs file locks are intentionally
-        // minimal stubs for compatibility with call sites that expect lock/unlock hooks.
+        // MemoryVfs deliberately does not serialize writers at file scope.
+        // FrankenSQLite's page-level MVCC/WAL layer owns conflict detection
+        // and concurrent publication; these hooks only preserve the VFS state
+        // machine expected by pager call sites.
         if self.lock_level < level {
             self.lock_level = level;
         }
@@ -917,7 +978,6 @@ impl VfsFile for MemoryFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        // MemoryVfs does not coordinate cross-handle RESERVED locks.
         Ok(false)
     }
 
@@ -1655,6 +1715,77 @@ mod tests {
     }
 
     #[test]
+    fn drop_releases_shm_locks_and_owner_registration() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shm_drop.db");
+        let shm_path = sqlite_shm_path(path);
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut file2, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        let _region1 = file1.shm_map(&cx, 0, 64, true).unwrap();
+        file1
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        drop(file1);
+
+        // A handle that leaves scope without xClose must not strand either
+        // its exclusive slot or its owner reference.
+        let _region2 = file2.shm_map(&cx, 0, 64, true).unwrap();
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        drop(file2);
+
+        assert!(
+            !vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "dropping the last mapped handle must remove orphaned SHM state"
+        );
+    }
+
+    #[test]
+    fn dropping_detached_old_handle_does_not_remove_recreated_shm_generation() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shm_recreate_drop_old.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut old_file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let _old_region = old_file.shm_map(&cx, 0, 64, true).unwrap();
+        old_file
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+
+        // Detach the old database/SHM generation, then create a replacement
+        // at the same pathname before the final old handle is dropped.
+        vfs.delete(&cx, path, false).unwrap();
+        let (mut replacement, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let _replacement_region = replacement.shm_map(&cx, 0, 64, true).unwrap();
+        replacement
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+
+        drop(old_file);
+
+        let (mut third, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let _third_region = third.shm_map(&cx, 0, 64, true).unwrap();
+        assert!(matches!(
+            third.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE),
+            Err(FrankenError::Busy)
+        ));
+
+        replacement
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        third
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+    }
+
+    #[test]
     fn shm_barrier_is_noop() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -1951,7 +2082,7 @@ mod tests {
         file.unlock(&cx, LockLevel::Shared).unwrap();
         file.unlock(&cx, LockLevel::None).unwrap();
 
-        // check_reserved_lock still false (MemoryVfs has no cross-connection locking).
+        // The reservation disappears once the handle downgrades below it.
         assert!(!file.check_reserved_lock(&cx).unwrap());
     }
 
@@ -2007,18 +2138,16 @@ mod tests {
         let (mut f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
         let (mut f2, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
-        // MemoryVfs locking is intentionally non-serializing: locks are local stubs.
+        // MemoryVfs locking is intentionally non-serializing: locks are local
+        // compatibility state while page-level MVCC owns writer conflicts.
         f1.lock(&cx, LockLevel::Shared).unwrap();
         f2.lock(&cx, LockLevel::Shared).unwrap();
 
         f1.lock(&cx, LockLevel::Reserved).unwrap();
         f2.lock(&cx, LockLevel::Reserved).unwrap();
-
-        // check_reserved_lock is always false (no cross-handle RESERVED coordination).
         assert!(!f2.check_reserved_lock(&cx).unwrap());
         assert!(!f1.check_reserved_lock(&cx).unwrap());
 
-        // Locks never block other handles.
         f1.lock(&cx, LockLevel::Exclusive).unwrap();
         f2.lock(&cx, LockLevel::Exclusive).unwrap();
 
@@ -2026,15 +2155,33 @@ mod tests {
         f1.lock(&cx, LockLevel::Shared).unwrap();
         assert_eq!(f1.lock_level, LockLevel::Exclusive);
 
+        // Unlock() should downgrade.
         f1.unlock(&cx, LockLevel::None).unwrap();
         assert_eq!(f1.lock_level, LockLevel::None);
-
-        // Unlock() should downgrade.
-        f2.lock(&cx, LockLevel::Shared).unwrap();
-        assert_eq!(f2.lock_level, LockLevel::Exclusive);
-
         f2.unlock(&cx, LockLevel::Shared).unwrap();
         assert_eq!(f2.lock_level, LockLevel::Shared);
+    }
+
+    #[test]
+    fn file_identity_tracks_shared_storage_not_path_text() {
+        let cx = Cx::new();
+        let shared_vfs = make_vfs();
+        let independent_vfs = make_vfs();
+        let path = Path::new("identity.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (shared_first, _) = shared_vfs.open(&cx, Some(path), flags).unwrap();
+        let (shared_second, _) = shared_vfs.open(&cx, Some(path), flags).unwrap();
+        let (independent, _) = independent_vfs.open(&cx, Some(path), flags).unwrap();
+
+        assert_eq!(
+            shared_first.file_identity().unwrap(),
+            shared_second.file_identity().unwrap()
+        );
+        assert_ne!(
+            shared_first.file_identity().unwrap(),
+            independent.file_identity().unwrap()
+        );
     }
 
     // =========================================================================

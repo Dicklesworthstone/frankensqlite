@@ -8,15 +8,24 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom, Write};
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_harness::fault_vfs::{
     FaultInjectingVfs, FaultKind, FaultMetricsSnapshot, FaultSpec, FaultTriggerRecord,
 };
+#[cfg(unix)]
+use fsqlite_pager::pager::DatabaseImageReceipt;
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{LockLevel, PageNumber, PageSize};
 use fsqlite_vfs::traits::{Vfs, VfsFile};
+#[cfg(unix)]
+use fsqlite_vfs::{FileIdentity, SyncKind, UnixVfs};
 use fsqlite_vfs::{MemoryVfs, ShmRegion};
 use serde_json::{Value, json};
 
@@ -591,4 +600,1273 @@ fn fault_injection_fsync_failure_during_commit_preserves_preexisting_page() {
             },
         }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// GH-138: in-place VACUUM publication fault matrix
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+const VACUUM_SOURCE_ROW_COUNT: i64 = 16;
+#[cfg(unix)]
+const VACUUM_CANDIDATE_ROW_COUNT: i64 = 2;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VacuumFileRole {
+    Source,
+    Candidate,
+    Journal,
+    Other,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VacuumFaultOperation {
+    Write,
+    Truncate,
+    DurableSync,
+    Close,
+    Delete,
+    SyncParentDirectory,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VacuumFaultEffect {
+    ReturnError,
+    PartialWrite { valid_bytes: usize },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VacuumFaultSpec {
+    label: &'static str,
+    role: VacuumFileRole,
+    operation: VacuumFaultOperation,
+    nth_match: usize,
+    effect: VacuumFaultEffect,
+}
+
+#[cfg(unix)]
+impl VacuumFaultSpec {
+    const fn error(
+        label: &'static str,
+        role: VacuumFileRole,
+        operation: VacuumFaultOperation,
+        nth_match: usize,
+    ) -> Self {
+        Self {
+            label,
+            role,
+            operation,
+            nth_match,
+            effect: VacuumFaultEffect::ReturnError,
+        }
+    }
+
+    const fn partial_write(
+        label: &'static str,
+        role: VacuumFileRole,
+        nth_match: usize,
+        valid_bytes: usize,
+    ) -> Self {
+        Self {
+            label,
+            role,
+            operation: VacuumFaultOperation::Write,
+            nth_match,
+            effect: VacuumFaultEffect::PartialWrite { valid_bytes },
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct VacuumFaultState {
+    armed: Option<VacuumFaultSpec>,
+    matching_operations_seen: usize,
+    fired_label: Option<&'static str>,
+    cancel_parent_after_source_write: Option<Cx>,
+    cancelled_after_source_write: bool,
+    silent_replay_corruption_armed: bool,
+    silent_replay_source_writes_seen: usize,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VacuumFaultSnapshot {
+    matching_operations_seen: usize,
+    fired_label: Option<&'static str>,
+    cancelled_after_source_write: bool,
+}
+
+#[cfg(unix)]
+struct VacuumFaultVfs<V: Vfs> {
+    inner: V,
+    source_path: PathBuf,
+    candidate_path: PathBuf,
+    journal_path: PathBuf,
+    state: Arc<Mutex<VacuumFaultState>>,
+}
+
+#[cfg(unix)]
+impl<V: Vfs> VacuumFaultVfs<V> {
+    fn new(inner: V, source_path: PathBuf, candidate_path: PathBuf) -> Self {
+        let journal_path = journal_path_for(&source_path);
+        Self {
+            inner,
+            source_path,
+            candidate_path,
+            journal_path,
+            state: Arc::new(Mutex::new(VacuumFaultState::default())),
+        }
+    }
+
+    fn arm(&self, spec: VacuumFaultSpec) {
+        assert!(spec.nth_match > 0, "fault match indices are one-based");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = VacuumFaultState {
+            armed: Some(spec),
+            matching_operations_seen: 0,
+            fired_label: None,
+            cancel_parent_after_source_write: None,
+            cancelled_after_source_write: false,
+            silent_replay_corruption_armed: false,
+            silent_replay_source_writes_seen: 0,
+        };
+    }
+
+    fn arm_cancel_after_first_source_write(&self, parent_cx: &Cx) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = VacuumFaultState {
+            armed: None,
+            matching_operations_seen: 0,
+            fired_label: None,
+            cancel_parent_after_source_write: Some(parent_cx.clone()),
+            cancelled_after_source_write: false,
+            silent_replay_corruption_armed: false,
+            silent_replay_source_writes_seen: 0,
+        };
+    }
+
+    fn arm_silent_replay_corruption(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = VacuumFaultState {
+            silent_replay_corruption_armed: true,
+            ..VacuumFaultState::default()
+        };
+    }
+
+    fn disarm(&self) {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = VacuumFaultState::default();
+    }
+
+    fn snapshot(&self) -> VacuumFaultSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        VacuumFaultSnapshot {
+            matching_operations_seen: state.matching_operations_seen,
+            fired_label: state.fired_label,
+            cancelled_after_source_write: state.cancelled_after_source_write,
+        }
+    }
+
+    fn role_for(&self, path: Option<&Path>, flags: VfsOpenFlags) -> VacuumFileRole {
+        if flags.contains(VfsOpenFlags::MAIN_JOURNAL)
+            || path.is_some_and(|path| path == self.journal_path)
+        {
+            VacuumFileRole::Journal
+        } else if path.is_some_and(|path| path == self.source_path) {
+            VacuumFileRole::Source
+        } else if path.is_some_and(|path| path == self.candidate_path) {
+            VacuumFileRole::Candidate
+        } else {
+            VacuumFileRole::Other
+        }
+    }
+
+    fn wrap_file(
+        &self,
+        inner: V::File,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> VacuumFaultFile<V::File> {
+        VacuumFaultFile {
+            inner,
+            role: self.role_for(path, flags),
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn take_fault(
+        &self,
+        role: VacuumFileRole,
+        operation: VacuumFaultOperation,
+    ) -> Option<(VacuumFaultEffect, &'static str)> {
+        take_vacuum_fault(&self.state, role, operation)
+    }
+}
+
+#[cfg(unix)]
+struct VacuumFaultFile<F: VfsFile> {
+    inner: F,
+    role: VacuumFileRole,
+    state: Arc<Mutex<VacuumFaultState>>,
+}
+
+#[cfg(unix)]
+fn take_vacuum_fault(
+    state: &Arc<Mutex<VacuumFaultState>>,
+    role: VacuumFileRole,
+    operation: VacuumFaultOperation,
+) -> Option<(VacuumFaultEffect, &'static str)> {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let spec = state.armed?;
+    if state.fired_label.is_some() || spec.role != role || spec.operation != operation {
+        return None;
+    }
+    state.matching_operations_seen = state.matching_operations_seen.saturating_add(1);
+    if state.matching_operations_seen != spec.nth_match {
+        return None;
+    }
+    state.fired_label = Some(spec.label);
+    Some((spec.effect, spec.label))
+}
+
+#[cfg(unix)]
+fn take_parent_to_cancel_after_source_write(
+    state: &Arc<Mutex<VacuumFaultState>>,
+    role: VacuumFileRole,
+) -> Option<Cx> {
+    if role != VacuumFileRole::Source {
+        return None;
+    }
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let parent = state.cancel_parent_after_source_write.take()?;
+    state.cancelled_after_source_write = true;
+    Some(parent)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SilentReplayWriteAction {
+    TriggerRollback,
+    CorruptSilently,
+}
+
+#[cfg(unix)]
+fn take_silent_replay_write_action(
+    state: &Arc<Mutex<VacuumFaultState>>,
+    role: VacuumFileRole,
+) -> Option<SilentReplayWriteAction> {
+    if role != VacuumFileRole::Source {
+        return None;
+    }
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.silent_replay_corruption_armed {
+        return None;
+    }
+    state.silent_replay_source_writes_seen =
+        state.silent_replay_source_writes_seen.saturating_add(1);
+    match state.silent_replay_source_writes_seen {
+        1 => Some(SilentReplayWriteAction::TriggerRollback),
+        2 => {
+            state.silent_replay_corruption_armed = false;
+            state.fired_label = Some("silent-replay-page-corruption");
+            Some(SilentReplayWriteAction::CorruptSilently)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn vacuum_injected_error(label: &str) -> FrankenError {
+    FrankenError::Io(io::Error::other(format!(
+        "GH-138 VACUUM fault injection: {label}"
+    )))
+}
+
+#[cfg(unix)]
+impl<V: Vfs> Vfs for VacuumFaultVfs<V> {
+    type File = VacuumFaultFile<V::File>;
+
+    fn name(&self) -> &'static str {
+        "gh-138-vacuum-fault-vfs"
+    }
+
+    fn open(
+        &self,
+        cx: &Cx,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (inner, out_flags) = self.inner.open(cx, path, flags)?;
+        Ok((self.wrap_file(inner, path, flags), out_flags))
+    }
+
+    fn open_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (inner, out_flags) =
+            self.inner
+                .open_with_expected_identity(cx, path, flags, expected_identity)?;
+        Ok((self.wrap_file(inner, Some(path), flags), out_flags))
+    }
+
+    fn open_reserved_with_expected_identity(
+        &self,
+        cx: &Cx,
+        path: &Path,
+        flags: VfsOpenFlags,
+        expected_identity: FileIdentity,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (inner, out_flags) =
+            self.inner
+                .open_reserved_with_expected_identity(cx, path, flags, expected_identity)?;
+        Ok((self.wrap_file(inner, Some(path), flags), out_flags))
+    }
+
+    fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+        let role = self.role_for(Some(path), VfsOpenFlags::empty());
+        if let Some((_, label)) = self.take_fault(role, VacuumFaultOperation::Delete) {
+            return Err(vacuum_injected_error(label));
+        }
+        self.inner.delete(cx, path, sync_dir)
+    }
+
+    fn sync_parent_directory(&self, cx: &Cx, path: &Path) -> Result<()> {
+        let role = self.role_for(Some(path), VfsOpenFlags::empty());
+        if let Some((_, label)) = self.take_fault(role, VacuumFaultOperation::SyncParentDirectory) {
+            return Err(vacuum_injected_error(label));
+        }
+        self.inner.sync_parent_directory(cx, path)
+    }
+
+    fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+        self.inner.access(cx, path, flags)
+    }
+
+    fn path_entry_exists(&self, cx: &Cx, path: &Path) -> Result<bool> {
+        self.inner.path_entry_exists(cx, path)
+    }
+
+    fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
+        self.inner.full_pathname(cx, path)
+    }
+
+    fn randomness(&self, cx: &Cx, buf: &mut [u8]) {
+        self.inner.randomness(cx, buf);
+    }
+
+    fn current_time(&self, cx: &Cx) -> f64 {
+        self.inner.current_time(cx)
+    }
+
+    fn is_memory(&self) -> bool {
+        self.inner.is_memory()
+    }
+}
+
+#[cfg(unix)]
+impl<F: VfsFile> VfsFile for VacuumFaultFile<F> {
+    fn close(&mut self, cx: &Cx) -> Result<()> {
+        let fault = take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Close);
+        let close_result = self.inner.close(cx);
+        if let Some((_, label)) = fault {
+            close_result?;
+            Err(vacuum_injected_error(label))
+        } else {
+            close_result
+        }
+    }
+
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
+    }
+
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.inner.read(cx, buf, offset)
+    }
+
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        match take_silent_replay_write_action(&self.state, self.role) {
+            Some(SilentReplayWriteAction::TriggerRollback) => {
+                self.inner.write(cx, buf, offset)?;
+                return Err(vacuum_injected_error(
+                    "trigger-rollback-before-silent-replay-corruption",
+                ));
+            }
+            Some(SilentReplayWriteAction::CorruptSilently) => {
+                let mut corrupted = buf.to_vec();
+                let byte = corrupted.last_mut().ok_or_else(|| {
+                    FrankenError::internal("silent replay corruption received an empty write")
+                })?;
+                // Keep the SQLite header parseable so a fresh pager can reach
+                // hot-journal recovery; corrupt only restored payload bytes.
+                *byte ^= 0x5a;
+                return self.inner.write(cx, &corrupted, offset);
+            }
+            None => {}
+        }
+        if let Some(parent_cx) = take_parent_to_cancel_after_source_write(&self.state, self.role) {
+            // Apply one complete target-page write first, then cancel the
+            // caller and force the publisher down its hot-journal replay path.
+            // The replay must use its independently masked cleanup context;
+            // returning before the old image is restored would make the test's
+            // byte and live-peer assertions fail immediately.
+            self.inner.write(cx, buf, offset)?;
+            parent_cx.cancel();
+            return Err(vacuum_injected_error(
+                "source-first-write-parent-cancellation",
+            ));
+        }
+        match take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Write) {
+            Some((VacuumFaultEffect::ReturnError, label)) => Err(vacuum_injected_error(label)),
+            Some((VacuumFaultEffect::PartialWrite { valid_bytes }, label)) => {
+                let applied = valid_bytes.min(buf.len());
+                if applied > 0 {
+                    self.inner.write(cx, &buf[..applied], offset)?;
+                }
+                Err(vacuum_injected_error(label))
+            }
+            None => self.inner.write(cx, buf, offset),
+        }
+    }
+
+    fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+        if let Some((_, label)) =
+            take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::Truncate)
+        {
+            return Err(vacuum_injected_error(label));
+        }
+        self.inner.truncate(cx, size)
+    }
+
+    fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+        self.inner.sync(cx, flags)
+    }
+
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        if let Some((_, label)) =
+            take_vacuum_fault(&self.state, self.role, VacuumFaultOperation::DurableSync)
+        {
+            return Err(vacuum_injected_error(label));
+        }
+        self.inner.durable_sync(cx, kind)
+    }
+
+    fn file_size(&self, cx: &Cx) -> Result<u64> {
+        self.inner.file_size(cx)
+    }
+
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        self.inner.lock(cx, level)
+    }
+
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        self.inner.unlock(cx, level)
+    }
+
+    fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+        self.inner.check_reserved_lock(cx)
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+
+    fn device_characteristics(&self) -> u32 {
+        self.inner.device_characteristics()
+    }
+
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+        self.inner.shm_map(cx, region, size, extend)
+    }
+
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        self.inner.shm_lock(cx, offset, n, flags)
+    }
+
+    fn shm_barrier(&self) {
+        self.inner.shm_barrier();
+    }
+
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+        self.inner.shm_unmap(cx, delete)
+    }
+
+    fn set_busy_timeout_ms(&mut self, ms: u64) {
+        self.inner.set_busy_timeout_ms(ms);
+    }
+}
+
+#[cfg(unix)]
+fn journal_path_for(database_path: &Path) -> PathBuf {
+    let mut journal_path: OsString = database_path.as_os_str().to_owned();
+    journal_path.push("-journal");
+    PathBuf::from(journal_path)
+}
+
+#[cfg(unix)]
+fn create_sqlite_vacuum_fixture(path: &Path, row_count: i64, blob_size: usize, seed: u8) {
+    let sqlite = rusqlite::Connection::open(path).expect("create SQLite VACUUM fixture");
+    sqlite
+        .execute_batch(
+            "PRAGMA page_size=4096; \
+             PRAGMA journal_mode=DELETE; \
+             PRAGMA synchronous=FULL; \
+             CREATE TABLE payload(id INTEGER PRIMARY KEY, body BLOB NOT NULL);",
+        )
+        .expect("create fixture schema");
+    let transaction = sqlite
+        .unchecked_transaction()
+        .expect("begin fixture transaction");
+    for id in 0..row_count {
+        let fill = seed.wrapping_add(u8::try_from(id).unwrap_or(u8::MAX));
+        transaction
+            .execute(
+                "INSERT INTO payload(id, body) VALUES (?1, ?2);",
+                rusqlite::params![id, vec![fill; blob_size]],
+            )
+            .expect("insert fixture row");
+    }
+    transaction.commit().expect("commit fixture rows");
+    sqlite
+        .execute_batch("VACUUM; PRAGMA journal_mode=DELETE;")
+        .expect("compact fixture image");
+    drop(sqlite);
+}
+
+#[cfg(unix)]
+fn patch_database_change_counter(path: &Path, change_counter: u32) {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open candidate header for provenance patch");
+    file.seek(SeekFrom::Start(24))
+        .expect("seek candidate change counter");
+    file.write_all(&change_counter.to_be_bytes())
+        .expect("write candidate change counter");
+    file.seek(SeekFrom::Start(92))
+        .expect("seek candidate version-valid-for");
+    file.write_all(&change_counter.to_be_bytes())
+        .expect("write candidate version-valid-for");
+    file.sync_all().expect("durably patch candidate header");
+}
+
+#[cfg(unix)]
+struct VacuumPublicationFixture {
+    _directory: tempfile::TempDir,
+    source_path: PathBuf,
+    candidate_path: PathBuf,
+    cx: Cx,
+    pager: SimplePager<VacuumFaultVfs<UnixVfs>>,
+    source_receipt: DatabaseImageReceipt,
+    candidate_receipt: DatabaseImageReceipt,
+    source_bytes: Vec<u8>,
+    candidate_bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl VacuumPublicationFixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().expect("VACUUM publication tempdir");
+        let source_path = directory.path().join("source.db");
+        let candidate_path = directory.path().join("candidate.db");
+        create_sqlite_vacuum_fixture(&source_path, VACUUM_SOURCE_ROW_COUNT, 1_900, 0x31);
+        create_sqlite_vacuum_fixture(&candidate_path, VACUUM_CANDIDATE_ROW_COUNT, 320, 0xA1);
+
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx(
+            &cx,
+            VacuumFaultVfs::new(UnixVfs::new(), source_path.clone(), candidate_path.clone()),
+            &source_path,
+            PageSize::DEFAULT,
+        )
+        .expect("open real-VFS source pager");
+        let source_receipt = pager
+            .capture_vacuum_source_image(&cx)
+            .expect("capture source image receipt");
+        let next_change_counter = source_receipt
+            .header()
+            .change_counter
+            .wrapping_add(1)
+            .max(1);
+        patch_database_change_counter(&candidate_path, next_change_counter);
+        let candidate_receipt = pager
+            .inspect_database_image(&cx, &candidate_path)
+            .expect("capture candidate image receipt");
+        let source_bytes = std::fs::read(&source_path).expect("read source fixture bytes");
+        let candidate_bytes = std::fs::read(&candidate_path).expect("read candidate fixture bytes");
+        assert!(
+            source_bytes.len() > candidate_bytes.len(),
+            "fault matrix requires a shrinking publication: source={} candidate={}",
+            source_bytes.len(),
+            candidate_bytes.len()
+        );
+        assert_ne!(
+            source_receipt.identity(),
+            candidate_receipt.identity(),
+            "source and candidate must be distinct filesystem objects"
+        );
+
+        Self {
+            _directory: directory,
+            source_path,
+            candidate_path,
+            cx,
+            pager,
+            source_receipt,
+            candidate_receipt,
+            source_bytes,
+            candidate_bytes,
+        }
+    }
+
+    fn refresh_receipts_after_peer_open(&mut self) {
+        self.source_receipt = self
+            .pager
+            .capture_vacuum_source_image(&self.cx)
+            .expect("recapture source after opening live peer");
+        let next_change_counter = self
+            .source_receipt
+            .header()
+            .change_counter
+            .wrapping_add(1)
+            .max(1);
+        patch_database_change_counter(&self.candidate_path, next_change_counter);
+        self.candidate_receipt = self
+            .pager
+            .inspect_database_image(&self.cx, &self.candidate_path)
+            .expect("recapture candidate after opening live peer");
+        self.source_bytes = std::fs::read(&self.source_path).expect("refresh source fixture bytes");
+        self.candidate_bytes =
+            std::fs::read(&self.candidate_path).expect("refresh candidate fixture bytes");
+    }
+}
+
+#[cfg(unix)]
+fn assert_image_matches_candidate(
+    published: &DatabaseImageReceipt,
+    candidate: &DatabaseImageReceipt,
+    source_identity: FileIdentity,
+) {
+    assert_eq!(published.identity(), source_identity);
+    assert_eq!(published.file_size(), candidate.file_size());
+    assert_eq!(published.header(), candidate.header());
+    assert_eq!(published.logical_hash(), candidate.logical_hash());
+}
+
+#[cfg(unix)]
+fn assert_journal_is_absent_or_non_hot(database_path: &Path, label: &str) {
+    let journal_path = journal_path_for(database_path);
+    let Ok(bytes) = std::fs::read(&journal_path) else {
+        return;
+    };
+    assert!(
+        bytes.len() < 8 || bytes[..8].iter().all(|byte| *byte == 0),
+        "{label}: failed publication left a hot rollback journal"
+    );
+}
+
+#[cfg(unix)]
+fn assert_both_engines_integrity(path: &Path, expected_rows: i64, label: &str) {
+    let sqlite = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap_or_else(|error| panic!("{label}: stock SQLite open failed: {error}"));
+    for pragma in ["quick_check", "integrity_check"] {
+        let result: String = sqlite
+            .query_row(&format!("PRAGMA {pragma};"), [], |row| row.get(0))
+            .unwrap_or_else(|error| panic!("{label}: stock SQLite {pragma} failed: {error}"));
+        assert_eq!(result, "ok", "{label}: stock SQLite {pragma}");
+    }
+    let sqlite_rows: i64 = sqlite
+        .query_row("SELECT COUNT(*) FROM payload;", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("{label}: stock SQLite row count failed: {error}"));
+    assert_eq!(sqlite_rows, expected_rows, "{label}: stock SQLite rows");
+    drop(sqlite);
+
+    let path_text = path.to_string_lossy();
+    let frank = fsqlite::Connection::open(path_text.as_ref())
+        .unwrap_or_else(|error| panic!("{label}: FrankenSQLite open failed: {error}"));
+    for pragma in ["quick_check", "integrity_check"] {
+        let rows = frank
+            .query(&format!("PRAGMA {pragma};"))
+            .unwrap_or_else(|error| panic!("{label}: FrankenSQLite {pragma} failed: {error}"));
+        assert_eq!(rows.len(), 1, "{label}: FrankenSQLite {pragma} rows");
+        assert_eq!(
+            rows[0].get(0),
+            Some(&fsqlite_types::SqliteValue::Text("ok".into())),
+            "{label}: FrankenSQLite {pragma}"
+        );
+    }
+    let rows = frank
+        .query("SELECT COUNT(*) FROM payload;")
+        .unwrap_or_else(|error| panic!("{label}: FrankenSQLite row count failed: {error}"));
+    assert_eq!(rows.len(), 1, "{label}: FrankenSQLite count rows");
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(expected_rows)),
+        "{label}: FrankenSQLite rows"
+    );
+}
+
+#[cfg(unix)]
+fn assert_bytes_reopen_in_both_engines(
+    directory: &Path,
+    bytes: &[u8],
+    expected_rows: i64,
+    label: &str,
+) {
+    let verification_path = directory.join(format!("{label}-fresh-reopen.db"));
+    std::fs::write(&verification_path, bytes).expect("write fresh-open verification image");
+    assert_both_engines_integrity(&verification_path, expected_rows, label);
+}
+
+#[cfg(unix)]
+fn assert_live_franken_integrity(
+    connection: &fsqlite::Connection,
+    expected_rows: i64,
+    label: &str,
+) {
+    for pragma in ["quick_check", "integrity_check"] {
+        let rows = connection
+            .query(&format!("PRAGMA {pragma};"))
+            .unwrap_or_else(|error| panic!("{label}: live peer {pragma} failed: {error}"));
+        assert_eq!(rows.len(), 1, "{label}: live peer {pragma} rows");
+        assert_eq!(
+            rows[0].get(0),
+            Some(&fsqlite_types::SqliteValue::Text("ok".into())),
+            "{label}: live peer {pragma}"
+        );
+    }
+    let rows = connection
+        .query("SELECT COUNT(*) FROM payload;")
+        .unwrap_or_else(|error| panic!("{label}: live peer row count failed: {error}"));
+    assert_eq!(rows.len(), 1, "{label}: live peer count rows");
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(expected_rows)),
+        "{label}: live peer observed a partially published image"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn vacuum_publication_precommit_fault_matrix_restores_exact_source_and_retries() {
+    let cases = [
+        VacuumFaultSpec::partial_write(
+            "journal-partial-record-write",
+            VacuumFileRole::Journal,
+            2,
+            128,
+        ),
+        VacuumFaultSpec::error(
+            "journal-first-durable-sync",
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::DurableSync,
+            1,
+        ),
+        VacuumFaultSpec::error(
+            "journal-parent-directory-sync",
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::SyncParentDirectory,
+            1,
+        ),
+        VacuumFaultSpec::partial_write("source-partial-page-write", VacuumFileRole::Source, 1, 128),
+        VacuumFaultSpec::error(
+            "source-truncate",
+            VacuumFileRole::Source,
+            VacuumFaultOperation::Truncate,
+            1,
+        ),
+        VacuumFaultSpec::error(
+            "source-durable-sync",
+            VacuumFileRole::Source,
+            VacuumFaultOperation::DurableSync,
+            1,
+        ),
+        VacuumFaultSpec::error(
+            "journal-invalidation-durable-sync",
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::DurableSync,
+            3,
+        ),
+    ];
+
+    for spec in cases {
+        let fixture = VacuumPublicationFixture::new();
+        let vfs = fixture.pager.vfs_handle();
+        let source_identity = fixture.source_receipt.identity();
+        vfs.arm(spec);
+
+        let error = fixture
+            .pager
+            .publish_validated_database_image(
+                &fixture.cx,
+                &fixture.candidate_path,
+                &fixture.source_receipt,
+                &fixture.candidate_receipt,
+            )
+            .expect_err("pre-commit injected fault must fail publication");
+        assert!(
+            error.to_string().contains(spec.label),
+            "{}: injected diagnostic was lost: {error}",
+            spec.label
+        );
+        let snapshot = vfs.snapshot();
+        assert_eq!(snapshot.fired_label, Some(spec.label));
+        assert_eq!(snapshot.matching_operations_seen, spec.nth_match);
+
+        let restored_bytes =
+            std::fs::read(&fixture.source_path).expect("read source after failed publication");
+        assert_eq!(
+            restored_bytes, fixture.source_bytes,
+            "{}: failed publication changed source bytes",
+            spec.label
+        );
+        assert_eq!(
+            fixture.pager.file_identity().expect("source identity"),
+            Some(source_identity),
+            "{}: failed publication replaced the source inode",
+            spec.label
+        );
+        let restored_receipt = fixture
+            .pager
+            .capture_vacuum_source_image(&fixture.cx)
+            .expect("recapture restored source image");
+        assert!(
+            restored_receipt == fixture.source_receipt,
+            "{}: restored logical source receipt changed",
+            spec.label
+        );
+        assert_journal_is_absent_or_non_hot(&fixture.source_path, spec.label);
+        assert_bytes_reopen_in_both_engines(
+            fixture._directory.path(),
+            &restored_bytes,
+            VACUUM_SOURCE_ROW_COUNT,
+            spec.label,
+        );
+
+        vfs.disarm();
+        fixture
+            .pager
+            .publish_validated_database_image(
+                &fixture.cx,
+                &fixture.candidate_path,
+                &fixture.source_receipt,
+                &fixture.candidate_receipt,
+            )
+            .unwrap_or_else(|retry_error| {
+                panic!("{}: clean retry failed: {retry_error}", spec.label)
+            });
+        let published_bytes =
+            std::fs::read(&fixture.source_path).expect("read retried publication");
+        assert_eq!(
+            published_bytes, fixture.candidate_bytes,
+            "{}: retry did not publish the exact candidate bytes",
+            spec.label
+        );
+        let published_receipt = fixture
+            .pager
+            .capture_vacuum_source_image(&fixture.cx)
+            .expect("capture retried publication");
+        assert_image_matches_candidate(
+            &published_receipt,
+            &fixture.candidate_receipt,
+            source_identity,
+        );
+        assert_both_engines_integrity(&fixture.source_path, VACUUM_CANDIDATE_ROW_COUNT, spec.label);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn vacuum_publication_parent_cancellation_after_first_target_write_restores_before_return() {
+    const LABEL: &str = "source-first-write-parent-cancellation";
+
+    let mut fixture = VacuumPublicationFixture::new();
+    let source_path_text = fixture.source_path.to_string_lossy().into_owned();
+    let live_peer = fsqlite::Connection::open(&source_path_text).expect("open live peer");
+    live_peer
+        .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+        .expect("keep cancellation fixture in rollback-journal format");
+    assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
+    fixture.refresh_receipts_after_peer_open();
+
+    let vfs = fixture.pager.vfs_handle();
+    let source_identity = fixture.source_receipt.identity();
+    vfs.arm_cancel_after_first_source_write(&fixture.cx);
+    let error = fixture
+        .pager
+        .publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        )
+        .expect_err("cancellation after the first target write must select rollback");
+    assert!(
+        error.to_string().contains(LABEL),
+        "cancellation diagnostic was lost: {error}"
+    );
+    assert!(
+        fixture.cx.is_cancel_requested(),
+        "fault hook did not cancel the publication parent context"
+    );
+    let snapshot = vfs.snapshot();
+    assert!(snapshot.cancelled_after_source_write);
+    assert_eq!(snapshot.fired_label, None);
+
+    // These assertions run immediately after the synchronous call returns.
+    // They prove the publisher did not surface cancellation while replay was
+    // still pending in a background task or deferred Drop path.
+    assert_eq!(
+        std::fs::read(&fixture.source_path).expect("read source after cancellation"),
+        fixture.source_bytes,
+        "publisher returned before restoring the exact old source image"
+    );
+    assert_eq!(
+        fixture.pager.file_identity().expect("source identity"),
+        Some(source_identity),
+        "cancelled publication replaced the source inode"
+    );
+    let verification_cx = Cx::new();
+    let restored_receipt = fixture
+        .pager
+        .capture_vacuum_source_image(&verification_cx)
+        .expect("maintenance locks must be released despite parent cancellation");
+    assert!(
+        restored_receipt == fixture.source_receipt,
+        "cancelled publication did not restore the source receipt"
+    );
+    assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
+    assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
+}
+
+#[cfg(unix)]
+#[test]
+fn vacuum_silent_replay_corruption_stays_hot_and_recovers_on_fresh_open() {
+    const LABEL: &str = "silent-replay-page-corruption";
+    let fixture = VacuumPublicationFixture::new();
+    let original_receipt = fixture.source_receipt.clone();
+    let fault_vfs = fixture.pager.vfs_handle();
+    fault_vfs.arm_silent_replay_corruption();
+
+    let error = fixture
+        .pager
+        .publish_validated_database_image(
+            &fixture.cx,
+            &fixture.candidate_path,
+            &fixture.source_receipt,
+            &fixture.candidate_receipt,
+        )
+        .expect_err("silent replay corruption must fail exact rollback verification");
+    assert!(
+        error
+            .to_string()
+            .contains("rollback recovery verification mismatch"),
+        "exact replay-verification diagnostic was lost: {error}"
+    );
+    assert_eq!(fault_vfs.snapshot().fired_label, Some(LABEL));
+
+    let journal_bytes = std::fs::read(journal_path_for(&fixture.source_path))
+        .expect("failed replay verification must retain its hot journal");
+    assert!(
+        journal_bytes.len() >= 8 && journal_bytes[..8].iter().any(|byte| *byte != 0),
+        "failed replay verification invalidated the only recovery record"
+    );
+    assert!(
+        fixture
+            .pager
+            .capture_vacuum_source_image(&fixture.cx)
+            .is_err(),
+        "a pager with unverified recovery must remain fail-closed"
+    );
+
+    fault_vfs.disarm();
+    let recovery_vfs = UnixVfs::new();
+    let VacuumPublicationFixture {
+        _directory,
+        source_path,
+        candidate_path: _,
+        cx,
+        pager,
+        source_receipt: _,
+        candidate_receipt: _,
+        source_bytes,
+        candidate_bytes: _,
+    } = fixture;
+    drop(fault_vfs);
+    drop(pager);
+
+    let recovered = SimplePager::open_with_cx(&cx, recovery_vfs, &source_path, PageSize::DEFAULT)
+        .expect("fresh open must retry and verify the retained hot journal");
+    assert_eq!(
+        std::fs::read(&source_path).expect("read freshly recovered source"),
+        source_bytes,
+        "fresh recovery did not restore the exact pre-publication bytes"
+    );
+    let recovered_receipt = recovered
+        .capture_vacuum_source_image(&cx)
+        .expect("freshly recovered pager must leave recovery clean");
+    assert!(
+        recovered_receipt == original_receipt,
+        "fresh recovery changed the source image receipt"
+    );
+    assert_journal_is_absent_or_non_hot(&source_path, LABEL);
+    drop(recovered);
+    assert_both_engines_integrity(&source_path, VACUUM_SOURCE_ROW_COUNT, LABEL);
+    drop(_directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_journal_failed_commit_drop_replays_hot_journal_before_return() {
+    const LABEL: &str = "ordinary-commit-source-partial-write";
+
+    let mut fixture = VacuumPublicationFixture::new();
+    let source_path_text = fixture.source_path.to_string_lossy().into_owned();
+    let live_peer = fsqlite::Connection::open(&source_path_text).expect("open live peer");
+    live_peer
+        .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+        .expect("keep failed-commit fixture in rollback-journal format");
+    assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
+    fixture.refresh_receipts_after_peer_open();
+
+    let page_size = PageSize::DEFAULT.as_usize();
+    let original_database = fixture.source_bytes.clone();
+    let original_page_one = original_database[..page_size].to_vec();
+    let mut failed_page_one = original_page_one.clone();
+    failed_page_one[100] ^= 0xFF;
+
+    let vfs = fixture.pager.vfs_handle();
+    let spec = VacuumFaultSpec::partial_write(LABEL, VacuumFileRole::Source, 1, 128);
+    let mut transaction = fixture
+        .pager
+        .begin(&fixture.cx, TransactionMode::Immediate)
+        .expect("begin ordinary rollback-journal transaction");
+    transaction
+        .write_page(&fixture.cx, PageNumber::ONE, &failed_page_one)
+        .expect("stage page-one overwrite");
+    vfs.arm(spec);
+    let error = transaction
+        .commit(&fixture.cx)
+        .expect_err("partial target write must fail ordinary commit");
+    assert!(
+        error.to_string().contains(LABEL),
+        "fault diagnostic was lost: {error}"
+    );
+    let snapshot = vfs.snapshot();
+    assert_eq!(snapshot.fired_label, Some(LABEL));
+    assert_eq!(snapshot.matching_operations_seen, 1);
+
+    // The commit has already made its journal durable and partially touched
+    // the database. Recovery must therefore be the failed transaction's Drop
+    // responsibility rather than a later reopen side effect.
+    assert_ne!(
+        std::fs::read(&fixture.source_path).expect("read partially written database"),
+        original_database,
+        "fault did not reach the target database after the hot journal"
+    );
+    let hot_journal = std::fs::read(journal_path_for(&fixture.source_path))
+        .expect("failed commit must leave its durable hot journal available to Drop");
+    assert!(
+        hot_journal.len() >= 8 && hot_journal[..8].iter().any(|byte| *byte != 0),
+        "failed commit did not preserve a hot rollback journal"
+    );
+
+    drop(transaction);
+
+    // These checks run immediately after Drop returns. Exact file and page
+    // equality prove replay was synchronous; successful begin proves Pending
+    // state and the single-writer baton were both released.
+    assert_eq!(
+        std::fs::read(&fixture.source_path).expect("read Drop-recovered database"),
+        original_database,
+        "Drop returned before restoring the exact pre-commit database"
+    );
+    assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
+    let verification_cx = Cx::new();
+    let mut reader = fixture
+        .pager
+        .begin(&verification_cx, TransactionMode::ReadOnly)
+        .expect("Drop recovery must clear pending state for the live pager");
+    assert_eq!(
+        reader
+            .get_page(&verification_cx, PageNumber::ONE)
+            .expect("read recovered page one")
+            .as_ref(),
+        original_page_one.as_slice(),
+        "live pager retained a partially written page after Drop recovery"
+    );
+    reader
+        .commit(&verification_cx)
+        .expect("finish recovery verification reader");
+    assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
+
+    // A full clean journal commit on the same live pager proves recovery did
+    // not merely make reads work while leaving writer state poisoned.
+    vfs.disarm();
+    let mut retry = fixture
+        .pager
+        .begin(&verification_cx, TransactionMode::Immediate)
+        .expect("begin clean commit after Drop recovery");
+    retry
+        .write_page(&verification_cx, PageNumber::ONE, &original_page_one)
+        .expect("stage clean retry page");
+    retry
+        .commit(&verification_cx)
+        .expect("clean commit after Drop recovery");
+    assert_journal_is_absent_or_non_hot(&fixture.source_path, LABEL);
+    assert_both_engines_integrity(&fixture.source_path, VACUUM_SOURCE_ROW_COUNT, LABEL);
+    assert_live_franken_integrity(&live_peer, VACUUM_SOURCE_ROW_COUNT, LABEL);
+}
+
+#[cfg(unix)]
+#[test]
+fn vacuum_publication_postcommit_cleanup_faults_preserve_committed_candidate_and_retry() {
+    let cases = [
+        VacuumFaultSpec::error(
+            "journal-postcommit-truncate",
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::Truncate,
+            3,
+        ),
+        VacuumFaultSpec::error(
+            "journal-postcommit-durable-sync",
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::DurableSync,
+            4,
+        ),
+        VacuumFaultSpec::error(
+            "journal-postcommit-delete",
+            VacuumFileRole::Journal,
+            VacuumFaultOperation::Delete,
+            1,
+        ),
+        VacuumFaultSpec::error(
+            "candidate-postcommit-close",
+            VacuumFileRole::Candidate,
+            VacuumFaultOperation::Close,
+            1,
+        ),
+    ];
+
+    for spec in cases {
+        let fixture = VacuumPublicationFixture::new();
+        let vfs = fixture.pager.vfs_handle();
+        let source_identity = fixture.source_receipt.identity();
+        vfs.arm(spec);
+
+        fixture
+            .pager
+            .publish_validated_database_image(
+                &fixture.cx,
+                &fixture.candidate_path,
+                &fixture.source_receipt,
+                &fixture.candidate_receipt,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{}: post-commit cleanup fault changed success into error: {error}",
+                    spec.label
+                )
+            });
+        let snapshot = vfs.snapshot();
+        assert_eq!(snapshot.fired_label, Some(spec.label));
+        assert_eq!(snapshot.matching_operations_seen, spec.nth_match);
+        assert_eq!(
+            std::fs::read(&fixture.source_path).expect("read committed target"),
+            fixture.candidate_bytes,
+            "{}: cleanup fault changed committed candidate bytes",
+            spec.label
+        );
+        assert_eq!(
+            fixture.pager.file_identity().expect("source identity"),
+            Some(source_identity),
+            "{}: publication replaced the source inode",
+            spec.label
+        );
+        assert_journal_is_absent_or_non_hot(&fixture.source_path, spec.label);
+        let first_published_receipt = fixture
+            .pager
+            .capture_vacuum_source_image(&fixture.cx)
+            .expect("capture committed candidate after cleanup fault");
+        assert_image_matches_candidate(
+            &first_published_receipt,
+            &fixture.candidate_receipt,
+            source_identity,
+        );
+
+        // A second in-place publication proves that any non-hot leftover was
+        // accepted and cleaned, and that post-commit errors did not poison the
+        // live pager's maintenance state.
+        vfs.disarm();
+        let second_source = fixture
+            .pager
+            .capture_vacuum_source_image(&fixture.cx)
+            .expect("capture source for second publication");
+        let next_change_counter = second_source.header().change_counter.wrapping_add(1).max(1);
+        patch_database_change_counter(&fixture.candidate_path, next_change_counter);
+        let second_candidate = fixture
+            .pager
+            .inspect_database_image(&fixture.cx, &fixture.candidate_path)
+            .expect("inspect second candidate");
+        fixture
+            .pager
+            .publish_validated_database_image(
+                &fixture.cx,
+                &fixture.candidate_path,
+                &second_source,
+                &second_candidate,
+            )
+            .unwrap_or_else(|error| panic!("{}: second publication failed: {error}", spec.label));
+        let second_candidate_bytes =
+            std::fs::read(&fixture.candidate_path).expect("read second candidate");
+        assert_eq!(
+            std::fs::read(&fixture.source_path).expect("read second publication"),
+            second_candidate_bytes,
+            "{}: second publication did not exactly match candidate",
+            spec.label
+        );
+        let second_published_receipt = fixture
+            .pager
+            .capture_vacuum_source_image(&fixture.cx)
+            .expect("capture second published image");
+        assert_image_matches_candidate(
+            &second_published_receipt,
+            &second_candidate,
+            source_identity,
+        );
+        assert_both_engines_integrity(&fixture.source_path, VACUUM_CANDIDATE_ROW_COUNT, spec.label);
+    }
 }
