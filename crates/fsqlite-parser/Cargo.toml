@@ -3,7 +3,7 @@ name = "fsqlite-parser"
 version = "0.1.16"
 description = "Hand-written recursive descent SQL parser"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 

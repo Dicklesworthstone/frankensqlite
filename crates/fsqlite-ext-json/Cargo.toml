@@ -3,7 +3,7 @@ name = "fsqlite-ext-json"
 version = "0.1.16"
 description = "JSON1 functions and virtual tables"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
