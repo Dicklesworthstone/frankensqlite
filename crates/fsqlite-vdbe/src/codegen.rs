@@ -5381,9 +5381,10 @@ fn codegen_select_count_star(
     if !table.without_rowid
         && let Some(values) = extract_rowid_in_list_target(where_clause, table, table_alias)
     {
-        return codegen_select_count_star_rowid_in(
+        codegen_select_count_star_rowid_in(
             b, cursor, table, out_regs, done_label, end_label, &values,
         );
+        return Ok(());
     }
     // bd-count-rowid-eq: `COUNT(*) WHERE <rowid> = <int literal>` counts the single row (0 or 1) with one
     // SeekRowid instead of a full scan — the rowid (IPK) has no secondary index, so this shape is NOT
@@ -5395,9 +5396,16 @@ fn codegen_select_count_star(
         && let Some(target) = extract_rowid_target_expr(where_clause, Some(table), table_alias)
         && let Expr::Literal(Literal::Integer(value), _) = target
     {
-        return codegen_select_count_star_rowid_in(
-            b, cursor, table, out_regs, done_label, end_label, &[*value],
+        codegen_select_count_star_rowid_in(
+            b,
+            cursor,
+            table,
+            out_regs,
+            done_label,
+            end_label,
+            &[*value],
         );
+        return Ok(());
     }
 
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -5553,7 +5561,7 @@ fn codegen_select_count_star_rowid_in(
     done_label: crate::Label,
     end_label: crate::Label,
     values: &[i64],
-) -> Result<(), CodegenError> {
+) {
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
     b.emit_op(
@@ -5569,7 +5577,14 @@ fn codegen_select_count_star_rowid_in(
     for &value in values {
         let skip_label = b.emit_label();
         b.emit_op(Opcode::Int64, 0, rowid_reg, 0, P4::Int64(value), 0);
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
         b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
         b.resolve_label(skip_label);
     }
@@ -5578,7 +5593,6 @@ fn codegen_select_count_star_rowid_in(
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]

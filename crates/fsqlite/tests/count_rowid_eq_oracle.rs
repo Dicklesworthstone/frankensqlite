@@ -7,7 +7,9 @@ use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
 fn count_f(c: &Connection, sql: &str) -> i64 {
-    let rows = c.query(sql).unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
+    let rows = c
+        .query(sql)
+        .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
     match rows.first().and_then(|r| r.values().first()) {
         Some(SqliteValue::Integer(n)) => *n,
         other => panic!("expected integer count, got {other:?} for `{sql}`"),
@@ -27,8 +29,14 @@ fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
 
 fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
-        Some(true) => assert!(!has_op(f, sql, "Rewind"), "rowid-eq COUNT must not full-scan (Rewind): `{sql}`"),
-        Some(false) => assert!(has_op(f, sql, "Rewind"), "control COUNT should full-scan (Rewind): `{sql}`"),
+        Some(true) => assert!(
+            !has_op(f, sql, "Rewind"),
+            "rowid-eq COUNT must not full-scan (Rewind): `{sql}`"
+        ),
+        Some(false) => assert!(
+            has_op(f, sql, "Rewind"),
+            "control COUNT should full-scan (Rewind): `{sql}`"
+        ),
         None => {}
     }
     assert_eq!(count_f(f, sql), count_r(r, sql), "count diverged: `{sql}`");
@@ -54,7 +62,12 @@ fn count_rowid_eq_matches_sqlite() {
     // rowid = <int literal>: single SeekRowid, no Rewind, count matches (0 or 1).
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 5", Some(true)); // present -> 1
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 150", Some(true)); // present -> 1
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 99999", Some(true)); // absent -> 0
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(*) FROM t WHERE id = 99999",
+        Some(true),
+    ); // absent -> 0
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 1", Some(true)); // first -> 1
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 300", Some(true)); // last -> 1
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE 5 = id", Some(true)); // reversed operand order -> 1
