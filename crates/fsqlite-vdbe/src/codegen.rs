@@ -5385,6 +5385,20 @@ fn codegen_select_count_star(
             b, cursor, table, out_regs, done_label, end_label, &values,
         );
     }
+    // bd-count-rowid-eq: `COUNT(*) WHERE <rowid> = <int literal>` counts the single row (0 or 1) with one
+    // SeekRowid instead of a full scan — the rowid (IPK) has no secondary index, so this shape is NOT
+    // diverted to the aggregate index-eq seek (bd-2dgf5) and would otherwise Rewind here. Integer literal
+    // ONLY (`SeekRowid` truncates reals via `to_integer()`, so `rowid = 2.5` would wrongly match rowid 2;
+    // a placeholder needs affinity handling): real/placeholder declines to the scan. Reuses the rowid-IN
+    // emitter with a one-element slice.
+    if !table.without_rowid
+        && let Some(target) = extract_rowid_target_expr(where_clause, Some(table), table_alias)
+        && let Expr::Literal(Literal::Integer(value), _) = target
+    {
+        return codegen_select_count_star_rowid_in(
+            b, cursor, table, out_regs, done_label, end_label, &[*value],
+        );
+    }
 
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
