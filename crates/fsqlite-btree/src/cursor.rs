@@ -2962,6 +2962,112 @@ impl<P: PageReader> BtCursor<P> {
         Self::read_child_at_offset(entry.page_data.as_bytes(), cell_offset)
     }
 
+    /// Read the separator rowid of an interior TABLE cell.
+    ///
+    /// Interior table cells are `[4-byte left child][rowid varint]`; this
+    /// decodes just the rowid, mirroring the inline probe in
+    /// `binary_search_table_interior`.
+    fn table_interior_key_at(entry: &StackEntry, cell_idx: u16) -> Result<i64> {
+        let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, cell_idx)?);
+        let cell_data = entry
+            .page_data
+            .as_bytes()
+            .get(cell_offset..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior table cell pointer {} points past page end (len {})",
+                    cell_offset,
+                    entry.page_data.as_bytes().len()
+                ),
+            })?;
+        if cell_data.len() < 4 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "interior table cell too short for child pointer".to_owned(),
+            });
+        }
+        let Some((key, _)) = read_varint(&cell_data[4..]) else {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "interior table cell has invalid rowid varint".to_owned(),
+            });
+        };
+        #[allow(clippy::cast_possible_wrap)]
+        Ok(key as i64)
+    }
+
+    /// Whether the cursor's CURRENT position is an admissible insertion point
+    /// for `rowid` in a table B-tree: the landing leaf's local key order AND
+    /// every ancestor separator on the descent path must place `rowid` in
+    /// exactly this slot.
+    ///
+    /// Callers that reuse a position they did not just seek (notably the
+    /// UPDATE delete+reinsert flow through `table_insert_prechecked_absent`)
+    /// need this check: a delete that drains the last cell of a subtree
+    /// leaves the cursor on the FIRST leaf of the NEXT subtree, across one or
+    /// more ancestor separators. Reinserting the same rowid there writes a
+    /// key that is <= a separator into that separator's right-hand subtree —
+    /// an out-of-order tree that stock SQLite reports as "Rowid out of
+    /// order" and that rowid seeks can no longer reach (observed in the
+    /// field as "table rowid seek on root N missed scan-visible rowid R on
+    /// successor page P"). Leaf-local order alone cannot catch this: the
+    /// landing leaf itself stays sorted.
+    fn current_position_admits_table_insert(&self, rowid: i64) -> Result<bool> {
+        let Some(top) = self.stack.last() else {
+            return Ok(false);
+        };
+        if !(top.header.page_type.is_leaf() && top.header.page_type.is_table()) {
+            return Ok(false);
+        }
+
+        // Leaf-local bounds around the insertion slot.
+        if top.header.cell_count > 0 {
+            if self.at_eof {
+                let last = Self::table_leaf_rowid_at(top, top.header.cell_count - 1)?;
+                if last >= rowid {
+                    return Ok(false);
+                }
+            } else {
+                if top.cell_idx >= top.header.cell_count {
+                    return Ok(false);
+                }
+                let successor = Self::table_leaf_rowid_at(top, top.cell_idx)?;
+                if successor <= rowid {
+                    return Ok(false);
+                }
+                if top.cell_idx > 0 {
+                    let predecessor = Self::table_leaf_rowid_at(top, top.cell_idx - 1)?;
+                    if predecessor >= rowid {
+                        return Ok(false);
+                    }
+                }
+            }
+        } else if !self.at_eof {
+            return Ok(false);
+        }
+
+        // Ancestor separators along the descent path. Descending through
+        // cell_idx means everything in that subtree must be
+        // > separator[cell_idx - 1] and <= separator[cell_idx].
+        for entry in self.stack.iter().rev().skip(1) {
+            if !entry.header.page_type.is_interior() {
+                return Ok(false);
+            }
+            let idx = entry.cell_idx;
+            if idx > 0 {
+                let lower = Self::table_interior_key_at(entry, idx - 1)?;
+                if lower >= rowid {
+                    return Ok(false);
+                }
+            }
+            if idx < entry.header.cell_count {
+                let upper = Self::table_interior_key_at(entry, idx)?;
+                if upper < rowid {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
         let depth = if self.stack.is_empty() {
             match self.last_known_depth {
@@ -9407,6 +9513,27 @@ impl<P: PageWriter> BtCursor<P> {
         data: &[u8],
     ) -> Result<()> {
         let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            // The caller proved `rowid` is absent, but the position it is
+            // reusing (typically the successor left behind by `delete()` in
+            // the UPDATE delete+reinsert flow) may sit on the wrong side of
+            // an ancestor separator: deleting the last cell of a subtree
+            // repositions the cursor onto the first leaf of the NEXT
+            // subtree. Blindly inserting there commits an out-of-order tree
+            // ("Rowid out of order" under stock SQLite integrity_check;
+            // rowid seeks then miss a scan-visible row). Revalidate the
+            // position and fall back to a fresh root-to-leaf insert seek
+            // when it is not an admissible slot for `rowid`.
+            if !cursor.current_position_admits_table_insert(rowid)? {
+                cursor.clear_seek_cache();
+                let reseek = cursor.table_seek_for_insert(cx, rowid)?;
+                if reseek.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rowid {rowid} appeared during prechecked-absent insert revalidation"
+                        ),
+                    });
+                }
+            }
             cursor.table_insert_from_current_position(cx, rowid, data)
         });
         if result.is_ok() {
@@ -12021,6 +12148,67 @@ mod tests {
             cursor.payload(&cx).unwrap(),
             format!("row-{}", row_count - 1).as_bytes()
         );
+    }
+
+    /// Regression: an UPDATE-shaped delete+reinsert of a row that is (a) the
+    /// sole cell of its leaf and (b) the maximum of a subtree whose separator
+    /// lives at grandparent-or-higher level must NOT relocate the row across
+    /// that separator.
+    ///
+    /// Pre-fix, `delete()` of such a row drained and freed its leaf and left
+    /// the cursor on the first leaf of the NEXT subtree;
+    /// `table_insert_prechecked_absent` then reinserted the rowid there,
+    /// committing a tree where the stale (still legal) ancestor separator
+    /// routes rowid seeks into the left subtree while the row now lives in
+    /// the right one: scans see the row, `table_move_to` errors with "table
+    /// rowid seek on root N missed scan-visible rowid R on successor page P",
+    /// and stock SQLite integrity_check reports "Rowid out of order".
+    /// Observed in the field on a CAS blob store where every multi-KB row
+    /// occupies its own leaf and a route-guard UPDATE rewrites rows in place.
+    #[test]
+    fn test_prechecked_absent_reinsert_does_not_cross_ancestor_separator() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        // Payloads big enough that every leaf holds exactly one cell, and
+        // enough rows to force a depth-3 tree, so some subtree separators
+        // live at the ROOT while leaves hang two levels below.
+        let row_count = 700_i64;
+        let payload = vec![0xA5u8; 3500];
+        for rowid in 1..=row_count {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        // UPDATE-shaped rewrite of EVERY row: position, delete, reinsert the
+        // same rowid through the prechecked-absent fast path (exactly what
+        // the direct UPDATE flow does when the in-place overwrite declines).
+        for rowid in 1..=row_count {
+            assert!(
+                cursor.table_move_to(&cx, rowid).unwrap().is_found(),
+                "rowid {rowid} must be reachable before its rewrite"
+            );
+            cursor.delete(&cx).unwrap();
+            cursor
+                .table_insert_prechecked_absent(&cx, rowid, &payload)
+                .unwrap();
+        }
+
+        // Every row must still be reachable by a rowid seek (pre-fix the
+        // divider-equal rows failed with the missed-scan-visible error), and
+        // the in-order scan must agree with the seeks.
+        for rowid in 1..=row_count {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap_or_else(|error| {
+                panic!("rowid {rowid} seek must not error after rewrite: {error}")
+            });
+            assert_eq!(
+                seek,
+                SeekResult::Found,
+                "rowid {rowid} must remain seek-reachable after its rewrite"
+            );
+        }
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), row_count);
     }
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
