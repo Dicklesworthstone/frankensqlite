@@ -13247,6 +13247,300 @@ mod tests {
         );
     }
 
+    /// Deterministic index key whose record order equals the ordinal order:
+    /// a fixed-width big-endian blob field followed by the ordinal itself,
+    /// padded so every entry spills to overflow pages when `pad` exceeds the
+    /// page's max-local threshold.
+    fn ordered_index_key(i: i64, pad: usize) -> Vec<u8> {
+        let mut blob = i.to_be_bytes().to_vec();
+        blob.resize(8 + pad, 0xC3);
+        serialize_record(&[SqliteValue::Blob(blob.into()), SqliteValue::Integer(i)])
+    }
+
+    /// Deterministic xorshift so "hash-shaped" (uniformly scattered) unique
+    /// keys are reproducible without any external randomness.
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// INSERT-only drift audit for UNIQUE index b-trees: scattered
+    /// ("hash-shaped") unique keys inserted through the canonical unique
+    /// probe path (`index_insert_unique_with_rightmost_report` — exactly
+    /// what a UNIQUE autoindex `IdxInsert` executes when the monotonic
+    /// fast-append hint does not apply) must keep EVERY key seek-reachable
+    /// across the many leaf/interior splits such a workload forces. Small
+    /// pages keep the tree deep so interior splits and fell-off-right-edge
+    /// probe restores (the interior-separator successor shape) are hit
+    /// constantly.
+    #[test]
+    fn test_unique_index_scattered_insert_only_keys_stay_seek_reachable() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, 512);
+        let mut cursor = BtCursor::new(store, root, 512, false);
+
+        let key_count = 5_000_u64;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut keys = Vec::with_capacity(key_count as usize);
+        for i in 0..key_count {
+            // 64 hex chars — the shape of a content-hash key — plus the
+            // rowid suffix, matching a UNIQUE autoindex record layout.
+            let a = xorshift64(&mut state);
+            let b = xorshift64(&mut state);
+            let hash = format!("{a:016x}{b:016x}{a:016x}{b:016x}");
+            #[allow(clippy::cast_possible_wrap)]
+            let key = serialize_record(&[
+                SqliteValue::Text(hash.into()),
+                SqliteValue::Integer(i as i64 + 1),
+            ]);
+            keys.push(key);
+        }
+
+        for (i, key) in keys.iter().enumerate() {
+            cursor
+                .index_insert_unique_with_rightmost_report(&cx, key, 1, "a.h")
+                .unwrap_or_else(|error| panic!("unique insert {i} must succeed: {error}"));
+        }
+
+        let mut misses = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            if cursor.index_move_to(&cx, key).unwrap() != SeekResult::Found {
+                misses.push(i);
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "insert-only unique workload lost {} of {key_count} keys to \
+             out-of-order placement; first missing insert ordinals: {:?}",
+            misses.len(),
+            &misses[..misses.len().min(10)]
+        );
+        validate_index_tree_invariants(&mut cursor, root)
+            .expect("index tree invariants must hold after scattered inserts");
+        assert_eq!(
+            scan_all_index_keys(&mut cursor, &cx).unwrap().len(),
+            key_count as usize
+        );
+    }
+
+    /// INSERT-only drift audit, monotonic variant: ascending unique keys
+    /// driven through the same fast-append-then-fallback loop the VDBE
+    /// `IdxInsert` uses (`index_append_after_current_rightmost_position`,
+    /// falling back to the unique probe when the right-edge reuse declines,
+    /// e.g. immediately after a split cleared the cursor stack). Every key
+    /// must stay seek-reachable and the tree well-formed.
+    #[test]
+    fn test_unique_index_monotonic_fast_append_across_splits_stays_seek_reachable() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, 512);
+        let mut cursor = BtCursor::new(store, root, 512, false);
+
+        let key_count = 4_000_i64;
+        let make_key = |i: i64| ordered_index_key(i, 40);
+        let mut fast_hits = 0usize;
+        let mut fallbacks = 0usize;
+
+        cursor
+            .index_insert_unique_with_rightmost_report(&cx, &make_key(1), 1, "a.h")
+            .unwrap();
+        for i in 2..=key_count {
+            let key = make_key(i);
+            // Engine shape: try the right-edge append reuse first; on decline
+            // (stale/cleared stack, e.g. after the previous insert split the
+            // leaf) fall back to the canonical unique probe.
+            if cursor
+                .index_append_after_current_rightmost_position(&cx, &key)
+                .unwrap()
+            {
+                fast_hits += 1;
+            } else {
+                fallbacks += 1;
+                cursor
+                    .index_insert_unique_with_rightmost_report(&cx, &key, 1, "a.h")
+                    .unwrap();
+            }
+        }
+        assert!(
+            fast_hits > 0,
+            "monotonic workload must exercise the fast-append reuse \
+             (hits={fast_hits}, fallbacks={fallbacks})"
+        );
+
+        let mut misses = Vec::new();
+        for i in 1..=key_count {
+            if cursor.index_move_to(&cx, &make_key(i)).unwrap() != SeekResult::Found {
+                misses.push(i);
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "monotonic fast-append workload lost {} of {key_count} keys \
+             (fast_hits={fast_hits}, fallbacks={fallbacks}); first: {:?}",
+            misses.len(),
+            &misses[..misses.len().min(10)]
+        );
+        validate_index_tree_invariants(&mut cursor, root)
+            .expect("index tree invariants must hold after monotonic appends");
+        assert_eq!(
+            i64::try_from(scan_all_index_keys(&mut cursor, &cx).unwrap().len()).unwrap(),
+            key_count
+        );
+    }
+
+    /// Sibling audit of the 83e0f563 table bug, INDEX side, canonical paths:
+    /// an UPDATE-shaped delete+reinsert on an index B-tree must keep every
+    /// key seek-reachable even when the delete drains a singleton leaf and
+    /// rebalances (the exact shape that broke the TABLE prechecked-absent
+    /// reuse). Production index maintenance (IdxDelete + IdxInsert, the
+    /// without-rowid UPDATE flow, and `native_replace_row`) always reinserts
+    /// through a fresh root-to-leaf seek — `index_insert` or the unique-probe
+    /// path — so this must hold by construction; this test pins it against a
+    /// deep tree with overflow-sized keys.
+    #[test]
+    fn test_index_delete_reinsert_via_canonical_paths_stays_seek_consistent() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, false);
+
+        // Overflow-sized keys (> the index max-local threshold for a 4096
+        // usable page) build a deep multi-level tree; pass 1 thins the tree
+        // so pass-2 deletes drain singleton leaves and force rebalances.
+        let key_count = 400_i64;
+        let pad = 1400usize;
+        for i in 1..=key_count {
+            cursor
+                .index_insert(&cx, &ordered_index_key(i, pad))
+                .unwrap();
+        }
+        for i in (2..=key_count).step_by(2) {
+            assert!(
+                cursor
+                    .index_move_to(&cx, &ordered_index_key(i, pad))
+                    .unwrap()
+                    .is_found(),
+                "key {i} must be reachable before thinning"
+            );
+            cursor.delete(&cx).unwrap();
+        }
+
+        // UPDATE-shaped rewrite of every surviving key: position, delete,
+        // reinsert the same key through the two canonical production paths.
+        for i in (1..=key_count).step_by(2) {
+            let key = ordered_index_key(i, pad);
+            assert!(
+                cursor.index_move_to(&cx, &key).unwrap().is_found(),
+                "key {i} must be reachable before its rewrite"
+            );
+            cursor.delete(&cx).unwrap();
+            if i % 4 == 1 {
+                cursor.index_insert(&cx, &key).unwrap();
+            } else {
+                cursor
+                    .index_insert_unique_with_rightmost_report(&cx, &key, 1, "t.c")
+                    .unwrap();
+            }
+        }
+
+        let mut misses = Vec::new();
+        for i in (1..=key_count).step_by(2) {
+            if cursor
+                .index_move_to(&cx, &ordered_index_key(i, pad))
+                .unwrap()
+                != SeekResult::Found
+            {
+                misses.push(i);
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "keys must stay seek-reachable after canonical rewrites: {misses:?}"
+        );
+        validate_index_tree_invariants(&mut cursor, root)
+            .expect("index tree invariants must hold after rewrites");
+        assert_eq!(
+            i64::try_from(scan_all_index_keys(&mut cursor, &cx).unwrap().len()).unwrap(),
+            key_count / 2
+        );
+    }
+
+    /// Canary for the hypothetical INDEX sibling of the 83e0f563 table bug:
+    /// deliberately MISUSE `index_insert_prechecked_absent` across a
+    /// `delete()` (reusing the post-delete position without a fresh seek) and
+    /// assert the failure mode stays LOUD, never silent.
+    ///
+    /// Unlike the table side — where the post-delete successor position can
+    /// silently sit across a stale ancestor separator and blind reinsertion
+    /// commits an out-of-order tree — the index side is structurally
+    /// protected: after a drain+rebalance, `delete()` re-anchors with a fresh
+    /// seek, and an index entry's cross-leaf successor is an ancestor
+    /// SEPARATOR (interior position), which
+    /// `index_insert_from_current_position` rejects with a hard error instead
+    /// of inserting out of order. This canary pins that property: if seek
+    /// successor normalization ever changes to cross into the next leaf the
+    /// way the table path does, the misuse below would start corrupting
+    /// silently and this test would fail.
+    #[test]
+    fn test_index_prechecked_absent_misuse_after_delete_fails_loud_never_corrupts() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, 512);
+        let mut cursor = BtCursor::new(store, root, 512, false);
+
+        let key_count = 400_i64;
+        for i in 1..=key_count {
+            cursor.index_insert(&cx, &ordered_index_key(i, 0)).unwrap();
+        }
+        // Thin to singletons so pass-2 deletes drain leaves and rebalance.
+        for i in (2..=key_count).step_by(2) {
+            assert!(
+                cursor
+                    .index_move_to(&cx, &ordered_index_key(i, 0))
+                    .unwrap()
+                    .is_found()
+            );
+            cursor.delete(&cx).unwrap();
+        }
+
+        for i in (1..=key_count).step_by(2) {
+            let key = ordered_index_key(i, 0);
+            assert!(
+                cursor.index_move_to(&cx, &key).unwrap().is_found(),
+                "key {i} must be reachable before its rewrite"
+            );
+            cursor.delete(&cx).unwrap();
+            // Blind reuse of the post-delete position. Allowed outcomes:
+            // success (position was admissible) or a hard error (position was
+            // an interior separator / empty stack). A hard error must leave
+            // the key re-insertable through the canonical path. What must
+            // NEVER happen is a silent out-of-order insert; the final sweep
+            // below catches that as a seek miss or invariant violation.
+            if cursor.index_insert_prechecked_absent(&cx, &key).is_err() {
+                cursor.index_insert(&cx, &key).unwrap();
+            }
+        }
+
+        let mut misses = Vec::new();
+        for i in (1..=key_count).step_by(2) {
+            if cursor.index_move_to(&cx, &ordered_index_key(i, 0)).unwrap() != SeekResult::Found {
+                misses.push(i);
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "misused prechecked reinsert silently corrupted the index; \
+             unreachable keys: {misses:?}"
+        );
+        validate_index_tree_invariants(&mut cursor, root)
+            .expect("index tree invariants must hold after misuse sweep");
+    }
+
     #[test]
     fn test_index_insert_unique_no_conflict_inserts_between_adjacent_prefixes() {
         let store = MemPageStore::with_empty_index(pn(2), USABLE);
