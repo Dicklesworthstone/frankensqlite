@@ -9866,7 +9866,7 @@ impl Connection {
         let vfs = env
             .memory_vfs_config()
             .map_or_else(MemoryVfs::new, MemoryVfs::new_with_config);
-        let db_path = PathBuf::from("/:memory:");
+        let db_path = vfs.full_pathname(&bootstrap_cx, Path::new("/:memory:"))?;
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _) = vfs.open(&bootstrap_cx, Some(&db_path), flags)?;
         db_file.write(&bootstrap_cx, bytes, 0)?;
