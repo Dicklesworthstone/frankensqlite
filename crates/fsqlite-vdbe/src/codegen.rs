@@ -17919,6 +17919,13 @@ pub fn codegen_update(
         matched_rowid_reg = b.alloc_reg();
         b.set_next_anon_placeholder(set_placeholder_count + 1);
         emit_expr(b, target_expr, matched_rowid_reg, None);
+        // Coerce a non-integer-literal rowid key (placeholder / real / text) to INTEGER affinity: a
+        // non-exact key (2.5 / 'abc' / NULL) rejects to `apply_done_label` (no row updated) instead of
+        // raw `SeekRowid` TRUNCATING it to a wrong rowid (`WHERE id = 2.5` must not update row 2).
+        // Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the DELETE / SELECT paths.
+        if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_jump_to_label(Opcode::MustBeInt, matched_rowid_reg, 0, apply_done_label, P4::None, 0);
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
@@ -19402,6 +19409,14 @@ pub fn codegen_delete(
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
+        // Coerce a non-integer-literal rowid key (placeholder / real / text) to INTEGER affinity: a
+        // non-exact key (2.5 / 'abc' / NULL) rejects to `collect_done_label` (nothing collected -> no
+        // delete) instead of raw `SeekRowid` TRUNCATING it to a wrong rowid (`WHERE id = 2.5` must not
+        // delete row 2). Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the SELECT
+        // rowid lookup + count/aggregate coerced seeks.
+        if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, collect_done_label, P4::None, 0);
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
