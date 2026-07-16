@@ -20,8 +20,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_ast::{
-    ColumnRef, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, QualifiedName,
-    ResultColumn, SelectCore, SelectStatement, Statement, TableOrSubquery, WithClause,
+    ColumnRef, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, Literal,
+    QualifiedName, ResultColumn, SelectCore, SelectStatement, Statement, TableOrSubquery,
+    WithClause,
 };
 use fsqlite_types::TypeAffinity;
 
@@ -521,6 +522,10 @@ pub enum SemanticErrorKind {
         to: TypeAffinity,
         context: String,
     },
+    /// A function argument fails a compile-time constraint (e.g. the
+    /// probability argument to `likelihood()` must be a constant float literal
+    /// in `[0.0, 1.0]`). Carries the fully-formed diagnostic message.
+    InvalidFunctionArgument { message: String },
 }
 
 /// Expected function arity.
@@ -1518,6 +1523,28 @@ impl<'a> Resolver<'a> {
                 });
             }
         }
+
+        // likelihood(X, prob): the probability must be a constant floating-point
+        // literal in [0.0, 1.0], matching C SQLite's exprProbability() contract.
+        // Integer literals, out-of-range values, and non-literal expressions are
+        // all rejected at prepare time.
+        if name.eq_ignore_ascii_case("likelihood") {
+            if let FunctionArgs::List(list) = args {
+                if list.len() == 2 {
+                    let is_valid_probability = matches!(
+                        &list[1],
+                        Expr::Literal(Literal::Float(p), _) if (0.0..=1.0).contains(p)
+                    );
+                    if !is_valid_probability {
+                        self.push_error(SemanticErrorKind::InvalidFunctionArgument {
+                            message:
+                                "second argument to likelihood() must be a constant between 0.0 and 1.0"
+                                    .to_owned(),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     fn push_error(&mut self, kind: SemanticErrorKind) {
@@ -1558,6 +1585,7 @@ impl<'a> Resolver<'a> {
             } => {
                 format!("implicit type coercion from {from:?} to {to:?} in {context}")
             }
+            SemanticErrorKind::InvalidFunctionArgument { message } => message.clone(),
         };
 
         self.errors.push(SemanticError { kind, message });
@@ -1581,10 +1609,12 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
             Some(FunctionArity::Exact(1))
         }
         "ifnull" | "nullif" | "instr" | "glob" | "likelihood" => Some(FunctionArity::Exact(2)),
-        "iif" | "replace" => Some(FunctionArity::Exact(3)),
+        "replace" => Some(FunctionArity::Exact(3)),
         "count" => Some(FunctionArity::Range(0, 1)),
         "group_concat" | "trim" | "ltrim" | "rtrim" | "round" => Some(FunctionArity::Range(1, 2)),
-        "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
+        // iif/if accept the 2-argument shorthand iif(X,Y) as of SQLite 3.48;
+        // `if` is iif's registered alias.
+        "substr" | "substring" | "like" | "iif" | "if" => Some(FunctionArity::Range(2, 3)),
         "coalesce" | "json_extract" => Some(FunctionArity::VariadicMin(2)),
         "json_remove" => Some(FunctionArity::VariadicMin(1)),
         "json_insert" | "json_replace" | "json_set" => Some(FunctionArity::VariadicMin(3)),

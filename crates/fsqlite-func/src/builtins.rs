@@ -435,13 +435,25 @@ impl ScalarFunction for IifFunc {
         };
         if is_true {
             Ok(args[1].clone())
-        } else {
+        } else if args.len() >= 3 {
             Ok(args[2].clone())
+        } else {
+            // Two-argument form iif(X,Y) is shorthand for iif(X,Y,NULL),
+            // i.e. CASE WHEN X THEN Y END (SQLite 3.48+).
+            Ok(SqliteValue::Null)
         }
     }
 
     fn num_args(&self) -> i32 {
-        3
+        -1 // 2 or 3 args
+    }
+
+    fn min_args(&self) -> i32 {
+        2
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(3)
     }
 
     fn name(&self) -> &str {
@@ -1979,6 +1991,11 @@ fn glob_match_inner(pat: &[char], txt: &[char], mut pi: usize, mut ti: usize) ->
                 }
                 if pi < pat.len() && pat[pi] == ']' {
                     pi += 1;
+                } else {
+                    // Unterminated character class: the pattern ran off the end
+                    // before a closing ']'. C SQLite's patternCompare returns 0
+                    // (no match) in this case, so `'a' GLOB '[a'` must be false.
+                    return false;
                 }
                 if found == negate {
                     return false;
@@ -2212,7 +2229,15 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
         }
 
         fn num_args(&self) -> i32 {
-            3
+            -1 // 2 or 3 args, mirroring iif
+        }
+
+        fn min_args(&self) -> i32 {
+            2
+        }
+
+        fn max_args(&self) -> Option<i32> {
+            Some(3)
         }
 
         fn name(&self) -> &str {
@@ -2331,6 +2356,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
         let mut space_sign = false;
         let mut zero_pad = false;
         let mut alt_form = false;
+        let mut alt_form2 = false;
         loop {
             if i >= chars.len() {
                 break;
@@ -2341,6 +2367,9 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 ' ' => space_sign = true,
                 '0' => zero_pad = true,
                 '#' => alt_form = true,
+                // SQLite's alternate-form-2 flag. For non-float conversions it has
+                // no effect; for %f/%g it selects the shortest round-trip form.
+                '!' => alt_form2 = true,
                 _ => break,
             }
             i += 1;
@@ -2432,10 +2461,24 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             'f' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
-                let prec = precision.unwrap_or(6);
-                let formatted = format_float_f(
-                    val, prec, width, left_align, show_sign, space_sign, zero_pad,
-                );
+                let formatted = if alt_form2 && val.is_finite() {
+                    // Alternate-form-2 (`!`): shortest round-trip representation
+                    // (always with a decimal point), ignoring precision — matches
+                    // C SQLite, e.g. printf('%!f',0.1) -> "0.1", '%!.3f' 1.5 -> "1.5".
+                    finish_float_padding(
+                        &format!("{val:?}"),
+                        width,
+                        left_align,
+                        show_sign,
+                        space_sign,
+                        zero_pad,
+                    )
+                } else {
+                    let prec = precision.unwrap_or(6);
+                    format_float_f(
+                        val, prec, width, left_align, show_sign, space_sign, zero_pad,
+                    )
+                };
                 result.push_str(&formatted);
             }
             'e' | 'E' => {
@@ -2466,6 +2509,16 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
                 {
                     result.push_str(&s);
+                } else if alt_form2 {
+                    // Alternate-form-2 (`!`): shortest round-trip form with a
+                    // decimal point, e.g. printf('%!g',1.0) -> "1.0".
+                    let mut s = format!("{val:?}");
+                    if spec == 'G' {
+                        s = s.to_uppercase();
+                    }
+                    result.push_str(&finish_float_padding(
+                        &s, width, left_align, show_sign, space_sign, zero_pad,
+                    ));
                 } else {
                     let formatted = format_float_g(val, sig, spec == 'G');
                     result.push_str(&finish_float_padding(
@@ -2790,6 +2843,9 @@ fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
     if !val.is_finite() {
         return format!("{val}");
     }
+    // C SQLite canonicalizes signed zero for %g: both +0.0 and -0.0 render as
+    // "0" (no minus sign). `-0.0 == 0.0` is true, so this maps -0.0 to +0.0.
+    let val = if val == 0.0 { 0.0 } else { val };
     let e_str = format!("{val:.prec$e}", prec = sig.saturating_sub(1));
     let exp: i32 = e_str
         .rsplit_once('e')
@@ -4655,6 +4711,99 @@ mod tests {
             )
             .unwrap(),
             SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_glob_unterminated_character_class_does_not_match() {
+        // Regression (#257): an unterminated '[' character class never matches,
+        // matching C SQLite's patternCompare which returns 0 at end-of-pattern.
+        assert_eq!(
+            invoke2(
+                &GlobFunc,
+                SqliteValue::Text(SmallText::from_string("[a")),
+                SqliteValue::Text(SmallText::from_string("a"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(0)
+        );
+        // The properly-closed form still matches.
+        assert_eq!(
+            invoke2(
+                &GlobFunc,
+                SqliteValue::Text(SmallText::from_string("[a]")),
+                SqliteValue::Text(SmallText::from_string("a"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(1)
+        );
+    }
+
+    #[test]
+    fn test_iif_two_argument_form() {
+        // Regression (#183): iif(X, Y) is shorthand for iif(X, Y, NULL) (3.48+).
+        let f = IifFunc;
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text(SmallText::from_string("y")),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("y"))
+        );
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Integer(0),
+                SqliteValue::Text(SmallText::from_string("y")),
+            ])
+            .unwrap(),
+            SqliteValue::Null
+        );
+    }
+
+    #[test]
+    fn test_format_g_negative_zero() {
+        // Regression (#258): printf('%g', -0.0) canonicalizes to '0' (no minus).
+        let f = FormatFunc;
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Text(SmallText::from_string("%g")),
+                SqliteValue::Float(-0.0),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("0"))
+        );
+    }
+
+    #[test]
+    fn test_format_altform2_flag() {
+        // Regression (#176): the '!' (alternate-form-2) flag is accepted. For
+        // string/int conversions the value formats normally; for %f it selects
+        // the shortest round-trip form with a decimal point.
+        let f = FormatFunc;
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Text(SmallText::from_string("%!5s")),
+                SqliteValue::Text(SmallText::from_string("ab")),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("   ab"))
+        );
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Text(SmallText::from_string("%!d")),
+                SqliteValue::Integer(3),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("3"))
+        );
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Text(SmallText::from_string("%!f")),
+                SqliteValue::Float(0.1),
+            ])
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("0.1"))
         );
     }
 

@@ -234,3 +234,40 @@ fn test_schema_qualified_table_star_rejects_wrong_schema_binding() {
         errors[0]
     );
 }
+
+#[test]
+fn test_likelihood_probability_must_be_constant_float_in_range() {
+    // Regression (#182): the second argument to likelihood() must be a constant
+    // floating-point literal in [0.0, 1.0], matching C SQLite's exprProbability.
+    let schema = Schema::new();
+
+    for sql in [
+        "SELECT likelihood(5, 0.5)",
+        "SELECT likelihood(5, 0.0)",
+        "SELECT likelihood(5, 1.0)",
+    ] {
+        let stmt = parse_one(sql);
+        let errors = Resolver::new(&schema).resolve_statement(&stmt);
+        assert!(
+            errors.is_empty(),
+            "{sql}: expected no errors, got {errors:?}"
+        );
+    }
+
+    // Integer literal, out-of-range value, and a negated literal are all rejected.
+    for sql in [
+        "SELECT likelihood(5, 1)",
+        "SELECT likelihood(5, 0)",
+        "SELECT likelihood(5, 2.0)",
+        "SELECT likelihood(5, -0.5)",
+    ] {
+        let stmt = parse_one(sql);
+        let errors = Resolver::new(&schema).resolve_statement(&stmt);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e.kind, SemanticErrorKind::InvalidFunctionArgument { .. })),
+            "{sql}: expected InvalidFunctionArgument error, got {errors:?}"
+        );
+    }
+}
