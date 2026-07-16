@@ -19347,3 +19347,25 @@ ledgered rejects across codegen, VDBE, and fsqlite-func). The remaining perf wor
   project's first sub-step (e.g. `bd-b3yw2` S1 RegisterValue for Track S), or (b) do a genuinely
   new profile run (`fsqlite/tests/execute_body_split.rs` + samply) to surface a fresh hotspot — the
   reason-from-code single-lever seam is dry.
+
+## 2026-07-16 - PROFILE FINDING: the bd-5310l 295x INSERT gap is O(n^2) SECONDARY-INDEX insert, not parse+plan (bd-aoj0g)
+
+Took the "run a fresh profile" recommendation. Built an ephemeral phase-attribution + index-isolation
+profile of ad-hoc INSERTs into `:memory:` (one txn) using `hot_path_profile_snapshot()`. Result
+CORRECTS bd-5310l's parse+plan framing for INSERT:
+- At ~10k rows: `execute_body` = 195090 ns/insert (83% of the 234419 wall); `parser.parse`+`compile`
+  only ~14 us (~6%); commit/finalize amortized ~0; all inserts hit the prepared insert fast lane.
+- INDEX ISOLATION (with vs without the secondary index `idx_t_k on t(k)`, same 10k-row depth):
+  NO index `execute_body` = 4837 ns/insert (~5 us, near C SQLite); WITH index = 187784 ns/insert.
+  => secondary-index maintenance = ~182947 ns/insert = **97% of INSERT execute_body**.
+- SCALING: per-insert grows 84 us (empty) -> 216 us (10k rows) then plateaus => the index insert is
+  **O(n) per row / O(n^2) total** (scales with index size). Base table (sequential IPK) insert is fine.
+- Path (real `:memory:` btree, NOT the test-only `MockBtreeCursor`): `BtCursor<MemPageStore>`
+  `index_insert` (`crates/fsqlite-btree/src/cursor.rs:10415`) -> `index_seek_for_insert` +
+  `with_btree_op(BtreeOpType::Insert)`.
+- Result: FILED bd-aoj0g (P1). This is the single biggest INSERT perf lever found and directly targets
+  the 295x gap; the exact O(n) op needs sub-profiling (seek O(block)/O(run) walk per
+  bd-seek-partial-key-oblock-kwdxa? MVCC/COW copy of a growing structure per insert? index-root
+  version-chain growth?) — deferred to bd-aoj0g as dedicated btree work, not a one-turn blind fix.
+  LESSON: when the reason-from-code seam is dry, a real phase+isolation profile finds levers the code
+  reading missed — here a 97%-of-cost O(n^2) hotspot that was mis-attributed to parse+plan.
