@@ -19180,3 +19180,240 @@ test is on the executed path, not merely linked into it.
 - Result: KEEP. Every measured size improved ~34-37% on the same worker and every confidence interval
   excludes zero. Revisit only if binding storage classes or register-write bookkeeping change;
   preserve the non-integer / unbound fallback through `set_reg_fast`.
+
+## 2026-07-16 - WIN: integer `Add`/`Subtract`/`Multiply` results write in place via `set_reg_int`
+
+- Target: the existing `vdbe_pipeline_execute_{add,subtract,multiply}/{64,256,1024}` benchmarks, each
+  a stream of an integer arithmetic op writing the same output register (`17 op 25` etc.). The hot
+  arms in `try_execute_hot_opcode` computed `a.sql_add/sub/mul(b)` and wrote the result with
+  `set_reg_fast`, which always pays `replace_register_value` (`std::mem::replace` +
+  `pool_return_reusable`). After the first write the output register already holds an `Integer`, so a
+  same-typed integer store could update it in place. Same in-place mechanism as the July 14/15
+  Copy/SCopy/Variable wins, extended from register moves to computed results.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` — new `set_reg_arith_result(r, value)` helper that
+  routes an `Integer` result through `set_reg_int` (in-place `*current = val` when the register
+  already holds an `Integer`) and everything else through `set_reg_fast`. The Add/Subtract/Multiply
+  hot arms call it. This is byte-identical: `sql_add/sub/mul` return `Integer(result)` ONLY for an
+  exact, non-overflowing value (integer overflow promotes to `Float` via `float_result_or_null`), so
+  a matched `Integer` is provably the exact result; `Float`/`Null` take the unchanged path. The
+  computation itself is untouched. Added focused tests `test_arith_integer_result_in_place_fast_path`
+  (chained Add/Multiply/Subtract on one register exercising the in-place path) and
+  `test_arith_float_result_falls_through_general_path` (Integer+Float -> Float via the general path);
+  a freshness-gated `cargo test -p fsqlite-vdbe --lib test_arith_` ran exactly those 2 and both
+  passed, plus the 6 pre-existing `*arith*` tests. Main-match fallback arms left untouched (dead;
+  hot path always handles these opcodes).
+- Same-worker foreground proof on actual remote worker `ovh-b`, from base commit `a42d1020` via
+  Criterion's built-in same-target-pool comparison. Base (clean tree) and candidate (edited tree)
+  used the identical Cargo payload
+  `cargo bench -j2 --config 'profile.release-perf.lto=false' --config
+  'profile.release-perf.codegen-units=16' --profile release-perf -p fsqlite-vdbe --bench
+  pipeline_stages -- '^vdbe_pipeline_execute_(add|subtract|multiply)/' --warm-up-time 0.5
+  --measurement-time 2 --sample-size 30 --noplot`, under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`:
+  - add:      `1.2094 us` -> `990.60 ns` (change `[-18.804%, -18.010%, -17.262%]`), `4.4078 us` ->
+    `3.5814 us` (`[-19.717%, -18.829%, -17.992%]`), `17.860 us` -> `14.082 us`
+    (`[-26.461%, -23.368%, -20.696%]`); all `p = 0.00`.
+  - subtract: `1.2022 us` -> `1.0565 us` (`[-12.891%, -11.562%, -10.324%]`), `4.4441 us` ->
+    `3.8558 us` (`[-15.025%, -13.847%, -12.797%]`), `17.345 us` -> `15.336 us`
+    (`[-14.158%, -12.999%, -11.786%]`); all `p = 0.00`.
+  - multiply: `1.2443 us` -> `1.0938 us` (`[-12.801%, -11.953%, -11.072%]`), `4.7257 us` ->
+    `4.0996 us` (`[-13.828%, -12.365%, -10.656%]`), `18.327 us` -> `16.323 us`
+    (`[-13.712%, -12.475%, -11.183%]`); all `p = 0.00`.
+  Freshness verified: candidate build recompiled `fsqlite-vdbe` on `ovh-b`, deltas are directional
+  (not parity), and the new tests provably ran on a fresh checkout (an earlier test attempt on
+  flaky `vmi1153651` served a STALE checkout missing the new tests — re-run confirmed 2/2, see
+  the stale-artifact hazard note).
+- Result: KEEP. All 9 cells improved (~12-23%) on the same worker with every confidence interval
+  excluding zero. Smaller ratio than the transfer family because arithmetic also pays the two
+  `get_reg` reads + `sql_*` compute, so the write is a smaller fraction of the op. Follow-ups (same
+  helper): `Divide`/`Remainder` (verify `sql_div`/`sql_rem` return `Integer` only for exact results)
+  and `ShiftLeft`/`ShiftRight`; `BitAnd`/`BitOr`/`BitNot` already use `set_reg_int` directly.
+
+## 2026-07-16 - WIN (`Divide`) + REJECT (`Remainder`): integer result in-place write
+
+- Target: `vdbe_pipeline_execute_{divide,remainder}/{64,256,1024}` (streams of `86/7=12` and
+  `86%7=2` into a reused register). Same lever as the Add/Subtract/Multiply win: route an `Integer`
+  result through `set_reg_arith_result` (in-place `set_reg_int`) instead of `set_reg_fast`.
+  `sql_div`/`sql_rem` return `Integer` only for an exact int/int result (div-by-zero -> `Null`,
+  overflow/float -> `Float`), so it is byte-identical. Correctness: freshness-gated
+  `cargo test -p fsqlite-vdbe --lib test_div_rem_integer_result_in_place_and_zero_null` ran exactly
+  the new test (in-place divide + remainder + divide-by-zero -> Null) and passed.
+- Same-worker foreground A/B on `ovh-b`, base commit `95128d77`, Criterion same-target-pool compare;
+  identical Cargo payload `... --bench pipeline_stages -- '^vdbe_pipeline_execute_(divide|remainder)/'
+  --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot` under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`:
+  - `Divide`: `1.8133 us` -> `1.7553 us` (`[-6.041%, -4.527%, -2.977%]`), `6.9070 us` -> `6.7317 us`
+    (`[-5.520%, -4.117%, -2.485%]`), `27.731 us` -> `26.251 us` (`[-6.734%, -5.369%, -4.190%]`); all
+    `p = 0.00`, every CI excludes zero.
+  - `Remainder`: `[-2.605%, -1.861%, -1.089%]` (`p = 0.00`), **`[-1.716%, -0.471%, +0.990%]`
+    (`p = 0.51` — CI INCLUDES ZERO)**, `[-3.218%, -1.839%, -0.448%]` (`p = 0.01`).
+- Result: KEEP `Divide` (shipped — clean ~4-5% at all three sizes, every CI excludes zero). REJECT
+  `Remainder` (reverted to `set_reg_fast`): the middle size is not significant (`p = 0.51`, CI spans
+  zero) and the others are only ~1-2%, so it fails the every-CI-excludes-zero bar. `sql_rem` does
+  slightly more work than `sql_div` (no early integer-division fast return), so the in-place write is
+  too small a fraction to reliably clear the noise floor — this is the diminishing-returns boundary
+  of the register-write vein (transfer ~30-37% -> arith ~12-23% -> divide ~4-5% -> remainder noise).
+  The correctness test still exercises the remainder path (via `set_reg_fast`) so it stays valid.
+  Shifts (`sql_shift_*`, always `Integer`) are the last untried arm but will be at-or-below the
+  divide ratio; treat the write-specialization vein as effectively mined out after this.
+
+## 2026-07-16 - REJECT: promote `NotNull` into `try_execute_hot_opcode`
+
+- Target: `vdbe_pipeline_execute_notnull/{64,256,1024}` (a dispatch-dominated loop of `NotNull`
+  jumps). `NotNull` is the only common jump opcode still served by the 190-arm main match (its
+  complement `IsNull` and `IfNot`/`IfPos`/`DecrJumpZero` are already promoted). Lever: add a
+  jump-table arm to `try_execute_hot_opcode` mirroring `IsNull` (byte-identical body, inverted). The
+  hot match lowers to a jump table so adding an arm is O(1) and cannot regress other opcodes; the
+  change is strictly *fewer* dispatches for `NotNull` (was hot-miss + main-match-hit, becomes
+  hot-hit). Correctness: freshness-gated `cargo test -p fsqlite-vdbe --lib
+  test_notnull_hot_path_jump_and_fallthrough` ran the one new test (jump-on-notnull +
+  fallthrough-on-null) and passed.
+- Same-worker A/B on `ovh-b`, base `971bae4c`, Criterion same-target-pool compare, identical Cargo
+  payload (`... -- '^vdbe_pipeline_execute_notnull/' ...`):
+  - `64`:   `612.83 ns` -> `578.39 ns`, change `[-6.551%, -5.386%, -4.323%]` (`p = 0.00`).
+  - `256`:  `2.1610 us` -> `2.0252 us`, change `[-7.835%, -6.732%, -5.526%]` (`p = 0.00`).
+  - `1024`: `8.4328 us` -> `8.9865 us`, change **`[+5.840%, +6.982%, +8.103%]` (`p = 0.00`) —
+    REGRESSION**.
+- Result: REJECT (not shipped; change parked in a `git stash` labelled "REJECTED notnull hot-path
+  promotion", not committed). Mixed: the two small sizes improved ~5-7% but `/1024` regressed ~7%,
+  and `/1024` (many ops = the large-scan case) is the representative real-world size. The regression
+  contradicts the mechanism (strictly fewer dispatches should help *uniformly*), and the degradation
+  is monotonic with measurement order (`/64` first improved, `/1024` last regressed) — the classic
+  signature of rising external contention on the shared `ovh-b` during the candidate window (baseline
+  and candidate measured ~10 min apart on a contended worker), with a possible code-layout/icache
+  contribution. Not shippable on a measured `/1024` regression regardless of cause. RETRY CONDITION:
+  re-run baseline+candidate on an *idle/dedicated* worker measuring `/1024` in isolation (or reorder
+  groups so `/1024` is measured first); ship only if the improvement is uniform. Low priority — the
+  absolute win is ~30 ns on a sub-microsecond op. LESSON: on a shared contended worker, a
+  monotonic-with-measurement-order delta (early groups better, late groups worse) is a contention
+  tell, not a real code effect — but you still cannot ship a measured regression; re-measure clean or
+  reject.
+
+## 2026-07-16 - REJECT: stack-back integer TEXT-affinity coercion (`apply_affinity(Text)`)
+
+- Target: `SqliteValue::apply_affinity(TypeAffinity::Text)` for an `Integer` (crates/fsqlite-types
+  value.rs ~716) did `let t = self.to_text(); SmallText::from_string(t)` — `i.to_string()` allocates a
+  heap `String` that `SmallText` (23-byte inline cap) then inlines and frees. This is a hot path
+  (every numeric inserted into a TEXT-affinity column + `CAST(int AS TEXT)`). Candidate: render the
+  i64 into a fixed 24-byte stack buffer via a `StackStr` (`fmt::Write`) + `write!(buf, "{i}")` +
+  `SmallText::new` — the same transient-heap→stack lever that won for date/time (`6f77194f`).
+  Byte-identity locked (a passing `int_to_small_text_matches_to_string` test vs `i.to_string()`).
+- Same-binary A/B (release-perf, `-p fsqlite-types --lib`, 1000 ints/iter):
+  `coerce OLD (to_string + from_string)` `65,448 ns` -> `coerce NEW (int_to_small_text)` `71,392 ns`
+  — **~9% SLOWER (a regression), not a win**.
+- Result: REJECT (reverted; nothing shipped). ROOT CAUSE: `i.to_string()` is a SPECIALIZED integer
+  formatter (fast), and the small-`String` allocation is POOLED (`VALUE_POOL_CAP = 256` in value.rs,
+  so malloc/free is nearly free). Replacing it with `write!(StackStr, "{i}")` pays the general
+  `core::fmt::Arguments` machinery cost, which EXCEEDS the (pooled, cheap) allocation it removes.
+  **KEY RULE for the transient-heap→stack vein: it only wins when the OLD path ALREADY uses the
+  general `format!` machinery — then stack-backing merely removes the malloc (date/time won: OLD used
+  `format!`). For `x.to_string()` (a specialized fast path) plus a POOLED small allocation, routing
+  through `write!` is a NET LOSS. To ever win integer→text you'd need a specialized stack itoa (not
+  `write!`) AND an un-pooled allocation — not worth it here.** Do NOT retry the float case the same
+  way (`format_sqlite_float` already uses the general render path, so it MIGHT win — but it has a
+  second `Vec` alloc in `sqlite_float_decode`; measure before trusting). Unrelated:
+  `opcode::tests::opcode_count` (opcode.rs) was already failing on the worker, not caused by this.
+
+## 2026-07-16 - MAP: accessible one-turn perf-lever space is EXHAUSTED (single-lever micro-opt campaign done)
+
+A consolidated finding after an extended single-lever campaign (many landed wins + several
+ledgered rejects across codegen, VDBE, and fsqlite-func). The remaining perf work does NOT fit
+"one lever, one turn"; this map exists so future cycles don't re-hunt the mined-out areas.
+
+- MINED OUT (no clean one-turn lever remains):
+  - CODEGEN access-path seeks — rowid eq/range/IN [+residual, +coerced param], index eq/range/prefix,
+    MIN/MAX index/pair/range/prefix, count, aggregate; all seek params via `is_simple_constant` /
+    `is_rowid_range_constant`. The coerced-rowid-eq family is complete across count/agg/SELECT/DML.
+  - VDBE micro-opcodes (`try_execute_hot_opcode` / register writes) — the in-place `set_reg_int`
+    family (Copy/SCopy/Variable/arith/Divide) is done; the ratio decays with per-op compute and the
+    rest sit BELOW this shared/contended fleet's ~10% measurement floor (NotNull promotion rejected).
+  - TRANSIENT-heap→stack — Soundex (`39ecd321`) + date/time (`6f77194f`) landed (~1.5-1.6×). The
+    rule (see the 2026-07-16 REJECT entry): only wins when OLD uses `format!` machinery over a
+    NON-pooled alloc. Integer coercion REGRESSED (specialized `to_string` + pooled alloc). `strftime`
+    is NOT a transient-heap target (results often > 23 bytes via user format literals -> not inlined;
+    `%J` uses `result.pop()`). `format_sqlite_float` is win-eligible but a MULTI-alloc
+    (`decimal.to_string()` + mutated `digits: Vec` with front-`insert` + render `String`) refactor of
+    fiddly rounding code in the core crate -> chartered-size, not one turn.
+  - LIKE/GLOB-prefix->range, the vectorized-batch path (NOT wired into engine.rs -> zero real EV).
+- REMAINING PERF = CHARTERED / STRUCTURAL (multi-turn, mostly gated): Track S union-style register
+  file to kill Arc refcounting on the hot path (`bd-i9sov`, P0 — ~50ns/5-col-row of atomic
+  refcounting); JIT/Cranelift (`bd-lezm3`, `bd-87bp2`); parallel SELECT (`bd-b434d`); arena for MVCC
+  publish (`bd-8euyp`); the `bd-5310l` 65× parse+plan gap (its own note: residual is systemic
+  MVCC/pager, micro-lever campaign done); `bd-1dp9.6.2` optimization-sprint umbrella (heavy
+  isomorphism-proof + structured-logging contract). The one medium refactor a future turn could take
+  as a real (measured) lever: full `format_sqlite_float` stack-back (both `Vec` and `String`), floats
+  common in CAST/concat/quote — but MEASURE (pooled-alloc + machinery-overhead risk per the rule).
+- Recommendation: a "take ONE perf bead" cycle should now either (a) commit to one chartered
+  project's first sub-step (e.g. `bd-b3yw2` S1 RegisterValue for Track S), or (b) do a genuinely
+  new profile run (`fsqlite/tests/execute_body_split.rs` + samply) to surface a fresh hotspot — the
+  reason-from-code single-lever seam is dry.
+
+## 2026-07-16 - PROFILE FINDING: the bd-5310l 295x INSERT gap is O(n^2) SECONDARY-INDEX insert, not parse+plan (bd-aoj0g)
+
+Took the "run a fresh profile" recommendation. Built an ephemeral phase-attribution + index-isolation
+profile of ad-hoc INSERTs into `:memory:` (one txn) using `hot_path_profile_snapshot()`. Result
+CORRECTS bd-5310l's parse+plan framing for INSERT:
+- At ~10k rows: `execute_body` = 195090 ns/insert (83% of the 234419 wall); `parser.parse`+`compile`
+  only ~14 us (~6%); commit/finalize amortized ~0; all inserts hit the prepared insert fast lane.
+- INDEX ISOLATION (with vs without the secondary index `idx_t_k on t(k)`, same 10k-row depth):
+  NO index `execute_body` = 4837 ns/insert (~5 us, near C SQLite); WITH index = 187784 ns/insert.
+  => secondary-index maintenance = ~182947 ns/insert = **97% of INSERT execute_body**.
+- SCALING: per-insert grows 84 us (empty) -> 216 us (10k rows) then plateaus => the index insert is
+  **O(n) per row / O(n^2) total** (scales with index size). Base table (sequential IPK) insert is fine.
+- Path (real `:memory:` btree, NOT the test-only `MockBtreeCursor`): `BtCursor<MemPageStore>`
+  `index_insert` (`crates/fsqlite-btree/src/cursor.rs:10415`) -> `index_seek_for_insert` +
+  `with_btree_op(BtreeOpType::Insert)`.
+- Result: FILED bd-aoj0g (P1). This is the single biggest INSERT perf lever found and directly targets
+  the 295x gap; the exact O(n) op needs sub-profiling (seek O(block)/O(run) walk per
+  bd-seek-partial-key-oblock-kwdxa? MVCC/COW copy of a growing structure per insert? index-root
+  version-chain growth?) — deferred to bd-aoj0g as dedicated btree work, not a one-turn blind fix.
+  LESSON: when the reason-from-code seam is dry, a real phase+isolation profile finds levers the code
+  reading missed — here a 97%-of-cost O(n^2) hotspot that was mis-attributed to parse+plan.
+
+## 2026-07-16 - REJECT: singleton-object direct key comparison in JSON path resolution (`bd-vv2kf.1`)
+
+- Target: `crates/fsqlite-ext-json/src/lib.rs::resolve_path`, measured by
+  `tests::perf_json_extract_deep_single_path` (200,000 `json_extract` calls per repeat, five repeats,
+  path `$.a.b.c.d[1].e` through four singleton objects). This was a fresh-subsystem pivot after the
+  codegen/VDBE/fsqlite-func one-turn map above. A release-profile `perf` run on `vmi1156319` sampled
+  `resolve_path` (0.87%), `IndexMap::get_index_of::<str>` (0.63%), and key hashing
+  (`DefaultHasher::finish` 1.20%, SipHasher write 1.03%, `RandomState::hash_one` 0.60%), behind the
+  dominant JSON parse/deserialization work.
+- Lever: for a `serde_json::Value::Object` with exactly one entry, compare the sole key directly and
+  reuse its value instead of hashing through `Map::get`; retain `Map::get` for larger objects. The
+  same helper covered quoted and unquoted object-key path segments. The candidate and temporary A/B
+  selector were fully reverted after measurement.
+- Foreground same-binary A/B on remote worker `vmi1152480` (RCH job
+  `j-29933730227290855`), `cargo test -p fsqlite-ext-json --lib --profile release` with
+  `profile.release.lto=false`, five paired repeats with old/new order alternated and medians reported:
+  baseline `380,698,300 ns`, candidate `381,800,934 ns`, candidate/baseline **`1.002896` (0.29%
+  slower)**. The cold compilation was outside the target-runner measurement cap; both variants ran in
+  one test binary, and both returned `Integer(456)`.
+- Result: REJECT (not shipped). The direct comparison does not clear even a sub-percent noise floor,
+  while adding a branch to every object step; parsing dominates this end-to-end workload. RETRY only
+  for a benchmark/API that reuses an already-parsed `Value` across many path resolutions, where object
+  lookup is independently shown to dominate. Do not retry on ordinary `json_extract`, which reparses
+  its input on each invocation.
+
+## 2026-07-16 - PROFILE (bd-aoj0g pinpoint): the O(n²) INSERT is NOT the btree cell ops — it is seek/witness/opcode
+
+Counter profile of the bd-aoj0g O(n²) secondary-index insert (debug build, btree metrics ENABLED via
+`set_btree_metrics_enabled` + `set_btree_copy_profile_enabled`; per-1000-insert batch at rising table
+size). DISPROVES the earlier slow-balance hypothesis:
+- Every btree CELL-OP counter is FLAT: `page_splits` ~0.004/insert (constant), `local_payload_copy_bytes`
+  0, `index_leaf_cell_assembly_bytes` 7 (constant), `interior_cell_rebuild_bytes` 0;
+  `conservative_reload_fallbacks` DECREASES with scale (0.79→0.14); `no_split_reuse_hits` rises to 0.87.
+- Yet wall grows ~linearly: 89 µs (empty) → 473 µs (9k rows), debug = **+43 ns per EXISTING row** (O(n)
+  per insert; extrapolates to the 295× gap at 100k).
+- So the O(n) is NOT btree cell insertion/split/balance/copy — it is in the SEEK / MVCC-witness /
+  IdxInsert-opcode layer. Prime suspect: `index_seek_for_insert` → `record_point_witness` →
+  `self.read_witnesses.push` (cursor.rs:2661/2681, `read_witnesses: Vec` at 1931) on EVERY index seek,
+  plus mvcc `hot_witness_index` push-accumulation; and the index seek's POOR cache locality (k=i%100
+  jumps 100 subtrees vs the table's sequential rightmost-leaf append — table insert is ~5 µs). 43 ns/row
+  = something touching all-N per insert or a cache-miss ramp.
+- Status: bd-aoj0g advanced + handed back to open with full counter data in its comments. NEXT: sub-time
+  the IdxInsert opcode (seek vs witness-record vs cell-insert) with direct `Instant` timers, or re-profile
+  with witness recording disabled / high-cardinality k (unique) to separate witness-O(n) from
+  locality-ramp. INFRA: enable btree counters (`set_btree_metrics_enabled`/`set_btree_copy_profile_enabled`)
+  — they are gated OFF by default and silently read zero otherwise; debug build is fine (counters are
+  opt-level-independent) and compiles faster than release-perf.

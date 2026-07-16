@@ -273,6 +273,12 @@ fn column_exists_ignore_case(columns: &[String], name: &str) -> bool {
     columns.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
 
+/// Match canonical spellings through `str` equality before paying for ASCII folding.
+#[inline]
+fn identifier_eq(left: &str, right: &str) -> bool {
+    left == right || left.eq_ignore_ascii_case(right)
+}
+
 fn qualifier_matches_table(qualifier: &str, table_name: &str, table_alias: Option<&str>) -> bool {
     qualifier.eq_ignore_ascii_case(table_name)
         || table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
@@ -1761,7 +1767,7 @@ fn best_access_path_internal(
 
     // Check each index for usability.
     for idx in indexes {
-        if !idx.table.eq_ignore_ascii_case(&table.name) {
+        if !identifier_eq(&idx.table, &table.name) {
             continue;
         }
         if not_indexed {
@@ -1812,7 +1818,7 @@ fn best_access_path_internal(
             needed.iter().all(|column| {
                 idx.columns
                     .iter()
-                    .any(|index_column| index_column.eq_ignore_ascii_case(column))
+                    .any(|index_column| identifier_eq(index_column, column))
                     // Ordinary SQLite indexes carry the rowid payload, so
                     // rowid projections remain index-only even if the rowid
                     // alias is not listed in idx.columns.
@@ -2725,14 +2731,14 @@ fn find_rowid_equality_term<'terms, 'expr>(
         .find(|term| where_term_matches_rowid_equality(table_name, term, rowid_alias_hints))
 }
 
-fn find_rowid_range_column(
+fn find_rowid_range_column<'a>(
     table_name: &str,
-    terms: &[WhereTerm<'_>],
+    terms: &'a [WhereTerm<'_>],
     rowid_alias_hints: &[RowidAliasHint],
-) -> Option<String> {
+) -> Option<&'a str> {
     terms.iter().find_map(|term| {
         where_term_matches_rowid_range(table_name, term, rowid_alias_hints)
-            .then(|| term.column.as_ref().map(|column| column.column.clone()))
+            .then(|| term.column.as_ref().map(|column| column.column.as_str()))
             .flatten()
     })
 }
@@ -2773,13 +2779,13 @@ fn extract_access_path_probe_with_rowid_aliases(
             let index_name = best.index.as_deref()?;
             let idx = indexes
                 .iter()
-                .find(|i| i.name.eq_ignore_ascii_case(index_name))?;
+                .find(|i| identifier_eq(&i.name, index_name))?;
             let leading_col = idx.columns.first()?;
             if let Some(term) = where_terms.iter().find(|t| {
                 matches!(t.kind, WhereTermKind::Equality)
                     && t.column
                         .as_ref()
-                        .is_some_and(|c| c.column.eq_ignore_ascii_case(leading_col))
+                        .is_some_and(|c| identifier_eq(&c.column, leading_col))
             }) {
                 let target = extract_comparison_operand(term.expr)?;
                 return Some(AccessPathProbe::Equality {
@@ -2791,7 +2797,7 @@ fn extract_access_path_probe_with_rowid_aliases(
                 matches!(t.kind, WhereTermKind::InList { .. })
                     && t.column
                         .as_ref()
-                        .is_some_and(|c| c.column.eq_ignore_ascii_case(leading_col))
+                        .is_some_and(|c| identifier_eq(&c.column, leading_col))
             }) {
                 return extract_in_list_probe(term.expr, leading_col);
             }
@@ -2801,12 +2807,12 @@ fn extract_access_path_probe_with_rowid_aliases(
             if best.index.is_none() {
                 let leading_col =
                     find_rowid_range_column(&best.table, where_terms, rowid_alias_hints)?;
-                return extract_range_probe_for_column(where_terms, &leading_col);
+                return extract_range_probe_for_column(where_terms, leading_col);
             }
             let index_name = best.index.as_deref()?;
             let idx = indexes
                 .iter()
-                .find(|i| i.name.eq_ignore_ascii_case(index_name))?;
+                .find(|i| identifier_eq(&i.name, index_name))?;
             let leading_col = idx.columns.first()?;
             extract_range_probe_for_column(where_terms, leading_col)
         }
@@ -2821,7 +2827,7 @@ fn extract_range_probe_for_column(
     let mut upper: Option<(Box<Expr>, bool)> = None;
     for term in where_terms {
         let col = match &term.column {
-            Some(c) if c.column.eq_ignore_ascii_case(leading_col) => c,
+            Some(c) if identifier_eq(&c.column, leading_col) => c,
             _ => continue,
         };
         if matches!(term.kind, WhereTermKind::Equality) {
@@ -3094,11 +3100,11 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
     // the table qualifier when present.  Unqualified columns (table = None)
     // are conservatively considered matching.
     let col_matches = |wc: &WhereColumn, idx_col: &str| -> bool {
-        wc.column.eq_ignore_ascii_case(idx_col)
+        identifier_eq(&wc.column, idx_col)
             && wc
                 .table
                 .as_ref()
-                .is_none_or(|t| t.eq_ignore_ascii_case(&index.table))
+                .is_none_or(|t| identifier_eq(t, &index.table))
     };
 
     let mut column_summaries = vec![IndexColumnTermSummary::default(); index.columns.len()];
@@ -6624,6 +6630,13 @@ mod tests {
         assert!(column_exists_ignore_case(&cols, "AGE"));
         assert!(!column_exists_ignore_case(&cols, "id")); // absent
         assert!(!column_exists_ignore_case(&[], "name")); // empty list
+    }
+
+    #[test]
+    fn test_identifier_eq_preserves_ascii_case_insensitivity() {
+        assert!(identifier_eq("users", "users"));
+        assert!(identifier_eq("USERS", "users"));
+        assert!(!identifier_eq("users", "orders"));
     }
 
     #[test]

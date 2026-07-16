@@ -251,6 +251,219 @@ fn index_delete_reinsert_overflow_stays_intact() {
     churn_delete_reinsert_with_overflow(env_i64("Q37EP_ROWS", 8_000), env_i64("Q37EP_ROUNDS", 16));
 }
 
+/// GH#132 field reports consistently localize committed damage to a composite
+/// UNIQUE autoindex after duplicate errors and caller-side typed recovery. This
+/// bounded, deterministic workload does not claim to reproduce either private
+/// historical artifact; it freezes the public mutation shape against current
+/// main, including reopen/checkpoint boundaries and freelist reuse.
+fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
+    const SEED: u64 = 0x132D_57A9;
+    const CYCLES: i64 = 8;
+    const ROWS_PER_CYCLE: i64 = 80;
+    const RECYCLE_ROWS: i64 = 20;
+
+    let dir = TempDir::new().expect("create GH#132 tempdir");
+    let db_path = dir.path().join(format!("gh132-{journal_mode}.db"));
+    let path = db_path.to_string_lossy().into_owned();
+
+    for cycle in 0..CYCLES {
+        {
+            let conn = fsqlite::Connection::open(path.clone()).unwrap_or_else(|error| {
+                panic!("GH#132 seed={SEED:#x} cycle={cycle}: reopen failed: {error}")
+            });
+            if cycle == 0 {
+                conn.execute("PRAGMA page_size=512")
+                    .expect("set tiny page size before schema creation");
+            }
+            conn.execute(&format!("PRAGMA journal_mode='{journal_mode}'"))
+                .unwrap_or_else(|error| {
+                    panic!("GH#132 seed={SEED:#x} cycle={cycle}: set journal mode failed: {error}")
+                });
+            if cycle == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE conversations (
+                         id INTEGER PRIMARY KEY,
+                         source_id TEXT NOT NULL,
+                         agent_id INTEGER NOT NULL,
+                         external_id TEXT NOT NULL,
+                         title TEXT NOT NULL,
+                         UNIQUE(source_id, agent_id, external_id)
+                     );",
+                )
+                .expect("create GH#132 composite UNIQUE schema");
+            }
+
+            for offset in 0..ROWS_PER_CYCLE {
+                let operation = cycle * ROWS_PER_CYCLE + offset;
+                let id = operation + 1;
+                let source = (operation * 37 + i64::try_from(SEED & 0xff).unwrap()) % 29;
+                let agent = (operation * 17 + 3) % 11;
+                let external = format!("external-{operation:06}");
+                conn.execute(&format!(
+                    "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
+                     VALUES({id},'source-{source:02}',{agent},'{external}','title-{operation:06}')"
+                ))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: insert failed: {error}"
+                    )
+                });
+
+                if offset % 4 == 0 {
+                    let duplicate_id = 900_000 + operation;
+                    let duplicate_error = conn
+                        .execute(&format!(
+                            "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
+                             VALUES({duplicate_id},'source-{source:02}',{agent},'{external}','duplicate')"
+                        ))
+                        .expect_err("composite UNIQUE duplicate must be rejected");
+                    assert!(
+                        matches!(
+                            duplicate_error,
+                            fsqlite::FrankenError::UniqueViolation { .. }
+                        ),
+                        "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                         duplicate must return typed UniqueViolation, got {duplicate_error:?}"
+                    );
+
+                    let recovered = conn
+                        .query(&format!(
+                            "SELECT id FROM conversations \
+                             WHERE source_id='source-{source:02}' \
+                               AND agent_id={agent} AND external_id='{external}'"
+                        ))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                                 typed recovery lookup failed: {error}"
+                            )
+                        });
+                    assert_eq!(
+                        recovered
+                            .first()
+                            .and_then(|row| row.values().first())
+                            .cloned(),
+                        Some(SqliteValue::Integer(id)),
+                        "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                         typed recovery must find the pre-existing row"
+                    );
+                    conn.execute(&format!(
+                        "UPDATE conversations SET title='recovered-{operation:06}' WHERE id={id}"
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                             recovery merge failed: {error}"
+                        )
+                    });
+                }
+            }
+
+            if cycle >= 2 {
+                let retired_cycle = cycle - 2;
+                let retired_start = retired_cycle * ROWS_PER_CYCLE + 1;
+                let retired_end = retired_start + RECYCLE_ROWS - 1;
+                conn.execute(&format!(
+                    "DELETE FROM conversations WHERE id BETWEEN {retired_start} AND {retired_end}"
+                ))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "GH#132 seed={SEED:#x} cycle={cycle}: freelist-producing delete failed: {error}"
+                    )
+                });
+
+                for replacement in 0..RECYCLE_ROWS {
+                    let replacement_id = 1_000_000 + cycle * RECYCLE_ROWS + replacement;
+                    conn.execute(&format!(
+                        "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
+                         VALUES({replacement_id},'recycled-{cycle:02}',{},
+                                'replacement-{cycle:02}-{replacement:03}','replacement')",
+                        replacement % 11
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "GH#132 seed={SEED:#x} cycle={cycle} replacement={replacement}: \
+                             freelist reuse insert failed: {error}"
+                        )
+                    });
+                }
+            }
+
+            if journal_mode == "WAL" && cycle % 2 == 1 {
+                conn.query("PRAGMA wal_checkpoint(PASSIVE)")
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "GH#132 seed={SEED:#x} cycle={cycle}: WAL checkpoint failed: {error}"
+                        )
+                    });
+            }
+            quick_check(&conn).unwrap_or_else(|error| {
+                panic!("GH#132 seed={SEED:#x} cycle={cycle}: fsqlite quick_check failed: {error}")
+            });
+        }
+
+        let stock = rusqlite::Connection::open(&path).unwrap_or_else(|error| {
+            panic!("GH#132 seed={SEED:#x} cycle={cycle}: stock reopen failed: {error}")
+        });
+        let quick: String = stock
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap_or_else(|error| {
+                panic!("GH#132 seed={SEED:#x} cycle={cycle}: stock quick_check failed: {error}")
+            });
+        assert_eq!(
+            quick, "ok",
+            "GH#132 seed={SEED:#x} cycle={cycle}: stock quick_check detected committed damage"
+        );
+    }
+
+    let stock = rusqlite::Connection::open(&path).expect("final stock reopen");
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("final stock integrity_check");
+    assert_eq!(
+        integrity, "ok",
+        "GH#132 seed={SEED:#x}: stock integrity_check detected committed damage"
+    );
+
+    fn collect_rows(
+        conn: &rusqlite::Connection,
+        from_clause: &str,
+    ) -> Vec<(String, i64, String, i64)> {
+        let sql = format!(
+            "SELECT source_id,agent_id,external_id,id FROM {from_clause} \
+             ORDER BY source_id,agent_id,external_id,id"
+        );
+        let mut statement = conn.prepare(&sql).expect("prepare stock comparison");
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query stock comparison")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect stock comparison")
+    }
+
+    let via_table = collect_rows(&stock, "conversations NOT INDEXED");
+    let via_index = collect_rows(
+        &stock,
+        "conversations INDEXED BY sqlite_autoindex_conversations_1",
+    );
+    assert_eq!(
+        via_index, via_table,
+        "GH#132 seed={SEED:#x}: composite UNIQUE index traversal diverged from table traversal"
+    );
+}
+
+#[test]
+fn composite_unique_duplicate_recovery_wal_stays_stock_canonical() {
+    composite_unique_duplicate_recovery_churn("WAL");
+}
+
+#[test]
+fn composite_unique_duplicate_recovery_rollback_stays_stock_canonical() {
+    composite_unique_duplicate_recovery_churn("DELETE");
+}
+
 /// Deep-tree variant: a tiny `page_size` (512) under WAL forces the index
 /// B-tree to many interior levels with only a few thousand rows, so every
 /// churn round drives interior-page splits/merges at multiple levels — the

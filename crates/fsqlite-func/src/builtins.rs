@@ -629,21 +629,19 @@ pub struct TrimFunc;
 pub struct LtrimFunc;
 pub struct RtrimFunc;
 
-fn trim_chars(s: &str, chars: &str) -> String {
+fn trim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     let char_set: Vec<char> = chars.chars().collect();
-    s.trim_matches(|c: char| char_set.contains(&c)).to_owned()
+    s.trim_matches(|c: char| char_set.contains(&c))
 }
 
-fn ltrim_chars(s: &str, chars: &str) -> String {
+fn ltrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     let char_set: Vec<char> = chars.chars().collect();
     s.trim_start_matches(|c: char| char_set.contains(&c))
-        .to_owned()
 }
 
-fn rtrim_chars(s: &str, chars: &str) -> String {
+fn rtrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     let char_set: Vec<char> = chars.chars().collect();
     s.trim_end_matches(|c: char| char_set.contains(&c))
-        .to_owned()
 }
 
 impl ScalarFunction for TrimFunc {
@@ -657,9 +655,10 @@ impl ScalarFunction for TrimFunc {
         } else {
             Cow::Borrowed(" ")
         };
-        Ok(SqliteValue::Text(SmallText::new(
-            trim_chars(s.as_ref(), chars.as_ref()).as_str(),
-        )))
+        Ok(SqliteValue::Text(SmallText::new(trim_chars(
+            s.as_ref(),
+            chars.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -690,9 +689,10 @@ impl ScalarFunction for LtrimFunc {
         } else {
             Cow::Borrowed(" ")
         };
-        Ok(SqliteValue::Text(SmallText::new(
-            ltrim_chars(s.as_ref(), chars.as_ref()).as_str(),
-        )))
+        Ok(SqliteValue::Text(SmallText::new(ltrim_chars(
+            s.as_ref(),
+            chars.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -723,9 +723,10 @@ impl ScalarFunction for RtrimFunc {
         } else {
             Cow::Borrowed(" ")
         };
-        Ok(SqliteValue::Text(SmallText::new(
-            rtrim_chars(s.as_ref(), chars.as_ref()).as_str(),
-        )))
+        Ok(SqliteValue::Text(SmallText::new(rtrim_chars(
+            s.as_ref(),
+            chars.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -1545,9 +1546,9 @@ impl ScalarFunction for SoundexFunc {
             return Ok(SqliteValue::Text(SmallText::new("?000")));
         }
         let s = text_arg(&args[0]);
-        Ok(SqliteValue::Text(SmallText::from_string(soundex(
-            s.as_ref(),
-        ))))
+        let code = soundex(s.as_ref());
+        let text = std::str::from_utf8(&code).expect("Soundex output must be ASCII");
+        Ok(SqliteValue::Text(SmallText::new(text)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1559,45 +1560,44 @@ impl ScalarFunction for SoundexFunc {
     }
 }
 
-fn soundex(s: &str) -> String {
+fn soundex(s: &str) -> [u8; 4] {
     let mut chars = s.chars().filter(|c| c.is_ascii_alphabetic());
     let first = match chars.next() {
         Some(c) => c.to_ascii_uppercase(),
-        None => return "?000".to_owned(),
+        None => return *b"?000",
     };
 
-    let code = |c: char| -> Option<char> {
+    let code = |c: char| -> Option<u8> {
         match c.to_ascii_uppercase() {
-            'B' | 'F' | 'P' | 'V' => Some('1'),
-            'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => Some('2'),
-            'D' | 'T' => Some('3'),
-            'L' => Some('4'),
-            'M' | 'N' => Some('5'),
-            'R' => Some('6'),
+            'B' | 'F' | 'P' | 'V' => Some(b'1'),
+            'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => Some(b'2'),
+            'D' | 'T' => Some(b'3'),
+            'L' => Some(b'4'),
+            'M' | 'N' => Some(b'5'),
+            'R' => Some(b'6'),
             _ => None, // A, E, I, O, U, H, W, Y
         }
     };
 
-    let mut result = String::with_capacity(4);
-    result.push(first);
+    let mut result = *b"0000";
+    result[0] = first as u8;
+    let mut result_len = 1;
     let mut last_code = code(first);
 
     for c in chars {
-        if result.len() >= 4 {
+        if result_len >= result.len() {
             break;
         }
         let current = code(c);
         if let Some(digit) = current {
             if current != last_code {
-                result.push(digit);
+                result[result_len] = digit;
+                result_len += 1;
             }
         }
         last_code = current;
     }
 
-    while result.len() < 4 {
-        result.push('0');
-    }
     result
 }
 

@@ -2997,6 +2997,15 @@ fn codegen_select_rowid_lookup(
         0,
     );
     emit_set_snapshot(b, cursor, time_travel);
+    // Coerce a non-integer-literal rowid key (placeholder / real / text) to INTEGER affinity before the
+    // seek: a non-exact key (2.5 / 'abc' / NULL) rejects to `done_label` (empty result) instead of raw
+    // `SeekRowid` TRUNCATING it to a wrong rowid (e.g. `WHERE id = 2.5` must not match rowid 2). Emitted
+    // after `OpenRead` so `done_label`'s Close sees an open cursor, mirroring `SeekRowid`'s own miss jump.
+    // An integer literal is already exact -> no MustBeInt (byte-identical to the pre-existing callers).
+    // Same coercion the count_star / aggregate rowid-eq paths use (bd-count/agg-rowid-eq-coerced).
+    if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
+        b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, done_label, P4::None, 0);
+    }
     b.emit_jump_to_label(
         Opcode::SeekRowid,
         cursor,
@@ -5382,7 +5391,17 @@ fn codegen_select_count_star(
         && let Some(values) = extract_rowid_in_list_target(where_clause, table, table_alias)
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &values, None, false,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &values,
+            None,
+            false,
         );
         return Ok(());
     }
@@ -5397,7 +5416,17 @@ fn codegen_select_count_star(
         && let Expr::Literal(Literal::Integer(value), _) = target
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &[*value], None, false,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &[*value],
+            None,
+            false,
         );
         return Ok(());
     }
@@ -5422,7 +5451,16 @@ fn codegen_select_count_star(
             extract_rowid_in_list_residual_target(where_clause, table, table_alias)
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &values, where_clause,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &values,
+            where_clause,
             true,
         );
         return Ok(());
@@ -5435,7 +5473,16 @@ fn codegen_select_count_star(
         && let Expr::Literal(Literal::Integer(value), _) = target
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &[*value], where_clause,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &[*value],
+            where_clause,
             true,
         );
         return Ok(());
@@ -5630,11 +5677,17 @@ fn codegen_select_count_star_rowid_in(
             P4::None,
             0,
         );
-        if residual_filter
-            && let Some(where_expr) = where_clause
-        {
+        if residual_filter && let Some(where_expr) = where_clause {
             b.set_next_anon_placeholder(where_placeholder_base);
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
+            );
         }
         b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
         b.resolve_label(skip_label);
@@ -12427,8 +12480,13 @@ fn codegen_select_aggregate(
         && index_eq_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
+        // bd-agg-rowid-eq-coerced: accept any simple constant (placeholder / real /
+        // text as well as an integer literal), not just an integer literal.
+        // `extract_rowid_target_expr` already requires `is_simple_constant`; the
+        // emission coerces a non-integer-literal bound with `MustBeInt` so 2.5 /
+        // 'abc' / NULL reject to the empty result instead of `SeekRowid` truncating
+        // them to a wrong rowid. Enables the seek for the prepared `WHERE rowid = ?`.
         extract_rowid_target_expr(where_clause, Some(table), table_alias)
-            .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
     } else {
         None
     };
@@ -12750,10 +12808,11 @@ fn codegen_select_aggregate(
         b.set_next_anon_placeholder(where_placeholder_base);
     } else if let Some(rowid_rhs) = rowid_eq_seek {
         // bd-2dgf5 rowid point lookup: seek the single row and accumulate it. A
-        // `SeekRowid` miss (or NULL / non-integer key) jumps straight to finalize, where
-        // the still-Null accumulators produce COUNT=0 / SUM=NULL — the exact empty-scan
-        // result. No duplicate-run loop and no scan fallback: rowid is unique and the
-        // integer-literal gate makes the seek exact, so the full scan is skipped.
+        // `SeekRowid` miss (or a `MustBeInt`-rejected non-exact key) jumps straight to
+        // finalize, where the still-Null accumulators produce COUNT=0 / SUM=NULL — the
+        // exact empty-scan result. No duplicate-run loop and no scan fallback: rowid is
+        // unique and `MustBeInt` (below) makes a non-integer-literal key exact-or-reject,
+        // so the full scan is skipped.
         b.emit_op(
             Opcode::OpenRead,
             cursor,
@@ -12764,6 +12823,15 @@ fn codegen_select_aggregate(
         );
         let rowid_reg = b.alloc_reg();
         emit_expr(b, rowid_rhs, rowid_reg, None);
+        // bd-agg-rowid-eq-coerced: coerce a non-integer-literal bound (placeholder /
+        // real / text) to INTEGER affinity before the seek; a non-exact key (2.5 /
+        // 'abc' / NULL) jumps to finalize (still-Null accumulators -> COUNT=0 /
+        // SUM=NULL, the exact empty result), while '5' / 5.0 coerce to 5. An integer
+        // literal is already exact -> no MustBeInt (byte-identical to the pre-existing
+        // integer-literal callers, golden snapshots unchanged).
+        if !matches!(rowid_rhs, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, finalize_label, P4::None, 0);
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             cursor,
@@ -13460,11 +13528,17 @@ fn codegen_select_aggregate(
                 P4::None,
                 0,
             );
-            if has_residual
-                && let Some(where_expr) = where_clause
-            {
+            if has_residual && let Some(where_expr) = where_clause {
                 b.set_next_anon_placeholder(where_placeholder_base);
-                emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_label,
+                );
             }
             emit_aggregate_accumulate_body(
                 b,
@@ -13501,7 +13575,15 @@ fn codegen_select_aggregate(
             0,
         );
         if let Some(where_expr) = where_clause {
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, finalize_label);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                finalize_label,
+            );
         }
         emit_aggregate_accumulate_body(
             b,
@@ -17837,6 +17919,13 @@ pub fn codegen_update(
         matched_rowid_reg = b.alloc_reg();
         b.set_next_anon_placeholder(set_placeholder_count + 1);
         emit_expr(b, target_expr, matched_rowid_reg, None);
+        // Coerce a non-integer-literal rowid key (placeholder / real / text) to INTEGER affinity: a
+        // non-exact key (2.5 / 'abc' / NULL) rejects to `apply_done_label` (no row updated) instead of
+        // raw `SeekRowid` TRUNCATING it to a wrong rowid (`WHERE id = 2.5` must not update row 2).
+        // Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the DELETE / SELECT paths.
+        if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_jump_to_label(Opcode::MustBeInt, matched_rowid_reg, 0, apply_done_label, P4::None, 0);
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
@@ -19320,6 +19409,14 @@ pub fn codegen_delete(
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
+        // Coerce a non-integer-literal rowid key (placeholder / real / text) to INTEGER affinity: a
+        // non-exact key (2.5 / 'abc' / NULL) rejects to `collect_done_label` (nothing collected -> no
+        // delete) instead of raw `SeekRowid` TRUNCATING it to a wrong rowid (`WHERE id = 2.5` must not
+        // delete row 2). Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the SELECT
+        // rowid lookup + count/aggregate coerced seeks.
+        if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, collect_done_label, P4::None, 0);
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
@@ -25370,6 +25467,47 @@ fn try_emit_column_substr_prefix(
     true
 }
 
+fn try_emit_column_octet_length(
+    b: &mut ProgramBuilder,
+    name: &str,
+    arg_list: &[Expr],
+    reg: i32,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !name.eq_ignore_ascii_case("octet_length")
+        || arg_list.len() != 1
+        || ctx.register_base.is_some()
+    {
+        return false;
+    }
+    let Expr::Column(col_ref, _) = &arg_list[0] else {
+        return false;
+    };
+    let Some(col_idx) = resolve_column_in_ctx(col_ref, ctx) else {
+        return false;
+    };
+    if ctx
+        .table
+        .columns
+        .get(col_idx)
+        .is_some_and(|column| column.generated_stored == Some(false))
+    {
+        return false;
+    }
+    let Ok(col_idx) = i32::try_from(col_idx) else {
+        return false;
+    };
+    b.emit_op(
+        Opcode::ColumnOctetLength,
+        ctx.cursor,
+        col_idx,
+        reg,
+        P4::None,
+        0,
+    );
+    true
+}
+
 enum InProbeValue<'a> {
     Expr(&'a Expr),
     FirstColumn,
@@ -26406,7 +26544,8 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
                     if let Some(scan_ctx) = ctx
-                        && try_emit_column_substr_prefix(b, name, arg_list, reg, scan_ctx)
+                        && (try_emit_column_substr_prefix(b, name, arg_list, reg, scan_ctx)
+                            || try_emit_column_octet_length(b, name, arg_list, reg, scan_ctx))
                     {
                         return;
                     }
@@ -28038,8 +28177,10 @@ fn emit_expr_with_fallback(
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
                     if try_emit_column_substr_prefix(b, name, arg_list, reg, inner_ctx)
+                        || try_emit_column_octet_length(b, name, arg_list, reg, inner_ctx)
                         || outer_ctx.is_some_and(|outer| {
                             try_emit_column_substr_prefix(b, name, arg_list, reg, outer)
+                                || try_emit_column_octet_length(b, name, arg_list, reg, outer)
                         })
                     {
                         return;
@@ -33594,6 +33735,88 @@ mod tests {
                 vec![SqliteValue::Blob(Arc::from(&b"ab"[..]))],
             ]
         );
+    }
+
+    #[test]
+    fn test_codegen_select_octet_length_column_uses_record_metadata_opcode() {
+        let stmt = select_sql("SELECT octet_length(name) FROM bench");
+        let schema = test_small_bench_schema();
+        let ctx = CodegenContext::default();
+        let mut builder = ProgramBuilder::new();
+        codegen_select(&mut builder, &stmt, &schema, &ctx).unwrap();
+        let program = builder.finish().unwrap();
+        let ops = opcode_sequence(&program);
+
+        assert!(
+            ops.contains(&Opcode::ColumnOctetLength),
+            "octet_length(column) must inspect record metadata before source materialization"
+        );
+        assert!(
+            !ops.contains(&Opcode::PureFunc),
+            "direct octet length should not decode the source for scalar dispatch"
+        );
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table = db.get_table_mut(2).expect("bench table should exist");
+        for (rowid, value) in [
+            SqliteValue::Text("éclair".into()),
+            SqliteValue::Blob(Arc::from(&b"abcdef"[..])),
+            SqliteValue::Integer(123),
+            SqliteValue::Null,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            table.insert_row(
+                i64::try_from(rowid + 1).unwrap(),
+                vec![
+                    SqliteValue::Integer(i64::try_from(rowid + 1).unwrap()),
+                    value,
+                    SqliteValue::Float(1.0),
+                ],
+            );
+        }
+
+        let results = execute_codegen_select_with_storage_cursor(&stmt, &schema, db);
+        assert_eq!(
+            results,
+            vec![
+                vec![SqliteValue::Integer(7)],
+                vec![SqliteValue::Integer(6)],
+                vec![SqliteValue::Integer(3)],
+                vec![SqliteValue::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_codegen_octet_length_virtual_generated_column_recomputes_value() {
+        let stmt = select_sql("SELECT octet_length(c) FROM t");
+        let schema = test_schema_with_virtual_generated();
+        let ctx = CodegenContext::default();
+        let mut builder = ProgramBuilder::new();
+        codegen_select(&mut builder, &stmt, &schema, &ctx).unwrap();
+        let program = builder.finish().unwrap();
+
+        assert!(
+            !opcode_sequence(&program).contains(&Opcode::ColumnOctetLength),
+            "a VIRTUAL generated column must be recomputed before octet_length"
+        );
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        db.get_table_mut(2).expect("table should exist").insert_row(
+            1,
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(0),
+                SqliteValue::Null,
+            ],
+        );
+
+        let results = execute_codegen_select_with_storage_cursor(&stmt, &schema, db);
+        assert_eq!(results, vec![vec![SqliteValue::Integer(2)]]);
     }
 
     #[test]

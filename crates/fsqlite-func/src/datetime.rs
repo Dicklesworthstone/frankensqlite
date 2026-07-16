@@ -37,7 +37,7 @@ use std::{
 };
 
 use fsqlite_error::Result;
-use fsqlite_types::SqliteValue;
+use fsqlite_types::{SmallText, SqliteValue};
 
 use crate::{FunctionRegistry, ScalarFunction};
 
@@ -715,22 +715,83 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
 
 // ── Output Formatters ─────────────────────────────────────────────────────
 
-fn format_date(jdn: f64) -> String {
-    let (y, m, d) = jdn_to_ymd(jdn);
-    format!("{y:04}-{m:02}-{d:02}")
+/// Fixed-capacity stack `fmt::Write` target. Any date/time output is at most ~26 bytes
+/// (a multi-digit year plus `-MM-DD HH:MM:SS.SSS`), so 48 bytes never overflows for a
+/// valid date; `write_str` returns `Err` on overflow so `build_small_text` can fall back.
+struct StackStr {
+    buf: [u8; 48],
+    len: usize,
 }
 
-fn format_time(jdn: f64, subsec: bool) -> String {
-    let (h, m, s, frac) = jdn_to_hms(jdn);
-    if subsec && frac > 1e-9 {
-        format!("{h:02}:{m:02}:{s:02}.{:03}", (frac * 1000.0).round() as i64)
-    } else {
-        format!("{h:02}:{m:02}:{s:02}")
+impl StackStr {
+    fn new() -> Self {
+        Self {
+            buf: [0; 48],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // Only ASCII digits/separators are ever written, so this is always valid UTF-8.
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 }
 
-fn format_datetime(jdn: f64, subsec: bool) -> String {
-    format!("{} {}", format_date(jdn), format_time(jdn, subsec))
+impl core::fmt::Write for StackStr {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len + s.len();
+        if end > self.buf.len() {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Render `write` into a stack buffer and build an inline `SmallText` (no heap) when it
+/// fits the 23-byte inline capacity — the common case for every real date/time. Falls
+/// back to a heap `String` only when the stack buffer overflows (an absurdly large year),
+/// re-running `write` (hence `Fn`, not `FnOnce`). Mirrors the stack-backed Soundex result
+/// (bd-t2sf9.1): the transient `format!` heap allocation that `SmallText` immediately
+/// inlined is eliminated for the hot path.
+fn build_small_text(write: impl Fn(&mut dyn core::fmt::Write) -> core::fmt::Result) -> SmallText {
+    let mut buf = StackStr::new();
+    if write(&mut buf).is_ok() {
+        SmallText::new(buf.as_str())
+    } else {
+        let mut heap = String::new();
+        let _ = write(&mut heap);
+        SmallText::from_string(heap)
+    }
+}
+
+fn format_date(jdn: f64) -> SmallText {
+    let (y, m, d) = jdn_to_ymd(jdn);
+    build_small_text(move |w| write!(w, "{y:04}-{m:02}-{d:02}"))
+}
+
+fn format_time(jdn: f64, subsec: bool) -> SmallText {
+    let (h, m, s, frac) = jdn_to_hms(jdn);
+    if subsec && frac > 1e-9 {
+        let ms = (frac * 1000.0).round() as i64;
+        build_small_text(move |w| write!(w, "{h:02}:{m:02}:{s:02}.{ms:03}"))
+    } else {
+        build_small_text(move |w| write!(w, "{h:02}:{m:02}:{s:02}"))
+    }
+}
+
+fn format_datetime(jdn: f64, subsec: bool) -> SmallText {
+    let (y, mo, d) = jdn_to_ymd(jdn);
+    let (h, mi, s, frac) = jdn_to_hms(jdn);
+    if subsec && frac > 1e-9 {
+        let ms = (frac * 1000.0).round() as i64;
+        build_small_text(move |w| {
+            write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}")
+        })
+    } else {
+        build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"))
+    }
 }
 
 #[inline]
@@ -1071,7 +1132,7 @@ pub struct DateFunc;
 impl ScalarFunction for DateFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, _)) => Ok(SqliteValue::Text(format_date(jdn).into())),
+            Some((jdn, _)) => Ok(SqliteValue::Text(format_date(jdn))),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -1092,7 +1153,7 @@ pub struct TimeFunc;
 impl ScalarFunction for TimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_time(jdn, subsec).into())),
+            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_time(jdn, subsec))),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -1113,7 +1174,7 @@ pub struct DateTimeFunc;
 impl ScalarFunction for DateTimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_datetime(jdn, subsec).into())),
+            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_datetime(jdn, subsec))),
             None => Ok(SqliteValue::Null),
         }
     }

@@ -6073,6 +6073,19 @@ fn sqlite_substr_prefix_value(value: &SqliteValue, prefix_len: usize) -> SqliteV
     }
 }
 
+fn sqlite_octet_length_value(value: &SqliteValue) -> SqliteValue {
+    if value.is_null() {
+        return SqliteValue::Null;
+    }
+    let len = match value {
+        SqliteValue::Text(text) => text.len(),
+        SqliteValue::Blob(bytes) => bytes.len(),
+        SqliteValue::Integer(_) | SqliteValue::Float(_) => value.to_text().len(),
+        SqliteValue::Null => unreachable!("NULL returned above"),
+    };
+    SqliteValue::Integer(i64::try_from(len).unwrap_or(i64::MAX))
+}
+
 fn sqlite_substr_prefix_text(text: Cow<'_, str>, prefix_len: usize) -> SqliteValue {
     let text = text.as_ref();
     let end = if text.is_ascii() {
@@ -12511,6 +12524,11 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            Opcode::ColumnOctetLength => {
+                self.execute_column_octet_length_hot(op)?;
+                *pc += 1;
+                Ok(true)
+            }
             Opcode::ResultRow => {
                 self.execute_result_row_hot(op, collect_vdbe_metrics, row_handler)?;
                 *pc += 1;
@@ -12611,7 +12629,7 @@ impl VdbeEngine {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);
                 let result = a.sql_add(b);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -12619,7 +12637,7 @@ impl VdbeEngine {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);
                 let result = a.sql_sub(b);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -12627,7 +12645,7 @@ impl VdbeEngine {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);
                 let result = a.sql_mul(b);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -12635,7 +12653,7 @@ impl VdbeEngine {
                 let divisor = self.get_reg(op.p1);
                 let dividend = self.get_reg(op.p2);
                 let result = sql_div(dividend, divisor);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -13259,6 +13277,21 @@ impl VdbeEngine {
 
         let value = self.cursor_column(op.p1, col_idx)?;
         self.set_reg_fast(op.p3, sqlite_substr_prefix_value(&value, prefix_len));
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn execute_column_octet_length_hot(&mut self, op: &VdbeOp) -> Result<()> {
+        let Ok(col_idx) = usize::try_from(op.p2) else {
+            self.set_reg_fast(op.p3, SqliteValue::Null);
+            return Ok(());
+        };
+        if let Some(value) = self.column_octet_length_direct(op.p1, col_idx)? {
+            self.set_reg_fast(op.p3, value);
+            return Ok(());
+        }
+        let value = self.cursor_column(op.p1, col_idx)?;
+        self.set_reg_fast(op.p3, sqlite_octet_length_value(&value));
         Ok(())
     }
 
@@ -14261,6 +14294,23 @@ impl VdbeEngine {
         self.replace_register_value(idx, normalized);
     }
 
+    /// Write an arithmetic result, updating an already-`Integer` register in
+    /// place via `set_reg_int` when the result is an `Integer`. sql_add/sub/mul
+    /// and sql_div return `Integer` only for an exact integer value (overflow
+    /// promotes to `Float`; divide-by-zero yields `Null`), so this is
+    /// byte-identical to `set_reg_fast` while skipping the
+    /// `replace_register_value` buffer swap on the common integer-into-integer
+    /// case. `Float`/`Null` results take the general path.
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
+    fn set_reg_arith_result(&mut self, r: i32, value: SqliteValue) {
+        if let SqliteValue::Integer(v) = value {
+            self.set_reg_int(r, v);
+        } else {
+            self.set_reg_fast(r, value);
+        }
+    }
+
     /// Null-specialized register write used by null-writing opcodes.
     ///
     /// Logical-write bookkeeping must run even when the register is already
@@ -14472,6 +14522,79 @@ impl VdbeEngine {
             | SerialTypeClass::Zero
             | SerialTypeClass::One
             | SerialTypeClass::Reserved => None,
+        };
+
+        if collect_vdbe_metrics && let Some(value) = value.as_ref() {
+            FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            record_decoded_value_metrics(value);
+        }
+        Ok(value)
+    }
+
+    /// Return `octet_length(column)` from record-header metadata when the
+    /// storage class encodes a byte length directly.
+    ///
+    /// This path deliberately requests only enough payload to parse the record
+    /// header. In particular, it must not expand an overflow TEXT/BLOB merely
+    /// to decide whether a higher layer is willing to materialize that value.
+    fn column_octet_length_direct(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+    ) -> Result<Option<SqliteValue>> {
+        let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(None);
+        };
+        if cursor.cursor.eof() {
+            return Ok(Some(SqliteValue::Null));
+        }
+
+        ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
+
+        let ipk_col_idx = cursor.ipk_col_idx;
+        let payload_includes = if let Some(ipk) = ipk_col_idx {
+            if let Some(cached) = cursor.payload_includes_rowid_alias {
+                cached
+            } else {
+                let includes = payload_includes_rowid_alias_without_rowid(
+                    &cursor.row_decode,
+                    ipk,
+                    cursor.table_column_count,
+                    cursor.first_not_null_non_ipk_col,
+                );
+                cursor.payload_includes_rowid_alias = Some(includes);
+                includes
+            }
+        } else {
+            false
+        };
+
+        let payload_idx = if let Some(ipk) = ipk_col_idx {
+            if col_idx == ipk {
+                return Ok(None);
+            }
+            if col_idx > ipk && !payload_includes {
+                col_idx - 1
+            } else {
+                col_idx
+            }
+        } else {
+            col_idx
+        };
+
+        let Some(col) = cursor.row_decode.column_offset(payload_idx) else {
+            return Ok(None);
+        };
+        let value = match classify_serial_type(col.serial_type) {
+            SerialTypeClass::Null | SerialTypeClass::Reserved => Some(SqliteValue::Null),
+            SerialTypeClass::Text | SerialTypeClass::Blob => {
+                Some(SqliteValue::Integer(i64::from(col.value_len)))
+            }
+            SerialTypeClass::Integer
+            | SerialTypeClass::Float
+            | SerialTypeClass::Zero
+            | SerialTypeClass::One => None,
         };
 
         if collect_vdbe_metrics && let Some(value) = value.as_ref() {
@@ -21119,6 +21242,98 @@ mod tests {
             vec![SqliteValue::Integer(-7)],
         );
         assert_eq!(rows, vec![vec![SqliteValue::Integer(-7)]]);
+    }
+
+    #[test]
+    fn test_arith_integer_result_in_place_fast_path() {
+        // Integer arithmetic results must land the exact integer value in the
+        // output register, including the already-Integer in-place path (a
+        // second write to the same register) and a Float-producing operand
+        // that must fall through to the general set_reg_fast path.
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let lhs = b.alloc_reg();
+                let rhs = b.alloc_reg();
+                let out = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 17, lhs, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 25, rhs, 0, P4::None, 0);
+                // out := 17 + 25, twice — the second Add hits the in-place path.
+                b.emit_op(Opcode::Add, rhs, lhs, out, P4::None, 0);
+                b.emit_op(Opcode::Add, rhs, lhs, out, P4::None, 0);
+                // out := out * 2 = 84 (still Integer, in place again).
+                let two = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 2, two, 0, P4::None, 0);
+                b.emit_op(Opcode::Multiply, two, out, out, P4::None, 0);
+                // out := out - 84 = 0.
+                b.emit_op(Opcode::Subtract, out, out, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_arith_float_result_falls_through_general_path() {
+        // A Float operand makes the result Float, which must take the general
+        // set_reg_fast path (not the integer in-place lane).
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let lhs = b.alloc_reg();
+                let rhs = b.alloc_reg();
+                let out = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 5, lhs, 0, P4::None, 0);
+                b.emit_op(Opcode::Real, 0, rhs, 0, P4::Real(2.5), 0);
+                b.emit_op(Opcode::Add, rhs, lhs, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Float(7.5)]]);
+    }
+
+    #[test]
+    fn test_div_rem_integer_result_in_place_and_zero_null() {
+        // Integer divide results reuse the output register in place (the shipped
+        // lever); remainder and a division by zero (Null) go through the general
+        // set_reg_fast path. All must land the exact value regardless.
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let dividend = b.alloc_reg();
+                let divisor = b.alloc_reg();
+                let zero = b.alloc_reg();
+                let out = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 86, dividend, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 7, divisor, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 0, zero, 0, P4::None, 0);
+                // out := 86 / 7 = 12, twice (the second is the in-place path).
+                b.emit_op(Opcode::Divide, divisor, dividend, out, P4::None, 0);
+                b.emit_op(Opcode::Divide, divisor, dividend, out, P4::None, 0);
+                // out := 86 % 7 = 2 (in-place over Integer 12).
+                b.emit_op(Opcode::Remainder, divisor, dividend, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                // out := 86 / 0 = NULL (general path over the Integer 2).
+                b.emit_op(Opcode::Divide, zero, dividend, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![],
+        );
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(2)], vec![SqliteValue::Null]]
+        );
     }
 
     #[test]
