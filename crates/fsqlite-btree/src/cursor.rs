@@ -2969,6 +2969,111 @@ impl<P: PageReader> BtCursor<P> {
         Self::read_child_at_offset(entry.page_data.as_bytes(), cell_offset)
     }
 
+    /// Decode the routing rowid stored in an interior table cell.
+    ///
+    /// An interior table cell is `[left-child: u32][rowid: varint]`. Keeping
+    /// this decoder shared by descent and insertion-position validation makes
+    /// it impossible for those two routing decisions to drift apart.
+    fn table_interior_rowid_at(entry: &StackEntry, cell_idx: u16) -> Result<i64> {
+        if !(entry.header.page_type.is_interior() && entry.header.page_type.is_table()) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "expected interior table page while reading routing rowid, got {:?}",
+                    entry.header.page_type
+                ),
+            });
+        }
+
+        let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, cell_idx)?);
+        let cell_data = entry
+            .page_data
+            .as_bytes()
+            .get(cell_offset..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior table cell pointer {} points past page end (len {})",
+                    cell_offset,
+                    entry.page_data.as_bytes().len()
+                ),
+            })?;
+        let rowid_bytes = cell_data
+            .get(4..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "interior table cell is shorter than its child pointer".to_owned(),
+            })?;
+        let (rowid, _) = read_varint(rowid_bytes).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "interior table cell has invalid rowid varint".to_owned(),
+        })?;
+        #[allow(clippy::cast_possible_wrap)]
+        Ok(rowid as i64)
+    }
+
+    /// Check that the cursor's current table-leaf position is a valid slot
+    /// for inserting `rowid`.
+    ///
+    /// Leaf-local ordering is necessary but not sufficient: after a delete
+    /// drains a subtree, the cursor can legitimately be positioned on the
+    /// logical successor in the next subtree. Inserting the deleted rowid at
+    /// that successor keeps the leaf sorted while placing it on the wrong side
+    /// of an ancestor separator. Validate both local neighbours and the full
+    /// root-to-leaf routing interval, including every parent/child link.
+    fn current_position_admits_table_insert(&self, rowid: i64) -> Result<bool> {
+        let Some((leaf, ancestors)) = self.stack.split_last() else {
+            return Ok(false);
+        };
+        if !(leaf.header.page_type.is_leaf() && leaf.header.page_type.is_table()) {
+            return Ok(false);
+        }
+
+        if leaf.header.cell_count == 0 {
+            return Ok(leaf.page_no == self.root_page && ancestors.is_empty() && self.at_eof);
+        }
+
+        if self.at_eof {
+            let last_rowid = Self::table_leaf_rowid_at(leaf, leaf.header.cell_count - 1)?;
+            if rowid <= last_rowid {
+                return Ok(false);
+            }
+        } else {
+            if leaf.cell_idx >= leaf.header.cell_count {
+                return Ok(false);
+            }
+            let successor = Self::table_leaf_rowid_at(leaf, leaf.cell_idx)?;
+            if rowid >= successor {
+                return Ok(false);
+            }
+            if leaf.cell_idx > 0 {
+                let predecessor = Self::table_leaf_rowid_at(leaf, leaf.cell_idx - 1)?;
+                if rowid <= predecessor {
+                    return Ok(false);
+                }
+            }
+        }
+
+        let mut routed_child = leaf.page_no;
+        for parent in ancestors.iter().rev() {
+            if !(parent.header.page_type.is_interior() && parent.header.page_type.is_table()) {
+                return Ok(false);
+            }
+
+            let child_idx = parent.cell_idx;
+            if Self::read_interior_child_inline(parent, child_idx)? != routed_child {
+                return Ok(false);
+            }
+            if child_idx > 0 && Self::table_interior_rowid_at(parent, child_idx - 1)? >= rowid {
+                return Ok(false);
+            }
+            if child_idx < parent.header.cell_count
+                && Self::table_interior_rowid_at(parent, child_idx)? < rowid
+            {
+                return Ok(false);
+            }
+            routed_child = parent.page_no;
+        }
+
+        Ok(routed_child == self.root_page)
+    }
+
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
         let depth = if self.stack.is_empty() {
             match self.last_known_depth {
@@ -4111,30 +4216,7 @@ impl<P: PageReader> BtCursor<P> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, mid)?);
-            let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "interior table cell pointer {} points past page end (len {})",
-                        offset,
-                        entry.page_data.as_bytes().len()
-                    ),
-                }
-            })?;
-            if cell_data.len() < 4 {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "interior table cell too short for child pointer".to_owned(),
-                });
-            }
-            let rowid = if let Some((r, _)) = read_varint(&cell_data[4..]) {
-                #[allow(clippy::cast_possible_wrap)]
-                let rowid_val = r as i64;
-                rowid_val
-            } else {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "interior table cell has invalid rowid varint".to_owned(),
-                });
-            };
+            let rowid = Self::table_interior_rowid_at(entry, mid)?;
 
             if target <= rowid {
                 hi = mid;
@@ -9564,6 +9646,17 @@ impl<P: PageWriter> BtCursor<P> {
         data: &[u8],
     ) -> Result<()> {
         let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if !cursor.current_position_admits_table_insert(rowid)? {
+                cursor.clear_seek_cache();
+                let seek = cursor.table_seek_for_insert(cx, rowid)?;
+                if seek.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rowid {rowid} appeared while revalidating a prechecked-absent insert"
+                        ),
+                    });
+                }
+            }
             cursor.table_insert_from_current_position(cx, rowid, data)
         });
         if result.is_ok() {
@@ -12174,6 +12267,50 @@ mod tests {
             cursor.payload(&cx).unwrap(),
             format!("row-{}", row_count - 1).as_bytes()
         );
+    }
+
+    /// A delete of a singleton leaf may rebalance the tree and position the
+    /// cursor on a successor leaf in a different ancestor subtree. Reusing
+    /// that position to restore the deleted row must not put the row on the
+    /// wrong side of an interior-table separator.
+    #[test]
+    fn test_delete_reinsert_keeps_deep_table_rowids_seekable() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        const ROW_COUNT: i64 = 700;
+        let payload = vec![0x6D; 3_500];
+        for rowid in 1..=ROW_COUNT {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        assert!(
+            cursor.measure_tree_depth(&cx).unwrap() >= 3,
+            "the regression needs an ancestor separator above the leaf parent"
+        );
+
+        for rowid in 1..=ROW_COUNT {
+            assert_eq!(
+                cursor.table_move_to(&cx, rowid).unwrap(),
+                SeekResult::Found,
+                "rowid {rowid} must exist before replacement"
+            );
+            cursor.delete(&cx).unwrap();
+            cursor
+                .table_insert_prechecked_absent(&cx, rowid, &payload)
+                .unwrap();
+        }
+
+        for rowid in 1..=ROW_COUNT {
+            assert_eq!(
+                cursor.table_move_to(&cx, rowid).unwrap(),
+                SeekResult::Found,
+                "rowid {rowid} must remain reachable through table routing"
+            );
+        }
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), ROW_COUNT);
     }
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.

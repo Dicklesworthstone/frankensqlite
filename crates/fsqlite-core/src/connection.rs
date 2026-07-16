@@ -136370,6 +136370,85 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_file_backed_overflow_updates_preserve_table_routing_order() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("overflow-update-routing.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let original_payload = "A".repeat(3_500);
+        let replacement_payload = "B".repeat(3_500);
+
+        let conn = Connection::open(&db_path_text).expect("open file-backed database");
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn.execute("PRAGMA journal_mode='delete';").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+            .unwrap();
+
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        for rowid in 1..=700_i64 {
+            conn.execute_with_params(
+                "INSERT INTO t(id, payload) VALUES (?1, ?2);",
+                &[
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Text(original_payload.clone().into()),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        // Each overflow-sized row occupies a singleton leaf. Replacing every
+        // row exercises delete + prechecked-absent reinsertion at separators
+        // from every level of the table B-tree.
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+        for rowid in 1..=700_i64 {
+            let changed = conn
+                .execute_with_params(
+                    "UPDATE t SET payload = ?1 WHERE id = ?2;",
+                    &[
+                        SqliteValue::Text(replacement_payload.clone().into()),
+                        SqliteValue::Integer(rowid),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(changed, 1, "rowid {rowid} must be replaced exactly once");
+        }
+        conn.execute("COMMIT;").unwrap();
+
+        for rowid in 1..=700_i64 {
+            let rows = conn
+                .query_with_params(
+                    "SELECT length(payload) FROM t WHERE id = ?1;",
+                    &[SqliteValue::Integer(rowid)],
+                )
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "rowid {rowid} must remain reachable by a routed point lookup"
+            );
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(3_500));
+        }
+
+        let integrity_rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(
+            integrity_rows[0].values()[0],
+            SqliteValue::Text("ok".into()),
+            "FrankenSQLite must not observe an out-of-order table B-tree"
+        );
+        conn.close().unwrap();
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity_check: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity_check, "ok",
+            "stock SQLite must accept the table after overflow-row replacements"
+        );
+    }
+
+    #[test]
     fn test_file_backed_delete_repairs_table_separator_for_sqlite_integrity_check() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("separator_repair.db");
