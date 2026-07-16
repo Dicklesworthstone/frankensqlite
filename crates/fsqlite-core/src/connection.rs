@@ -14048,7 +14048,19 @@ impl Connection {
                 Err(err) => return Err(err),
             }
         }
-        Err(FrankenError::Busy)
+        Err(self.strict_multi_process_busy_refusal(
+            "transaction lock admission remained busy through busy_timeout",
+        ))
+    }
+
+    fn strict_multi_process_busy_refusal(&self, detail: &'static str) -> FrankenError {
+        if self.attach_env.strict_multi_process() {
+            FrankenError::MultiProcessContractViolation {
+                detail: detail.to_owned(),
+            }
+        } else {
+            FrankenError::Busy
+        }
     }
 
     fn refresh_prepared_schema_state(
@@ -93381,6 +93393,63 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(-1);
         assert_eq!(count, 1, "data inserted in explicit txn should be visible");
+    }
+
+    #[test]
+    fn test_octet_length_ingress_probe_does_not_materialize_overflow_payloads() {
+        let _guard = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("octet-length-ingress.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            "CREATE TABLE ingress (state_id BIGINT NOT NULL PRIMARY KEY, snapshot_json TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let payload_bytes = 1024 * 1024;
+        conn.execute("BEGIN EXCLUSIVE").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO ingress VALUES (?1, ?2);",
+            &[
+                SqliteValue::Blob(std::sync::Arc::from(vec![0xA5; payload_bytes])),
+                SqliteValue::Text("x".repeat(payload_bytes).into()),
+            ],
+        )
+        .unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        fsqlite_btree::reset_btree_copy_profile();
+        fsqlite_btree::set_btree_copy_profile_enabled(true);
+        let rows = conn
+            .query(
+                "SELECT octet_length(state_id) AS state_id_bytes, \
+                        octet_length(snapshot_json) AS snapshot_bytes \
+                 FROM ingress LIMIT 2;",
+            )
+            .unwrap();
+        let profile = fsqlite_btree::btree_copy_profile_snapshot();
+        fsqlite_btree::set_btree_copy_profile_enabled(false);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values(),
+            &[
+                SqliteValue::Integer(i64::try_from(payload_bytes).unwrap()),
+                SqliteValue::Integer(i64::try_from(payload_bytes).unwrap()),
+            ]
+        );
+        assert_eq!(
+            profile.owned_payload_materialization_bytes, 0,
+            "record-header octet_length must not allocate either hostile payload: {profile:?}"
+        );
+        assert_eq!(
+            profile.overflow_chain_overflow_bytes, 0,
+            "record-header octet_length must not copy overflow bytes: {profile:?}"
+        );
+        assert_eq!(
+            profile.overflow_page_reads, 0,
+            "record-header octet_length must not read overflow pages: {profile:?}"
+        );
     }
 
     // ── Cx trace context propagation tests (bd-2g5.6) ─────────────────

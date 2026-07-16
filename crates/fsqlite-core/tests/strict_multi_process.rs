@@ -2,11 +2,9 @@
 //!
 //! These tests cover the infrastructure for the strict-multi-process
 //! opt-in: the `ConnectionEnv` flag, the `Connection::open_strict_multi_process`
-//! convenience constructor, and the new `MultiProcessContractViolation`
-//! error variant. Concrete refusal sites (F_SETLK timeout, WAL checkpoint
-//! contention, freelist trunk drift past db_size) attach to this
-//! infrastructure in follow-up work — the test here proves the opt-in
-//! plumbing itself is in place.
+//! convenience constructor, and the `MultiProcessContractViolation` error
+//! variant. Transaction lock admission is an enforced refusal site; open-time
+//! WAL-checkpoint and freelist-integrity refusals remain separate work.
 
 use fsqlite_core::connection::{Connection, ConnectionEnv};
 use fsqlite_error::{ErrorCode, FrankenError};
@@ -62,4 +60,33 @@ fn multi_process_contract_violation_carries_detail() {
         ErrorCode::Busy,
         "strict multi-process refusal should preserve SQLite BUSY compatibility"
     );
+}
+
+#[test]
+fn strict_multi_process_refuses_expired_transaction_lock_admission() {
+    let dir = tempfile::tempdir().expect("create temp directory");
+    let path = dir.path().join("strict-lock-admission.db");
+    let path = path.to_string_lossy().into_owned();
+
+    let holder = Connection::open(path.clone()).expect("open lock holder");
+    holder
+        .execute("CREATE TABLE guarded(value INTEGER NOT NULL);")
+        .expect("initialize test database");
+    let waiter = Connection::open_strict_multi_process(path).expect("open strict waiter");
+
+    holder
+        .execute("BEGIN EXCLUSIVE;")
+        .expect("holder acquires exclusive transaction lock");
+    waiter
+        .execute("PRAGMA busy_timeout = 0;")
+        .expect("disable retries for deterministic refusal");
+    let error = waiter
+        .execute("BEGIN IMMEDIATE;")
+        .expect_err("strict waiter must classify exhausted lock admission");
+
+    assert!(
+        matches!(error, FrankenError::MultiProcessContractViolation { .. }),
+        "strict mode must surface a typed contract violation, got {error:?}"
+    );
+    holder.execute("ROLLBACK;").expect("release holder lock");
 }

@@ -554,11 +554,22 @@ pub enum Opcode {
     /// materializing the full column. Unsupported storage classes fall back to
     /// the equivalent scalar `substr(value, 1, prefix_len)` behavior.
     ColumnSubstrPrefix = 197,
+
+    /// Compute `octet_length(column)` from a table cursor record header.
+    ///
+    /// P1 = cursor number, P2 = logical column index, P3 = output register,
+    /// P4 = `None`, P5 = 0.
+    ///
+    /// TEXT and BLOB byte lengths are encoded by the record serial type, so a
+    /// storage cursor can answer this without expanding overflow payloads or
+    /// allocating the source value. Unsupported storage classes fall back to
+    /// the equivalent scalar `octet_length(value)` behavior.
+    ColumnOctetLength = 198,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 198;
+    pub const COUNT: usize = 199;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -761,6 +772,7 @@ impl Opcode {
             Self::FusedOpenWriteLast => "FusedOpenWriteLast",
             Self::FusedLiteralResultRow => "FusedLiteralResultRow",
             Self::ColumnSubstrPrefix => "ColumnSubstrPrefix",
+            Self::ColumnOctetLength => "ColumnOctetLength",
         }
     }
 
@@ -973,6 +985,7 @@ impl Opcode {
             195 => Some(Self::FusedOpenWriteLast),
             196 => Some(Self::FusedLiteralResultRow),
             197 => Some(Self::ColumnSubstrPrefix),
+            198 => Some(Self::ColumnOctetLength),
             _ => None,
         }
     }
@@ -1601,7 +1614,8 @@ mod tests {
         assert_eq!(Opcode::from_byte(192), Some(Opcode::LikeConstFast));
         assert_eq!(Opcode::from_byte(196), Some(Opcode::FusedLiteralResultRow));
         assert_eq!(Opcode::from_byte(197), Some(Opcode::ColumnSubstrPrefix));
-        assert_eq!(Opcode::from_byte(198), None);
+        assert_eq!(Opcode::from_byte(198), Some(Opcode::ColumnOctetLength));
+        assert_eq!(Opcode::from_byte(199), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 

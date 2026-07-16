@@ -23,7 +23,12 @@ pub mod host_fs {
     use std::path::{Path, PathBuf};
 
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    #[cfg(windows)]
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
     use fsqlite_error::Result;
 
@@ -60,6 +65,42 @@ pub mod host_fs {
 
     pub fn open_file(path: &Path) -> Result<File> {
         Ok(File::open(path)?)
+    }
+
+    /// Open an existing regular file without following its final path entry.
+    ///
+    /// This is the identity-guard ingress for callers that will subsequently
+    /// ask the pager to open the same cooperative database pathname. It rejects
+    /// final symlinks/reparse points and non-regular objects before they can
+    /// block or alias the identity probe. Unix additionally rejects files with
+    /// multiple hard links, because such a pathname is not an isolated
+    /// authority namespace.
+    pub fn open_existing_regular_file_no_follow(path: &Path) -> Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(windows)]
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "identity-bound database path is not a regular file",
+            )
+            .into());
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "identity-bound database path has multiple hard links",
+            )
+            .into());
+        }
+        Ok(file)
     }
 
     pub fn rename(from: &Path, to: &Path) -> Result<()> {
@@ -123,6 +164,39 @@ pub mod host_fs {
         writeln!(file, "{line}")?;
         file.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "native", unix))]
+mod host_fs_security_tests {
+    use std::os::unix::fs::symlink;
+
+    use super::host_fs::{open_existing_regular_file_no_follow, reserve_new_file};
+
+    #[test]
+    fn identity_guard_rejects_final_symlinks_and_hard_link_aliases() {
+        let directory = tempfile::tempdir().expect("create isolated directory");
+        let database = directory.path().join("authority.db");
+        drop(reserve_new_file(&database).expect("reserve regular database"));
+        open_existing_regular_file_no_follow(&database).expect("regular single-link file opens");
+
+        let symlink_path = directory.path().join("authority-symlink.db");
+        symlink(&database, &symlink_path).expect("create final symlink");
+        assert!(
+            open_existing_regular_file_no_follow(&symlink_path).is_err(),
+            "identity guard must not follow a final symlink"
+        );
+
+        let hard_link_path = directory.path().join("authority-hardlink.db");
+        std::fs::hard_link(&database, &hard_link_path).expect("create hard-link alias");
+        assert!(
+            open_existing_regular_file_no_follow(&database).is_err(),
+            "identity guard must reject a multiply linked database"
+        );
+        assert!(
+            open_existing_regular_file_no_follow(&hard_link_path).is_err(),
+            "identity guard must reject the hard-link alias"
+        );
     }
 }
 

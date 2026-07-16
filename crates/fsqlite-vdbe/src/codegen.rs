@@ -5382,7 +5382,17 @@ fn codegen_select_count_star(
         && let Some(values) = extract_rowid_in_list_target(where_clause, table, table_alias)
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &values, None, false,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &values,
+            None,
+            false,
         );
         return Ok(());
     }
@@ -5397,7 +5407,17 @@ fn codegen_select_count_star(
         && let Expr::Literal(Literal::Integer(value), _) = target
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &[*value], None, false,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &[*value],
+            None,
+            false,
         );
         return Ok(());
     }
@@ -5422,7 +5442,16 @@ fn codegen_select_count_star(
             extract_rowid_in_list_residual_target(where_clause, table, table_alias)
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &values, where_clause,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &values,
+            where_clause,
             true,
         );
         return Ok(());
@@ -5435,7 +5464,16 @@ fn codegen_select_count_star(
         && let Expr::Literal(Literal::Integer(value), _) = target
     {
         codegen_select_count_star_rowid_in(
-            b, cursor, table, table_alias, schema, out_regs, done_label, end_label, &[*value], where_clause,
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            &[*value],
+            where_clause,
             true,
         );
         return Ok(());
@@ -5630,11 +5668,17 @@ fn codegen_select_count_star_rowid_in(
             P4::None,
             0,
         );
-        if residual_filter
-            && let Some(where_expr) = where_clause
-        {
+        if residual_filter && let Some(where_expr) = where_clause {
             b.set_next_anon_placeholder(where_placeholder_base);
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
+            );
         }
         b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
         b.resolve_label(skip_label);
@@ -13460,11 +13504,17 @@ fn codegen_select_aggregate(
                 P4::None,
                 0,
             );
-            if has_residual
-                && let Some(where_expr) = where_clause
-            {
+            if has_residual && let Some(where_expr) = where_clause {
                 b.set_next_anon_placeholder(where_placeholder_base);
-                emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_label,
+                );
             }
             emit_aggregate_accumulate_body(
                 b,
@@ -13501,7 +13551,15 @@ fn codegen_select_aggregate(
             0,
         );
         if let Some(where_expr) = where_clause {
-            emit_where_filter(b, where_expr, cursor, table, table_alias, schema, finalize_label);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                finalize_label,
+            );
         }
         emit_aggregate_accumulate_body(
             b,
@@ -25370,6 +25428,47 @@ fn try_emit_column_substr_prefix(
     true
 }
 
+fn try_emit_column_octet_length(
+    b: &mut ProgramBuilder,
+    name: &str,
+    arg_list: &[Expr],
+    reg: i32,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !name.eq_ignore_ascii_case("octet_length")
+        || arg_list.len() != 1
+        || ctx.register_base.is_some()
+    {
+        return false;
+    }
+    let Expr::Column(col_ref, _) = &arg_list[0] else {
+        return false;
+    };
+    let Some(col_idx) = resolve_column_in_ctx(col_ref, ctx) else {
+        return false;
+    };
+    if ctx
+        .table
+        .columns
+        .get(col_idx)
+        .is_some_and(|column| column.generated_stored == Some(false))
+    {
+        return false;
+    }
+    let Ok(col_idx) = i32::try_from(col_idx) else {
+        return false;
+    };
+    b.emit_op(
+        Opcode::ColumnOctetLength,
+        ctx.cursor,
+        col_idx,
+        reg,
+        P4::None,
+        0,
+    );
+    true
+}
+
 enum InProbeValue<'a> {
     Expr(&'a Expr),
     FirstColumn,
@@ -26406,7 +26505,8 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
                     if let Some(scan_ctx) = ctx
-                        && try_emit_column_substr_prefix(b, name, arg_list, reg, scan_ctx)
+                        && (try_emit_column_substr_prefix(b, name, arg_list, reg, scan_ctx)
+                            || try_emit_column_octet_length(b, name, arg_list, reg, scan_ctx))
                     {
                         return;
                     }
@@ -28038,8 +28138,10 @@ fn emit_expr_with_fallback(
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
                     if try_emit_column_substr_prefix(b, name, arg_list, reg, inner_ctx)
+                        || try_emit_column_octet_length(b, name, arg_list, reg, inner_ctx)
                         || outer_ctx.is_some_and(|outer| {
                             try_emit_column_substr_prefix(b, name, arg_list, reg, outer)
+                                || try_emit_column_octet_length(b, name, arg_list, reg, outer)
                         })
                     {
                         return;
@@ -33594,6 +33696,88 @@ mod tests {
                 vec![SqliteValue::Blob(Arc::from(&b"ab"[..]))],
             ]
         );
+    }
+
+    #[test]
+    fn test_codegen_select_octet_length_column_uses_record_metadata_opcode() {
+        let stmt = select_sql("SELECT octet_length(name) FROM bench");
+        let schema = test_small_bench_schema();
+        let ctx = CodegenContext::default();
+        let mut builder = ProgramBuilder::new();
+        codegen_select(&mut builder, &stmt, &schema, &ctx).unwrap();
+        let program = builder.finish().unwrap();
+        let ops = opcode_sequence(&program);
+
+        assert!(
+            ops.contains(&Opcode::ColumnOctetLength),
+            "octet_length(column) must inspect record metadata before source materialization"
+        );
+        assert!(
+            !ops.contains(&Opcode::PureFunc),
+            "direct octet length should not decode the source for scalar dispatch"
+        );
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table = db.get_table_mut(2).expect("bench table should exist");
+        for (rowid, value) in [
+            SqliteValue::Text("éclair".into()),
+            SqliteValue::Blob(Arc::from(&b"abcdef"[..])),
+            SqliteValue::Integer(123),
+            SqliteValue::Null,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            table.insert_row(
+                i64::try_from(rowid + 1).unwrap(),
+                vec![
+                    SqliteValue::Integer(i64::try_from(rowid + 1).unwrap()),
+                    value,
+                    SqliteValue::Float(1.0),
+                ],
+            );
+        }
+
+        let results = execute_codegen_select_with_storage_cursor(&stmt, &schema, db);
+        assert_eq!(
+            results,
+            vec![
+                vec![SqliteValue::Integer(7)],
+                vec![SqliteValue::Integer(6)],
+                vec![SqliteValue::Integer(3)],
+                vec![SqliteValue::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_codegen_octet_length_virtual_generated_column_recomputes_value() {
+        let stmt = select_sql("SELECT octet_length(c) FROM t");
+        let schema = test_schema_with_virtual_generated();
+        let ctx = CodegenContext::default();
+        let mut builder = ProgramBuilder::new();
+        codegen_select(&mut builder, &stmt, &schema, &ctx).unwrap();
+        let program = builder.finish().unwrap();
+
+        assert!(
+            !opcode_sequence(&program).contains(&Opcode::ColumnOctetLength),
+            "a VIRTUAL generated column must be recomputed before octet_length"
+        );
+
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        db.get_table_mut(2).expect("table should exist").insert_row(
+            1,
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(0),
+                SqliteValue::Null,
+            ],
+        );
+
+        let results = execute_codegen_select_with_storage_cursor(&stmt, &schema, db);
+        assert_eq!(results, vec![vec![SqliteValue::Integer(2)]]);
     }
 
     #[test]
