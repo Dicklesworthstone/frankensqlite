@@ -497,9 +497,11 @@ impl<F: VfsFile> WalFile<F> {
         )?;
         // Make the fresh header + truncation durable before any frame is
         // appended. Without this barrier a crash can leave the previous WAL
-        // generation's frames on disk behind a header they chain-validate
-        // against (salts are currently deterministic), replaying stale
-        // frames as committed on the next open.
+        // generation's frames on disk behind a header they could
+        // chain-validate against, replaying stale frames as committed on the
+        // next open. (Salts are randomized per generation — GH #201 — which
+        // independently defends against stale-frame replay, but the barrier
+        // remains the primary ordering guarantee.)
         file.sync(cx, SyncFlags::NORMAL)?;
 
         let running_checksum = read_wal_header_checksum(&header_bytes)?;

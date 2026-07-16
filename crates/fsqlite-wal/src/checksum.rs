@@ -209,6 +209,52 @@ pub struct WalSalts {
     pub salt2: u32,
 }
 
+impl WalSalts {
+    /// Fresh random salts for a brand-new WAL generation.
+    ///
+    /// Matching C SQLite (`walIndexRecover`/`walRestartHdr`), a new WAL must
+    /// carry unpredictable salts: frames from a stale or copied WAL of a
+    /// previous generation must fail salt validation instead of replaying
+    /// into the wrong database state. Deterministic salts (the old
+    /// `WalSalts::default()` = (0, 0) behavior, GH #201) let byte-identical
+    /// stale WALs validate across generations.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn generate() -> Self {
+        Self {
+            salt1: rand::random::<u32>(),
+            salt2: rand::random::<u32>(),
+        }
+    }
+
+    /// Wasm fallback: no durable WAL files exist on this target, so a
+    /// process-unique counter suffices to keep generations distinct.
+    #[cfg(target_arch = "wasm32")]
+    #[must_use]
+    pub fn generate() -> Self {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            salt1: n,
+            salt2: n.wrapping_mul(0x9E37_79B9),
+        }
+    }
+
+    /// Successor salts for a checkpoint RESTART/TRUNCATE of an existing WAL.
+    ///
+    /// C SQLite's `walRestartHdr` increments salt-1 (readers can detect the
+    /// generation change cheaply) and randomizes salt-2 (stale frames cannot
+    /// validate against the reset WAL).
+    #[must_use]
+    pub fn next_generation(self) -> Self {
+        Self {
+            salt1: self.salt1.wrapping_add(1),
+            salt2: Self::generate().salt2,
+        }
+    }
+}
+
 /// WAL magic number for little-endian checksum mode.
 pub const WAL_MAGIC_LE: u32 = 0x377F_0682;
 

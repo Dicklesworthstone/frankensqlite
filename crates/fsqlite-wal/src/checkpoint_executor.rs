@@ -22,7 +22,7 @@ use crate::checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
 };
-use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalSalts};
+use crate::checksum::WAL_FRAME_HEADER_SIZE;
 use crate::recovery_fence::{CheckpointChecksumVerdict, ExpectedPageChecksum};
 use crate::wal::WalFile;
 
@@ -251,10 +251,10 @@ fn apply_checkpoint_post_action<F: VfsFile>(
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
             let new_seq = wal.header().checkpoint_seq.wrapping_add(1);
-            let new_salts = WalSalts {
-                salt1: wal.header().salts.salt1.wrapping_add(1),
-                salt2: wal.header().salts.salt2.wrapping_add(1),
-            };
+            // Salt-1 increments, salt-2 randomizes (C SQLite `walRestartHdr`
+            // semantics): stale frames from the pre-reset generation must
+            // fail salt validation rather than replay (GH #201).
+            let new_salts = wal.header().salts.next_generation();
             let truncate = matches!(post_action, CheckpointPostAction::TruncateWal);
             if truncate {
                 // bd-yfdb6: enforce fsync(db, FULL) before any WAL
@@ -351,6 +351,7 @@ mod tests {
     use fsqlite_vfs::traits::Vfs;
 
     use super::*;
+    use crate::checksum::WalSalts;
 
     const PAGE_SIZE: u32 = 4096;
 
@@ -880,6 +881,9 @@ mod tests {
         let file = open_wal_file(&vfs, &cx);
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
+        // Salt-2 history across generations: every reset must randomize it
+        // (GH #201 — never the old deterministic +1 walk).
+        let mut salt2_history = vec![wal.header().salts.salt2];
         for round in 0..3u32 {
             populate_wal(&mut wal, &cx, 2);
             let state = CheckpointState {
@@ -891,11 +895,23 @@ mod tests {
             execute_checkpoint(&cx, &mut wal, CheckpointMode::Restart, state, &mut target)
                 .expect("checkpoint");
             assert_eq!(wal.header().checkpoint_seq, round + 1);
+            salt2_history.push(wal.header().salts.salt2);
         }
         assert_eq!(wal.header().checkpoint_seq, 3);
         let salts = wal.header().salts;
+        // Salt-1 increments once per reset (C SQLite walRestartHdr).
         assert_eq!(salts.salt1, test_salts().salt1.wrapping_add(3));
-        assert_eq!(salts.salt2, test_salts().salt2.wrapping_add(3));
+        // Salt-2 is randomized per reset: each generation must differ from
+        // its predecessor (a 2^-32 collision would be a red flag, and the
+        // old +1 walk always "passed" — assert the walk is gone explicitly).
+        for window in salt2_history.windows(2) {
+            assert_ne!(window[0], window[1], "salt2 must change on every WAL reset");
+            assert_ne!(
+                window[1],
+                window[0].wrapping_add(1),
+                "salt2 must be randomized, not the deterministic +1 walk (GH #201)"
+            );
+        }
     }
 
     #[test]
