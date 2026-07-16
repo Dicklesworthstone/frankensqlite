@@ -579,6 +579,13 @@ static FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
+    static FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS: Cell<u64> = const { Cell::new(0) };
+    static FSQLITE_JOIN_EXPR_BINDING_HITS: Cell<u64> = const { Cell::new(0) };
+    static FSQLITE_JOIN_EXPR_FALLBACK_SCANS: Cell<u64> = const { Cell::new(0) };
+}
 static FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_DIRECT_EVAL_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_RECURSIVE_CTE_PRECOMPILED_ARM_HITS: AtomicU64 = AtomicU64::new(0);
@@ -59633,6 +59640,19 @@ impl Connection {
 
         // ── 5. Apply WHERE filter ──
         if let Some(where_expr) = effective_where_clause_for_eval {
+            // The effective expression has already received any statement-level
+            // rewrites. Bind that exact tree once so ordinary WHERE evaluation
+            // does not repeat case-insensitive scans of `col_map` for every
+            // joined row. Correlated subqueries retain their existing dynamic
+            // resolver because inlining can replace expression trees per row.
+            let _where_bindings_guard = if expr_has_any_subquery(where_expr) {
+                None
+            } else {
+                let mut bindings = JoinExprBindings::default();
+                bindings.bind_expr(where_expr, &col_map, None);
+                Some(JoinExprBindingsGuard::push(bindings))
+            };
+
             // GH#117: arm the correlated-EXISTS value-set memo for this loop.
             // The child tables are read-only here, so the per-outer-row probe
             // can reuse a value-set built once instead of re-scanning the child
@@ -59718,6 +59738,25 @@ impl Connection {
             .iter()
             .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_any_subquery(expr)))
             || extra_order_exprs.iter().any(expr_has_any_subquery);
+
+        // Bind ordinary projection/ORDER expressions once before walking the
+        // joined rows. USING rewrites and subquery inlining can create new
+        // expression trees per row, so those specialized paths retain their
+        // existing resolver; the common projection path gets direct indices.
+        let _projection_bindings_guard = if !has_subqueries && using_skip.is_none() {
+            let mut bindings = JoinExprBindings::default();
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bindings.bind_expr(expr, &col_map, None);
+                }
+            }
+            for expr in &extra_order_exprs {
+                bindings.bind_expr(expr, &col_map, None);
+            }
+            Some(JoinExprBindingsGuard::push(bindings))
+        } else {
+            None
+        };
 
         let mut result: Vec<Row> = Vec::with_capacity(combined.len());
         for row in &combined {
@@ -64975,12 +65014,12 @@ fn join_prefers_memdb_hash_dispatch(select: &SelectStatement) -> bool {
 fn join_constraint_supports_hash_join(constraint: Option<&JoinConstraint>) -> bool {
     match constraint {
         Some(JoinConstraint::Using(columns)) => !columns.is_empty(),
-        Some(JoinConstraint::On(expr)) => join_on_expr_is_hash_equi(expr),
+        Some(JoinConstraint::On(expr)) => join_on_expr_has_hash_equi_conjunct(expr),
         None => false,
     }
 }
 
-fn join_on_expr_is_hash_equi(expr: &Expr) -> bool {
+fn join_on_expr_has_hash_equi_conjunct(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
@@ -64996,7 +65035,9 @@ fn join_on_expr_is_hash_equi(expr: &Expr) -> bool {
             op: BinaryOp::And,
             right,
             ..
-        } => join_on_expr_is_hash_equi(left) && join_on_expr_is_hash_equi(right),
+        } => {
+            join_on_expr_has_hash_equi_conjunct(left) || join_on_expr_has_hash_equi_conjunct(right)
+        }
         _ => false,
     }
 }
@@ -87888,6 +87929,88 @@ fn with_current_join_eval_collation_context<T>(
     f(current.as_deref())
 }
 
+/// Column bindings prepared once for a join expression and reused for every
+/// candidate row. `ColumnRef` is the parser-owned, immutable identifier key,
+/// so exact-key lookup avoids repeating case-folded scans of the full column
+/// map in the evaluator hot loop.
+#[derive(Default)]
+struct JoinExprBindings {
+    column_indices: HashMap<ColumnRef, usize>,
+}
+
+impl JoinExprBindings {
+    fn bind_expr(
+        &mut self,
+        expr: &Expr,
+        col_map: &[(String, String, bool)],
+        using_skip_indices: Option<&HashSet<usize>>,
+    ) {
+        for_each_column_ref_in_expr(expr, &mut |col_ref| {
+            if self.column_indices.contains_key(col_ref) {
+                return;
+            }
+            if let Ok(index) = find_col_in_map(
+                col_map,
+                col_ref.table.as_deref(),
+                &col_ref.column,
+                using_skip_indices,
+            ) {
+                self.column_indices.insert(col_ref.clone(), index);
+            }
+        });
+    }
+
+    fn column_index(&self, col_ref: &ColumnRef) -> Option<usize> {
+        self.column_indices.get(col_ref).copied()
+    }
+}
+
+thread_local! {
+    static CURRENT_JOIN_EXPR_BINDINGS: RefCell<Vec<Arc<JoinExprBindings>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+struct JoinExprBindingsGuard;
+
+impl JoinExprBindingsGuard {
+    fn push(bindings: JoinExprBindings) -> Self {
+        CURRENT_JOIN_EXPR_BINDINGS.with(|stack| stack.borrow_mut().push(Arc::new(bindings)));
+        Self
+    }
+}
+
+impl Drop for JoinExprBindingsGuard {
+    fn drop(&mut self) {
+        CURRENT_JOIN_EXPR_BINDINGS.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
+}
+
+fn current_join_expr_column_index(col_ref: &ColumnRef) -> Option<usize> {
+    CURRENT_JOIN_EXPR_BINDINGS.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .and_then(|bindings| bindings.column_index(col_ref))
+    })
+}
+
+fn resolve_join_expr_column_index(
+    col_ref: &ColumnRef,
+    col_map: &[(String, String, bool)],
+) -> Result<usize> {
+    if let Some(index) = current_join_expr_column_index(col_ref) {
+        #[cfg(test)]
+        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(counter.get().wrapping_add(1)));
+        return Ok(index);
+    }
+
+    #[cfg(test)]
+    FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(counter.get().wrapping_add(1)));
+    find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None)
+}
+
 #[derive(Debug, Clone)]
 struct LiveVtabInsertRow {
     explicit_rowid: Option<SqliteValue>,
@@ -88041,10 +88164,43 @@ impl std::hash::Hash for HashableJoinKey {
     }
 }
 
+fn resolve_hash_join_column_index(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+) -> Option<usize> {
+    let Expr::Column(col_ref, _) = expr else {
+        return None;
+    };
+    find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None).ok()
+}
+
+fn try_extract_equi_join_pair(
+    term: &Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+) -> Option<(usize, usize)> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOp::Eq,
+        right,
+        ..
+    } = term
+    else {
+        return None;
+    };
+    let left_idx = resolve_hash_join_column_index(left, col_map)?;
+    let right_idx = resolve_hash_join_column_index(right, col_map)?;
+    if left_idx < left_width && right_idx >= left_width {
+        Some((left_idx, right_idx - left_width))
+    } else if right_idx < left_width && left_idx >= left_width {
+        Some((right_idx, left_idx - left_width))
+    } else {
+        None
+    }
+}
+
 /// Try to extract equi-join column index pairs from an ON expression.
-/// Returns `Some(pairs)` when the expr is `a.col = b.col` (or AND chain
-/// of such equalities), where one side references a left column and the
-/// other a right column.
+/// Returns `Some(pairs)` only when every conjunct is a cross-side equality.
 fn try_extract_equi_join_indices(
     expr: &Expr,
     col_map: &[(String, String, bool)],
@@ -88055,43 +88211,10 @@ fn try_extract_equi_join_indices(
     if terms.is_empty() {
         return None;
     }
-    let mut pairs = Vec::with_capacity(terms.len());
-    for term in &terms {
-        let Expr::BinaryOp {
-            left,
-            op: BinaryOp::Eq,
-            right,
-            ..
-        } = term
-        else {
-            return None;
-        };
-        let resolve_col = |e: &Expr| -> Option<usize> {
-            if let Expr::Column(col_ref, _) = e {
-                if let Some(table) = &col_ref.table {
-                    col_map.iter().position(|(t, c, _)| {
-                        t.eq_ignore_ascii_case(table) && c.eq_ignore_ascii_case(&col_ref.column)
-                    })
-                } else {
-                    col_map
-                        .iter()
-                        .position(|(_, c, _)| c.eq_ignore_ascii_case(&col_ref.column))
-                }
-            } else {
-                None
-            }
-        };
-        let l_idx = resolve_col(left)?;
-        let r_idx = resolve_col(right)?;
-        if l_idx < left_width && r_idx >= left_width {
-            pairs.push((l_idx, r_idx - left_width));
-        } else if r_idx < left_width && l_idx >= left_width {
-            pairs.push((r_idx, l_idx - left_width));
-        } else {
-            return None;
-        }
-    }
-    Some(pairs)
+    terms
+        .into_iter()
+        .map(|term| try_extract_equi_join_pair(term, col_map, left_width))
+        .collect()
 }
 
 /// Hash-join: build a multi-map on the right table, probe for each left row.
@@ -88105,7 +88228,9 @@ fn execute_hash_join(
     kind: JoinKind,
     equi_pairs: &[(usize, usize)],
     track_right: bool,
-) -> Vec<Vec<SqliteValue>> {
+    residual: Option<&Expr>,
+    col_map: &[(String, String, bool)],
+) -> Result<Vec<Vec<SqliteValue>>> {
     let combined_width = left_width + right_width;
     let mut right_index: HashMap<HashableJoinKey, Vec<usize>> = HashMap::with_capacity(right.len());
     for (ri, right_row) in right.iter().enumerate() {
@@ -88140,6 +88265,16 @@ fn execute_hash_join(
                     let mut combined = Vec::with_capacity(combined_width);
                     combined.extend_from_slice(left_row);
                     combined.extend_from_slice(&right_row[..right_width]);
+
+                    if let Some(residual) = residual {
+                        #[cfg(test)]
+                        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS
+                            .with(|counter| counter.set(counter.get().wrapping_add(1)));
+                        if !eval_join_predicate(residual, &combined, col_map)? {
+                            continue;
+                        }
+                    }
+
                     result.push(combined);
                     matched = true;
                     if track_right {
@@ -88165,7 +88300,7 @@ fn execute_hash_join(
             }
         }
     }
-    result
+    Ok(result)
 }
 
 struct StreamingHashJoinPlan {
@@ -88287,15 +88422,13 @@ fn join_expr_resolved_collation(
                 JoinResolvedCollation::Named(collation.clone())
             }
         }
-        Expr::Column(col_ref, _) => {
-            find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None)
-                .ok()
-                .and_then(current_join_eval_column_collation)
-                .map_or(
-                    JoinResolvedCollation::Unspecified,
-                    JoinResolvedCollation::Named,
-                )
-        }
+        Expr::Column(col_ref, _) => resolve_join_expr_column_index(col_ref, col_map)
+            .ok()
+            .and_then(current_join_eval_column_collation)
+            .map_or(
+                JoinResolvedCollation::Unspecified,
+                JoinResolvedCollation::Named,
+            ),
         _ => JoinResolvedCollation::Unspecified,
     }
 }
@@ -88340,6 +88473,49 @@ fn join_hash_pairs_are_binary(equi_pairs: &[(usize, usize)], left_width: usize) 
     })
 }
 
+struct HashJoinPredicatePlan {
+    equi_pairs: Vec<(usize, usize)>,
+    residual: Option<Expr>,
+}
+
+/// Split an AND-connected ON predicate into a binary-collated cross-side
+/// equality key and the residual predicate. The hash key is only a candidate
+/// prefilter: when any residual exists, the complete original predicate is
+/// retained for candidate validation. This is required because the compact
+/// hash key normalizes numeric-looking TEXT broadly, while the authoritative
+/// expression evaluator also applies the two columns' declared affinities.
+fn plan_hash_join_predicate(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+) -> Option<HashJoinPredicatePlan> {
+    let mut terms = Vec::new();
+    flatten_and_terms(expr, &mut terms);
+
+    let mut equi_pairs = Vec::new();
+    let mut has_residual_term = false;
+    for term in terms {
+        if let Some(pair) = try_extract_equi_join_pair(term, col_map, left_width)
+            && join_hash_pairs_are_binary(std::slice::from_ref(&pair), left_width)
+        {
+            if !equi_pairs.contains(&pair) {
+                equi_pairs.push(pair);
+            }
+        } else {
+            has_residual_term = true;
+        }
+    }
+
+    if equi_pairs.is_empty() {
+        return None;
+    }
+
+    Some(HashJoinPredicatePlan {
+        equi_pairs,
+        residual: has_residual_term.then(|| expr.clone()),
+    })
+}
+
 /// Perform a single join step: combine left-side rows with right-side rows.
 /// Uses hash-join O(n+m) for equi-joins, falls back to nested-loop O(n*m).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -88354,21 +88530,38 @@ fn execute_single_join(
 ) -> Result<Vec<Vec<SqliteValue>>> {
     let combined_width = left_width + right_width;
 
+    // Resolve each referenced ON column once for this join step. The guard is
+    // scoped across both the hash residual evaluator and the nested fallback,
+    // so either path avoids per-candidate scans of `col_map`.
+    let _bindings_guard = match constraint {
+        Some(JoinConstraint::On(expr)) if !expr_has_any_subquery(expr) => {
+            let mut bindings = JoinExprBindings::default();
+            bindings.bind_expr(expr, col_map, None);
+            Some(JoinExprBindingsGuard::push(bindings))
+        }
+        _ => None,
+    };
+
     // ── Hash-join fast path for equi-joins (O(n+m) vs O(n*m)) ──
     if let Some(JoinConstraint::On(expr)) = constraint {
-        if let Some(equi_pairs) = try_extract_equi_join_indices(expr, col_map, left_width)
-            && join_hash_pairs_are_binary(&equi_pairs, left_width)
-        {
+        if let Some(plan) = plan_hash_join_predicate(expr, col_map, left_width) {
             let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
-            return Ok(execute_hash_join(
+            #[cfg(test)]
+            if plan.residual.is_some() {
+                FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS
+                    .with(|counter| counter.set(counter.get().wrapping_add(1)));
+            }
+            return execute_hash_join(
                 left,
                 right,
                 right_width,
                 left_width,
                 kind,
-                &equi_pairs,
+                &plan.equi_pairs,
                 track_right,
-            ));
+                plan.residual.as_ref(),
+                col_map,
+            );
         }
     }
     if let Some(JoinConstraint::Using(cols)) = constraint {
@@ -88393,7 +88586,7 @@ fn execute_single_join(
             && join_hash_pairs_are_binary(&equi_pairs, left_width)
         {
             let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
-            return Ok(execute_hash_join(
+            return execute_hash_join(
                 left,
                 right,
                 right_width,
@@ -88401,7 +88594,9 @@ fn execute_single_join(
                 kind,
                 &equi_pairs,
                 track_right,
-            ));
+                None,
+                col_map,
+            );
         }
     }
 
@@ -89370,18 +89565,16 @@ fn join_expr_affinity(
     context: &JoinEvalCollationContext,
 ) -> TypeAffinity {
     match expr {
-        Expr::Column(col_ref, _) => {
-            find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None)
-                .ok()
-                .and_then(|idx| {
-                    if col_map.get(idx).is_some_and(|(_, _, hidden)| *hidden) {
-                        Some(TypeAffinity::Integer)
-                    } else {
-                        context.column_affinities.get(idx).copied()
-                    }
-                })
-                .unwrap_or(TypeAffinity::Blob)
-        }
+        Expr::Column(col_ref, _) => resolve_join_expr_column_index(col_ref, col_map)
+            .ok()
+            .and_then(|idx| {
+                if col_map.get(idx).is_some_and(|(_, _, hidden)| *hidden) {
+                    Some(TypeAffinity::Integer)
+                } else {
+                    context.column_affinities.get(idx).copied()
+                }
+            })
+            .unwrap_or(TypeAffinity::Blob),
         Expr::Cast { type_name, .. } => TypeAffinity::from_type_name(&type_name.name),
         Expr::Collate { expr, .. } => join_expr_affinity(expr, col_map, context),
         _ => TypeAffinity::Blob,
@@ -89497,7 +89690,7 @@ pub(crate) fn eval_join_expr(
         Expr::Column(col_ref, _) => {
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
-            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
+            if let Ok(idx) = resolve_join_expr_column_index(col_ref, col_map) {
                 return Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null));
             }
             if let Some(rank) = try_eval_fts5_rank_column(col_ref, row, col_map)? {
@@ -92194,7 +92387,9 @@ mod tests {
     use super::{
         BoundPagerPublication, CommitSeq, Connection, ConnectionEnv, DifferentialEvent,
         FSQLITE_GROUP_BY_MEM_SCAN_FAST_PATH_HITS, FSQLITE_GROUP_BY_PROJECTION_PRUNE_HITS,
-        FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
+        FSQLITE_GROUP_BY_STREAMING_FAST_PATH_HITS, FSQLITE_JOIN_EXPR_BINDING_HITS,
+        FSQLITE_JOIN_EXPR_FALLBACK_SCANS, FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS,
+        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS, FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS,
         FSQLITE_TOP_CATEGORY_CTE_FAST_PATH_HITS, InProcessPageLockTable, IoPollStrategy,
         PagerBackend, PagerPublishedSnapshot, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
         SharedRuntimeState, SimplePager, Snapshot, init_global_runtime,
@@ -96100,6 +96295,399 @@ mod tests {
         assert_eq!(
             row_values(&rows[2]),
             vec![SqliteValue::Text("bob".into()), SqliteValue::Integer(7)]
+        );
+    }
+
+    #[test]
+    fn test_issue_285_predicate_heavy_join_hashes_equality_and_evaluates_residual_linearly() {
+        let _serial = super::fsqlite_core_test_serializer();
+        const SQL: &str = "SELECT count(*) FROM a JOIN b ON b.id = a.id \
+             AND typeof(b.d0)='integer' AND typeof(b.d1)='integer' \
+             AND typeof(b.d2)='integer' AND typeof(b.d3)='integer' \
+             AND typeof(b.d4)='integer' AND typeof(b.d5)='integer' \
+             AND typeof(b.d6)='integer' AND typeof(b.d7)='integer' \
+             AND typeof(b.d8)='integer' AND typeof(b.d9)='integer' \
+             AND typeof(a.c0)='integer' AND typeof(a.c1)='integer' \
+             AND typeof(a.c2)='integer' AND typeof(a.c3)='integer' \
+             AND typeof(a.c4)='integer' AND typeof(a.c5)='integer' \
+             AND typeof(a.c6)='integer' AND typeof(a.c7)='integer' \
+             AND typeof(a.c8)='integer' AND typeof(a.c9)='integer'";
+
+        let mut binding_hit_counts = Vec::new();
+        for row_count in [500usize, 1_000, 2_000] {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute(
+                "CREATE TABLE a(
+                    id INTEGER PRIMARY KEY,
+                    c0 INTEGER, c1 INTEGER, c2 INTEGER, c3 INTEGER, c4 INTEGER,
+                    c5 INTEGER, c6 INTEGER, c7 INTEGER, c8 INTEGER, c9 INTEGER
+                );
+                CREATE TABLE b(
+                    id INTEGER PRIMARY KEY,
+                    d0 INTEGER, d1 INTEGER, d2 INTEGER, d3 INTEGER, d4 INTEGER,
+                    d5 INTEGER, d6 INTEGER, d7 INTEGER, d8 INTEGER, d9 INTEGER
+                );",
+            )
+            .unwrap();
+
+            let a_values = (0..row_count)
+                .map(|value| {
+                    format!(
+                        "({value},{value},{value},{value},{value},{value},{value},{value},{value},{value},{value})"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let b_values = (0..row_count)
+                .map(|value| {
+                    let d9 = if value % 4 == 0 {
+                        "'not-an-integer'".to_owned()
+                    } else {
+                        value.to_string()
+                    };
+                    format!(
+                        "({value},{value},{value},{value},{value},{value},{value},{value},{value},{value},{d9})"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(&format!(
+                "BEGIN; INSERT INTO a VALUES {a_values}; INSERT INTO b VALUES {b_values}; COMMIT;"
+            ))
+            .unwrap();
+
+            let statement = conn.prepare(SQL).unwrap();
+            assert!(
+                statement.deferred_query_statement.is_some(),
+                "an equi-join with residual conjuncts must retain hash-join dispatch"
+            );
+
+            FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.set(0));
+            FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.set(0));
+            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+            let rows = statement.query().unwrap();
+            let expected = (0..row_count).filter(|value| value % 4 != 0).count();
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![SqliteValue::Integer(i64::try_from(expected).unwrap())]
+            );
+            assert_eq!(
+                FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.get()),
+                1,
+                "the residual-aware hash lane must execute"
+            );
+            assert_eq!(
+                FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.get()),
+                u64::try_from(row_count).unwrap(),
+                "one-to-one equality keys must evaluate the residual once per row, not once per Cartesian pair"
+            );
+            let binding_hits = FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get());
+            assert!(
+                binding_hits >= u64::try_from(row_count).unwrap() * 22,
+                "every ON column reference must resolve through its prebound index"
+            );
+            binding_hit_counts.push(binding_hits);
+            assert_eq!(
+                FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+                0,
+                "candidate evaluation must never rescan the column-name map"
+            );
+        }
+
+        let first_delta = binding_hit_counts[1] - binding_hit_counts[0];
+        let second_delta = binding_hit_counts[2] - binding_hit_counts[1];
+        assert_eq!(
+            second_delta,
+            first_delta * 2,
+            "doubling the row-count increment must exactly double bound-index lookups"
+        );
+    }
+
+    #[test]
+    fn test_join_where_columns_use_prebound_indexes_for_every_joined_row() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE l(id INTEGER PRIMARY KEY, payload TEXT);
+             CREATE TABLE r(id INTEGER PRIMARY KEY, payload TEXT);
+             INSERT INTO l VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+             INSERT INTO r VALUES (1, 'w'), (2, 'x'), (3, 'y'), (4, 'z');",
+        )
+        .unwrap();
+        let statement = conn
+            .prepare(
+                "SELECT count(*) FROM l JOIN r ON r.id = l.id
+                 WHERE typeof(l.payload) = 'text' AND r.payload IS NOT NULL",
+            )
+            .unwrap();
+
+        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
+        FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+        let rows = statement.query().unwrap();
+
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(4)]);
+        assert_eq!(
+            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get()),
+            8,
+            "two WHERE column references across four joined rows must use direct bindings"
+        );
+        assert_eq!(
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+            0,
+            "WHERE evaluation must not linearly rescan the column map"
+        );
+    }
+
+    #[test]
+    fn test_join_projection_columns_use_prebound_indexes_for_every_result_row() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE l(id INTEGER PRIMARY KEY, payload TEXT);
+             CREATE TABLE r(id INTEGER PRIMARY KEY, payload TEXT);
+             INSERT INTO l VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO r VALUES (1, 'x'), (2, 'y'), (3, 'z');",
+        )
+        .unwrap();
+        let statement = conn
+            .prepare("SELECT l.payload, r.payload FROM l JOIN r ON r.id = l.id")
+            .unwrap();
+
+        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
+        FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+        let rows = statement.query().unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get()),
+            6,
+            "two projected columns across three result rows must use direct bindings"
+        );
+        assert_eq!(
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+            0,
+            "projection evaluation must not linearly rescan the column map"
+        );
+    }
+
+    #[test]
+    fn test_hash_join_residual_preserves_left_join_duplicate_and_null_semantics() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE l(id INTEGER PRIMARY KEY, k INTEGER, enabled INTEGER);
+             CREATE TABLE r(id INTEGER PRIMARY KEY, k INTEGER, payload TEXT);
+             INSERT INTO l VALUES
+                 (1, 1, 1), (2, 1, 0), (3, 2, 1), (4, NULL, 1), (5, 3, 1);
+             INSERT INTO r VALUES
+                 (10, 1, 'x'), (11, 1, 'y'), (12, 2, 'z'), (13, NULL, 'n');",
+        )
+        .unwrap();
+
+        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.set(0));
+        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.set(0));
+        let rows = conn
+            .query(
+                "SELECT l.id, r.id, r.payload
+                 FROM l LEFT JOIN r
+                   ON l.k = r.k AND l.enabled = 1 AND r.payload != 'y'
+                 ORDER BY l.id, r.id",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(10),
+                    SqliteValue::Text("x".into()),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                ],
+                vec![
+                    SqliteValue::Integer(3),
+                    SqliteValue::Integer(12),
+                    SqliteValue::Text("z".into()),
+                ],
+                vec![
+                    SqliteValue::Integer(4),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                ],
+                vec![
+                    SqliteValue::Integer(5),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                ],
+            ]
+        );
+        assert_eq!(
+            FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.get()),
+            1
+        );
+        assert_eq!(
+            FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.get()),
+            5,
+            "duplicate equality keys should evaluate only their five candidate pairs"
+        );
+    }
+
+    #[test]
+    fn test_hash_join_residual_keeps_nocase_equality_on_collation_aware_fallback() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE l(code TEXT COLLATE NOCASE, enabled INTEGER);
+             CREATE TABLE r(code TEXT COLLATE NOCASE, payload TEXT);
+             INSERT INTO l VALUES ('Alpha', 1);
+             INSERT INTO r VALUES ('alpha', 'match');",
+        )
+        .unwrap();
+
+        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.set(0));
+        let rows = conn
+            .query(
+                "SELECT count(*) FROM l JOIN r
+                 ON r.code = l.code AND l.enabled = 1 AND typeof(r.payload) = 'text'",
+            )
+            .unwrap();
+
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+        assert_eq!(
+            FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.get()),
+            0,
+            "NOCASE equality must stay on the collation-aware nested fallback"
+        );
+    }
+
+    #[test]
+    fn test_hash_join_residual_rechecks_text_affinity_after_numeric_hash_prefilter() {
+        let _serial = super::fsqlite_core_test_serializer();
+        const QUERY: &str = "SELECT count(*) FROM l JOIN r
+             ON r.code = l.code AND l.code IS NOT NULL";
+        let cases = [
+            (
+                "CREATE TABLE l(code TEXT); CREATE TABLE r(code TEXT);
+                 INSERT INTO l VALUES ('01'); INSERT INTO r VALUES ('1');",
+                0_i64,
+            ),
+            (
+                "CREATE TABLE l(code TEXT); CREATE TABLE r(code INTEGER);
+                 INSERT INTO l VALUES ('01'); INSERT INTO r VALUES (1);",
+                1_i64,
+            ),
+        ];
+
+        for (setup, expected) in cases {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute(setup).unwrap();
+            let rows = conn.query(QUERY).unwrap();
+            let actual = match rows[0].get(0) {
+                Some(SqliteValue::Integer(value)) => *value,
+                other => panic!("unexpected FrankenSQLite count: {other:?}"),
+            };
+
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            oracle.execute_batch(setup).unwrap();
+            let sqlite_count: i64 = oracle.query_row(QUERY, [], |row| row.get(0)).unwrap();
+
+            assert_eq!(sqlite_count, expected);
+            assert_eq!(
+                actual, sqlite_count,
+                "hash candidate validation must preserve SQLite affinity semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hash_join_residual_full_join_tracks_matches_only_after_residual_passes() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE l(id INTEGER PRIMARY KEY, k INTEGER, enabled INTEGER);
+             CREATE TABLE r(id INTEGER PRIMARY KEY, k INTEGER);
+             INSERT INTO l VALUES (1, 1, 0), (2, 2, 1);
+             INSERT INTO r VALUES (10, 1), (20, 2), (30, 3);",
+        )
+        .unwrap();
+
+        FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.set(0));
+        FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.set(0));
+        let rows = conn
+            .query(
+                "SELECT l.id, r.id FROM l FULL JOIN r
+                 ON r.k = l.k AND l.enabled = 1",
+            )
+            .unwrap();
+        let values = rows.iter().map(row_values).collect::<Vec<_>>();
+
+        assert_eq!(values.len(), 4);
+        assert!(values.contains(&vec![SqliteValue::Integer(1), SqliteValue::Null]));
+        assert!(values.contains(&vec![SqliteValue::Integer(2), SqliteValue::Integer(20)]));
+        assert!(values.contains(&vec![SqliteValue::Null, SqliteValue::Integer(10)]));
+        assert!(values.contains(&vec![SqliteValue::Null, SqliteValue::Integer(30)]));
+        assert_eq!(
+            FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS.with(|counter| counter.get()),
+            1
+        );
+        assert_eq!(
+            FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS.with(|counter| counter.get()),
+            2,
+            "only the two equality-key candidates should reach residual evaluation"
+        );
+    }
+
+    #[test]
+    fn test_join_bindings_do_not_leak_into_correlated_on_subqueries() {
+        let _serial = super::fsqlite_core_test_serializer();
+        const SETUP: &str = "CREATE TABLE l(id INTEGER PRIMARY KEY, k INTEGER);
+             CREATE TABLE r(id INTEGER PRIMARY KEY, k INTEGER);
+             CREATE TABLE gate(l_id INTEGER);
+             INSERT INTO l VALUES (1, 1), (2, 2);
+             INSERT INTO r VALUES (10, 1), (20, 2);
+             INSERT INTO gate VALUES (2);";
+        const QUERY: &str = "SELECT l.id, r.id FROM l LEFT JOIN r
+             ON r.k = l.k
+                AND EXISTS (SELECT 1 FROM gate g WHERE g.l_id = l.id)
+             ORDER BY l.id";
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(SETUP).unwrap();
+        let actual = conn
+            .query(QUERY)
+            .unwrap()
+            .iter()
+            .map(row_values)
+            .collect::<Vec<_>>();
+
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        oracle.execute_batch(SETUP).unwrap();
+        let mut statement = oracle.prepare(QUERY).unwrap();
+        let expected = statement
+            .query_map([], |row| {
+                Ok(vec![
+                    row.get::<_, Option<i64>>(0)?
+                        .map_or(SqliteValue::Null, SqliteValue::Integer),
+                    row.get::<_, Option<i64>>(1)?
+                        .map_or(SqliteValue::Null, SqliteValue::Integer),
+                ])
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual,
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Null],
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(20)],
+            ]
         );
     }
 
