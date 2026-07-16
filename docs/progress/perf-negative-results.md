@@ -19394,3 +19394,26 @@ CORRECTS bd-5310l's parse+plan framing for INSERT:
   for a benchmark/API that reuses an already-parsed `Value` across many path resolutions, where object
   lookup is independently shown to dominate. Do not retry on ordinary `json_extract`, which reparses
   its input on each invocation.
+
+## 2026-07-16 - PROFILE (bd-aoj0g pinpoint): the O(n²) INSERT is NOT the btree cell ops — it is seek/witness/opcode
+
+Counter profile of the bd-aoj0g O(n²) secondary-index insert (debug build, btree metrics ENABLED via
+`set_btree_metrics_enabled` + `set_btree_copy_profile_enabled`; per-1000-insert batch at rising table
+size). DISPROVES the earlier slow-balance hypothesis:
+- Every btree CELL-OP counter is FLAT: `page_splits` ~0.004/insert (constant), `local_payload_copy_bytes`
+  0, `index_leaf_cell_assembly_bytes` 7 (constant), `interior_cell_rebuild_bytes` 0;
+  `conservative_reload_fallbacks` DECREASES with scale (0.79→0.14); `no_split_reuse_hits` rises to 0.87.
+- Yet wall grows ~linearly: 89 µs (empty) → 473 µs (9k rows), debug = **+43 ns per EXISTING row** (O(n)
+  per insert; extrapolates to the 295× gap at 100k).
+- So the O(n) is NOT btree cell insertion/split/balance/copy — it is in the SEEK / MVCC-witness /
+  IdxInsert-opcode layer. Prime suspect: `index_seek_for_insert` → `record_point_witness` →
+  `self.read_witnesses.push` (cursor.rs:2661/2681, `read_witnesses: Vec` at 1931) on EVERY index seek,
+  plus mvcc `hot_witness_index` push-accumulation; and the index seek's POOR cache locality (k=i%100
+  jumps 100 subtrees vs the table's sequential rightmost-leaf append — table insert is ~5 µs). 43 ns/row
+  = something touching all-N per insert or a cache-miss ramp.
+- Status: bd-aoj0g advanced + handed back to open with full counter data in its comments. NEXT: sub-time
+  the IdxInsert opcode (seek vs witness-record vs cell-insert) with direct `Instant` timers, or re-profile
+  with witness recording disabled / high-cardinality k (unique) to separate witness-O(n) from
+  locality-ramp. INFRA: enable btree counters (`set_btree_metrics_enabled`/`set_btree_copy_profile_enabled`)
+  — they are gated OFF by default and silently read zero otherwise; debug build is fine (counters are
+  opt-level-independent) and compiles faster than release-perf.
