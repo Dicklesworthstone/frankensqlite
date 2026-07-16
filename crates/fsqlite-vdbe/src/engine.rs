@@ -12639,15 +12639,22 @@ impl VdbeEngine {
                 let idx = usize::try_from(op.p1)
                     .ok()
                     .and_then(|one_based| one_based.checked_sub(1));
-                let value = idx
-                    .and_then(|idx| {
-                        borrowed_bindings
-                            .and_then(|bindings| bindings.get(idx))
-                            .or_else(|| self.bindings.get(idx))
-                    })
-                    .cloned()
-                    .unwrap_or(SqliteValue::Null);
-                self.set_reg_fast(op.p2, value);
+                let bound = idx.and_then(|idx| {
+                    borrowed_bindings
+                        .and_then(|bindings| bindings.get(idx))
+                        .or_else(|| self.bindings.get(idx))
+                });
+                // Integer parameters — the dominant prepared-statement bind
+                // type — update a pre-sized register in place via set_reg_int,
+                // skipping the clone + replace_register_value that the general
+                // path pays (mirrors copy_single_reg's Copy/SCopy fast lane).
+                if let Some(SqliteValue::Integer(v)) = bound {
+                    let v = *v;
+                    self.set_reg_int(op.p2, v);
+                } else {
+                    let value = bound.cloned().unwrap_or(SqliteValue::Null);
+                    self.set_reg_fast(op.p2, value);
+                }
                 *pc += 1;
                 Ok(true)
             }
@@ -21271,6 +21278,28 @@ mod tests {
             vec![SqliteValue::Integer(11), SqliteValue::Text("bound".into())],
         );
         assert_eq!(rows, vec![vec![SqliteValue::Text("bound".into())]]);
+    }
+
+    #[test]
+    fn test_variable_integer_binding_in_place_fast_path() {
+        // An integer parameter must land the identical Integer value in the
+        // target register both when it starts NULL and when it already holds
+        // an Integer (the in-place set_reg_int fast lane). Two Variable writes
+        // to the same register exercise both cases in one program.
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let r1 = b.alloc_reg();
+                b.emit_op(Opcode::Variable, 1, r1, 0, P4::None, 0);
+                b.emit_op(Opcode::Variable, 1, r1, 0, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![SqliteValue::Integer(-7)],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(-7)]]);
     }
 
     #[test]

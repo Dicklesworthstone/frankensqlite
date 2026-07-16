@@ -19140,3 +19140,43 @@ test is on the executed path, not merely linked into it.
   interval excludes zero. Revisit only if SCopy diverges from Copy's register or MakeRecord-sideband
   semantics; preserve source materialization and the generic fallback for non-integer or growing
   destinations.
+
+## 2026-07-15 - WIN: `Opcode::Variable` routes integer bindings through the in-place `set_reg_int`
+
+- Target: the existing `vdbe_pipeline_execute_variable/{64,256,1024}` benchmark, which binds
+  `Integer(42)` to parameter 1 and rebinds it into the same target register `op_repeats` times. The
+  `Opcode::Variable` arm in `try_execute_hot_opcode` resolved the binding, `.cloned()` it, and wrote
+  it with `set_reg_fast` — which always goes through `replace_register_value` (`std::mem::replace` +
+  `pool_return_reusable` buffer swap). After the first write the register already holds an `Integer`,
+  so every subsequent bind pays a full value replacement where an in-place integer store would do.
+  This is the prepared-statement parameter-bind opcode (Track W / bd-c0bsc territory) and the direct
+  analog of the July 14 Copy/SCopy `copy_single_reg` wins.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` — the `Opcode::Variable` hot arm now matches an
+  `Integer` binding and routes it through `set_reg_int` (which updates an already-`Integer` register
+  in place via `*current = val`, else replaces). Every non-integer binding and the unbound case keep
+  the exact prior `.cloned()` + `set_reg_fast` path, so register contents are byte-identical and only
+  the integer write mechanism changes. The dead main-match fallback arm (unreachable because the hot
+  path always handles Variable) was left untouched. Added focused test
+  `test_variable_integer_binding_in_place_fast_path` (two writes to one register exercise both the
+  NULL-start and already-Integer in-place cases); `cargo test -p fsqlite-vdbe --lib variable` passed
+  4/4. Ordering, tie-breaking, floating-point, and NaN normalization are not involved (integers).
+- Same-worker foreground proof on actual remote worker `ovh-b`, from base commit `87b14531` via
+  Criterion's built-in same-target-pool comparison. Base and candidate used the identical Cargo
+  payload
+  `cargo bench -j2 --config 'profile.release-perf.lto=false' --config
+  'profile.release-perf.codegen-units=16' --profile release-perf -p fsqlite-vdbe --bench
+  pipeline_stages -- '^vdbe_pipeline_execute_variable/' --warm-up-time 0.5 --measurement-time 2
+  --sample-size 30 --noplot`, under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`:
+  - 64 ops: `1.1744 us` -> `779.06 ns` point estimate (33.9% lower); Criterion change
+    `[-34.986%, -33.931%, -32.994%]`, `p = 0.00`.
+  - 256 ops: `4.4999 us` -> `2.8189 us` (36.3% lower); Criterion change
+    `[-37.103%, -36.273%, -35.484%]`, `p = 0.00`.
+  - 1024 ops: `17.942 us` -> `11.253 us` (36.7% lower); Criterion change
+    `[-37.574%, -36.736%, -35.896%]`, `p = 0.00`.
+  Freshness verified: the candidate build recompiled `fsqlite-vdbe` (edit compiled in), the change is
+  directional (~34-37%, not parity), and the new integer-bind test — which exists only in the edited
+  tree — passed.
+- Result: KEEP. Every measured size improved ~34-37% on the same worker and every confidence interval
+  excludes zero. Revisit only if binding storage classes or register-write bookkeeping change;
+  preserve the non-integer / unbound fallback through `set_reg_fast`.
