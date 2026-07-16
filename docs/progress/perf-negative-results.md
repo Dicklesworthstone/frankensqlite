@@ -19369,3 +19369,28 @@ CORRECTS bd-5310l's parse+plan framing for INSERT:
   version-chain growth?) — deferred to bd-aoj0g as dedicated btree work, not a one-turn blind fix.
   LESSON: when the reason-from-code seam is dry, a real phase+isolation profile finds levers the code
   reading missed — here a 97%-of-cost O(n^2) hotspot that was mis-attributed to parse+plan.
+
+## 2026-07-16 - REJECT: singleton-object direct key comparison in JSON path resolution (`bd-vv2kf.1`)
+
+- Target: `crates/fsqlite-ext-json/src/lib.rs::resolve_path`, measured by
+  `tests::perf_json_extract_deep_single_path` (200,000 `json_extract` calls per repeat, five repeats,
+  path `$.a.b.c.d[1].e` through four singleton objects). This was a fresh-subsystem pivot after the
+  codegen/VDBE/fsqlite-func one-turn map above. A release-profile `perf` run on `vmi1156319` sampled
+  `resolve_path` (0.87%), `IndexMap::get_index_of::<str>` (0.63%), and key hashing
+  (`DefaultHasher::finish` 1.20%, SipHasher write 1.03%, `RandomState::hash_one` 0.60%), behind the
+  dominant JSON parse/deserialization work.
+- Lever: for a `serde_json::Value::Object` with exactly one entry, compare the sole key directly and
+  reuse its value instead of hashing through `Map::get`; retain `Map::get` for larger objects. The
+  same helper covered quoted and unquoted object-key path segments. The candidate and temporary A/B
+  selector were fully reverted after measurement.
+- Foreground same-binary A/B on remote worker `vmi1152480` (RCH job
+  `j-29933730227290855`), `cargo test -p fsqlite-ext-json --lib --profile release` with
+  `profile.release.lto=false`, five paired repeats with old/new order alternated and medians reported:
+  baseline `380,698,300 ns`, candidate `381,800,934 ns`, candidate/baseline **`1.002896` (0.29%
+  slower)**. The cold compilation was outside the target-runner measurement cap; both variants ran in
+  one test binary, and both returned `Integer(456)`.
+- Result: REJECT (not shipped). The direct comparison does not clear even a sub-percent noise floor,
+  while adding a branch to every object step; parsing dominates this end-to-end workload. RETRY only
+  for a benchmark/API that reuses an already-parsed `Value` across many path resolutions, where object
+  lookup is independently shown to dominate. Do not retry on ordinary `json_extract`, which reparses
+  its input on each invocation.
