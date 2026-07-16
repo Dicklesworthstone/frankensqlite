@@ -19256,3 +19256,35 @@ test is on the executed path, not merely linked into it.
   The correctness test still exercises the remainder path (via `set_reg_fast`) so it stays valid.
   Shifts (`sql_shift_*`, always `Integer`) are the last untried arm but will be at-or-below the
   divide ratio; treat the write-specialization vein as effectively mined out after this.
+
+## 2026-07-16 - REJECT: promote `NotNull` into `try_execute_hot_opcode`
+
+- Target: `vdbe_pipeline_execute_notnull/{64,256,1024}` (a dispatch-dominated loop of `NotNull`
+  jumps). `NotNull` is the only common jump opcode still served by the 190-arm main match (its
+  complement `IsNull` and `IfNot`/`IfPos`/`DecrJumpZero` are already promoted). Lever: add a
+  jump-table arm to `try_execute_hot_opcode` mirroring `IsNull` (byte-identical body, inverted). The
+  hot match lowers to a jump table so adding an arm is O(1) and cannot regress other opcodes; the
+  change is strictly *fewer* dispatches for `NotNull` (was hot-miss + main-match-hit, becomes
+  hot-hit). Correctness: freshness-gated `cargo test -p fsqlite-vdbe --lib
+  test_notnull_hot_path_jump_and_fallthrough` ran the one new test (jump-on-notnull +
+  fallthrough-on-null) and passed.
+- Same-worker A/B on `ovh-b`, base `971bae4c`, Criterion same-target-pool compare, identical Cargo
+  payload (`... -- '^vdbe_pipeline_execute_notnull/' ...`):
+  - `64`:   `612.83 ns` -> `578.39 ns`, change `[-6.551%, -5.386%, -4.323%]` (`p = 0.00`).
+  - `256`:  `2.1610 us` -> `2.0252 us`, change `[-7.835%, -6.732%, -5.526%]` (`p = 0.00`).
+  - `1024`: `8.4328 us` -> `8.9865 us`, change **`[+5.840%, +6.982%, +8.103%]` (`p = 0.00`) —
+    REGRESSION**.
+- Result: REJECT (not shipped; change parked in a `git stash` labelled "REJECTED notnull hot-path
+  promotion", not committed). Mixed: the two small sizes improved ~5-7% but `/1024` regressed ~7%,
+  and `/1024` (many ops = the large-scan case) is the representative real-world size. The regression
+  contradicts the mechanism (strictly fewer dispatches should help *uniformly*), and the degradation
+  is monotonic with measurement order (`/64` first improved, `/1024` last regressed) — the classic
+  signature of rising external contention on the shared `ovh-b` during the candidate window (baseline
+  and candidate measured ~10 min apart on a contended worker), with a possible code-layout/icache
+  contribution. Not shippable on a measured `/1024` regression regardless of cause. RETRY CONDITION:
+  re-run baseline+candidate on an *idle/dedicated* worker measuring `/1024` in isolation (or reorder
+  groups so `/1024` is measured first); ship only if the improvement is uniform. Low priority — the
+  absolute win is ~30 ns on a sub-microsecond op. LESSON: on a shared contended worker, a
+  monotonic-with-measurement-order delta (early groups better, late groups worse) is a contention
+  tell, not a real code effect — but you still cannot ship a measured regression; re-measure clean or
+  reject.
