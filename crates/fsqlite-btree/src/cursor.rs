@@ -1887,6 +1887,13 @@ struct BulkTableGroup {
     end: usize,
 }
 
+#[derive(Debug)]
+enum MutationPathTarget {
+    TableInsert(i64),
+    ExactTableRowid(i64),
+    ExactIndexKey(Vec<u8>),
+}
+
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
 ///
 /// Generic over the page I/O backend for testability.
@@ -6982,6 +6989,17 @@ impl<P: PageWriter> BtCursor<P> {
         if depth == 0 {
             return Err(FrankenError::internal("cursor stack empty during balance"));
         }
+        let path_root = self.stack[0].page_no;
+        if path_root != self.root_page {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "insert balance cursor path starts at page {} instead of root {} (depth {})",
+                    path_root.get(),
+                    self.root_page.get(),
+                    depth
+                ),
+            });
+        }
 
         // A balance can split, merge, or free any leaf remembered by the
         // table-seek cache. Invalidate those topology-dependent anchors before
@@ -7206,7 +7224,23 @@ impl<P: PageWriter> BtCursor<P> {
     /// tree depth by one (the inverse of `balance_deeper`).
     fn balance_for_delete(&mut self, cx: &Cx) -> Result<()> {
         let depth = self.stack.len();
-        if depth <= 1 {
+        if depth == 0 {
+            return Err(FrankenError::internal(
+                "cursor stack empty during delete balance",
+            ));
+        }
+        let path_root = self.stack[0].page_no;
+        if path_root != self.root_page {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "delete balance cursor path starts at page {} instead of root {} (depth {})",
+                    path_root.get(),
+                    self.root_page.get(),
+                    depth
+                ),
+            });
+        }
+        if depth == 1 {
             return Ok(());
         }
 
@@ -8472,24 +8506,12 @@ impl<P: PageWriter> BtCursor<P> {
             return Err(FrankenError::internal("cursor stack is empty"));
         }
 
-        // The positioning seek may have landed via the table seek-cache fast
-        // path, which leaves a rootless single-entry stack (just the leaf,
-        // no path from the root). If this insert then splits the leaf,
-        // `balance_for_insert` interprets `stack.len() == 1` as "the leaf IS
-        // the root" and pushes the TRUE root down — the insert-side sibling
-        // of the bd-kwei8 delete corruption (emptied leaves left attached).
-        // Rebuild the full root-to-leaf path before mutating; clearing the
-        // seek cache first forces the re-seek to descend from the root. All
-        // table-insert entry points converge here, so this is the single
-        // choke point.
-        if self.stack.len() == 1
-            && self
-                .stack
-                .first()
-                .is_some_and(|entry| entry.page_no != self.root_page)
+        // A read fast path may leave only the landing leaf on the stack. The
+        // shared helper restores the root-to-leaf path before any mutation can
+        // reach balancing, where depth one means the page is the actual root.
+        if let Some(reseek) =
+            self.ensure_full_mutation_path(cx, MutationPathTarget::TableInsert(rowid))?
         {
-            self.clear_seek_cache();
-            let reseek = self.table_seek_for_insert(cx, rowid)?;
             if reseek.is_found() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -8616,6 +8638,58 @@ impl<P: PageWriter> BtCursor<P> {
                 Err(error)
             }
         }
+    }
+
+    /// Ensure structural mutation sees a complete path beginning at this
+    /// cursor's declared root page.
+    ///
+    /// Table seek-cache hits deliberately retain only the landing leaf for
+    /// read performance. Such a stack is safe for reads but not for balancing:
+    /// `stack.len() == 1` is reserved for a tree whose root is itself a leaf.
+    /// Re-seek from the root while mutation is still reversible, then let the
+    /// insert/delete caller validate whether the target was expected to exist.
+    fn ensure_full_mutation_path(
+        &mut self,
+        cx: &Cx,
+        target: MutationPathTarget,
+    ) -> Result<Option<SeekResult>> {
+        let first_page = self
+            .stack
+            .first()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty before mutation"))?
+            .page_no;
+        if first_page == self.root_page {
+            return Ok(None);
+        }
+
+        self.clear_seek_cache();
+        let result = match target {
+            MutationPathTarget::TableInsert(rowid) => self.table_seek_for_insert(cx, rowid)?,
+            MutationPathTarget::ExactTableRowid(rowid) => self.table_seek(cx, rowid)?,
+            MutationPathTarget::ExactIndexKey(key) => self.index_seek(cx, &key)?,
+        };
+
+        let rebuilt_first = self
+            .stack
+            .first()
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "mutation re-seek from root {} produced an empty cursor path",
+                    self.root_page.get()
+                ),
+            })?
+            .page_no;
+        if rebuilt_first != self.root_page {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "mutation cursor path starts at page {} instead of root {} after re-seek",
+                    rebuilt_first.get(),
+                    self.root_page.get()
+                ),
+            });
+        }
+
+        Ok(Some(result))
     }
 
     fn try_append_on_cached_rightmost_leaf(
@@ -10512,9 +10586,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             // The caller's positioning seek may have gone through the table
             // seek-cache fast path (`try_table_seek_cache`), which rebuilds
             // the stack as just the landing leaf with no path from the root.
-            // Deleting from such a rootless stack silently disables
-            // `balance_for_delete` (its `depth <= 1` early-return means "the
-            // leaf IS the root"), the pre-delete anchor capture, and
+            // Deleting from such a rootless stack used to silently disable
+            // `balance_for_delete` (depth one was treated as "the leaf IS the
+            // root"), the pre-delete anchor capture, and
             // separator repair — so a leaf drained to zero cells stays
             // referenced by its parent interior page, a shape stock SQLite
             // rejects as "database disk image is malformed" (bd-kwei8; the
@@ -10524,34 +10598,23 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             // Rebuild the full root-to-leaf path before mutating anything;
             // the seek cache was cleared above, so this re-seek descends
             // from the root.
-            let rootless = cursor.stack.len() == 1
-                && cursor
-                    .stack
-                    .first()
-                    .is_some_and(|entry| entry.page_no != cursor.root_page);
-            if rootless {
-                let top_is_table_leaf = cursor.stack.first().is_some_and(|entry| {
-                    entry.header.page_type.is_leaf() && entry.header.page_type.is_table()
-                });
-                if cursor.is_table && top_is_table_leaf {
-                    let rowid = cursor.rowid(cx)?;
-                    let seek = cursor.table_seek(cx, rowid)?;
-                    if !seek.is_found() {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "delete re-seek lost rowid {rowid} while rebuilding rootless cursor path"
-                            ),
-                        });
-                    }
+            if cursor
+                .stack
+                .first()
+                .is_some_and(|entry| entry.page_no != cursor.root_page)
+            {
+                let path_target = if cursor.is_table {
+                    MutationPathTarget::ExactTableRowid(cursor.rowid(cx)?)
                 } else {
-                    let key = cursor.payload(cx)?;
-                    let seek = cursor.index_seek(cx, &key)?;
-                    if !seek.is_found() {
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: "delete re-seek lost index key while rebuilding rootless cursor path"
-                                .to_owned(),
-                        });
-                    }
+                    MutationPathTarget::ExactIndexKey(cursor.payload(cx)?)
+                };
+                if let Some(reseek) = cursor.ensure_full_mutation_path(cx, path_target)?
+                    && !reseek.is_found()
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "delete re-seek lost the current entry while rebuilding the mutation path"
+                            .to_owned(),
+                    });
                 }
             }
 
@@ -13074,6 +13137,84 @@ mod tests {
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let err = cursor.table_insert(&cx, 7, b"dupe").unwrap_err();
         assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+    }
+
+    #[test]
+    fn test_balance_choke_points_reject_nonroot_single_entry_paths() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (10, b"ten")]));
+        store.pages.insert(4, build_leaf_table(&[(20, b"twenty")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let root_before = cursor.pager.pages[&2].clone();
+        let leaf_before = cursor.pager.pages[&3].clone();
+
+        // Model a read fast path that retained only its landing leaf. Neither
+        // balance entry point may reinterpret this non-root page as the root.
+        let mut rootless_leaf = cursor.load_page(&cx, pn(3)).unwrap();
+        rootless_leaf.cell_idx = 0;
+        cursor.stack.push(rootless_leaf);
+
+        let insert_error = cursor
+            .balance_for_insert(&cx, b"unused", 0)
+            .expect_err("insert balance must fail closed on a rootless path");
+        assert!(
+            matches!(
+                &insert_error,
+                FrankenError::DatabaseCorrupt { detail }
+                    if detail.contains("insert balance cursor path starts at page 3 instead of root 2")
+            ),
+            "unexpected insert-balance error: {insert_error:?}"
+        );
+
+        let delete_error = cursor
+            .balance_for_delete(&cx)
+            .expect_err("delete balance must fail closed on a rootless path");
+        assert!(
+            matches!(
+                &delete_error,
+                FrankenError::DatabaseCorrupt { detail }
+                    if detail.contains("delete balance cursor path starts at page 3 instead of root 2")
+            ),
+            "unexpected delete-balance error: {delete_error:?}"
+        );
+
+        assert_eq!(&cursor.pager.pages[&2], &root_before);
+        assert_eq!(&cursor.pager.pages[&3], &leaf_before);
+    }
+
+    #[test]
+    fn test_ensure_full_mutation_path_rebuilds_from_declared_root() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (10, b"ten")]));
+        store.pages.insert(4, build_leaf_table(&[(20, b"twenty")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut rootless_leaf = cursor.load_page(&cx, pn(3)).unwrap();
+        rootless_leaf.cell_idx = 0;
+        cursor.stack.push(rootless_leaf);
+        cursor.at_eof = false;
+
+        let result = cursor
+            .ensure_full_mutation_path(&cx, MutationPathTarget::ExactTableRowid(1))
+            .expect("rootless read position should be recoverable")
+            .expect("rootless position should trigger a re-seek");
+        assert!(result.is_found());
+        assert_eq!(cursor.stack.len(), 2);
+        assert_eq!(cursor.stack[0].page_no, pn(2));
+        assert_eq!(cursor.stack[1].page_no, pn(3));
     }
 
     #[test]
