@@ -244,6 +244,7 @@ impl RtreeConfig {
 pub struct RtreeIndex {
     config: RtreeConfig,
     entries: Vec<RtreeEntry>,
+    entry_ids: HashSet<i64>,
     geometry_registry: HashMap<String, Arc<dyn RtreeGeometry>>,
 }
 
@@ -252,6 +253,7 @@ impl std::fmt::Debug for RtreeIndex {
         f.debug_struct("RtreeIndex")
             .field("config", &self.config)
             .field("entries", &self.entries)
+            .field("entry_ids", &self.entry_ids)
             .field("geometry_count", &self.geometry_registry.len())
             .finish()
     }
@@ -264,6 +266,7 @@ impl RtreeIndex {
         Self {
             config,
             entries: Vec::new(),
+            entry_ids: HashSet::new(),
             geometry_registry: HashMap::new(),
         }
     }
@@ -300,7 +303,7 @@ impl RtreeIndex {
         if entry.bbox.dimensions() != self.config.dimensions {
             return false;
         }
-        if self.entries.iter().any(|e| e.id == entry.id) {
+        if !self.entry_ids.insert(entry.id) {
             return false;
         }
         self.entries.push(entry);
@@ -311,14 +314,16 @@ impl RtreeIndex {
     ///
     /// Returns `true` if an entry was removed.
     pub fn delete(&mut self, id: i64) -> bool {
-        let before = self.entries.len();
+        if !self.entry_ids.remove(&id) {
+            return false;
+        }
         self.entries.retain(|e| e.id != id);
-        self.entries.len() < before
+        true
     }
 
     #[must_use]
     pub fn contains_id(&self, id: i64) -> bool {
-        self.entries.iter().any(|entry| entry.id == id)
+        self.entry_ids.contains(&id)
     }
 
     #[must_use]
@@ -563,6 +568,7 @@ impl RtreeVirtualTable {
         self.index = RtreeIndex {
             config,
             entries: Vec::new(),
+            entry_ids: HashSet::new(),
             geometry_registry,
         };
 
