@@ -19180,3 +19180,51 @@ test is on the executed path, not merely linked into it.
 - Result: KEEP. Every measured size improved ~34-37% on the same worker and every confidence interval
   excludes zero. Revisit only if binding storage classes or register-write bookkeeping change;
   preserve the non-integer / unbound fallback through `set_reg_fast`.
+
+## 2026-07-16 - WIN: integer `Add`/`Subtract`/`Multiply` results write in place via `set_reg_int`
+
+- Target: the existing `vdbe_pipeline_execute_{add,subtract,multiply}/{64,256,1024}` benchmarks, each
+  a stream of an integer arithmetic op writing the same output register (`17 op 25` etc.). The hot
+  arms in `try_execute_hot_opcode` computed `a.sql_add/sub/mul(b)` and wrote the result with
+  `set_reg_fast`, which always pays `replace_register_value` (`std::mem::replace` +
+  `pool_return_reusable`). After the first write the output register already holds an `Integer`, so a
+  same-typed integer store could update it in place. Same in-place mechanism as the July 14/15
+  Copy/SCopy/Variable wins, extended from register moves to computed results.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` — new `set_reg_arith_result(r, value)` helper that
+  routes an `Integer` result through `set_reg_int` (in-place `*current = val` when the register
+  already holds an `Integer`) and everything else through `set_reg_fast`. The Add/Subtract/Multiply
+  hot arms call it. This is byte-identical: `sql_add/sub/mul` return `Integer(result)` ONLY for an
+  exact, non-overflowing value (integer overflow promotes to `Float` via `float_result_or_null`), so
+  a matched `Integer` is provably the exact result; `Float`/`Null` take the unchanged path. The
+  computation itself is untouched. Added focused tests `test_arith_integer_result_in_place_fast_path`
+  (chained Add/Multiply/Subtract on one register exercising the in-place path) and
+  `test_arith_float_result_falls_through_general_path` (Integer+Float -> Float via the general path);
+  a freshness-gated `cargo test -p fsqlite-vdbe --lib test_arith_` ran exactly those 2 and both
+  passed, plus the 6 pre-existing `*arith*` tests. Main-match fallback arms left untouched (dead;
+  hot path always handles these opcodes).
+- Same-worker foreground proof on actual remote worker `ovh-b`, from base commit `a42d1020` via
+  Criterion's built-in same-target-pool comparison. Base (clean tree) and candidate (edited tree)
+  used the identical Cargo payload
+  `cargo bench -j2 --config 'profile.release-perf.lto=false' --config
+  'profile.release-perf.codegen-units=16' --profile release-perf -p fsqlite-vdbe --bench
+  pipeline_stages -- '^vdbe_pipeline_execute_(add|subtract|multiply)/' --warm-up-time 0.5
+  --measurement-time 2 --sample-size 30 --noplot`, under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`:
+  - add:      `1.2094 us` -> `990.60 ns` (change `[-18.804%, -18.010%, -17.262%]`), `4.4078 us` ->
+    `3.5814 us` (`[-19.717%, -18.829%, -17.992%]`), `17.860 us` -> `14.082 us`
+    (`[-26.461%, -23.368%, -20.696%]`); all `p = 0.00`.
+  - subtract: `1.2022 us` -> `1.0565 us` (`[-12.891%, -11.562%, -10.324%]`), `4.4441 us` ->
+    `3.8558 us` (`[-15.025%, -13.847%, -12.797%]`), `17.345 us` -> `15.336 us`
+    (`[-14.158%, -12.999%, -11.786%]`); all `p = 0.00`.
+  - multiply: `1.2443 us` -> `1.0938 us` (`[-12.801%, -11.953%, -11.072%]`), `4.7257 us` ->
+    `4.0996 us` (`[-13.828%, -12.365%, -10.656%]`), `18.327 us` -> `16.323 us`
+    (`[-13.712%, -12.475%, -11.183%]`); all `p = 0.00`.
+  Freshness verified: candidate build recompiled `fsqlite-vdbe` on `ovh-b`, deltas are directional
+  (not parity), and the new tests provably ran on a fresh checkout (an earlier test attempt on
+  flaky `vmi1153651` served a STALE checkout missing the new tests — re-run confirmed 2/2, see
+  the stale-artifact hazard note).
+- Result: KEEP. All 9 cells improved (~12-23%) on the same worker with every confidence interval
+  excluding zero. Smaller ratio than the transfer family because arithmetic also pays the two
+  `get_reg` reads + `sql_*` compute, so the write is a smaller fraction of the op. Follow-ups (same
+  helper): `Divide`/`Remainder` (verify `sql_div`/`sql_rem` return `Integer` only for exact results)
+  and `ShiftLeft`/`ShiftRight`; `BitAnd`/`BitOr`/`BitNot` already use `set_reg_int` directly.

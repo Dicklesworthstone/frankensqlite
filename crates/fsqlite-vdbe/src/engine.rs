@@ -12629,7 +12629,7 @@ impl VdbeEngine {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);
                 let result = a.sql_add(b);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -12637,7 +12637,7 @@ impl VdbeEngine {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);
                 let result = a.sql_sub(b);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -12645,7 +12645,7 @@ impl VdbeEngine {
                 let a = self.get_reg(op.p2);
                 let b = self.get_reg(op.p1);
                 let result = a.sql_mul(b);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -14292,6 +14292,22 @@ impl VdbeEngine {
             other => other,
         };
         self.replace_register_value(idx, normalized);
+    }
+
+    /// Write an arithmetic result, updating an already-`Integer` register in
+    /// place via `set_reg_int` when the result is an `Integer`. sql_add/sub/mul
+    /// return `Integer` only for an exact, non-overflowing value (overflow
+    /// promotes to `Float`), so this is byte-identical to `set_reg_fast` while
+    /// skipping the `replace_register_value` buffer swap on the common
+    /// integer-into-integer case. `Float`/`Null` results take the general path.
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
+    fn set_reg_arith_result(&mut self, r: i32, value: SqliteValue) {
+        if let SqliteValue::Integer(v) = value {
+            self.set_reg_int(r, v);
+        } else {
+            self.set_reg_fast(r, value);
+        }
     }
 
     /// Null-specialized register write used by null-writing opcodes.
@@ -21225,6 +21241,62 @@ mod tests {
             vec![SqliteValue::Integer(-7)],
         );
         assert_eq!(rows, vec![vec![SqliteValue::Integer(-7)]]);
+    }
+
+    #[test]
+    fn test_arith_integer_result_in_place_fast_path() {
+        // Integer arithmetic results must land the exact integer value in the
+        // output register, including the already-Integer in-place path (a
+        // second write to the same register) and a Float-producing operand
+        // that must fall through to the general set_reg_fast path.
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let lhs = b.alloc_reg();
+                let rhs = b.alloc_reg();
+                let out = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 17, lhs, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 25, rhs, 0, P4::None, 0);
+                // out := 17 + 25, twice — the second Add hits the in-place path.
+                b.emit_op(Opcode::Add, rhs, lhs, out, P4::None, 0);
+                b.emit_op(Opcode::Add, rhs, lhs, out, P4::None, 0);
+                // out := out * 2 = 84 (still Integer, in place again).
+                let two = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 2, two, 0, P4::None, 0);
+                b.emit_op(Opcode::Multiply, two, out, out, P4::None, 0);
+                // out := out - 84 = 0.
+                b.emit_op(Opcode::Subtract, out, out, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_arith_float_result_falls_through_general_path() {
+        // A Float operand makes the result Float, which must take the general
+        // set_reg_fast path (not the integer in-place lane).
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let lhs = b.alloc_reg();
+                let rhs = b.alloc_reg();
+                let out = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 5, lhs, 0, P4::None, 0);
+                b.emit_op(Opcode::Real, 0, rhs, 0, P4::Real(2.5), 0);
+                b.emit_op(Opcode::Add, rhs, lhs, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Float(7.5)]]);
     }
 
     #[test]
