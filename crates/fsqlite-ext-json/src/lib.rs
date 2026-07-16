@@ -2058,6 +2058,19 @@ fn json_arg_value(name: &str, args: &[SqliteValue], index: usize) -> Result<Valu
     match args.get(index) {
         Some(SqliteValue::Text(text)) => parse_json_text(text),
         Some(SqliteValue::Blob(bytes)) => parse_json_input_blob(bytes),
+        // A bare SQL numeric value is interpreted as a JSON number (C SQLite's
+        // JSON-argument convention): e.g. json_type(123) -> 'integer',
+        // json_type(1.5) -> 'real'. A non-finite REAL cannot be represented as a
+        // serde_json number and falls through to the error arm below.
+        Some(SqliteValue::Integer(i)) => Ok(Value::Number((*i).into())),
+        Some(SqliteValue::Float(f)) if f.is_finite() => serde_json::Number::from_f64(*f)
+            .map(Value::Number)
+            .ok_or_else(|| {
+                FrankenError::function_error(format!(
+                    "{name} argument {} is not representable as JSON",
+                    index + 1
+                ))
+            }),
         Some(other) => Err(FrankenError::function_error(format!(
             "{name} argument {} must be TEXT or BLOB, got {}",
             index + 1,
@@ -2238,7 +2251,11 @@ impl ScalarFunction for JsonValidFunc {
             SqliteValue::Null => return Ok(SqliteValue::Null),
             SqliteValue::Text(text) => json_valid(text, flags),
             SqliteValue::Blob(bytes) => json_valid_blob(bytes, flags),
-            _ => 0,
+            // A bare SQL numeric renders to its JSON numeric form, which is valid
+            // JSON — except a non-finite REAL (Inf/NaN), which C SQLite rejects
+            // (e.g. json_valid(9e999) -> 0).
+            SqliteValue::Integer(_) => 1,
+            SqliteValue::Float(f) => i64::from(f.is_finite()),
         };
         Ok(SqliteValue::Integer(value))
     }
@@ -4265,6 +4282,39 @@ mod tests {
     #[test]
     fn test_json_type_array() {
         assert_eq!(json_type("[1,2]", None).unwrap(), Some("array"));
+    }
+
+    #[test]
+    fn test_json_valid_bare_numeric_values() {
+        // Regression (#259): bare SQL numerics are valid JSON; a non-finite REAL
+        // (Inf/NaN) is not (e.g. json_valid(9e999) -> 0).
+        let f = JsonValidFunc;
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(123)]).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Float(1.5)]).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Float(f64::INFINITY)]).unwrap(),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_json_type_bare_numeric_values() {
+        // Regression (#260): json_type(123) -> 'integer', json_type(1.5) -> 'real'.
+        let f = JsonTypeFunc;
+        assert_eq!(
+            f.invoke(&[SqliteValue::Integer(123)]).unwrap(),
+            SqliteValue::Text(SmallText::from_string("integer"))
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Float(1.5)]).unwrap(),
+            SqliteValue::Text(SmallText::from_string("real"))
+        );
     }
 
     // -----------------------------------------------------------------------
