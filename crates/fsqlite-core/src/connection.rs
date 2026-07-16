@@ -68248,6 +68248,143 @@ fn combine_where_clauses(
     }
 }
 
+/// Returns true when any expression position inside the SELECT still carries a
+/// bind placeholder (`?`, `?N`, `:name`, `@name`, `$name`).
+///
+/// frankensim-kl17o: a subquery whose predicate references placeholders is
+/// parameter-DEPENDENT — its result is not knowable until execution supplies
+/// bindings. Prepare-time paths call the eager subquery rewrite with
+/// `params = None`; evaluating such a subquery there reads every placeholder
+/// as NULL and bakes the wrong literal (`WHERE 0`) into the compiled program.
+/// This walker is the guard both for that rewrite and for the
+/// `*_subquery_supported_by_vdbe` routing predicates, which must keep
+/// parameter-dependent subqueries on dispatch paths that bind at execution.
+fn select_contains_any_placeholder(select: &SelectStatement) -> bool {
+    fn core(core: &SelectCore) -> bool {
+        match core {
+            SelectCore::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+                ..
+            } => {
+                columns.iter().any(|column| match column {
+                    ResultColumn::Expr { expr: e, .. } => expr(e),
+                    ResultColumn::Star | ResultColumn::TableStar(_) => false,
+                }) || from.as_ref().is_some_and(from_clause)
+                    || where_clause.as_deref().is_some_and(expr)
+                    || group_by.iter().any(expr)
+                    || having.as_deref().is_some_and(expr)
+                    || windows.iter().any(|window| window_spec(&window.spec))
+            }
+            SelectCore::Values(rows) => rows.iter().flatten().any(expr),
+        }
+    }
+    fn from_clause(from: &fsqlite_ast::FromClause) -> bool {
+        source(&from.source)
+            || from.joins.iter().any(|join| {
+                source(&join.table)
+                    || matches!(&join.constraint, Some(JoinConstraint::On(e)) if expr(e))
+            })
+    }
+    fn source(src: &TableOrSubquery) -> bool {
+        match src {
+            TableOrSubquery::Table { .. } => false,
+            TableOrSubquery::Subquery { query, .. } => select_contains_any_placeholder(query),
+            TableOrSubquery::TableFunction { args, .. } => args.iter().any(expr),
+            TableOrSubquery::ParenJoin(from) => from_clause(from),
+        }
+    }
+    fn window_spec(spec: &fsqlite_ast::WindowSpec) -> bool {
+        spec.partition_by.iter().any(expr)
+            || spec.order_by.iter().any(|ordering| expr(&ordering.expr))
+            || spec.frame.as_ref().is_some_and(|frame| {
+                frame_bound(&frame.start) || frame.end.as_ref().is_some_and(frame_bound)
+            })
+    }
+    fn frame_bound(bound: &fsqlite_ast::FrameBound) -> bool {
+        match bound {
+            fsqlite_ast::FrameBound::Preceding(e) | fsqlite_ast::FrameBound::Following(e) => {
+                expr(e)
+            }
+            fsqlite_ast::FrameBound::UnboundedPreceding
+            | fsqlite_ast::FrameBound::CurrentRow
+            | fsqlite_ast::FrameBound::UnboundedFollowing => false,
+        }
+    }
+    fn expr(e: &Expr) -> bool {
+        match e {
+            Expr::Placeholder(_, _) => true,
+            Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => false,
+            Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::IsNull { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::Collate { expr: inner, .. } => expr(inner),
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => expr(inner) || expr(low) || expr(high),
+            Expr::In {
+                expr: inner, set, ..
+            } => {
+                expr(inner)
+                    || match set {
+                        InSet::List(values) => values.iter().any(expr),
+                        InSet::Subquery(query) => select_contains_any_placeholder(query),
+                        InSet::Table(_) => false,
+                    }
+            }
+            Expr::Like {
+                expr: inner,
+                pattern,
+                escape,
+                ..
+            } => expr(inner) || expr(pattern) || escape.as_deref().is_some_and(expr),
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                operand.as_deref().is_some_and(expr)
+                    || whens.iter().any(|(when, then)| expr(when) || expr(then))
+                    || else_expr.as_deref().is_some_and(expr)
+            }
+            Expr::Exists { subquery, .. } => select_contains_any_placeholder(subquery),
+            Expr::Subquery(query, _) => select_contains_any_placeholder(query),
+            Expr::FunctionCall {
+                args, filter, over, ..
+            } => {
+                matches!(args, FunctionArgs::List(list) if list.iter().any(expr))
+                    || filter.as_deref().is_some_and(expr)
+                    || over.as_ref().is_some_and(window_spec)
+            }
+            Expr::JsonAccess {
+                expr: inner, path, ..
+            } => expr(inner) || expr(path),
+            Expr::RowValue(values, _) => values.iter().any(expr),
+        }
+    }
+    core(&select.body.select)
+        || select.body.compounds.iter().any(|(_, c)| core(c))
+        || select.order_by.iter().any(|term| expr(&term.expr))
+        || select
+            .limit
+            .as_ref()
+            .is_some_and(|limit| expr(&limit.limit) || limit.offset.as_ref().is_some_and(expr))
+        || select.with.as_ref().is_some_and(|with| {
+            with.ctes
+                .iter()
+                .any(|cte| select_contains_any_placeholder(&cte.query))
+        })
+}
+
 /// Returns true when statement-level subquery rewrite can mutate this statement.
 ///
 /// This intentionally tracks only expression positions visited by
@@ -68678,6 +68815,10 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
         || !sub.body.compounds.is_empty()
         || !sub.order_by.is_empty()
         || sub.limit.is_some()
+        // frankensim-kl17o: parameter-dependent subqueries survive the
+        // prepare-time rewrite un-folded and must route through dispatch
+        // paths that bind placeholders at execution.
+        || select_contains_any_placeholder(sub)
     {
         return false;
     }
@@ -68829,6 +68970,8 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
         || !sub.body.compounds.is_empty()
         || !sub.order_by.is_empty()
         || sub.limit.is_some()
+        // frankensim-kl17o: see exists_subquery_supported_by_vdbe.
+        || select_contains_any_placeholder(sub)
     {
         return false;
     }
@@ -68859,6 +69002,8 @@ fn in_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bo
     if in_subquery_needs_eager_eval(sub)
         || in_subquery_references_view(sub, conn)
         || in_subquery_references_sqlite_schema(sub, conn)
+        // frankensim-kl17o: see exists_subquery_supported_by_vdbe.
+        || select_contains_any_placeholder(sub)
     {
         return false;
     }
@@ -72244,7 +72389,10 @@ fn rewrite_in_expr(
                 let vdbe_supported = in_subquery_supported_by_vdbe(sub, conn);
                 let should_eager_rewrite = !is_correlated_subquery(sub)
                     && (!vdbe_supported
-                        || (rewrite_in_subqueries && !conn.skip_statement_memdb_refresh.get()));
+                        || (rewrite_in_subqueries && !conn.skip_statement_memdb_refresh.get()))
+                    // frankensim-kl17o: parameter-dependent IN subqueries must
+                    // not be materialized without bindings (see the Exists arm).
+                    && !(params.is_none() && select_contains_any_placeholder(sub));
                 if should_eager_rewrite {
                     // Keep VDBE/prepare-time-compatible IN subqueries intact so
                     // the direct fast paths and one-time materialized probe code
@@ -72351,6 +72499,14 @@ fn rewrite_in_expr(
             if is_correlated_subquery(subquery) {
                 return Ok(());
             }
+            // frankensim-kl17o: a placeholder-bearing subquery is
+            // parameter-dependent. Without bindings (prepare-time rewrite runs
+            // with `params = None`) evaluating it reads NULL for every
+            // placeholder and bakes the wrong literal into the compiled
+            // statement for every later execution.
+            if params.is_none() && select_contains_any_placeholder(subquery) {
+                return Ok(());
+            }
             let rows = conn.execute_statement(&Statement::Select(*subquery.clone()), params)?;
             let exists = !rows.is_empty();
             let result = if *not { !exists } else { exists };
@@ -72361,6 +72517,11 @@ fn rewrite_in_expr(
             // must be evaluated per-row; skip the eager rewrite so they survive
             // into the VDBE codegen which handles them via emit_scalar_subquery.
             if is_correlated_subquery(sub) {
+                return Ok(());
+            }
+            // frankensim-kl17o: parameter-dependent subqueries must not be
+            // folded without bindings (see the Exists arm above).
+            if params.is_none() && select_contains_any_placeholder(sub) {
                 return Ok(());
             }
             // Only fold a *scalar* (single-column) subquery to a literal. A

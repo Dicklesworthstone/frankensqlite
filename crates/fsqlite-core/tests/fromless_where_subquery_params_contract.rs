@@ -110,18 +110,18 @@ fn projection_exists_params_keep_working() {
     assert_eq!(projected[0].values()[0], SqliteValue::Integer(1));
 }
 
-/// ARMED KNOWN-RED (run with --ignored): parameters inside ANY
-/// subquery under a FROM-FUL outer WHERE never bind. Probe matrix
-/// (2026-07-16): literal predicates return rows; ?N int/blob, aliased/
-/// unaliased EXISTS, and scalar COUNT(*) subqueries all return zero
-/// rows; top-level params on the same statement bind fine; the
-/// prepared-statement route fails identically; EXPLAIN emits a CORRECT
-/// program (Column/Variable/Eq over the inline subquery loop), so the
-/// bindings are dropped at execution — suspect the canonicalized
-/// program-cache layer executes with an empty binding set for this
-/// shape. sqlite3 returns one row for every case below.
+/// frankensim-kl17o (fixed): parameters inside ANY subquery under a
+/// FROM-ful outer WHERE must bind. ROOT CAUSE was not execution-side
+/// binding at all: `prepare()` runs the eager subquery rewrite with
+/// `params = None`, which evaluated the uncorrelated subquery with every
+/// placeholder reading NULL and baked `WHERE 0` into the compiled
+/// statement — and the single-statement ad-hoc `query_with_params` route
+/// silently reuses the prepared pipeline. The fix defers folding of
+/// parameter-dependent subqueries (any subquery containing a
+/// placeholder) past prepare time and routes them through dispatch
+/// paths that bind at execution. sqlite3 returns one row for every case
+/// below.
 #[test]
-#[ignore = "live engine bug: subquery params under FROM-ful WHERE do not bind"]
 fn fromful_where_subquery_params_bind() {
     let conn = seeded();
     let fromful = conn
@@ -142,4 +142,80 @@ fn fromful_where_subquery_params_bind() {
         )
         .expect("scalar-count form");
     assert_eq!(scalar.len(), 1);
+}
+
+/// The baked-literal trap: one prepared statement re-executed with
+/// DIFFERENT bindings must track the bindings. The old bug froze the
+/// prepare-time (NULL-bound) subquery verdict into the program, so every
+/// execution returned the same wrong answer regardless of parameters.
+#[test]
+fn prepared_fromful_subquery_rebinds_per_execution() {
+    let conn = seeded();
+    let prepared = conn
+        .prepare(
+            "SELECT role FROM edges WHERE EXISTS(SELECT 1 FROM edges e2 WHERE e2.artifact = ?1 \
+             AND e2.op = ?2);",
+        )
+        .expect("prepare");
+    let matching = prepared
+        .query_with_params(&[
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+            SqliteValue::Integer(1),
+        ])
+        .expect("matching execution");
+    assert_eq!(
+        matching.len(),
+        1,
+        "matching bindings must satisfy the guard"
+    );
+    let unmatched = prepared
+        .query_with_params(&[
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])),
+            SqliteValue::Integer(1),
+        ])
+        .expect("unmatched execution");
+    assert_eq!(
+        unmatched.len(),
+        0,
+        "the SAME prepared statement with unmatched bindings must refuse"
+    );
+    let matching_again = prepared
+        .query_with_params(&[
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+            SqliteValue::Integer(1),
+        ])
+        .expect("matching re-execution");
+    assert_eq!(matching_again.len(), 1, "rebinding must not be sticky");
+}
+
+/// Guarded INSERT...SELECT via the prepared route (the fs-ledger seal
+/// idiom that surfaced frankensim-lnbzs) must honor per-execution
+/// bindings in both directions.
+#[test]
+fn prepared_guarded_insert_select_rebinds_per_execution() {
+    let conn = seeded();
+    let prepared = conn
+        .prepare(
+            "INSERT INTO seals SELECT ?1, ?2 WHERE EXISTS(SELECT 1 FROM edges WHERE artifact = \
+             ?3 AND op = ?4 LIMIT 1);",
+        )
+        .expect("prepare guarded insert");
+    let refused = prepared
+        .execute_with_params(&[
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+            SqliteValue::Integer(1),
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xBB_u8; 32])), // no such artifact
+            SqliteValue::Integer(1),
+        ])
+        .expect("unsatisfied guard executes");
+    assert_eq!(refused, 0, "unsatisfied guard must insert nothing");
+    let inserted = prepared
+        .execute_with_params(&[
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+            SqliteValue::Integer(1),
+            SqliteValue::Blob(std::sync::Arc::from(vec![0xAA_u8; 32])),
+            SqliteValue::Integer(1),
+        ])
+        .expect("satisfied guard executes");
+    assert_eq!(inserted, 1, "satisfied guard must insert exactly one row");
 }
