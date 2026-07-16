@@ -12313,6 +12313,44 @@ mod tests {
         assert_eq!(cursor.count_all_rows(&cx).unwrap(), ROW_COUNT);
     }
 
+    /// The revalidation guard must fail loud — not corrupt — when a caller
+    /// violates the "prechecked absent" contract itself: reusing a stale
+    /// NotFound position for a rowid that is actually present, where the
+    /// stale position ALSO fails admissibility. The fallback re-seek finds
+    /// the row and reports `DatabaseCorrupt` instead of inserting a
+    /// duplicate or splicing the tree out of order.
+    #[test]
+    fn test_prechecked_absent_present_row_at_inadmissible_position_fails_loud() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        let payload = vec![0x3Cu8; 3600];
+        for rowid in 1..=200_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        // Position the cursor far from rowid 7's true slot (EOF context from
+        // seeking past the end), then violate the contract: rowid 7 exists.
+        assert_eq!(
+            cursor.table_move_to(&cx, 10_000).unwrap(),
+            SeekResult::NotFound
+        );
+        assert!(cursor.eof());
+        let err = cursor
+            .table_insert_prechecked_absent(&cx, 7, &payload)
+            .expect_err("present rowid at an inadmissible reused position must fail loud");
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { .. }),
+            "expected DatabaseCorrupt, got {err:?}"
+        );
+
+        // The tree must be unharmed: exactly one rowid 7, full count intact.
+        assert_eq!(cursor.table_move_to(&cx, 7).unwrap(), SeekResult::Found);
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 200);
+    }
+
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
     fn build_leaf_table(entries: &[(i64, &[u8])]) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
