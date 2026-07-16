@@ -4140,7 +4140,21 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Seek to a key in an index B-tree. Returns the seek result.
     fn index_seek(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
-        let res = self.index_seek_for_insert(cx, target_key)?;
+        self.index_seek_with_bias(cx, target_key, IndexSeekBias::LowerBound)
+    }
+
+    /// Seek to the first key after the complete equal-prefix run.
+    fn index_seek_upper_bound(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+        self.index_seek_with_bias(cx, target_key, IndexSeekBias::UpperBound)
+    }
+
+    fn index_seek_with_bias(
+        &mut self,
+        cx: &Cx,
+        target_key: &[u8],
+        bias: IndexSeekBias,
+    ) -> Result<SeekResult> {
+        let res = self.index_seek_for_insert_with_bias(cx, target_key, bias)?;
         if !res.is_found() && self.at_eof {
             // We fell off the right edge of the leaf.
             // Determine if there is a successor up the tree.
@@ -4167,6 +4181,15 @@ impl<P: PageReader> BtCursor<P> {
     /// Internal seek used by INSERT that anchors the cursor on the leaf where
     /// the target belongs, even if it falls off the right edge.
     fn index_seek_for_insert(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+        self.index_seek_for_insert_with_bias(cx, target_key, IndexSeekBias::LowerBound)
+    }
+
+    fn index_seek_for_insert_with_bias(
+        &mut self,
+        cx: &Cx,
+        target_key: &[u8],
+        bias: IndexSeekBias,
+    ) -> Result<SeekResult> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         let mut current_page = self.root_page;
@@ -4195,7 +4218,8 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             if entry.header.page_type.is_leaf() {
-                let result = self.binary_search_index_leaf(cx, &entry, target_key)?;
+                let result =
+                    self.binary_search_index_leaf_with_bias(cx, &entry, target_key, bias)?;
                 match result {
                     BinarySearchResult::Found(idx) => {
                         let mut entry = entry;
@@ -4240,7 +4264,8 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior index page: binary search to find which child to descend.
-            let search_result = self.binary_search_index_interior(cx, &entry, target_key)?;
+            let search_result =
+                self.binary_search_index_interior_with_bias(cx, &entry, target_key, bias)?;
             match search_result {
                 BinarySearchResult::Found(idx) => {
                     let mut entry = entry;
@@ -4362,12 +4387,12 @@ impl<P: PageReader> BtCursor<P> {
         Ok(Cow::Owned(payload))
     }
 
-    /// Binary search a leaf index page for a key.
-    fn binary_search_index_leaf(
+    fn binary_search_index_leaf_with_bias(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
+        bias: IndexSeekBias,
     ) -> Result<BinarySearchResult> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         let count = entry.header.cell_count;
@@ -4384,7 +4409,12 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes(key.as_ref(), target, parsed_target.as_deref());
+            let ord = self.compare_index_key_bytes_with_bias(
+                key.as_ref(),
+                target,
+                parsed_target.as_deref(),
+                bias,
+            );
 
             match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
@@ -4396,11 +4426,22 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Binary search an interior index page to find which child to descend.
+    #[cfg(test)]
     fn binary_search_index_interior(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
+    ) -> Result<BinarySearchResult> {
+        self.binary_search_index_interior_with_bias(cx, entry, target, IndexSeekBias::LowerBound)
+    }
+
+    fn binary_search_index_interior_with_bias(
+        &self,
+        cx: &Cx,
+        entry: &StackEntry,
+        target: &[u8],
+        bias: IndexSeekBias,
     ) -> Result<BinarySearchResult> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         let count = entry.header.cell_count;
@@ -4417,7 +4458,12 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes(key.as_ref(), target, parsed_target.as_deref());
+            let ord = self.compare_index_key_bytes_with_bias(
+                key.as_ref(),
+                target,
+                parsed_target.as_deref(),
+                bias,
+            );
 
             // Note: target vs key comparison direction
             match ord {
@@ -4429,18 +4475,34 @@ impl<P: PageReader> BtCursor<P> {
         Ok(BinarySearchResult::NotFound(lo))
     }
 
+    #[cfg(test)]
     fn compare_index_key_bytes(
         &self,
         lhs_bytes: &[u8],
         rhs_bytes: &[u8],
         parsed_rhs: Option<&[fsqlite_types::SqliteValue]>,
     ) -> std::cmp::Ordering {
+        self.compare_index_key_bytes_with_bias(
+            lhs_bytes,
+            rhs_bytes,
+            parsed_rhs,
+            IndexSeekBias::LowerBound,
+        )
+    }
+
+    fn compare_index_key_bytes_with_bias(
+        &self,
+        lhs_bytes: &[u8],
+        rhs_bytes: &[u8],
+        parsed_rhs: Option<&[fsqlite_types::SqliteValue]>,
+        bias: IndexSeekBias,
+    ) -> std::cmp::Ordering {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         match (parse_record(lhs_bytes), parsed_rhs) {
             (Some(lhs_vals), Some(rhs_vals)) => self
-                .compare_index_key_values(&lhs_vals, rhs_vals)
-                .unwrap_or_else(|| lhs_bytes.cmp(rhs_bytes)),
-            _ => lhs_bytes.cmp(rhs_bytes),
+                .compare_index_key_values(&lhs_vals, rhs_vals, bias)
+                .unwrap_or_else(|| bias.adjust_byte_order(lhs_bytes.cmp(rhs_bytes))),
+            _ => bias.adjust_byte_order(lhs_bytes.cmp(rhs_bytes)),
         }
     }
 
@@ -4448,6 +4510,7 @@ impl<P: PageReader> BtCursor<P> {
         &self,
         lhs: &[fsqlite_types::SqliteValue],
         rhs: &[fsqlite_types::SqliteValue],
+        bias: IndexSeekBias,
     ) -> Option<std::cmp::Ordering> {
         let registry_guard = self
             .collation_registry
@@ -4468,7 +4531,11 @@ impl<P: PageReader> BtCursor<P> {
                 return Some(ord);
             }
         }
-        Some(lhs.len().cmp(&rhs.len()))
+        if bias == IndexSeekBias::UpperBound && rhs.len() <= lhs.len() {
+            Some(std::cmp::Ordering::Less)
+        } else {
+            Some(lhs.len().cmp(&rhs.len()))
+        }
     }
 
     fn cmp_index_values_collated(
@@ -5000,6 +5067,22 @@ enum BinarySearchResult {
     Found(u16),
     /// No match; the target would be inserted at this position.
     NotFound(u16),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexSeekBias {
+    LowerBound,
+    UpperBound,
+}
+
+impl IndexSeekBias {
+    fn adjust_byte_order(self, ordering: std::cmp::Ordering) -> std::cmp::Ordering {
+        if self == Self::UpperBound && ordering == std::cmp::Ordering::Equal {
+            std::cmp::Ordering::Less
+        } else {
+            ordering
+        }
+    }
 }
 
 impl<P: PageWriter> BtCursor<P> {
@@ -10222,6 +10305,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.index_seek(cx, key))
     }
 
+    fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
+            cursor.index_seek_upper_bound(cx, key)?;
+            Ok(())
+        })
+    }
+
     fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
         self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.table_seek(cx, rowid))
     }
@@ -13533,6 +13623,73 @@ mod tests {
         }
 
         assert_eq!(seen_rowids, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn test_cursor_index_prefix_upper_bound_skips_duplicate_run_during_descent() {
+        let key_42_1 = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(1)]);
+        let key_42_2 = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(2)]);
+        let separator = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(3)]);
+        let successor = serialize_record(&[SqliteValue::Integer(99), SqliteValue::Integer(9)]);
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), separator.as_slice())], pn(4)),
+        );
+        store.pages.insert(
+            3,
+            build_leaf_index(&[key_42_1.as_slice(), key_42_2.as_slice()]),
+        );
+        store
+            .pages
+            .insert(4, build_leaf_index(&[successor.as_slice()]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, false);
+        let prefix = serialize_record(&[SqliteValue::Integer(42)]);
+
+        cursor.index_move_to_upper_bound(&cx, &prefix).unwrap();
+        assert_eq!(
+            cursor.pager.read_pages(),
+            vec![pn(2), pn(4)],
+            "upper-bound descent must bypass the equal-prefix subtree"
+        );
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(99), SqliteValue::Integer(9)]
+        );
+
+        assert!(cursor.prev(&cx).unwrap());
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Integer(42), SqliteValue::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn test_cursor_index_prefix_upper_bound_honors_nocase_collation() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        cursor.set_index_collation_context(
+            vec![Some("NOCASE".to_owned())],
+            Arc::new(Mutex::new(CollationRegistry::new())),
+        );
+        for (text, rowid) in [("alpha", 1_i64), ("ALPHA", 2), ("beta", 3)] {
+            let key =
+                serialize_record(&[SqliteValue::Text(text.into()), SqliteValue::Integer(rowid)]);
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        let prefix = serialize_record(&[SqliteValue::Text("aLpHa".into())]);
+        cursor.index_move_to_upper_bound(&cx, &prefix).unwrap();
+        assert_eq!(
+            parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
+            vec![SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]
+        );
     }
 
     #[test]

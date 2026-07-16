@@ -84,6 +84,25 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// entry that would follow the key in sort order.
     fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult>;
 
+    /// Position the cursor at the strict upper bound of an index key.
+    ///
+    /// Packed-record implementations treat `key` as a logical prefix and
+    /// position after every stored key whose leading fields compare equal to
+    /// that prefix. Raw-byte implementations use the ordinary strict byte
+    /// upper bound. The cursor is at EOF when no greater key exists.
+    fn index_move_to_upper_bound(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        self.index_move_to(cx, key)?;
+        while !self.eof() {
+            if self.payload(cx)?.as_slice() != key {
+                break;
+            }
+            if !self.next(cx)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Position the cursor at the given rowid in a table B-tree.
     fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult>;
 
@@ -528,6 +547,25 @@ mod tests {
         assert_eq!(cursor.rowid(&cx).unwrap(), 2);
 
         assert!(!cursor.index_move_to(&cx, b"delta").unwrap().is_found());
+    }
+
+    #[test]
+    fn test_mock_cursor_index_upper_bound_skips_equal_keys() {
+        let entries = vec![
+            (1, b"alpha".to_vec()),
+            (2, b"beta".to_vec()),
+            (3, b"beta".to_vec()),
+            (4, b"gamma".to_vec()),
+        ];
+        let mut cursor = MockBtreeCursor::new(entries);
+        let cx = Cx::new();
+
+        cursor.index_move_to_upper_bound(&cx, b"beta").unwrap();
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 4);
+
+        cursor.index_move_to_upper_bound(&cx, b"gamma").unwrap();
+        assert!(cursor.eof());
     }
 
     #[test]
