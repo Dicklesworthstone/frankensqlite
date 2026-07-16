@@ -2725,14 +2725,14 @@ fn find_rowid_equality_term<'terms, 'expr>(
         .find(|term| where_term_matches_rowid_equality(table_name, term, rowid_alias_hints))
 }
 
-fn find_rowid_range_column(
+fn find_rowid_range_column<'a>(
     table_name: &str,
-    terms: &[WhereTerm<'_>],
+    terms: &'a [WhereTerm<'_>],
     rowid_alias_hints: &[RowidAliasHint],
-) -> Option<String> {
+) -> Option<&'a str> {
     terms.iter().find_map(|term| {
         where_term_matches_rowid_range(table_name, term, rowid_alias_hints)
-            .then(|| term.column.as_ref().map(|column| column.column.clone()))
+            .then(|| term.column.as_ref().map(|column| column.column.as_str()))
             .flatten()
     })
 }
@@ -2801,7 +2801,7 @@ fn extract_access_path_probe_with_rowid_aliases(
             if best.index.is_none() {
                 let leading_col =
                     find_rowid_range_column(&best.table, where_terms, rowid_alias_hints)?;
-                return extract_range_probe_for_column(where_terms, &leading_col);
+                return extract_range_probe_for_column(where_terms, leading_col);
             }
             let index_name = best.index.as_deref()?;
             let idx = indexes
