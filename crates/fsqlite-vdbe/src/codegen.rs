@@ -12471,8 +12471,13 @@ fn codegen_select_aggregate(
         && index_eq_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
+        // bd-agg-rowid-eq-coerced: accept any simple constant (placeholder / real /
+        // text as well as an integer literal), not just an integer literal.
+        // `extract_rowid_target_expr` already requires `is_simple_constant`; the
+        // emission coerces a non-integer-literal bound with `MustBeInt` so 2.5 /
+        // 'abc' / NULL reject to the empty result instead of `SeekRowid` truncating
+        // them to a wrong rowid. Enables the seek for the prepared `WHERE rowid = ?`.
         extract_rowid_target_expr(where_clause, Some(table), table_alias)
-            .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
     } else {
         None
     };
@@ -12794,10 +12799,11 @@ fn codegen_select_aggregate(
         b.set_next_anon_placeholder(where_placeholder_base);
     } else if let Some(rowid_rhs) = rowid_eq_seek {
         // bd-2dgf5 rowid point lookup: seek the single row and accumulate it. A
-        // `SeekRowid` miss (or NULL / non-integer key) jumps straight to finalize, where
-        // the still-Null accumulators produce COUNT=0 / SUM=NULL — the exact empty-scan
-        // result. No duplicate-run loop and no scan fallback: rowid is unique and the
-        // integer-literal gate makes the seek exact, so the full scan is skipped.
+        // `SeekRowid` miss (or a `MustBeInt`-rejected non-exact key) jumps straight to
+        // finalize, where the still-Null accumulators produce COUNT=0 / SUM=NULL — the
+        // exact empty-scan result. No duplicate-run loop and no scan fallback: rowid is
+        // unique and `MustBeInt` (below) makes a non-integer-literal key exact-or-reject,
+        // so the full scan is skipped.
         b.emit_op(
             Opcode::OpenRead,
             cursor,
@@ -12808,6 +12814,15 @@ fn codegen_select_aggregate(
         );
         let rowid_reg = b.alloc_reg();
         emit_expr(b, rowid_rhs, rowid_reg, None);
+        // bd-agg-rowid-eq-coerced: coerce a non-integer-literal bound (placeholder /
+        // real / text) to INTEGER affinity before the seek; a non-exact key (2.5 /
+        // 'abc' / NULL) jumps to finalize (still-Null accumulators -> COUNT=0 /
+        // SUM=NULL, the exact empty result), while '5' / 5.0 coerce to 5. An integer
+        // literal is already exact -> no MustBeInt (byte-identical to the pre-existing
+        // integer-literal callers, golden snapshots unchanged).
+        if !matches!(rowid_rhs, Expr::Literal(Literal::Integer(_), _)) {
+            b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, finalize_label, P4::None, 0);
+        }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             cursor,
