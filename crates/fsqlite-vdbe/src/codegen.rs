@@ -2997,6 +2997,15 @@ fn codegen_select_rowid_lookup(
         0,
     );
     emit_set_snapshot(b, cursor, time_travel);
+    // Coerce a non-integer-literal rowid key (placeholder / real / text) to INTEGER affinity before the
+    // seek: a non-exact key (2.5 / 'abc' / NULL) rejects to `done_label` (empty result) instead of raw
+    // `SeekRowid` TRUNCATING it to a wrong rowid (e.g. `WHERE id = 2.5` must not match rowid 2). Emitted
+    // after `OpenRead` so `done_label`'s Close sees an open cursor, mirroring `SeekRowid`'s own miss jump.
+    // An integer literal is already exact -> no MustBeInt (byte-identical to the pre-existing callers).
+    // Same coercion the count_star / aggregate rowid-eq paths use (bd-count/agg-rowid-eq-coerced).
+    if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
+        b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, done_label, P4::None, 0);
+    }
     b.emit_jump_to_label(
         Opcode::SeekRowid,
         cursor,
