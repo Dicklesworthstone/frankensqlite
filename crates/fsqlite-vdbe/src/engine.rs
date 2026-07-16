@@ -12653,7 +12653,7 @@ impl VdbeEngine {
                 let divisor = self.get_reg(op.p1);
                 let dividend = self.get_reg(op.p2);
                 let result = sql_div(dividend, divisor);
-                self.set_reg_fast(op.p3, result);
+                self.set_reg_arith_result(op.p3, result);
                 *pc += 1;
                 Ok(true)
             }
@@ -14296,10 +14296,11 @@ impl VdbeEngine {
 
     /// Write an arithmetic result, updating an already-`Integer` register in
     /// place via `set_reg_int` when the result is an `Integer`. sql_add/sub/mul
-    /// return `Integer` only for an exact, non-overflowing value (overflow
-    /// promotes to `Float`), so this is byte-identical to `set_reg_fast` while
-    /// skipping the `replace_register_value` buffer swap on the common
-    /// integer-into-integer case. `Float`/`Null` results take the general path.
+    /// and sql_div return `Integer` only for an exact integer value (overflow
+    /// promotes to `Float`; divide-by-zero yields `Null`), so this is
+    /// byte-identical to `set_reg_fast` while skipping the
+    /// `replace_register_value` buffer swap on the common integer-into-integer
+    /// case. `Float`/`Null` results take the general path.
     #[inline(always)]
     #[allow(clippy::inline_always)]
     fn set_reg_arith_result(&mut self, r: i32, value: SqliteValue) {
@@ -21297,6 +21298,42 @@ mod tests {
             vec![],
         );
         assert_eq!(rows, vec![vec![SqliteValue::Float(7.5)]]);
+    }
+
+    #[test]
+    fn test_div_rem_integer_result_in_place_and_zero_null() {
+        // Integer divide results reuse the output register in place (the shipped
+        // lever); remainder and a division by zero (Null) go through the general
+        // set_reg_fast path. All must land the exact value regardless.
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let dividend = b.alloc_reg();
+                let divisor = b.alloc_reg();
+                let zero = b.alloc_reg();
+                let out = b.alloc_reg();
+                b.emit_op(Opcode::Integer, 86, dividend, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 7, divisor, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, 0, zero, 0, P4::None, 0);
+                // out := 86 / 7 = 12, twice (the second is the in-place path).
+                b.emit_op(Opcode::Divide, divisor, dividend, out, P4::None, 0);
+                b.emit_op(Opcode::Divide, divisor, dividend, out, P4::None, 0);
+                // out := 86 % 7 = 2 (in-place over Integer 12).
+                b.emit_op(Opcode::Remainder, divisor, dividend, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                // out := 86 / 0 = NULL (general path over the Integer 2).
+                b.emit_op(Opcode::Divide, zero, dividend, out, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, out, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![],
+        );
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(2)], vec![SqliteValue::Null]]
+        );
     }
 
     #[test]

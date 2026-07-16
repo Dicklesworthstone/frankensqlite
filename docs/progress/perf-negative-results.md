@@ -19228,3 +19228,31 @@ test is on the executed path, not merely linked into it.
   `get_reg` reads + `sql_*` compute, so the write is a smaller fraction of the op. Follow-ups (same
   helper): `Divide`/`Remainder` (verify `sql_div`/`sql_rem` return `Integer` only for exact results)
   and `ShiftLeft`/`ShiftRight`; `BitAnd`/`BitOr`/`BitNot` already use `set_reg_int` directly.
+
+## 2026-07-16 - WIN (`Divide`) + REJECT (`Remainder`): integer result in-place write
+
+- Target: `vdbe_pipeline_execute_{divide,remainder}/{64,256,1024}` (streams of `86/7=12` and
+  `86%7=2` into a reused register). Same lever as the Add/Subtract/Multiply win: route an `Integer`
+  result through `set_reg_arith_result` (in-place `set_reg_int`) instead of `set_reg_fast`.
+  `sql_div`/`sql_rem` return `Integer` only for an exact int/int result (div-by-zero -> `Null`,
+  overflow/float -> `Float`), so it is byte-identical. Correctness: freshness-gated
+  `cargo test -p fsqlite-vdbe --lib test_div_rem_integer_result_in_place_and_zero_null` ran exactly
+  the new test (in-place divide + remainder + divide-by-zero -> Null) and passed.
+- Same-worker foreground A/B on `ovh-b`, base commit `95128d77`, Criterion same-target-pool compare;
+  identical Cargo payload `... --bench pipeline_stages -- '^vdbe_pipeline_execute_(divide|remainder)/'
+  --warm-up-time 0.5 --measurement-time 2 --sample-size 30 --noplot` under
+  `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --`:
+  - `Divide`: `1.8133 us` -> `1.7553 us` (`[-6.041%, -4.527%, -2.977%]`), `6.9070 us` -> `6.7317 us`
+    (`[-5.520%, -4.117%, -2.485%]`), `27.731 us` -> `26.251 us` (`[-6.734%, -5.369%, -4.190%]`); all
+    `p = 0.00`, every CI excludes zero.
+  - `Remainder`: `[-2.605%, -1.861%, -1.089%]` (`p = 0.00`), **`[-1.716%, -0.471%, +0.990%]`
+    (`p = 0.51` — CI INCLUDES ZERO)**, `[-3.218%, -1.839%, -0.448%]` (`p = 0.01`).
+- Result: KEEP `Divide` (shipped — clean ~4-5% at all three sizes, every CI excludes zero). REJECT
+  `Remainder` (reverted to `set_reg_fast`): the middle size is not significant (`p = 0.51`, CI spans
+  zero) and the others are only ~1-2%, so it fails the every-CI-excludes-zero bar. `sql_rem` does
+  slightly more work than `sql_div` (no early integer-division fast return), so the in-place write is
+  too small a fraction to reliably clear the noise floor — this is the diminishing-returns boundary
+  of the register-write vein (transfer ~30-37% -> arith ~12-23% -> divide ~4-5% -> remainder noise).
+  The correctness test still exercises the remainder path (via `set_reg_fast`) so it stays valid.
+  Shifts (`sql_shift_*`, always `Integer`) are the last untried arm but will be at-or-below the
+  divide ratio; treat the write-specialization vein as effectively mined out after this.
