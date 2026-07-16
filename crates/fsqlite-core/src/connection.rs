@@ -44434,7 +44434,22 @@ impl Connection {
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    if has_group_by(rewritten.as_ref())
+                    let is_fromless_select = matches!(
+                        &rewritten.body.select,
+                        SelectCore::Select { from: None, .. }
+                    );
+                    if is_fromless_select {
+                        if has_implicit_aggregation(rewritten.as_ref()) {
+                            self.execute_fromless_aggregate(&bound, None)
+                        } else {
+                            self.execute_expression_only_with_subqueries(&bound, None)
+                        }
+                    } else if matches!(&rewritten.body.select, SelectCore::Values(_)) {
+                        // VALUES may contain the same catalog scalar subqueries as
+                        // a FROM-less SELECT, but preserves one output row per
+                        // VALUES tuple rather than the SELECT path's single row.
+                        self.execute_expression_only_with_subqueries(&bound, None)
+                    } else if has_group_by(rewritten.as_ref())
                         || has_implicit_aggregation(rewritten.as_ref())
                         || has_ordered_aggregate(rewritten.as_ref())
                     {
@@ -52749,16 +52764,55 @@ impl Connection {
         Ok(rows)
     }
 
-    /// Execute an expression-only SELECT whose result columns contain scalar
-    /// subqueries.  The VDBE expression codegen cannot resolve table references
-    /// inside `Expr::Subquery` (e.g. CTE temp tables), so we evaluate each
-    /// column at the connection level where `execute_statement` has full schema
-    /// access.
+    /// Execute an expression-only SELECT or VALUES clause whose result
+    /// expressions contain scalar subqueries.  The VDBE expression codegen
+    /// cannot resolve table references inside `Expr::Subquery` (e.g. CTE temp
+    /// tables), so we evaluate each expression at the connection level where
+    /// `execute_statement` has full schema access.
     fn execute_expression_only_with_subqueries(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        if let SelectCore::Values(value_rows) = &select.body.select {
+            let Some(first_row) = value_rows.first() else {
+                return Err(FrankenError::ParseError {
+                    offset: 0,
+                    detail: "VALUES must include at least one row".to_owned(),
+                });
+            };
+            if first_row.is_empty() {
+                return Err(FrankenError::ParseError {
+                    offset: 0,
+                    detail: "VALUES row must include at least one expression".to_owned(),
+                });
+            }
+
+            let output_width = first_row.len();
+            let empty_row: Vec<SqliteValue> = Vec::new();
+            let empty_col_map: Vec<(String, String, bool)> = Vec::new();
+            let mut rows = Vec::with_capacity(value_rows.len());
+            for value_row in value_rows {
+                if value_row.len() != output_width {
+                    return Err(FrankenError::ParseError {
+                        offset: 0,
+                        detail: "VALUES rows must have matching column counts".to_owned(),
+                    });
+                }
+                let values = value_row
+                    .iter()
+                    .map(|expr| {
+                        self.eval_expr_with_subqueries(expr, &empty_row, &empty_col_map, params)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rows.push(Row { values });
+            }
+
+            let postprocess = build_expression_postprocess(select);
+            apply_expression_postprocess(&mut rows, &postprocess)?;
+            return Ok(rows);
+        }
+
         let SelectCore::Select {
             columns,
             where_clause,
@@ -126964,6 +127018,143 @@ mod sqlite_master_btree_tests {
             master_rows, schema_rows,
             "sqlite_schema alias should return the same rows as sqlite_master"
         );
+    }
+
+    #[test]
+    fn test_fromless_catalog_subqueries_match_sqlite_and_restore_materialization_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (7);").unwrap();
+
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        oracle
+            .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (7);")
+            .unwrap();
+
+        let cases = [
+            (
+                "SELECT (SELECT 1 FROM sqlite_master LIMIT 1);",
+                "matching sqlite_master scalar",
+            ),
+            (
+                "SELECT (SELECT 1 FROM sqlite_master WHERE name='missing' LIMIT 1);",
+                "empty sqlite_master scalar",
+            ),
+            (
+                "SELECT (SELECT 1 FROM sqlite_schema WHERE name='t' LIMIT 1);",
+                "sqlite_schema alias scalar",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='t');",
+                "matching sqlite_master EXISTS",
+            ),
+            (
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='missing');",
+                "empty sqlite_master EXISTS",
+            ),
+            (
+                "SELECT COALESCE((SELECT 1 FROM sqlite_master WHERE type='table' AND name='t' LIMIT 1),0);",
+                "matching table_exists COALESCE",
+            ),
+            (
+                "SELECT COALESCE((SELECT 1 FROM sqlite_master WHERE type='table' AND name='missing' LIMIT 1),0);",
+                "empty table_exists COALESCE",
+            ),
+            (
+                "SELECT COUNT((SELECT 1 FROM sqlite_master WHERE name='t' LIMIT 1));",
+                "matching catalog scalar in FROM-less aggregate",
+            ),
+            (
+                "SELECT COUNT((SELECT 1 FROM sqlite_master WHERE name='missing' LIMIT 1));",
+                "empty catalog scalar in FROM-less aggregate",
+            ),
+            ("SELECT COALESCE((SELECT 1),0);", "FROM-less scalar control"),
+            (
+                "SELECT COALESCE((SELECT x FROM t LIMIT 1),0);",
+                "ordinary-table scalar control",
+            ),
+            (
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='t' LIMIT 1;",
+                "direct catalog control",
+            ),
+        ];
+
+        for (sql, label) in cases {
+            let oracle_value = oracle
+                .query_row(sql, [], |row| row.get::<_, Option<i64>>(0))
+                .unwrap();
+            let expected = oracle_value.map_or(SqliteValue::Null, SqliteValue::Integer);
+            let actual = conn.query_row(sql).unwrap();
+            assert_eq!(actual.values(), &[expected], "{label}: {sql}");
+            assert!(
+                !conn.time_travel_active.get(),
+                "{label}: catalog materialization must restore the prior runtime mode"
+            );
+        }
+
+        let values_cases = [
+            (
+                "VALUES((SELECT 1 FROM sqlite_master WHERE name='t' LIMIT 1));",
+                "matching catalog scalar in VALUES",
+            ),
+            (
+                "VALUES((SELECT 1 FROM sqlite_schema WHERE name='missing' LIMIT 1));",
+                "empty catalog scalar in VALUES",
+            ),
+            (
+                "VALUES((SELECT 1 FROM sqlite_master WHERE name='t' LIMIT 1)),\
+                 ((SELECT 1 FROM sqlite_master WHERE name='missing' LIMIT 1)),\
+                 ((SELECT 2 FROM sqlite_schema WHERE name='t' LIMIT 1));",
+                "multi-row catalog scalars in VALUES",
+            ),
+        ];
+
+        for (sql, label) in values_cases {
+            let expected = {
+                let mut statement = oracle.prepare(sql).unwrap();
+                let mapped = statement
+                    .query_map([], |row| row.get::<_, Option<i64>>(0))
+                    .unwrap();
+                mapped
+                    .map(|result| {
+                        result
+                            .unwrap()
+                            .map_or(SqliteValue::Null, SqliteValue::Integer)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let actual = conn
+                .query(sql)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{label}: {sql}");
+            assert!(
+                !conn.time_travel_active.get(),
+                "{label}: catalog materialization must restore the prior runtime mode"
+            );
+        }
+
+        let error =
+            conn.query("SELECT (SELECT missing_column FROM sqlite_master WHERE name='t' LIMIT 1);");
+        assert!(error.is_err(), "unknown catalog column should still fail");
+        assert!(
+            !conn.time_travel_active.get(),
+            "catalog materialization must restore runtime mode after an execution error"
+        );
+        let values_error = conn
+            .query("VALUES((SELECT missing_column FROM sqlite_master WHERE name='t' LIMIT 1));");
+        assert!(
+            values_error.is_err(),
+            "unknown catalog column in VALUES should still fail"
+        );
+        assert!(
+            !conn.time_travel_active.get(),
+            "VALUES catalog materialization must restore runtime mode after an execution error"
+        );
+        let control = conn.query_row("SELECT x FROM t;").unwrap();
+        assert_eq!(control.values(), &[SqliteValue::Integer(7)]);
     }
 }
 
