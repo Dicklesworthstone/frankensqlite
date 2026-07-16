@@ -13634,9 +13634,6 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
 
-        // Update db_size if this page extends the database.
-        inner.db_size = inner.db_size.max(page_no.get());
-
         // Write directly to the database file, bypassing the cache.
         // The WAL checkpoint is authoritative, so we overwrite any cached version.
         let page_size = inner.page_size.as_usize();
@@ -13646,6 +13643,12 @@ where
         // A final repair also occurs in sync() so page_count remains correct
         // even when page 1 was checkpointed before higher-numbered pages.
         inner.db_file.write(cx, data, offset)?;
+        // Advance db_size only after the write lands (failure-atomic, like
+        // truncate() below): a failed write must not leave an inflated
+        // db_size behind for the checkpoint error path to publish or for a
+        // later sync() to stamp into the page-1 header as a page count
+        // exceeding the true file size (GH #194).
+        inner.db_size = inner.db_size.max(page_no.get());
         if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
             Self::patch_page1_header(&mut inner, &self.cache, cx)?;
         }
@@ -13716,6 +13719,11 @@ where
         // checkpoint writes/truncation, even if page 1 was checkpointed early.
         // ShardedPageCache is internally synchronized, so no lock needed.
         Self::patch_page1_header(&mut inner, &self.cache, cx)?;
+        // Durability barrier FIRST, publication second (GH #195): the
+        // published pager plane must never advertise checkpoint state whose
+        // backing writes have not survived their sync barrier. On sync
+        // failure nothing is published and the WAL remains authoritative.
+        inner.db_file.sync(cx, SyncFlags::NORMAL)?;
         // D1-CRITICAL Change 3: Use sharded publish_remove_page.
         self.published.publish_remove_page(
             cx,
@@ -13728,7 +13736,7 @@ where
             },
             PageNumber::ONE,
         );
-        inner.db_file.sync(cx, SyncFlags::NORMAL)
+        Ok(())
     }
 }
 
@@ -20266,6 +20274,232 @@ mod tests {
         let mode = pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
 
         assert_eq!(mode, JournalMode::Wal);
+    }
+
+    /// Fault VFS for checkpoint-writer failure-atomicity tests (GH #194/#195):
+    /// wraps `MemoryVfs` and fails the NEXT `write` or `sync` on the main DB
+    /// file when armed. Everything else delegates.
+    #[derive(Clone)]
+    struct CheckpointFaultVfs {
+        inner: MemoryVfs,
+        fail_next_write: Arc<AtomicBool>,
+        fail_next_sync: Arc<AtomicBool>,
+    }
+
+    impl CheckpointFaultVfs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                fail_next_write: Arc::new(AtomicBool::new(false)),
+                fail_next_sync: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    struct CheckpointFaultFile {
+        inner: MemoryFile,
+        is_main_db: bool,
+        fail_next_write: Arc<AtomicBool>,
+        fail_next_sync: Arc<AtomicBool>,
+    }
+
+    impl Vfs for CheckpointFaultVfs {
+        type File = CheckpointFaultFile;
+
+        fn name(&self) -> &'static str {
+            "checkpoint-fault"
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
+            Ok((
+                CheckpointFaultFile {
+                    inner,
+                    is_main_db: flags.contains(VfsOpenFlags::MAIN_DB),
+                    fail_next_write: Arc::clone(&self.fail_next_write),
+                    fail_next_sync: Arc::clone(&self.fail_next_sync),
+                },
+                actual_flags,
+            ))
+        }
+
+        fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+
+        fn is_memory(&self) -> bool {
+            true
+        }
+    }
+
+    impl VfsFile for CheckpointFaultFile {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.close(cx)
+        }
+
+        fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset)
+        }
+
+        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            if self.is_main_db && self.fail_next_write.swap(false, AtomicOrdering::AcqRel) {
+                return Err(FrankenError::internal(
+                    "injected checkpoint db write failure",
+                ));
+            }
+            self.inner.write(cx, buf, offset)
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            if self.is_main_db && self.fail_next_sync.swap(false, AtomicOrdering::AcqRel) {
+                return Err(FrankenError::internal(
+                    "injected checkpoint db sync failure",
+                ));
+            }
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
+    }
+
+    /// GH #194: a failed checkpoint page write must not leave `db_size`
+    /// advanced. Pre-fix, `write_page` bumped `inner.db_size` BEFORE the
+    /// fallible file write, so an I/O error left an inflated size behind for
+    /// the checkpoint error path to publish and for a later `sync()` to
+    /// stamp into the page-1 header as a page count past the true file end.
+    #[test]
+    fn test_checkpoint_write_failure_does_not_advance_db_size() {
+        use crate::traits::CheckpointPageWriter as _;
+        let cx = Cx::new();
+        let vfs = CheckpointFaultVfs::new();
+        let fail_write = Arc::clone(&vfs.fail_next_write);
+        let pager =
+            SimplePager::open(vfs, Path::new("/ckpt-fault-194.db"), PageSize::DEFAULT).unwrap();
+        let page_size = PageSize::DEFAULT.as_usize();
+        let mut writer = pager.checkpoint_writer();
+
+        // Baseline: successful checkpoint writes advance db_size normally.
+        let data = vec![0u8; page_size];
+        writer
+            .write_page(&cx, PageNumber::new(2).unwrap(), &data)
+            .unwrap();
+        let baseline = pager.inner.lock().unwrap().db_size;
+        assert!(baseline >= 2, "baseline write must advance db_size");
+
+        // Injected write failure for a page far past the current end must
+        // leave db_size exactly where it was.
+        fail_write.store(true, AtomicOrdering::Release);
+        let err = writer.write_page(&cx, PageNumber::new(50).unwrap(), &data);
+        assert!(err.is_err(), "injected write failure must surface");
+        assert_eq!(
+            pager.inner.lock().unwrap().db_size,
+            baseline,
+            "failed checkpoint write must not advance db_size (GH #194)"
+        );
+
+        // After the fault clears, the same write succeeds and db_size moves.
+        writer
+            .write_page(&cx, PageNumber::new(50).unwrap(), &data)
+            .unwrap();
+        assert_eq!(pager.inner.lock().unwrap().db_size, 50);
+    }
+
+    /// GH #195: `sync()` must not publish checkpoint state to the shared
+    /// pager plane before the durability barrier succeeds. Pre-fix, the
+    /// publish preceded `db_file.sync`, so a sync failure left published
+    /// metadata advertising checkpoint state whose writes had no barrier.
+    #[test]
+    fn test_checkpoint_sync_failure_publishes_nothing() {
+        use crate::traits::CheckpointPageWriter as _;
+        let cx = Cx::new();
+        let vfs = CheckpointFaultVfs::new();
+        let fail_sync = Arc::clone(&vfs.fail_next_sync);
+        let pager =
+            SimplePager::open(vfs, Path::new("/ckpt-fault-195.db"), PageSize::DEFAULT).unwrap();
+        let page_size = PageSize::DEFAULT.as_usize();
+        let mut writer = pager.checkpoint_writer();
+
+        // Complete one full checkpoint write+sync so page 1 exists on disk
+        // and the published plane holds a coherent baseline.
+        let mut page1 = vec![0u8; page_size];
+        page1[..16].copy_from_slice(b"SQLite format 3\0");
+        writer.write_page(&cx, PageNumber::ONE, &page1).unwrap();
+        writer.sync(&cx).unwrap();
+        let baseline = pager.published_snapshot();
+
+        // Grow the database, then fail the durability barrier: the published
+        // plane must still show the baseline db_size, not the new one.
+        let data = vec![0u8; page_size];
+        writer
+            .write_page(&cx, PageNumber::new(30).unwrap(), &data)
+            .unwrap();
+        fail_sync.store(true, AtomicOrdering::Release);
+        assert!(
+            writer.sync(&cx).is_err(),
+            "injected sync failure must surface"
+        );
+        let after_failure = pager.published_snapshot();
+        assert_eq!(
+            after_failure.db_size, baseline.db_size,
+            "publication must not precede the sync barrier (GH #195)"
+        );
+
+        // Once the barrier succeeds, the new state publishes.
+        writer.sync(&cx).unwrap();
+        assert_eq!(pager.published_snapshot().db_size, 30);
     }
 
     #[test]
