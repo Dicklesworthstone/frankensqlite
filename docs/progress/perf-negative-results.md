@@ -19313,3 +19313,37 @@ test is on the executed path, not merely linked into it.
   way (`format_sqlite_float` already uses the general render path, so it MIGHT win — but it has a
   second `Vec` alloc in `sqlite_float_decode`; measure before trusting). Unrelated:
   `opcode::tests::opcode_count` (opcode.rs) was already failing on the worker, not caused by this.
+
+## 2026-07-16 - MAP: accessible one-turn perf-lever space is EXHAUSTED (single-lever micro-opt campaign done)
+
+A consolidated finding after an extended single-lever campaign (many landed wins + several
+ledgered rejects across codegen, VDBE, and fsqlite-func). The remaining perf work does NOT fit
+"one lever, one turn"; this map exists so future cycles don't re-hunt the mined-out areas.
+
+- MINED OUT (no clean one-turn lever remains):
+  - CODEGEN access-path seeks — rowid eq/range/IN [+residual, +coerced param], index eq/range/prefix,
+    MIN/MAX index/pair/range/prefix, count, aggregate; all seek params via `is_simple_constant` /
+    `is_rowid_range_constant`. The coerced-rowid-eq family is complete across count/agg/SELECT/DML.
+  - VDBE micro-opcodes (`try_execute_hot_opcode` / register writes) — the in-place `set_reg_int`
+    family (Copy/SCopy/Variable/arith/Divide) is done; the ratio decays with per-op compute and the
+    rest sit BELOW this shared/contended fleet's ~10% measurement floor (NotNull promotion rejected).
+  - TRANSIENT-heap→stack — Soundex (`39ecd321`) + date/time (`6f77194f`) landed (~1.5-1.6×). The
+    rule (see the 2026-07-16 REJECT entry): only wins when OLD uses `format!` machinery over a
+    NON-pooled alloc. Integer coercion REGRESSED (specialized `to_string` + pooled alloc). `strftime`
+    is NOT a transient-heap target (results often > 23 bytes via user format literals -> not inlined;
+    `%J` uses `result.pop()`). `format_sqlite_float` is win-eligible but a MULTI-alloc
+    (`decimal.to_string()` + mutated `digits: Vec` with front-`insert` + render `String`) refactor of
+    fiddly rounding code in the core crate -> chartered-size, not one turn.
+  - LIKE/GLOB-prefix->range, the vectorized-batch path (NOT wired into engine.rs -> zero real EV).
+- REMAINING PERF = CHARTERED / STRUCTURAL (multi-turn, mostly gated): Track S union-style register
+  file to kill Arc refcounting on the hot path (`bd-i9sov`, P0 — ~50ns/5-col-row of atomic
+  refcounting); JIT/Cranelift (`bd-lezm3`, `bd-87bp2`); parallel SELECT (`bd-b434d`); arena for MVCC
+  publish (`bd-8euyp`); the `bd-5310l` 65× parse+plan gap (its own note: residual is systemic
+  MVCC/pager, micro-lever campaign done); `bd-1dp9.6.2` optimization-sprint umbrella (heavy
+  isomorphism-proof + structured-logging contract). The one medium refactor a future turn could take
+  as a real (measured) lever: full `format_sqlite_float` stack-back (both `Vec` and `String`), floats
+  common in CAST/concat/quote — but MEASURE (pooled-alloc + machinery-overhead risk per the rule).
+- Recommendation: a "take ONE perf bead" cycle should now either (a) commit to one chartered
+  project's first sub-step (e.g. `bd-b3yw2` S1 RegisterValue for Track S), or (b) do a genuinely
+  new profile run (`fsqlite/tests/execute_body_split.rs` + samply) to surface a fresh hotspot — the
+  reason-from-code single-lever seam is dry.
