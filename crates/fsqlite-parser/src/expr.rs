@@ -151,43 +151,52 @@ impl Parser {
 
     #[allow(clippy::too_many_lines)]
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
-        let tok = self.advance_token();
-        match &tok.kind {
+        let Token {
+            kind,
+            span: token_span,
+            line,
+            col,
+        } = self.advance_token();
+        match kind {
             // ── Literals ────────────────────────────────────────────────
-            TokenKind::Integer(i) => Ok(Expr::Literal(Literal::Integer(*i), tok.span)),
+            TokenKind::Integer(i) => Ok(Expr::Literal(Literal::Integer(i), token_span)),
             // An integer literal too large for i64 becomes a REAL, and a
             // magnitude beyond f64 range becomes ±Infinity — matching C
             // SQLite's text-to-real conversion (no f64::MAX clamp).
             TokenKind::OversizedInt(s) => match s.parse::<f64>() {
-                Ok(v) => Ok(Expr::Literal(Literal::Float(v), tok.span)),
-                Err(_) => Err(ParseError::at("integer out of range", Some(&tok))),
+                Ok(v) => Ok(Expr::Literal(Literal::Float(v), token_span)),
+                Err(_) => Err(ParseError {
+                    message: "integer out of range".to_owned(),
+                    span: token_span,
+                    line,
+                    col,
+                }),
             },
-            TokenKind::Float(f) => Ok(Expr::Literal(Literal::Float(*f), tok.span)),
-            TokenKind::String(s) => Ok(Expr::Literal(Literal::String(s.clone()), tok.span)),
-            TokenKind::Blob(b) => Ok(Expr::Literal(Literal::Blob(b.clone()), tok.span)),
-            TokenKind::KwNull => Ok(Expr::Literal(Literal::Null, tok.span)),
-            TokenKind::KwTrue => Ok(Expr::Literal(Literal::True, tok.span)),
-            TokenKind::KwFalse => Ok(Expr::Literal(Literal::False, tok.span)),
-            TokenKind::KwCurrentTime => Ok(Expr::Literal(Literal::CurrentTime, tok.span)),
-            TokenKind::KwCurrentDate => Ok(Expr::Literal(Literal::CurrentDate, tok.span)),
-            TokenKind::KwCurrentTimestamp => Ok(Expr::Literal(Literal::CurrentTimestamp, tok.span)),
+            TokenKind::Float(f) => Ok(Expr::Literal(Literal::Float(f), token_span)),
+            TokenKind::String(s) => Ok(Expr::Literal(Literal::String(s), token_span)),
+            TokenKind::Blob(b) => Ok(Expr::Literal(Literal::Blob(b), token_span)),
+            TokenKind::KwNull => Ok(Expr::Literal(Literal::Null, token_span)),
+            TokenKind::KwTrue => Ok(Expr::Literal(Literal::True, token_span)),
+            TokenKind::KwFalse => Ok(Expr::Literal(Literal::False, token_span)),
+            TokenKind::KwCurrentTime => Ok(Expr::Literal(Literal::CurrentTime, token_span)),
+            TokenKind::KwCurrentDate => Ok(Expr::Literal(Literal::CurrentDate, token_span)),
+            TokenKind::KwCurrentTimestamp => {
+                Ok(Expr::Literal(Literal::CurrentTimestamp, token_span))
+            }
 
             // ── Bind parameters ─────────────────────────────────────────
-            TokenKind::Question => Ok(Expr::Placeholder(PlaceholderType::Anonymous, tok.span)),
+            TokenKind::Question => Ok(Expr::Placeholder(PlaceholderType::Anonymous, token_span)),
             TokenKind::QuestionNum(n) => {
-                Ok(Expr::Placeholder(PlaceholderType::Numbered(*n), tok.span))
+                Ok(Expr::Placeholder(PlaceholderType::Numbered(n), token_span))
             }
             TokenKind::ColonParam(s) => Ok(Expr::Placeholder(
-                PlaceholderType::ColonNamed(s.clone()),
-                tok.span,
+                PlaceholderType::ColonNamed(s),
+                token_span,
             )),
-            TokenKind::AtParam(s) => Ok(Expr::Placeholder(
-                PlaceholderType::AtNamed(s.clone()),
-                tok.span,
-            )),
+            TokenKind::AtParam(s) => Ok(Expr::Placeholder(PlaceholderType::AtNamed(s), token_span)),
             TokenKind::DollarParam(s) => Ok(Expr::Placeholder(
-                PlaceholderType::DollarNamed(s.clone()),
-                tok.span,
+                PlaceholderType::DollarNamed(s),
+                token_span,
             )),
 
             // ── Unary prefix: - + ~ ─────────────────────────────────────
@@ -196,12 +205,12 @@ impl Parser {
                 if let TokenKind::OversizedInt(s) = self.peek_kind() {
                     if s == "9223372036854775808" {
                         let num_span = self.advance_token().span;
-                        let span = tok.span.merge(num_span);
+                        let span = token_span.merge(num_span);
                         return Ok(Expr::Literal(Literal::Integer(i64::MIN), span));
                     }
                 }
                 let inner = self.parse_expr_bp(bp::UNARY)?;
-                let span = tok.span.merge(inner.span());
+                let span = token_span.merge(inner.span());
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Negate,
                     expr: Box::new(inner),
@@ -210,7 +219,7 @@ impl Parser {
             }
             TokenKind::Plus => {
                 let inner = self.parse_expr_bp(bp::UNARY)?;
-                let span = tok.span.merge(inner.span());
+                let span = token_span.merge(inner.span());
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Plus,
                     expr: Box::new(inner),
@@ -219,7 +228,7 @@ impl Parser {
             }
             TokenKind::Tilde => {
                 let inner = self.parse_expr_bp(bp::UNARY)?;
-                let span = tok.span.merge(inner.span());
+                let span = token_span.merge(inner.span());
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::BitNot,
                     expr: Box::new(inner),
@@ -235,7 +244,7 @@ impl Parser {
                     self.expect_kind(&TokenKind::LeftParen)?;
                     let subquery = self.parse_subquery_minimal()?;
                     let end = self.expect_kind(&TokenKind::RightParen)?;
-                    let span = tok.span.merge(end);
+                    let span = token_span.merge(end);
                     return Ok(Expr::Exists {
                         subquery: Box::new(subquery),
                         not: true,
@@ -243,7 +252,7 @@ impl Parser {
                     });
                 }
                 let inner = self.parse_expr_bp(bp::NOT_PREFIX)?;
-                let span = tok.span.merge(inner.span());
+                let span = token_span.merge(inner.span());
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Not,
                     expr: Box::new(inner),
@@ -256,7 +265,7 @@ impl Parser {
                 self.expect_kind(&TokenKind::LeftParen)?;
                 let subquery = self.parse_subquery_minimal()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
-                let span = tok.span.merge(end);
+                let span = token_span.merge(end);
                 Ok(Expr::Exists {
                     subquery: Box::new(subquery),
                     not: false,
@@ -271,7 +280,7 @@ impl Parser {
                 self.expect_kind(&TokenKind::KwAs)?;
                 let type_name = self.parse_type_name()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
-                let span = tok.span.merge(end);
+                let span = token_span.merge(end);
                 Ok(Expr::Cast {
                     expr: Box::new(inner),
                     type_name,
@@ -280,14 +289,14 @@ impl Parser {
             }
 
             // ── CASE [operand] WHEN ... THEN ... [ELSE ...] END ────────
-            TokenKind::KwCase => self.parse_case_expr(tok.span),
+            TokenKind::KwCase => self.parse_case_expr(token_span),
 
             // ── RAISE(action, message) ──────────────────────────────────
             TokenKind::KwRaise => {
                 self.expect_kind(&TokenKind::LeftParen)?;
                 let (action, message) = self.parse_raise_args()?;
                 let end = self.expect_kind(&TokenKind::RightParen)?;
-                let span = tok.span.merge(end);
+                let span = token_span.merge(end);
                 Ok(Expr::Raise {
                     action,
                     message,
@@ -303,7 +312,7 @@ impl Parser {
                 ) {
                     let subquery = self.parse_subquery_minimal()?;
                     let end = self.expect_kind(&TokenKind::RightParen)?;
-                    let span = tok.span.merge(end);
+                    let span = token_span.merge(end);
                     return Ok(Expr::Subquery(Box::new(subquery), span));
                 }
                 let first = self.parse_expr()?;
@@ -316,7 +325,7 @@ impl Parser {
                         }
                     }
                     let end = self.expect_kind(&TokenKind::RightParen)?;
-                    let span = tok.span.merge(end);
+                    let span = token_span.merge(end);
                     Ok(Expr::RowValue(exprs, span))
                 } else {
                     self.expect_kind(&TokenKind::RightParen)?;
@@ -326,12 +335,12 @@ impl Parser {
 
             // ── Identifier: column ref or function call ─────────────────
             TokenKind::Id(name) | TokenKind::QuotedId(name, _) => {
-                self.parse_ident_expr(Arc::clone(name), tok.span)
+                self.parse_ident_expr(name, token_span)
             }
 
             // ── Keywords usable as function names ───────────────────────
             TokenKind::KwReplace if matches!(self.peek_kind(), TokenKind::LeftParen) => {
-                self.parse_function_call("replace".to_owned(), tok.span)
+                self.parse_function_call("replace".to_owned(), token_span)
             }
             // C SQLite exposes the pattern-matching operators as scalar
             // functions too: `like(P, X [, E])`, `glob(P, X)`,
@@ -339,30 +348,32 @@ impl Parser {
             // operator, so only treat it as a function name when directly
             // followed by `(`.
             TokenKind::KwLike if matches!(self.peek_kind(), TokenKind::LeftParen) => {
-                self.parse_function_call("like".to_owned(), tok.span)
+                self.parse_function_call("like".to_owned(), token_span)
             }
             TokenKind::KwGlob if matches!(self.peek_kind(), TokenKind::LeftParen) => {
-                self.parse_function_call("glob".to_owned(), tok.span)
+                self.parse_function_call("glob".to_owned(), token_span)
             }
             TokenKind::KwRegexp if matches!(self.peek_kind(), TokenKind::LeftParen) => {
-                self.parse_function_call("regexp".to_owned(), tok.span)
+                self.parse_function_call("regexp".to_owned(), token_span)
             }
             TokenKind::KwMatch if matches!(self.peek_kind(), TokenKind::LeftParen) => {
-                self.parse_function_call("match".to_owned(), tok.span)
+                self.parse_function_call("match".to_owned(), token_span)
             }
 
             // ── Non-reserved keywords usable as identifiers ─────────────
             // In SQL, non-reserved keywords (like KEY, MATCH, FIRST, etc.)
             // can be used as column names without quoting.
-            k if is_nonreserved_kw(k) => {
-                let name = kw_to_str(k);
-                self.parse_ident_expr(name, tok.span)
+            k if is_nonreserved_kw(&k) => {
+                let name = kw_to_str(&k);
+                self.parse_ident_expr(name, token_span)
             }
 
-            _ => Err(ParseError::at(
-                format!("unexpected token in expression: {:?}", tok.kind),
-                Some(&tok),
-            )),
+            kind => Err(ParseError {
+                message: format!("unexpected token in expression: {kind:?}"),
+                span: token_span,
+                line,
+                col,
+            }),
         }
     }
 
