@@ -3299,7 +3299,9 @@ where
 
     let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
-    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::default())?;
+    // Random salts (GH #201): a fresh WAL generation must not validate
+    // frames from any stale or copied WAL of a previous generation.
+    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::generate())?;
     install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true)
 }
 
@@ -40999,6 +41001,22 @@ impl Connection {
                         "Cannot add a UNIQUE column {}",
                         col_def.name
                     )));
+                }
+                // CHECK constraints may not contain a subquery. CREATE TABLE
+                // already rejects these (bd-bkbe6); ALTER TABLE ADD COLUMN
+                // must too, with C SQLite's alter-scoped message. Persisting
+                // such a CHECK poisons the on-disk schema: stock SQLite
+                // refuses to parse it and the whole file becomes unreadable
+                // ("malformed database schema").
+                for constraint in &col_def.constraints {
+                    if let ColumnConstraintKind::Check(ref expr) = constraint.kind
+                        && expr_contains_subquery_match(expr, &mut |_| true)
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {table_name} after add column: \
+                             subqueries prohibited in CHECK constraints"
+                        )));
+                    }
                 }
                 let affinity = col_def
                     .type_name

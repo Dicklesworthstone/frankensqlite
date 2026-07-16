@@ -1410,7 +1410,9 @@ where
     fn create_replacement_wal(&self, cx: &Cx) -> Result<WalFile<V::File>> {
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
         let (file, _) = self.vfs.open(cx, Some(&self.wal_path), flags)?;
-        WalFile::create(cx, file, self.page_size, 0, WalSalts::default())
+        // Random salts (GH #201): the replacement WAL must reject frames
+        // from the file it replaces.
+        WalFile::create(cx, file, self.page_size, 0, WalSalts::generate())
     }
 
     fn replace_with_created_wal(&mut self, cx: &Cx) -> Result<()> {

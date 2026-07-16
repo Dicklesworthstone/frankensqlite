@@ -328,3 +328,54 @@ fn alter_sequence_then_index_and_query() {
     );
     assert_no_mismatches(&m, "alter_sequence_then_index_and_query");
 }
+
+/// GH #252: ADD COLUMN with a subquery-containing CHECK must be rejected the
+/// way CREATE TABLE already rejects it. Accepting it persists a schema stock
+/// SQLite refuses to parse, making the whole file unreadable ("malformed
+/// database schema"). Both engines must refuse, and the schema must be
+/// untouched afterward.
+#[test]
+fn alter_add_column_check_with_subquery_rejected() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    apply(&fconn, &rconn, &["CREATE TABLE t (a INTEGER)"]);
+
+    let diverged = apply_checked(
+        &fconn,
+        &rconn,
+        &[
+            "ALTER TABLE t ADD COLUMN b CHECK((SELECT 1))",
+            "ALTER TABLE t ADD COLUMN c INTEGER CHECK(c > (SELECT count(*) FROM t))",
+            "ALTER TABLE t ADD COLUMN d CHECK(d IN (SELECT a FROM t))",
+            "ALTER TABLE t ADD COLUMN e CHECK(EXISTS (SELECT 1))",
+        ],
+    );
+    assert_no_mismatches(&diverged, "alter_add_column_check_with_subquery_rejected");
+
+    // The rejected ALTERs must leave no trace: no subquery text may reach
+    // the persisted schema (that is exactly what poisons the file for stock
+    // SQLite), the table stays usable, and a plain CHECK column is still
+    // addable. The exact DDL text is NOT compared: fsqlite currently
+    // re-prints ADD COLUMN schema text (column CHECK becomes a table-level
+    // CHECK) while C SQLite splices the original text — a pre-existing
+    // cosmetic divergence separate from this guard.
+    apply(
+        &fconn,
+        &rconn,
+        &[
+            "INSERT INTO t VALUES (1)",
+            "ALTER TABLE t ADD COLUMN ok INTEGER CHECK(ok IS NULL OR ok > 0)",
+            "INSERT INTO t (a, ok) VALUES (2, 5)",
+        ],
+    );
+    let schema_rows = fconn
+        .query("SELECT sql FROM sqlite_master WHERE name = 't'")
+        .unwrap();
+    let schema_text = format!("{:?}", schema_rows.first().map(|r| r.values().to_vec()));
+    assert!(
+        !schema_text.to_ascii_uppercase().contains("SELECT"),
+        "rejected subquery CHECKs must leave no trace in the schema: {schema_text}"
+    );
+    let m = oracle_compare(&fconn, &rconn, &["SELECT a, ok FROM t ORDER BY a"]);
+    assert_no_mismatches(&m, "alter_add_column_check_with_subquery_schema_clean");
+}
