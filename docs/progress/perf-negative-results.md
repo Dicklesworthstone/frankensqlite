@@ -19288,3 +19288,28 @@ test is on the executed path, not merely linked into it.
   monotonic-with-measurement-order delta (early groups better, late groups worse) is a contention
   tell, not a real code effect — but you still cannot ship a measured regression; re-measure clean or
   reject.
+
+## 2026-07-16 - REJECT: stack-back integer TEXT-affinity coercion (`apply_affinity(Text)`)
+
+- Target: `SqliteValue::apply_affinity(TypeAffinity::Text)` for an `Integer` (crates/fsqlite-types
+  value.rs ~716) did `let t = self.to_text(); SmallText::from_string(t)` — `i.to_string()` allocates a
+  heap `String` that `SmallText` (23-byte inline cap) then inlines and frees. This is a hot path
+  (every numeric inserted into a TEXT-affinity column + `CAST(int AS TEXT)`). Candidate: render the
+  i64 into a fixed 24-byte stack buffer via a `StackStr` (`fmt::Write`) + `write!(buf, "{i}")` +
+  `SmallText::new` — the same transient-heap→stack lever that won for date/time (`6f77194f`).
+  Byte-identity locked (a passing `int_to_small_text_matches_to_string` test vs `i.to_string()`).
+- Same-binary A/B (release-perf, `-p fsqlite-types --lib`, 1000 ints/iter):
+  `coerce OLD (to_string + from_string)` `65,448 ns` -> `coerce NEW (int_to_small_text)` `71,392 ns`
+  — **~9% SLOWER (a regression), not a win**.
+- Result: REJECT (reverted; nothing shipped). ROOT CAUSE: `i.to_string()` is a SPECIALIZED integer
+  formatter (fast), and the small-`String` allocation is POOLED (`VALUE_POOL_CAP = 256` in value.rs,
+  so malloc/free is nearly free). Replacing it with `write!(StackStr, "{i}")` pays the general
+  `core::fmt::Arguments` machinery cost, which EXCEEDS the (pooled, cheap) allocation it removes.
+  **KEY RULE for the transient-heap→stack vein: it only wins when the OLD path ALREADY uses the
+  general `format!` machinery — then stack-backing merely removes the malloc (date/time won: OLD used
+  `format!`). For `x.to_string()` (a specialized fast path) plus a POOLED small allocation, routing
+  through `write!` is a NET LOSS. To ever win integer→text you'd need a specialized stack itoa (not
+  `write!`) AND an un-pooled allocation — not worth it here.** Do NOT retry the float case the same
+  way (`format_sqlite_float` already uses the general render path, so it MIGHT win — but it has a
+  second `Vec` alloc in `sqlite_float_decode`; measure before trusting). Unrelated:
+  `opcode::tests::opcode_count` (opcode.rs) was already failing on the worker, not caused by this.
