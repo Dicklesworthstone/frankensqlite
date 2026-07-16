@@ -786,9 +786,7 @@ fn format_datetime(jdn: f64, subsec: bool) -> SmallText {
     let (h, mi, s, frac) = jdn_to_hms(jdn);
     if subsec && frac > 1e-9 {
         let ms = (frac * 1000.0).round() as i64;
-        build_small_text(move |w| {
-            write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}")
-        })
+        build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{ms:03}"))
     } else {
         build_small_text(move |w| write!(w, "{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"))
     }
