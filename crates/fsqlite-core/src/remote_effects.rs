@@ -552,7 +552,7 @@ impl Executor {
     pub(crate) fn try_acquire_for_testing(&self) -> Option<AdmissionPermit<'_>> {
         #[cfg(feature = "native")]
         {
-            self.bulkhead.try_acquire(1)
+            self.bulkhead.try_acquire(1, admission_now())
         }
         #[cfg(not(feature = "native"))]
         {
@@ -641,7 +641,7 @@ impl Executor {
 
         #[cfg(feature = "native")]
         {
-            if let Some(permit) = self.bulkhead.try_acquire(1) {
+            if let Some(permit) = self.bulkhead.try_acquire(1, admission_now()) {
                 let snapshot = self.snapshot();
                 debug!(
                     bead_id = BEAD_ID,
