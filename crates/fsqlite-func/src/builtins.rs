@@ -629,21 +629,19 @@ pub struct TrimFunc;
 pub struct LtrimFunc;
 pub struct RtrimFunc;
 
-fn trim_chars(s: &str, chars: &str) -> String {
+fn trim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     let char_set: Vec<char> = chars.chars().collect();
-    s.trim_matches(|c: char| char_set.contains(&c)).to_owned()
+    s.trim_matches(|c: char| char_set.contains(&c))
 }
 
-fn ltrim_chars(s: &str, chars: &str) -> String {
+fn ltrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     let char_set: Vec<char> = chars.chars().collect();
     s.trim_start_matches(|c: char| char_set.contains(&c))
-        .to_owned()
 }
 
-fn rtrim_chars(s: &str, chars: &str) -> String {
+fn rtrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     let char_set: Vec<char> = chars.chars().collect();
     s.trim_end_matches(|c: char| char_set.contains(&c))
-        .to_owned()
 }
 
 impl ScalarFunction for TrimFunc {
@@ -657,9 +655,10 @@ impl ScalarFunction for TrimFunc {
         } else {
             Cow::Borrowed(" ")
         };
-        Ok(SqliteValue::Text(SmallText::new(
-            trim_chars(s.as_ref(), chars.as_ref()).as_str(),
-        )))
+        Ok(SqliteValue::Text(SmallText::new(trim_chars(
+            s.as_ref(),
+            chars.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -690,9 +689,10 @@ impl ScalarFunction for LtrimFunc {
         } else {
             Cow::Borrowed(" ")
         };
-        Ok(SqliteValue::Text(SmallText::new(
-            ltrim_chars(s.as_ref(), chars.as_ref()).as_str(),
-        )))
+        Ok(SqliteValue::Text(SmallText::new(ltrim_chars(
+            s.as_ref(),
+            chars.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -723,9 +723,10 @@ impl ScalarFunction for RtrimFunc {
         } else {
             Cow::Borrowed(" ")
         };
-        Ok(SqliteValue::Text(SmallText::new(
-            rtrim_chars(s.as_ref(), chars.as_ref()).as_str(),
-        )))
+        Ok(SqliteValue::Text(SmallText::new(rtrim_chars(
+            s.as_ref(),
+            chars.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
