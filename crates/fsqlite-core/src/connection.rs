@@ -73343,6 +73343,48 @@ fn expr_may_observe_change_tracking(expr: &Expr) -> bool {
     }
 }
 
+/// Compare two evaluated in-aggregate `ORDER BY` key tuples, honoring each
+/// term's direction (`ASC`/`DESC`) and NULLS placement. Used by the interpreted
+/// `json_group_array`/`json_group_object` aggregates. (GH #266, #267)
+#[cfg(feature = "ext-json")]
+fn cmp_in_aggregate_order_keys(
+    order_by: &[OrderingTerm],
+    a: &[SqliteValue],
+    b: &[SqliteValue],
+) -> std::cmp::Ordering {
+    for (i, term) in order_by.iter().enumerate() {
+        let av = &a[i];
+        let bv = &b[i];
+        let ord = if av.is_null() || bv.is_null() {
+            if av.is_null() && bv.is_null() {
+                std::cmp::Ordering::Equal
+            } else {
+                let nulls = term
+                    .nulls
+                    .unwrap_or_else(|| default_nulls_order(term.direction));
+                match (av.is_null(), nulls) {
+                    (true, NullsOrder::First) | (false, NullsOrder::Last) => {
+                        std::cmp::Ordering::Less
+                    }
+                    (true, NullsOrder::Last) | (false, NullsOrder::First) => {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+            }
+        } else {
+            let mut o = cmp_sqlite_values(av, bv);
+            if term.direction == Some(SortDirection::Desc) {
+                o = o.reverse();
+            }
+            o
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Evaluate an expression that may contain aggregate function calls against
 /// a group of rows. Aggregate sub-expressions are computed over the full
 /// group; the remaining scalar parts are evaluated against the first row.
@@ -73356,7 +73398,12 @@ fn eval_group_agg_join_expr(
         // json_group_array; two-argument key/value pairs for json_group_object).
         #[cfg(feature = "ext-json")]
         Expr::FunctionCall {
-            name, args, filter, ..
+            name,
+            args,
+            filter,
+            order_by,
+            distinct,
+            ..
         } if is_builtin_json_aggregate(name) => {
             let exprs = match args {
                 FunctionArgs::List(e) => e.as_slice(),
@@ -73373,13 +73420,39 @@ fn eval_group_agg_join_expr(
                 let arg = exprs.first().ok_or_else(|| {
                     FrankenError::function_error("json_group_array() requires 1 argument")
                 })?;
-                let mut vals = Vec::new();
+                // Collect (value, ORDER BY keys) for each row that passes FILTER.
+                let mut items: Vec<(SqliteValue, Vec<SqliteValue>)> = Vec::new();
                 for row in group_rows {
                     if passes_filter(row) {
                         // NULLs are preserved (rendered as JSON null).
-                        vals.push(eval_join_expr(arg, row, col_map)?);
+                        let value = eval_join_expr(arg, row, col_map)?;
+                        let mut keys = Vec::with_capacity(order_by.len());
+                        for term in order_by {
+                            keys.push(eval_join_expr(&term.expr, row, col_map)?);
+                        }
+                        items.push((value, keys));
                     }
                 }
+                // DISTINCT removes duplicate values (first occurrence wins). (GH #268)
+                if *distinct {
+                    let mut seen: Vec<SqliteValue> = Vec::new();
+                    items.retain(|(v, _)| {
+                        if seen
+                            .iter()
+                            .any(|s| cmp_sqlite_values(s, v) == std::cmp::Ordering::Equal)
+                        {
+                            false
+                        } else {
+                            seen.push(v.clone());
+                            true
+                        }
+                    });
+                }
+                // In-aggregate ORDER BY sorts the collected values. (GH #266)
+                if !order_by.is_empty() {
+                    items.sort_by(|(_, ak), (_, bk)| cmp_in_aggregate_order_keys(order_by, ak, bk));
+                }
+                let vals: Vec<SqliteValue> = items.into_iter().map(|(v, _)| v).collect();
                 Ok(SqliteValue::Text(
                     fsqlite_ext_json::json_group_array(&vals)?.into(),
                 ))
@@ -73390,14 +73463,24 @@ fn eval_group_agg_join_expr(
                         "json_group_object() requires 2 arguments",
                     ));
                 }
-                let mut pairs = Vec::new();
+                let mut items: Vec<((SqliteValue, SqliteValue), Vec<SqliteValue>)> = Vec::new();
                 for row in group_rows {
                     if passes_filter(row) {
                         let key = eval_join_expr(&exprs[0], row, col_map)?;
                         let value = eval_join_expr(&exprs[1], row, col_map)?;
-                        pairs.push((key, value));
+                        let mut keys = Vec::with_capacity(order_by.len());
+                        for term in order_by {
+                            keys.push(eval_join_expr(&term.expr, row, col_map)?);
+                        }
+                        items.push(((key, value), keys));
                     }
                 }
+                // In-aggregate ORDER BY sorts the key/value pairs. (GH #267)
+                if !order_by.is_empty() {
+                    items.sort_by(|(_, ak), (_, bk)| cmp_in_aggregate_order_keys(order_by, ak, bk));
+                }
+                let pairs: Vec<(SqliteValue, SqliteValue)> =
+                    items.into_iter().map(|(kv, _)| kv).collect();
                 Ok(SqliteValue::Text(
                     fsqlite_ext_json::json_group_object(&pairs)?.into(),
                 ))
@@ -159145,6 +159228,51 @@ mod pager_routing_tests {
         assert!(conn.execute("CREATE INDEX v ON x(b);").is_err());
         // A genuinely new index name still works.
         conn.execute("CREATE INDEX ix ON x(b);").unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "ext-json")]
+    fn test_json_group_aggregate_order_by_and_distinct() {
+        // GH #266/#267/#268: json_group_array/object honor in-aggregate ORDER BY
+        // and DISTINCT.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3),(1),(1),(2);")
+            .unwrap();
+
+        let one = |sql: &str| -> String {
+            let rows = conn.query(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            match &rows[0].values()[0] {
+                SqliteValue::Text(s) => s.to_string(),
+                other => panic!("{sql}: expected text, got {other:?}"),
+            }
+        };
+
+        // #266: ORDER BY sorts the values (no dedup).
+        assert_eq!(
+            one("SELECT json_group_array(x ORDER BY x) FROM t"),
+            "[1,1,2,3]"
+        );
+        assert_eq!(
+            one("SELECT json_group_array(x ORDER BY x DESC) FROM t"),
+            "[3,2,1,1]"
+        );
+        // #268: DISTINCT dedups, preserving first-seen order.
+        assert_eq!(one("SELECT json_group_array(DISTINCT x) FROM t"), "[3,1,2]");
+        // DISTINCT + ORDER BY: dedup then sort.
+        assert_eq!(
+            one("SELECT json_group_array(DISTINCT x ORDER BY x) FROM t"),
+            "[1,2,3]"
+        );
+
+        // #267: json_group_object ORDER BY.
+        conn.execute("CREATE TABLE kv(k TEXT, v INTEGER);").unwrap();
+        conn.execute("INSERT INTO kv VALUES ('b',2),('a',1),('c',3);")
+            .unwrap();
+        assert_eq!(
+            one("SELECT json_group_object(k, v ORDER BY k) FROM kv"),
+            r#"{"a":1,"b":2,"c":3}"#
+        );
     }
 
     #[test]
