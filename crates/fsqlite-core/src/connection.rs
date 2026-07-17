@@ -42249,6 +42249,22 @@ impl Connection {
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
                 })?;
+            // An index cannot reuse the name of an existing table or view. C
+            // SQLite rejects this unconditionally — IF NOT EXISTS only suppresses
+            // a collision with another *index* of the same name. (GH #232)
+            let name_taken_by_table = schema
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(&index_name));
+            let name_taken_by_view = self
+                .views
+                .borrow()
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(&index_name));
+            if name_taken_by_table || name_taken_by_view {
+                return Err(FrankenError::Internal(format!(
+                    "there is already a table named {index_name}"
+                )));
+            }
             let index_name_exists = schema.iter().any(|candidate| {
                 candidate
                     .indexes
@@ -49564,11 +49580,26 @@ impl Connection {
                         // generated (bd-ewj3w).
                         let is_xinfo = full_name == "table_xinfo";
                         let pk_positions = self.compute_pk_positions(t);
+                        // table_info omits generated columns (they surface only in
+                        // table_xinfo) and renumbers cid over the remaining
+                        // columns; table_xinfo lists every column at its real cid.
+                        // (GH #240)
+                        let mut next_cid: i64 = 0;
                         let rows = t
                             .columns
                             .iter()
                             .enumerate()
-                            .map(|(i, col)| {
+                            .filter_map(|(i, col)| {
+                                if !is_xinfo && col.generated_expr.is_some() {
+                                    return None;
+                                }
+                                let cid = if is_xinfo {
+                                    i64::try_from(i).unwrap_or(0)
+                                } else {
+                                    let c = next_cid;
+                                    next_cid += 1;
+                                    c
+                                };
                                 let type_str =
                                     col.type_name.as_deref().unwrap_or(match col.affinity {
                                         'D' | 'd' => "INTEGER",
@@ -49584,7 +49615,7 @@ impl Connection {
                                     });
                                 let pk = pk_positions.get(i).copied().unwrap_or(0);
                                 let mut values = vec![
-                                    SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
+                                    SqliteValue::Integer(cid),
                                     SqliteValue::Text(col.name.clone().into()),
                                     SqliteValue::Text(type_str.into()),
                                     SqliteValue::Integer(notnull),
@@ -49601,7 +49632,7 @@ impl Connection {
                                     };
                                     values.push(SqliteValue::Integer(hidden));
                                 }
-                                Row { values }
+                                Some(Row { values })
                             })
                             .collect();
                         Ok(rows)
@@ -82292,16 +82323,25 @@ fn sort_rows_by_order_terms(
     let resolved: Vec<(usize, bool, NullsOrder, Option<String>)> = order_by
         .iter()
         .map(|term| {
+            // A compound ORDER BY term may be wrapped in COLLATE, e.g.
+            // `ORDER BY x COLLATE NOCASE` or `ORDER BY 1 COLLATE NOCASE`.
+            // Resolve the result-set index against the inner expression while
+            // still honoring the wrapper's collation (extracted below).
+            // (GH #217, #218, #219, #220, #221)
+            let base_expr = match &term.expr {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                other => other,
+            };
             // Try integer position reference first (ORDER BY 1, 2).
-            let idx = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
+            let idx = if let Expr::Literal(Literal::Integer(n), _) = base_expr {
                 let pos = usize::try_from(*n).unwrap_or(0);
                 if pos >= 1 && pos <= columns.len() {
                     Some(pos - 1)
                 } else {
                     None
                 }
-            } else if let Some(col_name) = expr_col_name(&term.expr) {
-                let order_table = if let Expr::Column(col_ref, _) = &term.expr {
+            } else if let Some(col_name) = expr_col_name(base_expr) {
+                let order_table = if let Expr::Column(col_ref, _) = base_expr {
                     col_ref.table.as_deref()
                 } else {
                     None
@@ -82310,7 +82350,7 @@ fn sort_rows_by_order_terms(
             } else {
                 // Expression ORDER BY: match structurally against result columns.
                 columns.iter().position(|c| match c {
-                    ResultColumn::Expr { expr, .. } => exprs_match(&term.expr, expr),
+                    ResultColumn::Expr { expr, .. } => exprs_match(base_expr, expr),
                     _ => false,
                 })
             };
@@ -159036,6 +159076,75 @@ mod pager_routing_tests {
                 "idx_pragma_items_name".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn test_compound_order_by_collate_resolves() {
+        // GH #217-#221: a COLLATE-wrapped ORDER BY term in a compound SELECT must
+        // resolve (by output name, alias, or 1-based position) and sort with the
+        // collation instead of erroring "not found in SELECT list".
+        let conn = Connection::open(":memory:").unwrap();
+        for sql in [
+            "SELECT 'b' AS x UNION SELECT 'A' ORDER BY x COLLATE NOCASE",
+            "SELECT 'b' AS x UNION ALL SELECT 'A' ORDER BY x COLLATE NOCASE",
+            "SELECT 'b' UNION SELECT 'A' ORDER BY 1 COLLATE NOCASE",
+        ] {
+            let rows = conn.query(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(rows.len(), 2, "sql={sql}");
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Text("A".into()),
+                "sql={sql}"
+            );
+            assert_eq!(
+                rows[1].values()[0],
+                SqliteValue::Text("b".into()),
+                "sql={sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pragma_table_info_excludes_generated_columns() {
+        // GH #240: table_info omits generated columns and renumbers cid over the
+        // remaining columns; table_xinfo still lists them at their real cid.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED, d INTEGER);",
+        )
+        .unwrap();
+        let info = conn.query("PRAGMA table_info(t);").unwrap();
+        let names: Vec<_> = info
+            .iter()
+            .map(|r| (r.values()[0].clone(), r.values()[1].clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (SqliteValue::Integer(0), SqliteValue::Text("a".into())),
+                (SqliteValue::Integer(1), SqliteValue::Text("d".into())),
+            ]
+        );
+        // xinfo still contains all three columns.
+        let xinfo = conn.query("PRAGMA table_xinfo(t);").unwrap();
+        assert_eq!(xinfo.len(), 3);
+    }
+
+    #[test]
+    fn test_create_index_name_collides_with_table_or_view() {
+        // GH #232: an index cannot reuse a table/view name, even with
+        // IF NOT EXISTS.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a);").unwrap();
+        conn.execute("CREATE TABLE x(b);").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM x;").unwrap();
+        assert!(
+            conn.execute("CREATE INDEX IF NOT EXISTS t ON x(b);")
+                .is_err()
+        );
+        assert!(conn.execute("CREATE INDEX v ON x(b);").is_err());
+        // A genuinely new index name still works.
+        conn.execute("CREATE INDEX ix ON x(b);").unwrap();
     }
 
     #[test]
