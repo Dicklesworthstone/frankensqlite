@@ -93,6 +93,12 @@ no breaking API changes.
   preventing creation of a database that stock SQLite reports as a malformed
   schema
   ([#252](https://github.com/Dicklesworthstone/frankensqlite/issues/252)).
+- Row-value `IS`, `IS NOT`, `IS DISTINCT FROM`, and `IS NOT DISTINCT FROM`
+  comparisons are NULL-safe and componentwise, while row-value `BETWEEN` and
+  `NOT BETWEEN` use SQLite-compatible lexicographic bounds (#170, #171, #243).
+- Generated columns are rejected from both column-level and table-level
+  primary keys, and `PRAGMA foreign_key_check(table)` reports an unknown table
+  instead of silently returning no rows (#181, #261).
 - `DELETE` and `UPDATE` rowid fast paths now apply SQLite's exact-integer
   coercion before seeking. A predicate such as `rowid = 2.5` no longer
   truncates to rowid 2 and mutates the wrong row; integral numeric and text
