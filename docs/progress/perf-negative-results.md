@@ -19417,3 +19417,27 @@ size). DISPROVES the earlier slow-balance hypothesis:
   locality-ramp. INFRA: enable btree counters (`set_btree_metrics_enabled`/`set_btree_copy_profile_enabled`)
   — they are gated OFF by default and silently read zero otherwise; debug build is fine (counters are
   opt-level-independent) and compiles faster than release-perf.
+
+## 2026-07-16 - ROOT CAUSE (bd-aoj0g CONFIRMED): the O(n²) INSERT is non-sequential-index CACHE LOCALITY
+
+Locality experiment (debug, `:memory:`, one txn, index on `k`, per-1000-insert ns by table size) —
+inserted the SAME rows but varied `k`, which controls the secondary-index key `(k, rowid)` order:
+- `k = i` (unique, sequential → MONOTONIC index key → append to the rightmost leaf): **FLAT**
+  ~125-153 ns/insert across 0→9k rows. NO growth.
+- `k = i%100` (low-cardinality, non-monotonic → scatters across 100 subtrees): **166 → 646 ns/insert**
+  (grows ~4× over 9k; extrapolates to the 295× gap at 100k).
+- `k = i%5000` (higher-cardinality, non-monotonic): flat ~130 ns until row 5000 (all 5000 distinct
+  k-values now exist), then STEP-jumps to ~330 ns and plateaus.
+CONCLUSION: the O(n²) secondary-index INSERT is **CPU-cache locality of NON-SEQUENTIAL index inserts** —
+each insert seeks a scattered leaf whose page is cache-cold as the index grows, and `MemPageStore::read_page`
+(cursor.rs:538) `.cloned()`s the full 4 KB page per read. A monotonic index key (sequential append, one hot
+leaf) is flat; a non-monotonic key scatters and ramps. This DEFINITIVELY rules out witnesses / btree cell
+ops / opcode overhead (those are constant, which the sequential case would also show).
+- Also note: even the FLAT sequential case is ~130 ns/insert (debug) with an index vs ~5 µs execute_body
+  without one — there is a high per-index-insert CONSTANT (re-descend + per-page 4 KB clone; stack-elision
+  is disabled because pages are dirty within the txn), separate from the locality ramp.
+- FIX = STRUCTURAL, not one-turn (recorded on bd-aoj0g, handed to open): the growth is inherent to
+  non-sequential inserts into a large in-memory B-tree; mitigations are chartered — LSM/B-epsilon-style
+  write buffering that batches+sorts index inserts, a larger effective page cache, or handing out
+  `Arc<[u8]>` pages instead of 4 KB clones (reduces the constant, not the ramp). The single biggest INSERT
+  perf item in the codebase is now fully root-caused.
