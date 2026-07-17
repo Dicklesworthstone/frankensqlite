@@ -19484,3 +19484,32 @@ table with no single-column index (release-perf, no LTO):
 - `COUNT(*) WHERE c = 500` (full-scan control): **33,791,088 ns/query**
 - **A/B ratio ≈ 657x** (seek replaces full scan; EXPLAIN confirms no Rewind on the seek, Rewind on control).
 SHIPPED: codegen.rs + `agg_in_list_composite_prefix_oracle.rs`. Single-column IN path unchanged (golden 8/8).
+
+## 2026-07-16 - PROFILE + WIP: seek-gap map (easy levers mined) + bd-distinct-loose-scan hits the btree hang
+
+Profiled the codegen seek vein with an EXPLAIN-opcode battery (`zz_seekgap_probe`, ephemeral) across DISTINCT,
+GROUP BY, MIN/MAX, equality, range, IN over single-column and composite indexes. Key finding: a crude
+"Rewind = full scan" heuristic FALSE-POSITIVES — the real opcode dumps show the accessible levers are already
+mined:
+- `MIN(a)` "full-scans" only in the heuristic; `codegen_select_minmax_index_seek` already does `Rewind`
+  (go-to-first) + a NULL-skip loop that stops at the first non-NULL (O(1), not O(n)). Not a gap.
+- `COUNT(*) WHERE a=5` / `SELECT id WHERE a=5` are already index-seek-served (SeekGE idx + walk the run);
+  the `Rewind` the heuristic flagged is UNREACHABLE dead code after the seek loop's exit jump. Not gaps.
+- `GROUP BY a` index-walk and `SELECT DISTINCT a` emit-on-change index-walk are both already REJECTED
+  (`63cc5f87` perf-flat vs the vectorized sorter; `6e672d6f` ~32% slower). The sorter is competitive.
+- The ONLY remaining real gap is the DISTINCT loose/skip scan (100-400x) — filed as bd-distinct-loose-scan.
+
+Implemented bd-distinct-loose-scan (WIP stashed "BlackThrush bd-distinct-loose-scan WIP ... DO NOT DROP"):
+`distinct_loose_scan_plan` + `codegen_select_distinct_loose_scan` + routing at the DISTINCT branch, gated to
+`SELECT DISTINCT <single plain BINARY col>` with a single-column ASC BINARY index, no WHERE/GROUP BY/HAVING/
+LIMIT, not generated/WITHOUT ROWID. Emitter: OpenRead idx, Rewind, loop { Column→emit; SeekGT past the run }.
+GOLDEN-COMPILES. **BLOCKED: the oracle HANGS** — the same failure the bead flagged ("skip-scan hangs"). Root-
+caused past the codegen probe: BOTH a 2-field `[value, i64::MAX]` probe AND a 1-field prefix `[value]` probe
+(the design-intended form for `compare_index_key_values`' UpperBound bias `rhs.len() <= lhs.len() => Less`,
+cursor.rs:4623) hang. So the bug is in the **btree upper-bound skip layer, NOT the codegen** — most likely the
+interior-page descent uses `IndexSeekBias::LowerBound` unconditionally (cursor.rs:4578) while the leaf uses
+UpperBound, so `index_seek_upper_bound` mis-positions when a value's run spans multiple leaves (my 2000-row /
+~166-per-value test does), and the cursor fails to advance → infinite loop. NEXT: root-cause
+`index_seek_with_bias(UpperBound)` / `binary_search_index_interior_with_bias` on a fast LOCAL build (per the
+bead) — likely the interior descent must propagate the UpperBound bias, or the leaf-crossing successor logic
+(cursor.rs:4247) must re-seek. Codegen WIP is correct in shape; unblocking is a btree-cursor fix. Did NOT ship.
