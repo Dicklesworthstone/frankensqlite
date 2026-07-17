@@ -17946,7 +17946,14 @@ pub fn codegen_update(
         // raw `SeekRowid` TRUNCATING it to a wrong rowid (`WHERE id = 2.5` must not update row 2).
         // Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the DELETE / SELECT paths.
         if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
-            b.emit_jump_to_label(Opcode::MustBeInt, matched_rowid_reg, 0, apply_done_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::MustBeInt,
+                matched_rowid_reg,
+                0,
+                apply_done_label,
+                P4::None,
+                0,
+            );
         }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
@@ -19437,7 +19444,14 @@ pub fn codegen_delete(
         // delete row 2). Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the SELECT
         // rowid lookup + count/aggregate coerced seeks.
         if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
-            b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, collect_done_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::MustBeInt,
+                rowid_reg,
+                0,
+                collect_done_label,
+                P4::None,
+                0,
+            );
         }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
