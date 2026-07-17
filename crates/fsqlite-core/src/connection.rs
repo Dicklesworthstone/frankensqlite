@@ -140440,6 +140440,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6741_simple_inner_join_uses_vdbe_storage_cursors() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_inner_join_vdbe_storage.db")?;
         conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")?;
         conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);")?;
@@ -140558,6 +140559,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6741_simple_derived_from_source_flattens_to_vdbe_storage_cursors() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) =
             open_t6751_file_backed_connection("strict_derived_from_vdbe_storage.db")?;
         conn.execute("CREATE TABLE orders (id INTEGER, customer TEXT, amount INTEGER);")?;
@@ -140680,6 +140682,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6741_left_join_uses_vdbe_storage_cursors() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_left_join_vdbe_storage.db")?;
         conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")?;
         conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);")?;
@@ -141473,6 +141476,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6751_named_window_partition_aggregate_logs_stage_lifecycle() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) =
             open_t6751_file_backed_connection("strict_named_window_partition_aggregate_log.db")?;
         conn.execute("CREATE TABLE sales (region TEXT, day INTEGER, amount INTEGER);")?;
