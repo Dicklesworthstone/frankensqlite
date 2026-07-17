@@ -72195,6 +72195,20 @@ fn expand_row_value_comparison(a: &[Expr], b: &[Expr], op: BinaryOp, span: Span)
             .zip(b)
             .map(|(l, r)| cmp(l, r, BinaryOp::Ne))
             .reduce(join(BinaryOp::Or)),
+        // (a,b) IS (c,d)  ->  a IS c AND b IS d  (NULL-safe, componentwise).
+        // Also covers `IS NOT DISTINCT FROM`, which parses to IS. (GH #170, #243)
+        BinaryOp::Is => a
+            .iter()
+            .zip(b)
+            .map(|(l, r)| cmp(l, r, BinaryOp::Is))
+            .reduce(join(BinaryOp::And)),
+        // (a,b) IS NOT (c,d)  ->  a IS NOT c OR b IS NOT d. Also covers
+        // `IS DISTINCT FROM`, which parses to IS NOT. (GH #170, #243)
+        BinaryOp::IsNot => a
+            .iter()
+            .zip(b)
+            .map(|(l, r)| cmp(l, r, BinaryOp::IsNot))
+            .reduce(join(BinaryOp::Or)),
         // Lexicographic: a0 STRICT b0 OR (a0 = b0 AND <rest>), last element uses
         // the original (possibly non-strict) operator.
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
@@ -72284,13 +72298,43 @@ fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
             high,
             not,
             span,
-        } => Expr::Between {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            low: Box::new(rewrite_row_value_comparisons(low)),
-            high: Box::new(rewrite_row_value_comparisons(high)),
-            not: *not,
-            span: *span,
-        },
+        } => {
+            let e2 = rewrite_row_value_comparisons(e);
+            let low2 = rewrite_row_value_comparisons(low);
+            let high2 = rewrite_row_value_comparisons(high);
+            // Row-value BETWEEN expands to (e >= low) AND (e <= high); row-value
+            // NOT BETWEEN to (e < low) OR (e > high) — each side compared
+            // lexicographically via the row-value comparison expansion. (GH #171)
+            if let (Expr::RowValue(ea, _), Expr::RowValue(la, _), Expr::RowValue(ha, _)) =
+                (&e2, &low2, &high2)
+            {
+                if !ea.is_empty() && ea.len() == la.len() && ea.len() == ha.len() {
+                    let (lo_op, hi_op, combine) = if *not {
+                        (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
+                    } else {
+                        (BinaryOp::Ge, BinaryOp::Le, BinaryOp::And)
+                    };
+                    if let (Some(lo_cmp), Some(hi_cmp)) = (
+                        expand_row_value_comparison(ea, la, lo_op, *span),
+                        expand_row_value_comparison(ea, ha, hi_op, *span),
+                    ) {
+                        return Expr::BinaryOp {
+                            left: Box::new(lo_cmp),
+                            op: combine,
+                            right: Box::new(hi_cmp),
+                            span: *span,
+                        };
+                    }
+                }
+            }
+            Expr::Between {
+                expr: Box::new(e2),
+                low: Box::new(low2),
+                high: Box::new(high2),
+                not: *not,
+                span: *span,
+            }
+        }
         Expr::In {
             expr: e,
             set,
@@ -159273,6 +159317,31 @@ mod pager_routing_tests {
             one("SELECT json_group_object(k, v ORDER BY k) FROM kv"),
             r#"{"a":1,"b":2,"c":3}"#
         );
+    }
+
+    #[test]
+    fn test_row_value_is_between_distinct() {
+        // GH #170/#171/#243: NULL-safe row-value IS/IS NOT, lexicographic
+        // row-value BETWEEN, and row-value IS DISTINCT FROM.
+        let conn = Connection::open(":memory:").unwrap();
+        let b = |sql: &str| -> i64 {
+            let rows = conn.query(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            match &rows[0].values()[0] {
+                SqliteValue::Integer(n) => *n,
+                other => panic!("{sql}: expected int, got {other:?}"),
+            }
+        };
+        // #170: row-value IS / IS NOT are NULL-safe and componentwise.
+        assert_eq!(b("SELECT (1,NULL) IS (1,NULL)"), 1);
+        assert_eq!(b("SELECT (1,NULL) IS (1,2)"), 0);
+        assert_eq!(b("SELECT (1,2) IS NOT (1,3)"), 1);
+        // #171: row-value BETWEEN / NOT BETWEEN (lexicographic).
+        assert_eq!(b("SELECT (1,2) BETWEEN (1,1) AND (1,3)"), 1);
+        assert_eq!(b("SELECT (2,0) BETWEEN (1,1) AND (1,3)"), 0);
+        assert_eq!(b("SELECT (2,0) NOT BETWEEN (1,1) AND (1,3)"), 1);
+        // #243: row-value IS DISTINCT FROM (NULL-safe negation of IS).
+        assert_eq!(b("SELECT (1,NULL) IS DISTINCT FROM (1,NULL)"), 0);
+        assert_eq!(b("SELECT (1,NULL) IS DISTINCT FROM (1,2)"), 1);
     }
 
     #[test]
