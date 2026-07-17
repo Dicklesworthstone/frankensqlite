@@ -19441,3 +19441,25 @@ ops / opcode overhead (those are constant, which the sequential case would also 
   write buffering that batches+sorts index inserts, a larger effective page cache, or handing out
   `Arc<[u8]>` pages instead of 4 KB clones (reduces the constant, not the ramp). The single biggest INSERT
   perf item in the codebase is now fully root-caused.
+
+## 2026-07-16 - BLOCKED: bd-in-list-composite-prefix implemented + golden-verified, oracle blocked by a fsqlite-core BUILD BREAK
+
+Implemented the composite-leading IN-list aggregate seek (bd-in-list-composite-prefix-probe): relaxed
+`index_integer_in_list_target` to fall back to a composite `(a, …)` index whose ascending leading column
+matches (after the single-column preference), and made `emit_aggregate_index_value_seek` probe with a
+1-field PREFIX `[value]` when `idx_schema.key_term_count() > 1` (so SeekGE anchors at the first `a=value`
+entry INCLUDING `a=value, b=NULL` rows, which the 2-field `[value, i64::MIN]` probe skips). Single-column
+path keeps the exact 2-field probe. **GOLDEN 8/8 unchanged** (fsqlite-vdbe compiles, single-col
+byte-identical). Wrote `agg_in_list_composite_prefix_oracle.rs` (COUNT/SUM/MIN/MAX/AVG over a composite
+index with `a=3` being b=NULL-only, dup IN values, no-match, single-col control, non-indexed control).
+- BLOCKER: the oracle CANNOT RUN — **fsqlite-core does not compile on a fresh build in ANY feature config**:
+  (native) `remote_effects.rs:644` passes 2 args to `Bulkhead::try_acquire`, but Cargo.lock pins
+  `asupersync 0.3.5` whose `try_acquire` takes 1 arg (re-applied by `51a20be2` "merge regression" — the lock
+  bump to 0.3.5 and the 2-arg call are inconsistent); (no-default-features) a separate `into_os_string` on
+  `!` error. This blocks ALL fresh `fsqlite` oracle/e2e builds, not just mine. NOT my change (fsqlite-vdbe
+  golden compiled clean).
+- Result: my WIP is STASHED ("BlackThrush bd-in-list-composite-prefix WIP ... DO NOT DROP") and the bead is
+  handed back to open. RETRY: once fsqlite-core builds again (pin asupersync to a 2-arg version, or revert
+  remote_effects.rs:644 to 1-arg — a dependency/core call, not mine), `git stash pop` the WIP and run
+  `cargo test -p fsqlite --test agg_in_list_composite_prefix_oracle`; the logic is sound + golden-clean, so
+  it should pass. Per the oracle-first cadence I did NOT ship the unverified codegen.
