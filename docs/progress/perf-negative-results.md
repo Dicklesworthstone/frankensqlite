@@ -19463,3 +19463,24 @@ index with `a=3` being b=NULL-only, dup IN values, no-match, single-col control,
   remote_effects.rs:644 to 1-arg — a dependency/core call, not mine), `git stash pop` the WIP and run
   `cargo test -p fsqlite --test agg_in_list_composite_prefix_oracle`; the logic is sound + golden-clean, so
   it should pass. Per the oracle-first cadence I did NOT ship the unverified codegen.
+
+## 2026-07-16 - RESOLVED + SHIPPED: root-caused the asupersync build break (STALE PIN) and landed bd-in-list-composite (~657x)
+
+The "fsqlite-core does not compile" blocker above was a **stale dependency pin**, not a 2-arg-vs-1-arg
+code bug: `remote_effects.rs` correctly targets asupersync's 2-arg `try_acquire(weight, now)` API
+(edf9852f/51a20be2's deliberate time-API move), which is **asupersync 0.3.9** — published on crates.io —
+but the workspace `Cargo.toml` pin was never bumped from `0.3.5` (1-arg). Every fresh fsqlite-core build
+(rch workers, clean checkouts) failed `error[E0061]`; only machines with an uncommitted local asupersync
+patch built. The earlier "no-default-features into_os_string on !" was a red herring from a separate
+non-native stub. Fix (`fix(deps): bump asupersync pin 0.3.5 -> 0.3.9`): one-line pin bump + lockstep lock
+update (asupersync + franken-decision/evidence/kernel 0.3.5->0.3.9). Verified `cargo check -p fsqlite
+--tests` compiles clean fleet-wide. (A stray uncommitted 1-arg workaround someone had left in the working
+tree was preserved to a stash, not discarded, and reverted to HEAD's 2-arg — the forward-correct state.)
+
+With fsqlite building again, bd-in-list-composite-prefix's oracle RAN and PASSED (byte-exact vs rusqlite,
+all of COUNT/SUM/MIN/MAX/AVG incl the `a=3` b=NULL-only case). Perf A/B on a 200k-row composite-`(a,b)`
+table with no single-column index (release-perf, no LTO):
+- `COUNT(*) WHERE a IN (5 vals)` (composite SeekGE 1-field prefix): **51,416 ns/query**
+- `COUNT(*) WHERE c = 500` (full-scan control): **33,791,088 ns/query**
+- **A/B ratio ≈ 657x** (seek replaces full scan; EXPLAIN confirms no Rewind on the seek, Rewind on control).
+SHIPPED: codegen.rs + `agg_in_list_composite_prefix_oracle.rs`. Single-column IN path unchanged (golden 8/8).

@@ -11899,16 +11899,30 @@ fn index_integer_in_list_target<'t>(
     {
         return None;
     }
-    // Find a single-column ascending index on the column. `index_for_column` returns the FIRST index
-    // whose LEADING column matches, which may be a *composite* `(col, …)` index that shadows a usable
-    // single-column one listed after it — filtering that result would then decline even though a
-    // single-column index exists. Search all indexes instead. (A composite index is not usable here: the
-    // `[value, i64::MIN]` probe's floor is the rowid for a single-column index but the *second key
-    // column* for a composite one, so a NULL second column — which sorts before `i64::MIN` — would be
-    // skipped. That needs a prefix probe; tracked as bd-in-list-composite-prefix-probe.)
-    let idx = table.indexes.iter().find(|idx| {
+    // Prefer a single-column ascending index on the column (its `[value, i64::MIN]` probe is exact).
+    // `index_for_column` returns the FIRST index whose LEADING column matches, which may be a
+    // *composite* `(col, …)` index that shadows a usable single-column one listed after it — filtering
+    // that result would then decline even though a single-column index exists. Search all indexes.
+    if let Some(idx) = table.indexes.iter().find(|idx| {
         idx.supports_direct_column_lookup()
             && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    }) {
+        return Some((idx, ints));
+    }
+    // bd-in-list-composite-prefix-probe: fall back to a composite index whose ASCENDING leading column
+    // is the target. The `[value, i64::MIN]` probe is WRONG here — its second field aligns with the
+    // trailing key column, and a NULL trailing column (sorts before `i64::MIN`) would be skipped by
+    // SeekGE. `emit_aggregate_index_value_seek` detects the composite case (`key_term_count() > 1`) and
+    // probes with a 1-field PREFIX `[value]`: SeekGE anchors at the first `a=value` entry regardless of
+    // the trailing column (including NULL), and the Column-0 run stop is unchanged.
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() > 1
             && !idx.key_term_descending(0)
             && idx
                 .columns
@@ -12124,21 +12138,29 @@ fn emit_aggregate_index_value_seek(
     covering: bool,
     residual_where: Option<&Expr>,
 ) {
-    let probe_key_regs = b.alloc_regs(2);
+    // bd-in-list-composite-prefix-probe: a composite `(a, …)` index is probed with a 1-field PREFIX
+    // `[value]` so SeekGE anchors at the first `a=value` entry regardless of the trailing key column
+    // (including a NULL trailing column, which sorts before `i64::MIN`). A single-column index keeps
+    // the exact 2-field `[value, i64::MIN]` probe (the second field is the rowid floor) — byte-identical.
+    let prefix_probe = idx_schema.key_term_count() > 1;
+    let n_probe: i32 = if prefix_probe { 1 } else { 2 };
+    let probe_key_regs = b.alloc_regs(n_probe);
     b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
-    b.emit_op(
-        Opcode::Int64,
-        0,
-        probe_key_regs + 1,
-        0,
-        P4::Int64(i64::MIN),
-        0,
-    );
+    if !prefix_probe {
+        b.emit_op(
+            Opcode::Int64,
+            0,
+            probe_key_regs + 1,
+            0,
+            P4::Int64(i64::MIN),
+            0,
+        );
+    }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        2,
+        n_probe,
         probe_record_reg,
         P4::None,
         0,
