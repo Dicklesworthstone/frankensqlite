@@ -263,6 +263,32 @@ fn edit_json_paths_value(
     Ok(edited)
 }
 
+/// Like [`edit_json_paths_value`], but honors each value argument's subtype: a
+/// value carrying `JSON_SUBTYPE` (e.g. produced by `json(...)`) is embedded as a
+/// JSON subtree instead of being stringified. `arg_subtypes` is indexed parallel
+/// to `args`; the value for the (path, value) pair beginning at `idx` is
+/// `args[idx + 1]` with subtype `arg_subtypes[idx + 1]`. (GH #233)
+fn edit_json_paths_value_with_subtypes(
+    name: &str,
+    input: &Value,
+    args: &[SqliteValue],
+    arg_subtypes: &[u32],
+    start: usize,
+    mode: EditMode,
+) -> Result<Value> {
+    let mut edited = input.clone();
+    let mut idx = start;
+    while idx + 1 < args.len() {
+        let path = text_arg(name, args, idx)?.to_owned();
+        let segments = parse_path(&path)?;
+        let subtype = arg_subtypes.get(idx + 1).copied().unwrap_or(0);
+        let replacement = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
+        apply_edit(&mut edited, &segments, replacement, mode);
+        idx += 2;
+    }
+    Ok(edited)
+}
+
 fn json_remove_value(root: &Value, paths: &[&str]) -> Result<Option<Value>> {
     let mut edited = root.clone();
     for path in paths {
@@ -2561,12 +2587,51 @@ impl ScalarFunction for JsonSetFunc {
         Ok(SqliteValue::Text(encoded.into()))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Set,
+        )?;
+        let encoded = encode_json_text("json edit encode failed", &edited)?;
+        Ok(SqliteValue::Text(encoded.into()))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
 
     fn name(&self) -> &'static str {
         "json_set"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 
@@ -2644,12 +2709,51 @@ impl ScalarFunction for JsonInsertFunc {
         Ok(SqliteValue::Text(encoded.into()))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Insert,
+        )?;
+        let encoded = encode_json_text("json edit encode failed", &edited)?;
+        Ok(SqliteValue::Text(encoded.into()))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
 
     fn name(&self) -> &'static str {
         "json_insert"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 
@@ -2727,12 +2831,51 @@ impl ScalarFunction for JsonReplaceFunc {
         Ok(SqliteValue::Text(encoded.into()))
     }
 
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_paths_value_with_subtypes(
+            self.name(),
+            &input,
+            args,
+            arg_subtypes,
+            1,
+            EditMode::Replace,
+        )?;
+        let encoded = encode_json_text("json edit encode failed", &edited)?;
+        Ok(SqliteValue::Text(encoded.into()))
+    }
+
     fn num_args(&self) -> i32 {
         -1
     }
 
     fn name(&self) -> &'static str {
         "json_replace"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 
@@ -4314,6 +4457,46 @@ mod tests {
         assert_eq!(
             f.invoke(&[SqliteValue::Float(1.5)]).unwrap(),
             SqliteValue::Text(SmallText::from_string("real"))
+        );
+    }
+
+    #[test]
+    fn test_json_mutation_embeds_nested_json_subtype() {
+        // Regression (#233): a value carrying the JSON subtype (produced by
+        // json(...)) is embedded as a JSON subtree, not stringified.
+        let nested = SqliteValue::Text(SmallText::from_string(r#"{"a":2}"#));
+        let subtypes = [0u32, 0, JSON_SUBTYPE];
+        let embedded = SqliteValue::Text(SmallText::from_string(r#"{"x":{"a":2}}"#));
+
+        let set_args = [
+            SqliteValue::Text(SmallText::from_string("{}")),
+            SqliteValue::Text(SmallText::from_string("$.x")),
+            nested.clone(),
+        ];
+        assert_eq!(
+            JsonSetFunc
+                .invoke_with_arg_subtypes(&set_args, &subtypes)
+                .unwrap(),
+            embedded
+        );
+        assert_eq!(
+            JsonInsertFunc
+                .invoke_with_arg_subtypes(&set_args, &subtypes)
+                .unwrap(),
+            embedded
+        );
+
+        // json_replace only rewrites an existing key.
+        let replace_args = [
+            SqliteValue::Text(SmallText::from_string(r#"{"x":9}"#)),
+            SqliteValue::Text(SmallText::from_string("$.x")),
+            nested,
+        ];
+        assert_eq!(
+            JsonReplaceFunc
+                .invoke_with_arg_subtypes(&replace_args, &subtypes)
+                .unwrap(),
+            embedded
         );
     }
 
