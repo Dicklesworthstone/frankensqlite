@@ -583,6 +583,9 @@ static FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
     static FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS: Cell<u64> = const { Cell::new(0) };
+    // Counts every successful prebound lookup across join planning and row
+    // evaluation. Tests must use per-query lower bounds rather than exact
+    // totals because additional optimized phases may legitimately consult it.
     static FSQLITE_JOIN_EXPR_BINDING_HITS: Cell<u64> = const { Cell::new(0) };
     static FSQLITE_JOIN_EXPR_FALLBACK_SCANS: Cell<u64> = const { Cell::new(0) };
 }
@@ -59176,7 +59179,11 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<SelectStatement> {
-        let mut result = select.clone();
+        // Preserve SQLite's statement-global bind numbering before any
+        // subquery is executed independently.  Canonicalizing only the
+        // extracted subquery would restart anonymous `?` slots at one and
+        // make the remaining outer expression read the wrong parameter.
+        let mut result = canonicalize_select_placeholders(select)?;
         rewrite_in_select_core(&mut result.body.select, self, false, params)?;
         // Also rewrite any compound arms.
         for (_op, core) in &mut result.body.compounds {
@@ -59207,7 +59214,10 @@ impl Connection {
         {
             return Ok(Cow::Borrowed(select));
         }
-        let mut result = select.clone();
+        // Fallback execution may also materialize an IN subquery separately,
+        // so it needs the same statement-wide bind-slot preservation as the
+        // primary rewrite path.
+        let mut result = canonicalize_select_placeholders(select)?;
         rewrite_in_select_core(&mut result.body.select, self, true, params)?;
         for (_op, core) in &mut result.body.compounds {
             rewrite_in_select_core(core, self, true, params)?;
@@ -96821,18 +96831,23 @@ mod tests {
             )
             .unwrap();
 
-        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+        let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
+        let fallback_scans_before = FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(std::cell::Cell::get);
         let rows = statement.query().unwrap();
 
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(4)]);
-        assert_eq!(
-            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get()),
-            8,
-            "two WHERE column references across four joined rows must use direct bindings"
+        let binding_hits = FSQLITE_JOIN_EXPR_BINDING_HITS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(binding_hits_before);
+        assert!(
+            binding_hits >= 8,
+            "two WHERE column references across four joined rows must use direct bindings \
+             (observed {binding_hits})"
         );
         assert_eq!(
-            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS
+                .with(std::cell::Cell::get)
+                .wrapping_sub(fallback_scans_before),
             0,
             "WHERE evaluation must not linearly rescan the column map"
         );
@@ -96853,18 +96868,23 @@ mod tests {
             .prepare("SELECT l.payload, r.payload FROM l JOIN r ON r.id = l.id")
             .unwrap();
 
-        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+        let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
+        let fallback_scans_before = FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(std::cell::Cell::get);
         let rows = statement.query().unwrap();
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get()),
-            6,
-            "two projected columns across three result rows must use direct bindings"
+        let binding_hits = FSQLITE_JOIN_EXPR_BINDING_HITS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(binding_hits_before);
+        assert!(
+            binding_hits >= 6,
+            "two projected columns across three result rows must use direct bindings \
+             (observed {binding_hits})"
         );
         assert_eq!(
-            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS
+                .with(std::cell::Cell::get)
+                .wrapping_sub(fallback_scans_before),
             0,
             "projection evaluation must not linearly rescan the column map"
         );
@@ -116218,6 +116238,153 @@ mod tests {
 
         let rewritten = conn.rewrite_in_subqueries_select(&select, None).unwrap();
         assert!(matches!(rewritten, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_rewrite_subqueries_preserves_statement_global_bind_slots() {
+        fn assert_in_list_placeholder(expr: &fsqlite_ast::Expr, expected: u32) {
+            let fsqlite_ast::Expr::In {
+                set: fsqlite_ast::InSet::List(items),
+                ..
+            } = expr
+            else {
+                panic!("expected rewritten IN-list expression");
+            };
+            assert!(
+                matches!(
+                    items.as_slice(),
+                    [fsqlite_ast::Expr::Placeholder(
+                        fsqlite_ast::PlaceholderType::Numbered(index),
+                        _
+                    )] if *index == expected
+                ),
+                "expected anonymous placeholder to retain statement-global slot {expected}"
+            );
+        }
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, issue_type TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE labels (issue_id TEXT, label TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO issues VALUES ('a', 'task'), ('b', 'feature');")
+            .unwrap();
+        conn.execute("INSERT INTO labels VALUES ('a', 'core'), ('b', 'core');")
+            .unwrap();
+
+        let params = [
+            SqliteValue::Text("core".into()),
+            SqliteValue::Text("task".into()),
+        ];
+        let statement = super::parse_single_statement(
+            "SELECT id FROM issues
+             WHERE id IN (SELECT issue_id FROM labels WHERE label = ?)
+               AND issue_type IN (?);",
+        )
+        .unwrap();
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+        let rewritten = conn.rewrite_subqueries(&select, Some(&params)).unwrap();
+        let fsqlite_ast::SelectCore::Select {
+            where_clause: Some(where_clause),
+            ..
+        } = &rewritten.body.select
+        else {
+            panic!("expected WHERE clause");
+        };
+        let fsqlite_ast::Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } = where_clause.as_ref()
+        else {
+            panic!("expected conjunctive WHERE clause");
+        };
+        assert!(
+            matches!(
+                left.as_ref(),
+                fsqlite_ast::Expr::In {
+                    set: fsqlite_ast::InSet::List(_),
+                    ..
+                }
+            ),
+            "parameterized subquery should be materialized at execution time"
+        );
+        assert_in_list_placeholder(right, 2);
+
+        let swapped_params = [
+            SqliteValue::Text("task".into()),
+            SqliteValue::Text("core".into()),
+        ];
+        let swapped_statement = super::parse_single_statement(
+            "SELECT id FROM issues
+             WHERE issue_type IN (?)
+               AND id IN (SELECT issue_id FROM labels WHERE label = ?);",
+        )
+        .unwrap();
+        let Statement::Select(swapped_select) = swapped_statement else {
+            panic!("expected SELECT statement");
+        };
+        let swapped = conn
+            .rewrite_subqueries(&swapped_select, Some(&swapped_params))
+            .unwrap();
+        let fsqlite_ast::SelectCore::Select {
+            where_clause: Some(swapped_where),
+            ..
+        } = &swapped.body.select
+        else {
+            panic!("expected WHERE clause");
+        };
+        let fsqlite_ast::Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } = swapped_where.as_ref()
+        else {
+            panic!("expected conjunctive WHERE clause");
+        };
+        assert_in_list_placeholder(left, 1);
+        assert!(
+            matches!(
+                right.as_ref(),
+                fsqlite_ast::Expr::In {
+                    set: fsqlite_ast::InSet::List(_),
+                    ..
+                }
+            ),
+            "subquery should retain slot two before materialization"
+        );
+
+        let numbered = conn
+            .query_with_params(
+                "SELECT id FROM issues
+                 WHERE id IN (SELECT issue_id FROM labels WHERE label = ?2)
+                   AND issue_type IN (?1);",
+                &[
+                    SqliteValue::Text("task".into()),
+                    SqliteValue::Text("core".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(numbered.len(), 1);
+        assert_eq!(numbered[0].values()[0], SqliteValue::Text("a".into()));
+
+        let named = conn
+            .query_with_params(
+                "SELECT id FROM issues
+                 WHERE id IN (SELECT issue_id FROM labels WHERE label = :label)
+                   AND issue_type IN (:kind);",
+                &[
+                    SqliteValue::Text("core".into()),
+                    SqliteValue::Text("task".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].values()[0], SqliteValue::Text("a".into()));
     }
 
     #[test]

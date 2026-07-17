@@ -3790,10 +3790,8 @@ fn build_hot_path_causal_classification(
         }
     }
     let mut allocation_beads = Vec::new();
-    for component in ["allocator_copy"] {
-        if let Some(entry) = find_wall_time_component(wall_time_components, component) {
-            push_mapped_beads(&mut allocation_beads, &entry.mapped_beads);
-        }
+    if let Some(entry) = find_wall_time_component(wall_time_components, "allocator_copy") {
+        push_mapped_beads(&mut allocation_beads, &entry.mapped_beads);
     }
     for component in ["row_materialization", "page_data_motion"] {
         if let Some(entry) = find_cost_component(cost_components, component) {

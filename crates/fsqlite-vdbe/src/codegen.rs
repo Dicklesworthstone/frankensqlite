@@ -5407,10 +5407,10 @@ fn codegen_select_count_star(
     }
     // bd-count-rowid-eq: `COUNT(*) WHERE <rowid> = <int literal>` counts the single row (0 or 1) with one
     // SeekRowid instead of a full scan — the rowid (IPK) has no secondary index, so this shape is NOT
-    // diverted to the aggregate index-eq seek (bd-2dgf5) and would otherwise Rewind here. Integer literal
-    // ONLY (`SeekRowid` truncates reals via `to_integer()`, so `rowid = 2.5` would wrongly match rowid 2;
-    // a placeholder needs affinity handling): real/placeholder declines to the scan. Reuses the rowid-IN
-    // emitter with a one-element slice.
+    // diverted to the aggregate index-eq seek (bd-2dgf5) and would otherwise Rewind here. This first arm
+    // handles integer literals directly and reuses the rowid-IN emitter with a one-element slice. Other
+    // constant forms continue to the MustBeInt-coerced seek below so reals cannot be truncated and
+    // placeholders receive affinity handling.
     if !table.without_rowid
         && let Some(target) = extract_rowid_target_expr(where_clause, Some(table), table_alias)
         && let Expr::Literal(Literal::Integer(value), _) = target

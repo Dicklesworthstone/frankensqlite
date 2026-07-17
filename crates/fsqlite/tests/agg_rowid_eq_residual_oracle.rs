@@ -15,7 +15,8 @@ fn val_f(c: &Connection, sql: &str) -> SqliteValue {
 }
 
 fn val_r(c: &rusqlite::Connection, sql: &str) -> rusqlite::types::Value {
-    c.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0)).unwrap()
+    c.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+        .unwrap()
 }
 
 fn same(f: &SqliteValue, r: &rusqlite::types::Value) -> bool {
@@ -39,24 +40,36 @@ fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
 
 fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
-        Some(true) => assert!(!has_op(f, sql, "Rewind"), "agg rowid-eq-residual must not full-scan (Rewind): `{sql}`"),
-        Some(false) => assert!(has_op(f, sql, "Rewind"), "control should full-scan (Rewind): `{sql}`"),
+        Some(true) => assert!(
+            !has_op(f, sql, "Rewind"),
+            "agg rowid-eq-residual must not full-scan (Rewind): `{sql}`"
+        ),
+        Some(false) => assert!(
+            has_op(f, sql, "Rewind"),
+            "control should full-scan (Rewind): `{sql}`"
+        ),
         None => {}
     }
     let (vf, vr) = (val_f(f, sql), val_r(r, sql));
-    assert!(same(&vf, &vr), "value diverged for `{sql}`: frank {vf:?} vs sqlite {vr:?}");
+    assert!(
+        same(&vf, &vr),
+        "value diverged for `{sql}`: frank {vf:?} vs sqlite {vr:?}"
+    );
 }
 
 #[test]
 fn agg_rowid_eq_residual_matches_sqlite() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in ["CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, x INTEGER);"] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
+    let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, x INTEGER);";
+    f.execute(schema).unwrap();
+    r.execute_batch(schema).unwrap();
     for i in 1..=300_i64 {
-        let vv = if i % 41 == 0 { "NULL".to_string() } else { (i * 2).to_string() };
+        let vv = if i % 41 == 0 {
+            "NULL".to_string()
+        } else {
+            (i * 2).to_string()
+        };
         let s = format!("INSERT INTO t VALUES ({i}, {vv}, {});", i % 7); // x = i % 7 (x[5]=5)
         f.execute(&s).unwrap();
         r.execute_batch(&s).unwrap();
@@ -66,15 +79,60 @@ fn agg_rowid_eq_residual_matches_sqlite() {
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 5", Some(true)); // -> 10
 
     // rowid = <int> AND <non-indexed residual>: seek the single row + residual, no Rewind, value byte-exact.
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 5 AND x = 5", Some(true)); // x[5]=5 -> 10
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 5 AND x = 3", Some(true)); // x[5]=5 != 3 -> NULL
-    cmp(&f, &r, "SELECT COUNT(v) FROM t WHERE id = 5 AND x = 5", Some(true)); // -> 1
-    cmp(&f, &r, "SELECT COUNT(v) FROM t WHERE id = 5 AND x = 3", Some(true)); // no match -> 0
-    cmp(&f, &r, "SELECT MAX(v) FROM t WHERE id = 5 AND x >= 0", Some(true)); // matches -> 10
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 99999 AND x = 0", Some(true)); // absent rowid -> NULL
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 41 AND x >= 0", Some(true)); // v NULL at id=41 -> NULL
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE 5 = id AND x = 5", Some(true)); // reversed operand -> 10
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 5 AND x > 0 AND x < 10", Some(true)); // multi-conjunct -> 10
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE id = 5 AND x = 5",
+        Some(true),
+    ); // x[5]=5 -> 10
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE id = 5 AND x = 3",
+        Some(true),
+    ); // x[5]=5 != 3 -> NULL
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(v) FROM t WHERE id = 5 AND x = 5",
+        Some(true),
+    ); // -> 1
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(v) FROM t WHERE id = 5 AND x = 3",
+        Some(true),
+    ); // no match -> 0
+    cmp(
+        &f,
+        &r,
+        "SELECT MAX(v) FROM t WHERE id = 5 AND x >= 0",
+        Some(true),
+    ); // matches -> 10
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE id = 99999 AND x = 0",
+        Some(true),
+    ); // absent rowid -> NULL
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE id = 41 AND x >= 0",
+        Some(true),
+    ); // v NULL at id=41 -> NULL
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE 5 = id AND x = 5",
+        Some(true),
+    ); // reversed operand -> 10
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE id = 5 AND x > 0 AND x < 10",
+        Some(true),
+    ); // multi-conjunct -> 10
 
     // Placeholder residual routes to the seek too.
     assert!(

@@ -2,7 +2,8 @@
 //! 1) with one SeekRowid instead of full-scanning. The rowid (IPK) has no secondary index, so this shape
 //! is NOT diverted to the aggregate index-eq seek (bd-2dgf5) — it reaches codegen_select_count_star and
 //! would otherwise Rewind. Counts are compared against C SQLite; the optimization is confirmed by the
-//! ABSENCE of a `Rewind` in the plan. A real/placeholder rowid or a non-rowid column correctly declines.
+//! ABSENCE of a `Rewind` in the plan. Non-integer constants and placeholders use the adjacent
+//! MustBeInt-coerced rowid path; only a non-rowid predicate correctly declines.
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
@@ -72,12 +73,12 @@ fn count_rowid_eq_matches_sqlite() {
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 300", Some(true)); // last -> 1
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE 5 = id", Some(true)); // reversed operand order -> 1
 
-    // A REAL rowid literal declines (SeekRowid would truncate 2.5 -> 2); full scan stays correct (0).
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 2.5", Some(false));
-    // A placeholder rowid declines (needs affinity handling); plan asserted only (no bind needed).
+    // A REAL rowid literal uses the coerced seek: MustBeInt rejects 2.5 rather than truncating it to 2.
+    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE id = 2.5", Some(true));
+    // A placeholder also routes through MustBeInt at runtime; plan asserted only (no bind needed).
     assert!(
-        has_op(&f, "SELECT COUNT(*) FROM t WHERE id = ?", "Rewind"),
-        "param rowid-eq COUNT declines to the scan"
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE id = ?", "Rewind"),
+        "param rowid-eq COUNT must use the coerced seek"
     );
     // Control: a non-rowid indexed column is served by the aggregate seek (bd-2dgf5), NOT this lever —
     // only assert the count. A non-indexed usage would full-scan; z has no index.

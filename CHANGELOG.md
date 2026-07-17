@@ -17,6 +17,113 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.17] -- 2026-07-16 (B-tree corruption and join-correctness fixes)
+
+Full-workspace lockstep release (`0.1.16 -> 0.1.17`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Added
+
+- Strict multi-process operation now reports lock-admission exhaustion as a
+  typed contract violation, opens existing regular files without following a
+  final symlink, rejects hard-link aliases at the identity boundary, and can
+  compute `octet_length(column)` from record metadata without materializing an
+  overflow payload.
+
+### Fixed
+
+- **Direct updates of overflow-backed rows can no longer commit an out-of-order
+  table B-tree** ([PR #287](https://github.com/Dicklesworthstone/frankensqlite/pull/287)).
+  A delete that drained a singleton leaf could leave its cursor on the logical
+  successor in a different ancestor subtree. Reusing that position to reinsert
+  the same rowid preserved leaf-local order while violating an ancestor
+  separator, making the row scan-visible but unreachable by point seek and
+  causing stock SQLite's `integrity_check` to report `Rowid out of order`.
+  Prechecked inserts now validate both leaf neighbours and the complete
+  root-to-leaf routing interval before reuse, falling back to a fresh root
+  descent when necessary while retaining the zero-I/O same-leaf fast path.
+  Deterministic depth-3 B-tree and file-backed SQL regressions prove every row
+  remains point-seekable and that stock SQLite reports an intact image.
+- Mutation paths now reconstruct a real root-to-leaf stack before balancing
+  cached leaf-only cursor positions. Root identity is checked at both balance
+  choke points, preventing rootless table inserts or deletes from treating a
+  cached leaf as the tree root and extending the corruption coverage for
+  composite-UNIQUE update churn (#132).
+- Checkpoint writes are failure-atomic with respect to both database size and
+  shared pager publication. A failed page write no longer advances the
+  in-memory page count, and checkpoint metadata is published only after the
+  database durability barrier succeeds, so write or sync faults cannot stamp a
+  page count beyond end-of-file or advertise unflushed checkpoint state
+  ([#194](https://github.com/Dicklesworthstone/frankensqlite/issues/194),
+  [#195](https://github.com/Dicklesworthstone/frankensqlite/issues/195)).
+  Fault-injecting VFS regressions cover both failure orderings and successful
+  recovery after the injected fault clears.
+- Fresh and replacement WAL generations now seed both salts from operating
+  system entropy, while checkpoint reset increments the first salt and
+  re-randomizes the second. This replaces the deterministic `(0, 0)`, `(1, 1)`,
+  `(2, 2)` sequence and ensures stale or copied frames fail generation
+  validation instead of chaining against an unrelated database state
+  ([#201](https://github.com/Dicklesworthstone/frankensqlite/issues/201)).
+- `ALTER TABLE ... ADD COLUMN` rejects `CHECK` constraints containing
+  subqueries before mutating or persisting the schema, matching SQLite and
+  preventing creation of a database that stock SQLite reports as a malformed
+  schema
+  ([#252](https://github.com/Dicklesworthstone/frankensqlite/issues/252)).
+- `DELETE` and `UPDATE` rowid fast paths now apply SQLite's exact-integer
+  coercion before seeking. A predicate such as `rowid = 2.5` no longer
+  truncates to rowid 2 and mutates the wrong row; integral numeric and text
+  values still resolve normally, while non-integral, non-numeric, and `NULL`
+  values select no row.
+- Catalog scalar and `EXISTS` subqueries over `sqlite_master` and
+  `sqlite_schema` now return through expression-aware executors after catalog
+  materialization instead of failing in the JOIN-only executor
+  ([#286](https://github.com/Dicklesworthstone/frankensqlite/issues/286)).
+- Hash joins now retain and authoritatively evaluate residual `ON` predicates
+  after probing extracted equality keys. Join, `WHERE`, and projection column
+  references are bound once per statement instead of performing repeated
+  case-insensitive name scans per candidate row, fixing the predicate-heavy
+  quadratic path while preserving affinity, collation, duplicate, `NULL`, and
+  outer-join semantics
+  ([#285](https://github.com/Dicklesworthstone/frankensqlite/issues/285)).
+- Parameter-dependent scalar subqueries are no longer constant-folded before
+  bindings are available, preserving placeholder values in both FROM-less and
+  table-backed `WHERE` expressions. The locked asupersync dependency is updated
+  to 0.3.9 so native bulkhead admission uses the same explicit-time API in
+  source builds, published crates, and downstream consumers.
+- Scalar-function conformance now matches SQLite for unterminated `GLOB`
+  character classes (#257), negative-zero and alternate-form-2
+  `printf`/`format` output (#258, #176), two-argument `iif`/`if` (#183), and
+  prepare-time `likelihood` probability validation (#182).
+- JSON functions accept finite bare SQL integer and real values as JSON
+  numbers. `json_valid` and `json_type` now report the same results as SQLite,
+  while non-finite reals remain invalid (#259, #260).
+- The Unix installer now guards empty proxy-argument expansion under
+  `set -u`, preserving zero arguments on macOS's system Bash 3.2 while still
+  forwarding configured HTTP(S) proxies unchanged.
+
+### Performance
+
+- Partial-key `SeekGT`/`SeekLE` operations use a logarithmic biased B-tree
+  descent rather than walking equal-prefix runs; the targeted MAX-prefix
+  workload improved by more than 13x.
+- Aggregate rowid equality with parameter, real, or text inputs uses a bounded
+  seek with exact-integer coercion instead of a full table scan. Ordinary
+  rowid reads use the same semantics.
+- Integer parameter, arithmetic, and division results update compatible VDBE
+  registers in place. Date/time formatting uses stack-backed buffers, `TRIM`
+  borrows its output slice, parser prefix payloads move directly into the AST,
+  exact identifier lookup takes a dedicated planner fast path, and R-tree
+  duplicate-id detection is indexed in O(1).
+
+### CI / Release
+
+- All 25 publishable `fsqlite` / `fsqlite-*` crates remain in the validated
+  topological crates.io release closure; `fsqlite-e2e` and
+  `fsqlite-harness` remain private workspace packages.
+- Native release artifacts cover fully static Linux x86-64 and arm64, macOS
+  x86-64 and arm64, and Windows x86-64. Every archive is checksum-bound,
+  minisign-authenticated, and accompanied by provenance plus an SPDX SBOM.
+
 ## [0.1.16] -- 2026-07-14 (corruption fixes and namespace-generation hardening)
 
 Full-workspace lockstep release (`0.1.15 -> 0.1.16`). Semver-compatible 0.1.x;
@@ -191,11 +298,6 @@ lossy values.
 
 ### CI / Release
 
-- The Unix installer now guards empty proxy-argument expansion under
-  `set -u`, preserving zero arguments on macOS's system Bash 3.2 while still
-  forwarding configured HTTP(S) proxies unchanged. Native arm64, Rosetta
-  x86-64, explicit-version, and latest-release installation paths are covered
-  by live signed-release smoke tests.
 - The unstable prefetch-intrinsic feature gate is now enabled only on x86-64,
   where the optimized pager and B-tree paths use it. Arm64 release builds no
   longer fail strict warning gates on an otherwise unused crate feature.

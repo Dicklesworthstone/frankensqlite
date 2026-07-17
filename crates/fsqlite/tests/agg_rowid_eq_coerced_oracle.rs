@@ -16,7 +16,8 @@ fn val_f(c: &Connection, sql: &str) -> SqliteValue {
 }
 
 fn val_r(c: &rusqlite::Connection, sql: &str) -> rusqlite::types::Value {
-    c.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0)).unwrap()
+    c.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+        .unwrap()
 }
 
 fn same(f: &SqliteValue, r: &rusqlite::types::Value) -> bool {
@@ -40,24 +41,36 @@ fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
 
 fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
-        Some(true) => assert!(!has_op(f, sql, "Rewind"), "agg rowid-eq-coerced must not full-scan (Rewind): `{sql}`"),
-        Some(false) => assert!(has_op(f, sql, "Rewind"), "control should full-scan (Rewind): `{sql}`"),
+        Some(true) => assert!(
+            !has_op(f, sql, "Rewind"),
+            "agg rowid-eq-coerced must not full-scan (Rewind): `{sql}`"
+        ),
+        Some(false) => assert!(
+            has_op(f, sql, "Rewind"),
+            "control should full-scan (Rewind): `{sql}`"
+        ),
         None => {}
     }
     let (vf, vr) = (val_f(f, sql), val_r(r, sql));
-    assert!(same(&vf, &vr), "value diverged for `{sql}`: frank {vf:?} vs sqlite {vr:?}");
+    assert!(
+        same(&vf, &vr),
+        "value diverged for `{sql}`: frank {vf:?} vs sqlite {vr:?}"
+    );
 }
 
 #[test]
 fn agg_rowid_eq_coerced_matches_sqlite() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in ["CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);"] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
+    let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);";
+    f.execute(schema).unwrap();
+    r.execute_batch(schema).unwrap();
     for i in 1..=300_i64 {
-        let vv = if i % 41 == 0 { "NULL".to_string() } else { (i * 2).to_string() };
+        let vv = if i % 41 == 0 {
+            "NULL".to_string()
+        } else {
+            (i * 2).to_string()
+        };
         let s = format!("INSERT INTO t VALUES ({i}, {vv});");
         f.execute(&s).unwrap();
         r.execute_batch(&s).unwrap();
@@ -77,8 +90,18 @@ fn agg_rowid_eq_coerced_matches_sqlite() {
     cmp(&f, &r, "SELECT COUNT(v) FROM t WHERE id = 2.5", Some(true)); // no match -> 0
     cmp(&f, &r, "SELECT AVG(v) FROM t WHERE id = 5.0", Some(true)); // -> 10.0
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 300.0", Some(true)); // last row v=600 -> 600
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 99999.0", Some(true)); // exact real, absent -> NULL
-    cmp(&f, &r, "SELECT COUNT(v) FROM t WHERE id = 99999.0", Some(true)); // absent -> 0
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE id = 99999.0",
+        Some(true),
+    ); // exact real, absent -> NULL
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(v) FROM t WHERE id = 99999.0",
+        Some(true),
+    ); // absent -> 0
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE id = 41.0", Some(true)); // v NULL at id=41 -> NULL
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE '25' = id", Some(true)); // reversed operand, text -> 50
 

@@ -33,8 +33,14 @@ fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
 
 fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
-        Some(true) => assert!(!has_op(f, sql, "Rewind"), "rowid-eq-coerced lookup must not full-scan (Rewind): `{sql}`"),
-        Some(false) => assert!(has_op(f, sql, "Rewind"), "control should full-scan (Rewind): `{sql}`"),
+        Some(true) => assert!(
+            !has_op(f, sql, "Rewind"),
+            "rowid-eq-coerced lookup must not full-scan (Rewind): `{sql}`"
+        ),
+        Some(false) => assert!(
+            has_op(f, sql, "Rewind"),
+            "control should full-scan (Rewind): `{sql}`"
+        ),
         None => {}
     }
     assert_eq!(rows_f(f, sql), rows_r(r, sql), "rows diverged for `{sql}`");
@@ -44,10 +50,9 @@ fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bo
 fn nonagg_rowid_eq_coerced_matches_sqlite() {
     let f = Connection::open(":memory:").unwrap();
     let r = rusqlite::Connection::open_in_memory().unwrap();
-    for s in ["CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);"] {
-        f.execute(s).unwrap();
-        r.execute_batch(s).unwrap();
-    }
+    let schema = "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);";
+    f.execute(schema).unwrap();
+    r.execute_batch(schema).unwrap();
     for i in 1..=300_i64 {
         let s = format!("INSERT INTO t VALUES ({i}, {});", i * 10);
         f.execute(&s).unwrap();
