@@ -120,7 +120,15 @@ no breaking API changes.
   prepare-time `likelihood` probability validation (#182).
 - JSON functions accept finite bare SQL integer and real values as JSON
   numbers. `json_valid` and `json_type` now report the same results as SQLite,
-  while non-finite reals remain invalid (#259, #260).
+  while non-finite reals remain invalid (#259, #260). Interpreted
+  `json_group_array` and `json_group_object` aggregates now honor their
+  in-aggregate `ORDER BY` terms, and `json_group_array(DISTINCT ...)` removes
+  duplicate values before ordering (#266, #267, #268).
+- Recursive trigger execution now returns its typed depth-limit error before
+  exhausting the Rust thread stack. The safety cap is tightened from 32 to 8
+  frames, and the regression runs the complete ping-pong trigger chain on an
+  explicit 1 MiB stack so future compiler frame growth fails in CI instead of
+  aborting the process.
 - The Unix installer now guards empty proxy-argument expansion under
   `set -u`, preserving zero arguments on macOS's system Bash 3.2 while still
   forwarding configured HTTP(S) proxies unchanged.

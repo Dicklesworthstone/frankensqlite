@@ -371,9 +371,11 @@ fn retry_busy_connection_bootstrap<T>(mut operation: impl FnMut() -> Result<T>) 
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
 /// level consumes significantly more stack space than C (~20-40 KiB per level
-/// including VDBE dispatch + expression evaluation).  A practical limit of 32
-/// prevents stack overflow while still allowing reasonable trigger chains.
-const MAX_TRIGGER_DEPTH: usize = 32;
+/// including VDBE dispatch + expression evaluation). Keep at least a 2x margin
+/// below the observed 2 MiB test-thread stack boundary: compiler changes can
+/// grow these frames, and the limit must fire before the process aborts. The
+/// regression test exercises this boundary on an explicit 1 MiB stack.
+const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// Maximum depth for FK CASCADE propagation.
 ///
@@ -43701,8 +43703,8 @@ impl Connection {
     ) -> Result<bool> {
         // F-PGM.11: Enforce trigger recursion depth limit.
         // SQLite uses SQLITE_MAX_TRIGGER_DEPTH=1000, but each Rust recursion
-        // level is heavier on the call stack than C. Use 100 as a practical
-        // limit that prevents stack overflow while still allowing deep nesting.
+        // level is heavier on the call stack than C. MAX_TRIGGER_DEPTH keeps a
+        // conservative safety margin below the regression-tested thread stack.
         if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
@@ -109885,33 +109887,44 @@ mod tests {
     #[test]
     fn test_recursive_trigger_depth_limit() {
         // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
-        // Without recursive_triggers=ON, the default behavior suppresses
-        // same-table re-entry, so we test with two tables that ping-pong
-        // triggers between each other (which is NOT suppressed by the
-        // default recursive_triggers=OFF — that only suppresses self-table).
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("PRAGMA recursive_triggers = ON;").unwrap();
-        conn.execute("CREATE TABLE a (n INTEGER);").unwrap();
-        conn.execute("CREATE TABLE b (n INTEGER);").unwrap();
-        conn.execute("INSERT INTO a VALUES (0);").unwrap();
-        conn.execute("INSERT INTO b VALUES (0);").unwrap();
-        // Trigger chain: UPDATE a → fire trg_a → UPDATE b → fire trg_b → UPDATE a → ...
-        conn.execute(
-            "CREATE TRIGGER trg_a AFTER UPDATE ON a BEGIN UPDATE b SET n = NEW.n + 1; END;",
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TRIGGER trg_b AFTER UPDATE ON b BEGIN UPDATE a SET n = NEW.n + 1; END;",
-        )
-        .unwrap();
-        let err = conn
-            .execute("UPDATE a SET n = 1;")
-            .expect_err("should hit trigger depth limit");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("too many levels of trigger recursion"),
-            "unexpected error: {msg}",
-        );
+        // Pin the regression to a 1 MiB stack so ordinary compiler frame
+        // growth cannot silently move the process-abort boundary below the
+        // configured error boundary again.
+        std::thread::Builder::new()
+            .name("recursive-trigger-depth-limit".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                // Without recursive_triggers=ON, the default behavior suppresses
+                // same-table re-entry, so we test with two tables that ping-pong
+                // triggers between each other.
+                let conn = Connection::open(":memory:").unwrap();
+                conn.execute("PRAGMA recursive_triggers = ON;").unwrap();
+                conn.execute("CREATE TABLE a (n INTEGER);").unwrap();
+                conn.execute("CREATE TABLE b (n INTEGER);").unwrap();
+                conn.execute("INSERT INTO a VALUES (0);").unwrap();
+                conn.execute("INSERT INTO b VALUES (0);").unwrap();
+                // Trigger chain: UPDATE a → trg_a → UPDATE b → trg_b → UPDATE a → ...
+                conn.execute(
+                    "CREATE TRIGGER trg_a AFTER UPDATE ON a BEGIN UPDATE b SET n = NEW.n + 1; END;",
+                )
+                .unwrap();
+                conn.execute(
+                    "CREATE TRIGGER trg_b AFTER UPDATE ON b BEGIN UPDATE a SET n = NEW.n + 1; END;",
+                )
+                .unwrap();
+                let err = conn
+                    .execute("UPDATE a SET n = 1;")
+                    .expect_err("should hit trigger depth limit");
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("too many levels of trigger recursion"),
+                    "unexpected error: {msg}",
+                );
+                assert!(conn.trigger_frame_stack.borrow().is_empty());
+            })
+            .expect("spawn 1 MiB trigger-depth regression thread")
+            .join()
+            .expect("trigger-depth regression thread panicked");
     }
 
     #[test]
