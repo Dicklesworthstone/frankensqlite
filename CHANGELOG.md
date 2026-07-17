@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.17] -- 2026-07-16 (B-tree corruption and join-correctness fixes)
+## [0.1.17] -- 2026-07-17 (B-tree corruption and join-correctness fixes)
 
 Full-workspace lockstep release (`0.1.16 -> 0.1.17`). Semver-compatible 0.1.x;
 no breaking API changes.
@@ -67,6 +67,12 @@ no breaking API changes.
   pages, invalid headers, page-size drift, and I/O failures all fail closed
   with `BusySnapshot`, while a byte-identical checkpoint no longer breaks
   retained autocommit.
+- `ORDER BY ... COLLATE` resolution now preserves SQLite's positional and
+  output-alias precedence, then matches the selected collation expression
+  before falling back to its unwrapped structure. This keeps simple grouped
+  queries such as `SELECT tag COLLATE BINARY ... ORDER BY tag COLLATE BINARY`
+  working while retaining the compound-select fixes for collated aliases and
+  positional terms.
 - Checkpoint writes are failure-atomic with respect to both database size and
   shared pager publication. A failed page write no longer advances the
   in-memory page count, and checkpoint metadata is published only after the

@@ -73,7 +73,7 @@ impl CoreSqlConformanceHarness {
     fn franken_query_rows(&self, sql: &str) -> Vec<Vec<String>> {
         self.franken
             .query(sql)
-            .expect("query FrankenSQLite")
+            .unwrap_or_else(|error| panic!("query FrankenSQLite `{sql}`: {error}"))
             .iter()
             .map(|row| row.values().iter().map(format_franken_value).collect())
             .collect()

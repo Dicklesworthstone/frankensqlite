@@ -82446,19 +82446,31 @@ fn resolve_named_order_term_idx(
     order_table: Option<&str>,
     columns: &[ResultColumn],
 ) -> Option<usize> {
+    // SQLite resolves an unqualified output alias before consulting source
+    // column names, even when the alias appears later in the result list.
+    if order_table.is_none() {
+        if let Some(index) = columns.iter().position(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr {
+                    alias: Some(alias),
+                    ..
+                } if alias.eq_ignore_ascii_case(col_name)
+            )
+        }) {
+            return Some(index);
+        }
+    }
+
     columns.iter().position(|column| match column {
-        ResultColumn::Expr {
-            expr: Expr::Column(result_col_ref, _),
-            alias,
-            ..
-        } => {
-            if order_table.is_none()
-                && alias
-                    .as_deref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(col_name))
-            {
-                return true;
-            }
+        ResultColumn::Expr { expr, .. } => {
+            let result_expr = match expr {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                _ => expr,
+            };
+            let Expr::Column(result_col_ref, _) = result_expr else {
+                return false;
+            };
             if !result_col_ref.column.eq_ignore_ascii_case(col_name) {
                 return false;
             }
@@ -82469,24 +82481,28 @@ fn resolve_named_order_term_idx(
                     .is_some_and(|result_table| result_table.eq_ignore_ascii_case(table))
             })
         }
-        ResultColumn::Expr {
-            alias: Some(alias), ..
-        } => order_table.is_none() && alias.eq_ignore_ascii_case(col_name),
-        _ => false,
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
     })
 }
 
 /// Try to resolve an ORDER BY expression to a column index in `columns`.
 /// Returns `None` if the expression doesn't match any column.
 fn resolve_order_term_idx(expr: &Expr, columns: &[ResultColumn]) -> Option<usize> {
-    if let Expr::Literal(Literal::Integer(n), _) = expr {
+    // A compound ORDER BY may wrap an output name, alias, or 1-based position
+    // in COLLATE. Resolve those SQLite-defined output references against the
+    // inner expression first; the caller still applies the outer collation
+    // while sorting.
+    let base_expr = match expr {
+        Expr::Collate { expr, .. } => expr.as_ref(),
+        _ => expr,
+    };
+
+    if let Expr::Literal(Literal::Integer(n), _) = base_expr {
         let pos = usize::try_from(*n).unwrap_or(0);
-        if pos >= 1 && pos <= columns.len() {
-            return Some(pos - 1);
-        }
+        return (pos >= 1 && pos <= columns.len()).then_some(pos - 1);
     }
-    if let Some(col_name) = expr_col_name(expr) {
-        let order_table = if let Expr::Column(col_ref, _) = expr {
+    if let Some(col_name) = expr_col_name(base_expr) {
+        let order_table = if let Expr::Column(col_ref, _) = base_expr {
             col_ref.table.as_deref()
         } else {
             None
@@ -82495,8 +82511,22 @@ fn resolve_order_term_idx(expr: &Expr, columns: &[ResultColumn]) -> Option<usize
             return Some(found);
         }
     }
+
+    // After ordinal and output-name/alias precedence, preserve an exact
+    // selected expression before falling back to the unwrapped expression.
+    // This matters for non-column COLLATE expressions while preventing a
+    // selected integer literal from stealing `ORDER BY 1`.
+    if let Some(index) = columns.iter().position(|column| match column {
+        ResultColumn::Expr {
+            expr: output_expr, ..
+        } => exprs_match(expr, output_expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }) {
+        return Some(index);
+    }
+
     columns.iter().position(|c| match c {
-        ResultColumn::Expr { expr: e, .. } => exprs_match(expr, e),
+        ResultColumn::Expr { expr: e, .. } => exprs_match(base_expr, e),
         _ => false,
     })
 }
@@ -82514,38 +82544,7 @@ fn sort_rows_by_order_terms(
     let resolved: Vec<(usize, bool, NullsOrder, Option<String>)> = order_by
         .iter()
         .map(|term| {
-            // A compound ORDER BY term may be wrapped in COLLATE, e.g.
-            // `ORDER BY x COLLATE NOCASE` or `ORDER BY 1 COLLATE NOCASE`.
-            // Resolve the result-set index against the inner expression while
-            // still honoring the wrapper's collation (extracted below).
-            // (GH #217, #218, #219, #220, #221)
-            let base_expr = match &term.expr {
-                Expr::Collate { expr, .. } => expr.as_ref(),
-                other => other,
-            };
-            // Try integer position reference first (ORDER BY 1, 2).
-            let idx = if let Expr::Literal(Literal::Integer(n), _) = base_expr {
-                let pos = usize::try_from(*n).unwrap_or(0);
-                if pos >= 1 && pos <= columns.len() {
-                    Some(pos - 1)
-                } else {
-                    None
-                }
-            } else if let Some(col_name) = expr_col_name(base_expr) {
-                let order_table = if let Expr::Column(col_ref, _) = base_expr {
-                    col_ref.table.as_deref()
-                } else {
-                    None
-                };
-                resolve_named_order_term_idx(col_name, order_table, columns)
-            } else {
-                // Expression ORDER BY: match structurally against result columns.
-                columns.iter().position(|c| match c {
-                    ResultColumn::Expr { expr, .. } => exprs_match(base_expr, expr),
-                    _ => false,
-                })
-            };
-            let idx = idx.ok_or_else(|| {
+            let idx = resolve_order_term_idx(&term.expr, columns).ok_or_else(|| {
                 FrankenError::Internal("ORDER BY expression not found in SELECT list".to_owned())
             })?;
             let desc = matches!(term.direction, Some(SortDirection::Desc));
@@ -159450,6 +159449,92 @@ mod pager_routing_tests {
                 "sql={sql}"
             );
         }
+    }
+
+    #[test]
+    fn test_order_by_collate_preserves_selected_expression_resolution() {
+        // A COLLATE-wrapped selected expression must remain resolvable through
+        // its inner output name. This guards the non-compound regression
+        // exposed while fixing GH #217-#221.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tags(tag TEXT COLLATE NOCASE);")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES ('beta'), ('Alpha'), ('alpha');")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT tag COLLATE BINARY, COUNT(*)
+                 FROM tags
+                 GROUP BY tag COLLATE BINARY
+                 ORDER BY tag COLLATE BINARY",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Text("Alpha".into()), SqliteValue::Integer(1),],
+                vec![SqliteValue::Text("alpha".into()), SqliteValue::Integer(1),],
+                vec![SqliteValue::Text("beta".into()), SqliteValue::Integer(1),],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_order_by_output_reference_precedence() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        // A 1-based ordinal must win over structural equality with a later
+        // selected integer literal, including when COLLATE wraps the ordinal.
+        for sql in [
+            "SELECT 2 AS sort_key, 1 AS literal_value
+             UNION ALL
+             SELECT 1, 1
+             ORDER BY 1",
+            "SELECT 2 AS sort_key, 1 AS literal_value
+             UNION ALL
+             SELECT 1, 1
+             ORDER BY 1 COLLATE BINARY",
+        ] {
+            let rows = conn
+                .query(sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                ],
+                "sql={sql}"
+            );
+        }
+
+        // An output alias must likewise win over an earlier result expression
+        // that structurally matches the underlying source column.
+        conn.execute("CREATE TABLE order_aliases(source_value INTEGER, alias_value INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO order_aliases VALUES (2, 1), (1, 2);")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT source_value, alias_value AS source_value
+                 FROM order_aliases
+                 ORDER BY source_value",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
+            ]
+        );
     }
 
     #[test]
