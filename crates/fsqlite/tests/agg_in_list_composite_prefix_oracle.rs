@@ -15,7 +15,8 @@ fn val_f(c: &Connection, sql: &str) -> SqliteValue {
 }
 
 fn val_r(c: &rusqlite::Connection, sql: &str) -> rusqlite::types::Value {
-    c.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0)).unwrap()
+    c.query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
+        .unwrap()
 }
 
 fn same(f: &SqliteValue, r: &rusqlite::types::Value) -> bool {
@@ -39,12 +40,21 @@ fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
 
 fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str, no_rewind: Option<bool>) {
     match no_rewind {
-        Some(true) => assert!(!has_op(f, sql, "Rewind"), "composite-prefix IN seek must not full-scan (Rewind): `{sql}`"),
-        Some(false) => assert!(has_op(f, sql, "Rewind"), "control should full-scan (Rewind): `{sql}`"),
+        Some(true) => assert!(
+            !has_op(f, sql, "Rewind"),
+            "composite-prefix IN seek must not full-scan (Rewind): `{sql}`"
+        ),
+        Some(false) => assert!(
+            has_op(f, sql, "Rewind"),
+            "control should full-scan (Rewind): `{sql}`"
+        ),
         None => {}
     }
     let (vf, vr) = (val_f(f, sql), val_r(r, sql));
-    assert!(same(&vf, &vr), "value diverged for `{sql}`: frank {vf:?} vs sqlite {vr:?}");
+    assert!(
+        same(&vf, &vr),
+        "value diverged for `{sql}`: frank {vf:?} vs sqlite {vr:?}"
+    );
 }
 
 #[test]
@@ -62,7 +72,11 @@ fn agg_in_list_composite_prefix_matches_sqlite() {
     for i in 1..=400_i64 {
         let a = i % 20; // 20 distinct a-values (0..19)
         // a==3 rows ALWAYS have b=NULL (the pure fix case); plus a scattering of other NULL b.
-        let b = if a == 3 || i % 11 == 0 { "NULL".to_string() } else { (i % 5).to_string() };
+        let b = if a == 3 || i % 11 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 5).to_string()
+        };
         let s = format!("INSERT INTO t VALUES ({i}, {a}, {b}, {});", i * 2);
         f.execute(&s).unwrap();
         r.execute_batch(&s).unwrap();
@@ -72,13 +86,38 @@ fn agg_in_list_composite_prefix_matches_sqlite() {
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE a IN (3)", Some(true));
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE a IN (3)", Some(true));
     // Mixed trailing b (some NULL, some not) across several a-values.
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 0)", Some(true));
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE a IN (3, 7, 0)", Some(true));
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(*) FROM t WHERE a IN (3, 7, 0)",
+        Some(true),
+    );
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE a IN (3, 7, 0)",
+        Some(true),
+    );
     // Duplicate IN values must not double-count.
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE a IN (5, 5, 7)", Some(true));
-    cmp(&f, &r, "SELECT SUM(v) FROM t WHERE a IN (5, 5, 7)", Some(true));
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(*) FROM t WHERE a IN (5, 5, 7)",
+        Some(true),
+    );
+    cmp(
+        &f,
+        &r,
+        "SELECT SUM(v) FROM t WHERE a IN (5, 5, 7)",
+        Some(true),
+    );
     // No-match list.
-    cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE a IN (999, 1000)", Some(true));
+    cmp(
+        &f,
+        &r,
+        "SELECT COUNT(*) FROM t WHERE a IN (999, 1000)",
+        Some(true),
+    );
     cmp(&f, &r, "SELECT SUM(v) FROM t WHERE a IN (999)", Some(true));
     // Single value with many rows.
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE a IN (7)", Some(true));
@@ -102,8 +141,18 @@ fn agg_in_list_composite_prefix_matches_sqlite() {
         f2.execute(&s).unwrap();
         r2.execute_batch(&s).unwrap();
     }
-    cmp(&f2, &r2, "SELECT COUNT(*) FROM u WHERE a IN (3, 7)", Some(true));
-    cmp(&f2, &r2, "SELECT SUM(v) FROM u WHERE a IN (3, 7)", Some(true));
+    cmp(
+        &f2,
+        &r2,
+        "SELECT COUNT(*) FROM u WHERE a IN (3, 7)",
+        Some(true),
+    );
+    cmp(
+        &f2,
+        &r2,
+        "SELECT SUM(v) FROM u WHERE a IN (3, 7)",
+        Some(true),
+    );
 
     // Control: a non-indexed predicate still full-scans.
     cmp(&f, &r, "SELECT COUNT(*) FROM t WHERE v = 100", Some(false));

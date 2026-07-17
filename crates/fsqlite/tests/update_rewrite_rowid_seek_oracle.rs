@@ -34,7 +34,9 @@ fn blob_hex(byte: u8, len: usize) -> String {
 }
 
 fn count_f(c: &Connection, sql: &str) -> i64 {
-    let rows = c.query(sql).unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
+    let rows = c
+        .query(sql)
+        .unwrap_or_else(|e| panic!("frank `{sql}`: {e}"));
     match rows.first().and_then(|r| r.values().first().cloned()) {
         Some(SqliteValue::Integer(n)) => n,
         other => panic!("expected integer from `{sql}`, got {other:?}"),
@@ -90,12 +92,13 @@ fn update_rewrite_keeps_every_row_rowid_seek_reachable() {
     // both engines must agree row-for-row.
     let mut unreachable = Vec::new();
     for i in 1..=ROWS {
-        let probe = format!(
-            "SELECT count(*) FROM t WHERE id = {i} AND length(v) = {NEW_BYTES}"
-        );
+        let probe = format!("SELECT count(*) FROM t WHERE id = {i} AND length(v) = {NEW_BYTES}");
         let f = count_f(&frank, &probe);
         let r = count_r(&oracle, &probe);
-        assert_eq!(f, r, "engines diverged on `{probe}`: frank {f} vs sqlite {r}");
+        assert_eq!(
+            f, r,
+            "engines diverged on `{probe}`: frank {f} vs sqlite {r}"
+        );
         if f != 1 {
             unreachable.push(i);
         }
@@ -148,12 +151,13 @@ fn update_rewrite_overflow_rows_stay_seek_reachable() {
 
     let mut unreachable = Vec::new();
     for i in 1..=OVERFLOW_ROWS {
-        let probe = format!(
-            "SELECT count(*) FROM t WHERE id = {i} AND length(v) = {OVERFLOW_NEW}"
-        );
+        let probe = format!("SELECT count(*) FROM t WHERE id = {i} AND length(v) = {OVERFLOW_NEW}");
         let f = count_f(&frank, &probe);
         let r = count_r(&oracle, &probe);
-        assert_eq!(f, r, "engines diverged on `{probe}`: frank {f} vs sqlite {r}");
+        assert_eq!(
+            f, r,
+            "engines diverged on `{probe}`: frank {f} vs sqlite {r}"
+        );
         if f != 1 {
             unreachable.push(i);
         }
