@@ -56,10 +56,11 @@ use fsqlite_wal::{
     PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalControlSurface,
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
     ParallelWalOperatingMode, ParallelWalShadowVerdict, RecoveryFence, SubmitOutcome,
-    TransactionConflictSnapshot, TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
-    WalGenerationIdentity, commit_phase_timing_enabled, detailed_consolidation_metrics_enabled,
-    parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
-    parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
+    TransactionConflictPageBaseline, TransactionConflictSnapshot, TransactionFrameBatch,
+    TransactionFrameBatchContext, WalFile, WalGenerationIdentity, commit_phase_timing_enabled,
+    detailed_consolidation_metrics_enabled, parallel_wal_fallback_reason_name,
+    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
+    resolve_parallel_wal_control_surface_from_env,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -3095,6 +3096,7 @@ fn attach_group_commit_conflict_metadata(
     mut batch: TransactionFrameBatch,
     conflict_pages: &[PageNumber],
     conflict_snapshot: Option<traits::WalPublicationSnapshot>,
+    conflict_page_baselines: &[TransactionConflictPageBaseline],
 ) -> TransactionFrameBatch {
     let conflict_pages = conflict_pages
         .iter()
@@ -3102,6 +3104,7 @@ fn attach_group_commit_conflict_metadata(
         .collect::<Vec<_>>();
     let conflict_snapshot = conflict_snapshot.map(transaction_conflict_snapshot_from_wal);
     batch = batch.with_conflict_snapshot(conflict_pages, conflict_snapshot);
+    batch = batch.with_conflict_page_baselines(conflict_page_baselines.to_vec());
     batch
 }
 
@@ -3115,8 +3118,12 @@ fn conflicting_pages_since_batch_snapshots(
         let Some(snapshot) = batch.conflict_snapshot else {
             continue;
         };
-        let batch_conflicts =
-            wal.conflicting_pages_since_snapshot(cx, snapshot, &batch.conflict_pages)?;
+        let batch_conflicts = wal.conflicting_pages_since_snapshot(
+            cx,
+            snapshot,
+            &batch.conflict_pages,
+            &batch.conflict_page_baselines,
+        )?;
         conflicts.extend(batch_conflicts);
     }
     conflicts.sort_unstable();
@@ -9965,6 +9972,31 @@ impl<V: Vfs> SimpleTransaction<V> {
         pages
     }
 
+    /// Capture exact, snapshot-bound full-page hashes for conflict candidates.
+    ///
+    /// The transaction read cache is the only safe source here: it is pinned
+    /// to this handle's begin-time visibility and is never refreshed in place.
+    /// A candidate absent from that cache deliberately has no baseline; the
+    /// cross-generation validator must then fail closed with `BusySnapshot`.
+    fn conflict_page_baselines(
+        &self,
+        conflict_pages: &[PageNumber],
+    ) -> Vec<TransactionConflictPageBaseline> {
+        let txn_read_cache = self.txn_read_cache.borrow();
+        conflict_pages
+            .iter()
+            .filter_map(|page_no| {
+                txn_read_cache.get(page_no).map(|page| {
+                    let page_hash = *blake3::hash(page.as_bytes()).as_bytes();
+                    TransactionConflictPageBaseline {
+                        page_number: page_no.get(),
+                        page_hash,
+                    }
+                })
+            })
+            .collect()
+    }
+
     fn publish_committed_state(&self, cx: &Cx, update: PublishedPagerUpdate) {
         // D1-CRITICAL Change 3: Use sharded publish_commit.
         self.published.publish_commit(cx, update, &self.write_set);
@@ -10630,6 +10662,7 @@ where
             write_set,
             write_pages_sorted,
             conflict_pages,
+            &[],
             queue,
         )
     }
@@ -10645,6 +10678,7 @@ where
         write_set: &HashMap<PageNumber, StagedPage, S>,
         write_pages_sorted: &[PageNumber],
         conflict_pages: &[PageNumber],
+        conflict_page_baselines: &[TransactionConflictPageBaseline],
         queue: &GroupCommitQueueRef,
     ) -> Result<()> {
         let detailed_metrics = detailed_consolidation_metrics_enabled();
@@ -10673,7 +10707,12 @@ where
         let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
         let conflict_snapshot =
             with_wal_backend_read(wal_backend, |wal| Ok(wal.pinned_read_snapshot()))?;
-        let batch = attach_group_commit_conflict_metadata(batch, conflict_pages, conflict_snapshot);
+        let batch = attach_group_commit_conflict_metadata(
+            batch,
+            conflict_pages,
+            conflict_snapshot,
+            conflict_page_baselines,
+        );
         let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
 
         let parallel_wal_control = queue.parallel_wal_control().clone();
@@ -12510,6 +12549,8 @@ where
                 Vec::new()
             };
         }
+        let cross_process_conflict_page_baselines =
+            self.conflict_page_baselines(&cross_process_conflict_pages);
         let wal_current_db_size = inner.db_size;
         let wal_sync_policy = inner.wal_commit_sync_policy;
 
@@ -12538,6 +12579,7 @@ where
                 &self.write_set,
                 &self.write_pages_sorted,
                 &cross_process_conflict_pages,
+                &cross_process_conflict_page_baselines,
                 &self.group_commit_queue,
             );
             record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
@@ -12930,6 +12972,8 @@ where
             } else {
                 Vec::new()
             };
+            let cross_process_conflict_page_baselines =
+                self.conflict_page_baselines(&cross_process_conflict_pages);
             let wal_current_db_size = inner.db_size;
             let wal_sync_policy = inner.wal_commit_sync_policy;
 
@@ -12944,6 +12988,7 @@ where
                     &self.write_set,
                     &self.write_pages_sorted,
                     &cross_process_conflict_pages,
+                    &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
                 );
                 inner = match inner_arc

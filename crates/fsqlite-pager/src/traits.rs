@@ -26,7 +26,8 @@ use fsqlite_vfs::UnixVfs;
 #[cfg(all(feature = "native", target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs;
 use fsqlite_wal::{
-    TransactionConflictSnapshot, WalGenerationIdentity, checksum::WalChecksumTransform,
+    TransactionConflictPageBaseline, TransactionConflictSnapshot, WalGenerationIdentity,
+    checksum::WalChecksumTransform,
 };
 
 // ---------------------------------------------------------------------------
@@ -309,6 +310,7 @@ pub trait WalBackend: Send + Sync {
         _cx: &Cx,
         _snapshot: TransactionConflictSnapshot,
         _page_numbers: &[u32],
+        _page_baselines: &[TransactionConflictPageBaseline],
     ) -> Result<Vec<u32>> {
         Ok(Vec::new())
     }

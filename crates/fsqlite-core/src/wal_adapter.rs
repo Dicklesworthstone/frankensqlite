@@ -20,9 +20,9 @@ use fsqlite_pager::traits::{
 use fsqlite_pager::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend, WalPublicationSnapshot,
 };
-use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::{PageNumber, PageSize};
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::DatabaseNamespaceBinding;
 use fsqlite_vfs::{Vfs, VfsFile};
@@ -30,8 +30,8 @@ use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksu
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget,
-    TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile, WalGenerationIdentity, WalHeader,
-    WalSalts, execute_checkpoint, validate_wal_header_checksum,
+    TransactionConflictPageBaseline, TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile,
+    WalGenerationIdentity, WalHeader, WalSalts, execute_checkpoint, validate_wal_header_checksum,
 };
 use tracing::debug;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -55,6 +55,19 @@ use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 /// for the full visible generation. Tests can still lower this cap explicitly
 /// to exercise the bounded fallback path.
 const PAGE_INDEX_MAX_ENTRIES: usize = usize::MAX;
+
+fn sqlite_database_header_page_size(page_one: &[u8]) -> Option<u32> {
+    if page_one.len() < 18 || !page_one.starts_with(b"SQLite format 3\0") {
+        return None;
+    }
+    let encoded = u16::from_be_bytes([page_one[16], page_one[17]]);
+    let decoded = if encoded == 1 {
+        65_536
+    } else {
+        u32::from(encoded)
+    };
+    PageSize::new(decoded).map(PageSize::get)
+}
 
 /// How a visible page lookup was resolved for the current WAL generation.
 ///
@@ -1208,6 +1221,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         cx: &Cx,
         snapshot: TransactionConflictSnapshot,
         page_numbers: &[u32],
+        _page_baselines: &[TransactionConflictPageBaseline],
     ) -> Result<Vec<u32>> {
         if page_numbers.is_empty() {
             return Ok(Vec::new());
@@ -1361,6 +1375,7 @@ where
     V::File: Send + Sync + 'static,
 {
     vfs: V,
+    db_path: PathBuf,
     wal_path: PathBuf,
     page_size: u32,
     create_missing: bool,
@@ -1377,6 +1392,7 @@ where
     #[must_use]
     pub fn new(
         vfs: V,
+        db_path: impl AsRef<Path>,
         wal_path: impl AsRef<Path>,
         page_size: u32,
         wal: WalFile<V::File>,
@@ -1387,6 +1403,7 @@ where
     ) -> Self {
         Self {
             vfs,
+            db_path: db_path.as_ref().to_path_buf(),
             wal_path: wal_path.as_ref().to_path_buf(),
             page_size,
             create_missing,
@@ -1456,6 +1473,125 @@ where
             && path_header.page_size == current_header.page_size
             && path_header.checkpoint_seq == current_header.checkpoint_seq
             && path_header.salts == current_header.salts)
+    }
+
+    /// Revalidate conflict candidates across a WAL-generation transition.
+    ///
+    /// A stock SQLite reader may checkpoint and replace an otherwise
+    /// unchanged WAL while a FrankenSQLite transaction is open. Treating the
+    /// generation change itself as a write conflict produces a false
+    /// `BusySnapshot`. Conversely, blindly accepting the new generation can
+    /// overwrite a real external commit that was checkpointed into the main
+    /// database. The only safe admission proof is therefore page-specific:
+    /// every candidate must have a transaction-snapshot baseline, and its
+    /// latest committed full-page image (new WAL first, main DB otherwise)
+    /// must hash identically.
+    ///
+    /// Any missing/ambiguous baseline, unreadable or short main page, invalid
+    /// database header, page-size change, WAL read error, or close failure
+    /// fails closed by returning every candidate as conflicting.
+    fn conflicts_after_generation_change(
+        &mut self,
+        cx: &Cx,
+        page_numbers: &[u32],
+        page_baselines: &[TransactionConflictPageBaseline],
+    ) -> Vec<u32> {
+        let mut candidates = page_numbers
+            .iter()
+            .copied()
+            .filter(|page| *page != 0)
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut baselines = HashMap::<u32, [u8; 32]>::new();
+        let mut ambiguous_baselines = HashSet::<u32>::new();
+        for baseline in page_baselines {
+            if baseline.page_number == 0 {
+                continue;
+            }
+            if let Some(previous) = baselines.insert(baseline.page_number, baseline.page_hash)
+                && previous != baseline.page_hash
+            {
+                ambiguous_baselines.insert(baseline.page_number);
+            }
+        }
+
+        let main_db_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = match self.vfs.open(cx, Some(&self.db_path), main_db_flags) {
+            Ok(opened) => opened,
+            Err(_) => return candidates,
+        };
+        let page_size = match usize::try_from(self.page_size) {
+            Ok(page_size) if page_size > 0 => page_size,
+            _ => {
+                let _ = db_file.close(cx);
+                return candidates;
+            }
+        };
+
+        // Validate the current main-database header before trusting offsets.
+        // SQLite encodes a 64 KiB page as the u16 value 1.
+        let mut page_one = vec![0_u8; page_size];
+        let page_one_read = match db_file.read(cx, &mut page_one, 0) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) => {
+                let _ = db_file.close(cx);
+                return candidates;
+            }
+        };
+        let header_page_size =
+            (page_one_read == page_size).then(|| sqlite_database_header_page_size(&page_one));
+        if header_page_size.flatten() != Some(self.page_size) {
+            let _ = db_file.close(cx);
+            return candidates;
+        }
+
+        let mut conflicts = Vec::new();
+        for &page_number in &candidates {
+            let Some(expected_hash) = baselines.get(&page_number).copied() else {
+                conflicts.push(page_number);
+                continue;
+            };
+            if ambiguous_baselines.contains(&page_number) {
+                conflicts.push(page_number);
+                continue;
+            }
+
+            let current_page = match self.inner.read_page(cx, page_number) {
+                Ok(Some(page)) if page.len() == page_size => page,
+                Ok(Some(_)) | Err(_) => {
+                    conflicts.push(page_number);
+                    continue;
+                }
+                Ok(None) => {
+                    let mut page = vec![0_u8; page_size];
+                    let page_offset = u64::from(page_number.saturating_sub(1))
+                        .saturating_mul(u64::from(self.page_size));
+                    match db_file.read(cx, &mut page, page_offset) {
+                        Ok(bytes_read) if bytes_read == page_size => page,
+                        Ok(_) | Err(_) => {
+                            conflicts.push(page_number);
+                            continue;
+                        }
+                    }
+                }
+            };
+            let current_hash = *blake3::hash(&current_page).as_bytes();
+            if current_hash != expected_hash {
+                conflicts.push(page_number);
+            }
+        }
+
+        if db_file.close(cx).is_err() {
+            return candidates;
+        }
+        conflicts.sort_unstable();
+        conflicts.dedup();
+        conflicts
     }
 
     fn ensure_current_wal_path(&mut self, cx: &Cx) -> Result<()> {
@@ -1590,10 +1726,15 @@ where
         cx: &Cx,
         snapshot: TransactionConflictSnapshot,
         page_numbers: &[u32],
+        page_baselines: &[TransactionConflictPageBaseline],
     ) -> Result<Vec<u32>> {
         self.ensure_current_wal_path(cx)?;
+        let latest = self.inner.refresh_published_snapshot(cx)?;
+        if latest.generation != snapshot.generation {
+            return Ok(self.conflicts_after_generation_change(cx, page_numbers, page_baselines));
+        }
         self.inner
-            .conflicting_pages_since_snapshot(cx, snapshot, page_numbers)
+            .conflicting_pages_since_snapshot(cx, snapshot, page_numbers, page_baselines)
     }
 
     fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {
@@ -1699,6 +1840,110 @@ mod tests {
             *byte = reduced ^ seed;
         }
         page
+    }
+
+    fn sqlite_page_one(encoded_page_size: u16) -> Vec<u8> {
+        let mut page = sample_page(0x11);
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&encoded_page_size.to_be_bytes());
+        page
+    }
+
+    fn write_main_db_pages(vfs: &MemoryVfs, cx: &Cx, pages: &[Vec<u8>]) {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs
+            .open(cx, Some(std::path::Path::new("test.db")), flags)
+            .expect("open main database");
+        file.truncate(cx, 0).expect("truncate main database");
+        for (index, page) in pages.iter().enumerate() {
+            let offset = u64::try_from(index)
+                .expect("page index fits u64")
+                .saturating_mul(u64::from(PAGE_SIZE));
+            file.write(cx, page, offset).expect("write database page");
+        }
+        file.close(cx).expect("close main database");
+    }
+
+    fn replacement_salts() -> WalSalts {
+        WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0x9ABC_DEF0,
+        }
+    }
+
+    fn replace_path_visible_wal(vfs: &MemoryVfs, cx: &Cx) {
+        let wal_path = std::path::Path::new("test.db-wal");
+        vfs.delete(cx, wal_path, false)
+            .expect("remove old path-visible WAL");
+        let file = open_wal_file(vfs, cx);
+        WalFile::create(cx, file, PAGE_SIZE, 1, replacement_salts())
+            .expect("create replacement WAL")
+            .close(cx)
+            .expect("close replacement WAL");
+    }
+
+    fn append_replacement_wal_page(
+        vfs: &MemoryVfs,
+        cx: &Cx,
+        page_number: u32,
+        page: &[u8],
+        db_size_if_commit: u32,
+    ) {
+        let file = open_wal_file(vfs, cx);
+        let wal = WalFile::open(cx, file).expect("open replacement WAL");
+        let mut adapter = WalBackendAdapter::new(wal);
+        adapter
+            .append_frame(cx, page_number, page, db_size_if_commit)
+            .expect("append replacement WAL page");
+        adapter.sync(cx).expect("sync replacement WAL page");
+        adapter
+            .into_inner()
+            .close(cx)
+            .expect("close replacement WAL");
+    }
+
+    fn make_generation_transition_backend(
+        vfs: &MemoryVfs,
+        cx: &Cx,
+    ) -> (
+        PathRefreshingWalBackend<MemoryVfs>,
+        TransactionConflictSnapshot,
+        Vec<u8>,
+    ) {
+        let page_one = sqlite_page_one(u16::try_from(PAGE_SIZE).expect("page size fits u16"));
+        let page_two = sample_page(0x22);
+        write_main_db_pages(vfs, cx, &[page_one.clone(), page_two.clone()]);
+
+        let file = open_wal_file(vfs, cx);
+        let wal =
+            WalFile::create(cx, file, PAGE_SIZE, 0, test_salts()).expect("create original WAL");
+        let mut backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            std::path::Path::new("test.db"),
+            std::path::Path::new("test.db-wal"),
+            PAGE_SIZE,
+            wal,
+            true,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            None,
+        );
+        backend
+            .append_frame(cx, 1, &page_one, 0)
+            .expect("append original page 1");
+        backend
+            .append_frame(cx, 2, &page_two, 2)
+            .expect("append original commit");
+        backend
+            .begin_transaction(cx)
+            .expect("pin original WAL generation");
+        let pinned = backend.pinned_read_snapshot().expect("pinned WAL snapshot");
+        let snapshot = TransactionConflictSnapshot {
+            generation: pinned.generation,
+            last_commit_frame: pinned.last_commit_frame,
+            commit_count: pinned.commit_count,
+        };
+        replace_path_visible_wal(vfs, cx);
+        (backend, snapshot, page_two)
     }
 
     fn open_wal_file(vfs: &MemoryVfs, cx: &Cx) -> <MemoryVfs as Vfs>::File {
@@ -1860,6 +2105,7 @@ mod tests {
         let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
         let mut backend = PathRefreshingWalBackend::new(
             vfs.clone(),
+            std::path::Path::new("test.db"),
             wal_path,
             PAGE_SIZE,
             wal,
@@ -1903,6 +2149,149 @@ mod tests {
                         && detail.contains("during path refresh")
             ),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_generation_change_allows_identical_full_page_baseline() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        let baseline = TransactionConflictPageBaseline {
+            page_number: 2,
+            page_hash: *blake3::hash(&page_two).as_bytes(),
+        };
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("validate checkpoint-only generation transition");
+        assert!(
+            conflicts.is_empty(),
+            "byte-identical checkpoint-only reset must not create a false conflict"
+        );
+    }
+
+    #[test]
+    fn test_generation_change_rejects_changed_candidate_page() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        let changed_page_two = sample_page(0x33);
+        write_main_db_pages(
+            &vfs,
+            &cx,
+            &[
+                sqlite_page_one(u16::try_from(PAGE_SIZE).expect("page size fits u16")),
+                changed_page_two,
+            ],
+        );
+        let baseline = TransactionConflictPageBaseline {
+            page_number: 2,
+            page_hash: *blake3::hash(&page_two).as_bytes(),
+        };
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("validate changed page across generation transition");
+        assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_changed_candidate_from_replacement_wal() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        append_replacement_wal_page(&vfs, &cx, 2, &sample_page(0x44), 2);
+        let baseline = TransactionConflictPageBaseline {
+            page_number: 2,
+            page_hash: *blake3::hash(&page_two).as_bytes(),
+        };
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("replacement WAL page must take precedence over identical main page");
+        assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_missing_baseline() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, _) = make_generation_transition_backend(&vfs, &cx);
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[])
+            .expect("missing baseline must fail closed");
+        assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_conflicting_duplicate_baselines() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        let baselines = [
+            TransactionConflictPageBaseline {
+                page_number: 2,
+                page_hash: *blake3::hash(&page_two).as_bytes(),
+            },
+            TransactionConflictPageBaseline {
+                page_number: 2,
+                page_hash: *blake3::hash(&sample_page(0x55)).as_bytes(),
+            },
+        ];
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &baselines)
+            .expect("conflicting duplicate baselines must fail closed");
+        assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_short_candidate_page() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        write_main_db_pages(
+            &vfs,
+            &cx,
+            &[sqlite_page_one(
+                u16::try_from(PAGE_SIZE).expect("page size fits u16"),
+            )],
+        );
+        let baseline = TransactionConflictPageBaseline {
+            page_number: 2,
+            page_hash: *blake3::hash(&page_two).as_bytes(),
+        };
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("short page must fail closed");
+        assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_database_page_size_change() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+        write_main_db_pages(&vfs, &cx, &[sqlite_page_one(8192), page_two.clone()]);
+        let baseline = TransactionConflictPageBaseline {
+            page_number: 2,
+            page_hash: *blake3::hash(&page_two).as_bytes(),
+        };
+
+        let conflicts = backend
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .expect("page-size change must fail closed");
+        assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_decodes_64k_database_header_sentinel() {
+        assert_eq!(
+            sqlite_database_header_page_size(&sqlite_page_one(1)),
+            Some(65_536)
         );
     }
 
@@ -3066,12 +3455,12 @@ mod tests {
             .expect("commit later page 2 update");
 
         let conflicts = adapter
-            .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[2, 99])
+            .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[2, 99], &[])
             .expect("conflict check should scan later committed frames");
         assert_eq!(conflicts, vec![2]);
 
         let unrelated = adapter
-            .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[99])
+            .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[99], &[])
             .expect("unrelated page should stay conflict-free");
         assert!(unrelated.is_empty());
     }

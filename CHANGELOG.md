@@ -34,6 +34,9 @@ no breaking API changes.
 
 - **Direct updates of overflow-backed rows can no longer commit an out-of-order
   table B-tree** ([PR #287](https://github.com/Dicklesworthstone/frankensqlite/pull/287)).
+  The report and reproducer from
+  [@etafund](https://github.com/etafund) were independently reproduced and
+  reimplemented in `796c4cb7`, with full contributor credit.
   A delete that drained a singleton leaf could leave its cursor on the logical
   successor in a different ancestor subtree. Reusing that position to reinsert
   the same rowid preserved leaf-local order while violating an ancestor
@@ -48,7 +51,22 @@ no breaking API changes.
   cached leaf-only cursor positions. Root identity is checked at both balance
   choke points, preventing rootless table inserts or deletes from treating a
   cached leaf as the tree root and extending the corruption coverage for
-  composite-UNIQUE update churn (#132).
+  composite-UNIQUE update churn (`c57499fb`,
+  [#132](https://github.com/Dicklesworthstone/frankensqlite/issues/132)).
+  The demonstrated delete/reinsert cursor-reuse mechanism is fixed, but #132
+  intentionally remains open: its private historical artifacts have not yet
+  been re-derived from a public generator or rerun against both fixes, so this
+  release does not claim that every historical corruption mechanism has been
+  eliminated.
+- Cross-process first-committer-wins validation now distinguishes a benign
+  stock-SQLite checkpoint/reset from a real external write. Across a WAL
+  generation transition, every conflict candidate is admitted only when an
+  exact page-number-associated BLAKE3 hash of the transaction's full snapshot
+  page matches the latest committed full page (replacement WAL first, main
+  database otherwise). Missing or ambiguous baselines, changed or truncated
+  pages, invalid headers, page-size drift, and I/O failures all fail closed
+  with `BusySnapshot`, while a byte-identical checkpoint no longer breaks
+  retained autocommit.
 - Checkpoint writes are failure-atomic with respect to both database size and
   shared pager publication. A failed page write no longer advances the
   in-memory page count, and checkpoint metadata is published only after the

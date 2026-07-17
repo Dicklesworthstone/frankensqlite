@@ -174,6 +174,16 @@ pub struct TransactionFrameBatch {
     /// horizon, the batch must fail with BUSY_SNAPSHOT instead of appending a
     /// stale page image that could hide the other writer's committed rows.
     pub conflict_snapshot: Option<TransactionConflictSnapshot>,
+    /// Full-page hashes captured from the submitting transaction's pinned
+    /// snapshot, keyed by exact page number.
+    ///
+    /// These are used only when an external checkpoint replaces/resets the WAL
+    /// generation while the transaction is open. A generation change alone
+    /// does not prove a write conflict: a stock SQLite reader can checkpoint
+    /// an otherwise unchanged WAL. The eventual flusher may admit that benign
+    /// transition only when every conflict candidate has a baseline and the
+    /// latest committed full-page image hashes identically.
+    pub conflict_page_baselines: Vec<TransactionConflictPageBaseline>,
     /// Lane-local staging context captured before group-commit submission.
     pub context: TransactionFrameBatchContext,
 }
@@ -184,6 +194,15 @@ pub struct TransactionConflictSnapshot {
     pub generation: WalGenerationIdentity,
     pub last_commit_frame: Option<usize>,
     pub commit_count: u64,
+}
+
+/// Snapshot-bound full-page hash for one cross-process conflict candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionConflictPageBaseline {
+    /// Exact 1-based database page number associated with `page_hash`.
+    pub page_number: u32,
+    /// BLAKE3 hash of the complete page image visible to the transaction.
+    pub page_hash: [u8; 32],
 }
 
 /// Lane-local staging context attached to a transaction batch.
@@ -207,6 +226,7 @@ impl TransactionFrameBatch {
             frames,
             conflict_pages: Vec::new(),
             conflict_snapshot: None,
+            conflict_page_baselines: Vec::new(),
             context: TransactionFrameBatchContext::default(),
         }
     }
@@ -220,6 +240,16 @@ impl TransactionFrameBatch {
     ) -> Self {
         self.conflict_pages = conflict_pages;
         self.conflict_snapshot = conflict_snapshot;
+        self
+    }
+
+    /// Attach snapshot-bound full-page hashes for WAL-generation transitions.
+    #[must_use]
+    pub fn with_conflict_page_baselines(
+        mut self,
+        conflict_page_baselines: Vec<TransactionConflictPageBaseline>,
+    ) -> Self {
+        self.conflict_page_baselines = conflict_page_baselines;
         self
     }
 

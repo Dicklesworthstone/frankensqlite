@@ -3230,6 +3230,7 @@ where
     }
     let adapter = PathRefreshingWalBackend::new(
         vfs,
+        pager.db_path(),
         wal_path,
         expected_page_size,
         wal,
