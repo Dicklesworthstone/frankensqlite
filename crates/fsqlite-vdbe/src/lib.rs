@@ -1457,6 +1457,10 @@ pub mod pragma {
         /// `PRAGMA secure_delete` tri-state: 0 = OFF, 1 = ON, 2 = FAST (default 0).
         /// Set/readback surface only.
         pub secure_delete: i64,
+        /// `PRAGMA threads` auxiliary worker-thread limit (default 0). Advisory:
+        /// FrankenSQLite does not spawn SQLite-style sort helper threads, so this
+        /// is a stored limit clamped to the stock maximum (8).
+        pub threads: i64,
     }
 
     impl Default for ConnectionPragmaState {
@@ -1490,6 +1494,7 @@ pub mod pragma {
                 automatic_index: true,
                 locking_mode: "normal".to_owned(),
                 secure_delete: 0,
+                threads: 0,
             }
         }
     }
@@ -1610,6 +1615,9 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("secure_delete") {
             return apply_secure_delete(state, stmt);
         }
+        if name.eq_ignore_ascii_case("threads") {
+            return apply_threads(state, stmt);
+        }
         if is_fsqlite_mvcc_max_chain_length(&stmt.name) {
             return apply_mvcc_max_chain_length(state, stmt);
         }
@@ -1704,6 +1712,28 @@ pub mod pragma {
         }
         // OFF/ON/TRUE/FALSE map to 0/1.
         Ok(i64::from(parse_bool(expr)?))
+    }
+
+    /// `PRAGMA threads [= N]`. A bare query reports the current limit; an
+    /// assignment with a non-negative N clamps to the stock maximum (8), stores
+    /// it, and echoes the effective value. A negative argument leaves the limit
+    /// unchanged and just reports it, matching C SQLite. (GH #279)
+    fn apply_threads(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        /// Stock `SQLITE_MAX_WORKER_THREADS`.
+        const MAX_WORKER_THREADS: i64 = 8;
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.threads)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let n = parse_integer_expr(expr)?;
+                if n >= 0 {
+                    state.threads = n.min(MAX_WORKER_THREADS);
+                }
+                Ok(PragmaOutput::Int(state.threads))
+            }
+        }
     }
 
     /// `PRAGMA case_sensitive_like = ON|OFF`. SQLite treats this as write-only,
@@ -3170,6 +3200,21 @@ mod tests {
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = FAST"), Int(2));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = OFF"), Int(0));
         assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(2));
+    }
+
+    #[test]
+    fn test_connection_pragma_threads_readback() {
+        // GH #279: threads reports the stored limit; a set clamps to 8; a
+        // negative argument leaves the limit unchanged.
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = 4"), Int(4));
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(4));
+        // Clamps to the stock maximum of 8.
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = 100"), Int(8));
+        // A negative argument leaves the current limit unchanged.
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = -1"), Int(8));
     }
 
     #[test]
