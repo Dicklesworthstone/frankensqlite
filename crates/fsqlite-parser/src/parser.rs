@@ -8,19 +8,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fsqlite_ast::{
     AlterTableAction, AlterTableStatement, Assignment, AssignmentTarget, AttachStatement,
-    BeginStatement, ColumnConstraint, ColumnConstraintKind, ColumnDef, CompoundOp, ConflictAction,
-    CreateIndexStatement, CreateTableBody, CreateTableStatement, CreateTriggerStatement,
-    CreateViewStatement, CreateVirtualTableStatement, Cte, CteMaterialized, DefaultValue,
-    Deferrable, DeferrableInitially, DeleteStatement, Distinctness, DropObjectType, DropStatement,
-    Expr, ForeignKeyAction, ForeignKeyActionType, ForeignKeyClause, ForeignKeyTrigger, FrameBound,
-    FrameExclude, FrameSpec, FrameType, FromClause, GeneratedStorage, IndexHint, IndexedColumn,
-    InsertSource, InsertStatement, JoinClause, JoinConstraint, JoinKind, JoinType, LimitClause,
-    Literal, NullsOrder, OrderingTerm, PragmaStatement, PragmaValue, QualifiedName,
-    QualifiedTableRef, ResultColumn, RollbackStatement, SelectBody, SelectCore, SelectStatement,
-    SortDirection, Span, Statement, TableConstraint, TableConstraintKind, TableOrSubquery,
-    TimeTravelClause, TimeTravelTarget, TransactionMode, TriggerEvent, TriggerTiming, TypeName,
-    UpdateStatement, UpsertAction, UpsertClause, UpsertTarget, VacuumStatement, WindowDef,
-    WindowSpec, WithClause,
+    BeginStatement, ColumnConstraint, ColumnConstraintKind, ColumnDef, ColumnRef, CompoundOp,
+    ConflictAction, CreateIndexStatement, CreateTableBody, CreateTableStatement,
+    CreateTriggerStatement, CreateViewStatement, CreateVirtualTableStatement, Cte, CteMaterialized,
+    DefaultValue, Deferrable, DeferrableInitially, DeleteStatement, Distinctness, DropObjectType,
+    DropStatement, Expr, ForeignKeyAction, ForeignKeyActionType, ForeignKeyClause,
+    ForeignKeyTrigger, FrameBound, FrameExclude, FrameSpec, FrameType, FromClause,
+    GeneratedStorage, IndexHint, IndexedColumn, InsertSource, InsertStatement, JoinClause,
+    JoinConstraint, JoinKind, JoinType, LimitClause, Literal, NullsOrder, OrderingTerm,
+    PragmaStatement, PragmaValue, QualifiedName, QualifiedTableRef, ResultColumn,
+    RollbackStatement, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
+    TableConstraint, TableConstraintKind, TableOrSubquery, TimeTravelClause, TimeTravelTarget,
+    TransactionMode, TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction,
+    UpsertClause, UpsertTarget, VacuumStatement, WindowDef, WindowSpec, WithClause,
 };
 
 use crate::lexer::Lexer;
@@ -2040,6 +2040,23 @@ impl Parser {
             self.advance();
             return Ok(Expr::Literal(Literal::True, sp));
         }
+        // SQLite's pragma value grammar (nmnum ::= plus_num | nm | ON | DELETE |
+        // DEFAULT) treats the reserved keywords DELETE and DEFAULT as names in
+        // value position — e.g. `PRAGMA journal_mode=DELETE`, `PRAGMA
+        // temp_store=DEFAULT`. The general expression parser rejects reserved
+        // keyword tokens, so accept them here as identifier-valued pragma
+        // arguments (matching how WAL/TRUNCATE/PERSIST/MEMORY/OFF lex as plain
+        // identifiers and already work).
+        let pragma_value_keyword = match self.peek() {
+            TokenKind::KwDelete => Some("delete"),
+            TokenKind::KwDefault => Some("default"),
+            _ => None,
+        };
+        if let Some(name) = pragma_value_keyword {
+            let sp = self.current_span();
+            self.advance();
+            return Ok(Expr::Column(ColumnRef::bare(name), sp));
+        }
         self.parse_expr()
     }
 
@@ -2944,6 +2961,28 @@ mod tests {
     fn pragma_allows_on_value() {
         let stmt = parse_one("PRAGMA fsqlite.serializable = ON");
         assert!(matches!(stmt, Statement::Pragma(_)));
+    }
+
+    #[test]
+    fn pragma_allows_delete_and_default_keyword_values() {
+        // GH #276: DELETE and DEFAULT are reserved statement keywords but are
+        // valid pragma values (SQLite's nmnum grammar). They must parse in value
+        // position and resolve to their identifier name.
+        for (sql, expected) in [
+            ("PRAGMA journal_mode = DELETE", "delete"),
+            ("PRAGMA temp_store = DEFAULT", "default"),
+        ] {
+            let Statement::Pragma(p) = parse_one(sql) else {
+                unreachable!("expected Pragma for {sql}");
+            };
+            match p.value {
+                Some(PragmaValue::Assign(Expr::Column(col, _))) => {
+                    assert!(col.table.is_none(), "sql={sql}");
+                    assert_eq!(&*col.column, expected, "sql={sql}");
+                }
+                other => unreachable!("expected Assign(Column) for {sql}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
