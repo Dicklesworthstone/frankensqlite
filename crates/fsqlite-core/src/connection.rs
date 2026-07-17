@@ -39981,6 +39981,48 @@ impl Connection {
                     )));
                 }
 
+                // Generated columns may not be part of the PRIMARY KEY. SQLite
+                // rejects this at CREATE time, for both a column-level generated
+                // PRIMARY KEY and a table-level PRIMARY KEY listing a generated
+                // column. (GH #181)
+                let col_is_generated = |col: &fsqlite_ast::ColumnDef| {
+                    col.constraints
+                        .iter()
+                        .any(|c| matches!(c.kind, ColumnConstraintKind::Generated { .. }))
+                };
+                for col in columns {
+                    let is_col_level_pk = col
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                    if is_col_level_pk && col_is_generated(col) {
+                        return Err(FrankenError::FunctionError(
+                            "generated columns cannot be part of the PRIMARY KEY".to_owned(),
+                        ));
+                    }
+                }
+                for tc in constraints {
+                    if let TableConstraintKind::PrimaryKey {
+                        columns: pk_columns,
+                        ..
+                    } = &tc.kind
+                    {
+                        for pk_col in pk_columns {
+                            if let Some(normalized) = normalize_indexed_column_term(pk_col)
+                                && let Some(col) = columns
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(&normalized.column_name))
+                                && col_is_generated(col)
+                            {
+                                return Err(FrankenError::FunctionError(
+                                    "generated columns cannot be part of the PRIMARY KEY"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 // CHECK constraints may not contain a subquery — SQLite rejects
                 // them at CREATE time ("subqueries prohibited in CHECK
                 // constraints"). Validate before allocating any pages so a
@@ -49791,6 +49833,17 @@ impl Connection {
                     },
                     None => None,
                 };
+                // A named table must exist; C SQLite errors "no such table: X"
+                // rather than silently returning zero rows. (GH #261)
+                if let Some(name) = &only_table
+                    && !self
+                        .schema
+                        .borrow()
+                        .iter()
+                        .any(|t| t.name.eq_ignore_ascii_case(name))
+                {
+                    return Err(FrankenError::NoSuchTable { name: name.clone() });
+                }
                 // Resolve every FK to check (column NAMES + fkid) up front so no
                 // schema borrow is held across the queries below.
                 struct FkCheck {
@@ -159342,6 +159395,43 @@ mod pager_routing_tests {
         // #243: row-value IS DISTINCT FROM (NULL-safe negation of IS).
         assert_eq!(b("SELECT (1,NULL) IS DISTINCT FROM (1,NULL)"), 0);
         assert_eq!(b("SELECT (1,NULL) IS DISTINCT FROM (1,2)"), 1);
+    }
+
+    #[test]
+    fn test_generated_column_cannot_be_primary_key() {
+        // GH #181: a generated column may not be part of the PRIMARY KEY.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(
+            conn.execute(
+                "CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED PRIMARY KEY);"
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "CREATE TABLE t2(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED, PRIMARY KEY(b));"
+            )
+            .is_err()
+        );
+        // A non-generated PK alongside a generated column is fine.
+        conn.execute(
+            "CREATE TABLE t3(a INTEGER PRIMARY KEY, b INTEGER GENERATED ALWAYS AS (a*2) STORED);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_foreign_key_check_unknown_table_errors() {
+        // GH #261: foreign_key_check on a nonexistent table errors instead of
+        // silently returning zero rows.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a);").unwrap();
+        assert!(
+            conn.query("PRAGMA foreign_key_check(nonexistent);")
+                .is_err()
+        );
+        // A valid table is accepted (no FKs -> empty result).
+        assert!(conn.query("PRAGMA foreign_key_check(t);").is_ok());
     }
 
     #[test]
