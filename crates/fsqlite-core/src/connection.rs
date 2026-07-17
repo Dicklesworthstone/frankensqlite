@@ -190159,7 +190159,14 @@ mod pager_routing_tests {
                     )?;
                 }
                 conn_a.execute("COMMIT;")?;
-                conn_a.close()?;
+                // The regression boundary is the concurrent COMMIT above.
+                // Avoid a close-time passive checkpoint while B is still
+                // racing: a transient checkpoint Busy is unrelated to the
+                // validate→publish invariant and must not masquerade as a
+                // commit failure. The canonical SQLite oracle below opens the
+                // database with its WAL still present and validates the full
+                // durable image.
+                conn_a.close_without_checkpoint()?;
                 Ok(())
             })();
             let _ = a_done_tx.send(res);
@@ -190203,12 +190210,12 @@ mod pager_routing_tests {
             // Best-effort close on success; on a snapshot/busy conflict the
             // transaction is already torn down by the engine.
             if res.is_ok() {
-                conn_b.close().unwrap();
+                conn_b.close_without_checkpoint().unwrap();
             } else {
                 // Roll back any partial uncommitted state so the file is clean
                 // for the canonical-SQLite oracle read.
                 let _ = conn_b.execute("ROLLBACK;");
-                conn_b.close().unwrap();
+                conn_b.close_without_checkpoint().unwrap();
             }
             let _ = b_done_tx.send(res);
         });
