@@ -464,6 +464,352 @@ fn composite_unique_duplicate_recovery_rollback_stays_stock_canonical() {
     composite_unique_duplicate_recovery_churn("DELETE");
 }
 
+// ============================================================================
+// GH #289: post-stock-VACUUM packed UNIQUE autoindex corruption fingerprint.
+// ============================================================================
+
+fn gh289_mix(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn gh289_key(ordinal: i64) -> String {
+    let first = gh289_mix(ordinal as u64 ^ 0x0289_5eed_cafe_f00d);
+    let second = gh289_mix(first);
+    let third = gh289_mix(second);
+    let tail = gh289_mix(third) & 0x000f_ffff;
+    let key = format!("{first:016x}{second:016x}{third:016x}{tail:05x}");
+    assert_eq!(key.len(), 53);
+    key
+}
+
+fn gh289_insert_target_row(conn: &fsqlite::Connection, ordinal: i64, payload: &str) {
+    let key = gh289_key(ordinal);
+    conn.execute(&format!(
+        "INSERT INTO gh289_objects(object_key,bucket,payload) \
+         VALUES('{key}',{},'{payload}-{ordinal:08}')",
+        ordinal.rem_euclid(97)
+    ))
+    .unwrap_or_else(|error| panic!("GH#289 insert ordinal={ordinal} failed: {error}"));
+}
+
+fn gh289_stock_repack(path: &str) {
+    let stock = rusqlite::Connection::open(path).expect("GH#289 stock maintenance open");
+    stock
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("GH#289 stock busy timeout");
+    stock
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); REINDEX; VACUUM;")
+        .expect("GH#289 stock REINDEX + VACUUM");
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("GH#289 post-maintenance stock integrity_check");
+    assert_eq!(integrity, "ok", "GH#289 stock maintenance must start clean");
+    let page_size: i64 = stock
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("GH#289 stock page_size");
+    let freelist: i64 = stock
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("GH#289 stock freelist_count");
+    assert_eq!(page_size, 512, "GH#289 must exercise tiny packed pages");
+    assert_eq!(freelist, 0, "stock VACUUM must leave a fully packed file");
+}
+
+fn gh289_assert_stock_canonical(path: &str, expected_rows: i64) {
+    let stock = rusqlite::Connection::open(path).expect("GH#289 final stock open");
+    stock
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("GH#289 final stock busy timeout");
+    stock
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("GH#289 final stock checkpoint");
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("GH#289 final stock integrity_check");
+    assert_eq!(integrity, "ok", "GH#289 committed image is corrupt");
+
+    let table_rows: i64 = stock
+        .query_row(
+            "SELECT COUNT(*) FROM gh289_objects NOT INDEXED",
+            [],
+            |row| row.get(0),
+        )
+        .expect("GH#289 table row count");
+    let index_rows: i64 = stock
+        .query_row(
+            "SELECT COUNT(*) FROM gh289_objects \
+             INDEXED BY sqlite_autoindex_gh289_objects_1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("GH#289 autoindex row count");
+    assert_eq!(table_rows, expected_rows, "GH#289 table row count drift");
+    assert_eq!(
+        index_rows, table_rows,
+        "GH#289 wrong number of entries in the UNIQUE autoindex"
+    );
+
+    let collect = |from_clause: &str| -> Vec<(String, i64)> {
+        let sql = format!("SELECT object_key,rowid FROM {from_clause} ORDER BY object_key,rowid");
+        let mut statement = stock.prepare(&sql).expect("GH#289 comparison prepare");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("GH#289 comparison query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("GH#289 comparison collect")
+    };
+    let table_entries = collect("gh289_objects NOT INDEXED");
+    let index_entries = collect("gh289_objects INDEXED BY sqlite_autoindex_gh289_objects_1");
+    assert_eq!(
+        index_entries, table_entries,
+        "GH#289 autoindex has duplicated, missing, misplaced, or wrong-rowid cells"
+    );
+
+    let duplicate_keys: i64 = stock
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT object_key
+                 FROM gh289_objects INDEXED BY sqlite_autoindex_gh289_objects_1
+                 GROUP BY object_key HAVING COUNT(*) != 1
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("GH#289 duplicate-key fingerprint");
+    assert_eq!(
+        duplicate_keys, 0,
+        "GH#289 UNIQUE autoindex contains a duplicated key run"
+    );
+}
+
+fn gh289_post_stock_vacuum_stress(seed_rows: i64, transactions: i64, readers: usize) {
+    const ROWS_PER_TRANSACTION: i64 = 15;
+    const AUX_TABLES: i64 = 8;
+
+    let dir = TempDir::new().expect("GH#289 tempdir");
+    let db_path = dir.path().join("gh289-packed-unique.db");
+    let path = db_path.to_string_lossy().into_owned();
+    let payload = "p".repeat(1_450);
+
+    {
+        let stock = rusqlite::Connection::open(&path).expect("GH#289 stock seed open");
+        stock
+            .execute_batch(
+                "PRAGMA page_size=512;
+                 CREATE TABLE gh289_stock_anchor(id INTEGER PRIMARY KEY);
+                 VACUUM;",
+            )
+            .expect("GH#289 create a canonical 512-byte-page database");
+        let page_size: i64 = stock
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("GH#289 seed page_size");
+        assert_eq!(page_size, 512, "GH#289 stock seed must use tiny pages");
+    }
+
+    {
+        let conn = fsqlite::Connection::open(path.clone()).expect("GH#289 seed open");
+        conn.execute("PRAGMA journal_mode=WAL")
+            .expect("GH#289 WAL mode");
+        conn.execute_batch(
+            "CREATE TABLE gh289_objects (
+                 object_key TEXT PRIMARY KEY NOT NULL,
+                 bucket INTEGER NOT NULL,
+                 payload TEXT NOT NULL
+             );
+             CREATE INDEX gh289_objects_secondary
+                 ON gh289_objects(bucket, object_key);
+             CREATE TABLE gh289_blobs (
+                 txn_id INTEGER PRIMARY KEY,
+                 payload BLOB NOT NULL
+             );",
+        )
+        .expect("GH#289 core schema");
+        for table in 0..AUX_TABLES {
+            conn.execute_batch(&format!(
+                "CREATE TABLE gh289_aux_{table} (
+                     id INTEGER PRIMARY KEY,
+                     value TEXT NOT NULL
+                 );
+                 CREATE INDEX gh289_aux_{table}_value ON gh289_aux_{table}(value);"
+            ))
+            .unwrap_or_else(|error| panic!("GH#289 auxiliary schema {table}: {error}"));
+        }
+
+        conn.execute("BEGIN IMMEDIATE")
+            .expect("GH#289 seed transaction begin");
+        for ordinal in 0..seed_rows {
+            gh289_insert_target_row(&conn, ordinal, &payload);
+        }
+        conn.execute("COMMIT")
+            .expect("GH#289 seed transaction commit");
+        quick_check(&conn).unwrap_or_else(|error| panic!("GH#289 seed corrupt: {error}"));
+        conn.query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("GH#289 seed checkpoint");
+    }
+
+    gh289_stock_repack(&path);
+
+    let stop_readers = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let reader_handles = (0..readers)
+        .map(|reader_id| {
+            let path = path.clone();
+            let stop = std::sync::Arc::clone(&stop_readers);
+            let errors = std::sync::Arc::clone(&reader_errors);
+            std::thread::spawn(move || {
+                let conn = match fsqlite::Connection::open(path) {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        errors
+                            .lock()
+                            .unwrap()
+                            .push(format!("reader {reader_id} open failed: {error}"));
+                        return;
+                    }
+                };
+                let _ = conn.execute("PRAGMA busy_timeout=10000");
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    match conn.query(
+                        "SELECT object_key,rowid
+                         FROM gh289_objects
+                         INDEXED BY sqlite_autoindex_gh289_objects_1
+                         ORDER BY object_key LIMIT 64",
+                    ) {
+                        Ok(rows) => {
+                            if rows.windows(2).any(|pair| {
+                                let left = match pair[0].values().first() {
+                                    Some(SqliteValue::Text(value)) => value.as_ref(),
+                                    other => panic!(
+                                        "GH#289 reader expected a TEXT autoindex key, got {other:?}"
+                                    ),
+                                };
+                                let right = match pair[1].values().first() {
+                                    Some(SqliteValue::Text(value)) => value.as_ref(),
+                                    other => panic!(
+                                        "GH#289 reader expected a TEXT autoindex key, got {other:?}"
+                                    ),
+                                };
+                                left > right
+                            }) {
+                                errors.lock().unwrap().push(format!(
+                                    "reader {reader_id} observed out-of-order autoindex keys"
+                                ));
+                                return;
+                            }
+                        }
+                        Err(error) if cc_is_transient(&error) => {}
+                        Err(error) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("reader {reader_id} index scan failed: {error}"));
+                            return;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let writer_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let conn = fsqlite::Connection::open(path.clone()).expect("GH#289 writer reopen");
+        conn.execute("PRAGMA busy_timeout=10000")
+            .expect("GH#289 writer busy timeout");
+        conn.execute("PRAGMA journal_mode=WAL")
+            .expect("GH#289 writer WAL mode");
+
+        for transaction in 0..transactions {
+            conn.execute("BEGIN IMMEDIATE")
+                .unwrap_or_else(|error| panic!("GH#289 txn {transaction} begin: {error}"));
+            for offset in 0..ROWS_PER_TRANSACTION {
+                let ordinal = seed_rows + transaction * ROWS_PER_TRANSACTION + offset;
+                gh289_insert_target_row(&conn, ordinal, &payload);
+            }
+            conn.execute(&format!(
+                "INSERT INTO gh289_blobs(txn_id,payload) VALUES({transaction},zeroblob({}))",
+                4_096 + transaction.rem_euclid(13) * 4_096
+            ))
+            .unwrap_or_else(|error| panic!("GH#289 txn {transaction} blob write: {error}"));
+            for table in 0..AUX_TABLES {
+                conn.execute(&format!(
+                    "INSERT INTO gh289_aux_{table}(id,value) \
+                     VALUES({transaction},'txn-{transaction:06}-table-{table}')"
+                ))
+                .unwrap_or_else(|error| {
+                    panic!("GH#289 txn {transaction} auxiliary table {table}: {error}")
+                });
+            }
+            conn.execute("COMMIT")
+                .unwrap_or_else(|error| panic!("GH#289 txn {transaction} commit: {error}"));
+
+            for rollback in 0..3_i64 {
+                let ordinal = 10_000_000 + transaction * 10 + rollback;
+                conn.execute("BEGIN IMMEDIATE").unwrap_or_else(|error| {
+                    panic!("GH#289 txn {transaction} rollback {rollback} begin: {error}")
+                });
+                gh289_insert_target_row(&conn, ordinal, &payload);
+                conn.execute("ROLLBACK").unwrap_or_else(|error| {
+                    panic!("GH#289 txn {transaction} rollback {rollback}: {error}")
+                });
+            }
+
+            if transaction % 5 == 0 || transaction + 1 == transactions {
+                quick_check(&conn).unwrap_or_else(|error| {
+                    panic!("GH#289 committed corruption after txn {transaction}: {error}")
+                });
+            }
+            if transaction % 10 == 9 {
+                if let Err(error) = conn.query("PRAGMA wal_checkpoint(PASSIVE)") {
+                    assert!(
+                        error.to_string().contains("database is busy"),
+                        "GH#289 checkpoint after txn {transaction}: {error}"
+                    );
+                }
+            }
+        }
+    }));
+
+    stop_readers.store(true, std::sync::atomic::Ordering::Release);
+    for handle in reader_handles {
+        handle.join().expect("GH#289 reader thread panicked");
+    }
+    let reader_errors = reader_errors.lock().unwrap();
+    assert!(
+        reader_errors.is_empty(),
+        "GH#289 concurrent reader failures: {reader_errors:?}"
+    );
+    drop(reader_errors);
+    if let Err(payload) = writer_result {
+        std::panic::resume_unwind(payload);
+    }
+
+    let final_checkpoint =
+        fsqlite::Connection::open(&path).expect("GH#289 final checkpoint connection");
+    final_checkpoint
+        .query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .expect("GH#289 final FrankenSQLite checkpoint after readers stopped");
+
+    gh289_assert_stock_canonical(&path, seed_rows + transactions * ROWS_PER_TRANSACTION);
+}
+
+#[test]
+fn gh289_post_stock_vacuum_packed_unique_autoindex_stays_canonical() {
+    gh289_post_stock_vacuum_stress(1_970, 40, 0);
+}
+
+#[test]
+#[ignore = "GH#289 multi-btree + concurrent-reader packed-leaf stress; run explicitly"]
+fn gh289_post_stock_vacuum_with_concurrent_readers_stays_canonical() {
+    gh289_post_stock_vacuum_stress(
+        env_i64("GH289_SEED_ROWS", 1_970),
+        env_i64("GH289_TRANSACTIONS", 80),
+        2,
+    );
+}
+
 /// Deep-tree variant: a tiny `page_size` (512) under WAL forces the index
 /// B-tree to many interior levels with only a few thousand rows, so every
 /// churn round drives interior-page splits/merges at multiple levels — the
