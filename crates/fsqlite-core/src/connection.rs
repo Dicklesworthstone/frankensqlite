@@ -136962,7 +136962,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         );
         assert!(
             snapshot.fsqlite_compat_trace_callbacks_total
-                >= baseline.fsqlite_compat_trace_callbacks_total + 1,
+                > baseline.fsqlite_compat_trace_callbacks_total,
             "compat callback counter should still advance"
         );
     }
@@ -164327,6 +164327,213 @@ mod pager_routing_tests {
             !opcodes.iter().any(|op| op == "AggStep" || op == "AggFinal"),
             "NOCASE COUNT(*) IN query should stay on the direct counter path: {opcodes:?}"
         );
+    }
+
+    #[test]
+    fn test_count_composite_index_rowid_subquery_streams_first_key_runs() {
+        fn scalar_count(conn: &Connection, sql: &str) -> i64 {
+            let rows = conn.query(sql).unwrap();
+            match rows.as_slice() {
+                [row] => match row.values() {
+                    [SqliteValue::Integer(value)] => *value,
+                    values => panic!("expected one integer count, got {values:?}"),
+                },
+                rows => panic!("expected one count row, got {rows:?}"),
+            }
+        }
+
+        // Exact CASS schema/query shape: the only messages index is the
+        // UNIQUE(conversation_id, idx) autoindex, while the RHS is the complete,
+        // naturally ordered conversations rowid stream.  Deliberate orphans
+        // must be excluded exactly like the reference inner join.
+        let conn = Connection::open(":memory:").unwrap();
+        for sql in [
+            "PRAGMA foreign_keys = OFF;",
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL
+            );",
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                body TEXT,
+                UNIQUE(conversation_id, idx)
+            );",
+            "INSERT INTO conversations VALUES (1, 'one'), (2, 'two'), (4, 'four');",
+            "INSERT INTO messages VALUES
+                (1, 1, 0, 'a'),
+                (2, 1, 1, 'b'),
+                (3, 2, 0, 'c'),
+                (4, 3, 0, 'orphan'),
+                (5, 5, 0, 'orphan too');",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        let cass_sql = "SELECT COUNT(*)
+            FROM messages INDEXED BY sqlite_autoindex_messages_1
+            WHERE conversation_id IN (SELECT rowid FROM conversations)";
+        let reference_sql = "SELECT COUNT(*)
+            FROM messages AS m
+            INNER JOIN conversations AS c ON c.rowid = m.conversation_id";
+        assert_eq!(scalar_count(&conn, cass_sql), 3);
+        assert_eq!(
+            scalar_count(&conn, cass_sql),
+            scalar_count(&conn, reference_sql)
+        );
+
+        let prepared = conn.prepare(cass_sql).unwrap();
+        let ops = prepared.program.ops();
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::CountIndexEqRun),
+            "composite first-key semijoin should count duplicate runs: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "sqlite_autoindex_messages_1")
+            }),
+            "the exact forced composite autoindex should drive the outer stream: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name == "conversations")
+            }),
+            "the RHS conversations rowid source should be scanned directly: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name == "messages")
+            }),
+            "the covering composite-index counter must never open the messages table: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::OpenRead)
+                .count(),
+            2,
+            "only the outer index and RHS table should be opened: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op.opcode,
+                Opcode::OpenAutoindex | Opcode::Count | Opcode::AggStep | Opcode::AggFinal
+            )),
+            "the streaming counter must not materialize or enter generic aggregation: {ops:?}"
+        );
+
+        // Non-unique composite index, duplicate complete keys, nullable first
+        // keys, matching non-BINARY collation, and a descending trailing term.
+        // Only the first key controls the merge, so all of these are legitimate
+        // and NULL rows must be skipped before the integer comparison loop.
+        let nonunique = Connection::open(":memory:").unwrap();
+        for sql in [
+            "CREATE TABLE allowed_buckets (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                bucket_id INTEGER COLLATE NOCASE,
+                position INTEGER NOT NULL,
+                payload TEXT
+            );",
+            "CREATE INDEX idx_events_bucket_position
+                ON events(bucket_id COLLATE NOCASE, position DESC);",
+            "INSERT INTO allowed_buckets VALUES (1), (3);",
+            "INSERT INTO events VALUES
+                (1, NULL, 9, 'null'),
+                (2, 1, 5, 'a'),
+                (3, 1, 5, 'duplicate full key'),
+                (4, 2, 8, 'excluded'),
+                (5, 3, 7, 'b'),
+                (6, 3, 6, 'c');",
+        ] {
+            nonunique.execute(sql).unwrap();
+        }
+        let nonunique_sql = "SELECT COUNT(*)
+            FROM events INDEXED BY idx_events_bucket_position
+            WHERE bucket_id IN (SELECT rowid FROM allowed_buckets)";
+        let nonunique_reference = "SELECT COUNT(*)
+            FROM events AS e
+            INNER JOIN allowed_buckets AS b ON b.rowid = e.bucket_id";
+        assert_eq!(scalar_count(&nonunique, nonunique_sql), 4);
+        assert_eq!(
+            scalar_count(&nonunique, nonunique_sql),
+            scalar_count(&nonunique, nonunique_reference)
+        );
+        let nonunique_ops = nonunique.prepare(nonunique_sql).unwrap();
+        let nonunique_ops = nonunique_ops.program.ops();
+        assert!(
+            nonunique_ops
+                .iter()
+                .any(|op| op.opcode == Opcode::CountIndexEqRun),
+            "non-unique composite first-key runs should use the fused counter: {nonunique_ops:?}"
+        );
+        assert!(
+            nonunique_ops.iter().any(|op| op.opcode == Opcode::IsNull),
+            "nullable first keys need an explicit NULL skip: {nonunique_ops:?}"
+        );
+        assert!(
+            !nonunique_ops
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "matching NOCASE semantics must remain on the direct merge: {nonunique_ops:?}"
+        );
+
+        // The list/materialized-probe path deliberately remains single-key.
+        // Its `(key, min-rowid)` seek record is not a valid lower bound for a
+        // `(key, trailing-key, rowid)` composite index.
+        let list_sql = "SELECT COUNT(*)
+            FROM messages INDEXED BY sqlite_autoindex_messages_1
+            WHERE conversation_id IN (1, 2, 4, 6, 7, 8, 9, 10)";
+        assert_eq!(scalar_count(&conn, list_sql), 3);
+        let list_ops = explain_opcodes(&conn, list_sql);
+        assert!(
+            !list_ops
+                .iter()
+                .any(|op| op == "CountIndexEqRun" || op == "SeekGE"),
+            "composite IN-list must not enter the single-key probe-record path: {list_ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_count_composite_index_rowid_subquery_rejects_unsafe_index_shapes() {
+        let conn = Connection::open(":memory:").unwrap();
+        for sql in [
+            "CREATE TABLE probe_ids (id INTEGER PRIMARY KEY);",
+            "INSERT INTO probe_ids VALUES (1), (3);",
+            "CREATE TABLE desc_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_desc_items ON desc_items(k DESC, seq);",
+            "CREATE TABLE partial_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_partial_items ON partial_items(k, seq) WHERE seq >= 0;",
+            "CREATE TABLE expression_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_expression_items ON expression_items((k + 0), seq);",
+            "CREATE TABLE collated_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_collated_items ON collated_items(k, seq);",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        let rejected = [
+            "SELECT COUNT(*) FROM desc_items
+                WHERE k IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM partial_items
+                WHERE k IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM expression_items
+                WHERE (k + 0) IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM collated_items
+                WHERE k COLLATE NOCASE IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM collated_items NOT INDEXED
+                WHERE k IN (SELECT rowid FROM probe_ids)",
+        ];
+        for sql in rejected {
+            let opcodes = explain_opcodes(&conn, sql);
+            assert!(
+                !opcodes.iter().any(|op| op == "CountIndexEqRun"),
+                "unsafe DESC/expression/partial/collation/NOT INDEXED shape must decline the composite-run counter for `{sql}`: {opcodes:?}"
+            );
+        }
     }
 
     #[test]

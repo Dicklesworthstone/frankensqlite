@@ -2144,6 +2144,46 @@ pub fn codegen_select(
         );
     }
 
+    // A rowid-backed IN subquery over an indexed outer column can be lowered to
+    // a streaming semijoin that counts each equal first-key run in the outer
+    // index.  Route that proven shape before the planner directive: the planner
+    // currently models IN as a scan and an explicit INDEXED BY hint therefore
+    // otherwise commits us to the generic per-row membership program.  The
+    // extractor honors INDEXED BY/NOT INDEXED and admits a composite index only
+    // when the unique, ordered RHS rowid stream makes the merge path mandatory;
+    // list/materialized probes retain their single-key seek contract.
+    if simple_count_star {
+        let scan_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        if let Some((idx_schema, in_target)) = extract_count_indexed_in_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            &scan_ctx,
+            from_index_hint,
+        ) {
+            return codegen_select_count_star_indexed_in_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                out_regs,
+                done_label,
+                end_label,
+                idx_schema,
+                in_target,
+            );
+        }
+    }
+
     // bd-zqkrp: route a composite equality-prefix + trailing-range seek (`WHERE a = v AND b <range>`
     // on `index(a, b)`) BEFORE the planner directive. The planner reports this as an IndexRange
     // directive, but the single-column `index_range` local below is None for this shape, so the
@@ -2652,6 +2692,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             rowid_range,
+            from_index_hint,
         )
     } else if let Some(target_expr) = rowid_target {
         codegen_select_rowid_lookup(
@@ -5342,6 +5383,7 @@ fn codegen_select_count_star(
     done_label: crate::Label,
     end_label: crate::Label,
     rowid_range: Option<RowidRangeTarget<'_>>,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Result<(), CodegenError> {
     let scan_ctx = ScanCtx {
         cursor,
@@ -5367,9 +5409,14 @@ fn codegen_select_count_star(
             probe_target,
         );
     }
-    if let Some((idx_schema, in_target)) =
-        extract_count_indexed_in_target(where_clause, table, table_alias, schema, &scan_ctx)
-    {
+    if let Some((idx_schema, in_target)) = extract_count_indexed_in_target(
+        where_clause,
+        table,
+        table_alias,
+        schema,
+        &scan_ctx,
+        index_hint,
+    ) {
         return codegen_select_count_star_indexed_in_scan(
             b,
             cursor,
@@ -6130,6 +6177,11 @@ fn codegen_select_count_star_indexed_in_scan(
 
             b.resolve_label(align_outer);
             b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+            // NULL is never equal to a rowid probe.  Skip nullable leading
+            // index keys explicitly: comparison opcodes intentionally do not
+            // order NULL against an integer for SQL predicate purposes, so
+            // omitting this edge would strand the outer cursor on its NULL run.
+            b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Lt,
                 r_current_key,
@@ -6401,6 +6453,7 @@ fn codegen_select_count_star_indexed_in_scan(
 
         b.resolve_label(align_outer);
         b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
         b.emit_jump_to_label(
             Opcode::Lt,
             r_current_key,
@@ -24547,6 +24600,7 @@ fn extract_count_indexed_in_target<'a>(
     table_alias: Option<&'a str>,
     schema: &'a [TableSchema],
     scan_ctx: &ScanCtx<'a>,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Option<(&'a IndexSchema, CountIndexedInTarget<'a>)> {
     let expr = where_clause?;
     let Expr::In {
@@ -24560,44 +24614,56 @@ fn extract_count_indexed_in_target<'a>(
     };
 
     let column_name = column_name(operand, table, table_alias)?;
-    // All-index search for a single-column ascending index: `index_for_column` returns the first
-    // leading-column match, which may be a COMPOSITE `(col, …)` index declared before the single-column
-    // one; the `key_term_count() != 1` decline would then full-scan `COUNT(*) WHERE col IN (…)` whenever
-    // a composite `(col, …)` index shadows `idx_col` (bd-agg-range-shadowed-index, COUNT-IN mirror —
-    // reachable once the list reaches the once-materialized threshold and the per-value seek engages).
-    let idx_schema = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
-            && idx.key_term_count() == 1
-            && !idx.key_term_descending(0)
-            && idx
-                .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&column_name))
-    })?;
-    if !collation_names_equivalent(
-        effective_collation_ctx(operand, Some(scan_ctx)),
-        idx_schema.key_term_collation(0),
-    ) {
-        return None;
-    }
+    // Search all indexes so a composite leading-column match cannot shadow a
+    // later usable single-column index.  Composite indexes are safe only for
+    // the ordered semijoin below: the materialized/list fallback seeks with a
+    // two-field `(key, min-rowid)` record, whose physical contract is exactly a
+    // single-key index followed by rowid.
+    let find_index = |allow_composite: bool| {
+        table.indexes.iter().find(|idx| {
+            let matches_hint = match index_hint {
+                None => true,
+                Some(fsqlite_ast::IndexHint::IndexedBy(name)) => {
+                    idx.name.eq_ignore_ascii_case(name)
+                }
+                Some(fsqlite_ast::IndexHint::NotIndexed) => false,
+            };
+            matches_hint
+                && idx.supports_direct_column_lookup()
+                && (allow_composite || idx.key_term_count() == 1)
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&column_name))
+                && collation_names_equivalent(
+                    effective_collation_ctx(operand, Some(scan_ctx)),
+                    idx.key_term_collation(0),
+                )
+        })
+    };
 
     match set {
         InSet::List(values)
             if can_use_once_materialized_in_list(values, operand, Some(scan_ctx)) =>
         {
+            let idx_schema = find_index(false)?;
             Some((idx_schema, CountIndexedInTarget::List(values)))
         }
         InSet::Subquery(_) => {
             let probe_source = resolve_in_probe_source(set, schema)?;
-            if can_use_direct_count_indexed_in_subquery_probe_source(
-                table,
-                idx_schema,
-                &probe_source,
-                operand,
-                scan_ctx,
-            ) {
+            if let Some(idx_schema) = find_index(true).filter(|idx_schema| {
+                can_use_direct_count_indexed_in_subquery_probe_source(
+                    table,
+                    idx_schema,
+                    &probe_source,
+                    operand,
+                    scan_ctx,
+                )
+            }) {
                 Some((idx_schema, CountIndexedInTarget::ProbeSource(probe_source)))
             } else {
+                let idx_schema = find_index(false)?;
                 can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx)
                     .then_some((
                         idx_schema,
@@ -24607,6 +24673,7 @@ fn extract_count_indexed_in_target<'a>(
         }
         InSet::Table(_) => {
             let probe_source = resolve_in_probe_source(set, schema)?;
+            let idx_schema = find_index(false)?;
             can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx).then_some((
                 idx_schema,
                 CountIndexedInTarget::MaterializedProbeSource(probe_source),
@@ -25623,7 +25690,6 @@ fn can_use_direct_count_indexed_in_subquery_probe_source(
     matches!(probe_source.value, InProbeValue::Rowid)
         && can_use_once_materialized_in_probe_source(probe_source, operand, scan_ctx)
         && count_probe_source_can_skip_materialization(probe_source)
-        && extract_safe_probe_source_rowid_range(probe_source).is_some()
         && count_exists_semijoin_merge_is_safe(table, idx_schema, probe_source)
 }
 
@@ -30283,17 +30349,50 @@ mod tests {
             "indexed residual path must not full-scan the table"
         );
 
-        // Shapes the direct rowid seek MUST decline — each must fall back to a
-        // Rewind/Next scan so the scan's correct semantics apply. `id = -5` parses as
-        // unary-negate over an integer literal (not `Literal::Integer`), so it declines
-        // too; optimizing negative rowids is a clean follow-up, and the differential
-        // oracle confirms the scan is correct.  The residual case uses unindexed `v`
-        // so no independent index path can legitimately claim it.
+        // Non-integer literal constants use the newer exact-or-reject rowid
+        // probe: MustBeInt converts values such as '2' losslessly and jumps to
+        // aggregate finalization for a non-integral real such as 2.5.  Both
+        // shapes avoid a table scan, as covered by agg_rowid_eq_coerced_oracle.
         for sql in [
             "SELECT SUM(v) FROM t WHERE id = 2.5",
             "SELECT SUM(v) FROM t WHERE id = '2'",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::MustBeInt),
+                "`{sql}` must coerce the rowid probe exactly"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "`{sql}` must use the exact-or-reject rowid probe"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must not scan after exact-or-reject coercion"
+            );
+        }
+
+        // A rowid equality with an unindexed residual still probes the unique
+        // row directly and re-applies the full predicate before AggStep.
+        let residual_ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE id = 2 AND v = '3'");
+        assert!(
+            residual_ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "rowid equality plus residual must still use the unique rowid probe"
+        );
+        assert!(
+            residual_ops.iter().any(|op| op.opcode == Opcode::AggStep),
+            "rowid equality plus residual must retain aggregate accumulation"
+        );
+        assert!(
+            !residual_ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "rowid equality plus residual must not scan the table"
+        );
+
+        // Shapes the direct rowid seek still MUST decline. `id = -5` parses as
+        // unary-negate over an integer literal (not a simple constant), while
+        // NOT INDEXED explicitly retains the scan contract.
+        for sql in [
             "SELECT SUM(v) FROM t WHERE id = -5",
-            "SELECT SUM(v) FROM t WHERE id = 2 AND v = '3'",
             "SELECT SUM(v) FROM t NOT INDEXED WHERE id = 2",
         ] {
             let ops = bd_2dgf5_program(sql);
@@ -37524,9 +37623,15 @@ mod tests {
             unreachable!("fixture should include a WHERE clause");
         };
 
-        let extracted =
-            extract_count_indexed_in_target(Some(where_clause), table, None, &schema, &scan_ctx)
-                .expect("indexed IN target should match");
+        let extracted = extract_count_indexed_in_target(
+            Some(where_clause),
+            table,
+            None,
+            &schema,
+            &scan_ctx,
+            None,
+        )
+        .expect("indexed IN target should match");
 
         assert_eq!(extracted.0.name, "idx_t_b");
         match extracted.1 {
@@ -37576,8 +37681,15 @@ mod tests {
         };
 
         assert!(
-            extract_count_indexed_in_target(Some(&where_expr), table, None, &schema, &scan_ctx)
-                .is_none(),
+            extract_count_indexed_in_target(
+                Some(&where_expr),
+                table,
+                None,
+                &schema,
+                &scan_ctx,
+                None,
+            )
+            .is_none(),
             "count(*) indexed-IN fast path must reject indexes whose collation does not match the probe semantics"
         );
     }
