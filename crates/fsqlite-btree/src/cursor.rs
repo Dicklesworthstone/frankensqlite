@@ -2328,7 +2328,10 @@ impl<P: PageReader> BtCursor<P> {
         probe_value: i64,
     ) -> Result<FirstIndexKeyIntegerLocalRunSegment> {
         enum LocalRunScanOutcome {
-            MatchedAll(i64),
+            MatchedAll {
+                matched: i64,
+                last_cell_idx: Option<u16>,
+            },
             MatchedCurrent(i64),
             Mismatch {
                 matched: i64,
@@ -2359,6 +2362,7 @@ impl<P: PageReader> BtCursor<P> {
                     let page = top.page_data.as_bytes();
                     let cell_pointers = &top.cell_pointers;
                     let mut matched = 0_i64;
+                    let mut last_matched_cell_idx = None;
                     let mut outcome = None;
 
                     for idx in start_idx..cell_count {
@@ -2380,6 +2384,7 @@ impl<P: PageReader> BtCursor<P> {
                         )? {
                             Some(value) if value == probe_value => {
                                 matched = matched.wrapping_add(1);
+                                last_matched_cell_idx = Some(idx);
                             }
                             Some(current_value) => {
                                 outcome = Some(LocalRunScanOutcome::Mismatch {
@@ -2399,7 +2404,10 @@ impl<P: PageReader> BtCursor<P> {
                         }
                     }
 
-                    outcome.unwrap_or(LocalRunScanOutcome::MatchedAll(matched))
+                    outcome.unwrap_or(LocalRunScanOutcome::MatchedAll {
+                        matched,
+                        last_cell_idx: last_matched_cell_idx,
+                    })
                 } else if page_type.is_table() {
                     LocalRunScanOutcome::NeedsFallback {
                         matched: 0,
@@ -2424,8 +2432,28 @@ impl<P: PageReader> BtCursor<P> {
             };
 
             match scan_outcome {
-                LocalRunScanOutcome::MatchedAll(matched)
-                | LocalRunScanOutcome::MatchedCurrent(matched) => {
+                LocalRunScanOutcome::MatchedAll {
+                    matched,
+                    last_cell_idx,
+                } => {
+                    // The local fast lane inspected every cell from the
+                    // cursor's starting slot through the end of this leaf.
+                    // Position the cursor on the final consumed cell before
+                    // advancing.  Leaving it on the starting slot makes the
+                    // next iteration rescan the suffix and turns a run of N
+                    // equal keys into the triangular sum N+(N-1)+...+1.
+                    if let Some(last_cell_idx) = last_cell_idx {
+                        self.stack
+                            .last_mut()
+                            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+                            .cell_idx = last_cell_idx;
+                    }
+                    matched_total = matched_total.wrapping_add(matched);
+                    if !self.advance_next(cx)? {
+                        return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
+                    }
+                }
+                LocalRunScanOutcome::MatchedCurrent(matched) => {
                     matched_total = matched_total.wrapping_add(matched);
                     if !self.advance_next(cx)? {
                         return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));

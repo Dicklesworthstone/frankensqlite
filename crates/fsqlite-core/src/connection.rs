@@ -164498,6 +164498,125 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_count_composite_index_rowid_subquery_counts_each_run_once_file_backed() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        let conn = Connection::open(path).unwrap();
+        for sql in [
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                body TEXT,
+                UNIQUE(conversation_id, idx)
+            );",
+            "INSERT INTO conversations VALUES (1, 'one');",
+            "INSERT INTO messages VALUES
+                (1, 1, 0, 'zero'),
+                (2, 1, 1, 'one'),
+                (3, 1, 2, 'two'),
+                (4, 1, 3, 'three'),
+                (5, 1, 4, 'four');",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        let sql = "SELECT COUNT(*)
+            FROM messages INDEXED BY sqlite_autoindex_messages_1
+            WHERE conversation_id IN (SELECT rowid FROM conversations)";
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(
+            rows[0].values,
+            vec![SqliteValue::Integer(5)],
+            "a five-row equality run must contribute five, not the triangular sum fifteen"
+        );
+
+        let opcodes = explain_opcodes(&conn, sql);
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| opcode.as_str() == "CountIndexEqRun")
+                .count(),
+            1,
+            "the merge program should contain one fused run counter: {opcodes:?}"
+        );
+        let count_pos = first_opcode_position(&opcodes, "CountIndexEqRun").unwrap();
+        assert_eq!(
+            opcodes.get(count_pos + 1).map(String::as_str),
+            Some("IfNullRow"),
+            "the run counter must test its advanced outer cursor before moving the probe source: {opcodes:?}"
+        );
+    }
+
+    #[test]
+    fn test_temp_sparse_ipk_driver_join_preserves_all_parameterized_values() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages
+             USING fts5(body, content='');",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO fts_messages(rowid, body) VALUES (1, 'seed');")
+            .unwrap();
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS cass_fts_repair_probe_ids(
+                id INTEGER PRIMARY KEY
+            );",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM cass_fts_repair_probe_ids;")
+            .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO cass_fts_repair_probe_ids(id) VALUES(?1),(?2);",
+            &[SqliteValue::Integer(1_000_000), SqliteValue::Integer(1)],
+        )
+        .unwrap();
+        for rowid in [500_000_i64, 1_000_000] {
+            conn.execute_with_params(
+                "INSERT INTO fts_messages_docsize(id, sz)
+                 SELECT ?1, sz FROM fts_messages_docsize WHERE id = ?2;",
+                &[SqliteValue::Integer(rowid), SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        }
+
+        let requested = conn
+            .query("SELECT id FROM cass_fts_repair_probe_ids ORDER BY id;")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested,
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1_000_000)],
+            "the parameterized multi-row VALUES insert must preserve both sparse IPKs"
+        );
+
+        let mut joined = conn
+            .query(
+                "SELECT f.id
+                 FROM cass_fts_repair_probe_ids AS requested
+                 INNER JOIN fts_messages_docsize AS f ON f.id = requested.id;",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| match row.values[0] {
+                SqliteValue::Integer(value) => value,
+                ref other => panic!("expected integer FTS shadow rowid, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        joined.sort_unstable();
+        assert_eq!(
+            joined,
+            vec![1, 1_000_000],
+            "the sparse TEMP-IPK repair driver must find every requested FTS shadow row"
+        );
+    }
+
+    #[test]
     fn test_count_composite_index_rowid_subquery_rejects_unsafe_index_shapes() {
         let conn = Connection::open(":memory:").unwrap();
         for sql in [
