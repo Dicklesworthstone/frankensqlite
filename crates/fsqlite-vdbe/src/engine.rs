@@ -1726,7 +1726,7 @@ impl ConcurrentContext {
 /// Shared wrapper around a boxed [`TransactionHandle`] so multiple
 /// storage cursors can share one transaction.
 ///
-/// Optionally includes [`ConcurrentContext`] for MVCC page-level locking
+/// Optionally includes a `ConcurrentContext` for MVCC page-level locking
 /// (bd-kivg / 5E.2).
 #[derive(Clone)]
 pub struct SharedTxnPageIo {
@@ -7360,7 +7360,7 @@ impl VdbeEngine {
     /// Like [`set_transaction`](Self::set_transaction), but also enables
     /// MVCC page-level locking for concurrent writers. When the concurrent
     /// context is present:
-    /// - Write operations acquire page-level locks via [`concurrent_write_page`]
+    /// - Write operations acquire page-level locks via [`fsqlite_mvcc::concurrent_write_page`]
     /// - Written pages are recorded in the write set for FCW validation at commit
     pub fn set_transaction_concurrent(
         &mut self,

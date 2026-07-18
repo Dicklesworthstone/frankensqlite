@@ -219,7 +219,7 @@ impl CellResolve {
 /// - `commit_seq`: 8 bytes
 /// - `created_by`: 16 bytes (TxnToken = TxnId + TxnEpoch)
 /// - `kind`: 1 byte (+ padding)
-/// - `prev_idx`: 8 bytes (Option<CellDeltaIdx>)
+/// - `prev_idx`: 8 bytes (`Option<CellDeltaIdx>`)
 /// - `cell_data`: Variable (typically 50-200 bytes for a row)
 /// - `page_number`: 4 bytes (for materialization)
 /// - Estimated total: ~40 bytes fixed + cell_data

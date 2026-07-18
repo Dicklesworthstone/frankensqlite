@@ -13,7 +13,7 @@
 //! 2. [`ensure_db_fsync_before_wal_truncate`] — insists on an explicit full
 //!    fsync of the database file before any WAL truncate. Callers that only
 //!    had `fdatasync` coverage previously must upgrade. See
-//!    [`checkpoint_executor::execute_checkpoint`].
+//!    [`crate::execute_checkpoint`].
 //! 3. [`PidOwnedLockRegistry`] — lightweight PID tracker that pairs every
 //!    lock acquisition with the owning PID and exposes
 //!    `release_dead_pid_locks` for recovery start-up. Uses the `/proc`-based
@@ -140,7 +140,7 @@ impl RecoveryFence {
         self.acquire_for_recovery_with(RECOVERY_FENCE_MAX_RETRIES, RECOVERY_FENCE_BACKOFF)
     }
 
-    /// Version of [`acquire_for_recovery`] with a caller-provided budget.
+    /// Version of [`Self::acquire_for_recovery`] with a caller-provided budget.
     ///
     /// Used by tests to keep wall-clock time small.
     pub fn acquire_for_recovery_with(

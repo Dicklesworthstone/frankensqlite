@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
-## [0.1.17] -- 2026-07-17 (B-tree corruption and join-correctness fixes)
+## [0.1.17] -- 2026-07-18 (B-tree corruption and join-correctness fixes)
 
 Full-workspace lockstep release (`0.1.16 -> 0.1.17`). Semver-compatible 0.1.x;
 no breaking API changes.

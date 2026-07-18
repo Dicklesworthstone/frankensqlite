@@ -76,7 +76,8 @@ for line in "${required_profile_lines[@]}"; do
     fi
 done
 
-metadata_json="$(mktemp)"
+metadata_json="${REPORT_DIR}/${RUN_ID}-cargo-metadata.json"
+# shellcheck disable=SC2317 # Invoked indirectly by the EXIT trap below.
 cleanup() {
     local exit_code=$?
     if [[ ${exit_code} -eq 0 ]]; then
@@ -84,7 +85,6 @@ cleanup() {
     else
         emit_schema_event "report" "fail" "fail"
     fi
-    rm -f "${metadata_json}"
 }
 trap cleanup EXIT
 

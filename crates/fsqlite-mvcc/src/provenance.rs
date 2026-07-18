@@ -118,7 +118,7 @@ impl fmt::Display for TupleId {
 ///   - `Plus(a, b)` is alternative derivation: a + b
 ///   - `Times(a, b)` is combined contribution: a * b
 ///
-/// This corresponds to the polynomial semiring N[X] from Green et al. 2007.
+/// This corresponds to the polynomial semiring `N[X]` from Green et al. 2007.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub enum ProvenanceToken {
     /// Additive identity: this value was not produced.

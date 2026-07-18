@@ -12,9 +12,10 @@
 //!
 //! # Auto-Bisect Hooks
 //!
-//! When a regression is detected (gate failure that is not a flake), the [`AutoBisectHook`]
-//! produces a [`BisectRequest`] with the commit range, deterministic replay seed, and
-//! failing gate identifier. CI can consume this to trigger automated bisection.
+//! When a regression is detected (gate failure that is not a flake), the
+//! [`AutoBisectConfig`] policy and dispatcher produce a [`BisectRequest`] with
+//! the commit range, deterministic replay seed, and failing gate identifier.
+//! CI can consume this to trigger automated bisection.
 //!
 //! # Artifact Publication
 //!

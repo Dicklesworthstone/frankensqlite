@@ -1,7 +1,8 @@
 //! Automatic mismatch minimizer and canonical signature pipeline (bd-1dp9.2.3).
 //!
-//! Given a failing differential test (a [`DifferentialResult`] or
-//! [`MetamorphicTestCase`] that diverges), this module:
+//! Given a failing differential test (a
+//! [`crate::differential_v2::DifferentialResult`] or
+//! [`crate::metamorphic::MetamorphicTestCase`] that diverges), this module:
 //!
 //! 1. **Minimizes** the workload to the smallest subset of SQL statements
 //!    that still reproduces the divergence (delta debugging).

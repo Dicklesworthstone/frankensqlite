@@ -1,7 +1,7 @@
 //! Concrete single-writer pager for Phase 5 persistence.
 //!
 //! `SimplePager` implements [`MvccPager`] with single-writer semantics over a
-//! VFS-backed database file and a zero-copy [`PageCache`].
+//! VFS-backed database file and a zero-copy [`ShardedPageCache`].
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
 #[cfg(target_arch = "x86_64")]
@@ -7618,9 +7618,9 @@ where
     /// Like [`open_with_cx`](Self::open_with_cx) but allows overriding the
     /// page-buffer-pool ceiling.
     ///
-    /// `page_buffer_max` is resolved via [`resolve_page_buffer_max`]: `Some(n)`
+    /// `page_buffer_max` is resolved via [`crate::resolve_page_buffer_max`]: `Some(n)`
     /// uses that value directly, `None` checks the `FSQLITE_PAGE_BUFFER_MAX`
-    /// env var, then falls back to [`DEFAULT_PAGE_BUFFER_MAX`] (262 144).
+    /// env var, then falls back to [`crate::DEFAULT_PAGE_BUFFER_MAX`] (262 144).
     #[allow(clippy::too_many_lines)]
     pub fn open_with_cx_and_page_buffer_max(
         cx: &Cx,
@@ -8185,7 +8185,7 @@ where
 
     /// Open a database in true read-only mode for fast analytical queries.
     ///
-    /// Unlike [`open_with_cx`], this:
+    /// Unlike [`Self::open_with_cx`], this:
     /// - Opens the file with `READONLY` VFS flags (no write lock acquisition)
     /// - Skips journal recovery (read-only connections cannot replay journals)
     /// - Skips freelist traversal (not needed for read-only queries)
@@ -13605,7 +13605,7 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
 
 /// A checkpoint page writer that writes pages directly to the database file.
 ///
-/// This type implements [`CheckpointPageWriter`] and is used during WAL
+/// This type implements [`crate::CheckpointPageWriter`] and is used during WAL
 /// checkpointing to transfer committed pages from the WAL back to the main
 /// database file.
 ///
@@ -13791,7 +13791,7 @@ where
 {
     /// Create a checkpoint page writer for WAL checkpointing.
     ///
-    /// The returned writer implements [`CheckpointPageWriter`] and can be
+    /// The returned writer implements [`crate::CheckpointPageWriter`] and can be
     /// wrapped in a `CheckpointTargetAdapter` from `fsqlite-core` to satisfy
     /// the WAL executor's `CheckpointTarget` trait.
     ///

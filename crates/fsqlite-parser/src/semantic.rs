@@ -170,7 +170,7 @@ impl Schema {
         }
     }
 
-    /// Look up a table by a scope lookup key produced by [`table_lookup_key`].
+    /// Look up a table by a scope lookup key produced by `table_lookup_key`.
     #[must_use]
     pub fn find_table_by_lookup_key(&self, lookup_key: &str) -> Option<&TableDef> {
         if let Some((schema_name, table_name)) = lookup_key.split_once('\0') {

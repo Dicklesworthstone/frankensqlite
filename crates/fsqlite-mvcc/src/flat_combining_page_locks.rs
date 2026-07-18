@@ -44,7 +44,7 @@
 //! between publication and result retrieval. A caller's `Cx` cancellation
 //! does not interrupt the spin: by construction, the combiner has at most
 //! `MAX_FC_SLOTS` pending requests and drains them in a bounded number of
-//! iterations. If a caller drops their [`FcPageLockGuard`] without polling
+//! iterations. If a caller drops their `FcPageLockGuard` without polling
 //! the result, the slot remains marked `CANCELLED`; the combiner recognises
 //! the marker, skips the request, and clears the slot. No data is lost and
 //! no new lock is installed on a cancelled request.

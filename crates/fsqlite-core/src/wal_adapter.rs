@@ -5,7 +5,7 @@
 //!
 //! - [`WalBackendAdapter`] wraps `WalFile` to satisfy the pager's
 //!   [`WalBackend`] trait (pager -> WAL direction).
-//! - [`CheckpointTargetAdapterRef`] wraps `CheckpointPageWriter` to satisfy the
+//! - `CheckpointTargetAdapterRef` wraps `CheckpointPageWriter` to satisfy the
 //!   WAL executor's [`CheckpointTarget`] trait (WAL -> pager direction).
 
 use std::collections::{HashMap, HashSet};

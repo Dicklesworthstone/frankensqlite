@@ -527,11 +527,11 @@ fn run_unix_same_process_lock_probe() -> Result<String, String> {
     let reserved_seen = file_b
         .check_reserved_lock(&cx)
         .map_err(|error| format!("unix_probe_reserved_probe_failed error={error}"))?;
-    // check_reserved_lock reports whether another process holds RESERVED; our own reservation
-    // should stay invisible here even though the VFS still rejects a second same-process
-    // reserver through inode-level bookkeeping.
-    if reserved_seen {
-        return Err("unix_probe_unexpected_reserved_lock_visibility_same_process".to_owned());
+    // SQLite's xCheckReservedLock contract is connection-relative: a different handle must
+    // observe the reservation even when both handles live in this process. The reserving
+    // handle itself remains exempt, which the Unix VFS unit tests verify directly.
+    if !reserved_seen {
+        return Err("unix_probe_reserved_lock_not_visible_same_process".to_owned());
     }
 
     file_b

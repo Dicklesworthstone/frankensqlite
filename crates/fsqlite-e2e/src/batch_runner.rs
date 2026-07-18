@@ -45,7 +45,7 @@ pub struct BatchConfig {
     /// Preset names from [`oplog::preset_catalog()`].  Empty means "all".
     pub preset_names: Vec<String>,
     /// Concurrency levels to sweep.  Empty means use each preset's
-    /// [`ConcurrencySweep::worker_counts`].
+    /// [`field@crate::oplog::ConcurrencySweep::worker_counts`].
     pub concurrency_levels: Vec<u16>,
     /// Seeds for deterministic replay.
     pub seeds: Vec<u64>,

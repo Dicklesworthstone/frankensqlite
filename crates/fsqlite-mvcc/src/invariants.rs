@@ -1285,7 +1285,7 @@ impl VersionStore {
     /// Compute the average version chain length for GC pressure estimation.
     ///
     /// Samples up to `sample_limit` pages from the chain heads and returns the
-    /// mean chain length. This is used by [`GcScheduler`] to derive the GC
+    /// mean chain length. This is used by [`crate::GcScheduler`] to derive the GC
     /// invocation frequency.
     ///
     /// Returns 0.0 if no pages exist.

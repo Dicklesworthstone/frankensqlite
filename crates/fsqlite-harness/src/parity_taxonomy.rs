@@ -20,7 +20,7 @@
 //!
 //! # Determinism
 //!
-//! [`FeatureUniverse::features()`] returns features in a deterministic order
+//! The [`field@FeatureUniverse::features`] map stores features in deterministic order
 //! (sorted by [`FeatureId`]). All scoring arithmetic uses `f64` with no
 //! platform-dependent rounding; scores are truncated to 6 decimal places via
 //! [`truncate_score`] for cross-platform reproducibility.

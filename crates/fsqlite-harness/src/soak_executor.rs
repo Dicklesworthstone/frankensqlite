@@ -367,7 +367,8 @@ impl Default for SoakFaultConfig {
 
 /// Deterministic soak executor that drives workloads and probes invariants.
 ///
-/// The executor is single-threaded and deterministic. Each call to [`run_step`]
+/// The executor is single-threaded and deterministic. Each call to
+/// [`SoakExecutor::run_step`]
 /// simulates one transaction and advances the internal state. Invariant probes
 /// are triggered at intervals defined by the [`SoakWorkloadSpec`].
 pub struct SoakExecutor {

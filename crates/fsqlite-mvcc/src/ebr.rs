@@ -217,8 +217,8 @@ impl std::fmt::Display for EbrMetricsSnapshot {
 ///
 /// When a version chain for a page exceeds this cap with at least one pinned
 /// reader holding an older `commit_seq`, the MVCC layer force-aborts the
-/// pinned reader via [`VersionGuardRegistry::mark_force_abort`] and surfaces a
-/// [`MvccError::StaleReaderForceAborted`] error on the reader's next access.
+/// pinned reader via [`VersionGuardRegistry::mark_force_abort`], making the
+/// force-abort status observable on the reader's next access.
 /// This prevents the OOM failure mode documented in `bd-wt4uu` (unbounded
 /// version-chain growth under long-lived readers at 3am prod load).
 pub const DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE: usize = 4096;
@@ -234,7 +234,7 @@ pub struct StaleReaderConfig {
     /// stale reader still pins an older `commit_seq`.
     ///
     /// When exceeded, the offending reader is force-aborted rather than
-    /// letting the chain grow to OOM. See [`bd-wt4uu`] design doc.
+    /// letting the chain grow to OOM. See the `bd-wt4uu` design doc.
     pub max_pending_versions_per_page: usize,
 }
 
@@ -656,7 +656,7 @@ impl Drop for VersionGuard {
 ///
 /// Unlike [`VersionGuard`], a ticket does not hold a thread-local
 /// `crossbeam-epoch::Guard`.  This makes it `Send + Sync` so it can live
-/// inside a [`Transaction`] that may be moved between threads (async
+/// inside a [`crate::Transaction`] that may be moved between threads (async
 /// workloads, thread pools, etc.).
 ///
 /// Stale-reader detection and epoch-advancement tracking still work because the

@@ -6882,7 +6882,7 @@ impl<'a> Fts5ShadowQuery<'a> {
     }
 
     /// Public entry point preserved for callers; the actual ranked-search
-    /// engine lives once on [`Fts5DoclistProvider::search_with_weights`].
+    /// engine lives once on `Fts5DoclistProvider::search_with_weights`.
     pub fn search_queries_with_weights(
         &self,
         queries: &[&str],
@@ -7024,7 +7024,7 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
 /// whole in-memory inverted index on every connection.
 ///
 /// It shares the entire ranked-search engine (boolean/phrase/NEAR evaluation,
-/// column filters, BM25) with [`Fts5ShadowQuery`] via [`Fts5DoclistProvider`],
+/// column filters, BM25) with [`Fts5ShadowQuery`] via `Fts5DoclistProvider`,
 /// so a reopened on-disk index returns IDENTICAL rowids, ordering, and scores to
 /// the in-memory path — only the doclist primitives differ (on-demand segment
 /// reads vs. an in-memory row set).
@@ -8074,7 +8074,7 @@ impl Fts5Table {
     ///
     /// `new_docs` are the `(rowid, post-rowid column args)` pairs for the rows
     /// the current INSERT added — the same `args[2..]` the vtable `update` saw,
-    /// decoded identically via [`Self::decode_column_values`]. Only those rows
+    /// decoded identically via `Self::decode_column_values`. Only those rows
     /// are tokenized, so the work is O(new rows) instead of the full
     /// re-encode's O(table); a batch rebuild is then O(table) overall instead
     /// of O(table^2), which is the root cause of the cass#301 `index --full`

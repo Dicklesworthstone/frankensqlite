@@ -1239,7 +1239,7 @@ pub(crate) static GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK: LazyLock<std::sync::Mu
 ///
 /// This struct manages the FILLING→FLUSHING→COMPLETE state machine.
 /// It is designed to be held behind a `Mutex` and accessed by concurrent
-/// writers through [`GroupCommitQueue`].
+/// writers through `GroupCommitQueue`.
 #[derive(Debug)]
 pub struct GroupCommitConsolidator {
     /// Current consolidation phase.

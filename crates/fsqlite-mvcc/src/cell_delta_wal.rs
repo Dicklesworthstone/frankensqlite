@@ -40,7 +40,7 @@
 //! During WAL recovery:
 //! 1. Read frame marker word
 //! 2. Full-page frames: apply directly to page cache (existing path)
-//! 3. Cell-delta frames: insert into [`CellVisibilityLog`], then materialize affected pages
+//! 3. Cell-delta frames: insert into [`crate::CellVisibilityLog`], then materialize affected pages
 //!
 //! # Checkpoint Integration
 //!
@@ -48,7 +48,7 @@
 //! 1. Materialize all pages with outstanding cell deltas
 //! 2. Write full page images to main DB file
 //! 3. Truncate WAL (clears both frame types)
-//! 4. Clear [`CellVisibilityLog`] for checkpointed pages
+//! 4. Clear [`crate::CellVisibilityLog`] for checkpointed pages
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId};

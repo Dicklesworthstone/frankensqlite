@@ -2345,7 +2345,7 @@ pub fn rows_have_identical_serial_types(rows: &[&[SqliteValue]]) -> bool {
 /// Homogeneous-batch fast path for `encode_batch`.
 ///
 /// Returns `None` if the batch is heterogeneous, empty, or below the
-/// size threshold [`ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS`]. Otherwise
+/// size threshold `ENCODE_BATCH_HOMOGENEOUS_MIN_ROWS`. Otherwise
 /// computes the record header ONCE and `memcpy`s it into every row
 /// slot, then writes each row's body bytes in a tight loop amenable
 /// to auto-vectorization.
@@ -2458,7 +2458,7 @@ pub fn encode_batch_auto(rows: &[&[SqliteValue]]) -> fsqlite_error::Result<Vec<u
 
 /// Decode a value from its serial type and raw bytes.
 ///
-/// Public so that [`RecordOffsetTable`] consumers can perform lazy
+/// Public so that record-offset-table consumers can perform lazy
 /// per-column decoding without re-parsing the header.
 #[allow(clippy::cast_possible_truncation)]
 pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Option<SqliteValue> {

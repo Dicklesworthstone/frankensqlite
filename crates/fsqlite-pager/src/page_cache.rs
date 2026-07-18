@@ -810,7 +810,7 @@ impl PageCache {
     /// Create a new, empty `PageCache` configured for the given `page_size`.
     ///
     /// The buffer-pool ceiling is determined by
-    /// [`resolve_page_buffer_max(None)`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
+    /// [`resolve_page_buffer_max`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
     /// environment variable if set, otherwise [`DEFAULT_PAGE_BUFFER_MAX`]
     /// (262 144 buffers ≈ 1 GiB at 4 KiB pages).
     pub fn new(page_size: PageSize) -> Self {
@@ -2288,8 +2288,9 @@ impl std::fmt::Debug for PageCacheShard {
 /// # Single-Connection Fast Path (bd-fzr07)
 ///
 /// For single-connection `:memory:` workloads, the cache can use a flat
-/// [`FastPageArray`] that provides O(1) page access via direct Vec indexing.
-/// Enable with [`new_single_connection`] or [`enable_fast_path`].
+/// `FastPageArray` that provides O(1) page access via direct Vec indexing.
+/// Enable with [`ShardedPageCache::new_single_connection`] or
+/// [`ShardedPageCache::enable_fast_path`].
 ///
 /// # Thread Safety
 ///
@@ -2350,11 +2351,11 @@ impl ShardedPageCache {
     /// Create a new sharded page cache with the given page size.
     ///
     /// The buffer-pool ceiling is determined by
-    /// [`resolve_page_buffer_max(None)`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
+    /// [`resolve_page_buffer_max`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
     /// environment variable if set, otherwise [`DEFAULT_PAGE_BUFFER_MAX`]
     /// (262 144 buffers ≈ 1 GiB at 4 KiB pages).
     ///
-    /// For single-connection `:memory:` workloads, prefer [`new_single_connection`]
+    /// For single-connection `:memory:` workloads, prefer [`Self::new_single_connection`]
     /// which enables the fast-path flat array (bd-fzr07).
     pub fn new(page_size: PageSize) -> Self {
         Self::with_max_buffers_and_shards(
@@ -3274,7 +3275,7 @@ impl ShardedPageCache {
 
     /// Evict one clean pool-backed cache page and return its buffer to the
     /// free list. Callers that immediately need the allocation should prefer
-    /// [`Self::take_clean_buffer`] to avoid a free-list race.
+    /// `Self::take_clean_buffer` to avoid a free-list race.
     pub fn evict_clean_any(&self) -> bool {
         self.take_clean_buffer().is_some()
     }

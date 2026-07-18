@@ -515,7 +515,7 @@ impl Expr {
 /// where the same logical expression is parsed from different source texts.
 ///
 /// SQL identifiers and function names are case-insensitive, so comparisons of
-/// [`FunctionCall::name`] and [`Collate::collation`] use
+/// `FunctionCall::name` and `Collate::collation` use
 /// `eq_ignore_ascii_case` rather than byte-exact equality.  Column and table
 /// names in [`ColumnRef`] are compared via the derived `PartialEq` on that
 /// struct, which is currently case-sensitive — this is a known limitation but

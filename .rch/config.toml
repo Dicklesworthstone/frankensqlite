@@ -8,7 +8,12 @@
 exclude_patterns = [
     "*.rlib",
     "*.rmeta",
-    ".beads/",
+    # Keep the tracked issue ledger available: several compliance tests read
+    # .beads/issues.jsonl.  Exclude only Beads' mutable runtime state.
+    ".beads/.br_recovery/",
+    ".beads/.write.lock",
+    ".beads/beads.db",
+    ".beads/beads.db-*",
     ".bun/",
     ".rch-target-*/",
     ".rch-target*/",

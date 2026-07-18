@@ -19,7 +19,7 @@
 //!
 //! # Size discipline
 //!
-//! Row-level diffs are capped at [`MAX_DIFF_ROWS`] per table to prevent
+//! Row-level diffs are capped at `MAX_DIFF_ROWS` per table to prevent
 //! multi-gigabyte bundles.  Full working copies are omitted by default but
 //! can be included via [`BundleConfig::include_working_copies`].
 

@@ -14,16 +14,16 @@
 //!   perf-update-delete 1280 1000 delete fsqlite exact-gate
 //!
 //! Arguments:
-//!   [rows]   Number of rows to pre-populate (default 10_000)
-//!   [iters]  Number of outer iterations for profiling (default 10)
-//!   [which]  "update" | "delete" | "both" (default "both")
-//!   [engine] "fsqlite" | "sqlite" | "compare" (default "fsqlite")
-//!   [mode]   "standard" | "isolated" | "rollback-isolated" | "sparse-isolated" | "exact-gate" (default "standard")
+//!   `[rows]`   Number of rows to pre-populate (default 10_000)
+//!   `[iters]`  Number of outer iterations for profiling (default 10)
+//!   `[which]`  "update" | "delete" | "both" (default "both")
+//!   `[engine]` "fsqlite" | "sqlite" | "compare" (default "fsqlite")
+//!   `[mode]`   "standard" | "isolated" | "rollback-isolated" | "sparse-isolated" | "exact-gate" (default "standard")
 //!
 //! Environment:
 //!   FSQLITE_BENCH_PROFILE_DML=1       Print fsqlite hot-path counters for each measured DML window.
-//!   FSQLITE_BENCH_PERF_CTL=<fifo>      Enable/disable an attached perf session around exact DML windows.
-//!   FSQLITE_BENCH_PERF_ACK=<fifo>      Wait for perf control acknowledgements before crossing each boundary.
+//!   FSQLITE_BENCH_PERF_CTL=`<fifo>`      Enable/disable an attached perf session around exact DML windows.
+//!   FSQLITE_BENCH_PERF_ACK=`<fifo>`      Wait for perf control acknowledgements before crossing each boundary.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
