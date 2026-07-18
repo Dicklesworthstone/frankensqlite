@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite"
-version = "0.1.17"
+version = "0.1.18"
 description = "Public API facade"
 edition.workspace = true
 license-file.workspace = true
@@ -11,8 +11,8 @@ rust-version.workspace = true
 asupersync = { workspace = true, optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-core = { version = "0.1.17", path = "../fsqlite-core", default-features = false }
-fsqlite-vfs = { version = "0.1.17", path = "../fsqlite-vfs", default-features = false }
+fsqlite-core = { version = "0.1.18", path = "../fsqlite-core", default-features = false }
+fsqlite-vfs = { version = "0.1.18", path = "../fsqlite-vfs", default-features = false }
 fsqlite-ext-json = { workspace = true, optional = true }
 fsqlite-ext-fts5 = { workspace = true, optional = true }
 fsqlite-ext-fts3 = { workspace = true, optional = true }

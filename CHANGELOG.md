@@ -17,6 +17,38 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.18] -- 2026-07-18 (streaming composite-index count semijoins)
+
+Full-workspace lockstep release (`0.1.17 -> 0.1.18`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Performance
+
+- `COUNT(*)` over an indexed outer column and a complete, ordered rowid
+  subquery now streams both inputs as a merge semijoin and counts equal
+  first-key index runs with `CountIndexEqRun`. The fast path supports safe
+  composite indexes such as `UNIQUE(conversation_id, idx)`, avoids opening the
+  covered table, and eliminates both automatic-index materialization and
+  per-row Rust callbacks for this shape.
+
+### Correctness
+
+- Explicit `INDEXED BY` is honored before the generic planner scan directive
+  for the proven streaming-count shape, while `NOT INDEXED`, descending first
+  keys, partial or expression indexes, and collation mismatches continue to
+  decline the optimization. Nullable leading keys are skipped explicitly, and
+  list/materialized probes retain their single-key physical seek contract.
+- Runtime and opcode regressions cover the production
+  `messages(conversation_id, idx)` schema, orphan exclusion, duplicate complete
+  keys, nullable first keys, matching non-binary collations, descending trailing
+  terms, and every unsafe fallback class.
+
+### CI / Release
+
+- All publishable `fsqlite` / `fsqlite-*` crates are released in lockstep at
+  `0.1.18`, with native signed artifacts for Linux x86-64 and arm64, macOS
+  x86-64 and arm64, and Windows x86-64.
+
 ## [0.1.17] -- 2026-07-18 (B-tree corruption and join-correctness fixes)
 
 Full-workspace lockstep release (`0.1.16 -> 0.1.17`). Semver-compatible 0.1.x;

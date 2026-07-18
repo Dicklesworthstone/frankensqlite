@@ -8,7 +8,7 @@ checksum, validates its exact version and SQL execution, and atomically installs
 fsqlite.exe. PowerShell 5.1 and newer are supported.
 
 .PARAMETER Version
-Exact release tag to install, such as v0.1.17. Defaults to the latest release.
+Exact release tag to install, such as v0.1.18. Defaults to the latest release.
 
 .PARAMETER Destination
 Directory that receives fsqlite.exe. Defaults to $HOME\.local\bin.
@@ -45,12 +45,12 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/frankensqlite/main/inst
 Installs the latest release with a cache-busting request.
 
 .EXAMPLE
-.\install.ps1 -Version v0.1.17 -Destination C:\Tools\FrankenSQLite
+.\install.ps1 -Version v0.1.18 -Destination C:\Tools\FrankenSQLite
 
 Installs an exact release to a custom directory.
 
 .EXAMPLE
-.\install.ps1 -Version v0.1.17 -OfflineArchive .\fsqlite-0.1.17-windows_amd64.zip -Checksum $sha256 -KeepTemp
+.\install.ps1 -Version v0.1.18 -OfflineArchive .\fsqlite-0.1.18-windows_amd64.zip -Checksum $sha256 -KeepTemp
 
 Verifies and installs a previously downloaded archive without network access.
 #>
