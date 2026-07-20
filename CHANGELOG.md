@@ -17,6 +17,45 @@ Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
 ---
 
+## [0.1.19] -- 2026-07-19 (bounded FTS repair and TEMP-page integrity)
+
+Full-workspace lockstep release (`0.1.18 -> 0.1.19`). Semver-compatible 0.1.x;
+no breaking API changes.
+
+### Added
+
+- `Connection::open_existing_schema_only` and identity/environment variants
+  provide an existing-only, writable database open that loads schema metadata
+  without hydrating table rows into the compatibility `MemDatabase`. This is
+  the bounded-memory entry point for repairing or incrementally updating very
+  large SQLite-compatible databases.
+
+### Fixed
+
+- **Connection-local TEMP tables and indexes can no longer allocate orphaned
+  pages in the main database**
+  ([#290](https://github.com/Dicklesworthstone/frankensqlite/issues/290)). TEMP
+  roots now live exclusively in `MemDatabase`; finalized VDBE programs route
+  those roots through the TEMP namespace, including fused inserts, explicit
+  index creation/drop, UNIQUE enforcement, and snapshot reconstruction. A
+  file-backed regression proves TEMP DDL leaves the main page count unchanged
+  and stock SQLite reports both `quick_check` and `integrity_check` as `ok`.
+- Schema-only registration of contentless FTS5 tables remains lazy instead of
+  hydrating the historical corpus. Full scans enumerate persisted `_docsize`
+  rowids, explicit-rowid appends reject duplicates and add bounded incremental
+  segments, and each in-memory delta is discarded after durable persistence.
+  This removes the multi-million-message registration OOM observed by CASS.
+- FrankenSQLite-created FTS5 shadow tables now use stock SQLite's canonical
+  schema, including `WITHOUT ROWID` `_idx`/`_config` tables and the
+  contentless-delete `_docsize.origin` column. Cross-engine regressions reopen
+  the resulting image with stock SQLite and verify integrity and MATCH results.
+
+### Release
+
+- All publishable `fsqlite` / `fsqlite-*` crates are released in lockstep at
+  `0.1.19`. Native artifacts are built and signed outside GitHub Actions for
+  Linux x86-64 and arm64, macOS x86-64 and arm64, and Windows x86-64.
+
 ## [0.1.18] -- 2026-07-18 (streaming composite-index count semijoins)
 
 Full-workspace lockstep release (`0.1.17 -> 0.1.18`). Semver-compatible 0.1.x;
