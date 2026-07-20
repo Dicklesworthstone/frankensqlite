@@ -9082,6 +9082,14 @@ pub struct Connection {
     /// fallback and require all cursor operations to route through the real
     /// Pager+BtreeCursor stack. Used for parity-certification testing.
     reject_mem_fallback: RefCell<bool>,
+    /// Whether schema reload may keep a contentless FTS5 table in the
+    /// bounded, on-disk lazy representation.
+    ///
+    /// This is deliberately enabled only by the explicit schema-only open
+    /// family. Ordinary opens retain the historical hydrated representation,
+    /// whose mutation and auxiliary-command semantics are broader than the
+    /// repair-oriented lazy contract.
+    allow_lazy_contentless_fts5: bool,
     /// Internal execution guard for statements that temporarily install
     /// mirrored temp tables into the MemDatabase. The ordinary read-path
     /// refresh would rebuild MemDB from pager state and discard those tables
@@ -9712,6 +9720,7 @@ impl Connection {
             // Schema-only connections always use parity-cert mode (pager-backed
             // cursors); the MemDatabase is deliberately left empty.
             reject_mem_fallback: RefCell::new(true),
+            allow_lazy_contentless_fts5: true,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
@@ -10130,6 +10139,7 @@ impl Connection {
             // via `set_reject_mem_fallback(false)` or
             // `PRAGMA fsqlite.parity_cert = OFF`.
             reject_mem_fallback: RefCell::new(true),
+            allow_lazy_contentless_fts5: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
@@ -62436,7 +62446,6 @@ impl Connection {
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String, Vec<ColumnInfo>)],
         preserve_existing_live_vtabs: bool,
-        hydrate_rows: bool,
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let mut reloaded = HashMap::new();
 
@@ -62487,7 +62496,7 @@ impl Connection {
                     schema,
                     table_name,
                     &create_stmt.args,
-                    !hydrate_rows,
+                    self.allow_lazy_contentless_fts5,
                 ) && self.read_fts5_lazy_has_segments(
                     cx,
                     txn,
@@ -62547,7 +62556,6 @@ impl Connection {
         _rowid_alias_columns: &HashMap<String, usize>,
         _specs: &[(String, String, Vec<ColumnInfo>)],
         _preserve_existing_live_vtabs: bool,
-        _hydrate_rows: bool,
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let _ = self;
         Ok(HashMap::new())
@@ -63456,7 +63464,6 @@ impl Connection {
                     &new_alias_map,
                     &pending_rootpage_zero_virtual_tables,
                     preserve_existing_live_vtabs,
-                    hydrate_rows,
                 )?;
             reloaded.extend(rootpage_zero_live_vtabs);
             Some(reloaded)
@@ -132280,6 +132287,18 @@ SELECT x FROM t;
         }
 
         let conn = Connection::open(&db_str).unwrap();
+        #[cfg(feature = "ext-fts5")]
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs_fts should reconnect as FTS5");
+            assert!(
+                !fts5.is_lazy_on_disk(),
+                "ordinary opens must retain hydrated contentless FTS5 semantics"
+            );
+        }
         let rows = conn
             .query(
                 "SELECT rowid FROM docs_fts \
@@ -132661,6 +132680,18 @@ SELECT x FROM t;
         }
 
         let conn = Connection::open(&db_str).unwrap();
+        #[cfg(feature = "ext-fts5")]
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs_fts should reconnect as FTS5");
+            assert!(
+                !fts5.is_lazy_on_disk(),
+                "ordinary opens must retain hydrated stock contentless FTS5 semantics"
+            );
+        }
         let rows = conn
             .query(
                 "SELECT rowid FROM docs_fts \
