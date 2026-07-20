@@ -669,6 +669,82 @@ impl MemTable {
         self.unique_constraints.push(constraint);
     }
 
+    /// Remove one matching UNIQUE constraint from the in-memory table.
+    ///
+    /// TEMP indexes are represented by direct `MemTable` constraints rather
+    /// than a separate B-tree, so `DROP INDEX` uses this to retire exactly the
+    /// enforcement rule that `CREATE UNIQUE INDEX` installed.
+    pub fn remove_unique_column_group_with_collations(
+        &mut self,
+        cols: &[usize],
+        collations: &[Option<String>],
+    ) -> bool {
+        let normalized = UniqueConstraintState::new(cols.to_vec(), collations.to_vec());
+        let Some(position) = self.unique_constraints.iter().rposition(|constraint| {
+            constraint.columns == normalized.columns
+                && constraint.collations.len() == normalized.collations.len()
+                && constraint
+                    .collations
+                    .iter()
+                    .zip(&normalized.collations)
+                    .all(|(left, right)| match (left, right) {
+                        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                        (None, None) => true,
+                        _ => false,
+                    })
+        }) else {
+            return false;
+        };
+        self.unique_constraints.remove(position);
+        true
+    }
+
+    /// Return whether the current rows satisfy a proposed UNIQUE constraint.
+    ///
+    /// This is used by TEMP `CREATE UNIQUE INDEX` before mutating schema
+    /// metadata. Builtin collations use the same canonical key encoding as the
+    /// installed constraint; custom collations use the exact comparison path.
+    pub fn unique_column_group_is_valid(
+        &self,
+        cols: &[usize],
+        collations: &[Option<String>],
+    ) -> bool {
+        let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec());
+        if constraint.index.is_some() {
+            let mut seen = HashSet::new();
+            for row in &self.rows {
+                if let Some(key) = Self::unique_key_for_constraint(
+                    &row.values,
+                    &constraint.columns,
+                    &constraint.collations,
+                ) && !seen.insert(key)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        let registry = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (idx, row) in self.rows.iter().enumerate() {
+            if self.rows[idx + 1..].iter().any(|other| {
+                Self::unique_constraint_matches_row(
+                    &row.values,
+                    &other.values,
+                    &constraint.columns,
+                    &constraint.collations,
+                    &registry,
+                )
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Find rows that conflict with `new_values` on any UNIQUE constraint.
     /// Returns the rowids of all conflicting rows.
     pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
@@ -8685,6 +8761,23 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     self.pending_next_after_delete.remove(&cursor_id);
+                    if op.p3 == 1 {
+                        let has_temp_root = self
+                            .db
+                            .as_ref()
+                            .is_some_and(|db| db.get_table(root_page).is_some());
+                        if !has_temp_root {
+                            return Err(FrankenError::Internal(format!(
+                                "OpenRead failed: TEMP root page {root_page} is not attached"
+                            )));
+                        }
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, false));
+                        self.cursor_root_pages.insert(cursor_id, root_page);
+                        pc += 1;
+                        continue;
+                    }
                     if !self.open_storage_cursor(cursor_id, root_page, false) {
                         return Err(FrankenError::Internal(format!(
                             "OpenRead failed: could not open storage cursor on root page {root_page}"
@@ -8713,6 +8806,23 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     self.pending_next_after_delete.remove(&cursor_id);
+                    if op.p3 == 1 {
+                        let has_temp_root = self
+                            .db
+                            .as_ref()
+                            .is_some_and(|db| db.get_table(root_page).is_some());
+                        if !has_temp_root {
+                            return Err(FrankenError::Internal(format!(
+                                "OpenWrite failed: TEMP root page {root_page} is not attached"
+                            )));
+                        }
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, true));
+                        self.cursor_root_pages.insert(cursor_id, root_page);
+                        pc += 1;
+                        continue;
+                    }
                     if !self.open_storage_cursor(cursor_id, root_page, true) {
                         return Err(FrankenError::Internal(format!(
                             "OpenWrite failed: could not open storage cursor on root page {root_page}"
@@ -13050,9 +13160,58 @@ impl VdbeEngine {
                             "FusedAppendInsert: cursor is not writable",
                         ));
                     }
+                } else if let Some(root_page) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
+                    // TEMP tables deliberately use the direct MemDatabase
+                    // cursor backend. Preserve the fused opcode's semantics
+                    // there instead of requiring a pager-backed cursor.
+                    let rowid = self.db.as_mut().map_or(1, |db| db.alloc_rowid(root_page));
+                    let mut rec_buf = self.make_record_lookaside.take_buf();
+                    self.serialize_record_from_register_range(
+                        first_reg,
+                        num_cols,
+                        &op.p4,
+                        &mut rec_buf,
+                    );
+                    let values = parse_record(&rec_buf).ok_or_else(|| {
+                        FrankenError::internal("malformed SQLite record in TEMP FusedAppendInsert")
+                    })?;
+                    rec_buf.clear();
+                    self.make_record_lookaside.replace_buf(rec_buf);
+
+                    let unique_conflicts = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.get_table(root_page))
+                        .map(|table| table.find_unique_conflicts(&values))
+                        .unwrap_or_default();
+                    if !unique_conflicts.is_empty() {
+                        return Err(FrankenError::UniqueViolation {
+                            columns: "TEMP table unique constraint".to_owned(),
+                        });
+                    }
+                    let db = self.db.as_mut().ok_or_else(|| {
+                        FrankenError::internal(
+                            "FusedAppendInsert: TEMP MemDatabase is not attached",
+                        )
+                    })?;
+                    db.upsert_row(root_page, rowid, values);
+
+                    self.changes += 1;
+                    self.last_insert_rowid = rowid;
+                    self.last_insert_rowid_valid = true;
+                    self.last_insert_cursor_id = Some(cursor_id);
+                    self.set_conflict_skip_idx(false);
+                    self.set_pending_insert_rollback(Some(PendingInsertRollback {
+                        cursor_id,
+                        rowid,
+                        previous_last_insert_rowid,
+                        previous_last_insert_rowid_valid,
+                        update_restore: None,
+                    }));
+                    self.pending_next_after_delete.remove(&cursor_id);
                 } else {
                     return Err(FrankenError::internal(format!(
-                        "FusedAppendInsert: no storage cursor for id {cursor_id}"
+                        "FusedAppendInsert: no cursor for id {cursor_id}"
                     )));
                 }
                 *pc += 1;

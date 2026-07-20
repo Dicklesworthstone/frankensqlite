@@ -9425,6 +9425,16 @@ impl Connection {
         Self::open_schema_only_with_env(path, ConnectionEnv::default())
     }
 
+    /// Open an existing file-backed database for reading and writing while
+    /// loading only its schema into the compatibility [`MemDatabase`].
+    ///
+    /// This combines the bounded-memory behavior of [`Self::open_schema_only`]
+    /// with the existing-only, writable contract of [`Self::open_existing`].
+    /// The main database file is never created or initialized by this method.
+    pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self> {
+        Self::open_existing_schema_only_with_env(path, ConnectionEnv::default())
+    }
+
     /// Open a schema-only connection only if the read-only VFS handle has
     /// `expected_identity`.
     ///
@@ -9447,12 +9457,37 @@ impl Connection {
         )
     }
 
+    /// Open a writable, existing-only schema connection if the main database
+    /// handle has `expected_identity`.
+    ///
+    /// The cooperative-path and no-alias requirements documented on
+    /// [`Self::open_existing_with_expected_identity`] apply unchanged.
+    pub fn open_existing_schema_only_with_expected_identity(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+    ) -> Result<Self> {
+        Self::open_existing_schema_only_with_expected_identity_and_env(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+    }
+
     /// Open a schema-only connection with an explicit runtime environment.
     ///
     /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
     /// specifying a custom [`ConnectionEnv`].
     pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env)
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false)
+    }
+
+    /// Open a writable, existing-only schema connection with an explicit
+    /// runtime environment.
+    pub fn open_existing_schema_only_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true)
     }
 
     /// Open an identity-bound schema-only connection with an explicit runtime
@@ -9469,6 +9504,22 @@ impl Connection {
             path,
             Some(expected_identity),
             env,
+            false,
+        )
+    }
+
+    /// Open an identity-bound, writable, existing-only schema connection with
+    /// an explicit runtime environment.
+    pub fn open_existing_schema_only_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(
+            path,
+            Some(expected_identity),
+            env,
+            true,
         )
     }
 
@@ -9476,9 +9527,13 @@ impl Connection {
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
+        writable: bool,
     ) -> Result<Self> {
         let path = path.into();
-        if path.is_empty() || (expected_identity.is_some() && path == ":memory:") {
+        if path.is_empty()
+            || (writable && path == ":memory:")
+            || (expected_identity.is_some() && path == ":memory:")
+        {
             return Err(FrankenError::CannotOpen {
                 path: std::path::PathBuf::from(path),
             });
@@ -9492,13 +9547,22 @@ impl Connection {
                 .with_trace_context(next_trace_id(), 0, 0);
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
-            PagerBackend::open_readonly_with_page_buffer_max(
-                &path,
-                &bootstrap_cx,
-                expected_identity,
-                env.page_buffer_max(),
-                env.memory_vfs_config(),
-            )
+            if writable {
+                PagerBackend::open_existing_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    expected_identity,
+                    env.page_buffer_max(),
+                )
+            } else {
+                PagerBackend::open_readonly_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    expected_identity,
+                    env.page_buffer_max(),
+                    env.memory_vfs_config(),
+                )
+            }
         })?;
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
@@ -9698,7 +9762,11 @@ impl Connection {
         conn.register_cache_pages_module();
         conn.bootstrap_journal_mode_from_storage(false)?;
         conn.bootstrap_pragma_state_from_storage();
-        conn.apply_current_journal_mode_to_pager_readonly()?;
+        if writable {
+            conn.apply_current_journal_mode_to_pager()?;
+        } else {
+            conn.apply_current_journal_mode_to_pager_readonly()?;
+        }
         conn.apply_current_synchronous_to_pager()?;
         let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
@@ -11641,6 +11709,9 @@ impl Connection {
                     if plan.idx_num == 1 {
                         return self.scan_lazy_fts5_match(src, plan);
                     }
+                    if !self.rootpage_zero_fts5_has_internal_content_shadow(&src.table_name) {
+                        return self.scan_lazy_contentless_fts5_rows(src);
+                    }
                     self.promote_lazy_fts5_table(&src.table_name)?;
                 }
                 let instances = self.vtab_instances.borrow();
@@ -12012,15 +12083,17 @@ impl Connection {
 
     /// Whether `<table_name>` has the catalog shape needed for lazy on-disk FTS5.
     ///
-    /// Only regular stored-content FTS5 tables are lazy-capable: the lazy reader
-    /// needs `_data` for MATCH and `_content` for result projection. The caller
-    /// must also verify that `_data` has a non-empty structure row; metadata-only
-    /// FrankenSQLite-created indexes should rebuild from `_content` instead.
+    /// Regular stored-content tables need `_content` for result projection.
+    /// Schema-only contentless opens can also remain lazy when `_docsize` can
+    /// enumerate rowids; their projected user columns are NULL by definition.
+    /// The caller must additionally verify that `_data` has a non-empty
+    /// structure row.
     #[cfg(feature = "ext-fts5")]
     fn fts5_table_is_lazy_capable(
         schema: &[TableSchema],
         table_name: &str,
         args: &[String],
+        allow_contentless: bool,
     ) -> bool {
         let has_shadow = |suffix: &str| {
             let name = format!("{table_name}{suffix}");
@@ -12028,8 +12101,17 @@ impl Connection {
                 .iter()
                 .any(|table| table.name.eq_ignore_ascii_case(&name) && table.root_page > 0)
         };
-        let regular_content = virtual_table_option_value(args, "content").is_none();
-        has_shadow("_data") && regular_content && has_shadow("_content")
+        let content = virtual_table_option_value(args, "content");
+        let projection_is_lazy_capable = match content.as_deref() {
+            None => has_shadow("_content"),
+            // Contentless tables project NULLs and use `_docsize` to enumerate
+            // rowids. Keep normal fully-hydrated opens unchanged; this bounded
+            // path is specifically for schema-only callers handling huge
+            // indexes that cannot fit in memory.
+            Some("") => allow_contentless && has_shadow("_docsize"),
+            Some(_) => false,
+        };
+        has_shadow("_data") && projection_is_lazy_capable
     }
 
     /// Read the persisted live document count for a lazy FTS5 table.
@@ -12239,6 +12321,48 @@ impl Connection {
                 row
             })
             .collect())
+    }
+
+    /// Enumerate a lazy contentless FTS5 table without hydrating its posting
+    /// lists. `_docsize` contains one row per live document; projected user
+    /// columns are NULL by definition, so the scan only needs those rowids.
+    #[cfg(feature = "ext-fts5")]
+    fn scan_lazy_contentless_fts5_rows(
+        &self,
+        src: &JoinTableSource,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let docsize_name = format!("{}_docsize", src.table_name);
+        let root_page = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&docsize_name))
+            .map(|table| table.root_page)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "lazy contentless FTS5 table `{}` is missing `{docsize_name}`",
+                    src.table_name
+                ),
+            })?;
+        let root = page_number_from_schema_root(root_page, &docsize_name, "fts5 docsize shadow")?;
+        self.with_integrity_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            let mut rows = Vec::new();
+            if cursor.first(cx)? {
+                loop {
+                    let rowid = cursor.rowid(cx)?;
+                    let mut row = vec![SqliteValue::Null; src.col_names.len()];
+                    if src.hidden_rowid_projection.is_some() {
+                        row.push(SqliteValue::Integer(rowid));
+                    }
+                    rows.push(row);
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+            }
+            Ok(rows)
+        })
     }
 
     /// Promote a lazy on-disk FTS5 table into the in-memory representation for
@@ -32604,18 +32728,47 @@ impl Connection {
         let cx = self.op_cx()?;
         let key = table_name.to_ascii_uppercase();
         #[cfg(feature = "ext-fts5")]
-        {
-            let is_lazy = {
+        let lazy_contentless = {
+            let (is_lazy, column_count) = {
                 let instances = self.vtab_instances.borrow();
-                instances
+                let fts5 = instances
                     .get(&key)
-                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                    .is_some_and(Fts5Table::is_lazy_on_disk)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>());
+                (
+                    fts5.is_some_and(Fts5Table::is_lazy_on_disk),
+                    fts5.map_or(0, |table| table.columns().len()),
+                )
             };
-            if is_lazy {
+            let contentless =
+                is_lazy && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name);
+            if is_lazy && !contentless {
                 self.promote_lazy_fts5_table(table_name)?;
             }
-        }
+            if contentless {
+                let mut rowids = HashSet::with_capacity(rows.len());
+                for row in rows {
+                    let rowid = row
+                        .explicit_rowid
+                        .as_ref()
+                        .ok_or_else(|| {
+                            FrankenError::function_error(format!(
+                                "lazy contentless FTS5 INSERT into `{table_name}` requires an explicit rowid"
+                            ))
+                        })?
+                        .to_integer();
+                    if !rowids.insert(rowid) {
+                        return Err(FrankenError::PrimaryKeyViolation);
+                    }
+                    let exists = self.with_lazy_fts5_reader(table_name, |reader| {
+                        Ok(reader.read_docsize(rowid, column_count)?.is_some())
+                    })?;
+                    if exists {
+                        return Err(FrankenError::PrimaryKeyViolation);
+                    }
+                }
+            }
+            contentless
+        };
         let mut instances = self.vtab_instances.borrow_mut();
         let instance = instances.get_mut(&key).ok_or_else(|| {
             FrankenError::Internal(format!("virtual table not found: {table_name}"))
@@ -32649,6 +32802,18 @@ impl Connection {
 
         #[cfg(feature = "ext-fts5")]
         if self.persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids)? {
+            if lazy_contentless {
+                let mut instances = self.vtab_instances.borrow_mut();
+                let fts5 = instances
+                    .get_mut(&key)
+                    .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "virtual table changed type during lazy insert: {table_name}"
+                        ))
+                    })?;
+                fts5.note_lazy_inserted_rows(&inserted_rowids);
+            }
             return Ok(inserted_rowids);
         }
 
@@ -33712,34 +33877,27 @@ impl Connection {
 
     #[cfg(feature = "ext-fts5")]
     fn create_fts5_shadow_table(&self, table: Fts5ShadowTableDef) -> Result<()> {
-        let root_page = self.allocate_root_page()?;
-        self.db
-            .borrow_mut()
-            .create_table_at(root_page, table.columns.len());
-        if let Some(rowid_alias_idx) = table.columns.iter().position(|column| column.is_ipk) {
-            self.rowid_alias_columns
-                .borrow_mut()
-                .insert(table.name.to_ascii_lowercase(), rowid_alias_idx);
+        let create = match parse_single_statement(&table.create_sql)? {
+            Statement::CreateTable(create) => create,
+            _ => {
+                return Err(FrankenError::Internal(format!(
+                    "FTS5 shadow definition for {} did not parse as CREATE TABLE",
+                    table.name
+                )));
+            }
+        };
+        if !create.name.name.eq_ignore_ascii_case(&table.name) {
+            return Err(FrankenError::Internal(format!(
+                "FTS5 shadow definition name mismatch: expected {}, parsed {}",
+                table.name, create.name.name
+            )));
         }
-        self.schema.borrow_mut().push(TableSchema {
-            name: table.name.clone(),
-            root_page,
-            columns: table.columns,
-            indexes: Vec::new(),
-            strict: false,
-            without_rowid: false,
-            primary_key_constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-            check_constraints: Vec::new(),
-        });
-        self.rebuild_schema_indices();
-        self.insert_sqlite_master_row(
-            "table",
-            &table.name,
-            &table.name,
-            root_page,
-            &table.create_sql,
-        )
+
+        // Route shadow DDL through the ordinary CREATE TABLE implementation.
+        // Besides keeping the parser/schema/catalog representations identical,
+        // this is what makes `%_idx` and `%_config` real WITHOUT ROWID b-trees
+        // with owned roots and primary-key metadata, exactly like stock SQLite.
+        self.execute_create_table(&create)
     }
 
     #[allow(clippy::unused_self)]
@@ -40065,8 +40223,7 @@ impl Connection {
                         .iter()
                         .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
                     if col.unique && !col.is_ipk && !(create.without_rowid && column_primary_key) {
-                        let idx_root = self.allocate_index_root_page()?;
-                        self.db.borrow_mut().create_table_at(idx_root, 0);
+                        let idx_root = self.allocate_schema_table_root(target_is_temp, 0, true)?;
                         // Per-constraint ON CONFLICT declared on the column's
                         // UNIQUE / (non-IPK) PRIMARY KEY clause.
                         let conflict_action =
@@ -40124,8 +40281,8 @@ impl Connection {
                             if all_ipk {
                                 continue;
                             }
-                            let idx_root = self.allocate_index_root_page()?;
-                            self.db.borrow_mut().create_table_at(idx_root, 0);
+                            let idx_root =
+                                self.allocate_schema_table_root(target_is_temp, 0, true)?;
                             // Per-constraint ON CONFLICT declared on the
                             // table-level UNIQUE / PRIMARY KEY constraint.
                             let conflict_action = match &tc.kind {
@@ -40159,12 +40316,11 @@ impl Connection {
                 }
 
                 let num_columns = col_infos.len();
-                let root_page = if create.without_rowid {
-                    self.allocate_index_root_page()?
-                } else {
-                    self.allocate_root_page()?
-                };
-                self.db.borrow_mut().create_table_at(root_page, num_columns);
+                let root_page = self.allocate_schema_table_root(
+                    target_is_temp,
+                    num_columns,
+                    create.without_rowid,
+                )?;
 
                 // Register UNIQUE column groups with MemTable for in-memory
                 // constraint enforcement. This is needed because MemDatabase
@@ -40612,10 +40768,12 @@ impl Connection {
                         .map(|idx| schema.remove(idx))
                 };
                 if let Some(table) = removed {
-                    // TEMP table pages live in the same MemDatabase; release the
-                    // backing memtable. (Indexes on TEMP tables are not yet
-                    // separately tracked here.)
+                    // TEMP table and index roots are MemDatabase-only. Release
+                    // every one without touching the main pager freelist.
                     self.db.borrow_mut().destroy_table(table.root_page);
+                    for index in &table.indexes {
+                        self.db.borrow_mut().destroy_table(index.root_page);
+                    }
                 }
                 self.temp_table_names.borrow_mut().remove(&drop_name_lc);
                 self.rowid_alias_columns.borrow_mut().remove(&drop_name_lc);
@@ -40719,9 +40877,12 @@ impl Connection {
                 }
             }
             DropObjectType::Index => {
+                let temp_names = self.temp_table_names.borrow();
                 let mut schema = self.schema.borrow_mut();
                 let mut found = false;
                 let mut dropped_root_page = None;
+                let mut dropped_temp = false;
+                let mut dropped_temp_unique = None;
                 for table in schema.iter_mut() {
                     if let Some(pos) = table
                         .indexes
@@ -40730,11 +40891,28 @@ impl Connection {
                     {
                         let removed = table.indexes.remove(pos);
                         dropped_root_page = Some(removed.root_page);
+                        dropped_temp = temp_names.contains(&table.name.to_ascii_lowercase());
+                        if dropped_temp && removed.is_unique {
+                            let columns = removed
+                                .columns
+                                .iter()
+                                .map(|column| {
+                                    table.columns.iter().position(|candidate| {
+                                        candidate.name.eq_ignore_ascii_case(column)
+                                    })
+                                })
+                                .collect::<Option<Vec<_>>>();
+                            if let Some(columns) = columns {
+                                dropped_temp_unique =
+                                    Some((table.root_page, columns, removed.key_collations));
+                            }
+                        }
                         found = true;
                         break;
                     }
                 }
                 drop(schema);
+                drop(temp_names);
                 if !found {
                     if drop_stmt.if_exists {
                         return Ok(());
@@ -40742,13 +40920,23 @@ impl Connection {
                     return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
                 }
                 if let Some(root_page) = dropped_root_page {
-                    // Free all B-tree pages for the index back to the pager
-                    // freelist before removing the in-memory MemDatabase entry.
-                    self.free_btree_pages(root_page, false)?;
+                    // TEMP indexes are MemDatabase-only and must never be
+                    // interpreted as main-pager roots. Persistent indexes are
+                    // returned to the pager freelist as usual.
+                    if !dropped_temp {
+                        self.free_btree_pages(root_page, false)?;
+                    }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
-                if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name) {
-                    swallow_missing_master(err)?;
+                if let Some((table_root, columns, collations)) = dropped_temp_unique {
+                    if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
+                        table.remove_unique_column_group_with_collations(&columns, &collations);
+                    }
+                }
+                if !dropped_temp {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name) {
+                        swallow_missing_master(err)?;
+                    }
                 }
                 true
             }
@@ -42284,6 +42472,19 @@ impl Connection {
     fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
+        let target_is_temp = self
+            .temp_table_names
+            .borrow()
+            .contains(&table_name.to_ascii_lowercase());
+        if let Some(index_schema) = stmt.name.schema.as_deref() {
+            let names_temp = index_schema.eq_ignore_ascii_case("temp");
+            let names_main = index_schema.eq_ignore_ascii_case("main");
+            if (names_temp && !target_is_temp) || (names_main && target_is_temp) {
+                return Err(FrankenError::FunctionError(format!(
+                    "cannot create index `{index_name}` in schema `{index_schema}` on table `{table_name}`"
+                )));
+            }
+        }
 
         // Phase 1: Validate schema (with borrow)
         {
@@ -42401,12 +42602,50 @@ impl Connection {
             Vec::new()
         };
 
-        // Phase 3: Allocate index B-tree root page (no borrow held)
-        let root_page = self.allocate_index_root_page()?;
+        if target_is_temp && stmt.unique && has_expression_term {
+            return Err(FrankenError::NotImplemented(
+                "UNIQUE expression indexes on TEMP tables are not yet supported".to_owned(),
+            ));
+        }
 
-        // Phase 4: Create B-tree in db layer (for in-memory engine compatibility)
-        // Index B-trees have key = (indexed columns..., rowid), no payload columns
-        self.db.borrow_mut().create_table_at(root_page, 0);
+        let temp_unique_columns = if target_is_temp && stmt.unique {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            let columns = col_names
+                .iter()
+                .map(|column| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.name.eq_ignore_ascii_case(column))
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "failed to resolve TEMP index columns for `{index_name}`"
+                    ))
+                })?;
+            let db = self.db.borrow();
+            let table = db.get_table(table.root_page).ok_or_else(|| {
+                FrankenError::Internal(format!("TEMP table `{table_name}` has no attached storage"))
+            })?;
+            if !table.unique_column_group_is_valid(&columns, &key_collations) {
+                return Err(FrankenError::UniqueViolation {
+                    columns: col_names.join(", "),
+                });
+            }
+            Some(columns)
+        } else {
+            None
+        };
+
+        // Phase 3: Allocate index B-tree root page (no borrow held)
+        let root_page = self.allocate_schema_table_root(target_is_temp, 0, true)?;
 
         // Phase 5: Record index in schema (with mut borrow)
         {
@@ -42425,14 +42664,37 @@ impl Connection {
                 where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
                 root_page,
                 is_unique: stmt.unique,
-                key_collations,
+                key_collations: key_collations.clone(),
                 conflict_action: None,
             });
         }
 
+        if let Some(columns) = temp_unique_columns {
+            let table_root = self
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
+                table.add_unique_column_group_with_collations(columns, key_collations.clone());
+            }
+        }
+
         // Phase 6: Persist to sqlite_master
         let create_sql = stmt.to_string();
-        self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
+        if !target_is_temp {
+            self.insert_sqlite_master_row(
+                "index",
+                &index_name,
+                table_name,
+                root_page,
+                &create_sql,
+            )?;
+        }
 
         self.increment_schema_cookie()?;
 
@@ -42440,6 +42702,9 @@ impl Connection {
         // SQLite populates a new index with all current table data during
         // CREATE INDEX.  For UNIQUE indexes this also validates that no
         // duplicate values exist.
+        if target_is_temp {
+            return Ok(());
+        }
         let (table, index) = {
             let schema = self.schema.borrow();
             let table = schema
@@ -44644,6 +44909,34 @@ impl Connection {
         let rollback_result = txn.rollback(&cx);
         reserve_result?;
         rollback_result
+    }
+
+    /// Allocate a root for schema-visible table storage and create its
+    /// `MemDatabase` representation.
+    ///
+    /// Persistent objects own a pager B-tree root. TEMP objects are strictly
+    /// connection-local and must never allocate or initialize a main-database
+    /// page: doing so without a matching `sqlite_master` owner leaves an
+    /// orphan that stock SQLite reports as "Page N: never used". Their roots
+    /// therefore come only from the collision-safe MemDatabase namespace.
+    fn allocate_schema_table_root(
+        &self,
+        temporary: bool,
+        num_columns: usize,
+        index_btree: bool,
+    ) -> Result<i32> {
+        if temporary {
+            self.reserve_clean_memdb_root_pages(1)?;
+            return Ok(self.db.borrow_mut().create_table(num_columns));
+        }
+
+        let root_page = if index_btree {
+            self.allocate_index_root_page()?
+        } else {
+            self.allocate_root_page()?
+        };
+        self.db.borrow_mut().create_table_at(root_page, num_columns);
+        Ok(root_page)
     }
 
     fn reserve_clean_memdb_root_pages_with_txn(
@@ -51124,6 +51417,32 @@ impl Connection {
             }
             // Recreate the TEMP table and its rows in the rebuilt memdb.
             new_db.create_table_at(temp_schema.root_page, temp_schema.columns.len());
+            for index in &temp_schema.indexes {
+                new_db.create_table_at(index.root_page, 0);
+            }
+            if let Some(mem_table) = new_db.get_table_mut(temp_schema.root_page) {
+                for index in temp_schema.indexes.iter().filter(|index| index.is_unique) {
+                    let Some(columns) = index
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            temp_schema
+                                .columns
+                                .iter()
+                                .position(|candidate| candidate.name.eq_ignore_ascii_case(column))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    if !columns.is_empty() {
+                        mem_table.add_unique_column_group_with_collations(
+                            columns,
+                            index.key_collations.clone(),
+                        );
+                    }
+                }
+            }
             for (rowid, vals) in rows {
                 new_db.upsert_row(temp_schema.root_page, rowid, vals);
             }
@@ -51165,6 +51484,52 @@ impl Connection {
         }
     }
 
+    /// Return every schema root owned by connection-local TEMP tables.
+    ///
+    /// TEMP objects use the ordinary schema metadata shape, but their storage
+    /// lives exclusively in `MemDatabase`. Finalized VDBE programs use this
+    /// set to annotate those roots with SQLite database number 1 so execution
+    /// never consults or mutates the main pager for them.
+    fn temp_storage_roots(&self) -> HashSet<i32> {
+        let temp_names = self.temp_table_names.borrow();
+        if temp_names.is_empty() {
+            return HashSet::new();
+        }
+        let schema = self.schema.borrow();
+        let mut roots = HashSet::new();
+        for table in schema
+            .iter()
+            .filter(|table| temp_names.contains(&table.name.to_ascii_lowercase()))
+        {
+            roots.insert(table.root_page);
+            roots.extend(table.indexes.iter().map(|index| index.root_page));
+        }
+        roots
+    }
+
+    /// Remove TEMP indexes from a statement-local codegen snapshot.
+    ///
+    /// `MemTable` enforces declared uniqueness directly, while its cursor
+    /// backend intentionally has no separate index B-trees. Emitting an index
+    /// access plan would therefore create an empty, misleading access path.
+    /// The connection's schema remains unchanged; only this disposable clone
+    /// is simplified to table scans.
+    fn suppress_temp_indexes_for_codegen(schema: &mut [TableSchema], temp_roots: &HashSet<i32>) {
+        for table in schema {
+            if temp_roots.contains(&table.root_page) {
+                table.indexes.clear();
+            }
+        }
+    }
+
+    fn route_temp_roots_in_program(
+        mut program: VdbeProgram,
+        temp_roots: &HashSet<i32>,
+    ) -> VdbeProgram {
+        program.route_storage_roots_to_temp_database(temp_roots.iter().copied());
+        program
+    }
+
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
         let prof = hot_path_profile_enabled();
@@ -51184,16 +51549,19 @@ impl Connection {
         // TEMP shadowing) — borrow `self.schema` directly and skip the O(total-schema) deep clone.
         // The schema data fed to the planner + codegen is identical either way, so the emitted
         // program is byte-for-byte unchanged.
+        let temp_roots = self.temp_storage_roots();
         let needs_owned_schema = FSQLITE_FORCE_SCHEMA_CLONE_BENCH.with(std::cell::Cell::get)
             || self.sqlite_stat1_root_page().is_some()
-            || !self.shadowed_main_tables.borrow().is_empty();
-        if needs_owned_schema {
+            || !self.shadowed_main_tables.borrow().is_empty()
+            || !temp_roots.is_empty();
+        let program = if needs_owned_schema {
             let t = prof.then(Instant::now);
             let mut schema = self.schema.borrow().clone();
             // bd-wjrs0: when a TEMP table shadows a same-named main table, the visible `schema`
             // entry is the TEMP one. An explicit `main.<name>` reference must still reach the
             // shadowed main table, so swap it back into this per-statement snapshot.
             self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
         } else {
@@ -51201,7 +51569,8 @@ impl Connection {
             let schema = self.schema.borrow();
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
-        }
+        }?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// Shared tail of `compile_table_select`: plan the directive and emit the program.
@@ -60785,14 +61154,20 @@ impl Connection {
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
         let insert = self.resolve_insert_values_subqueries(insert)?;
-        let schema = self.schema.borrow();
-        let table_schema = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
-            .ok_or_else(|| {
-                FrankenError::Internal(format!("no such table: {}", insert.table.name))
-            })?;
-        Self::validate_insert_target_columns(table_schema, &insert.table.name, &insert.columns)?;
+        {
+            let schema = self.schema.borrow();
+            let table_schema = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("no such table: {}", insert.table.name))
+                })?;
+            Self::validate_insert_target_columns(
+                table_schema,
+                &insert.table.name,
+                &insert.columns,
+            )?;
+        }
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
             .rowid_alias_columns
@@ -60804,9 +61179,19 @@ impl Connection {
             rowid_alias_col_idx,
             ..CodegenContext::default()
         };
-        codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
-            .map_err(codegen_error_to_franken)?;
-        builder.finish()
+        let temp_roots = self.temp_storage_roots();
+        if temp_roots.is_empty() {
+            let schema = self.schema.borrow();
+            codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        }
+        let program = builder.finish()?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// If the INSERT source contains VALUES rows with subquery expressions,
@@ -60866,7 +61251,6 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
-        let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
             .rowid_alias_columns
@@ -60878,21 +61262,42 @@ impl Connection {
             rowid_alias_col_idx,
             ..CodegenContext::default()
         };
-        codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
-        builder.finish()
+        let temp_roots = self.temp_storage_roots();
+        if temp_roots.is_empty() {
+            let schema = self.schema.borrow();
+            codegen_update(&mut builder, update, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            codegen_update(&mut builder, update, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        }
+        let program = builder.finish()?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
-        let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
             ..CodegenContext::default()
         };
-        codegen_delete(&mut builder, delete, &schema, &ctx).map_err(codegen_error_to_franken)?;
-        builder.finish()
+        let temp_roots = self.temp_storage_roots();
+        if temp_roots.is_empty() {
+            let schema = self.schema.borrow();
+            codegen_delete(&mut builder, delete, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            codegen_delete(&mut builder, delete, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        }
+        let program = builder.finish()?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// Attempt to compile any statement into a `VdbeProgram` for EXPLAIN.
@@ -62031,6 +62436,7 @@ impl Connection {
         rowid_alias_columns: &HashMap<String, usize>,
         specs: &[(String, String, Vec<ColumnInfo>)],
         preserve_existing_live_vtabs: bool,
+        hydrate_rows: bool,
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let mut reloaded = HashMap::new();
 
@@ -62077,16 +62483,19 @@ impl Connection {
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
-                if Self::fts5_table_is_lazy_capable(schema, table_name, &create_stmt.args)
-                    && self.read_fts5_lazy_has_segments(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        schema,
-                        table_name,
-                    )?
-                {
+                if Self::fts5_table_is_lazy_capable(
+                    schema,
+                    table_name,
+                    &create_stmt.args,
+                    !hydrate_rows,
+                ) && self.read_fts5_lazy_has_segments(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    schema,
+                    table_name,
+                )? {
                     let column_count = parse_virtual_table_column_infos(&create_stmt.args).len();
                     let doc_count = self.read_fts5_lazy_doc_count(
                         cx,
@@ -62138,6 +62547,7 @@ impl Connection {
         _rowid_alias_columns: &HashMap<String, usize>,
         _specs: &[(String, String, Vec<ColumnInfo>)],
         _preserve_existing_live_vtabs: bool,
+        _hydrate_rows: bool,
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let _ = self;
         Ok(HashMap::new())
@@ -63046,6 +63456,7 @@ impl Connection {
                     &new_alias_map,
                     &pending_rootpage_zero_virtual_tables,
                     preserve_existing_live_vtabs,
+                    hydrate_rows,
                 )?;
             reloaded.extend(rootpage_zero_live_vtabs);
             Some(reloaded)
@@ -85325,46 +85736,25 @@ fn fts5_shadow_table_defs(
                 quote_identifier(&data_name)
             ),
             name: data_name,
-            columns: vec![
-                ColumnInfo::basic("id", 'D', true),
-                ColumnInfo::basic("block", 'A', false),
-            ],
         },
         Fts5ShadowTableDef {
             create_sql: format!(
-                "CREATE TABLE {}(segid INTEGER, term BLOB, pgno INTEGER)",
+                "CREATE TABLE {}(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
                 quote_identifier(&idx_name)
             ),
             name: idx_name,
-            columns: vec![
-                ColumnInfo::basic("segid", 'D', false),
-                ColumnInfo::basic("term", 'A', false),
-                ColumnInfo::basic("pgno", 'D', false),
-            ],
         },
         Fts5ShadowTableDef {
             create_sql: format!(
-                "CREATE TABLE {}(k TEXT PRIMARY KEY, v)",
+                "CREATE TABLE {}(k PRIMARY KEY, v) WITHOUT ROWID",
                 quote_identifier(&config_name)
             ),
             name: config_name,
-            columns: vec![
-                ColumnInfo::basic("k", 'B', false),
-                ColumnInfo::basic("v", 'C', false),
-            ],
         },
     ];
 
     if virtual_table_option_value(args, "content").is_none() {
         let content_name = format!("{table_name}_content");
-        let mut columns = Vec::with_capacity(fts_columns.len() + 1);
-        columns.push(ColumnInfo::basic("id", 'D', true));
-        columns.extend(
-            fts_columns
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| ColumnInfo::basic(format!("c{idx}"), 'B', false)),
-        );
         let content_columns = (0..fts_columns.len())
             .map(|idx| format!("c{idx}"))
             .collect::<Vec<_>>()
@@ -85383,7 +85773,6 @@ fn fts5_shadow_table_defs(
         defs.push(Fts5ShadowTableDef {
             create_sql,
             name: content_name,
-            columns,
         });
     }
 
@@ -85392,16 +85781,21 @@ fn fts5_shadow_table_defs(
         Some("0")
     ) {
         let docsize_name = format!("{table_name}_docsize");
+        let contentless_delete = matches!(
+            virtual_table_option_value(args, "contentless_delete").as_deref(),
+            Some("1")
+        );
+        let columns = if contentless_delete {
+            "id INTEGER PRIMARY KEY, sz BLOB, origin INTEGER"
+        } else {
+            "id INTEGER PRIMARY KEY, sz BLOB"
+        };
         defs.push(Fts5ShadowTableDef {
             create_sql: format!(
-                "CREATE TABLE {}(id INTEGER PRIMARY KEY, sz BLOB)",
+                "CREATE TABLE {}({columns})",
                 quote_identifier(&docsize_name)
             ),
             name: docsize_name,
-            columns: vec![
-                ColumnInfo::basic("id", 'D', true),
-                ColumnInfo::basic("sz", 'A', false),
-            ],
         });
     }
 
@@ -88429,7 +88823,6 @@ struct LiveVtabInsertRow {
 #[derive(Debug, Clone)]
 struct Fts5ShadowTableDef {
     name: String,
-    columns: Vec<ColumnInfo>,
     create_sql: String,
 }
 
@@ -131924,6 +132317,179 @@ SELECT x FROM t;
         );
     }
 
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_existing_schema_only_contentless_fts5_stays_lazy_across_incremental_appends() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_only_contentless_append.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE messages_fts USING fts5(body, content='');
+                    INSERT INTO messages_fts(rowid, body) VALUES
+                        (1, 'alpha rust'),
+                        (2, 'beta search'),
+                        (3, 'gamma rust search');
+                    INSERT INTO messages_fts(messages_fts) VALUES('optimize');
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open_existing_schema_only(&db_str).unwrap();
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("MESSAGES_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("contentless table should reconnect as FTS5");
+            assert!(fts5.is_lazy_on_disk());
+            assert_eq!(fts5.row_count(), 3);
+        }
+
+        conn.execute(
+            "INSERT INTO messages_fts(rowid, body) VALUES
+                (4, 'delta rust'),
+                (5, 'epsilon search');",
+        )
+        .unwrap();
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("MESSAGES_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("contentless table should remain FTS5");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "incremental append must not hydrate the historical corpus"
+            );
+            assert_eq!(fts5.row_count(), 5);
+        }
+
+        let rust_rows = conn
+            .query(
+                "SELECT rowid FROM messages_fts
+                 WHERE messages_fts MATCH 'rust' ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rust_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(4),
+            ]
+        );
+        let full_scan = conn
+            .query("SELECT rowid, body FROM messages_fts ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(full_scan.len(), 5);
+        assert!(
+            full_scan
+                .iter()
+                .all(|row| matches!(row.values(), [SqliteValue::Integer(_), SqliteValue::Null]))
+        );
+
+        let duplicate = conn
+            .execute("INSERT INTO messages_fts(rowid, body) VALUES (4, 'duplicate');")
+            .expect_err("lazy append must reject an existing persisted rowid");
+        assert!(matches!(duplicate, FrankenError::PrimaryKeyViolation));
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick: String = sqlite
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick, "ok");
+        assert_eq!(integrity, "ok");
+        let matched: Vec<i64> = sqlite
+            .prepare(
+                "SELECT rowid FROM messages_fts
+                 WHERE messages_fts MATCH 'rust' ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(matched, vec![1, 3, 4]);
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_fsqlite_created_fts5_uses_stock_shadow_schema_and_passes_stock_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("canonical_fts5_shadows.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE messages_fts USING
+                 fts5(body, content='', contentless_delete=1);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO messages_fts(rowid, body) VALUES (1, 'canonical shadow');")
+                .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let shadow_sql = |name: &str| -> String {
+            sqlite
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let normalize_sql = |sql: String| {
+            sql.chars()
+                .filter(|ch| !ch.is_ascii_whitespace() && *ch != '"')
+                .flat_map(char::to_uppercase)
+                .collect::<String>()
+        };
+        let idx_sql = normalize_sql(shadow_sql("messages_fts_idx"));
+        let config_sql = normalize_sql(shadow_sql("messages_fts_config"));
+        let docsize_sql = normalize_sql(shadow_sql("messages_fts_docsize"));
+        assert!(
+            idx_sql.ends_with("PRIMARYKEY(SEGID,TERM))WITHOUTROWID"),
+            "unexpected FTS5 idx shadow DDL: {idx_sql}"
+        );
+        assert!(
+            config_sql.ends_with("(KPRIMARYKEY,V)WITHOUTROWID"),
+            "unexpected FTS5 config shadow DDL: {config_sql}"
+        );
+        assert!(
+            docsize_sql.contains("ORIGININTEGER"),
+            "contentless-delete docsize shadow must store origin: {docsize_sql}"
+        );
+        for name in ["messages_fts_idx", "messages_fts_config"] {
+            let without_rowid: i64 = sqlite
+                .query_row(
+                    "SELECT wr FROM pragma_table_list WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(without_rowid, 1, "{name} must be a WITHOUT ROWID table");
+        }
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
     #[test]
     fn test_fsqlite_created_external_content_fts5_reopen_uses_persisted_segments() {
         let dir = tempfile::tempdir().unwrap();
@@ -133908,6 +134474,50 @@ fts5(title, body, content=docs, content_rowid=id)'
             .unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS mixed (id INTEGER PRIMARY KEY, val TEXT);")
             .expect("strict parity-cert create table must honor non-default page sizes");
+    }
+
+    #[test]
+    fn test_open_existing_schema_only_is_writable_but_never_creates_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing.db");
+        let missing_str = missing_path.to_string_lossy().into_owned();
+        let err = Connection::open_existing_schema_only(&missing_str)
+            .expect_err("existing-only schema open must reject a missing path");
+        assert!(matches!(err, FrankenError::CannotOpen { .. }));
+        assert!(!missing_path.exists());
+
+        let db_path = dir.path().join("existing.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE events(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+                     INSERT INTO events VALUES (1, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open_existing_schema_only(&db_str).unwrap();
+        assert!(!conn.memdb_rows_loaded.get());
+        conn.execute("INSERT INTO events VALUES (2, 'appended');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, body FROM events ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("appended".into()));
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let appended: String = sqlite
+            .query_row("SELECT body FROM events WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(appended, "appended");
+        assert_eq!(integrity, "ok");
     }
 
     #[test]
@@ -164613,6 +165223,90 @@ mod pager_routing_tests {
             joined,
             vec![1, 1_000_000],
             "the sparse TEMP-IPK repair driver must find every requested FTS shadow row"
+        );
+    }
+
+    #[test]
+    fn test_temp_table_ddl_never_allocates_unowned_main_database_pages() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE durable(
+                id INTEGER PRIMARY KEY,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO durable VALUES (1, 'seed', 'main');")
+            .unwrap();
+        let before = conn.query("PRAGMA page_count;").unwrap()[0].values()[0].to_integer();
+
+        conn.execute(
+            "CREATE TEMP TABLE repair_probe(
+                id INTEGER PRIMARY KEY,
+                external_id TEXT UNIQUE,
+                ordinal INTEGER,
+                tag TEXT,
+                UNIQUE(ordinal, external_id)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repair_probe VALUES
+                (1000000, 'high', 2, 'alpha'),
+                (1, 'low', 1, 'beta');",
+        )
+        .unwrap();
+        let rows = conn
+            .query("SELECT id FROM repair_probe ORDER BY ordinal;")
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1_000_000)]
+        );
+        conn.execute("CREATE INDEX temp.idx_repair_ordinal ON repair_probe(ordinal);")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX temp.idx_repair_tag ON repair_probe(tag);")
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO repair_probe VALUES (2, 'other', 3, 'alpha');")
+                .is_err(),
+            "TEMP UNIQUE indexes must reject duplicate keys without a pager B-tree"
+        );
+        conn.execute("DROP INDEX temp.idx_repair_tag;").unwrap();
+        conn.execute("INSERT INTO repair_probe VALUES (2, 'other', 3, 'alpha');")
+            .unwrap();
+        conn.execute("DROP INDEX temp.idx_repair_ordinal;").unwrap();
+        let after = conn.query("PRAGMA page_count;").unwrap()[0].values()[0].to_integer();
+        assert_eq!(
+            after, before,
+            "TEMP table roots and implicit indexes must not consume main-database pages"
+        );
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(temp.path()).unwrap();
+        let quick: String = sqlite
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick, "ok");
+        assert_eq!(integrity, "ok");
+        let leaked: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='repair_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "TEMP catalog entries must remain connection-local"
         );
     }
 

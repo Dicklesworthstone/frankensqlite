@@ -7757,6 +7757,34 @@ impl Fts5Table {
         self.lazy_on_disk
     }
 
+    /// Advance lazy-mode bookkeeping after the host durably appends documents.
+    ///
+    /// Lazy contentless tables keep their historical posting lists on disk and
+    /// only materialize the current INSERT delta in memory.  Once the host has
+    /// persisted that delta, the cached count and rowid allocator must advance
+    /// without clearing lazy mode or hydrating the historical corpus.
+    pub fn note_lazy_inserted_rows(&mut self, rowids: &[i64]) {
+        if !self.lazy_on_disk {
+            return;
+        }
+        self.lazy_doc_count = self.lazy_doc_count.saturating_add(rowids.len());
+        if let Some(max_rowid) = rowids.iter().copied().max() {
+            self.next_rowid = self.next_rowid.max(max_rowid.saturating_add(1));
+        }
+        // The host has made this statement's delta visible through the same
+        // on-disk reader used by MATCH. Drop the transient postings/content so
+        // repeated batches stay O(batch), not O(total corpus).
+        self.documents.clear();
+        self.shadow_rows = None;
+        self.row_locales.clear();
+        self.index = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+    }
+
     /// Leave lazy on-disk mode after the host materializes table rows.
     pub fn clear_lazy_on_disk(&mut self) {
         self.lazy_on_disk = false;

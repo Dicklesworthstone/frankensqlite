@@ -921,6 +921,9 @@ fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static 
     for op in ops {
         match op.opcode {
             Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast => {
+                if op.p3 == 1 {
+                    return Some("temp_database_cursor");
+                }
                 storage_cursor_ids.insert(op.p1);
             }
             Opcode::SorterOpen => {
@@ -1075,6 +1078,40 @@ pub struct VdbeProgram {
 }
 
 impl VdbeProgram {
+    /// Route storage-root opens for connection-local TEMP objects through
+    /// SQLite's database-number 1 namespace.
+    ///
+    /// Code generation deliberately operates on schema metadata rather than
+    /// connection state, so it cannot know which otherwise ordinary table
+    /// roots belong to the TEMP database. The connection applies this final
+    /// annotation after codegen. Execution then uses the attached
+    /// [`MemDatabase`](crate::engine::MemDatabase) instead of ever consulting
+    /// or mutating pages in the main pager.
+    pub fn route_storage_roots_to_temp_database(
+        &mut self,
+        temp_roots: impl IntoIterator<Item = i32>,
+    ) {
+        let temp_roots: HashSet<i32> = temp_roots.into_iter().collect();
+        if temp_roots.is_empty() {
+            return;
+        }
+
+        let mut routed_any = false;
+        for op in &mut self.ops {
+            if matches!(
+                op.opcode,
+                Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast
+            ) && temp_roots.contains(&op.p2)
+            {
+                op.p3 = 1;
+                routed_any = true;
+            }
+        }
+        if routed_any {
+            self.requires_attached_memdb = true;
+        }
+    }
+
     fn verify_control_flow_targets(&self) -> Result<()> {
         let op_count = self.ops.len();
         for (pc, op) in self.ops.iter().enumerate() {
