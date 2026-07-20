@@ -574,16 +574,22 @@ mod tests {
         let config = DiscoveryConfig::default();
         let candidates = discover_sqlite_files(&config).unwrap();
 
-        // We expect at least some beads.db files in /dp.
-        let beads_count = candidates
-            .iter()
-            .filter(|c| c.tags.contains(&"beads".to_owned()) && c.header_ok)
-            .count();
-
+        // `/dp` is a live fleet workspace, not a fixture with a stable
+        // inventory. In particular, repositories may migrate from the legacy
+        // `beads.db` format to JSONL-only `br` state. Keep this host smoke test
+        // focused on discovery's actual contract: traversal succeeds, results
+        // stay rooted under the requested tree, and ordering is deterministic.
         assert!(
-            beads_count > 0,
-            "expected at least one beads.db file in /dp, found 0 out of {} candidates",
-            candidates.len()
+            candidates
+                .iter()
+                .all(|candidate| candidate.path.starts_with(dp)),
+            "discovery returned a candidate outside /dp"
+        );
+        assert!(
+            candidates
+                .windows(2)
+                .all(|pair| pair[0].path <= pair[1].path),
+            "discovery results must be sorted by path"
         );
     }
 }
