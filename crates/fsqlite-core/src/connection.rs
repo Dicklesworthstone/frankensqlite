@@ -27931,6 +27931,20 @@ impl Connection {
         };
 
         let table_name = resolved_insert.table.name.as_str();
+        // The direct-simple lane opens `root_page` against the main pager.
+        // Connection-local TEMP roots deliberately share the integer root
+        // namespace but live only in `MemDatabase`; their compiled VDBE
+        // programs carry database number 1 to preserve that distinction.
+        // Keep TEMP inserts on that routed reusable-program lane. Otherwise a
+        // single-row prepared INSERT can mistake the first clean TEMP root for
+        // a page just beyond the main snapshot (CASS restart repair / GH#290).
+        if self
+            .temp_table_names
+            .borrow()
+            .contains(&table_name.to_ascii_lowercase())
+        {
+            return Ok(None);
+        }
         let schema = self.schema.borrow();
         let Some(table) = schema
             .iter()
@@ -132371,12 +132385,46 @@ SELECT x FROM t;
             assert_eq!(fts5.row_count(), 3);
         }
 
+        // Model the bounded CASS repair driver: its TEMP table is created
+        // before the main FTS shadow grows. The connection must keep that
+        // connection-local root isolated even when later shadow B-tree splits
+        // allocate the same numeric page in the main database.
+        conn.execute("CREATE TEMP TABLE repair_probe_ids(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO repair_probe_ids(id) VALUES(?1),(?2);",
+            &[SqliteValue::Integer(1), SqliteValue::Integer(2)],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repair_probe_ids;").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO repair_probe_ids(id) VALUES(?1);",
+            &[SqliteValue::Integer(1)],
+        )
+        .unwrap();
+
         conn.execute(
             "INSERT INTO messages_fts(rowid, body) VALUES
                 (4, 'delta rust'),
                 (5, 'epsilon search');",
         )
         .unwrap();
+        conn.execute("DELETE FROM repair_probe_ids;").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO repair_probe_ids(id) VALUES(?1),(?2);",
+            &[SqliteValue::Integer(4), SqliteValue::Integer(5)],
+        )
+        .unwrap();
+        let probe_rows = conn
+            .query("SELECT id FROM repair_probe_ids ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            probe_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(4), SqliteValue::Integer(5)]
+        );
         {
             let instances = conn.vtab_instances.borrow();
             let fts5 = instances
