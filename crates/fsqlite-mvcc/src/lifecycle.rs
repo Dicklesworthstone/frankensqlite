@@ -1318,6 +1318,12 @@ impl TransactionManager {
 
     fn publish_shared_snapshot(&self, commit_seq: CommitSeq) {
         let snapshot = Snapshot::new(commit_seq, self.schema_epoch);
+        // NOTE: ecs_epoch is sampled BEFORE the seqlock critical section
+        // inside publish_snapshot. Sound today because nothing advances
+        // ecs_epoch concurrently with commit publication (only reconcile and
+        // tests write it); if an ecs-bump path is ever added, this load must
+        // move inside the publish critical section or the out-of-order guard
+        // could persist a stale epoch.
         self.shm.publish_snapshot(
             snapshot.high,
             snapshot.schema_epoch,

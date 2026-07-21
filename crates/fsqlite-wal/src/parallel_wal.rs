@@ -869,9 +869,8 @@ pub struct SegmentRecoveryOptions {
     /// exist only in memory, so deleting the durable segment before apply
     /// creates a crash window that silently loses committed data. The
     /// eligible paths are returned in
-    /// [`SegmentRecoveryResult::deletable_segments`];
-    /// [`recover_and_apply_segments`] deletes them after apply, and manual
-    /// callers use [`delete_recovered_segments`] at their own apply boundary.
+    /// [`SegmentRecoveryResult::deletable_segments`], and the caller invokes
+    /// [`delete_recovered_segments`] once the applied state is durable.
     pub delete_after_recovery: bool,
     /// Stop at the first corrupt segment and return the durable prefix instead
     /// of failing the whole recovery.
@@ -986,7 +985,11 @@ pub fn recover_segments(
 pub fn delete_recovered_segments(result: &SegmentRecoveryResult) {
     for path in &result.deletable_segments {
         if let Err(e) = delete_segment(path) {
-            eprintln!("warning: failed to delete segment {}: {e}", path.display());
+            tracing::warn!(
+                segment = %path.display(),
+                error = %e,
+                "failed to delete recovered segment; it will be re-parsed on the next recovery"
+            );
         }
     }
 }
@@ -1013,6 +1016,12 @@ fn ordered_segment_records(epoch: u64, records: &[WalRecord]) -> io::Result<Vec<
 ///
 /// The page_contents map is keyed by page number and contains the
 /// current contents of each page. Records are applied in epoch order.
+///
+/// With `delete_after_recovery`, eligible segment paths are returned in
+/// [`SegmentRecoveryResult::deletable_segments`] but are **not** removed:
+/// the map filled here is in-memory state, so the caller must first make
+/// the applied pages durable and then call [`delete_recovered_segments`]
+/// (GH #192).
 pub fn recover_and_apply_segments(
     db_path: &Path,
     page_contents: &mut HashMap<u32, Vec<u8>, impl BuildHasher>,
@@ -1028,11 +1037,11 @@ pub fn recover_and_apply_segments(
         }
     }
 
-    // GH #192: delete segments only after every record has been applied to
-    // the caller's page state. Before this point the parsed records exist
-    // only in memory and the segment files are the sole durable copy.
-    delete_recovered_segments(&result);
-
+    // GH #192: segments are NOT deleted here. `page_contents` is an
+    // in-memory map — deleting the segments now would make it the sole copy
+    // of committed data, recreating the crash window this fix closes. The
+    // caller must persist the applied state durably and only then call
+    // [`delete_recovered_segments`] with this result.
     Ok(result)
 }
 
@@ -2827,11 +2836,23 @@ mod tests {
         assert_eq!(page.len(), 32);
         assert!(page.iter().all(|&b| b == 3), "should have epoch 3 content");
 
-        // Segments should be deleted
+        // GH #192: the in-memory apply must NOT delete the segments — they
+        // are the sole durable copy until the caller persists the pages.
+        let remaining = list_segments(&db_path).expect("list should succeed");
+        assert_eq!(
+            remaining.len(),
+            3,
+            "segments must survive until the applied state is durable"
+        );
+        assert_eq!(result.deletable_segments.len(), 3);
+
+        // Once the caller has made the applied pages durable, explicit
+        // cleanup removes exactly the recovered segments.
+        delete_recovered_segments(&result);
         let remaining = list_segments(&db_path).expect("list should succeed");
         assert!(
             remaining.is_empty(),
-            "segments should be deleted after recovery"
+            "post-durability cleanup deletes the recovered segments"
         );
     }
 

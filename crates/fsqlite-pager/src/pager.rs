@@ -8269,10 +8269,23 @@ where
         let pending_namespace = if vfs.is_memory() {
             None
         } else {
-            Some(PendingNamespaceOpen::begin(
-                &db_path,
-                NamespaceOpenIntent::ReadOnlyExisting,
-            )?)
+            // GH #140: prefer strictly read-only admission — join the
+            // existing namespace generation without creating or rewriting
+            // any sidecar record. Only when no admissible records exist
+            // (a database never opened by FrankenSQLite, e.g. a stock
+            // SQLite file) fall back to the writable Shared admission so
+            // the database still opens read-only on writable media; the
+            // zero-mutation clean-database case remains tracked in #140.
+            // Busy is NOT a fallback trigger: it means a live generation
+            // transition is in flight and must stay retryable.
+            match PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::ReadOnlyExisting) {
+                Ok(pending) => Some(pending),
+                Err(FrankenError::CannotOpen { .. }) => Some(PendingNamespaceOpen::begin(
+                    &db_path,
+                    NamespaceOpenIntent::Shared,
+                )?),
+                Err(error) => return Err(error),
+            }
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_expected_identity = pending_namespace
@@ -13771,10 +13784,11 @@ where
         //
         // GH #198: this sync is the checkpoint recovery fence — the WAL
         // generation may be invalidated right after it, so it must be the
-        // full-durability barrier (`FULL` maps to a true fsync including
-        // metadata, and to the strongest platform barrier where the VFS
-        // distinguishes one), not the relaxed `NORMAL` mode.
-        inner.db_file.sync(cx, SyncFlags::FULL)?;
+        // strongest platform durability barrier. `durable_sync(FullDurable)`
+        // reaches F_FULLFSYNC on macOS (plain `sync(FULL)` stops at fsync,
+        // which does not flush the drive cache there) and a full fsync
+        // including metadata everywhere else.
+        inner.db_file.durable_sync(cx, SyncKind::FullDurable)?;
         // D1-CRITICAL Change 3: Use sharded publish_remove_page.
         self.published.publish_remove_page(
             cx,
@@ -20335,9 +20349,24 @@ mod tests {
         inner: MemoryVfs,
         fail_next_write: Arc<AtomicBool>,
         fail_next_sync: Arc<AtomicBool>,
-        /// Bits of the last `SyncFlags` that crossed the main-DB VFS boundary
-        /// (0 = no sync observed yet). Used by the GH #198 regression.
-        last_db_sync_flags: Arc<std::sync::atomic::AtomicU8>,
+        /// Encoded durability request last observed on the main-DB file
+        /// (0 = none yet; see `encode_sync_request`). Used by the GH #198
+        /// regression to prove the checkpoint fence asks for `FullDurable`.
+        last_db_sync_request: Arc<std::sync::atomic::AtomicU8>,
+    }
+
+    /// Encoding for `last_db_sync_request`: plain `sync` calls record
+    /// `0x10 | flags`, `durable_sync` calls record `0x20 | kind`.
+    const SYNC_REQUEST_PLAIN: u8 = 0x10;
+    const SYNC_REQUEST_DURABLE: u8 = 0x20;
+
+    fn encode_durable_sync_kind(kind: SyncKind) -> u8 {
+        SYNC_REQUEST_DURABLE
+            | match kind {
+                SyncKind::DataOnly => 1,
+                SyncKind::DataAndMetadata => 2,
+                SyncKind::FullDurable => 3,
+            }
     }
 
     impl CheckpointFaultVfs {
@@ -20346,7 +20375,7 @@ mod tests {
                 inner: MemoryVfs::new(),
                 fail_next_write: Arc::new(AtomicBool::new(false)),
                 fail_next_sync: Arc::new(AtomicBool::new(false)),
-                last_db_sync_flags: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                last_db_sync_request: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             }
         }
     }
@@ -20356,7 +20385,7 @@ mod tests {
         is_main_db: bool,
         fail_next_write: Arc<AtomicBool>,
         fail_next_sync: Arc<AtomicBool>,
-        last_db_sync_flags: Arc<std::sync::atomic::AtomicU8>,
+        last_db_sync_request: Arc<std::sync::atomic::AtomicU8>,
     }
 
     impl Vfs for CheckpointFaultVfs {
@@ -20379,7 +20408,7 @@ mod tests {
                     is_main_db: flags.contains(VfsOpenFlags::MAIN_DB),
                     fail_next_write: Arc::clone(&self.fail_next_write),
                     fail_next_sync: Arc::clone(&self.fail_next_sync),
-                    last_db_sync_flags: Arc::clone(&self.last_db_sync_flags),
+                    last_db_sync_request: Arc::clone(&self.last_db_sync_request),
                 },
                 actual_flags,
             ))
@@ -20426,8 +20455,8 @@ mod tests {
 
         fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
             if self.is_main_db {
-                self.last_db_sync_flags
-                    .store(flags.bits(), AtomicOrdering::Release);
+                self.last_db_sync_request
+                    .store(SYNC_REQUEST_PLAIN | flags.bits(), AtomicOrdering::Release);
                 if self.fail_next_sync.swap(false, AtomicOrdering::AcqRel) {
                     return Err(FrankenError::internal(
                         "injected checkpoint db sync failure",
@@ -20435,6 +20464,19 @@ mod tests {
                 }
             }
             self.inner.sync(cx, flags)
+        }
+
+        fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+            if self.is_main_db {
+                self.last_db_sync_request
+                    .store(encode_durable_sync_kind(kind), AtomicOrdering::Release);
+                if self.fail_next_sync.swap(false, AtomicOrdering::AcqRel) {
+                    return Err(FrankenError::internal(
+                        "injected checkpoint db sync failure",
+                    ));
+                }
+            }
+            self.inner.durable_sync(cx, kind)
         }
 
         fn file_size(&self, cx: &Cx) -> Result<u64> {
@@ -20564,15 +20606,17 @@ mod tests {
     }
 
     /// GH #198: the checkpoint writer's durability barrier is the recovery
-    /// fence executed before WAL invalidation, so the flag that crosses the
-    /// VFS boundary must be `FULL` (true fsync incl. metadata / strongest
-    /// platform barrier), not the relaxed `NORMAL` mode.
+    /// fence executed before WAL invalidation, so the request that crosses
+    /// the VFS boundary must be `durable_sync(FullDurable)` — the only entry
+    /// point that reaches the strongest platform barrier (F_FULLFSYNC on
+    /// macOS) — not the relaxed `sync(NORMAL)` mode and not plain
+    /// `sync(FULL)`, which stops at fsync.
     #[test]
-    fn test_checkpoint_writer_sync_uses_full_durability_flag() {
+    fn test_checkpoint_writer_sync_uses_full_durability_barrier() {
         use crate::traits::CheckpointPageWriter as _;
         let cx = Cx::new();
         let vfs = CheckpointFaultVfs::new();
-        let observed_flags = Arc::clone(&vfs.last_db_sync_flags);
+        let observed_request = Arc::clone(&vfs.last_db_sync_request);
         let pager =
             SimplePager::open(vfs, Path::new("/ckpt-sync-flag-198.db"), PageSize::DEFAULT).unwrap();
         let page_size = PageSize::DEFAULT.as_usize();
@@ -20583,11 +20627,12 @@ mod tests {
         writer.write_page(&cx, PageNumber::ONE, &page1).unwrap();
         writer.sync(&cx).unwrap();
 
-        let flags = SyncFlags::from_bits_retain(observed_flags.load(AtomicOrdering::Acquire));
+        let request = observed_request.load(AtomicOrdering::Acquire);
         assert_eq!(
-            flags,
-            SyncFlags::FULL,
-            "checkpoint durability fence must cross the VFS as FULL (GH #198), got {flags:?}"
+            request,
+            encode_durable_sync_kind(SyncKind::FullDurable),
+            "checkpoint durability fence must cross the VFS as \
+             durable_sync(FullDurable) (GH #198), got encoded request {request:#04x}"
         );
     }
 

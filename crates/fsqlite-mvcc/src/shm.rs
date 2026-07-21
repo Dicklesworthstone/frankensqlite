@@ -134,7 +134,27 @@ const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 const SNAPSHOT_PUBLISHER_INITIALIZING: u64 = 1_u64 << 63;
 
 /// Process-local generation used to make consecutive ownership tokens distinct.
-static NEXT_SNAPSHOT_PUBLISHER_GENERATION: AtomicU64 = AtomicU64::new(1);
+///
+/// Seeded from per-process entropy rather than a fixed constant: with a fixed
+/// seed, a new process that reuses a dead publisher's PID would mint the exact
+/// token the dead owner left stamped, and a concurrent waiter that already
+/// proved the old owner dead could CAS the *live* new owner out (token ABA).
+/// Entropy makes cross-process token collision negligible, so the claim CAS
+/// remains a sound guard.
+static NEXT_SNAPSHOT_PUBLISHER_GENERATION: OnceLock<AtomicU64> = OnceLock::new();
+
+fn next_snapshot_publisher_generation_counter() -> &'static AtomicU64 {
+    NEXT_SNAPSHOT_PUBLISHER_GENERATION.get_or_init(|| {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        // RandomState carries per-process random SipHash keys; hashing the
+        // pid and birth marker through it yields a process-unique seed
+        // without pulling in an RNG dependency.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.write_u64(current_process_birth_marker());
+        AtomicU64::new(hasher.finish())
+    })
+}
 
 #[cfg(unix)]
 fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
@@ -218,7 +238,7 @@ impl SnapshotPublisherIdentity {
     fn current() -> Self {
         let pid = std::process::id();
         let generation = loop {
-            let raw = NEXT_SNAPSHOT_PUBLISHER_GENERATION.fetch_add(1, Ordering::Relaxed);
+            let raw = next_snapshot_publisher_generation_counter().fetch_add(1, Ordering::Relaxed);
             let generation = (raw as u32) & 0x7fff_ffff;
             if generation != 0 {
                 break generation;
@@ -860,6 +880,27 @@ impl SharedMemoryLayout {
     /// Crash-staleness is recovered only after proving the stamped owner dead.
     /// There is no elapsed-time takeover: a descheduled live publisher retains
     /// ownership indefinitely, preserving the seqlock safety contract.
+    ///
+    /// Protocol constraints (deliberate, documented trade-offs):
+    ///
+    /// - **Dead-owner detection is procfs-based.** All publishers sharing a
+    ///   region must live in one PID namespace; a peer in a different
+    ///   namespace could judge a live publisher dead (its PID is not visible
+    ///   in `/proc`) and steal the critical section. On platforms without
+    ///   `/proc` (and on non-unix), a stamped owner is presumed alive
+    ///   forever, so crash recovery of an owner-stamped odd sequence is
+    ///   unavailable there — publishers wait until `reconcile` semantics or
+    ///   process restart clear the region.
+    /// - **Legacy unowned-odd sequences** (left by a pre-ownership binary
+    ///   crashing mid-publish) are recovered only by the explicit
+    ///   `force_recovery` reconcile path; ordinary publishers wait. Callers
+    ///   that open a shared region with possibly-stale contents must run
+    ///   reconciliation before the first publish/read on that region.
+    /// - **Mixed-version sharing is unsupported.** A pre-ownership binary
+    ///   attached to the same region still barges on odd sequences
+    ///   (reintroducing GH #199); `LAYOUT_VERSION` was not bumped because the
+    ///   byte layout is unchanged, so version negotiation cannot catch this —
+    ///   deployments must not mix binaries across this protocol change.
     fn begin_snapshot_publish(&self) -> SnapshotPublishPermit {
         self.begin_snapshot_publish_with(
             SnapshotPublisherIdentity::current(),
@@ -958,7 +999,8 @@ impl SharedMemoryLayout {
 
         // Concurrent commits can finish publication out of allocation order.
         // Never let a late lower sequence overwrite a newer complete triple.
-        if commit_seq.get() >= current_commit_seq {
+        let published = commit_seq.get() >= current_commit_seq;
+        if published {
             // DDL ordering: schema_epoch (Release) before commit_seq (Release).
             self.store_u64_field(
                 offsets::SCHEMA_EPOCH,
@@ -978,14 +1020,18 @@ impl SharedMemoryLayout {
                 commit_seq.get(),
                 Ordering::Release,
             );
-        } else {
+        }
+        self.end_snapshot_publish(permit);
+        // Logged outside the seqlock critical section: while the sequence is
+        // odd every reader spins, so nothing that can allocate, format, or
+        // panic belongs between begin and end.
+        if !published {
             tracing::debug!(
                 attempted_commit_seq = commit_seq.get(),
                 current_commit_seq,
-                "skipping stale out-of-order shared snapshot publication"
+                "skipped stale out-of-order shared snapshot publication"
             );
         }
-        self.end_snapshot_publish(permit);
     }
 
     // -----------------------------------------------------------------------
@@ -1691,7 +1737,10 @@ mod tests {
             offsets::TXN_SLOT_OFFSET,
             offsets::COMMITTED_READERS_OFFSET,
             offsets::COMMITTED_READERS_BYTES,
+            offsets::NEXT_COMMIT_SEQ,
             offsets::LAYOUT_CHECKSUM,
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
         ];
         for &off in &u64_offsets {
             assert_eq!(off % 8, 0, "offset {off} not 8-byte aligned");

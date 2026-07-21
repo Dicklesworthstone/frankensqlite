@@ -779,7 +779,13 @@ fn open_with_flags_read_only_query_preserves_every_database_artifact() {
 
 #[cfg(all(feature = "native", any(unix, windows)))]
 #[test]
-fn open_with_flags_read_only_refuses_missing_namespace_without_side_effects() {
+fn open_with_flags_read_only_opens_stock_database_without_touching_it() {
+    // GH #140 (partial): a stock SQLite database that FrankenSQLite has
+    // never opened carries no namespace records, so strictly read-only
+    // admission cannot join an existing generation. The open must still
+    // succeed (via the Shared-admission fallback) and must not modify the
+    // database file itself; the namespace sidecars it creates are the
+    // documented residual gap tracked in #140.
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("readonly_missing_namespace.db");
     let path_str = path.to_str().unwrap();
@@ -791,17 +797,27 @@ fn open_with_flags_read_only_refuses_missing_namespace_without_side_effects() {
         )
         .expect("seed external SQLite database");
     drop(external);
-    let before = snapshot_directory_files(dir.path());
+    let db_bytes_before = std::fs::read(&path).expect("snapshot stock database bytes");
 
-    let error = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .expect_err("read-only admission must require an existing namespace generation");
+    let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("stock database must remain openable read-only via fallback admission");
+    let row = readonly
+        .query_row("SELECT value FROM external_probe")
+        .expect("query the stock-database row");
+    assert_eq!(row.get(0), Some(&SqliteValue::Integer(7)));
+    drop(readonly);
 
-    assert!(matches!(error, FrankenError::CannotOpen { .. }));
     assert_eq!(
-        snapshot_directory_files(dir.path()),
-        before,
-        "missing namespace records must refuse without creating or changing any artifact"
+        std::fs::read(&path).expect("re-read stock database bytes"),
+        db_bytes_before,
+        "read-only open must not modify the stock database file"
     );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(
+            !suffixed_path(&path, suffix).exists(),
+            "read-only open must not create a {suffix} companion"
+        );
+    }
 }
 
 #[test]
