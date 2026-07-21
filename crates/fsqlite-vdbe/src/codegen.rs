@@ -1856,6 +1856,7 @@ pub fn codegen_select(
                     table,
                     table_alias,
                     schema,
+                    None,
                 )
                 .is_some()
                 || aggregate_index_prefix_literal_residual_target(
@@ -2189,16 +2190,35 @@ pub fn codegen_select(
     // directive, but the single-column `index_range` local below is None for this shape, so the
     // directive bypasses to a full scan. The seek is affinity-coerced and differential-proven
     // bit-identical, so preferring it is always correct and strictly faster. First cut declines
-    // ORDER BY / LIMIT / DISTINCT / aggregate / GROUP BY / hints / WITHOUT ROWID.
+    // ORDER BY / LIMIT / DISTINCT / aggregate / GROUP BY / WITHOUT ROWID.
+    //
+    // GH #291: an `INDEXED BY` hint naming a composite index MUST take this
+    // seek — previously any hint declined it, and because the IndexRange
+    // directive arm also rejects composite shapes, the hinted query fell all
+    // the way back to a full table scan (observed as multi-GB RSS for a
+    // 593-row range lookup on a 9 GB database). The hint now restricts the
+    // candidate set to the named index; `NOT INDEXED` still declines by
+    // definition.
+    let composite_required_index = match from_index_hint {
+        None => Some(None),
+        Some(fsqlite_ast::IndexHint::IndexedBy(name)) => Some(Some(name.as_str())),
+        Some(fsqlite_ast::IndexHint::NotIndexed) => None,
+    };
     let composite_prefix_range = if !is_aggregate
         && time_travel.is_none()
-        && from_index_hint.is_none()
+        && let Some(required_index) = composite_required_index
         && distinct == Distinctness::All
         && group_by.is_empty()
         && having.is_none()
         && !table.without_rowid
     {
-        composite_index_prefix_range_target(where_clause.as_deref(), table, table_alias, schema)
+        composite_index_prefix_range_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            required_index,
+        )
     } else {
         None
     };
@@ -12634,7 +12654,7 @@ fn codegen_select_aggregate(
         && index_range_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        composite_index_prefix_range_target(where_clause, table, table_alias, schema)
+        composite_index_prefix_range_target(where_clause, table, table_alias, schema, None)
     } else {
         None
     };
@@ -24911,12 +24931,18 @@ fn composite_index_prefix_range_target<'a>(
     table: &'a TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
+    required_index: Option<&str>,
 ) -> Option<CompositePrefixRange<'a>> {
     if table.without_rowid {
         return None;
     }
     let where_expr = where_clause?;
     for index in &table.indexes {
+        // GH #291: an `INDEXED BY` hint pins the candidate set to the named
+        // index (SQLite name resolution is case-insensitive).
+        if required_index.is_some_and(|name| !index.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
         let key_terms = index.key_term_count();
         if key_terms < 2
             || index.columns.len() != key_terms
