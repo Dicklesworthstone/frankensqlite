@@ -74,8 +74,9 @@ pub use checksum::{
     recovery_action_for_checksum_failure, sqlite_wal_checksum, supports_torn_write_sector_size,
     tier_for_algorithm, validate_wal_chain, validate_wal_header_checksum, verify_page_checksum,
     verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128, wal_frame_db_size,
-    wal_header_checksum, write_page_checksum, write_wal_frame_checksum, write_wal_frame_salts,
-    write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
+    wal_header_checksum, wal_header_treated_as_empty, write_page_checksum,
+    write_wal_frame_checksum, write_wal_frame_salts, write_wal_header_checksum,
+    write_wal_header_salts, zero_page_checksum_trailer,
 };
 pub use group_commit::{
     ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase, FrameSubmission,

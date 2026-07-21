@@ -3278,6 +3278,20 @@ where
     }
 }
 
+/// GH #292: decide whether an existing (>= 32 byte) WAL sidecar must be
+/// treated as empty per stock SQLite `walIndexRecover` semantics — bad magic,
+/// invalid page size, or header-checksum mismatch. A short header read also
+/// classifies as empty. An unsupported format version on a checksum-valid
+/// header stays a hard error and is left to [`WalFile::open`].
+fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<bool> {
+    let mut header_buf = [0_u8; fsqlite_wal::WAL_HEADER_SIZE];
+    let bytes_read = file.read(cx, &mut header_buf, 0)?;
+    if bytes_read < header_buf.len() {
+        return Ok(true);
+    }
+    Ok(fsqlite_wal::wal_header_treated_as_empty(&header_buf))
+}
+
 fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
@@ -3292,12 +3306,31 @@ where
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
         let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
-            match WalFile::open(cx, file) {
-                Ok(wal) => return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true),
-                Err(err) => return Err(err),
+            if wal_sidecar_treated_as_empty(cx, &file)? {
+                // GH #292: stock SQLite (`walIndexRecover`) treats a WAL whose
+                // header fails magic/page-size/checksum validation as EMPTY —
+                // e.g. a torn or garbage sidecar left by a killed process —
+                // and proceeds against the main database. Hard-failing here
+                // made FrankenSQLite refuse databases that native SQLite
+                // reports as fully consistent. Discard the unusable sidecar
+                // and fall through to a fresh WAL generation; fresh random
+                // salts guarantee no stale tail frame can ever validate.
+                tracing::warn!(
+                    wal_path = %wal_path.display(),
+                    "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
+                );
+                let _ = file.close(cx);
+            } else {
+                match WalFile::open(cx, file) {
+                    Ok(wal) => {
+                        return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
+        } else {
+            let _ = file.close(cx);
         }
-        let _ = file.close(cx);
     }
 
     let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
@@ -3344,6 +3377,18 @@ where
         Err(err) => return Err(err),
     };
     if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+        let _ = file.close(cx);
+        return Ok(false);
+    }
+
+    // GH #292: mirror stock SQLite — an invalid WAL header means "no WAL",
+    // not a corrupt database. Read-only/existing installs proceed against
+    // the main database exactly like the missing/short-sidecar cases above.
+    if wal_sidecar_treated_as_empty(cx, &file)? {
+        tracing::warn!(
+            wal_path = %wal_path.display(),
+            "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
+        );
         let _ = file.close(cx);
         return Ok(false);
     }
@@ -125459,8 +125504,13 @@ mod tests {
         );
     }
 
+    /// GH #292: a header-sized sidecar whose header fails validation (here:
+    /// zeroed bytes = invalid magic) must be treated as an EMPTY WAL — stock
+    /// SQLite `walIndexRecover` semantics — and replaced by a fresh
+    /// generation, not surfaced as `WalCorrupt`. Hard-failing here made
+    /// FrankenSQLite refuse databases native SQLite reports as consistent.
     #[test]
-    fn test_install_wal_backend_rejects_corrupt_existing_wal() {
+    fn test_install_wal_backend_treats_corrupt_existing_wal_as_empty() {
         let cx = Cx::new();
         let vfs = MemoryVfs::new();
         let db_path = Path::new("/wal_corrupt_existing.db");
@@ -125473,8 +125523,48 @@ mod tests {
         file.write(&cx, &[0_u8; 32], 0).unwrap();
         file.close(&cx).unwrap();
 
+        super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
+            .expect("corrupt-header WAL must be treated as empty (GH #292)");
+
+        // The unusable sidecar was replaced by a fresh, valid generation.
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        let wal = fsqlite_wal::WalFile::open(&cx, file).expect("fresh WAL generation is valid");
+        assert_eq!(wal.frame_count(), 0, "fresh generation starts empty");
+    }
+
+    /// GH #292 boundary: an unsupported WAL format version on an
+    /// otherwise-valid, checksum-correct header is the one case stock SQLite
+    /// keeps as a hard error (`SQLITE_CANTOPEN`) — it must NOT be silently
+    /// treated as empty, or a future-format WAL's committed data would be
+    /// discarded.
+    #[test]
+    fn test_install_wal_backend_still_rejects_unsupported_format_version() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = Path::new("/wal_future_version.db");
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT).unwrap(),
+        );
+        let wal_path = wal_path_for_db_path("/wal_future_version.db");
+
+        // Build a header with valid magic/page size, a future format version,
+        // and a CORRECT checksum over bytes 0..24.
+        let mut header = [0_u8; 32];
+        header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_001_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&4096_u32.to_be_bytes());
+        let checksum = fsqlite_wal::wal_header_checksum(&header, false).expect("checksum");
+        header[24..28].copy_from_slice(&checksum.s1.to_be_bytes());
+        header[28..32].copy_from_slice(&checksum.s2.to_be_bytes());
+
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        file.write(&cx, &header, 0).unwrap();
+        file.close(&cx).unwrap();
+
         let err = super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
-            .expect_err("header-sized corrupt WAL should be surfaced");
+            .expect_err("checksum-valid future-version WAL must stay a hard error");
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
             "unexpected error: {err:?}"

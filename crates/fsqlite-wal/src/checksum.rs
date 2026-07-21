@@ -1658,6 +1658,39 @@ fn ensure_frame_len(frame: &[u8], page_size: usize) -> Result<()> {
     ensure_min_len(frame, frame_size, "WAL frame")
 }
 
+/// GH #292: classify a 32-byte WAL header exactly the way stock SQLite's
+/// `walIndexRecover` does.
+///
+/// Returns `true` when the header is invalid in a way stock SQLite treats as
+/// "this WAL is empty" and silently proceeds without it: bad magic, invalid
+/// page size, or header-checksum mismatch (a torn or garbage sidecar, e.g.
+/// left behind by a killed process). Returns `false` both for a fully valid
+/// header and for the single hard-error case stock SQLite keeps: a
+/// checksum-valid header with an unsupported format version
+/// (`SQLITE_CANTOPEN` there, [`FrankenError::WalCorrupt`] here).
+///
+/// Check order mirrors `walIndexRecover`: magic → page size → checksum →
+/// (version left to the caller), so a torn header with a damaged version
+/// field still classifies as empty via its failed checksum.
+#[must_use]
+pub fn wal_header_treated_as_empty(header_buf: &[u8; WAL_HEADER_SIZE]) -> bool {
+    let magic = read_be_u32_at(header_buf, 0);
+    if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+        return true;
+    }
+    if ensure_valid_wal_header_page_size(read_be_u32_at(header_buf, 8)).is_err() {
+        return true;
+    }
+    let big_endian = magic == WAL_MAGIC_BE;
+    let (Ok(stored), Ok(expected)) = (
+        read_wal_header_checksum(header_buf),
+        wal_header_checksum(header_buf, big_endian),
+    ) else {
+        return true;
+    };
+    stored != expected
+}
+
 fn ensure_valid_wal_header_page_size(page_size: u32) -> Result<()> {
     if PageSize::new(page_size).is_none() {
         return Err(FrankenError::WalCorrupt {
