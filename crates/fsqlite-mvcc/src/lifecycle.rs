@@ -15,6 +15,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use fsqlite_error::FrankenError;
 use fsqlite_types::sync_primitives::{Instant, Mutex};
 use fsqlite_types::{
     CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
@@ -390,6 +391,30 @@ impl std::fmt::Display for MvccError {
 
 impl std::error::Error for MvccError {}
 
+fn map_read_page_error(error: MvccError, pgno: PageNumber) -> FrankenError {
+    match error {
+        MvccError::Busy => FrankenError::Busy,
+        MvccError::BusySnapshot => FrankenError::BusySnapshot {
+            conflicting_pages: pgno.get().to_string(),
+        },
+        MvccError::Schema => FrankenError::SchemaChanged,
+        MvccError::IoErr => FrankenError::IoRead { page: pgno.get() },
+        MvccError::InvalidState
+        | MvccError::TxnIdExhausted
+        | MvccError::InvalidWriteMergePolicy => FrankenError::Internal(error.to_string()),
+        MvccError::ShmTooSmall
+        | MvccError::ShmBadMagic
+        | MvccError::ShmVersionMismatch
+        | MvccError::ShmInvalidPageSize
+        | MvccError::ShmChecksumMismatch => FrankenError::DatabaseCorrupt {
+            detail: error.to_string(),
+        },
+        MvccError::TxnMaxDurationExceeded => FrankenError::TransactionRolledBack {
+            reason: error.to_string(),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Savepoint
 // ---------------------------------------------------------------------------
@@ -763,18 +788,28 @@ impl TransactionManager {
     /// 2. For DEFERRED mode: establish snapshot on first read.
     /// 3. Resolve via version store.
     ///
-    /// Returns `None` if the page has no committed version visible at the
+    /// Returns `Ok(None)` if the page has no committed version visible at the
     /// transaction's snapshot (and is not in the write_set).
-    pub fn read_page(&self, txn: &mut Transaction, pgno: PageNumber) -> Option<PageData> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MvccError::TxnMaxDurationExceeded`] when the transaction has
+    /// outlived `txn_max_duration_ms`; the transaction is aborted as a side
+    /// effect. GH #202: this abort must be distinguishable from ordinary page
+    /// absence, otherwise callers treat a dead transaction's reads as
+    /// legitimate empty results.
+    pub fn read_page(
+        &self,
+        txn: &mut Transaction,
+        pgno: PageNumber,
+    ) -> Result<Option<PageData>, MvccError> {
         assert_eq!(
             txn.state,
             TransactionState::Active,
             "can only read in active transactions"
         );
 
-        if self.ensure_txn_within_max_duration(txn).is_err() {
-            return None;
-        }
+        self.ensure_txn_within_max_duration(txn)?;
 
         // Check write_set first.
         if let Some(data) = txn.write_set_data.get(&pgno).cloned() {
@@ -783,7 +818,7 @@ impl TransactionManager {
                 .and_then(|entry| entry.new_version.or(entry.old_version))
                 .unwrap_or(txn.snapshot.high);
             txn.record_page_read(pgno, tracked_version);
-            return Some(data);
+            return Ok(Some(data));
         }
 
         // DEFERRED snapshot establishment on first read.
@@ -800,11 +835,14 @@ impl TransactionManager {
         }
 
         // Resolve visible version from the version store.
-        let version = self
+        let Some(version) = self
             .version_store
-            .resolve_visible_version(pgno, &txn.snapshot)?;
+            .resolve_visible_version(pgno, &txn.snapshot)
+        else {
+            return Ok(None);
+        };
         txn.record_page_read(pgno, version.commit_seq);
-        Some(version.data)
+        Ok(Some(version.data))
     }
 
     /// Read a page and apply visible cell-level deltas before returning it.
@@ -820,7 +858,10 @@ impl TransactionManager {
         usable_size: u32,
     ) -> fsqlite_error::Result<Option<PageData>> {
         let staged_full_page = txn.write_set_data.contains_key(&pgno);
-        let Some(base_page) = self.read_page(txn, pgno) else {
+        let Some(base_page) = self
+            .read_page(txn, pgno)
+            .map_err(|error| map_read_page_error(error, pgno))?
+        else {
             return Ok(None);
         };
 
@@ -885,21 +926,20 @@ impl TransactionManager {
     /// This is the range-scan callsite for SSI tracking: every scanned page is
     /// captured in the read-set/witness ledger, including pages with no visible
     /// committed version (tracked at `snapshot.high` fallback).
-    #[must_use]
     pub fn read_page_range(
         &self,
         txn: &mut Transaction,
         start_page: PageNumber,
         end_page: PageNumber,
-    ) -> Vec<(PageNumber, Option<PageData>)> {
+    ) -> Result<Vec<(PageNumber, Option<PageData>)>, MvccError> {
         if start_page.get() > end_page.get() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut visible_pages = Vec::new();
         for raw_page in start_page.get()..=end_page.get() {
             if let Some(page) = PageNumber::new(raw_page) {
-                let page_data = self.read_page(txn, page);
+                let page_data = self.read_page(txn, page)?;
                 if page_data.is_none() {
                     // Empty pages still need page-level predicate coverage so
                     // SSI can reason about the scan footprint without a second
@@ -910,7 +950,7 @@ impl TransactionManager {
             }
         }
 
-        visible_pages
+        Ok(visible_pages)
     }
 
     fn publish_cached_gc_horizon(&self, snapshot_counts: &BTreeMap<CommitSeq, usize>) {
@@ -2411,7 +2451,8 @@ mod tests {
         let before = crate::observability::mvcc_snapshot_metrics_snapshot();
         let mut reader = m.begin(BeginKind::Deferred).unwrap();
         let capture_guard = crate::test_support::tracing_capture_guard();
-        let (read, logs) = with_tracing_capture(&capture_guard, || m.read_page(&mut reader, pgno));
+        let (read, logs) =
+            with_tracing_capture(&capture_guard, || m.read_page(&mut reader, pgno).unwrap());
         assert!(read.is_some());
 
         let after = crate::observability::mvcc_snapshot_metrics_snapshot();
@@ -2474,7 +2515,7 @@ mod tests {
         assert_eq!(txn.mode, TransactionMode::Serialized);
 
         // Read a page — this should establish the snapshot.
-        let _ = m.read_page(&mut txn, PageNumber::new(1).unwrap());
+        let _ = m.read_page(&mut txn, PageNumber::new(1).unwrap()).unwrap();
         assert!(
             txn.snapshot_established,
             "snapshot should be established after first read"
@@ -2531,7 +2572,7 @@ mod tests {
         m.write_page(&mut txn, pgno, data).unwrap();
 
         // Read should return write_set version, not version store.
-        let read_data = m.read_page(&mut txn, pgno).unwrap();
+        let read_data = m.read_page(&mut txn, pgno).unwrap().unwrap();
         assert_eq!(read_data.as_bytes()[0], 0xAB);
     }
 
@@ -2543,12 +2584,12 @@ mod tests {
         assert!(!txn.snapshot_established);
 
         // Read any page — triggers snapshot establishment.
-        let _ = m.read_page(&mut txn, PageNumber::new(1).unwrap());
+        let _ = m.read_page(&mut txn, PageNumber::new(1).unwrap()).unwrap();
         assert!(txn.snapshot_established);
 
         // Snapshot should stay the same on subsequent reads.
         let snap_high = txn.snapshot.high;
-        let _ = m.read_page(&mut txn, PageNumber::new(2).unwrap());
+        let _ = m.read_page(&mut txn, PageNumber::new(2).unwrap()).unwrap();
         assert_eq!(
             txn.snapshot.high, snap_high,
             "snapshot must not change after establishment"
@@ -2568,7 +2609,7 @@ mod tests {
 
         // New transaction should see the committed data.
         let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
-        let data = m.read_page(&mut txn2, pgno);
+        let data = m.read_page(&mut txn2, pgno).unwrap();
         assert!(data.is_some(), "committed data should be visible");
         assert_eq!(data.unwrap().as_bytes()[0], 0x01);
     }
@@ -2583,7 +2624,7 @@ mod tests {
         let committed = m.commit(&mut writer).unwrap();
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let data = m.read_page(&mut reader, pgno).unwrap();
+        let data = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(data.as_bytes()[0], 0x22);
         assert_eq!(reader.read_version_for_page(pgno), Some(committed));
         assert!(
@@ -2609,7 +2650,7 @@ mod tests {
             pinned_reader.snapshot.high, seq1,
             "reader must pin the latest committed version at begin"
         );
-        let first_read = m.read_page(&mut pinned_reader, pgno).unwrap();
+        let first_read = m.read_page(&mut pinned_reader, pgno).unwrap().unwrap();
         assert_eq!(first_read.as_bytes()[0], 0x10);
         assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq1));
 
@@ -2619,7 +2660,7 @@ mod tests {
         let seq2 = m.commit(&mut later_writer).unwrap();
         assert!(seq2 > seq1);
 
-        let pinned_again = m.read_page(&mut pinned_reader, pgno).unwrap();
+        let pinned_again = m.read_page(&mut pinned_reader, pgno).unwrap().unwrap();
         assert_eq!(
             pinned_again.as_bytes()[0],
             0x10,
@@ -2639,7 +2680,7 @@ mod tests {
             fresh_reader.snapshot.high >= seq2,
             "fresh reader must start after the later concurrent commit"
         );
-        let fresh_read = m.read_page(&mut fresh_reader, pgno).unwrap();
+        let fresh_read = m.read_page(&mut fresh_reader, pgno).unwrap().unwrap();
         assert_eq!(
             fresh_read.as_bytes()[0],
             0x20,
@@ -2693,7 +2734,7 @@ mod tests {
         let committed = m.commit(&mut seed).unwrap();
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let scanned = m.read_page_range(&mut reader, p20, p23);
+        let scanned = m.read_page_range(&mut reader, p20, p23).unwrap();
         assert_eq!(scanned.len(), 4);
         assert_eq!(
             scanned
@@ -2732,7 +2773,7 @@ mod tests {
         let p30 = PageNumber::new(30).unwrap();
         let p25 = PageNumber::new(25).unwrap();
 
-        let scanned = m.read_page_range(&mut reader, p30, p25);
+        let scanned = m.read_page_range(&mut reader, p30, p25).unwrap();
         assert!(scanned.is_empty());
         assert!(reader.read_set_versions.is_empty());
         assert!(reader.read_keys.is_empty());
@@ -2759,7 +2800,7 @@ mod tests {
             "intervening commit must advance snapshot high for this regression"
         );
 
-        let scanned = m.read_page_range(&mut reader, p40, p41);
+        let scanned = m.read_page_range(&mut reader, p40, p41).unwrap();
         assert_eq!(scanned.len(), 2);
         assert!(reader.snapshot_established);
         assert_eq!(reader.read_version_for_page(p40), Some(committed));
@@ -2782,7 +2823,7 @@ mod tests {
         let mut visible_pages = Vec::new();
         for raw_page in start_page.get()..=end_page.get() {
             if let Some(page) = PageNumber::new(raw_page) {
-                visible_pages.push((page, manager.read_page(txn, page)));
+                visible_pages.push((page, manager.read_page(txn, page).unwrap()));
             }
         }
         visible_pages
@@ -2844,7 +2885,9 @@ mod tests {
                 let run_start = Instant::now();
                 for _ in 0..ITERATIONS {
                     let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-                    let rows = m.read_page_range(&mut reader, start_page, end_page);
+                    let rows = m
+                        .read_page_range(&mut reader, start_page, end_page)
+                        .unwrap();
                     let checksum =
                         consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);
                     black_box(checksum);
@@ -2907,7 +2950,7 @@ mod tests {
 
         // Now start a DEFERRED txn and read (establishing snapshot at current seq).
         let mut txn = m.begin(BeginKind::Deferred).unwrap();
-        let _ = m.read_page(&mut txn, PageNumber::new(2).unwrap());
+        let _ = m.read_page(&mut txn, PageNumber::new(2).unwrap()).unwrap();
         assert!(txn.snapshot_established);
 
         // Advance the database again with another commit.
@@ -2947,7 +2990,7 @@ mod tests {
         assert!(m.cached_gc_horizon().is_none());
 
         assert_eq!(
-            m.read_page(&mut reader_then_writer, pgno),
+            m.read_page(&mut reader_then_writer, pgno).unwrap(),
             Some(test_data(0x01))
         );
         assert!(reader_then_writer.snapshot_established);
@@ -3005,7 +3048,7 @@ mod tests {
 
         let mut reader_then_writer = m.begin(BeginKind::Deferred).unwrap();
         assert_eq!(
-            m.read_page(&mut reader_then_writer, pgno),
+            m.read_page(&mut reader_then_writer, pgno).unwrap(),
             Some(test_data(0x04))
         );
         assert!(reader_then_writer.snapshot_established);
@@ -3334,7 +3377,7 @@ mod tests {
 
         // Concurrent reads must still be permitted.
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let got = m.read_page(&mut reader, pgno).unwrap();
+        let got = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(got.as_bytes()[0], 0x11);
     }
 
@@ -3349,7 +3392,7 @@ mod tests {
 
         // DEFERRED read-only begin always permitted.
         let mut def = m.begin(BeginKind::Deferred).unwrap();
-        let _ = m.read_page(&mut def, PageNumber::new(2).unwrap());
+        let _ = m.read_page(&mut def, PageNumber::new(2).unwrap()).unwrap();
 
         // But writer upgrade should be excluded while concurrent locks exist.
         let err = m
@@ -3664,7 +3707,7 @@ mod tests {
         // Data should not be visible to a new transaction.
         let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
         assert!(
-            m.read_page(&mut txn2, pgno).is_none(),
+            m.read_page(&mut txn2, pgno).unwrap().is_none(),
             "aborted data must not be visible"
         );
     }
@@ -3991,6 +4034,7 @@ mod tests {
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
         let read_back = m
             .read_page(&mut reader, p2)
+            .unwrap()
             .expect("rewritten page must be published");
         assert_eq!(read_back.as_bytes(), rewritten.as_bytes());
         m.abort(&mut reader);
@@ -4142,7 +4186,7 @@ mod tests {
         assert!(!txn_def.snapshot_established);
 
         // Read page 1 — establishes snapshot.
-        let data_p1 = m.read_page(&mut txn_def, p1).unwrap();
+        let data_p1 = m.read_page(&mut txn_def, p1).unwrap().unwrap();
         assert_eq!(data_p1.as_bytes()[0], 0x11);
         assert!(txn_def.snapshot_established);
 
@@ -4161,16 +4205,16 @@ mod tests {
         // --- Verify all data visible in a new snapshot ---
         let mut txn_read = m.begin(BeginKind::Concurrent).unwrap();
 
-        let r1 = m.read_page(&mut txn_read, p1).unwrap();
+        let r1 = m.read_page(&mut txn_read, p1).unwrap().unwrap();
         assert_eq!(r1.as_bytes()[0], 0x11, "page 1 from IMMEDIATE");
 
-        let r2 = m.read_page(&mut txn_read, p2).unwrap();
+        let r2 = m.read_page(&mut txn_read, p2).unwrap().unwrap();
         assert_eq!(r2.as_bytes()[0], 0x22, "page 2 from EXCLUSIVE");
 
-        let r3 = m.read_page(&mut txn_read, p3).unwrap();
+        let r3 = m.read_page(&mut txn_read, p3).unwrap().unwrap();
         assert_eq!(r3.as_bytes()[0], 0x33, "page 3 from DEFERRED");
 
-        let r4 = m.read_page(&mut txn_read, p4).unwrap();
+        let r4 = m.read_page(&mut txn_read, p4).unwrap().unwrap();
         assert_eq!(r4.as_bytes()[0], 0x44, "page 4 from CONCURRENT");
 
         // --- Verify isolation: old snapshot doesn't see new writes ---
@@ -4184,7 +4228,7 @@ mod tests {
         m.commit(&mut txn_update).unwrap();
 
         // txn_old should still see the old version of page 1 (0x11, not 0xFF).
-        let r1_old = m.read_page(&mut txn_old, p1).unwrap();
+        let r1_old = m.read_page(&mut txn_old, p1).unwrap().unwrap();
         assert_eq!(
             r1_old.as_bytes()[0],
             0x11,
@@ -4662,6 +4706,7 @@ mod tests {
         for page in pages {
             assert!(
                 m.read_page(&mut old_reader, PageNumber::new(page).unwrap())
+                    .unwrap()
                     .is_none(),
                 "old snapshot must not see post-snapshot commit"
             );
@@ -4672,6 +4717,7 @@ mod tests {
         for page in pages {
             assert!(
                 m.read_page(&mut fresh_reader, PageNumber::new(page).unwrap())
+                    .unwrap()
                     .is_some(),
                 "fresh snapshot must see all committed pages"
             );
@@ -4730,6 +4776,7 @@ mod tests {
         let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
         assert!(
             m.read_page(&mut txn1, PageNumber::new(500).unwrap())
+                .unwrap()
                 .is_none(),
             "read on missing page should terminate and return None"
         );
@@ -4760,7 +4807,7 @@ mod tests {
         m.write_page(&mut writer, pgno, test_data(0x22)).unwrap();
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let visible = m.read_page(&mut reader, pgno).unwrap();
+        let visible = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(
             visible.as_bytes()[0],
             0x11,
@@ -4778,14 +4825,14 @@ mod tests {
         m.commit(&mut seed).unwrap();
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let first = m.read_page(&mut reader, pgno).unwrap();
+        let first = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(first.as_bytes()[0], 0x33);
 
         let mut writer = m.begin(BeginKind::Immediate).unwrap();
         m.write_page(&mut writer, pgno, test_data(0x44)).unwrap();
         m.commit(&mut writer).unwrap();
 
-        let second = m.read_page(&mut reader, pgno).unwrap();
+        let second = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(
             second.as_bytes()[0],
             0x33,
@@ -4805,7 +4852,7 @@ mod tests {
         m.commit(&mut seed).unwrap();
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let first_a = m.read_page(&mut reader, page_a).unwrap();
+        let first_a = m.read_page(&mut reader, page_a).unwrap().unwrap();
         assert_eq!(first_a.as_bytes()[0], 0x10);
 
         let mut writer_a = m.begin(BeginKind::Concurrent).unwrap();
@@ -4818,8 +4865,8 @@ mod tests {
             .unwrap();
         m.commit(&mut writer_b).unwrap();
 
-        let second_b = m.read_page(&mut reader, page_b).unwrap();
-        let second_a = m.read_page(&mut reader, page_a).unwrap();
+        let second_b = m.read_page(&mut reader, page_b).unwrap().unwrap();
+        let second_a = m.read_page(&mut reader, page_a).unwrap().unwrap();
         assert_eq!(
             (second_a.as_bytes()[0], second_b.as_bytes()[0]),
             (0x10, 0x20),
@@ -4827,8 +4874,8 @@ mod tests {
         );
 
         let mut later_reader = m.begin(BeginKind::Concurrent).unwrap();
-        let later_a = m.read_page(&mut later_reader, page_a).unwrap();
-        let later_b = m.read_page(&mut later_reader, page_b).unwrap();
+        let later_a = m.read_page(&mut later_reader, page_a).unwrap().unwrap();
+        let later_b = m.read_page(&mut later_reader, page_b).unwrap().unwrap();
         assert_eq!(
             (later_a.as_bytes()[0], later_b.as_bytes()[0]),
             (0xA0, 0xB0),
@@ -4854,6 +4901,7 @@ mod tests {
         let mut initial_visible = Vec::new();
         for page in [1_301_u32, 1_302, 1_303, phantom_page] {
             if m.read_page(&mut reader, PageNumber::new(page).unwrap())
+                .unwrap()
                 .is_some()
             {
                 initial_visible.push(page);
@@ -4873,6 +4921,7 @@ mod tests {
         let mut second_visible = Vec::new();
         for page in [1_301_u32, 1_302, 1_303, phantom_page] {
             if m.read_page(&mut reader, PageNumber::new(page).unwrap())
+                .unwrap()
                 .is_some()
             {
                 second_visible.push(page);
@@ -4896,7 +4945,7 @@ mod tests {
         assert!(committed > CommitSeq::ZERO);
 
         let mut later_reader = m.begin(BeginKind::Concurrent).unwrap();
-        let read = m.read_page(&mut later_reader, pgno).unwrap();
+        let read = m.read_page(&mut later_reader, pgno).unwrap().unwrap();
         assert_eq!(
             read.as_bytes()[0],
             0x5A,
@@ -4949,7 +4998,7 @@ mod tests {
         m.commit(&mut seed).unwrap();
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut reader, pgno).unwrap();
+        let _ = m.read_page(&mut reader, pgno).unwrap().unwrap();
 
         let mut writer = m.begin(BeginKind::Concurrent).unwrap();
         m.write_page(&mut writer, pgno, test_data(0x20)).unwrap();
@@ -5043,7 +5092,7 @@ mod tests {
 
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
         let start = Instant::now();
-        let read = m.read_page(&mut reader, pgno).unwrap();
+        let read = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert!(
             start.elapsed() < MAX_ELAPSED,
             "read should terminate quickly even on deep chains"
@@ -5131,14 +5180,14 @@ mod tests {
         m.commit(&mut seed).unwrap();
 
         let mut reader = m.begin(BeginKind::Deferred).unwrap();
-        let first_read = m.read_page(&mut reader, pgno).unwrap();
+        let first_read = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(first_read.as_bytes()[0], 0x10);
 
         let mut updater = m.begin(BeginKind::Immediate).unwrap();
         m.write_page(&mut updater, pgno, test_data(0x20)).unwrap();
         m.commit(&mut updater).unwrap();
 
-        let second_read = m.read_page(&mut reader, pgno).unwrap();
+        let second_read = m.read_page(&mut reader, pgno).unwrap().unwrap();
         assert_eq!(
             second_read.as_bytes()[0],
             0x10,
@@ -5146,7 +5195,7 @@ mod tests {
         );
 
         let mut stale = m.begin(BeginKind::Deferred).unwrap();
-        let _ = m.read_page(&mut stale, pgno).unwrap();
+        let _ = m.read_page(&mut stale, pgno).unwrap().unwrap();
         let mut writer2 = m.begin(BeginKind::Immediate).unwrap();
         m.write_page(&mut writer2, pgno, test_data(0x30)).unwrap();
         m.commit(&mut writer2).unwrap();
@@ -5182,14 +5231,14 @@ mod tests {
             m.commit(&mut seed).unwrap();
 
             let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-            let first = m.read_page(&mut reader, pgno).unwrap();
+            let first = m.read_page(&mut reader, pgno).unwrap().unwrap();
             prop_assert_eq!(first.as_bytes()[0], base);
 
             let mut writer = m.begin(BeginKind::Immediate).unwrap();
             m.write_page(&mut writer, pgno, test_data(next)).unwrap();
             m.commit(&mut writer).unwrap();
 
-            let second = m.read_page(&mut reader, pgno).unwrap();
+            let second = m.read_page(&mut reader, pgno).unwrap().unwrap();
             prop_assert_eq!(second.as_bytes()[0], base);
         }
 
@@ -5242,6 +5291,7 @@ mod tests {
         for page in [901_u32, 902, 903] {
             assert!(
                 m.read_page(&mut old_reader, PageNumber::new(page).unwrap())
+                    .unwrap()
                     .is_none()
             );
         }
@@ -5624,9 +5674,9 @@ mod tests {
         let mut r3 = m.begin(BeginKind::Deferred).unwrap();
 
         let pgno = PageNumber::new(1).unwrap();
-        let _ = m.read_page(&mut r1, pgno);
-        let _ = m.read_page(&mut r2, pgno);
-        let _ = m.read_page(&mut r3, pgno);
+        let _ = m.read_page(&mut r1, pgno).unwrap();
+        let _ = m.read_page(&mut r2, pgno).unwrap();
+        let _ = m.read_page(&mut r3, pgno).unwrap();
 
         assert!(r1.snapshot_established);
         assert!(r2.snapshot_established);
@@ -5650,7 +5700,7 @@ mod tests {
         assert!(m.write_mutex().holder().is_some());
 
         let mut reader = m.begin(BeginKind::Deferred).unwrap();
-        let data = m.read_page(&mut reader, pgno);
+        let data = m.read_page(&mut reader, pgno).unwrap();
         assert!(
             data.is_some(),
             "reader must not be blocked by active writer (WAL semantics)"
@@ -5706,8 +5756,8 @@ mod tests {
 
         // Writer 2 sees complete state from w1.
         let mut w2 = m.begin(BeginKind::Immediate).unwrap();
-        let a = m.read_page(&mut w2, pgno_a).unwrap();
-        let b = m.read_page(&mut w2, pgno_b).unwrap();
+        let a = m.read_page(&mut w2, pgno_a).unwrap().unwrap();
+        let b = m.read_page(&mut w2, pgno_b).unwrap().unwrap();
         assert_eq!(a.as_bytes()[0], 0x01, "w2 sees w1 page A");
         assert_eq!(b.as_bytes()[0], 0x02, "w2 sees w1 page B");
         m.commit(&mut w2).unwrap();
@@ -5834,8 +5884,8 @@ mod tests {
 
         // Both committed values must be visible.
         let mut reader = m.begin(BeginKind::Deferred).unwrap();
-        let d1 = m.read_page(&mut reader, p1).unwrap();
-        let d2 = m.read_page(&mut reader, p2).unwrap();
+        let d1 = m.read_page(&mut reader, p1).unwrap().unwrap();
+        let d2 = m.read_page(&mut reader, p2).unwrap().unwrap();
         assert_eq!(d1.as_bytes()[0], 0xAA);
         assert_eq!(d2.as_bytes()[0], 0xBB);
     }
@@ -5884,12 +5934,12 @@ mod tests {
 
         // T1: reads P_A, writes P_B.
         let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t1, pa);
+        let _ = m.read_page(&mut t1, pa).unwrap();
         m.write_page(&mut t1, pb, test_data(0x21)).unwrap();
 
         // T2: reads P_B, writes P_A.
         let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t2, pb);
+        let _ = m.read_page(&mut t2, pb).unwrap();
         // t2 can't write P_A since page lock isn't held for reads, but
         // we simulate the rw-antidependency flags as the witness plane would set them.
         m.write_page(&mut t2, pa, test_data(0x11)).unwrap();
@@ -5945,7 +5995,7 @@ mod tests {
 
         // T1 reads page K (establishing read dependency).
         let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-        let data = m.read_page(&mut t1, pgno);
+        let data = m.read_page(&mut t1, pgno).unwrap();
         assert!(data.is_some());
 
         // T2 writes page K after T1's snapshot — creates rw-antidependency.
@@ -6028,7 +6078,9 @@ mod tests {
         // Concurrent reader can still work during serialized writer.
         let _active_writer = m.begin(BeginKind::Immediate).unwrap();
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let read_result = m.read_page(&mut reader, PageNumber::new(1).unwrap());
+        let read_result = m
+            .read_page(&mut reader, PageNumber::new(1).unwrap())
+            .unwrap();
         assert!(
             read_result.is_some(),
             "concurrent reader works during serialized writer"
@@ -6259,23 +6311,23 @@ mod tests {
 
             // T1: reads both, writes A.
             let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-            let a1 = decode_i64(&m.read_page(&mut t1, pa).unwrap());
-            let b1 = decode_i64(&m.read_page(&mut t1, pb).unwrap());
+            let a1 = decode_i64(&m.read_page(&mut t1, pa).unwrap().unwrap());
+            let b1 = decode_i64(&m.read_page(&mut t1, pb).unwrap().unwrap());
             assert_eq!((a1, b1), (50, 50));
             m.write_page(&mut t1, pa, test_i64(a1 - 90)).unwrap(); // -40
 
             // T2: reads both, writes B.
             let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
-            let a2 = decode_i64(&m.read_page(&mut t2, pa).unwrap());
-            let b2 = decode_i64(&m.read_page(&mut t2, pb).unwrap());
+            let a2 = decode_i64(&m.read_page(&mut t2, pa).unwrap().unwrap());
+            let b2 = decode_i64(&m.read_page(&mut t2, pb).unwrap().unwrap());
             assert_eq!((a2, b2), (50, 50));
             m.write_page(&mut t2, pb, test_i64(b2 - 90)).unwrap(); // -40
 
             // Each transaction's local constraint check passes under its snapshot.
-            let sum1 = decode_i64(&m.read_page(&mut t1, pa).unwrap())
-                + decode_i64(&m.read_page(&mut t1, pb).unwrap());
-            let sum2 = decode_i64(&m.read_page(&mut t2, pa).unwrap())
-                + decode_i64(&m.read_page(&mut t2, pb).unwrap());
+            let sum1 = decode_i64(&m.read_page(&mut t1, pa).unwrap().unwrap())
+                + decode_i64(&m.read_page(&mut t1, pb).unwrap().unwrap());
+            let sum2 = decode_i64(&m.read_page(&mut t2, pa).unwrap().unwrap())
+                + decode_i64(&m.read_page(&mut t2, pb).unwrap().unwrap());
             assert!(sum1 >= 0, "txn1 local constraint check must pass");
             assert!(sum2 >= 0, "txn2 local constraint check must pass");
 
@@ -6293,8 +6345,8 @@ mod tests {
 
             // Verify global invariant preserved: final sum must be >= 0.
             let mut reader = m.begin(BeginKind::Deferred).unwrap();
-            let a = decode_i64(&m.read_page(&mut reader, pa).unwrap());
-            let b = decode_i64(&m.read_page(&mut reader, pb).unwrap());
+            let a = decode_i64(&m.read_page(&mut reader, pa).unwrap().unwrap());
+            let b = decode_i64(&m.read_page(&mut reader, pb).unwrap().unwrap());
             assert!(a + b >= 0, "global invariant must hold (a={a}, b={b})");
         });
 
@@ -6335,8 +6387,8 @@ mod tests {
             let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
             let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
 
-            let a1 = decode_i64(&m.read_page(&mut t1, pa).unwrap());
-            let b2 = decode_i64(&m.read_page(&mut t2, pb).unwrap());
+            let a1 = decode_i64(&m.read_page(&mut t1, pa).unwrap().unwrap());
+            let b2 = decode_i64(&m.read_page(&mut t2, pb).unwrap().unwrap());
             m.write_page(&mut t1, pa, test_i64(a1 - 90)).unwrap();
             m.write_page(&mut t2, pb, test_i64(b2 - 90)).unwrap();
 
@@ -6351,8 +6403,8 @@ mod tests {
             let _ = m.commit(&mut t2).unwrap();
 
             let mut reader = m.begin(BeginKind::Deferred).unwrap();
-            let a = decode_i64(&m.read_page(&mut reader, pa).unwrap());
-            let b = decode_i64(&m.read_page(&mut reader, pb).unwrap());
+            let a = decode_i64(&m.read_page(&mut reader, pa).unwrap().unwrap());
+            let b = decode_i64(&m.read_page(&mut reader, pb).unwrap().unwrap());
             assert!(
                 a + b < 0,
                 "expected anomaly under SI (a={a}, b={b}, sum={})",
@@ -6384,11 +6436,11 @@ mod tests {
         m.commit(&mut setup).unwrap();
 
         let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t1, pa); // T1 reads A
+        let _ = m.read_page(&mut t1, pa).unwrap(); // T1 reads A
         m.write_page(&mut t1, pb, test_data(0x21)).unwrap(); // T1 writes B
 
         let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t2, pb); // T2 reads B
+        let _ = m.read_page(&mut t2, pb).unwrap(); // T2 reads B
         m.write_page(&mut t2, pa, test_data(0x11)).unwrap(); // T2 writes A
 
         // T1: in_rw (T2 writes A, which T1 read), out_rw (T1 writes B, which T2 read).
@@ -6421,15 +6473,15 @@ mod tests {
         m.commit(&mut setup).unwrap();
 
         let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t1, p1);
+        let _ = m.read_page(&mut t1, p1).unwrap();
         m.write_page(&mut t1, p2, test_data(0x12)).unwrap();
 
         let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t2, p2);
+        let _ = m.read_page(&mut t2, p2).unwrap();
         m.write_page(&mut t2, p3, test_data(0x23)).unwrap();
 
         let mut t3 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t3, p3);
+        let _ = m.read_page(&mut t3, p3).unwrap();
         m.write_page(&mut t3, p1, test_data(0x31)).unwrap();
 
         // In a 3-way cycle, the "pivot" transactions have both edges.
@@ -6471,7 +6523,7 @@ mod tests {
 
         // Read-only transaction: only reads, no writes.
         let mut reader = m.begin(BeginKind::Concurrent).unwrap();
-        let data = m.read_page(&mut reader, pgno);
+        let data = m.read_page(&mut reader, pgno).unwrap();
         assert!(data.is_some());
 
         // Reader has no writes, so no dangerous structure possible.
@@ -6504,8 +6556,8 @@ mod tests {
 
         // T1 (serialized): reads both, writes A.
         let mut t1 = m.begin(BeginKind::Immediate).unwrap();
-        let _ = m.read_page(&mut t1, pa);
-        let _ = m.read_page(&mut t1, pb);
+        let _ = m.read_page(&mut t1, pa).unwrap();
+        let _ = m.read_page(&mut t1, pb).unwrap();
         m.write_page(&mut t1, pa, test_data(0xD8)).unwrap();
 
         // T2 cannot even begin IMMEDIATE while T1 holds the mutex.
@@ -6519,7 +6571,7 @@ mod tests {
 
         // After T1 commits, T2 can proceed and sees T1's changes.
         let mut t2 = m.begin(BeginKind::Immediate).unwrap();
-        let a = m.read_page(&mut t2, pa).unwrap();
+        let a = m.read_page(&mut t2, pa).unwrap().unwrap();
         assert_eq!(
             a.as_bytes()[0],
             0xD8,
@@ -6546,14 +6598,14 @@ mod tests {
 
         // T1: reads index page + data_a, writes data_b.
         let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t1, idx_page);
-        let _ = m.read_page(&mut t1, data_a);
+        let _ = m.read_page(&mut t1, idx_page).unwrap();
+        let _ = m.read_page(&mut t1, data_a).unwrap();
         m.write_page(&mut t1, data_b, test_data(0x1B)).unwrap();
 
         // T2: reads index page + data_b, writes data_a.
         let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
-        let _ = m.read_page(&mut t2, idx_page);
-        let _ = m.read_page(&mut t2, data_b);
+        let _ = m.read_page(&mut t2, idx_page).unwrap();
+        let _ = m.read_page(&mut t2, data_b).unwrap();
         m.write_page(&mut t2, data_a, test_data(0x2A)).unwrap();
 
         // Index witness captures the conflict: both read the shared index page,
@@ -6624,7 +6676,7 @@ mod tests {
             for row in 0_u32..100 {
                 let pgno_raw = 10_000 + thread_id * 100 + row;
                 let pgno = PageNumber::new(pgno_raw).expect("page number in range");
-                if guard.read_page(&mut reader, pgno).is_some() {
+                if guard.read_page(&mut reader, pgno).unwrap().is_some() {
                     present += 1;
                 }
             }
@@ -6995,7 +7047,7 @@ mod tests {
 
         let mut pinning_reader = mgr.begin(BeginKind::Deferred).unwrap();
         assert!(
-            mgr.read_page(&mut pinning_reader, pgno).is_some(),
+            mgr.read_page(&mut pinning_reader, pgno).unwrap().is_some(),
             "pinning reader should see the seeded page version"
         );
 
@@ -7121,7 +7173,7 @@ mod tests {
 
         // Pin the GC horizon with a long-running reader.
         let mut pinned_reader = mgr.begin(BeginKind::Concurrent).unwrap();
-        let _ = mgr.read_page(&mut pinned_reader, pgno);
+        let _ = mgr.read_page(&mut pinned_reader, pgno).unwrap();
 
         // Write enough to exceed max_chain_length (4) but stay below hard
         // limit (16).  With C7 soft-bound, these should all succeed.
@@ -7167,7 +7219,7 @@ mod tests {
 
         // Pin the GC horizon.
         let mut pinned_reader = mgr.begin(BeginKind::Concurrent).unwrap();
-        let _ = mgr.read_page(&mut pinned_reader, pgno);
+        let _ = mgr.read_page(&mut pinned_reader, pgno).unwrap();
 
         // Write enough to exceed hard limit (4 * 4 = 16).
         let mut saw_busy = false;
@@ -7235,7 +7287,7 @@ mod tests {
             "deferred txns should not pin horizon before first read"
         );
 
-        let _ = mgr.read_page(&mut deferred, pgno);
+        let _ = mgr.read_page(&mut deferred, pgno).unwrap();
         assert!(
             mgr.cached_gc_horizon().is_some(),
             "first read should register active snapshot horizon"
@@ -7269,7 +7321,7 @@ mod tests {
         );
         assert_eq!(mgr.shm.load_gc_horizon(), commit_seq);
         assert_eq!(
-            mgr.read_page(&mut reader, pgno),
+            mgr.read_page(&mut reader, pgno).unwrap(),
             Some(data),
             "read-only transaction should resolve the committed seed page"
         );
@@ -7326,11 +7378,11 @@ mod tests {
         let mut txn_a = mgr.begin(BeginKind::Deferred).unwrap();
         let mut txn_b = mgr.begin(BeginKind::Deferred).unwrap();
 
-        let _ = mgr.read_page(&mut txn_a, pgno);
+        let _ = mgr.read_page(&mut txn_a, pgno).unwrap();
         let first_horizon = mgr
             .cached_gc_horizon()
             .expect("first active snapshot should populate cached horizon");
-        let _ = mgr.read_page(&mut txn_b, pgno);
+        let _ = mgr.read_page(&mut txn_b, pgno).unwrap();
         assert_eq!(
             mgr.cached_gc_horizon(),
             Some(first_horizon),
@@ -7358,7 +7410,7 @@ mod tests {
         let write_pgno = PageNumber::new(6_783).unwrap();
 
         let mut oldest = mgr.begin(BeginKind::Deferred).unwrap();
-        let _ = mgr.read_page(&mut oldest, read_pgno);
+        let _ = mgr.read_page(&mut oldest, read_pgno).unwrap();
         let oldest_horizon = oldest.snapshot.high;
 
         let mut writer = mgr.begin(BeginKind::Concurrent).unwrap();
@@ -7367,7 +7419,7 @@ mod tests {
         mgr.commit(&mut writer).expect("writer should commit");
 
         let mut newer = mgr.begin(BeginKind::Deferred).unwrap();
-        let _ = mgr.read_page(&mut newer, read_pgno);
+        let _ = mgr.read_page(&mut newer, read_pgno).unwrap();
         let newer_horizon = newer.snapshot.high;
         assert!(
             newer_horizon > oldest_horizon,
@@ -7548,7 +7600,7 @@ mod tests {
             "local commit publication should update the cached snapshot epoch"
         );
         assert_eq!(
-            mgr.read_page(&mut reader, pgno),
+            mgr.read_page(&mut reader, pgno).unwrap(),
             Some(test_data(0x2A)),
             "reader should observe the locally committed page at the reused snapshot"
         );
@@ -7591,7 +7643,7 @@ mod tests {
             "reader should hit the locally published snapshot cache"
         );
         assert_eq!(
-            mgr.read_page(&mut reader, pgno),
+            mgr.read_page(&mut reader, pgno).unwrap(),
             Some(test_data(0x4C)),
             "reader should observe the committed page before read-only commit"
         );
@@ -7643,7 +7695,7 @@ mod tests {
         mgr.commit(&mut seed).expect("seed writer should commit");
 
         let mut reader = mgr.begin(BeginKind::Deferred).unwrap();
-        let _ = mgr.read_page(&mut reader, pgno);
+        let _ = mgr.read_page(&mut reader, pgno).unwrap();
 
         let mut writer_a = mgr.begin(BeginKind::Concurrent).unwrap();
         mgr.write_page(&mut writer_a, pgno, test_data(0x11))
@@ -7677,7 +7729,7 @@ mod tests {
         let seq1 = mgr.commit(&mut seed).expect("seed writer should commit");
 
         let mut oldest_reader = mgr.begin(BeginKind::Concurrent).unwrap();
-        let oldest_visible = mgr.read_page(&mut oldest_reader, pgno).unwrap();
+        let oldest_visible = mgr.read_page(&mut oldest_reader, pgno).unwrap().unwrap();
         assert_eq!(oldest_visible.as_bytes()[0], 0x10);
         assert_eq!(oldest_reader.read_version_for_page(pgno), Some(seq1));
 
@@ -7706,7 +7758,7 @@ mod tests {
             pinned_reader.snapshot.high, seq3,
             "new live reader should pin the newest committed sequence"
         );
-        let pinned_visible = mgr.read_page(&mut pinned_reader, pgno).unwrap();
+        let pinned_visible = mgr.read_page(&mut pinned_reader, pgno).unwrap().unwrap();
         assert_eq!(pinned_visible.as_bytes()[0], 0x12);
         assert_eq!(pinned_reader.read_version_for_page(pgno), Some(seq3));
 
@@ -7734,7 +7786,7 @@ mod tests {
             "GC must prune versions older than the live horizon and stop at the version visible to the pinned reader"
         );
 
-        let pinned_after_prune = mgr.read_page(&mut pinned_reader, pgno).unwrap();
+        let pinned_after_prune = mgr.read_page(&mut pinned_reader, pgno).unwrap().unwrap();
         assert_eq!(
             pinned_after_prune.as_bytes()[0],
             0x12,
@@ -7764,7 +7816,7 @@ mod tests {
         );
 
         let mut fresh_reader = mgr.begin(BeginKind::Concurrent).unwrap();
-        let fresh_visible = mgr.read_page(&mut fresh_reader, pgno).unwrap();
+        let fresh_visible = mgr.read_page(&mut fresh_reader, pgno).unwrap().unwrap();
         assert_eq!(fresh_visible.as_bytes()[0], 0x14);
         assert_eq!(fresh_reader.read_version_for_page(pgno), Some(seq5));
 
@@ -7830,7 +7882,7 @@ mod tests {
         let pgno = PageNumber::new(200).unwrap();
 
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
-        let _ = mgr.read_page(&mut txn, pgno); // Establish snapshot
+        let _ = mgr.read_page(&mut txn, pgno).unwrap(); // Establish snapshot
 
         // Simulate cell-level mutation: record a cell delta but don't call write_page
         let cell_key = CellKey {
@@ -11518,7 +11570,7 @@ mod tests {
         let logical_pgno = PageNumber::new(301).unwrap();
 
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
-        let _ = mgr.read_page(&mut txn, logical_pgno);
+        let _ = mgr.read_page(&mut txn, logical_pgno).unwrap();
 
         // Write to structural page (via write_page)
         let data = test_data(0xCD);
@@ -11572,7 +11624,7 @@ mod tests {
         let pgno = PageNumber::new(400).unwrap();
 
         let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
-        let _ = mgr.read_page(&mut txn, pgno);
+        let _ = mgr.read_page(&mut txn, pgno).unwrap();
 
         // Record cell delta
         let cell_key = CellKey {

@@ -268,7 +268,7 @@ fn run_oltp_workload(
                         for r in 0..reads_per_txn {
                             let rpn =
                                 page_slot(seed_snapshot.wrapping_add(u64::from(r) * 31), num_pages);
-                            let _ = mgr_ref.read_page(&mut txn, page(rpn));
+                            let _ = mgr_ref.read_page(&mut txn, page(rpn)).unwrap();
                         }
 
                         // Simulate CPU work (record comparison, serialization).
@@ -400,9 +400,10 @@ fn run_readonly_workload(
                     };
 
                     // Read-only: just read pages, no writes.
-                    let _ = manager.read_page(&mut txn, page(target));
-                    let _ =
-                        manager.read_page(&mut txn, page(page_slot(local_seed >> 16, num_pages)));
+                    let _ = manager.read_page(&mut txn, page(target)).unwrap();
+                    let _ = manager
+                        .read_page(&mut txn, page(page_slot(local_seed >> 16, num_pages)))
+                        .unwrap();
 
                     match manager.commit(&mut txn) {
                         Ok(_) => {
@@ -473,7 +474,7 @@ fn run_concurrent_fp_measurement(
                         continue;
                     };
 
-                    let _ = mgr.read_page(&mut txn, page(read_page_num));
+                    let _ = mgr.read_page(&mut txn, page(read_page_num)).unwrap();
                     let write_result =
                         mgr.write_page(&mut txn, page(write_page_num), make_page(write_page_num));
                     if write_result.is_err() {

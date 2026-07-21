@@ -853,12 +853,25 @@ pub struct SegmentRecoveryResult {
     pub epochs: Vec<u64>,
     /// Any partial segments that were skipped (truncated/corrupt).
     pub partial_segments: Vec<PathBuf>,
+    /// Successfully parsed segment files that are eligible for deletion once
+    /// their records have been durably applied (GH #192). Populated only when
+    /// `delete_after_recovery` was requested; the caller (or
+    /// [`delete_recovered_segments`]) removes them **after** apply.
+    pub deletable_segments: Vec<PathBuf>,
 }
 
 /// Options for segment recovery.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SegmentRecoveryOptions {
-    /// Delete segment files after successful recovery.
+    /// Mark successfully parsed segment files for deletion once their records
+    /// have been applied. Segments are **never** removed by
+    /// [`recover_segments`] itself (GH #192): parsed-but-unapplied records
+    /// exist only in memory, so deleting the durable segment before apply
+    /// creates a crash window that silently loses committed data. The
+    /// eligible paths are returned in
+    /// [`SegmentRecoveryResult::deletable_segments`];
+    /// [`recover_and_apply_segments`] deletes them after apply, and manual
+    /// callers use [`delete_recovered_segments`] at their own apply boundary.
     pub delete_after_recovery: bool,
     /// Stop at the first corrupt segment and return the durable prefix instead
     /// of failing the whole recovery.
@@ -887,6 +900,7 @@ pub fn recover_segments(
         bytes_read: 0,
         epochs: Vec::with_capacity(segments.len()),
         partial_segments: Vec::new(),
+        deletable_segments: Vec::new(),
     };
 
     let mut all_records = Vec::new();
@@ -949,20 +963,32 @@ pub fn recover_segments(
         }
     }
 
-    // Delete segments after successful recovery if requested
+    // GH #192: segments must stay durable until their records are applied.
+    // Deleting here would leave parsed records only in memory — a crash
+    // between this point and apply would silently discard committed data.
+    // Instead, expose the deletable set for the caller's post-apply cleanup.
     if options.delete_after_recovery {
-        for (_, path) in &segments {
-            // Skip segments that were partial/corrupt
-            if result.partial_segments.contains(path) {
-                continue;
-            }
-            if let Err(e) = delete_segment(path) {
-                eprintln!("warning: failed to delete segment {}: {e}", path.display());
-            }
-        }
+        result.deletable_segments = segments
+            .iter()
+            .filter(|(_, path)| !result.partial_segments.contains(path))
+            .map(|(_, path)| path.clone())
+            .collect();
     }
 
     Ok((result, EpochOrderCoordinator::recovery_order(&all_records)))
+}
+
+/// Delete segment files that a completed recovery marked as deletable.
+///
+/// Call this only **after** every recovered record has been durably applied
+/// to page state (GH #192). Deletion failures are non-fatal: an undeleted
+/// segment is re-parsed on the next recovery, which is idempotent.
+pub fn delete_recovered_segments(result: &SegmentRecoveryResult) {
+    for path in &result.deletable_segments {
+        if let Err(e) = delete_segment(path) {
+            eprintln!("warning: failed to delete segment {}: {e}", path.display());
+        }
+    }
 }
 
 fn ordered_segment_records(epoch: u64, records: &[WalRecord]) -> io::Result<Vec<WalRecord>> {
@@ -1001,6 +1027,11 @@ pub fn recover_and_apply_segments(
             page_contents.insert(page_id, record.after_image);
         }
     }
+
+    // GH #192: delete segments only after every record has been applied to
+    // the caller's page state. Before this point the parsed records exist
+    // only in memory and the segment files are the sole durable copy.
+    delete_recovered_segments(&result);
 
     Ok(result)
 }
@@ -2801,6 +2832,64 @@ mod tests {
         assert!(
             remaining.is_empty(),
             "segments should be deleted after recovery"
+        );
+    }
+
+    /// GH #192: `recover_segments` must never delete segment files itself.
+    /// Between parse and apply the returned records exist only in memory, so
+    /// the durable segments have to survive until the caller's apply boundary.
+    #[test]
+    fn test_recover_segments_keeps_segments_until_apply() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("test.db");
+
+        let batch = EpochFlushBatch {
+            epoch: 1,
+            records: vec![WalRecord {
+                txn_token: TxnToken::new(
+                    fsqlite_types::TxnId::new(1).unwrap(),
+                    fsqlite_types::TxnEpoch::new(0),
+                ),
+                epoch: 1,
+                page_id: PageNumber::new(1).unwrap(),
+                begin_seq: CommitSeq::new(100),
+                end_seq: Some(CommitSeq::new(100)),
+                before_image: Vec::new(),
+                after_image: vec![0xAA; 32],
+            }],
+            records_per_core: vec![1],
+        };
+        write_segment(&db_path, &batch, FsyncPolicy::Off).expect("write should succeed");
+
+        // This is the crash-window boundary from the issue: records parsed
+        // and returned, nothing applied yet.
+        let (result, records) = recover_segments(
+            &db_path,
+            SegmentRecoveryOptions {
+                delete_after_recovery: true,
+                ..Default::default()
+            },
+        )
+        .expect("recovery should succeed");
+
+        assert_eq!(result.segments_recovered, 1);
+        assert_eq!(records.len(), 1, "record retained in memory");
+        let remaining = list_segments(&db_path).expect("list should succeed");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "segment must remain durable while its records are unapplied"
+        );
+        assert_eq!(result.deletable_segments, vec![segment_path(&db_path, 1)]);
+
+        // After the caller applies the records, explicit cleanup removes them.
+        delete_recovered_segments(&result);
+        let remaining = list_segments(&db_path).expect("list should succeed");
+        assert!(
+            remaining.is_empty(),
+            "post-apply cleanup deletes the recovered segments"
         );
     }
 

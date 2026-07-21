@@ -2729,6 +2729,38 @@ impl ShardedPageCache {
         }
     }
 
+    /// Admit a clean miss-fill image only while the page is still absent
+    /// from both storage tiers (GH #197).
+    ///
+    /// The read-miss path drops every cache lock during its VFS read, so a
+    /// writer can install a **newer** image for the same page while the miss
+    /// I/O is in flight. Unconditionally inserting the miss result would
+    /// overwrite that newer resident image — including a dirty one, silently
+    /// losing the write. Under the same per-page shard serialization used by
+    /// [`Self::insert_tiered`], this checks residency first and discards the
+    /// stale miss-fill when the page reappeared.
+    ///
+    /// Returns `true` if the miss-fill was admitted.
+    fn insert_tiered_if_absent(&self, page_no: PageNumber, buf: PageBuf) -> bool {
+        let shard_idx = self.shard_index(page_no);
+        let mut shard = self.shards[shard_idx].lock();
+        if shard.pages.contains_key(&page_no) || self.flat_slots.contains_stable(page_no) {
+            // A newer resident image won the race; the stale miss-fill loses.
+            return false;
+        }
+        match self.flat_slots.try_insert(page_no, buf) {
+            Ok(is_new) => {
+                let duplicate_removed = shard.remove(page_no);
+                is_new && !duplicate_removed
+            }
+            Err(buf) => {
+                let admitted = shard.insert_with_dirty_state(page_no, buf, false);
+                self.shards_dirty.store(true, Ordering::Release);
+                admitted
+            }
+        }
+    }
+
     /// Select the shard index for a given page number.
     ///
     /// Uses multiplicative hashing with the golden ratio constant for good
@@ -3024,10 +3056,14 @@ impl ShardedPageCache {
         }
 
         let result = f(buf.as_slice());
-        // Insert into flat slots; overflow to shard on CAS failure.
-        self.insert_tiered(page_no, buf, false);
-        self.note_page_access_without_metrics(page_no);
-        self.record_eviction_admit(page_no);
+        // Insert into flat slots; overflow to shard on CAS failure. The lock
+        // was released across the VFS read, so a writer may have installed a
+        // newer image meanwhile — in that case the stale miss-fill must be
+        // discarded, not written over the fresh entry (GH #197).
+        if self.insert_tiered_if_absent(page_no, buf) {
+            self.note_page_access_without_metrics(page_no);
+            self.record_eviction_admit(page_no);
+        }
         Ok(result)
     }
 
@@ -4903,6 +4939,60 @@ mod tests {
         assert!(
             snapshot.t2_size >= 1,
             "S3-FIFO metrics should expose a non-empty main queue for sharded cache"
+        );
+    }
+
+    /// GH #197: a cache-miss fill that raced with a concurrent writer must
+    /// not overwrite the newer resident image the writer installed while the
+    /// miss I/O was in flight.
+    ///
+    /// The interleaving is forced deterministically: the miss path reads the
+    /// stale bytes from the VFS, then — before it re-acquires the cache to
+    /// install them — the `f` callback plays the role of the racing writer
+    /// and installs fresh bytes for the same page. The resident entry must
+    /// keep the fresh bytes.
+    #[test]
+    fn gh_197_late_miss_fill_does_not_overwrite_newer_resident_page() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("/gh-197.db")),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
+            )
+            .expect("open db file");
+
+        let page_size = PageSize::DEFAULT.as_usize();
+        let page_no = PageNumber::new(7).unwrap();
+        let offset = page_offset(page_no, PageSize::DEFAULT);
+
+        // Backing store holds the stale image 0x11.
+        file.write(&cx, &vec![0x11_u8; page_size], offset)
+            .expect("seed stale page");
+
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+
+        // Miss path: while the stale read result is still un-cached, a
+        // writer installs the fresh image 0x22 for the same page.
+        cache
+            .read_page(&cx, &mut file, page_no, |stale| {
+                assert!(
+                    stale.iter().all(|&b| b == 0x11),
+                    "miss I/O must observe the stale backing bytes"
+                );
+                let mut fresh = cache.pool().acquire().expect("acquire fresh buf");
+                fresh.as_mut_slice().fill(0x22);
+                cache.insert_buffer(page_no, fresh);
+            })
+            .expect("miss read");
+
+        let resident = cache
+            .get_copy(page_no)
+            .expect("page must be resident after the race");
+        assert!(
+            resident.iter().all(|&b| b == 0x22),
+            "newer resident image must win over the stale late miss-fill (GH #197)"
         );
     }
 

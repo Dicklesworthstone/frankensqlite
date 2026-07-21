@@ -41,6 +41,9 @@ pub enum NamespaceOpenIntent {
     /// Join the live generation, or establish a new shared generation when no
     /// connection currently owns the namespace.
     Shared,
+    /// Join an existing generation without creating or rewriting namespace
+    /// records. Missing or malformed records fail closed.
+    ReadOnlyExisting,
     /// Exclusively reserve the namespace through empty-database bootstrap.
     ReservedExclusive,
 }
@@ -76,9 +79,23 @@ impl PendingNamespaceOpen {
     /// path.  This operation is non-blocking; lock contention returns BUSY.
     pub fn begin(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Self> {
         validate_stable_path(stable_path)?;
-        let gate = open_secure_lock_file(&sidecar_path(stable_path, GATE_SUFFIX))?;
-        let mut use_file = open_secure_lock_file(&sidecar_path(stable_path, USE_SUFFIX))?;
-        try_lock(&gate, FileLockMode::Exclusive)?;
+        let (gate, mut use_file) = if intent == NamespaceOpenIntent::ReadOnlyExisting {
+            (
+                open_existing_secure_lock_file(&sidecar_path(stable_path, GATE_SUFFIX))?,
+                open_existing_secure_lock_file(&sidecar_path(stable_path, USE_SUFFIX))?,
+            )
+        } else {
+            (
+                open_secure_lock_file(&sidecar_path(stable_path, GATE_SUFFIX))?,
+                open_secure_lock_file(&sidecar_path(stable_path, USE_SUFFIX))?,
+            )
+        };
+        let gate_mode = if intent == NamespaceOpenIntent::ReadOnlyExisting {
+            FileLockMode::Shared
+        } else {
+            FileLockMode::Exclusive
+        };
+        try_lock(&gate, gate_mode)?;
 
         let lease = match intent {
             NamespaceOpenIntent::ReservedExclusive => {
@@ -98,6 +115,15 @@ impl PendingNamespaceOpen {
                         }
                     }
                     Err(FileLockError::Io(error)) => return Err(error.into()),
+                }
+            }
+            NamespaceOpenIntent::ReadOnlyExisting => {
+                try_lock(&use_file, FileLockMode::Shared)?;
+                let generation_identity = read_identity_record(&mut use_file, stable_path)?;
+                PendingLease::JoinShared {
+                    gate,
+                    use_file,
+                    generation_identity,
                 }
             }
         };
@@ -285,6 +311,14 @@ fn open_secure_lock_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn open_existing_secure_lock_file(path: &Path) -> Result<File> {
+    let file = configured_existing_readonly_open_options()
+        .open(path)
+        .map_err(|_| cannot_open(path))?;
+    validate_secure_lock_file(path, &file)?;
+    Ok(file)
+}
+
 fn configured_open_options(create_new: bool) -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(create_new);
@@ -295,6 +329,28 @@ fn configured_open_options(create_new: bool) -> OpenOptions {
         options
             .mode(0o600)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+}
+
+fn configured_existing_readonly_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -694,7 +750,8 @@ fn reject_existing_entry(database_path: &Path, candidate: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, FileTimes};
+    use std::time::{Duration, UNIX_EPOCH};
 
     use tempfile::tempdir;
 
@@ -735,6 +792,189 @@ mod tests {
         assert_eq!(join.expected_identity(), Some(identity));
         let peer = join.bind(identity).expect("bind peer");
         assert!(!peer.bootstrap_is_exclusive());
+    }
+
+    #[test]
+    fn readonly_existing_generation_preserves_namespace_records() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("readonly-existing.db");
+        let identity = create_database(&database, b"existing generation");
+        let writer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        writer.finish_bootstrap().expect("publish generation");
+        drop(writer);
+
+        let gate_path = sidecar_path(&database, GATE_SUFFIX);
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+        let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        File::options()
+            .write(true)
+            .open(&use_path)
+            .expect("open identity record for timestamp sentinel")
+            .set_times(FileTimes::new().set_modified(sentinel_modified))
+            .expect("set identity-record timestamp sentinel");
+        let before_gate = fs::read(&gate_path).expect("snapshot gate record");
+        let before_use = fs::read(&use_path).expect("snapshot identity record");
+        let before_use_modified = fs::metadata(&use_path)
+            .expect("identity record metadata")
+            .modified()
+            .expect("identity record modification time");
+
+        let pending = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("join existing generation read-only");
+        assert_eq!(pending.expected_identity(), Some(identity));
+        let reader = pending.bind(identity).expect("bind read-only generation");
+        reader
+            .validate_path_identity()
+            .expect("read-only generation remains bound");
+        reader
+            .finish_bootstrap()
+            .expect("shared read-only binding has no bootstrap transition");
+        drop(reader);
+
+        assert_eq!(fs::read(&gate_path).expect("read gate record"), before_gate);
+        assert_eq!(
+            fs::read(&use_path).expect("read identity record"),
+            before_use
+        );
+        assert_eq!(
+            fs::metadata(&use_path)
+                .expect("identity record metadata")
+                .modified()
+                .expect("identity record modification time"),
+            before_use_modified,
+            "read-only admission must not rewrite an unchanged identity record"
+        );
+    }
+
+    #[test]
+    fn readonly_admission_blocks_generation_transition_then_holds_use_lease() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("readonly-transition.db");
+        let displaced = dir.path().join("readonly-transition.displaced.db");
+        let original_identity = create_database(&database, b"original generation");
+        let writer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(original_identity)
+            .expect("bind generation");
+        writer.finish_bootstrap().expect("publish generation");
+        drop(writer);
+
+        let pending_reader =
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+                .expect("begin read-only admission");
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared),
+            Err(FrankenError::Busy)
+        ));
+        let reader = pending_reader
+            .bind(original_identity)
+            .expect("bind read-only generation");
+
+        fs::rename(&database, &displaced).expect("displace original generation");
+        let replacement_identity = create_database(&database, b"replacement generation");
+        let stale_writer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("writer joins the reader-held generation");
+        assert_eq!(stale_writer.expected_identity(), Some(original_identity));
+        assert!(matches!(
+            stale_writer.bind(replacement_identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+
+        drop(reader);
+        let replacement = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit replacement after reader release");
+        assert_eq!(replacement.expected_identity(), None);
+        replacement
+            .bind(replacement_identity)
+            .expect("bind replacement generation")
+            .finish_bootstrap()
+            .expect("publish replacement generation");
+    }
+
+    #[test]
+    fn readonly_existing_generation_refuses_missing_records_without_creating_them() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("readonly-missing-records.db");
+        create_database(&database, b"external database");
+        let entries_before = fs::read_dir(dir.path())
+            .expect("list pristine namespace")
+            .map(|entry| entry.expect("namespace entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+
+        let entries_after = fs::read_dir(dir.path())
+            .expect("list refused namespace")
+            .map(|entry| entry.expect("namespace entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(entries_after, entries_before);
+        assert!(!sidecar_path(&database, GATE_SUFFIX).exists());
+        assert!(!sidecar_path(&database, USE_SUFFIX).exists());
+    }
+
+    #[test]
+    fn readonly_existing_generation_refuses_corrupt_record_without_repairing_it() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("readonly-corrupt-record.db");
+        let identity = create_database(&database, b"existing generation");
+        let writer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(identity)
+            .expect("bind generation");
+        writer.finish_bootstrap().expect("publish generation");
+        drop(writer);
+
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+        fs::write(&use_path, b"corrupt identity record").expect("corrupt identity record");
+        let before = fs::read(&use_path).expect("snapshot corrupt identity record");
+
+        assert!(matches!(
+            PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            fs::read(&use_path).expect("read refused identity record"),
+            before,
+            "read-only admission must not repair or rewrite a corrupt record"
+        );
+    }
+
+    #[test]
+    fn readonly_existing_generation_refuses_main_identity_drift_without_rebinding() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("readonly-identity-drift.db");
+        let displaced = dir.path().join("readonly-identity-drift.displaced.db");
+        let original_identity = create_database(&database, b"original generation");
+        let writer = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit generation")
+            .bind(original_identity)
+            .expect("bind generation");
+        writer.finish_bootstrap().expect("publish generation");
+        drop(writer);
+
+        fs::rename(&database, &displaced).expect("displace original generation");
+        let replacement_identity = create_database(&database, b"replacement generation");
+        let use_path = sidecar_path(&database, USE_SUFFIX);
+        let record_before = fs::read(&use_path).expect("snapshot original identity record");
+
+        let pending = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::ReadOnlyExisting)
+            .expect("read original recorded identity");
+        assert_eq!(pending.expected_identity(), Some(original_identity));
+        assert!(matches!(
+            pending.bind(replacement_identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(
+            fs::read(&use_path).expect("read refused identity record"),
+            record_before,
+            "read-only identity refusal must not rebind the record to a replacement file"
+        );
     }
 
     #[test]

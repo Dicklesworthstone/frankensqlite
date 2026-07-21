@@ -221,8 +221,8 @@ fn run_3txn_trace(order: [usize; 3]) -> Result<TraceOutcome, String> {
     let mut reader = manager
         .begin(BeginKind::Deferred)
         .map_err(|error| format!("trace_reader_begin_failed error={error:?}"))?;
-    let page1 = manager.read_page(&mut reader, page(1));
-    let page2 = manager.read_page(&mut reader, page(2));
+    let page1 = manager.read_page(&mut reader, page(1)).unwrap();
+    let page2 = manager.read_page(&mut reader, page(2)).unwrap();
 
     if committed[2] {
         if committed[0] || committed[1] {
@@ -412,7 +412,11 @@ fn test_snapshot_isolation_long_reader() -> Result<(), String> {
     let mut reader = manager
         .begin(BeginKind::Deferred)
         .map_err(|error| format!("reader_begin_failed error={error:?}"))?;
-    if manager.read_page(&mut reader, target_page).is_some() {
+    if manager
+        .read_page(&mut reader, target_page)
+        .unwrap()
+        .is_some()
+    {
         return Err("reader should see no page before writer commit".to_string());
     }
 
@@ -426,7 +430,11 @@ fn test_snapshot_isolation_long_reader() -> Result<(), String> {
         .commit(&mut writer)
         .map_err(|error| format!("writer_commit_failed error={error:?}"))?;
 
-    if manager.read_page(&mut reader, target_page).is_some() {
+    if manager
+        .read_page(&mut reader, target_page)
+        .unwrap()
+        .is_some()
+    {
         return Err("reader snapshot should not observe post-snapshot commit".to_string());
     }
 
@@ -455,6 +463,7 @@ fn test_snapshot_isolation_new_reader_sees_committed_changes() -> Result<(), Str
         .map_err(|error| format!("reader_begin_failed error={error:?}"))?;
     let observed = manager
         .read_page(&mut reader, target_page)
+        .unwrap()
         .ok_or_else(|| "new reader must observe committed page".to_string())?;
     if observed.as_bytes() != written.as_bytes() {
         return Err("new reader payload mismatch".to_string());
@@ -548,6 +557,7 @@ fn test_rebase_merge_distinct_offsets_succeeds() -> Result<(), String> {
         .map_err(|error| format!("reader_begin_failed error={error:?}"))?;
     let merged = manager
         .read_page(&mut reader, target)
+        .unwrap()
         .ok_or_else(|| "merged page should exist".to_string())?;
     if merged.as_bytes()[0] != 0xAA || merged.as_bytes()[7] != 0xBB {
         return Err(format!(

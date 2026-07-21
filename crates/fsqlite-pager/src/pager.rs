@@ -8271,7 +8271,7 @@ where
         } else {
             Some(PendingNamespaceOpen::begin(
                 &db_path,
-                NamespaceOpenIntent::Shared,
+                NamespaceOpenIntent::ReadOnlyExisting,
             )?)
         };
         #[cfg(all(feature = "native", any(unix, windows)))]
@@ -13768,7 +13768,13 @@ where
         // published pager plane must never advertise checkpoint state whose
         // backing writes have not survived their sync barrier. On sync
         // failure nothing is published and the WAL remains authoritative.
-        inner.db_file.sync(cx, SyncFlags::NORMAL)?;
+        //
+        // GH #198: this sync is the checkpoint recovery fence — the WAL
+        // generation may be invalidated right after it, so it must be the
+        // full-durability barrier (`FULL` maps to a true fsync including
+        // metadata, and to the strongest platform barrier where the VFS
+        // distinguishes one), not the relaxed `NORMAL` mode.
+        inner.db_file.sync(cx, SyncFlags::FULL)?;
         // D1-CRITICAL Change 3: Use sharded publish_remove_page.
         self.published.publish_remove_page(
             cx,
@@ -20329,6 +20335,9 @@ mod tests {
         inner: MemoryVfs,
         fail_next_write: Arc<AtomicBool>,
         fail_next_sync: Arc<AtomicBool>,
+        /// Bits of the last `SyncFlags` that crossed the main-DB VFS boundary
+        /// (0 = no sync observed yet). Used by the GH #198 regression.
+        last_db_sync_flags: Arc<std::sync::atomic::AtomicU8>,
     }
 
     impl CheckpointFaultVfs {
@@ -20337,6 +20346,7 @@ mod tests {
                 inner: MemoryVfs::new(),
                 fail_next_write: Arc::new(AtomicBool::new(false)),
                 fail_next_sync: Arc::new(AtomicBool::new(false)),
+                last_db_sync_flags: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             }
         }
     }
@@ -20346,6 +20356,7 @@ mod tests {
         is_main_db: bool,
         fail_next_write: Arc<AtomicBool>,
         fail_next_sync: Arc<AtomicBool>,
+        last_db_sync_flags: Arc<std::sync::atomic::AtomicU8>,
     }
 
     impl Vfs for CheckpointFaultVfs {
@@ -20368,6 +20379,7 @@ mod tests {
                     is_main_db: flags.contains(VfsOpenFlags::MAIN_DB),
                     fail_next_write: Arc::clone(&self.fail_next_write),
                     fail_next_sync: Arc::clone(&self.fail_next_sync),
+                    last_db_sync_flags: Arc::clone(&self.last_db_sync_flags),
                 },
                 actual_flags,
             ))
@@ -20413,10 +20425,14 @@ mod tests {
         }
 
         fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
-            if self.is_main_db && self.fail_next_sync.swap(false, AtomicOrdering::AcqRel) {
-                return Err(FrankenError::internal(
-                    "injected checkpoint db sync failure",
-                ));
+            if self.is_main_db {
+                self.last_db_sync_flags
+                    .store(flags.bits(), AtomicOrdering::Release);
+                if self.fail_next_sync.swap(false, AtomicOrdering::AcqRel) {
+                    return Err(FrankenError::internal(
+                        "injected checkpoint db sync failure",
+                    ));
+                }
             }
             self.inner.sync(cx, flags)
         }
@@ -20545,6 +20561,34 @@ mod tests {
         // Once the barrier succeeds, the new state publishes.
         writer.sync(&cx).unwrap();
         assert_eq!(pager.published_snapshot().db_size, 30);
+    }
+
+    /// GH #198: the checkpoint writer's durability barrier is the recovery
+    /// fence executed before WAL invalidation, so the flag that crosses the
+    /// VFS boundary must be `FULL` (true fsync incl. metadata / strongest
+    /// platform barrier), not the relaxed `NORMAL` mode.
+    #[test]
+    fn test_checkpoint_writer_sync_uses_full_durability_flag() {
+        use crate::traits::CheckpointPageWriter as _;
+        let cx = Cx::new();
+        let vfs = CheckpointFaultVfs::new();
+        let observed_flags = Arc::clone(&vfs.last_db_sync_flags);
+        let pager =
+            SimplePager::open(vfs, Path::new("/ckpt-sync-flag-198.db"), PageSize::DEFAULT).unwrap();
+        let page_size = PageSize::DEFAULT.as_usize();
+        let mut writer = pager.checkpoint_writer();
+
+        let mut page1 = vec![0u8; page_size];
+        page1[..16].copy_from_slice(b"SQLite format 3\0");
+        writer.write_page(&cx, PageNumber::ONE, &page1).unwrap();
+        writer.sync(&cx).unwrap();
+
+        let flags = SyncFlags::from_bits_retain(observed_flags.load(AtomicOrdering::Acquire));
+        assert_eq!(
+            flags,
+            SyncFlags::FULL,
+            "checkpoint durability fence must cross the VFS as FULL (GH #198), got {flags:?}"
+        );
     }
 
     #[test]

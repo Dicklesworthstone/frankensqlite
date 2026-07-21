@@ -305,9 +305,11 @@ fn scenario_disjoint_pages_both_commit() -> Result<(), String> {
 
     let page1 = manager
         .read_page(&mut reader, page(1))
+        .unwrap()
         .ok_or_else(|| "page1_missing_after_disjoint_commit".to_owned())?;
     let page2 = manager
         .read_page(&mut reader, page(2))
+        .unwrap()
         .ok_or_else(|| "page2_missing_after_disjoint_commit".to_owned())?;
 
     if page1.as_bytes()[0] != 0x11 {
@@ -349,6 +351,7 @@ fn scenario_same_page_disjoint_cells_merge() -> Result<(), String> {
 
     let base = manager
         .read_page(&mut t2, page(7))
+        .unwrap()
         .unwrap_or_else(|| seeded_page(0));
 
     let t1_page = with_byte_override(&base, 0, 0xAA)?;
@@ -374,6 +377,7 @@ fn scenario_same_page_disjoint_cells_merge() -> Result<(), String> {
         .map_err(|error| format!("reader_begin_failed error={error:?}"))?;
     let merged = manager
         .read_page(&mut reader, page(7))
+        .unwrap()
         .ok_or_else(|| "merged_page_missing".to_owned())?;
 
     if merged.as_bytes()[0] != 0xAA {
@@ -419,16 +423,20 @@ fn run_write_skew_case(ssi_enabled: bool) -> Result<(bool, bool), String> {
 
     let t1_read_page1 = manager
         .read_page(&mut t1, page(1))
+        .unwrap()
         .ok_or_else(|| "t1_read_page1_missing".to_owned())?;
     let _t1_read_page2 = manager
         .read_page(&mut t1, page(2))
+        .unwrap()
         .ok_or_else(|| "t1_read_page2_missing".to_owned())?;
 
     let _t2_read_page1 = manager
         .read_page(&mut t2, page(1))
+        .unwrap()
         .ok_or_else(|| "t2_read_page1_missing".to_owned())?;
     let t2_read_page2 = manager
         .read_page(&mut t2, page(2))
+        .unwrap()
         .ok_or_else(|| "t2_read_page2_missing".to_owned())?;
 
     manager

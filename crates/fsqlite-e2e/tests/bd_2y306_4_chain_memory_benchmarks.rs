@@ -319,7 +319,10 @@ fn run_long_reader_scenario(seed: u64) -> LongReaderMetrics {
     mgr.commit(&mut seed_txn).expect("seed commit");
 
     let mut reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
-    let _ = mgr.read_page(&mut reader, hot_pgno).expect("reader pin");
+    let _ = mgr
+        .read_page(&mut reader, hot_pgno)
+        .unwrap()
+        .expect("reader pin");
 
     let before = GLOBAL_EBR_METRICS.snapshot();
     let started = Instant::now();
