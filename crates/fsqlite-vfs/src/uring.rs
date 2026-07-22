@@ -50,6 +50,8 @@ compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
 const IO_URING_LOCK_POISONED_MSG: &str = "io_uring runtime lock poisoned";
 const IO_URING_READ_CONFORMAL_BREACH_MSG: &str = "io_uring read conformal tail breach";
 const IO_URING_WRITE_CONFORMAL_BREACH_MSG: &str = "io_uring write conformal tail breach";
+const IO_URING_READ_ERROR_FALLBACK_MSG: &str = "io_uring read error fallback";
+const IO_URING_WRITE_ERROR_FALLBACK_MSG: &str = "io_uring write error fallback";
 const IO_URING_MAX_RW_CHUNK_BYTES: usize = 64 * 1024;
 #[cfg(feature = "linux-asupersync-uring")]
 const IO_URING_ASUPERSYNC_INIT_FAILED_MSG: &str = "asupersync io_uring backend init failed";
@@ -68,7 +70,6 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
-#[cfg(test)]
 fn should_fallback_to_unix_on_uring_error(err: &FrankenError) -> bool {
     match err {
         FrankenError::Abort => false,
@@ -77,7 +78,6 @@ fn should_fallback_to_unix_on_uring_error(err: &FrankenError) -> bool {
     }
 }
 
-#[cfg(test)]
 fn should_disable_runtime_on_uring_fallback(err: &FrankenError) -> bool {
     match err {
         FrankenError::Abort => false,
@@ -617,20 +617,39 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                 })?;
 
             #[cfg(test)]
-            if FORCE_ASUPERSYNC_READ_FAIL.load(Ordering::Acquire) {
-                return Err(FrankenError::Io(io::Error::other(
-                    "forced asupersync read failure",
-                )));
-            }
-            #[cfg(test)]
             if FORCE_ASUPERSYNC_READ_ABORT.load(Ordering::Acquire) {
                 return Err(FrankenError::Abort);
             }
 
-            let bytes_read = backend
-                .read_at(&mut buf[total..chunk_end], off)
-                .await
-                .map_err(FrankenError::Io)?;
+            #[cfg(test)]
+            let read_result = if FORCE_ASUPERSYNC_READ_FAIL.load(Ordering::Acquire) {
+                Err(io::Error::other("forced asupersync read failure"))
+            } else {
+                backend.read_at(&mut buf[total..chunk_end], off).await
+            };
+            #[cfg(not(test))]
+            let read_result = backend.read_at(&mut buf[total..chunk_end], off).await;
+
+            let bytes_read = match read_result {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    let error = FrankenError::Io(error);
+                    if !should_fallback_to_unix_on_uring_error(&error) {
+                        return Err(error);
+                    }
+                    if should_disable_runtime_on_uring_fallback(&error) {
+                        self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
+                    }
+                    record_io_uring_read_unix_fallback();
+                    return crate::traits::AsyncVfsDataPath::read_async(
+                        &self.inner,
+                        cx,
+                        buf,
+                        offset,
+                    )
+                    .await;
+                }
+            };
             checkpoint_or_abort(cx)?;
 
             if bytes_read == 0 {
@@ -683,20 +702,39 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                 })?;
 
             #[cfg(test)]
-            if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
-                return Err(FrankenError::Io(io::Error::other(
-                    "forced asupersync write failure",
-                )));
-            }
-            #[cfg(test)]
             if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
                 return Err(FrankenError::Abort);
             }
 
-            let advanced = backend
-                .write_at(&buf[total..chunk_end], off)
-                .await
-                .map_err(FrankenError::Io)?;
+            #[cfg(test)]
+            let write_result = if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+                Err(io::Error::other("forced asupersync write failure"))
+            } else {
+                backend.write_at(&buf[total..chunk_end], off).await
+            };
+            #[cfg(not(test))]
+            let write_result = backend.write_at(&buf[total..chunk_end], off).await;
+
+            let advanced = match write_result {
+                Ok(advanced) => advanced,
+                Err(error) => {
+                    let error = FrankenError::Io(error);
+                    if !should_fallback_to_unix_on_uring_error(&error) {
+                        return Err(error);
+                    }
+                    if should_disable_runtime_on_uring_fallback(&error) {
+                        self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
+                    }
+                    record_io_uring_write_unix_fallback();
+                    return crate::traits::AsyncVfsDataPath::write_async(
+                        &self.inner,
+                        cx,
+                        buf,
+                        offset,
+                    )
+                    .await;
+                }
+            };
             checkpoint_or_abort(cx)?;
 
             if advanced == 0 {
@@ -730,9 +768,37 @@ mod tests {
 
     use fsqlite_observability::{io_uring_latency_snapshot, reset_io_uring_latency_metrics};
     use fsqlite_types::flags::VfsOpenFlags;
+    use std::future::Future;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use crate::traits::AsyncVfsDataPath;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct TestThreadWaker(std::thread::Thread);
+
+    impl Wake for TestThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on_test<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(TestThreadWaker(std::thread::current())));
+        let mut task_cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut task_cx) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
 
     fn open_flags_create() -> VfsOpenFlags {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
@@ -1145,13 +1211,12 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_abort_propagation.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_ABORT);
-        let err = file
-            .write(&cx, b"abort", 0)
+        let err = block_on_test(file.write_async(&cx, b"abort", 0))
             .expect_err("write should propagate abort");
 
         assert!(matches!(err, FrankenError::Abort));
@@ -1184,7 +1249,7 @@ mod tests {
 
         let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_READ_ABORT);
         let mut buf = [0_u8; 4];
-        let err = match file.read(&cx, &mut buf, 0) {
+        let err = match block_on_test(file.read_async(&cx, &mut buf, 0)) {
             Ok(bytes) => {
                 return Err(FrankenError::Io(io::Error::other(format!(
                     "read should propagate abort, read {bytes} bytes"
@@ -1298,20 +1363,19 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_write_failure.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         let _force_write_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_FAIL);
-        file.write(&cx, b"fallback", 0)
+        block_on_test(file.write_async(&cx, b"fallback", 0))
             .expect("write should succeed via unix fallback");
 
         assert!(vfs.runtime.is_disabled());
         assert!(!vfs.is_available());
 
         let mut buf = [0_u8; 8];
-        let n = file
-            .read(&cx, &mut buf, 0)
+        let n = block_on_test(file.read_async(&cx, &mut buf, 0))
             .expect("read should use unix path after runtime disable");
         assert_eq!(n, 8);
         assert_eq!(&buf, b"fallback");
@@ -1328,17 +1392,15 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_read_failure.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
-        file.write(&cx, b"fallback", 0)
-            .expect("write should seed data");
+        block_on_test(file.write_async(&cx, b"fallback", 0)).expect("write should seed data");
 
         let _force_read_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_READ_FAIL);
         let mut buf = [0_u8; 8];
-        let n = file
-            .read(&cx, &mut buf, 0)
+        let n = block_on_test(file.read_async(&cx, &mut buf, 0))
             .expect("read should succeed via unix fallback");
 
         assert_eq!(n, 8);
