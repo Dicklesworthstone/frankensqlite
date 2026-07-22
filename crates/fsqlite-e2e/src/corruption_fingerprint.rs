@@ -707,8 +707,7 @@ fn parse_wal_sidecar(header: &[u8], length: u64) -> Option<WalSidecarMetadata> {
 fn sqlite_immutable_uri(path: &Path) -> String {
     let mut uri = String::from("file:");
     for byte in path.to_string_lossy().bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~' | b':')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~' | b':') {
             uri.push(char::from(byte));
         } else {
             let _ = write!(uri, "%{byte:02X}");
@@ -860,9 +859,8 @@ fn collect_ownership(
         );
     }
 
-    let mut statement = connection.prepare(
-        "SELECT name,path,pageno,pagetype FROM dbstat ORDER BY name,pageno",
-    )?;
+    let mut statement =
+        connection.prepare("SELECT name,path,pageno,pagetype FROM dbstat ORDER BY name,pageno")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let name: String = row.get(0)?;
@@ -980,7 +978,11 @@ fn compare_target_index(
 ) -> Result<(IndexConsistency, BTreeSet<Vec<u8>>), rusqlite::Error> {
     let Some((object_type, table_name, _, _)) = schema.get(index_name) else {
         return Ok((
-            incomparable_index(index_name, "", "index is absent from sqlite_schema".to_owned()),
+            incomparable_index(
+                index_name,
+                "",
+                "index is absent from sqlite_schema".to_owned(),
+            ),
             BTreeSet::new(),
         ));
     };
@@ -1238,8 +1240,8 @@ pub fn classify_sqlite_artifact(
     let reserved_bytes = u32::from(header[20]);
     let usable_size = page_size.saturating_sub(reserved_bytes);
     let header_page_count = read_u32_be(&header, 28).unwrap_or_default();
-    let file_page_count = u32::try_from(file.metadata()?.len() / u64::from(page_size))
-        .unwrap_or(u32::MAX);
+    let file_page_count =
+        u32::try_from(file.metadata()?.len() / u64::from(page_size)).unwrap_or(u32::MAX);
     let page_count = if header_page_count == 0 {
         file_page_count
     } else {
@@ -1303,8 +1305,7 @@ pub fn classify_sqlite_artifact(
 
     let (target_index, target_fragments) = match target_index {
         Some(index_name) => {
-            let (comparison, fragments) =
-                compare_target_index(&connection, &schema, index_name)?;
+            let (comparison, fragments) = compare_target_index(&connection, &schema, index_name)?;
             (Some(comparison), fragments)
         }
         None => (None, BTreeSet::new()),

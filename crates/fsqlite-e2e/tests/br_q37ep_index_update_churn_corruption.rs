@@ -256,6 +256,30 @@ fn index_delete_reinsert_overflow_stays_intact() {
 /// bounded, deterministic workload does not claim to reproduce either private
 /// historical artifact; it freezes the public mutation shape against current
 /// main, including reopen/checkpoint boundaries and freelist reuse.
+fn collect_gh132_rows(
+    connection: &rusqlite::Connection,
+    from_clause: &str,
+) -> Vec<(String, i64, String, i64, String)> {
+    let sql = format!(
+        "SELECT source_id,agent_id,external_id,id,title FROM {from_clause} \
+         ORDER BY source_id,agent_id,external_id,id,title"
+    );
+    let mut statement = connection.prepare(&sql).expect("prepare GH#132 comparison");
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query GH#132 comparison")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect GH#132 comparison")
+}
+
 fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
     const SEED: u64 = 0x132D_57A9;
     const CYCLES: i64 = 8;
@@ -265,32 +289,49 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
     let dir = TempDir::new().expect("create GH#132 tempdir");
     let db_path = dir.path().join(format!("gh132-{journal_mode}.db"));
     let path = db_path.to_string_lossy().into_owned();
+    let oracle_path = dir.path().join(format!("gh132-{journal_mode}-oracle.db"));
 
     for cycle in 0..CYCLES {
         {
             let conn = fsqlite::Connection::open(path.clone()).unwrap_or_else(|error| {
                 panic!("GH#132 seed={SEED:#x} cycle={cycle}: reopen failed: {error}")
             });
+            let oracle = rusqlite::Connection::open(&oracle_path).unwrap_or_else(|error| {
+                panic!("GH#132 seed={SEED:#x} cycle={cycle}: oracle reopen failed: {error}")
+            });
             if cycle == 0 {
                 conn.execute("PRAGMA page_size=512")
                     .expect("set tiny page size before schema creation");
+                oracle
+                    .execute_batch("PRAGMA page_size=512;")
+                    .expect("set oracle tiny page size before schema creation");
             }
             conn.execute(&format!("PRAGMA journal_mode='{journal_mode}'"))
                 .unwrap_or_else(|error| {
                     panic!("GH#132 seed={SEED:#x} cycle={cycle}: set journal mode failed: {error}")
                 });
+            oracle
+                .execute_batch(&format!("PRAGMA journal_mode='{journal_mode}';"))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "GH#132 seed={SEED:#x} cycle={cycle}: \
+                         set oracle journal mode failed: {error}"
+                    )
+                });
             if cycle == 0 {
-                conn.execute_batch(
-                    "CREATE TABLE conversations (
+                let schema = "CREATE TABLE conversations (
                          id INTEGER PRIMARY KEY,
                          source_id TEXT NOT NULL,
                          agent_id INTEGER NOT NULL,
                          external_id TEXT NOT NULL,
                          title TEXT NOT NULL,
                          UNIQUE(source_id, agent_id, external_id)
-                     );",
-                )
-                .expect("create GH#132 composite UNIQUE schema");
+                     );";
+                conn.execute_batch(schema)
+                    .expect("create GH#132 composite UNIQUE schema");
+                oracle
+                    .execute_batch(schema)
+                    .expect("create oracle GH#132 composite UNIQUE schema");
             }
 
             for offset in 0..ROWS_PER_CYCLE {
@@ -299,23 +340,31 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                 let source = (operation * 37 + i64::try_from(SEED & 0xff).unwrap()) % 29;
                 let agent = (operation * 17 + 3) % 11;
                 let external = format!("external-{operation:06}");
-                conn.execute(&format!(
+                let insert = format!(
                     "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
                      VALUES({id},'source-{source:02}',{agent},'{external}','title-{operation:06}')"
-                ))
+                );
+                conn.execute(&insert)
                 .unwrap_or_else(|error| {
                     panic!(
                         "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: insert failed: {error}"
                     )
                 });
+                oracle.execute_batch(&insert).unwrap_or_else(|error| {
+                    panic!(
+                        "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                         oracle insert failed: {error}"
+                    )
+                });
 
                 if offset % 4 == 0 {
                     let duplicate_id = 900_000 + operation;
+                    let duplicate = format!(
+                        "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
+                         VALUES({duplicate_id},'source-{source:02}',{agent},'{external}','duplicate')"
+                    );
                     let duplicate_error = conn
-                        .execute(&format!(
-                            "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
-                             VALUES({duplicate_id},'source-{source:02}',{agent},'{external}','duplicate')"
-                        ))
+                        .execute(&duplicate)
                         .expect_err("composite UNIQUE duplicate must be rejected");
                     assert!(
                         matches!(
@@ -325,6 +374,9 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                         "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
                          duplicate must return typed UniqueViolation, got {duplicate_error:?}"
                     );
+                    oracle
+                        .execute_batch(&duplicate)
+                        .expect_err("oracle composite UNIQUE duplicate must be rejected");
 
                     let recovered = conn
                         .query(&format!(
@@ -347,13 +399,33 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                         "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
                          typed recovery must find the pre-existing row"
                     );
-                    conn.execute(&format!(
+                    let oracle_recovered: i64 = oracle
+                        .query_row(
+                            "SELECT id FROM conversations \
+                             WHERE source_id=?1 AND agent_id=?2 AND external_id=?3",
+                            (format!("source-{source:02}"), agent, &external),
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                                 oracle typed recovery lookup failed: {error}"
+                            )
+                        });
+                    assert_eq!(oracle_recovered, id);
+                    let update = format!(
                         "UPDATE conversations SET title='recovered-{operation:06}' WHERE id={id}"
-                    ))
-                    .unwrap_or_else(|error| {
+                    );
+                    conn.execute(&update).unwrap_or_else(|error| {
                         panic!(
                             "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
                              recovery merge failed: {error}"
+                        )
+                    });
+                    oracle.execute_batch(&update).unwrap_or_else(|error| {
+                        panic!(
+                            "GH#132 seed={SEED:#x} cycle={cycle} operation={operation}: \
+                             oracle recovery merge failed: {error}"
                         )
                     });
                 }
@@ -363,27 +435,40 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                 let retired_cycle = cycle - 2;
                 let retired_start = retired_cycle * ROWS_PER_CYCLE + 1;
                 let retired_end = retired_start + RECYCLE_ROWS - 1;
-                conn.execute(&format!(
+                let delete = format!(
                     "DELETE FROM conversations WHERE id BETWEEN {retired_start} AND {retired_end}"
-                ))
+                );
+                conn.execute(&delete)
                 .unwrap_or_else(|error| {
                     panic!(
                         "GH#132 seed={SEED:#x} cycle={cycle}: freelist-producing delete failed: {error}"
                     )
                 });
+                oracle.execute_batch(&delete).unwrap_or_else(|error| {
+                    panic!(
+                        "GH#132 seed={SEED:#x} cycle={cycle}: \
+                         oracle freelist-producing delete failed: {error}"
+                    )
+                });
 
                 for replacement in 0..RECYCLE_ROWS {
                     let replacement_id = 1_000_000 + cycle * RECYCLE_ROWS + replacement;
-                    conn.execute(&format!(
+                    let insert = format!(
                         "INSERT INTO conversations(id,source_id,agent_id,external_id,title) \
                          VALUES({replacement_id},'recycled-{cycle:02}',{},
                                 'replacement-{cycle:02}-{replacement:03}','replacement')",
                         replacement % 11
-                    ))
-                    .unwrap_or_else(|error| {
+                    );
+                    conn.execute(&insert).unwrap_or_else(|error| {
                         panic!(
                             "GH#132 seed={SEED:#x} cycle={cycle} replacement={replacement}: \
                              freelist reuse insert failed: {error}"
+                        )
+                    });
+                    oracle.execute_batch(&insert).unwrap_or_else(|error| {
+                        panic!(
+                            "GH#132 seed={SEED:#x} cycle={cycle} replacement={replacement}: \
+                             oracle freelist reuse insert failed: {error}"
                         )
                     });
                 }
@@ -394,6 +479,14 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
                     .unwrap_or_else(|error| {
                         panic!(
                             "GH#132 seed={SEED:#x} cycle={cycle}: WAL checkpoint failed: {error}"
+                        )
+                    });
+                oracle
+                    .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "GH#132 seed={SEED:#x} cycle={cycle}: \
+                             oracle WAL checkpoint failed: {error}"
                         )
                     });
             }
@@ -414,6 +507,29 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
             quick, "ok",
             "GH#132 seed={SEED:#x} cycle={cycle}: stock quick_check detected committed damage"
         );
+        let oracle = rusqlite::Connection::open(&oracle_path).unwrap_or_else(|error| {
+            panic!("GH#132 seed={SEED:#x} cycle={cycle}: oracle verify open failed: {error}")
+        });
+        let oracle_quick: String = oracle
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap_or_else(|error| {
+                panic!("GH#132 seed={SEED:#x} cycle={cycle}: oracle quick_check failed: {error}")
+            });
+        assert_eq!(oracle_quick, "ok");
+        let produced_table = collect_gh132_rows(&stock, "conversations NOT INDEXED");
+        let produced_index = collect_gh132_rows(
+            &stock,
+            "conversations INDEXED BY sqlite_autoindex_conversations_1",
+        );
+        let oracle_table = collect_gh132_rows(&oracle, "conversations NOT INDEXED");
+        assert_eq!(
+            produced_index, produced_table,
+            "GH#132 seed={SEED:#x} cycle={cycle}: committed index/table divergence"
+        );
+        assert_eq!(
+            produced_table, oracle_table,
+            "GH#132 seed={SEED:#x} cycle={cycle}: FrankenSQLite diverged from stock SQLite"
+        );
     }
 
     let stock = rusqlite::Connection::open(&path).expect("final stock reopen");
@@ -425,26 +541,8 @@ fn composite_unique_duplicate_recovery_churn(journal_mode: &str) {
         "GH#132 seed={SEED:#x}: stock integrity_check detected committed damage"
     );
 
-    fn collect_rows(
-        conn: &rusqlite::Connection,
-        from_clause: &str,
-    ) -> Vec<(String, i64, String, i64)> {
-        let sql = format!(
-            "SELECT source_id,agent_id,external_id,id FROM {from_clause} \
-             ORDER BY source_id,agent_id,external_id,id"
-        );
-        let mut statement = conn.prepare(&sql).expect("prepare stock comparison");
-        statement
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .expect("query stock comparison")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect stock comparison")
-    }
-
-    let via_table = collect_rows(&stock, "conversations NOT INDEXED");
-    let via_index = collect_rows(
+    let via_table = collect_gh132_rows(&stock, "conversations NOT INDEXED");
+    let via_index = collect_gh132_rows(
         &stock,
         "conversations INDEXED BY sqlite_autoindex_conversations_1",
     );
