@@ -891,13 +891,12 @@ pub trait VfsFile: Send + Sync {
     fn set_busy_timeout_ms(&mut self, _ms: u64) {}
 }
 
-/// Async data-path trait for VFS file I/O (bd-2jpu6.1 Phase 0).
+/// Non-blocking data path for VFS file I/O (bd-2jpu6.1).
 ///
-/// Separates the async read/write data path from the sync `VfsFile` trait
-/// so callers that can drive a future (e.g. pager hot path with io_uring)
-/// avoid `pollster::block_on` overhead. Implementations that have a native
-/// async backend (io_uring via asupersync) override these to submit SQEs
-/// directly; sync-only backends get a default that delegates to `VfsFile`.
+/// This companion contract remains separate from the object-safe [`VfsFile`]
+/// control plane while the pager and B-tree layers migrate to async I/O. Every
+/// backend must implement reads and writes explicitly: a default cannot know
+/// whether touching the backend inline would block an executor thread.
 pub trait AsyncVfsDataPath: VfsFile {
     /// Async read into `buf` at byte `offset`. Returns bytes read; short
     /// reads zero-fill the remainder (same contract as `VfsFile::read`).
@@ -908,11 +907,7 @@ pub trait AsyncVfsDataPath: VfsFile {
         offset: u64,
     ) -> impl std::future::Future<Output = Result<usize>> + Send
     where
-        Self: Sync,
-    {
-        let result = self.read(cx, buf, offset);
-        async move { result }
-    }
+        Self: Sync;
 
     /// Async write of `buf` at byte `offset`.
     fn write_async(
@@ -922,14 +917,7 @@ pub trait AsyncVfsDataPath: VfsFile {
         offset: u64,
     ) -> impl std::future::Future<Output = Result<()>> + Send
     where
-        Self: Sync,
-    {
-        // Default: synchronous write — the `&mut self` requirement of
-        // `VfsFile::write` cannot be met through `&self`, so sync-only
-        // backends should override this if they want async write support.
-        let _ = (cx, buf, offset);
-        async { Err(fsqlite_error::FrankenError::Unsupported) }
-    }
+        Self: Sync;
 
     /// Async batch write of page-sized buffers. Default delegates to
     /// sequential `write_async` calls.
@@ -941,16 +929,9 @@ pub trait AsyncVfsDataPath: VfsFile {
     where
         Self: Sync,
     {
-        let results: Vec<Result<()>> = writes
-            .iter()
-            .map(|(offset, data)| {
-                let _ = (cx, *data, *offset);
-                Ok(())
-            })
-            .collect();
         async move {
-            for r in results {
-                r?;
+            for (offset, data) in writes {
+                self.write_async(cx, data, *offset).await?;
             }
             Ok(())
         }
@@ -1588,7 +1569,10 @@ mod tests {
     }
 
     #[test]
-    fn async_vfs_data_path_default_read_resolves_immediately() {
+    fn async_memory_data_path_resolves_immediately_and_writes_real_bytes() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
         use crate::memory::MemoryVfs;
 
         let cx = Cx::new();
@@ -1596,14 +1580,44 @@ mod tests {
         let flags = fsqlite_types::flags::VfsOpenFlags::MAIN_DB
             | fsqlite_types::flags::VfsOpenFlags::CREATE
             | fsqlite_types::flags::VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, None, flags).unwrap();
+        let (file, _) = vfs.open(&cx, None, flags).unwrap();
 
         let payload = b"hello async vfs";
-        file.write(&cx, payload, 0).unwrap();
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(waker);
+        let mut write = std::pin::pin!(file.write_async(&cx, payload, 0));
+        assert!(matches!(
+            write.as_mut().poll(&mut task_cx),
+            Poll::Ready(Ok(()))
+        ));
+        drop(write);
 
         let mut buf = [0u8; 15];
-        let n = pollster::block_on(AsyncVfsDataPath::read_async(&file, &cx, &mut buf, 0)).unwrap();
-        assert_eq!(n, 15);
+        {
+            let mut read = std::pin::pin!(file.read_async(&cx, &mut buf, 0));
+            assert!(matches!(
+                read.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(15))
+            ));
+        }
         assert_eq!(&buf, payload);
+
+        let writes: &[(u64, &[u8])] = &[(0, b"real"), (8, b"batch")];
+        let mut batch = std::pin::pin!(file.write_page_batch_async(&cx, writes));
+        assert!(matches!(
+            batch.as_mut().poll(&mut task_cx),
+            Poll::Ready(Ok(()))
+        ));
+        drop(batch);
+
+        let mut batch_buf = [0_u8; 13];
+        {
+            let mut verify = std::pin::pin!(file.read_async(&cx, &mut batch_buf, 0));
+            assert!(matches!(
+                verify.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(13))
+            ));
+        }
+        assert_eq!(&batch_buf, b"realo asbatch");
     }
 }

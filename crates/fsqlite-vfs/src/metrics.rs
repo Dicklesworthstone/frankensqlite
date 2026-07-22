@@ -29,7 +29,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 
 use crate::shm::ShmRegion;
-use crate::traits::{FileIdentity, VfsFile};
+use crate::traits::{AsyncVfsDataPath, FileIdentity, VfsFile};
 
 // ---------------------------------------------------------------------------
 // Global metrics counters
@@ -365,9 +365,40 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     }
 }
 
-impl<F: VfsFile + crate::traits::AsyncVfsDataPath> crate::traits::AsyncVfsDataPath
-    for TracingFile<F>
-{
+impl<F: VfsFile + AsyncVfsDataPath> AsyncVfsDataPath for TracingFile<F> {
+    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        GLOBAL_VFS_METRICS.read_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes_requested = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "read_async",
+            &*self.path,
+            bytes_requested,
+            self.inner.read_async(cx, buf, offset).await
+        );
+        if let Ok(read) = &result {
+            GLOBAL_VFS_METRICS
+                .read_bytes_total
+                .fetch_add(*read as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "write_async",
+            &*self.path,
+            bytes,
+            self.inner.write_async(cx, buf, offset).await
+        );
+        if result.is_ok() {
+            GLOBAL_VFS_METRICS
+                .write_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        result
+    }
 }
 
 // TracingFile is Send+Sync automatically because F: VfsFile requires Send+Sync

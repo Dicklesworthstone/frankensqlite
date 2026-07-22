@@ -1107,7 +1107,22 @@ impl VfsFile for MemoryFile {
     }
 }
 
-impl crate::traits::AsyncVfsDataPath for MemoryFile {}
+impl crate::traits::AsyncVfsDataPath for MemoryFile {
+    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        // MemoryFile only takes bounded in-process mutexes. Keeping the work
+        // inside this future makes its first poll complete immediately without
+        // allocating, yielding, or entering the blocking pool.
+        self.read(cx, buf, offset)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]

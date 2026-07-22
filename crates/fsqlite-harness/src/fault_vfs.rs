@@ -28,7 +28,7 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::shm::ShmRegion;
-use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile};
+use fsqlite_vfs::traits::{AsyncVfsDataPath, FileIdentity, Vfs, VfsFile};
 use tracing::{debug, debug_span};
 
 /// Bead identifier for tracing/log correlation.
@@ -692,6 +692,33 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
 
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.inner.set_busy_timeout_ms(ms);
+    }
+}
+
+impl<F: AsyncVfsDataPath> AsyncVfsDataPath for FaultInjectingFile<F> {
+    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        match self.state.check_read(&self.path, offset, buf.len()) {
+            ReadDecision::Allow => self.inner.read_async(cx, buf, offset).await,
+            ReadDecision::IoError => Err(io_failure_error("fault injection: read failure")),
+            ReadDecision::PoweredOff => Err(power_cut_error()),
+        }
+    }
+
+    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        match self.state.check_write(&self.path, offset, buf.len()) {
+            WriteDecision::Allow => self.inner.write_async(cx, buf, offset).await,
+            WriteDecision::TornWrite { valid_bytes }
+            | WriteDecision::PartialWrite { valid_bytes } => {
+                let applied = valid_bytes.min(buf.len());
+                if applied > 0 {
+                    self.inner.write_async(cx, &buf[..applied], offset).await?;
+                }
+                Err(io_failure_error("fault injection: partial write"))
+            }
+            WriteDecision::IoError => Err(io_failure_error("fault injection: write failure")),
+            WriteDecision::DiskFull => Err(FrankenError::DatabaseFull),
+            WriteDecision::PoweredOff => Err(power_cut_error()),
+        }
     }
 }
 

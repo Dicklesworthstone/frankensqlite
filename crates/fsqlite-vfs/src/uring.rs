@@ -48,10 +48,6 @@ compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
 
 #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
 const IO_URING_LOCK_POISONED_MSG: &str = "io_uring runtime lock poisoned";
-const IO_URING_READ_PANICKED_MSG: &str = "io_uring read panicked";
-const IO_URING_WRITE_PANICKED_MSG: &str = "io_uring write panicked";
-const IO_URING_READ_ERROR_FALLBACK_MSG: &str = "io_uring read error fallback";
-const IO_URING_WRITE_ERROR_FALLBACK_MSG: &str = "io_uring write error fallback";
 const IO_URING_READ_CONFORMAL_BREACH_MSG: &str = "io_uring read conformal tail breach";
 const IO_URING_WRITE_CONFORMAL_BREACH_MSG: &str = "io_uring write conformal tail breach";
 const IO_URING_MAX_RW_CHUNK_BYTES: usize = 64 * 1024;
@@ -72,6 +68,7 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
+#[cfg(test)]
 fn should_fallback_to_unix_on_uring_error(err: &FrankenError) -> bool {
     match err {
         FrankenError::Abort => false,
@@ -80,6 +77,7 @@ fn should_fallback_to_unix_on_uring_error(err: &FrankenError) -> bool {
     }
 }
 
+#[cfg(test)]
 fn should_disable_runtime_on_uring_fallback(err: &FrankenError) -> bool {
     match err {
         FrankenError::Abort => false,
@@ -436,271 +434,6 @@ pub struct IoUringFile {
     asupersync_backend: Option<AsupersyncIoUringFile>,
 }
 
-impl IoUringFile {
-    #[cfg(feature = "linux-asupersync-uring")]
-    fn has_uring_data_path(&self) -> bool {
-        self.runtime.is_available() && self.asupersync_backend.is_some()
-    }
-
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    fn read_via_uring(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
-            FrankenError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "io_uring runtime unavailable",
-            ))
-        })?;
-
-        self.inner.with_inode_io_file(|file| {
-            let mut total = 0_usize;
-            while total < buf.len() {
-                checkpoint_or_abort(cx)?;
-                let off = offset
-                    .checked_add(u64::try_from(total).expect("usize must fit into u64"))
-                    .ok_or_else(|| {
-                        FrankenError::Io(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "offset overflow during io_uring read",
-                        ))
-                    })?;
-
-                let chunk_end = next_chunk_end(total, buf.len());
-                let requested = u32::try_from(chunk_end - total).map_err(|_| {
-                    FrankenError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("read size too large for io_uring: {}", chunk_end - total),
-                    ))
-                })?;
-
-                seek_to(file, off)?;
-                let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let ring = lock_mutex_or_io(ring_mutex)?;
-                    pollster::block_on(ring.read(file, requested))
-                }));
-
-                let data = match read_result {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(err)) => {
-                        if is_lock_poison_error(&err) {
-                            self.runtime.disable(IO_URING_LOCK_POISONED_MSG);
-                        }
-                        return Err(FrankenError::Io(err));
-                    }
-                    Err(_) => {
-                        self.runtime.disable(IO_URING_READ_PANICKED_MSG);
-                        return Err(FrankenError::Io(io::Error::other(
-                            IO_URING_READ_PANICKED_MSG,
-                        )));
-                    }
-                };
-
-                if data.is_empty() {
-                    break; // EOF
-                }
-
-                let bytes_read = data.len();
-                buf[total..total + bytes_read].copy_from_slice(&data);
-                total += bytes_read;
-            }
-
-            if total < buf.len() {
-                buf[total..].fill(0);
-            }
-            Ok(total)
-        })
-    }
-
-    #[cfg(feature = "linux-asupersync-uring")]
-    fn read_via_uring(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let backend = self.asupersync_backend.as_ref().ok_or_else(|| {
-            FrankenError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "asupersync io_uring backend unavailable",
-            ))
-        })?;
-
-        let mut total = 0_usize;
-        while total < buf.len() {
-            checkpoint_or_abort(cx)?;
-            let chunk_end = next_chunk_end(total, buf.len());
-            let off = offset
-                .checked_add(u64::try_from(total).expect("usize must fit into u64"))
-                .ok_or_else(|| {
-                    FrankenError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "offset overflow during io_uring read",
-                    ))
-                })?;
-
-            #[cfg(test)]
-            if FORCE_ASUPERSYNC_READ_FAIL.load(Ordering::Acquire) {
-                return Err(FrankenError::Io(io::Error::other(
-                    "forced asupersync read failure",
-                )));
-            }
-            #[cfg(test)]
-            if FORCE_ASUPERSYNC_READ_ABORT.load(Ordering::Acquire) {
-                return Err(FrankenError::Abort);
-            }
-
-            let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pollster::block_on(backend.read_at(&mut buf[total..chunk_end], off))
-            }));
-
-            let bytes_read = match read_result {
-                Ok(Ok(n)) => n,
-                Ok(Err(err)) => return Err(FrankenError::Io(err)),
-                Err(_) => {
-                    self.runtime.disable(IO_URING_READ_PANICKED_MSG);
-                    return Err(FrankenError::Io(io::Error::other(
-                        IO_URING_READ_PANICKED_MSG,
-                    )));
-                }
-            };
-
-            if bytes_read == 0 {
-                break; // EOF
-            }
-            total += bytes_read;
-        }
-
-        if total < buf.len() {
-            buf[total..].fill(0);
-        }
-        Ok(total)
-    }
-
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    fn write_via_uring(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
-            FrankenError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "io_uring runtime unavailable",
-            ))
-        })?;
-
-        self.inner.with_inode_io_file(|file| {
-            let mut total = 0_usize;
-            while total < buf.len() {
-                checkpoint_or_abort(cx)?;
-                let chunk_end = next_chunk_end(total, buf.len());
-                let off = offset
-                    .checked_add(u64::try_from(total).expect("usize must fit into u64"))
-                    .ok_or_else(|| {
-                        FrankenError::Io(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "offset overflow during io_uring write",
-                        ))
-                    })?;
-                seek_to(file, off)?;
-                let before = current_offset(file)?;
-                // uring-fs currently requires owning the payload for submission; chunking
-                // bounds this copy size while preserving forward progress semantics.
-                let payload = buf[total..chunk_end].to_vec();
-                let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let ring = lock_mutex_or_io(ring_mutex)?;
-                    pollster::block_on(ring.write(file, payload))
-                }));
-                match write_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        if is_lock_poison_error(&err) {
-                            self.runtime.disable(IO_URING_LOCK_POISONED_MSG);
-                        }
-                        return Err(FrankenError::Io(err));
-                    }
-                    Err(_) => {
-                        self.runtime.disable(IO_URING_WRITE_PANICKED_MSG);
-                        return Err(FrankenError::Io(io::Error::other(
-                            IO_URING_WRITE_PANICKED_MSG,
-                        )));
-                    }
-                }
-                let after = current_offset(file)?;
-                let advanced_u64 = after.checked_sub(before).ok_or_else(|| {
-                    FrankenError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "io_uring write moved cursor backwards: before={before} after={after}"
-                        ),
-                    ))
-                })?;
-                let advanced = usize::try_from(advanced_u64).map_err(|_| {
-                    FrankenError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("io_uring write advanced too far: {advanced_u64}"),
-                    ))
-                })?;
-                if advanced == 0 {
-                    return Err(FrankenError::Io(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "io_uring write advanced by 0 bytes",
-                    )));
-                }
-                let remaining = chunk_end - total;
-                total += advanced.min(remaining);
-            }
-            Ok(())
-        })
-    }
-
-    #[cfg(feature = "linux-asupersync-uring")]
-    fn write_via_uring(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        let backend = self.asupersync_backend.as_ref().ok_or_else(|| {
-            FrankenError::Io(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "asupersync io_uring backend unavailable",
-            ))
-        })?;
-
-        let mut total = 0_usize;
-        while total < buf.len() {
-            checkpoint_or_abort(cx)?;
-            let chunk_end = next_chunk_end(total, buf.len());
-            let off = offset
-                .checked_add(u64::try_from(total).expect("usize must fit into u64"))
-                .ok_or_else(|| {
-                    FrankenError::Io(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "offset overflow during io_uring write",
-                    ))
-                })?;
-            #[cfg(test)]
-            if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
-                return Err(FrankenError::Io(io::Error::other(
-                    "forced asupersync write failure",
-                )));
-            }
-            #[cfg(test)]
-            if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
-                return Err(FrankenError::Abort);
-            }
-            let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pollster::block_on(backend.write_at(&buf[total..chunk_end], off))
-            }));
-            let advanced: usize = match write_result {
-                Ok(Ok(advanced)) => advanced,
-                Ok(Err(err)) => return Err(FrankenError::Io(err)),
-                Err(_) => {
-                    self.runtime.disable(IO_URING_WRITE_PANICKED_MSG);
-                    return Err(FrankenError::Io(io::Error::other(
-                        IO_URING_WRITE_PANICKED_MSG,
-                    )));
-                }
-            };
-            if advanced == 0 {
-                return Err(FrankenError::Io(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "io_uring write advanced by 0 bytes",
-                )));
-            }
-            let remaining = chunk_end - total;
-            total += advanced.min(remaining);
-        }
-        Ok(())
-    }
-}
-
 impl Vfs for IoUringVfs {
     type File = IoUringFile;
 
@@ -787,69 +520,14 @@ impl VfsFile for IoUringFile {
     }
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        #[cfg(feature = "linux-asupersync-uring")]
-        if self.has_uring_data_path() {
-            let start = Instant::now();
-            match self.read_via_uring(cx, buf, offset) {
-                Ok(bytes) => {
-                    let elapsed = start.elapsed();
-                    if record_io_uring_read_latency(elapsed) {
-                        let snapshot = io_uring_latency_snapshot();
-                        enforce_conformal_breach_policy(
-                            &self.runtime,
-                            "read",
-                            elapsed,
-                            snapshot.read_conformal_upper_bound_us,
-                            IO_URING_READ_CONFORMAL_BREACH_MSG,
-                        );
-                    }
-                    return Ok(bytes);
-                }
-                Err(err) => {
-                    if !should_fallback_to_unix_on_uring_error(&err) {
-                        return Err(err);
-                    }
-                    if should_disable_runtime_on_uring_fallback(&err) {
-                        self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
-                    }
-                }
-            }
-        }
+        // The object-safe control-plane trait cannot drive a Future. Keep its
+        // compatibility path honestly synchronous; async callers must use
+        // AsyncVfsDataPath, which never blocks an executor on this fallback.
         record_io_uring_read_unix_fallback();
         self.inner.read(cx, buf, offset)
     }
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        #[cfg(feature = "linux-asupersync-uring")]
-        if self.has_uring_data_path() {
-            let start = Instant::now();
-            match self.write_via_uring(cx, buf, offset) {
-                Ok(()) => {
-                    let elapsed = start.elapsed();
-                    if record_io_uring_write_latency(elapsed) {
-                        let snapshot = io_uring_latency_snapshot();
-                        enforce_conformal_breach_policy(
-                            &self.runtime,
-                            "write",
-                            elapsed,
-                            snapshot.write_conformal_upper_bound_us,
-                            IO_URING_WRITE_CONFORMAL_BREACH_MSG,
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(err) => {
-                    if !should_fallback_to_unix_on_uring_error(&err) {
-                        return Err(err);
-                    }
-                    if should_disable_runtime_on_uring_fallback(&err) {
-                        self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
-                    }
-                }
-            }
-        }
         record_io_uring_write_unix_fallback();
         self.inner.write(cx, buf, offset)
     }
@@ -917,7 +595,11 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
         checkpoint_or_abort(cx)?;
         let backend = match &self.asupersync_backend {
             Some(b) if self.runtime.is_available() => b,
-            _ => return self.inner.read(cx, buf, offset),
+            _ => {
+                record_io_uring_read_unix_fallback();
+                return crate::traits::AsyncVfsDataPath::read_async(&self.inner, cx, buf, offset)
+                    .await;
+            }
         };
 
         let start = Instant::now();
@@ -949,6 +631,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                 .read_at(&mut buf[total..chunk_end], off)
                 .await
                 .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)?;
 
             if bytes_read == 0 {
                 break;
@@ -980,7 +663,8 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
             Some(b) if self.runtime.is_available() => b,
             _ => {
                 record_io_uring_write_unix_fallback();
-                return Err(FrankenError::Unsupported);
+                return crate::traits::AsyncVfsDataPath::write_async(&self.inner, cx, buf, offset)
+                    .await;
             }
         };
 
@@ -1013,6 +697,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                 .write_at(&buf[total..chunk_end], off)
                 .await
                 .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)?;
 
             if advanced == 0 {
                 return Err(FrankenError::Io(io::Error::new(
