@@ -11483,7 +11483,18 @@ where
                     None
                 };
 
-                if prepared_batch.is_none() {
+                // Operator-forced conservative mode is the production
+                // comparator for D1.c: it retains the former centralized
+                // frame serialization/checksum preparation inside the
+                // durability combiner. Every other mode prepares before the
+                // ordered residue, either from a lane-staged batch or through
+                // this safe raw fallback.
+                if prepared_batch.is_none()
+                    && !matches!(
+                        parallel_wal_control.mode,
+                        ParallelWalOperatingMode::Conservative
+                    )
+                {
                     let prepared = with_wal_backend_read(wal_backend, |wal| {
                         let mut prepared_batch = wal.prepare_append_frames(&frame_refs)?;
                         if let Some(prepared) = prepared_batch.as_mut() {
@@ -11546,9 +11557,15 @@ where
                         let flush_io_result = (|| -> Result<()> {
                             let mut completed_receipt = None;
                             with_wal_backend(wal_backend, |wal| {
-                                frames_written_start = u64::try_from(wal.frame_count())
-                                    .unwrap_or(u64::MAX)
-                                    .saturating_add(1);
+                                // A connection-local WAL backend can lag a
+                                // commit published through a peer backend.
+                                // Refresh it while the cross-process append
+                                // gate is held before deriving the certified
+                                // frame interval. Conflict detection also
+                                // refreshes, so compute the interval only
+                                // after every operation that can advance the
+                                // backend's view of the durable tail.
+                                let _ = wal.refresh_published_snapshot(cx)?;
                                 let t_append_conflict_check_start =
                                     detailed_metrics.then(Instant::now);
                                 let stale_conflict_pages =
@@ -11564,6 +11581,11 @@ where
                                             .join(","),
                                     });
                                 }
+                                let authorized_seed =
+                                    wal.latest_authorized_parallel_wal_commit_certificate(cx)?;
+                                frames_written_start = u64::try_from(wal.frame_count())
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_add(1);
                                 frames_written_end = frames_written_start
                                     .checked_add(
                                         u64::try_from(frame_count)
@@ -11576,8 +11598,6 @@ where
                                         .fetch_add(1, AtomicOrdering::Relaxed)
                                         .saturating_add(1);
                                 }
-                                let authorized_seed =
-                                    wal.latest_authorized_parallel_wal_commit_certificate(cx)?;
 
                                 let receipt = queue.record_persisted_epoch(
                                     PersistedGroupCommitInput {

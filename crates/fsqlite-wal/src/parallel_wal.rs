@@ -1257,11 +1257,15 @@ impl ParallelWalDurabilityCombiner {
         F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
         S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
     {
-        let ordered_start = Instant::now();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Measure the actual serialized durability/publication residue. Lock
+        // acquisition delay is queueing time, not time spent in the ordered
+        // region, and including it makes the critical-section metric depend
+        // on scheduler noise rather than the work this combiner owns.
+        let ordered_start = Instant::now();
         let (mut certificate, fallback_reason) = build_commit_certificate(&state, &request)?;
         certificate.certificate_crc32c = certificate.computed_crc32c();
 

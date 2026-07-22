@@ -31,9 +31,13 @@ const PERFORMANCE_CHILD_TEST_NAME: &str =
 const CHILD_MODE_ENV: &str = "FSQLITE_BD_3WOP3_1_3_MODE";
 const CHILD_RUN_DIR_ENV: &str = "FSQLITE_BD_3WOP3_1_3_RUN_DIR";
 const PERFORMANCE_THREADS_ENV: &str = "FSQLITE_BD_3WOP3_1_3_PERFORMANCE_THREADS";
+const PERFORMANCE_REPETITION_ENV: &str = "FSQLITE_BD_3WOP3_1_3_PERFORMANCE_REPETITION";
 const REPORT_ARTIFACT_ENV: &str = "FSQLITE_BD_3WOP3_1_3_ARTIFACT";
 const RUN_ROOT_ENV: &str = "FSQLITE_BD_3WOP3_1_3_RUN_ROOT";
 const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const DURABILITY_LOG_FILTER: &str = "warn,fsqlite::wal::durability_combiner=debug";
+const MAX_THROUGHPUT_REGRESSION_PERCENT: u64 = 5;
+const PERFORMANCE_REPETITIONS: usize = 4;
 
 static E2E_LOCK: Mutex<()> = Mutex::new(());
 
@@ -89,6 +93,7 @@ struct PerformanceRunSummary {
     evidence_owner: String,
     mode: String,
     thread_count: usize,
+    repetition: usize,
     transactions_per_thread: usize,
     committed_transactions: usize,
     retry_count: u64,
@@ -120,6 +125,20 @@ fn percentile(samples: &[u64], percentage: usize) -> u64 {
     sorted.sort_unstable();
     let rank = sorted.len().saturating_mul(percentage).div_ceil(100);
     sorted[rank.saturating_sub(1)]
+}
+
+fn median(samples: &[u64]) -> u64 {
+    assert!(!samples.is_empty(), "median requires at least one sample");
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        sorted[middle - 1]
+            .saturating_add(sorted[middle])
+            .div_ceil(2)
+    } else {
+        sorted[middle]
+    }
 }
 
 fn evidence_id(mode: &str) -> String {
@@ -195,7 +214,7 @@ fn query_single_text(conn: &fsqlite::Connection, sql: &str) -> String {
     let rows = conn
         .query(sql)
         .unwrap_or_else(|error| panic!("{sql}: {error}"));
-    match rows.first().and_then(|row| row.first()) {
+    match rows.first().and_then(|row| row.get(0)) {
         Some(SqliteValue::Text(value)) => value.to_string(),
         other => panic!("expected one TEXT value for {sql}, got {other:?}"),
     }
@@ -212,7 +231,7 @@ fn fetch_final_rows(conn: &fsqlite::Connection) -> Vec<FinalRow> {
     .expect("query final rows")
     .into_iter()
     .map(|row| {
-        let table_name = match row.first() {
+        let table_name = match row.get(0) {
             Some(SqliteValue::Text(value)) => value.to_string(),
             other => panic!("expected TEXT table_name, got {other:?}"),
         };
@@ -518,8 +537,9 @@ fn run_performance_workload(
     run_dir: &Path,
     mode: &str,
     thread_count: usize,
+    repetition: usize,
 ) -> PerformanceRunSummary {
-    const TRANSACTIONS_PER_THREAD: usize = 4;
+    const TRANSACTIONS_PER_THREAD: usize = 16;
 
     let _logging_guard = init_logging(run_dir, true).expect("initialize performance logging");
     let db_path = run_dir.join("parallel_wal_publication_performance.db");
@@ -568,7 +588,7 @@ fn run_performance_workload(
             let rows = verification
                 .query(&format!("SELECT COUNT(*) FROM lane_{lane_id}"))
                 .expect("count production matrix rows");
-            match rows.first().and_then(|row| row.first()) {
+            match rows.first().and_then(|row| row.get(0)) {
                 Some(SqliteValue::Integer(count)) => usize::try_from(*count).expect("row count"),
                 other => panic!("expected production matrix row count, got {other:?}"),
             }
@@ -620,7 +640,7 @@ fn run_performance_workload(
         committed_transactions_u64.saturating_mul(1_000_000_000) / wall_time_ns
     };
     let cell_evidence_id =
-        format!("D1-PFA-01:fsqlite_mvcc:baseline_unpinned:c{thread_count}:{mode}:42");
+        format!("D1-PFA-01:fsqlite_mvcc:baseline_unpinned:c{thread_count}:{mode}:r{repetition}:42");
 
     PerformanceRunSummary {
         claim_id: BEAD_ID.to_owned(),
@@ -628,6 +648,7 @@ fn run_performance_workload(
         evidence_owner: EVIDENCE_OWNER.to_owned(),
         mode: mode.to_owned(),
         thread_count,
+        repetition,
         transactions_per_thread: TRANSACTIONS_PER_THREAD,
         committed_transactions,
         retry_count,
@@ -643,12 +664,14 @@ fn run_performance_workload(
         ordered_region_ns_per_commit: ordered_region_total_ns / committed_transactions_u64.max(1),
         ordered_region_ns,
         replay_command: format!(
-            "FSQLITE_PARALLEL_WAL_MODE={mode} FSQLITE_BD_3WOP3_1_3_PERFORMANCE_THREADS={thread_count} {REPLAY_COMMAND}"
+            "FSQLITE_PARALLEL_WAL_MODE={mode} FSQLITE_BD_3WOP3_1_3_PERFORMANCE_THREADS={thread_count} FSQLITE_BD_3WOP3_1_3_PERFORMANCE_REPETITION={repetition} {REPLAY_COMMAND}"
         ),
         oracle: "row_count_and_integrity_check".to_owned(),
         allowed_difference_policy: ALLOWED_DIFFERENCE_POLICY.to_owned(),
         baseline_comparator: if mode == "auto" {
-            format!("D1-PFA-01:fsqlite_mvcc:baseline_unpinned:c{thread_count}:conservative:42")
+            format!(
+                "D1-PFA-01:fsqlite_mvcc:baseline_unpinned:c{thread_count}:conservative:r{repetition}:42"
+            )
         } else {
             "none".to_owned()
         },
@@ -688,7 +711,7 @@ fn spawn_mode_run(mode: &str) -> PublicationRunSummary {
         .arg("--ignored")
         .arg("--nocapture")
         .arg("--test-threads=1")
-        .env("RUST_LOG", "trace")
+        .env("RUST_LOG", DURABILITY_LOG_FILTER)
         .env(CHILD_MODE_ENV, mode)
         .env(CHILD_RUN_DIR_ENV, &run_dir)
         .env("FSQLITE_PARALLEL_WAL_MODE", mode)
@@ -703,25 +726,31 @@ fn spawn_mode_run(mode: &str) -> PublicationRunSummary {
         .expect("parse child summary")
 }
 
-fn spawn_performance_run(mode: &str, thread_count: usize) -> PerformanceRunSummary {
-    let (run_dir, _temp_guard) = run_root_for(&format!("performance-{mode}-{thread_count}t"));
+fn spawn_performance_run(
+    mode: &str,
+    thread_count: usize,
+    repetition: usize,
+) -> PerformanceRunSummary {
+    let (run_dir, _temp_guard) =
+        run_root_for(&format!("performance-{mode}-{thread_count}t-r{repetition}"));
     let status = Command::new(env::current_exe().expect("current test executable"))
         .arg("--exact")
         .arg(PERFORMANCE_CHILD_TEST_NAME)
         .arg("--ignored")
         .arg("--nocapture")
         .arg("--test-threads=1")
-        .env("RUST_LOG", "trace")
+        .env("RUST_LOG", DURABILITY_LOG_FILTER)
         .env(CHILD_MODE_ENV, mode)
         .env(CHILD_RUN_DIR_ENV, &run_dir)
         .env(PERFORMANCE_THREADS_ENV, thread_count.to_string())
+        .env(PERFORMANCE_REPETITION_ENV, repetition.to_string())
         .env("FSQLITE_PARALLEL_WAL_MODE", mode)
         .env("FSQLITE_PARALLEL_WAL_LANES", thread_count.to_string())
         .status()
         .expect("spawn production performance matrix run");
     assert!(
         status.success(),
-        "bead_id={BEAD_ID} case={mode}_{thread_count}t_performance_child_failed status={status}"
+        "bead_id={BEAD_ID} case={mode}_{thread_count}t_r{repetition}_performance_child_failed status={status}"
     );
     serde_json::from_slice(
         &fs::read(run_dir.join("performance-summary.json"))
@@ -904,12 +933,21 @@ fn bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent() {
             .any(|verdict| verdict == "clean")
     );
 
-    let performance_matrix = [
-        spawn_performance_run("conservative", 8),
-        spawn_performance_run("auto", 8),
-        spawn_performance_run("conservative", 16),
-        spawn_performance_run("auto", 16),
-    ];
+    let mut performance_matrix = Vec::with_capacity(PERFORMANCE_REPETITIONS * 4);
+    for thread_count in [8_usize, 16_usize] {
+        for repetition in 0..PERFORMANCE_REPETITIONS {
+            // Alternate pair order so warmup, scheduler, and host drift do not
+            // systematically favor either operating mode.
+            let mode_order = if repetition % 2 == 0 {
+                ["conservative", "auto"]
+            } else {
+                ["auto", "conservative"]
+            };
+            for mode in mode_order {
+                performance_matrix.push(spawn_performance_run(mode, thread_count, repetition));
+            }
+        }
+    }
     for cell in &performance_matrix {
         assert_eq!(cell.row_count, cell.committed_transactions);
         assert_eq!(cell.integrity_check, "ok");
@@ -917,34 +955,94 @@ fn bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent() {
         assert!(cell.ordered_region_total_ns > 0);
         assert!(cell.throughput_transactions_per_second > 0);
     }
+    println!(
+        "FSQLITE_D1_PERFORMANCE_CELLS_JSON={}",
+        serde_json::to_string(&performance_matrix).expect("serialize performance cells")
+    );
     let performance_comparisons = [8_usize, 16_usize].map(|thread_count| {
-        let conservative = performance_matrix
+        let conservative_cells = performance_matrix
             .iter()
-            .find(|cell| cell.thread_count == thread_count && cell.mode == "conservative")
-            .expect("conservative performance cell");
-        let auto = performance_matrix
+            .filter(|cell| cell.thread_count == thread_count && cell.mode == "conservative")
+            .collect::<Vec<_>>();
+        let auto_cells = performance_matrix
             .iter()
-            .find(|cell| cell.thread_count == thread_count && cell.mode == "auto")
-            .expect("auto performance cell");
+            .filter(|cell| cell.thread_count == thread_count && cell.mode == "auto")
+            .collect::<Vec<_>>();
+        assert_eq!(conservative_cells.len(), PERFORMANCE_REPETITIONS);
+        assert_eq!(auto_cells.len(), PERFORMANCE_REPETITIONS);
+        let conservative_ordered_ns_per_commit = conservative_cells
+            .iter()
+            .map(|cell| cell.ordered_region_ns_per_commit)
+            .collect::<Vec<_>>();
+        let auto_ordered_ns_per_commit = auto_cells
+            .iter()
+            .map(|cell| cell.ordered_region_ns_per_commit)
+            .collect::<Vec<_>>();
+        let conservative_throughput = conservative_cells
+            .iter()
+            .map(|cell| cell.throughput_transactions_per_second)
+            .collect::<Vec<_>>();
+        let auto_throughput = auto_cells
+            .iter()
+            .map(|cell| cell.throughput_transactions_per_second)
+            .collect::<Vec<_>>();
+        let conservative_ordered_median = median(&conservative_ordered_ns_per_commit);
+        let auto_ordered_median = median(&auto_ordered_ns_per_commit);
+        let conservative_throughput_median = median(&conservative_throughput);
+        let auto_throughput_median = median(&auto_throughput);
+        assert!(
+            auto_ordered_median < conservative_ordered_median,
+            "bead_id={BEAD_ID} case=centralized_publication_cost_shrank threads={thread_count} before_ns_per_commit={} after_ns_per_commit={}",
+            conservative_ordered_median,
+            auto_ordered_median
+        );
+        let minimum_accepted_throughput = conservative_throughput_median
+            .saturating_mul(100 - MAX_THROUGHPUT_REGRESSION_PERCENT)
+            .div_ceil(100);
+        assert!(
+            auto_throughput_median >= minimum_accepted_throughput,
+            "bead_id={BEAD_ID} case=centralized_work_not_relocated threads={thread_count} before_tps={} after_tps={} minimum_after_tps={} tolerance_percent={MAX_THROUGHPUT_REGRESSION_PERCENT}",
+            conservative_throughput_median,
+            auto_throughput_median,
+            minimum_accepted_throughput
+        );
+        assert!(
+            conservative_cells.iter().chain(&auto_cells).all(|cell| {
+                cell.row_count == cell.committed_transactions && cell.integrity_check == "ok"
+            }),
+            "bead_id={BEAD_ID} case=performance_matrix_semantics_preserved threads={thread_count}"
+        );
         serde_json::json!({
             "thread_count": thread_count,
-            "before_evidence_id": &conservative.evidence_id,
-            "after_evidence_id": &auto.evidence_id,
-            "before_ordered_region_ns_per_commit": conservative.ordered_region_ns_per_commit,
-            "after_ordered_region_ns_per_commit": auto.ordered_region_ns_per_commit,
-            "ordered_region_reduction_ns_per_commit": conservative
-                .ordered_region_ns_per_commit
-                .saturating_sub(auto.ordered_region_ns_per_commit),
-            "ordered_region_shrank": auto.ordered_region_ns_per_commit
-                < conservative.ordered_region_ns_per_commit,
-            "before_throughput_transactions_per_second": conservative
-                .throughput_transactions_per_second,
-            "after_throughput_transactions_per_second": auto
-                .throughput_transactions_per_second,
-            "throughput_non_regression": auto.throughput_transactions_per_second
-                >= conservative.throughput_transactions_per_second,
-            "semantics_preserved": auto.row_count == conservative.row_count
-                && auto.integrity_check == conservative.integrity_check,
+            "repetitions": PERFORMANCE_REPETITIONS,
+            "pair_order": "alternating",
+            "aggregation": "median",
+            "before_evidence_ids": conservative_cells
+                .iter()
+                .map(|cell| &cell.evidence_id)
+                .collect::<Vec<_>>(),
+            "after_evidence_ids": auto_cells
+                .iter()
+                .map(|cell| &cell.evidence_id)
+                .collect::<Vec<_>>(),
+            "before_ordered_region_ns_per_commit_samples": conservative_ordered_ns_per_commit,
+            "after_ordered_region_ns_per_commit_samples": auto_ordered_ns_per_commit,
+            "before_ordered_region_ns_per_commit_median": conservative_ordered_median,
+            "after_ordered_region_ns_per_commit_median": auto_ordered_median,
+            "ordered_region_reduction_ns_per_commit": conservative_ordered_median
+                .saturating_sub(auto_ordered_median),
+            "ordered_region_shrank": auto_ordered_median < conservative_ordered_median,
+            "before_throughput_transactions_per_second_samples": conservative_throughput,
+            "after_throughput_transactions_per_second_samples": auto_throughput,
+            "before_throughput_transactions_per_second_median": conservative_throughput_median,
+            "after_throughput_transactions_per_second_median": auto_throughput_median,
+            "maximum_accepted_throughput_regression_percent":
+                MAX_THROUGHPUT_REGRESSION_PERCENT,
+            "minimum_accepted_throughput_transactions_per_second":
+                minimum_accepted_throughput,
+            "throughput_within_regression_budget": auto_throughput_median
+                >= minimum_accepted_throughput,
+            "semantics_preserved": true,
         })
     });
 
@@ -972,7 +1070,7 @@ fn bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent() {
             "fallback_reason": "operator_forced",
         },
         "centralized_publication_cost_matrix": {
-            "methodology": "production file-backed FrankenSQLite disjoint-table concurrent commits; conservative is the before comparator and auto is the lane-staged after path; ordered-region cost comes only from production durability-combiner receipts",
+            "methodology": "production file-backed FrankenSQLite disjoint-table concurrent commits; conservative retains raw frame preparation inside the durability combiner and auto performs lane/fallback preparation before the tiny ordered residue; each 8-thread and 16-thread comparison uses four alternating-order pairs and the median, ordered-region cost comes only from lock-held production durability-combiner receipts, and a declared 5 percent median wall-throughput non-regression budget guards against opaque relocation",
             "cells": &performance_matrix,
             "comparisons": performance_comparisons,
         },
@@ -1030,8 +1128,13 @@ fn bd_3wop3_1_3_parallel_wal_publication_performance_child_entrypoint() {
         .expect("performance thread-count env must be present")
         .parse::<usize>()
         .expect("performance thread count must be usize");
+    let repetition = env::var(PERFORMANCE_REPETITION_ENV)
+        .expect("performance repetition env must be present")
+        .parse::<usize>()
+        .expect("performance repetition must be usize");
     assert!(matches!(thread_count, 8 | 16));
-    let summary = run_performance_workload(&run_dir, &mode, thread_count);
+    assert!(repetition < PERFORMANCE_REPETITIONS);
+    let summary = run_performance_workload(&run_dir, &mode, thread_count, repetition);
     fs::write(
         run_dir.join("performance-summary.json"),
         serde_json::to_vec_pretty(&summary).expect("serialize performance child summary"),

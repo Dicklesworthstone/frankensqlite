@@ -139,36 +139,36 @@ emit_event "bootstrap" "running" "verification started"
 run_compile_step \
     "wal_unit" \
     "deterministic certificates, durable-before-visible ordering, safe fallbacks, and concurrency" \
-    cargo test -p fsqlite-wal parallel_wal::tests --lib -- --nocapture
+    cargo test -j 4 -p fsqlite-wal parallel_wal::tests --lib -- --nocapture
 
 run_compile_step \
     "pager_unit" \
     "certificate-backed pager publication authorization and atomic full-group page-plane handoff" \
-    cargo test -p fsqlite-pager parallel_wal_ --lib -- --nocapture
+    cargo test -j 4 -p fsqlite-pager parallel_wal_ --lib -- --nocapture
 
 run_compile_step \
     "certificate_storage" \
     "durable sidecar reconstruction and commit-marker authorization boundary" \
-    cargo test -p fsqlite-core durable_certificate_sidecar_precedes_and_reconstructs_wal_commit --lib -- --nocapture
+    cargo test -j 4 -p fsqlite-core durable_certificate_sidecar_precedes_and_reconstructs_wal_commit --lib -- --nocapture
 
 run_compile_step \
     "cross_process_continuity" \
     "bounded authorized-tail lookup and two-instance certificate clock continuity" \
-    cargo test -p fsqlite-core two_backend_instances_continue_authorized_certificate_clocks --lib -- --nocapture
+    cargo test -j 4 -p fsqlite-core two_backend_instances_continue_authorized_certificate_clocks --lib -- --nocapture
 
 run_compile_step \
     "checkpoint_compatibility" \
     "existing WAL checkpoint compatibility invariant" \
-    cargo test -p fsqlite-core test_pragma_wal_checkpoint_after_writes --lib -- --nocapture
+    cargo test -j 4 -p fsqlite-core test_pragma_wal_checkpoint_after_writes --lib -- --nocapture
 
 run_compile_step \
     "e2e" \
     "auto, conservative, and shadow-compare row/integrity/publication matrix" \
     env \
-    RUST_LOG=trace \
+    RUST_LOG=warn,fsqlite::wal::durability_combiner=debug \
     FSQLITE_BD_3WOP3_1_3_RUN_ROOT="${RUN_ROOT}" \
     FSQLITE_BD_3WOP3_1_3_ARTIFACT="${REPORT_JSON}" \
-    cargo test -p fsqlite-e2e --test bd_3wop3_1_3_parallel_wal_publication -- --nocapture --test-threads=1
+    cargo test -j 4 -p fsqlite-e2e --test bd_3wop3_1_3_parallel_wal_publication -- --nocapture --test-threads=1
 
 # Strict RCH executes the test on the worker, so its direct artifact path is
 # worker-local. The test also emits the same compact JSON on stdout; materialize
