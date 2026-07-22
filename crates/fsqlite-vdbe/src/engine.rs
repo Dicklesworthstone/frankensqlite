@@ -7079,6 +7079,42 @@ impl VdbeEngine {
         key_values
     }
 
+    fn delete_index_entry_for_rowid(&mut self, cursor_id: i32, rowid: i64) -> Result<()> {
+        let Some(sc) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(());
+        };
+        if !sc.writable || !sc.cursor.first(&sc.cx)? {
+            return Ok(());
+        }
+
+        loop {
+            let key = sc.cursor.payload(&sc.cx)?;
+            let values = parse_record(&key).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "REPLACE cleanup encountered a malformed secondary-index record".to_owned(),
+            })?;
+            let entry_rowid = values
+                .last()
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail:
+                        "REPLACE cleanup encountered a secondary-index record without a rowid suffix"
+                            .to_owned(),
+                })?;
+            if entry_rowid == rowid {
+                sc.cursor.delete(&sc.cx)?;
+                invalidate_storage_cursor_row_cache_with_reason(
+                    sc,
+                    self.collect_vdbe_metrics,
+                    DecodeCacheInvalidationReason::WriteMutation,
+                );
+                return Ok(());
+            }
+            if !sc.cursor.next(&sc.cx)? {
+                return Ok(());
+            }
+        }
+    }
+
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
     /// Deletes the conflicting row from the table AND from all associated indexes.
     fn native_replace_row(&mut self, tbl_cursor_id: i32, conflict_rowid: i64) -> Result<()> {
@@ -7112,6 +7148,14 @@ impl VdbeEngine {
         let table_index_meta = Arc::clone(&self.table_index_meta);
         if let Some(index_metas) = table_index_meta.get(&tbl_cursor_id) {
             for meta in index_metas.iter() {
+                if meta.column_indices.is_empty() {
+                    // Partial and expression index keys cannot be rebuilt
+                    // from plain column offsets alone. Every rowid-table
+                    // secondary key ends with the table rowid, so scan for
+                    // that exact victim suffix instead of leaving an orphan.
+                    self.delete_index_entry_for_rowid(meta.cursor_id, conflict_rowid)?;
+                    continue;
+                }
                 let key_values = self.index_key_values_from_table_payload(
                     table_root_page,
                     &old_row,
@@ -7250,6 +7294,14 @@ impl VdbeEngine {
                         )
                     })?;
                     for meta in index_metas.iter() {
+                        // Empty column metadata denotes an expression or
+                        // partial index. These indexes were not restorable by
+                        // this path before they were registered for REPLACE
+                        // cleanup, so do not synthesize an invalid `(rowid)`
+                        // key here.
+                        if meta.column_indices.is_empty() {
+                            continue;
+                        }
                         let key_values = self.index_key_values_from_table_payload(
                             table_root_page,
                             &old_row,
@@ -27738,6 +27790,86 @@ mod tests {
                 .unwrap()
                 .is_found(),
             "non-conflicting index entries must remain intact"
+        );
+    }
+
+    #[test]
+    fn test_native_replace_row_scans_expression_index_for_victim_rowid() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(2);
+        let index_root = 256;
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(txn);
+        engine.table_index_meta = Arc::new(HashMap::from([(
+            0,
+            vec![IndexCursorMeta {
+                cursor_id: 1,
+                column_indices: Vec::new(),
+            }]
+            .into_boxed_slice(),
+        )]));
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+        engine.cursor_root_pages.insert(0, table_root);
+        engine.cursor_root_pages.insert(1, index_root);
+
+        let victim_row =
+            encode_record(&[SqliteValue::Text("VICTIM".into()), SqliteValue::Integer(1)]);
+        let keep_row = encode_record(&[SqliteValue::Text("KEEP".into()), SqliteValue::Integer(2)]);
+        let victim_index =
+            encode_record(&[SqliteValue::Text("victim".into()), SqliteValue::Integer(1)]);
+        let keep_index =
+            encode_record(&[SqliteValue::Text("keep".into()), SqliteValue::Integer(2)]);
+
+        {
+            let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 1, &victim_row)
+                .unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &keep_row)
+                .unwrap();
+        }
+        {
+            let index_cursor = engine.storage_cursors.get_mut(&1).unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &victim_index)
+                .unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &keep_index)
+                .unwrap();
+        }
+
+        engine.native_replace_row(0, 1).unwrap();
+
+        let index_cursor = engine.storage_cursors.get_mut(&1).unwrap();
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &victim_index)
+                .unwrap()
+                .is_found(),
+            "expression-index cleanup must remove the victim's rowid-suffixed key"
+        );
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &keep_index)
+                .unwrap()
+                .is_found(),
+            "rowid-suffix scanning must preserve other expression-index entries"
         );
     }
 

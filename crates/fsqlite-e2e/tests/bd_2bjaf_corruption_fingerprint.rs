@@ -3,9 +3,12 @@
 //! Validates parsing of PRAGMA integrity_check output into structured
 //! failures and normalization into stable signatures for grouping.
 
+use std::fs::OpenOptions;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
 use fsqlite_e2e::corruption_fingerprint::{
-    FailureKind, NormalizedSignature, RefCountClass, TreeIdClass, fingerprint,
-    fingerprint_collection, inventory_report, normalize, parse_failure,
+    FailureKind, NormalizedSignature, RefCountClass, TreeIdClass, classify_sqlite_artifact,
+    fingerprint, fingerprint_collection, inventory_report, normalize, parse_failure,
     parse_integrity_check_output,
 };
 
@@ -404,4 +407,172 @@ fn t40_full_inventory_report_on_forensic_snapshot() {
     assert!(report.contains("Total failures: 100"));
     assert!(report.contains("Distinct signatures:"));
     assert!(report.contains("page_double_ref"));
+}
+
+#[test]
+fn t41_read_only_artifact_classifier_maps_index_freelist_and_sidecars() {
+    let directory = tempfile::tempdir().expect("artifact tempdir");
+    let database = directory.path().join("classifier.db");
+    let connection = rusqlite::Connection::open(&database).expect("create artifact");
+    connection
+        .execute_batch(
+            "PRAGMA page_size=512;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY,
+                 source_id TEXT NOT NULL,
+                 agent_id INTEGER NOT NULL,
+                 external_id TEXT NOT NULL,
+                 UNIQUE(source_id,agent_id,external_id)
+             );
+             INSERT INTO conversations(source_id,agent_id,external_id) VALUES
+                 ('source-a',1,'external-a'),
+                 ('source-b',2,'external-b'),
+                 ('source-c',3,'external-c'),
+                 ('source-d',4,'external-d');
+             CREATE TABLE recyclable(id INTEGER PRIMARY KEY, payload BLOB);
+             INSERT INTO recyclable(payload) VALUES(zeroblob(1800));
+             DELETE FROM recyclable;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("build artifact with ownership and freelist state");
+
+    let report = classify_sqlite_artifact(&database, Some("sqlite_autoindex_conversations_1"))
+        .expect("classify healthy artifact");
+    assert!(report.input_files_unchanged);
+    assert_eq!(report.page_size, 512);
+    assert_eq!(report.header_page_count, report.pragma_page_count);
+    assert_eq!(report.header_freelist_count, report.pragma_freelist_count);
+    assert_eq!(
+        report.freelist_pages.len(),
+        report.header_freelist_count as usize
+    );
+    assert!(report.orphan_pages.is_empty());
+    assert!(report.multiply_owned_pages.is_empty());
+    assert_eq!(report.integrity_check_lines, ["ok"]);
+    assert!(report.integrity_check_error.is_none());
+
+    let ownership = report
+        .ownership
+        .iter()
+        .find(|owner| owner.name == "sqlite_autoindex_conversations_1")
+        .expect("target autoindex ownership");
+    assert!(ownership.root_page > 1);
+    assert!(ownership.height >= 1);
+    assert!(ownership.pages.contains(&ownership.root_page));
+
+    let comparison = report.target_index.as_ref().expect("target comparison");
+    assert!(comparison.comparable, "{:?}", comparison.reason);
+    assert_eq!(comparison.table_entry_count, 4);
+    assert_eq!(comparison.index_entry_count, 4);
+    assert!(comparison.missing_from_index.is_empty());
+    assert!(comparison.extra_in_index.is_empty());
+    assert!(
+        comparison
+            .query_plan
+            .as_deref()
+            .is_some_and(|plan| plan.contains("sqlite_autoindex_conversations_1"))
+    );
+
+    let wal = report
+        .sidecars
+        .iter()
+        .find(|sidecar| sidecar.kind == "wal")
+        .expect("WAL sidecar report");
+    assert!(
+        wal.snapshot.exists,
+        "open WAL connection must retain its sidecar"
+    );
+    let wal_metadata = wal.wal.as_ref().expect("parse WAL header");
+    assert_eq!(wal_metadata.page_size, 512);
+    assert_eq!(wal_metadata.frame_count, 0);
+    assert_eq!(wal_metadata.trailing_bytes, 0);
+}
+
+#[test]
+fn t42_artifact_classifier_finds_recognizable_orphan_index_page() {
+    let directory = tempfile::tempdir().expect("artifact tempdir");
+    let database = directory.path().join("orphan.db");
+    let index_root = {
+        let connection = rusqlite::Connection::open(&database).expect("create artifact");
+        connection
+            .execute_batch(
+                "PRAGMA page_size=512;
+                 CREATE TABLE conversations (
+                     id INTEGER PRIMARY KEY,
+                     source_id TEXT NOT NULL,
+                     agent_id INTEGER NOT NULL,
+                     external_id TEXT NOT NULL,
+                     UNIQUE(source_id,agent_id,external_id)
+                 );
+                 INSERT INTO conversations(source_id,agent_id,external_id) VALUES
+                     ('source-a',1,'external-a'),
+                     ('source-b',2,'external-b'),
+                     ('source-c',3,'external-c'),
+                     ('source-d',4,'external-d');",
+            )
+            .expect("build target index");
+        connection
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema \
+                 WHERE name='sqlite_autoindex_conversations_1'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("target root page")
+    };
+
+    let clean = classify_sqlite_artifact(&database, Some("sqlite_autoindex_conversations_1"))
+        .expect("classify clean source");
+    assert!(clean.orphan_pages.is_empty());
+
+    let orphan_page = clean.page_count + 1;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&database)
+        .expect("open disposable artifact for corruption fixture construction");
+    let mut copied_index_page = vec![0_u8; clean.page_size as usize];
+    file.seek(SeekFrom::Start(
+        u64::from(index_root - 1) * u64::from(clean.page_size),
+    ))
+    .expect("seek target index root");
+    file.read_exact(&mut copied_index_page)
+        .expect("read target index root");
+    file.seek(SeekFrom::End(0)).expect("seek artifact end");
+    file.write_all(&copied_index_page)
+        .expect("append orphan clone");
+    file.seek(SeekFrom::Start(28))
+        .expect("seek header page count");
+    file.write_all(&orphan_page.to_be_bytes())
+        .expect("publish orphan page in header count");
+    file.sync_all().expect("sync corruption fixture");
+    drop(file);
+
+    let report = classify_sqlite_artifact(&database, Some("sqlite_autoindex_conversations_1"))
+        .expect("classify orphan artifact");
+    assert!(report.input_files_unchanged);
+    assert_eq!(report.orphan_pages, [orphan_page]);
+    assert!(
+        report
+            .integrity_check_lines
+            .iter()
+            .any(|line| line.contains(&format!("Page {orphan_page}: never used")))
+    );
+    let probe = report.orphan_probes.first().expect("orphan probe");
+    assert_eq!(probe.page, orphan_page);
+    assert!(
+        probe
+            .btree_page_type
+            .as_deref()
+            .is_some_and(|page_type| page_type.contains("index"))
+    );
+    assert!(
+        !probe.matching_target_key_fragments.is_empty(),
+        "copied index page should retain recognizable target-key fragments"
+    );
+    let comparison = report.target_index.as_ref().expect("target comparison");
+    assert!(comparison.comparable);
+    assert!(comparison.missing_from_index.is_empty());
+    assert!(comparison.extra_in_index.is_empty());
 }

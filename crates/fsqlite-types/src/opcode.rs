@@ -1087,6 +1087,8 @@ pub struct IndexCursorMeta {
     pub cursor_id: i32,
     /// Column indices (0-based positions in the table schema) that make up
     /// the index key. The index key is `(col[0], col[1], ..., rowid)`.
+    /// Empty denotes a partial or expression index whose persisted entry must
+    /// be located by its trailing rowid during REPLACE victim cleanup.
     pub column_indices: Vec<usize>,
 }
 
