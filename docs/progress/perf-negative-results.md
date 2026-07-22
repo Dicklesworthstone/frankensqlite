@@ -19563,3 +19563,30 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   entries from the live index; asupersync 0.3.9 cannot compile under a bare `-p fsqlite` resolver-v2
   feature subgraph (atp module needs optional deps only workspace-level unification activates) —
   full-stack builds must be workspace-scoped (`--workspace --test ...`) or fleet-run.
+
+## 2026-07-22 - Adaptive micro-sampling for the 100-row DELETE comparator tail
+
+- Target: the refreshed worst raw ratio in
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`,
+  `UPDATE/DELETE Throughput / 100 rows / delete 5 rows` at `3.3188x`. The
+  refresh itself had high C/F CV (`14.03%/35.91%`), so this candidate changed
+  only `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`: extend sampling for
+  sub-20-us rows until a tighter elapsed-time floor, without changing either
+  engine or the measured SQL envelope. Source was manually restored after the
+  measurement rejected the lever.
+- Interleaved same-worker target evidence (`A1/B1/A2/B2`, where A is the
+  existing sampler and B is the adaptive candidate): A1 C/F
+  `2.174/6.743 us`, ratio `3.1017`, CV `5.83%/3.79%`; B1
+  `1.703/5.741 us`, ratio `3.3711`, CV `0.65%/1.14%`; A2
+  `2.275/7.624 us`, ratio `3.3512`, CV `4.28%/26.17%`; B2
+  `1.683/6.732 us`, ratio `4.0000`, CV `0.24%/9.97%`.
+- Result: rejected. The null-control alternation disproved a coherent engine
+  win, and the candidate still failed the mandatory under-5% FSQLite CV gate
+  in B2. More sampling stabilized the C comparator but did not stabilize the
+  full prepared-DELETE transaction envelope, so it cannot support a KEEP or a
+  new performance claim.
+- Do not retry adaptive micro-sampling as a performance lever for this row.
+  Reconsider benchmark-only sampling changes only if an external scheduler or
+  timer study identifies a concrete noise source and an interleaved same-worker
+  null control brings both engines below 5% CV without changing their SQL,
+  transaction, fixture, or teardown envelopes.
