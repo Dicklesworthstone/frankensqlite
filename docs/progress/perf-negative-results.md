@@ -19590,3 +19590,38 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   timer study identifies a concrete noise source and an interleaved same-worker
   null control brings both engines below 5% CV without changing their SQL,
   transaction, fixture, or teardown envelopes.
+
+## 2026-07-22 - Untracked `zz_*` probe triage: no durable test candidates as-is
+
+- Target: all 30 untracked `crates/fsqlite/tests/zz_*` probe files left in the
+  shared checkout after the rowid/index seek campaign.
+- Result: none should land as-is. Every file declares `EPHEMERAL ... Not for
+  commit`; the 29 benches are ignored single-shot `Instant` probes with no
+  interleaved null control, no repeated-sample CV, and generally no C-SQLite
+  oracle. `zz_seekgap_probe.rs` only dumps opcode lists and overlaps the owned
+  DISTINCT skip-scan lane. The useful rowid/index opcode shapes are already
+  covered by landed commits `91e42854`, `b41d02d5`, `66a62e57`, `dcd6f3c`,
+  `73ff169c`, `9c692992`, `a9a95427`, `1023043f`, `d32a263a`, `81a66d3f`, and
+  `8ba32e76` plus their durable tests.
+- Operator list; preserved untouched and not deleted:
+  `zz_aggincomposite_bench.rs`, `zz_aggrowideqcoerced_bench.rs`,
+  `zz_aggrowideqresidual_bench.rs`, `zz_aggrowidin_bench.rs`,
+  `zz_aggrowidinresidual_bench.rs`, `zz_countrowideq_bench.rs`,
+  `zz_countrowideqcoerced_bench.rs`, `zz_countrowidin_bench.rs`,
+  `zz_countrowidresidual_bench.rs`, `zz_deleterowidin_bench.rs`,
+  `zz_dmlindexeq_bench.rs`, `zz_dmlindexeqnum_bench.rs`,
+  `zz_dmlindexeqparam_bench.rs`, `zz_dmlindexeqresidual_bench.rs`,
+  `zz_dmlindexeqtext_bench.rs`, `zz_dmlrowideqresidual_bench.rs`,
+  `zz_dmlrowidinresidual_bench.rs`, `zz_dmlrowidrange_bench.rs`,
+  `zz_indexeqorderrowid_bench.rs`, `zz_indexeqorderrowiddesc_bench.rs`,
+  `zz_rowideqresidual_bench.rs`, `zz_rowidinorder_bench.rs`,
+  `zz_rowidinresidual_bench.rs`, `zz_rowidorderscan_bench.rs`,
+  `zz_rowidorderscandesc_bench.rs`, `zz_rowidorderscandescfilt_bench.rs`,
+  `zz_rowidorderscanfilt_bench.rs`, `zz_rowidrangeresidual_bench.rs`,
+  `zz_seekgap_probe.rs`, and `zz_updaterowidin_bench.rs`.
+- Retry condition: promote an individual probe only after it demonstrates a
+  still-uncovered semantic shape, is renamed out of the `zz_` namespace, gains
+  a C-SQLite differential oracle plus durable opcode/behavior assertions, and
+  any numeric claim uses interleaved same-worker sampling with a null control
+  and CV below 5%. The operator decides archival/removal; this agent deleted
+  nothing.
