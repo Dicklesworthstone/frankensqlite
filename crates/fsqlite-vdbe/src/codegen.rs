@@ -338,6 +338,9 @@ pub struct SelectPlannerDirective {
 pub struct FkDef {
     /// Column indices in the child table that form the FK.
     pub child_columns: Vec<usize>,
+    /// Owning column for a column-level `REFERENCES` clause; `None` for a
+    /// table-level `FOREIGN KEY` constraint.
+    pub owner_column: Option<String>,
     /// Referenced (parent) table name.
     pub parent_table: String,
     /// Referenced column names in the parent table.

@@ -1186,6 +1186,30 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn append_fk_reference_clause(sql: &mut String, fk: &FkDef) {
+    use std::fmt::Write as _;
+
+    let _ = write!(sql, " REFERENCES {}", quote_identifier(&fk.parent_table));
+    if !fk.parent_columns.is_empty() {
+        let parent_columns = fk
+            .parent_columns
+            .iter()
+            .map(|column_name| quote_identifier(column_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(sql, "({parent_columns})");
+    }
+    if fk.on_delete != FkActionType::NoAction {
+        let _ = write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete));
+    }
+    if fk.on_update != FkActionType::NoAction {
+        let _ = write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update));
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    }
+}
+
 /// Reconstruct a `CREATE TABLE` statement from a `TableSchema`.
 pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
     build_create_table_sql_with_implicit_index_predicate(table, |index| {
@@ -1260,6 +1284,13 @@ where
         }) {
             let _ = write!(sql, " CHECK({})", check.expr);
         }
+        for fk in table.foreign_keys.iter().filter(|fk| {
+            fk.owner_column
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+        }) {
+            append_fk_reference_clause(&mut sql, fk);
+        }
     }
     // Emit PRIMARY KEY constraints BEFORE UNIQUE constraints.  Stock SQLite
     // assigns autoindex ordinals (sqlite_autoindex_T_N) in the order they
@@ -1313,7 +1344,11 @@ where
             .join(", ");
         let _ = write!(sql, ", UNIQUE ({cols})");
     }
-    for fk in &table.foreign_keys {
+    for fk in table
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.owner_column.is_none())
+    {
         let child_columns = fk
             .child_columns
             .iter()
@@ -1323,27 +1358,8 @@ where
         if child_columns.is_empty() {
             continue;
         }
-        let _ = write!(
-            sql,
-            ", FOREIGN KEY({}) REFERENCES {}",
-            child_columns.join(", "),
-            quote_identifier(&fk.parent_table)
-        );
-        if !fk.parent_columns.is_empty() {
-            let parent_columns = fk
-                .parent_columns
-                .iter()
-                .map(|column_name| quote_identifier(column_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(sql, "({parent_columns})");
-        }
-        if fk.on_delete != FkActionType::NoAction {
-            let _ = write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete));
-        }
-        if fk.on_update != FkActionType::NoAction {
-            let _ = write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update));
-        }
+        let _ = write!(sql, ", FOREIGN KEY({})", child_columns.join(", "));
+        append_fk_reference_clause(&mut sql, fk);
     }
     for check in table
         .check_constraints
@@ -1544,9 +1560,9 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
     indexes
 }
 
-fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
+pub(crate) fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
     let Some(Statement::CreateTable(create)) = parse_single_statement(sql) else {
-        return Vec::new();
+        return extract_foreign_keys_sql_fallback(sql, columns);
     };
     let CreateTableBody::Columns {
         columns: column_defs,
@@ -1560,7 +1576,11 @@ fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef
     for (column_index, column) in column_defs.iter().enumerate() {
         for constraint in &column.constraints {
             if let ColumnConstraintKind::ForeignKey(clause) = &constraint.kind {
-                foreign_keys.push(fk_clause_to_def(&[column_index], clause));
+                foreign_keys.push(fk_clause_to_def(
+                    &[column_index],
+                    Some(column.name.clone()),
+                    clause,
+                ));
             }
         }
     }
@@ -1579,7 +1599,7 @@ fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef
                 })
                 .collect::<Vec<_>>();
             if !child_indices.is_empty() {
-                foreign_keys.push(fk_clause_to_def(&child_indices, clause));
+                foreign_keys.push(fk_clause_to_def(&child_indices, None, clause));
             }
         }
     }
@@ -1587,7 +1607,197 @@ fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef
     foreign_keys
 }
 
-fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
+fn extract_foreign_keys_sql_fallback(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
+    let Some(open) = find_unquoted_sql_char(sql, '(') else {
+        return Vec::new();
+    };
+    let Some(close) = find_matching_sql_paren(sql, open) else {
+        return Vec::new();
+    };
+    let mut foreign_keys = Vec::new();
+
+    for definition in split_top_level_csv_items(&sql[open + 1..close]) {
+        if starts_with_unquoted_table_constraint(&definition) {
+            let Some(foreign_pos) = find_top_level_unquoted_sql_keyword(&definition, "FOREIGN")
+            else {
+                continue;
+            };
+            let after_foreign = &definition[foreign_pos + "FOREIGN".len()..];
+            let Some(key_pos) = find_top_level_unquoted_sql_keyword(after_foreign, "KEY") else {
+                continue;
+            };
+            let after_key = &after_foreign[key_pos + "KEY".len()..];
+            let child_list = trim_leading_sql_space_and_comments(after_key);
+            if !child_list.starts_with('(') {
+                continue;
+            }
+            let open_paren = definition.len() - child_list.len();
+            let Some(close_paren) = find_matching_sql_paren(&definition, open_paren) else {
+                continue;
+            };
+            let Some(child_names) =
+                parse_sql_identifier_list(&definition[open_paren + 1..close_paren])
+            else {
+                continue;
+            };
+            let Some(child_indices) = child_names
+                .iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(name))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if let Some(fk) =
+                parse_fk_reference_sql(&definition[close_paren + 1..], &child_indices, None)
+            {
+                foreign_keys.push(fk);
+            }
+            continue;
+        }
+
+        let Some((column_name, remainder)) = parse_column_name_and_remainder(&definition) else {
+            continue;
+        };
+        let Some(column_index) = columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            continue;
+        };
+        if let Some(fk) = parse_fk_reference_sql(remainder, &[column_index], Some(column_name)) {
+            foreign_keys.push(fk);
+        }
+    }
+
+    foreign_keys
+}
+
+fn parse_sql_identifier_list(input: &str) -> Option<Vec<String>> {
+    split_top_level_csv_items(input)
+        .into_iter()
+        .map(|item| {
+            let (name, remainder) = parse_column_name_and_remainder(&item)?;
+            trim_leading_sql_space_and_comments(remainder)
+                .is_empty()
+                .then_some(name)
+        })
+        .collect()
+}
+
+fn parse_fk_reference_sql(
+    input: &str,
+    child_indices: &[usize],
+    owner_column: Option<String>,
+) -> Option<FkDef> {
+    let references_pos = find_top_level_unquoted_sql_keyword(input, "REFERENCES")?;
+    let after_references =
+        trim_leading_sql_space_and_comments(&input[references_pos + "REFERENCES".len()..]);
+    let (parent_table, after_parent_table) = parse_fk_parent_table(after_references)?;
+    let after_parent_table = trim_leading_sql_space_and_comments(after_parent_table);
+    let (parent_columns, action_sql) = if after_parent_table.starts_with('(') {
+        let open_paren = input.len() - after_parent_table.len();
+        let close_paren = find_matching_sql_paren(input, open_paren)?;
+        (
+            parse_sql_identifier_list(&input[open_paren + 1..close_paren])?,
+            &input[close_paren + 1..],
+        )
+    } else {
+        (Vec::new(), after_parent_table)
+    };
+    let tokens = collect_unquoted_sql_keyword_tokens(action_sql)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect::<Vec<_>>();
+    let mut on_delete = FkActionType::NoAction;
+    let mut on_update = FkActionType::NoAction;
+    for (index, token) in tokens.iter().enumerate() {
+        if token != "ON" || index + 2 >= tokens.len() {
+            continue;
+        }
+        let action = match tokens[index + 2].as_str() {
+            "CASCADE" => Some(FkActionType::Cascade),
+            "RESTRICT" => Some(FkActionType::Restrict),
+            "SET" if tokens.get(index + 3).is_some_and(|token| token == "NULL") => {
+                Some(FkActionType::SetNull)
+            }
+            "SET"
+                if tokens
+                    .get(index + 3)
+                    .is_some_and(|token| token == "DEFAULT") =>
+            {
+                Some(FkActionType::SetDefault)
+            }
+            "NO" if tokens.get(index + 3).is_some_and(|token| token == "ACTION") => {
+                Some(FkActionType::NoAction)
+            }
+            _ => None,
+        };
+        match (tokens[index + 1].as_str(), action) {
+            ("DELETE", Some(action)) => on_delete = action,
+            ("UPDATE", Some(action)) => on_update = action,
+            _ => {}
+        }
+    }
+    let deferred = tokens.windows(3).enumerate().any(|(index, window)| {
+        (index == 0 || tokens[index - 1] != "NOT")
+            && window[0] == "DEFERRABLE"
+            && window[1] == "INITIALLY"
+            && window[2] == "DEFERRED"
+    });
+
+    Some(FkDef {
+        child_columns: child_indices.to_vec(),
+        owner_column,
+        parent_table,
+        parent_columns,
+        on_delete,
+        on_update,
+        deferred,
+    })
+}
+
+fn parse_fk_parent_table(input: &str) -> Option<(String, &str)> {
+    let trimmed = trim_leading_sql_space_and_comments(input);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (name_raw, remainder) = match trimmed.as_bytes()[0] {
+        b'"' => parse_quoted_identifier(trimmed, b'"', b'"')?,
+        b'`' => parse_quoted_identifier(trimmed, b'`', b'`')?,
+        b'[' => parse_bracket_identifier(trimmed)?,
+        _ => {
+            let mut chars = trimmed.char_indices().peekable();
+            let mut end = trimmed.len();
+            while let Some((index, ch)) = chars.next() {
+                let starts_comment = matches!(ch, '-' | '/')
+                    && chars.peek().is_some_and(|(_, next)| {
+                        (ch == '-' && *next == '-') || (ch == '/' && *next == '*')
+                    });
+                if ch.is_whitespace() || ch == '(' || starts_comment {
+                    end = index;
+                    break;
+                }
+            }
+            (&trimmed[..end], &trimmed[end..])
+        }
+    };
+    (!name_raw.is_empty()).then(|| {
+        (
+            strip_identifier_quotes(name_raw),
+            trim_leading_sql_space_and_comments(remainder),
+        )
+    })
+}
+
+fn fk_clause_to_def(
+    child_indices: &[usize],
+    owner_column: Option<String>,
+    clause: &fsqlite_ast::ForeignKeyClause,
+) -> FkDef {
     let mut on_delete = FkActionType::NoAction;
     let mut on_update = FkActionType::NoAction;
     for action in &clause.actions {
@@ -1612,6 +1822,7 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
     });
     FkDef {
         child_columns: child_indices.to_vec(),
+        owner_column,
         parent_table: clause.table.clone(),
         parent_columns: clause.columns.clone(),
         on_delete,
@@ -4433,6 +4644,7 @@ PRAGMA integrity_check;
             primary_key_constraints: Vec::new(),
             foreign_keys: vec![FkDef {
                 child_columns: vec![1],
+                owner_column: None,
                 parent_table: "pa\"rent".to_owned(),
                 parent_columns: vec!["id\"x".to_owned()],
                 on_delete: FkActionType::Cascade,
@@ -4588,6 +4800,7 @@ PRAGMA integrity_check;
             primary_key_constraints: Vec::new(),
             foreign_keys: vec![FkDef {
                 child_columns: vec![0],
+                owner_column: None,
                 parent_table: "parent".to_owned(),
                 parent_columns: vec!["id".to_owned()],
                 on_delete: FkActionType::Cascade,
@@ -4729,6 +4942,35 @@ PRAGMA integrity_check;
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_foreign_key_fallback_preserves_ownership_and_actions() {
+        // The trailing CHECK conflict clause is accepted by SQLite but is not
+        // yet accepted by the full AST parser, forcing the schema fallback.
+        let sql = r#"CREATE TABLE child(
+            "owned col" INTEGER REFERENCES parent(id)
+                ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+            keep INTEGER,
+            CONSTRAINT fk_keep FOREIGN KEY(keep) REFERENCES "parent table"("id col")
+                ON UPDATE RESTRICT NOT DEFERRABLE INITIALLY DEFERRED,
+            CHECK(keep > 0) ON CONFLICT FAIL
+        )"#;
+        let columns = parse_columns_from_create_sql(sql);
+        let foreign_keys = extract_foreign_keys_from_sql(sql, &columns);
+
+        assert_eq!(foreign_keys.len(), 2);
+        assert_eq!(foreign_keys[0].child_columns, vec![0]);
+        assert_eq!(foreign_keys[0].owner_column.as_deref(), Some("owned col"));
+        assert_eq!(foreign_keys[0].parent_table, "parent");
+        assert_eq!(foreign_keys[0].parent_columns, vec!["id"]);
+        assert_eq!(foreign_keys[0].on_delete, FkActionType::Cascade);
+        assert!(foreign_keys[0].deferred);
+
+        assert_eq!(foreign_keys[1].child_columns, vec![1]);
+        assert_eq!(foreign_keys[1].owner_column, None);
+        assert_eq!(foreign_keys[1].on_update, FkActionType::Restrict);
+        assert!(!foreign_keys[1].deferred);
     }
 
     #[test]

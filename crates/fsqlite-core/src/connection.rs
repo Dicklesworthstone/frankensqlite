@@ -40465,7 +40465,7 @@ impl Connection {
                 for (i, col) in columns.iter().enumerate() {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
-                            fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                            fk_defs.push(fk_clause_to_def(&[i], Some(col.name.clone()), fk_clause));
                         }
                     }
                 }
@@ -40484,7 +40484,7 @@ impl Connection {
                             })
                             .collect();
                         if !child_indices.is_empty() {
-                            fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                            fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                         }
                     }
                 }
@@ -41265,6 +41265,13 @@ impl Connection {
                 }
                 for fk in &mut renamed_table.foreign_keys {
                     rename_fk_parent_columns(fk, &renamed_table.name, old, new);
+                    if fk
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(old))
+                    {
+                        fk.owner_column = Some(new.clone());
+                    }
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
                     if idx == table_idx {
@@ -41500,6 +41507,7 @@ impl Connection {
                     }
                     table.foreign_keys.push(FkDef {
                         child_columns: vec![new_column_index],
+                        owner_column: Some(col_def.name.clone()),
                         parent_table: clause.table.clone(),
                         parent_columns: clause.columns.clone(),
                         on_delete,
@@ -41562,6 +41570,64 @@ impl Connection {
                     )));
                 }
 
+                let index_references_dropped_column = |index: &IndexSchema| -> Result<bool> {
+                    let key_expression_references_column =
+                        index
+                            .key_expressions
+                            .iter()
+                            .try_fold(false, |found, expr_sql| {
+                                Ok::<bool, FrankenError>(
+                                    found || stored_expr_references_column(expr_sql, col_name)?,
+                                )
+                            })?;
+                    let predicate_references_column = index
+                        .where_clause
+                        .as_deref()
+                        .map(|where_sql| stored_expr_references_column(where_sql, col_name))
+                        .transpose()?
+                        .unwrap_or(false);
+                    Ok(index
+                        .columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(col_name))
+                        || key_expression_references_column
+                        || predicate_references_column)
+                };
+
+                // Table-level UNIQUE constraints keep SQLite's schema-error
+                // precedence ahead of table-level foreign keys.
+                for index in &table.indexes {
+                    if self.index_is_implicit_autoindex(&index.name, &table.name)
+                        && index_references_dropped_column(index)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+
+                // A table-level FOREIGN KEY survives independently of its
+                // child columns. SQLite diagnoses this before generated,
+                // CHECK, or explicit-index dependencies. A column-level
+                // REFERENCES clause, by contrast, is owned by and removed
+                // with the dropped column.
+                for fk in &table.foreign_keys {
+                    if !fk.child_columns.contains(&col_idx) {
+                        continue;
+                    }
+                    let is_owned_by_dropped_column = fk
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name));
+                    if !is_owned_by_dropped_column {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: unknown column \"{col_name}\" in foreign key definition",
+                            table.name
+                        )));
+                    }
+                }
+
                 // SQLite requires every table to retain at least one ordinary
                 // (non-generated) column. Check this before dependency errors so
                 // `DROP COLUMN` reports the same primary schema defect as stock
@@ -41611,39 +41677,13 @@ impl Connection {
                     }
                 }
 
-                // Both explicit indexes and implicit table-level UNIQUE
-                // constraints make the column non-droppable. This includes
+                // Explicit indexes make the column non-droppable. This includes
                 // expression-index terms and partial-index predicates, whose
                 // dependencies are not represented in `IndexSchema::columns`.
                 for index in &table.indexes {
-                    let key_expression_references_column =
-                        index
-                            .key_expressions
-                            .iter()
-                            .try_fold(false, |found, expr_sql| {
-                                Ok::<bool, FrankenError>(
-                                    found || stored_expr_references_column(expr_sql, col_name)?,
-                                )
-                            })?;
-                    let predicate_references_column = index
-                        .where_clause
-                        .as_deref()
-                        .map(|where_sql| stored_expr_references_column(where_sql, col_name))
-                        .transpose()?
-                        .unwrap_or(false);
-                    let references_column = index
-                        .columns
-                        .iter()
-                        .any(|column| column.eq_ignore_ascii_case(col_name))
-                        || key_expression_references_column
-                        || predicate_references_column;
-                    if references_column {
-                        if self.index_is_implicit_autoindex(&index.name, &table.name) {
-                            return Err(FrankenError::FunctionError(format!(
-                                "error in table {} after drop column: no such column: {col_name}",
-                                table.name
-                            )));
-                        }
+                    if !self.index_is_implicit_autoindex(&index.name, &table.name)
+                        && index_references_dropped_column(index)?
+                    {
                         return Err(FrankenError::FunctionError(format!(
                             "error in index {} after drop column: no such column: {col_name}",
                             index.name
@@ -41671,9 +41711,11 @@ impl Connection {
                 // Remove FKs that reference the dropped column, and adjust
                 // column indices for remaining FKs whose child_columns point
                 // past the removed position.
-                table
-                    .foreign_keys
-                    .retain(|fk| !fk.child_columns.contains(&col_idx));
+                table.foreign_keys.retain(|fk| {
+                    !fk.owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                });
                 for fk in &mut table.foreign_keys {
                     for ci in &mut fk.child_columns {
                         if *ci > col_idx {
@@ -63375,7 +63417,11 @@ impl Connection {
                     for (i, col) in col_defs.iter().enumerate() {
                         for c in &col.constraints {
                             if let ColumnConstraintKind::ForeignKey(fk_clause) = &c.kind {
-                                fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                                fk_defs.push(fk_clause_to_def(
+                                    &[i],
+                                    Some(col.name.clone()),
+                                    fk_clause,
+                                ));
                             }
                         }
                     }
@@ -63395,7 +63441,7 @@ impl Connection {
                                 })
                                 .collect();
                             if !child_indices.is_empty() {
-                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                                fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                             }
                         }
                     }
@@ -63455,6 +63501,10 @@ impl Connection {
                         }
                     }
                 }
+            }
+            if parsed_create_table.is_none() {
+                fk_defs =
+                    crate::compat_persist::extract_foreign_keys_from_sql(&create_sql, &columns);
             }
 
             let check_defs = parsed_create_table.as_ref().map_or_else(
@@ -67716,6 +67766,13 @@ where
                 part.push_str(&check.expr);
                 part.push(')');
             }
+            for fk in table.foreign_keys.iter().filter(|fk| {
+                fk.owner_column
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+            }) {
+                append_fk_reference_clause_sql(&mut part, fk);
+            }
             part
         })
         .collect();
@@ -67771,7 +67828,11 @@ where
     // Append table-level FOREIGN KEY constraints so they survive
     // round-tripping through sqlite_master.
     let mut fk_clauses = String::new();
-    for fk in &table.foreign_keys {
+    for fk in table
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.owner_column.is_none())
+    {
         use std::fmt::Write;
         let child_cols: Vec<&str> = fk
             .child_columns
@@ -67783,33 +67844,15 @@ where
         }
         write!(
             fk_clauses,
-            ", FOREIGN KEY({}) REFERENCES {}",
+            ", FOREIGN KEY({})",
             child_cols
                 .iter()
                 .map(|c| maybe_quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            maybe_quote_ident(&fk.parent_table),
         )
         .ok();
-        if !fk.parent_columns.is_empty() {
-            write!(
-                fk_clauses,
-                "({})",
-                fk.parent_columns
-                    .iter()
-                    .map(|c| maybe_quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-            .ok();
-        }
-        if fk.on_delete != FkActionType::NoAction {
-            write!(fk_clauses, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
-        }
-        if fk.on_update != FkActionType::NoAction {
-            write!(fk_clauses, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
-        }
+        append_fk_reference_clause_sql(&mut fk_clauses, fk);
     }
     // Append table-level CHECK constraints.
     let mut check_clauses = String::new();
@@ -67846,6 +67889,33 @@ fn fk_action_sql(action: FkActionType) -> &'static str {
         FkActionType::SetNull => "SET NULL",
         FkActionType::SetDefault => "SET DEFAULT",
         FkActionType::Cascade => "CASCADE",
+    }
+}
+
+fn append_fk_reference_clause_sql(sql: &mut String, fk: &FkDef) {
+    use std::fmt::Write;
+
+    write!(sql, " REFERENCES {}", maybe_quote_ident(&fk.parent_table)).ok();
+    if !fk.parent_columns.is_empty() {
+        write!(
+            sql,
+            "({})",
+            fk.parent_columns
+                .iter()
+                .map(|column| maybe_quote_ident(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .ok();
+    }
+    if fk.on_delete != FkActionType::NoAction {
+        write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
+    }
+    if fk.on_update != FkActionType::NoAction {
+        write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
     }
 }
 
@@ -83271,7 +83341,11 @@ fn sort_rows_by_order_terms(
 }
 
 /// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
-fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
+fn fk_clause_to_def(
+    child_indices: &[usize],
+    owner_column: Option<String>,
+    clause: &fsqlite_ast::ForeignKeyClause,
+) -> FkDef {
     let mut on_delete = FkActionType::NoAction;
     let mut on_update = FkActionType::NoAction;
     for action in &clause.actions {
@@ -83289,6 +83363,7 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
     }
     FkDef {
         child_columns: child_indices.to_vec(),
+        owner_column,
         parent_table: clause.table.clone(),
         parent_columns: clause.columns.clone(),
         on_delete,
@@ -107157,6 +107232,208 @@ mod tests {
             err.to_string()
                 .contains("error in table composite_unique after drop column"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_preserves_foreign_key_ownership() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE column_owned (
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+                    DEFERRABLE INITIALLY DEFERRED,
+                keep INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE column_owned RENAME COLUMN parent_id TO renamed_parent_id;")
+            .unwrap();
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'column_owned';")
+            .unwrap();
+        let renamed_sql = row_values(&rows[0])[0].to_text();
+        assert!(
+            renamed_sql.contains(
+                "renamed_parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
+            ),
+            "{renamed_sql}"
+        );
+        conn.execute("ALTER TABLE column_owned DROP COLUMN renamed_parent_id;")
+            .unwrap();
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'column_owned';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        assert!(!sql.contains("REFERENCES"), "{sql}");
+
+        conn.execute("CREATE TABLE table_owned (parent_id INTEGER, keep INTEGER, FOREIGN KEY(parent_id) REFERENCES parent(id));")
+            .unwrap();
+        conn.execute("ALTER TABLE table_owned RENAME COLUMN parent_id TO renamed_parent_id;")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE table_owned DROP COLUMN renamed_parent_id;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table table_owned after drop column: unknown column \"renamed_parent_id\" in foreign key definition"
+            ),
+            "{err}"
+        );
+
+        conn.execute("CREATE TABLE add_owned (keep INTEGER);")
+            .unwrap();
+        conn.execute("ALTER TABLE add_owned ADD COLUMN parent_id INTEGER REFERENCES parent(id);")
+            .unwrap();
+        conn.execute("ALTER TABLE add_owned DROP COLUMN parent_id;")
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-fk-owner.db");
+        {
+            let persisted = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            persisted
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_column (parent_id INTEGER REFERENCES parent(id) ON UPDATE RESTRICT, keep INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE reopen_column RENAME COLUMN parent_id TO renamed_parent_id;")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_table (parent_id INTEGER, keep INTEGER, FOREIGN KEY(parent_id) REFERENCES parent(id));")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_add (keep INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE reopen_add ADD COLUMN parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL;")
+                .unwrap();
+        }
+        {
+            let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            reopened
+                .execute("ALTER TABLE reopen_column DROP COLUMN renamed_parent_id;")
+                .unwrap();
+            let err = reopened
+                .execute("ALTER TABLE reopen_table DROP COLUMN parent_id;")
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FrankenError::FunctionError(ref message)
+                        if message == "error in table reopen_table after drop column: unknown column \"parent_id\" in foreign key definition"
+                ),
+                "{err}"
+            );
+            reopened
+                .execute("ALTER TABLE reopen_add DROP COLUMN parent_id;")
+                .unwrap();
+        }
+
+        let fallback_path = temp_dir.path().join("drop-column-fk-fallback.db");
+        {
+            let sqlite = rusqlite::Connection::open(&fallback_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE fallback_column (
+                         parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                         keep INTEGER,
+                         CHECK(keep > 0) ON CONFLICT FAIL
+                     );
+                     CREATE TABLE fallback_table (
+                         parent_id INTEGER,
+                         keep INTEGER,
+                         FOREIGN KEY(parent_id) REFERENCES parent(id),
+                         CHECK(keep > 0) ON CONFLICT FAIL
+                     );
+                     CREATE INDEX fallback_index ON fallback_table(parent_id);",
+                )
+                .unwrap();
+        }
+        let fallback = Connection::open(fallback_path.to_string_lossy().into_owned()).unwrap();
+        fallback.execute("PRAGMA foreign_keys = ON;").unwrap();
+        {
+            let schema = fallback.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name == "fallback_column")
+                .unwrap();
+            let foreign_key = &table.foreign_keys[0];
+            assert_eq!(foreign_key.parent_table, "parent");
+            assert_eq!(foreign_key.parent_columns, vec!["id"]);
+            assert_eq!(
+                foreign_key.on_delete,
+                fsqlite_vdbe::codegen::FkActionType::Cascade
+            );
+            assert_eq!(foreign_key.owner_column.as_deref(), Some("parent_id"));
+        }
+        let err = fallback
+            .execute("INSERT INTO fallback_column(parent_id, keep) VALUES(999, 1);")
+            .expect_err("fallback FK metadata must still enforce the parent lookup");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        fallback
+            .execute("ALTER TABLE fallback_column DROP COLUMN parent_id;")
+            .unwrap();
+        let err = fallback
+            .execute("ALTER TABLE fallback_table DROP COLUMN parent_id;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table fallback_table after drop column: unknown column \"parent_id\" in foreign key definition"
+            ),
+            "{err}"
+        );
+
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        oracle
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE fallback_table (
+                     parent_id INTEGER,
+                     keep INTEGER,
+                     FOREIGN KEY(parent_id) REFERENCES parent(id),
+                     CHECK(keep > 0) ON CONFLICT FAIL
+                 );
+                 CREATE INDEX fallback_index ON fallback_table(parent_id);",
+            )
+            .unwrap();
+        let oracle_err = oracle
+            .execute("ALTER TABLE fallback_table DROP COLUMN parent_id;", [])
+            .unwrap_err();
+        assert!(
+            oracle_err.to_string().contains(
+                "error in table fallback_table after drop column: unknown column \"parent_id\" in foreign key definition"
+            ),
+            "{oracle_err}"
+        );
+
+        let rows = fallback
+            .query("SELECT name FROM sqlite_master WHERE name = 'fallback_index';")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "rejected ALTER removed its explicit index");
+        let rows = fallback
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_table';")
+            .unwrap();
+        assert!(
+            row_values(&rows[0])[0]
+                .to_text()
+                .contains("FOREIGN KEY(parent_id)"),
+            "rejected ALTER rewrote the table schema"
+        );
+        let rows = fallback
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_column';")
+            .unwrap();
+        assert!(
+            !row_values(&rows[0])[0].to_text().contains("REFERENCES"),
+            "column-owned fallback FK survived its dropped column"
         );
     }
 
