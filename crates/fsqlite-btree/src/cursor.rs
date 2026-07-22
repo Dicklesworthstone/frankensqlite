@@ -14011,6 +14011,80 @@ mod tests {
         );
     }
 
+    /// bd-distinct-loose-scan: the loose/skip scan (`first`, then repeated
+    /// prefix upper-bound seeks) must terminate in exactly one seek per
+    /// distinct value on a NATURALLY SPLIT multi-level tree whose duplicate
+    /// runs span several leaves. A seek that lands back inside the current
+    /// run turns the loop into an infinite re-emit of the same value; the
+    /// iteration cap converts that hang into a loud failure.
+    #[test]
+    fn test_cursor_index_prefix_upper_bound_loose_scan_over_multi_leaf_runs() {
+        const DISTINCT: i64 = 8;
+        const PER_VALUE: i64 = 1000;
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        // Interleaved insert order (value = i % DISTINCT) mirrors the failing
+        // `SELECT DISTINCT` workload and exercises natural page splits; each
+        // value's run of PER_VALUE entries spans multiple leaves.
+        for i in 0..DISTINCT * PER_VALUE {
+            let key =
+                serialize_record(&[SqliteValue::Integer(i % DISTINCT), SqliteValue::Integer(i)]);
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        // --- 1-field prefix probe (the design-intended loose-scan shape). ---
+        assert!(
+            cursor.first(&cx).unwrap(),
+            "populated index has a first row"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..=DISTINCT {
+            let payload = cursor.payload(&cx).unwrap();
+            let fields = parse_record(&payload).unwrap();
+            let SqliteValue::Integer(v) = fields[0] else {
+                panic!("integer index key expected, got {fields:?}");
+            };
+            seen.push(v);
+            let probe = serialize_record(&[SqliteValue::Integer(v)]);
+            cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
+            if cursor.eof() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..DISTINCT).collect::<Vec<_>>(),
+            "prefix upper-bound loose scan must visit each distinct value exactly once"
+        );
+
+        // --- 2-field [value, i64::MAX] sentinel probe (the alternate shape). ---
+        assert!(cursor.first(&cx).unwrap());
+        let mut seen_sentinel = Vec::new();
+        for _ in 0..=DISTINCT {
+            let payload = cursor.payload(&cx).unwrap();
+            let fields = parse_record(&payload).unwrap();
+            let SqliteValue::Integer(v) = fields[0] else {
+                panic!("integer index key expected, got {fields:?}");
+            };
+            seen_sentinel.push(v);
+            let probe =
+                serialize_record(&[SqliteValue::Integer(v), SqliteValue::Integer(i64::MAX)]);
+            cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
+            if cursor.eof() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen_sentinel,
+            (0..DISTINCT).collect::<Vec<_>>(),
+            "sentinel upper-bound loose scan must visit each distinct value exactly once"
+        );
+    }
+
     #[test]
     fn test_cursor_index_prefix_upper_bound_honors_nocase_collation() {
         let mut store = MemPageStore::new(USABLE);
