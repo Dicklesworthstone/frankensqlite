@@ -19625,3 +19625,56 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   any numeric claim uses interleaved same-worker sampling with a null control
   and CV below 5%. The operator decides archival/removal; this agent deleted
   nothing.
+
+## 2026-07-22 - REJECT: prepared DELETE vector batch publication deferral
+
+- Target: refreshed worst raw ratio, `UPDATE/DELETE Throughput / 100 rows /
+  delete 5 rows` (`3.3188x`) in
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+  This was the broader same-leaf operator admitted by the retry predicates on
+  the closed direct-publication and transaction-local rowid-batch attempts: it
+  added a prepared-parameter batch API without an O(table rows) proof set or
+  deferred physical-delete scan.
+- Candidate preflight: `sql_pipeline_candidate_preflight --workload DELETE
+  --operation prepared_delete_vector_batch --direction other --benchmark
+  comprehensive-bench-update-delete --source-surface
+  PreparedStatement::execute_batch_with_params --json` returned `allowed` with
+  zero matched records. Profile-first routing on the exact 100-row/5-delete
+  shape put `execute_body` at `4.659-5.620 us`, with commit roundtrip
+  `1.493-2.214 us`; the per-row direct DELETE tail included active probe
+  `1.011-1.303 us`, seek `0.742-1.133 us`, leaf flush `1.112-1.373 us`, and
+  five memory-sync calls totaling `0.331-0.551 us`.
+- Touched during the rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, and
+  `crates/fsqlite-e2e/src/bin/perf_update_delete.rs`. The candidate fused only
+  eligible direct rowid DELETEs in an active explicit transaction, publishing
+  the conservative memory write-set once at the batch boundary; savepoints,
+  tracing, foreign-key work, and other DML shapes retained the sequential
+  executor. The benchmark kept the original loop as the same-binary null
+  control behind `FSQLITE_BENCH_DISABLE_DELETE_BATCH`. Source was manually
+  restored after rejection.
+- Behavior-isomorphism proof passed remotely through RCH: two focused tests
+  covered duplicate/missing rowids and exact affected counts, read-your-writes,
+  transaction rollback, savepoint fallback plus `ROLLBACK TO`, committed row
+  count, and an instrumentation assertion reducing eight direct DELETE memory
+  syncs to two (`2 passed; 0 failed`). The release-perf two-binary build also
+  passed. This proves the mechanism worked; it did not prove enough speed.
+- Final interleaved same-worker A/B used one release-perf binary on
+  `vmi1149989`, pinned to CPU 8, five alternating-order pairs of 500,000 exact
+  100-row/5-delete iterations. Candidate per-delete samples were
+  `1356/1185/1201/1314/1294 ns` (median `1294 ns`, mean `1270.0 ns`, CV
+  `5.210%`); null-control samples were `1317/1259/1225/1330/1309 ns` (median
+  `1309 ns`, mean `1288.0 ns`, CV `3.078%`). The median delta was only `1.146%`,
+  below control noise, and candidate CV failed the mandatory `<5%` gate. An
+  earlier 20,000-iteration alternation was discarded because two LTO links
+  were still active on the worker.
+- Result: rejected. Collapsing five memory-write-set publications to two is
+  real but too small relative to the full prepared-DELETE transaction envelope
+  to justify a new public batch API or a benchmark-only call-shape advantage.
+  Do not retry publication-only prepared DELETE batching. Reconsider only if a
+  different batch operator also removes a measured larger component (at least
+  one of commit roundtrip, leaf materialization/flush, or repeated seek), and a
+  quiescent same-worker null-controlled A/B improves the 100-row median by at
+  least 10% with both variants below 5% CV and no regression in the 1k/10k
+  DELETE rows.
