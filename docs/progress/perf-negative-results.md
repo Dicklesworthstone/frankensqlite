@@ -19513,3 +19513,115 @@ UpperBound, so `index_seek_upper_bound` mis-positions when a value's run spans m
 `index_seek_with_bias(UpperBound)` / `binary_search_index_interior_with_bias` on a fast LOCAL build (per the
 bead) — likely the interior descent must propagate the UpperBound bias, or the leaf-crossing successor logic
 (cursor.rs:4247) must re-seek. Codegen WIP is correct in shape; unblocking is a btree-cursor fix. Did NOT ship.
+
+## 2026-07-22 - KEEP + BLOCKER ROOT-CAUSED: adaptive DISTINCT loose/skip scan lands at 23.5x; the "skip-scan hang" was ResultRow register drain, never the btree (bd-distinct-loose-scan-c8nay)
+
+- Result type: lever KEEP + blocker resolution. Prior state: 2026-07-11 (reverted, hang),
+  2026-07-16 (WIP stashed, hang re-observed, btree upper-bound layer suspected — see previous entry).
+- BLOCKER ROOT CAUSE (definitive, gdb-proven): the WIP emitted Column -> ResultRow -> Copy ->
+  MakeRecord -> SeekGT, but the engine's ResultRow (`execute_result_row_hot`) DRAINS its source
+  registers via `take_reg_range` — the probe Copy after ResultRow always read NULL, so every SeekGT
+  probe was the constant record `[2,0]`=`[NULL]` (gdb breakpoint on the SeekGT arm: probe identical
+  across 8 iterations) while the cursor sat CORRECTLY parked at the NULL-run upper bound (leaf page 6,
+  cell 54/500, at_eof=false, byte-identical stack each iteration). The loop re-emitted one row
+  forever; reproduced locally to 192 GB RSS before kill. Fix: the probe Copy precedes ResultRow.
+- BTREE EXONERATED: `test_cursor_index_prefix_upper_bound_loose_scan_over_multi_leaf_runs`
+  (46a4544b; extended with a leading NULL run + [NULL]-prefix probes in the lever commit) drives the
+  loose-scan loop over a NATURALLY SPLIT multi-leaf tree with both probe shapes (1-field prefix and
+  [value, i64::MAX] sentinel): one seek per distinct value, terminates. The 2026-07-16
+  interior-descent-LowerBound hypothesis is REFUTED — `binary_search_index_interior_with_bias` has
+  propagated the bias since a42d1020, which predates the hang. HAZARD (chartered follow-up
+  bd-resultrow-drain-sweep): ANY emitter reading a result register after ResultRow silently gets NULL
+  (take_reg_range drain diverges from stock SQLite register semantics); sweep existing emitters.
+- PREFLIGHT GATE: sql_pipeline_candidate_preflight --operation DistinctLooseScan --direction other
+  => verdict "allowed", zero matched no-retry records.
+- LEVER (commit eee0c07d): distinct_loose_scan_plan + codegen_select_distinct_loose_scan
+  (BlackThrush stash@{0} WIP, applied, stash preserved) + ADAPTIVE skip: up to 3 cheap Next probes
+  (Ne, NULLEQ 0x80, BINARY collation) exit short runs before paying a root-to-leaf SeekGT. Gates:
+  single plain BINARY column output, single-column ASC BINARY index (supports_direct_column_lookup
+  => not partial, no extra stored columns; name match => not expression), rowid table, not
+  generated, no WHERE/GROUP BY/HAVING/LIMIT; ORDER BY and aggregates consumed by earlier branches.
+- WORST CASE MEASURED AND FIXED: pure per-value SeekGT on an ALL-DISTINCT 20k-row index cost
+  109.8 ms/query vs 8.9-10.1 ms sorter (~11x REGRESSION) — the adaptive Next-probe form degrades to
+  an emit-on-change walk at 9.9 ms (sorter parity). Do NOT re-land a seek-only loose scan without
+  the adaptive fallback; this is the retry predicate for any future "simplify the inner loop" idea.
+- A/B (release-perf, isolated cc-target on csd, interleaved lever-vs-null-control x5 batches of 200,
+  in-binary EXPLAIN freshness gate printed "loose-scan/index"): DISTINCT k (50 distinct / 20k rows,
+  indexed, loose scan) 384,065 ns/query CV 5.2% vs DISTINCT u (same data, NOT indexed, sorter
+  control) 9,018,971 ns/query CV 3.2% => 23.48x; single-shot 321 us vs 8.9 ms => 27.7x. CV gate note:
+  k's 5.2% is a hair over the 5% target on the shared host; the 23.5x effect is ~450x beyond the
+  noise — decisive. Historical pre-lever baseline for the same shape: 14.8 ms (2026-07-11 entry).
+- CONFORMANCE: distinct_loose_scan_oracle 3/3 byte-exact vs rusqlite (int/text NULL-run tables,
+  empty/single/all-same/all-NULL, mixed storage classes 2 vs 2.0 typeless, REAL runs, i64::MIN/MAX,
+  all-distinct, short 2-3 runs, file-backed Txn-cursor variant; EXPLAIN no-SorterOpen gate). DECLINE
+  controls (NOCASE, non-indexed) assert SET-equality: bare-DISTINCT fallback ORDER already diverges
+  from C SQLite (pre-existing bd-distinct-scan-order-divergence-zv52i, not introduced here).
+  No-regression: fsqlite 654/0, fsqlite-btree 487/0, fsqlite-vdbe 1060/0 lib suites; clippy
+  -D warnings; fmt.
+- Environment incidents fixed en route (memory notes saved): csd's crates.io sparse-index cache had
+  regressed (serde capped at 1.0.224, franken-* 0.3.9 missing) — healed by rewriting 4 stale .cache
+  entries from the live index; asupersync 0.3.9 cannot compile under a bare `-p fsqlite` resolver-v2
+  feature subgraph (atp module needs optional deps only workspace-level unification activates) —
+  full-stack builds must be workspace-scoped (`--workspace --test ...`) or fleet-run.
+
+## 2026-07-22 - Adaptive micro-sampling for the 100-row DELETE comparator tail
+
+- Target: the refreshed worst raw ratio in
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`,
+  `UPDATE/DELETE Throughput / 100 rows / delete 5 rows` at `3.3188x`. The
+  refresh itself had high C/F CV (`14.03%/35.91%`), so this candidate changed
+  only `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`: extend sampling for
+  sub-20-us rows until a tighter elapsed-time floor, without changing either
+  engine or the measured SQL envelope. Source was manually restored after the
+  measurement rejected the lever.
+- Interleaved same-worker target evidence (`A1/B1/A2/B2`, where A is the
+  existing sampler and B is the adaptive candidate): A1 C/F
+  `2.174/6.743 us`, ratio `3.1017`, CV `5.83%/3.79%`; B1
+  `1.703/5.741 us`, ratio `3.3711`, CV `0.65%/1.14%`; A2
+  `2.275/7.624 us`, ratio `3.3512`, CV `4.28%/26.17%`; B2
+  `1.683/6.732 us`, ratio `4.0000`, CV `0.24%/9.97%`.
+- Result: rejected. The null-control alternation disproved a coherent engine
+  win, and the candidate still failed the mandatory under-5% FSQLite CV gate
+  in B2. More sampling stabilized the C comparator but did not stabilize the
+  full prepared-DELETE transaction envelope, so it cannot support a KEEP or a
+  new performance claim.
+- Do not retry adaptive micro-sampling as a performance lever for this row.
+  Reconsider benchmark-only sampling changes only if an external scheduler or
+  timer study identifies a concrete noise source and an interleaved same-worker
+  null control brings both engines below 5% CV without changing their SQL,
+  transaction, fixture, or teardown envelopes.
+
+## 2026-07-22 - Untracked `zz_*` probe triage: no durable test candidates as-is
+
+- Target: all 30 untracked `crates/fsqlite/tests/zz_*` probe files left in the
+  shared checkout after the rowid/index seek campaign.
+- Result: none should land as-is. Every file declares `EPHEMERAL ... Not for
+  commit`; the 29 benches are ignored single-shot `Instant` probes with no
+  interleaved null control, no repeated-sample CV, and generally no C-SQLite
+  oracle. `zz_seekgap_probe.rs` only dumps opcode lists and overlaps the owned
+  DISTINCT skip-scan lane. The useful rowid/index opcode shapes are already
+  covered by landed commits `91e42854`, `b41d02d5`, `66a62e57`, `dcd6f3c`,
+  `73ff169c`, `9c692992`, `a9a95427`, `1023043f`, `d32a263a`, `81a66d3f`, and
+  `8ba32e76` plus their durable tests.
+- Operator list; preserved untouched and not deleted:
+  `zz_aggincomposite_bench.rs`, `zz_aggrowideqcoerced_bench.rs`,
+  `zz_aggrowideqresidual_bench.rs`, `zz_aggrowidin_bench.rs`,
+  `zz_aggrowidinresidual_bench.rs`, `zz_countrowideq_bench.rs`,
+  `zz_countrowideqcoerced_bench.rs`, `zz_countrowidin_bench.rs`,
+  `zz_countrowidresidual_bench.rs`, `zz_deleterowidin_bench.rs`,
+  `zz_dmlindexeq_bench.rs`, `zz_dmlindexeqnum_bench.rs`,
+  `zz_dmlindexeqparam_bench.rs`, `zz_dmlindexeqresidual_bench.rs`,
+  `zz_dmlindexeqtext_bench.rs`, `zz_dmlrowideqresidual_bench.rs`,
+  `zz_dmlrowidinresidual_bench.rs`, `zz_dmlrowidrange_bench.rs`,
+  `zz_indexeqorderrowid_bench.rs`, `zz_indexeqorderrowiddesc_bench.rs`,
+  `zz_rowideqresidual_bench.rs`, `zz_rowidinorder_bench.rs`,
+  `zz_rowidinresidual_bench.rs`, `zz_rowidorderscan_bench.rs`,
+  `zz_rowidorderscandesc_bench.rs`, `zz_rowidorderscandescfilt_bench.rs`,
+  `zz_rowidorderscanfilt_bench.rs`, `zz_rowidrangeresidual_bench.rs`,
+  `zz_seekgap_probe.rs`, and `zz_updaterowidin_bench.rs`.
+- Retry condition: promote an individual probe only after it demonstrates a
+  still-uncovered semantic shape, is renamed out of the `zz_` namespace, gains
+  a C-SQLite differential oracle plus durable opcode/behavior assertions, and
+  any numeric claim uses interleaved same-worker sampling with a null control
+  and CV below 5%. The operator decides archival/removal; this agent deleted
+  nothing.

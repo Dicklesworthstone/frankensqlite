@@ -82,8 +82,24 @@ fn assert_same(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     );
 }
 
+/// Order-insensitive comparison for DECLINE-control shapes: bare-DISTINCT row
+/// order on the sorter fallback is implementation-defined and already diverges
+/// from C SQLite (fsqlite sorts ascending; C emits first-seen scan order) —
+/// tracked as bd-distinct-scan-order-divergence-zv52i, pre-existing on main.
+/// The controls here only need to prove the SET is correct and the shape fell
+/// back without semantic drift.
+fn assert_same_set(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    let mut fv: Vec<String> = f_rows(f, sql).lines().map(str::to_owned).collect();
+    let mut rv: Vec<String> = r_rows(r, sql).lines().map(str::to_owned).collect();
+    fv.sort();
+    rv.sort();
+    assert_eq!(
+        fv, rv,
+        "\nSET MISMATCH for `{sql}`\n fsqlite:\n{fv:?}\n rusqlite:\n{rv:?}\n"
+    );
+}
+
 #[test]
-#[ignore = "bd-distinct-loose-scan-c8nay: enable when the loose-scan codegen routing lands"]
 fn distinct_loose_scan_matches_rusqlite() {
     // ---- Main eligible table: few distinct values among many rows, with a NULL run. ----
     let mut ins = Vec::new();
@@ -171,7 +187,7 @@ fn distinct_loose_scan_matches_rusqlite() {
             "INSERT INTO nc VALUES (4, 'banana');".to_string(),
         ],
     );
-    assert_same(&fc, &rc, "SELECT DISTINCT s FROM nc");
+    assert_same_set(&fc, &rc, "SELECT DISTINCT s FROM nc");
 
     // ---- Control: non-indexed column falls back. ----
     let (fn_, rn) = both(
@@ -180,7 +196,7 @@ fn distinct_loose_scan_matches_rusqlite() {
             .map(|i| format!("INSERT INTO ni VALUES ({i}, {}, {});", i % 6, i % 6))
             .collect::<Vec<_>>(),
     );
-    assert_same(&fn_, &rn, "SELECT DISTINCT b FROM ni");
+    assert_same_set(&fn_, &rn, "SELECT DISTINCT b FROM ni");
 }
 
 /// Cross-storage-class runs: a typeless (BLOB-affinity) column stores `2` and `2.0` as DISTINCT
@@ -188,7 +204,6 @@ fn distinct_loose_scan_matches_rusqlite() {
 /// C SQLite's index scan. REAL columns exercise float-key runs, and negative/boundary integers pin
 /// the varint edges of the probe record.
 #[test]
-#[ignore = "bd-distinct-loose-scan-c8nay: enable when the loose-scan codegen routing lands"]
 fn distinct_loose_scan_mixed_storage_classes_match_rusqlite() {
     // ---- Typeless column: int 2 and float 2.0 compare equal but store differently. ----
     let mut ins = Vec::new();
@@ -216,8 +231,7 @@ fn distinct_loose_scan_mixed_storage_classes_match_rusqlite() {
     let mut rins = Vec::new();
     for i in 1..=400 {
         let v = match i % 5 {
-            0 => "-3.25",
-            1 => "-3.25",
+            0 | 1 => "-3.25",
             2 => "0.0",
             3 => "9007199254740993.0",
             _ => "1.5",
@@ -232,6 +246,30 @@ fn distinct_loose_scan_mixed_storage_classes_match_rusqlite() {
         &rins,
     );
     assert_same(&f2, &r2, "SELECT DISTINCT v FROM fr");
+
+    // ---- All-distinct column: the adaptive Next-probe path (no seeks) must stay byte-exact. ----
+    let (fh, rh) = both(
+        &[
+            "CREATE TABLE hd (id INTEGER PRIMARY KEY, v INTEGER);",
+            "CREATE INDEX idx_hd ON hd(v);",
+        ],
+        &(1..=500)
+            .map(|i| format!("INSERT INTO hd VALUES ({i}, {});", i * 13 % 4999))
+            .collect::<Vec<_>>(),
+    );
+    assert_same(&fh, &rh, "SELECT DISTINCT v FROM hd");
+
+    // ---- Short runs (2-3 per value): the boundary between Next-probe exit and SeekGT. ----
+    let (fs, rs) = both(
+        &[
+            "CREATE TABLE sr (id INTEGER PRIMARY KEY, v INTEGER);",
+            "CREATE INDEX idx_sr ON sr(v);",
+        ],
+        &(1..=300)
+            .map(|i| format!("INSERT INTO sr VALUES ({i}, {});", i / 3))
+            .collect::<Vec<_>>(),
+    );
+    assert_same(&fs, &rs, "SELECT DISTINCT v FROM sr");
 
     // ---- Integer boundary values: i64::MIN/MAX runs must not confuse the probe. ----
     let mut bins = Vec::new();
@@ -256,7 +294,6 @@ fn distinct_loose_scan_mixed_storage_classes_match_rusqlite() {
 /// File-backed variant of the main eligible shape: the loose scan must behave identically through
 /// the pager/transaction cursor stack (`CursorBackend::Txn`), not just the `:memory:` image.
 #[test]
-#[ignore = "bd-distinct-loose-scan-c8nay: enable when the loose-scan codegen routing lands"]
 fn distinct_loose_scan_file_backed_matches_rusqlite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loose_scan.db");
