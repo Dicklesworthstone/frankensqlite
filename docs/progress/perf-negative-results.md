@@ -19678,3 +19678,57 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   quiescent same-worker null-controlled A/B improves the 100-row median by at
   least 10% with both variants below 5% CV and no regression in the 1k/10k
   DELETE rows.
+
+## 2026-07-22 - BLOCKER: live B-epsilon/cell-delta DELETE bridge is not a one-lever edit
+
+- Target after the second consecutive DELETE rejection: the refreshed worst
+  raw ratio, `UPDATE/DELETE Throughput / 100 rows / delete 5 rows` at
+  `3.318815x`, and its stable large-row control, `10000 rows / delete 500
+  rows` at `1.847112x`. The raw worst row is not itself an admissible KEEP
+  baseline (`C/F CV=14.03%/35.91%`); the 10K/500 row is stable
+  (`C/F CV=1.48%/1.08%`). Both come from
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+- Mandatory negative-evidence review blocked the next narrow candidate before
+  source editing. A dense first/last-key exact-slot predictor for
+  `TableLeafDeleteRun::search_table_leaf` is an exact repeat of the CLOSED
+  2026-05-12 candidate: it already reduced the 500-delete search bucket from
+  `39,571 ns` to `17,444 ns` and moved that row from `0.282699 ms` to
+  `0.236423 ms`, but worsened the full-quick primary score
+  `0.3676859704 -> 0.3732603712` and C-faster count `9 -> 10`. Its retry
+  predicate (same-window full-quick neutrality/better, or a broader logical
+  mutation operator) is not satisfied by another standalone search patch.
+- Profile-first evidence from the exact current 100-row/5-delete envelope
+  distributes time across `execute_body=4.659-5.620 us`, commit roundtrip
+  `1.493-2.214 us`, retained active probe `1.011-1.303 us`, seek
+  `0.742-1.133 us`, leaf flush `1.112-1.373 us`, and five memory-sync calls
+  totaling `0.331-0.551 us`. The immediately preceding prepared vector batch
+  proved that collapsing those five publications to two changes the median by
+  only `1.146%`; no remaining single micro-boundary dominates this envelope.
+- The different alien primitive selected was B-epsilon/Bw-tree logical DELETE
+  messages backed by the existing MVCC cell-delta substrate. Current source
+  inspection found a concrete integration blocker:
+  `MvccManager::read_page_with_cell_deltas` and cell-log savepoint/rollback support exist in
+  `crates/fsqlite-mvcc/src/lifecycle.rs`, but every call site is still an
+  inline MVCC test. The live B-tree adapter in
+  `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo::{read_page,read_page_data,read_btree_page_data}`) reads
+  pager transaction page images;
+  its `ConcurrentContext` carries only `SharedConcurrentHandle`, lock table,
+  and commit index, with no `MvccManager`/`CellVisibilityLog` bridge. The core
+  direct DELETE path likewise records quotient-filter bookkeeping, not cell
+  deltas. A record-delete-only hook would therefore report an affected row
+  while point/scan reads still observe the physical row, violating
+  read-your-writes and behavior isomorphism.
+- Result: explicit integration blocker; no source patch was attempted and no
+  CLOSED lever was reopened. This is not a throughput-limit claim. The next
+  admissible attempt is a distinct representation change that first lands the
+  live adapter contract: route point and scan reads through the same
+  transaction-owned cell-delta view, bind logical DELETE messages to the live
+  concurrent handle and page witnesses, preserve duplicate/missing affected
+  counts plus index/FK/QF/count-cache effects, and prove savepoint, rollback,
+  structural fallback, commit/recovery, and concurrent visibility. Retry the
+  performance candidate only after that contract exists, then require an
+  interleaved same-worker null-controlled focused DELETE A/B with both CVs
+  below `5%`, at least `10%` median improvement on 100/5, no 1K/10K DELETE
+  regression, and a same-window full-quick primary score and C-faster count no
+  worse than control.
