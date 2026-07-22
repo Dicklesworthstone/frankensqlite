@@ -158884,6 +158884,74 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_replace_cleans_partial_and_expression_index_victims_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replace-index-victim-cleanup.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE partial_t (a TEXT, b INTEGER UNIQUE, c INTEGER);
+                 CREATE INDEX partial_idx ON partial_t(a) WHERE c > 0;
+                 INSERT INTO partial_t VALUES ('victim', 1, 5);
+                 INSERT OR REPLACE INTO partial_t VALUES ('newrow', 1, 0);
+
+                 CREATE TABLE expression_t (a TEXT, b INTEGER UNIQUE);
+                 CREATE INDEX expression_idx ON expression_t(lower(a));
+                 INSERT INTO expression_t VALUES ('VICTIM', 1);
+                 INSERT OR REPLACE INTO expression_t VALUES ('other', 1);",
+            )
+            .unwrap();
+
+            assert_eq!(
+                conn.query("SELECT a, b, c FROM partial_t;").unwrap()[0].values(),
+                &[
+                    SqliteValue::Text("newrow".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(0),
+                ]
+            );
+            assert_eq!(
+                conn.query("SELECT a, b FROM expression_t;").unwrap()[0].values(),
+                &[SqliteValue::Text("other".into()), SqliteValue::Integer(1),]
+            );
+        }
+
+        let reopened = Connection::open(&db_str).unwrap();
+        assert_eq!(reopened.query("SELECT * FROM partial_t;").unwrap().len(), 1);
+        assert_eq!(
+            reopened.query("SELECT * FROM expression_t;").unwrap().len(),
+            1
+        );
+        drop(reopened);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let stale_partial: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM partial_t INDEXED BY partial_idx
+                 WHERE a = 'victim' AND c > 0;",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_partial, 0);
+        let stale_expression: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM expression_t INDEXED BY expression_idx
+                 WHERE lower(a) = 'victim';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_expression, 0);
+    }
+
+    #[test]
     fn test_replace_on_unique_multiple_columns() {
         // REPLACE should handle multiple UNIQUE columns — each conflicting row
         // gets deleted before insertion.

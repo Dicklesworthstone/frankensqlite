@@ -22326,14 +22326,21 @@ fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_
         .indexes
         .iter()
         .enumerate()
-        .filter(|(_, index)| index.supports_replace_cleanup_meta())
         .map(|(idx_offset, index)| {
             let cursor_id = table_cursor + 1 + idx_offset as i32;
-            let column_indices: Vec<usize> = index
-                .columns
-                .iter()
-                .filter_map(|col_name| table.column_index(col_name))
-                .collect();
+            // Direct, non-partial column indexes can reconstruct their exact
+            // key from the victim table payload. Partial and expression
+            // indexes cannot: an empty list tells the engine to locate the
+            // victim entry by its trailing rowid instead.
+            let column_indices = if index.supports_replace_cleanup_meta() {
+                index
+                    .columns
+                    .iter()
+                    .filter_map(|col_name| table.column_index(col_name))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             IndexCursorMeta {
                 cursor_id,
                 column_indices,
