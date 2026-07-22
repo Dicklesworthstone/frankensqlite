@@ -2983,6 +2983,25 @@ pub fn codegen_select(
             end_label,
         )
     } else if distinct == Distinctness::Distinct {
+        // bd-distinct-loose-scan: `SELECT DISTINCT <indexed col>` (no WHERE/GROUP BY/HAVING/LIMIT) is a
+        // loose/skip index scan — emit each distinct value once and `SeekGT` past its whole run — instead
+        // of scanning every row into a dedup sorter. Work scales with #distinct values, not rows.
+        if where_clause.is_none()
+            && stmt.limit.is_none()
+            && group_by.is_empty()
+            && having.is_none()
+            && let Some(scan) = distinct_loose_scan_plan(columns, table, table_alias)
+        {
+            return codegen_select_distinct_loose_scan(
+                b,
+                cursor,
+                &scan,
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+            );
+        }
         // --- Full table scan with DISTINCT ---
         codegen_select_distinct_scan(
             b,
@@ -11213,6 +11232,160 @@ fn codegen_select_count_distinct_index_walk(
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
+}
+
+/// A `SELECT DISTINCT <col> FROM t` (no WHERE/GROUP BY/HAVING/LIMIT/ORDER BY) served by a loose/skip
+/// index scan: emit each distinct value once, then `SeekGT [value, i64::MAX]` past the value's whole
+/// duplicate run to the next distinct value. Work scales with the number of DISTINCT values, not rows.
+/// bd-distinct-loose-scan.
+struct DistinctLooseScan {
+    index_name: String,
+    index_root: i32,
+}
+
+/// Cheap `Next` attempts per emitted value before the loose scan pays for a
+/// root-to-leaf `SeekGT` past the run. Keeps all-distinct indexes at
+/// emit-on-change-walk cost instead of one seek per row.
+const DISTINCT_LOOSE_SCAN_NEXT_PROBES: usize = 3;
+
+/// Detect `SELECT DISTINCT <col>` resolvable by a loose index scan. Gated tight so the loose scan is
+/// provably byte-identical to the sorter path: exactly one plain-column output (not `*`/rowid/expr), a
+/// BINARY column with a single-column ASC BINARY index (so index key order == the DISTINCT comparison),
+/// not a generated column, and not WITHOUT ROWID. WHERE/GROUP BY/HAVING/LIMIT are excluded by the caller.
+/// Searches all indexes so a composite `(col, …)` declared first does not shadow a usable single-column
+/// one (bd-agg-range-shadowed-index).
+fn distinct_loose_scan_plan(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<DistinctLooseScan> {
+    if table.without_rowid {
+        return None;
+    }
+    let [ResultColumn::Expr { expr, .. }] = columns else {
+        return None;
+    };
+    let SortKeySource::Column(col_idx) = resolve_column_ref(expr, table, table_alias)? else {
+        return None;
+    };
+    let column = table.columns.get(col_idx)?;
+    // BINARY only: the index's BINARY key order must equal the DISTINCT comparison so adjacent-run
+    // skipping matches C SQLite's grouping. Generated columns decline (first cut).
+    if column.generated_expr.is_some()
+        || column
+            .collation
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
+            && idx
+                .key_term_collation(0)
+                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+    })?;
+    Some(DistinctLooseScan {
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+    })
+}
+
+/// Emit `SELECT DISTINCT <col> FROM t` as a loose/skip index scan: open the single-column index, emit
+/// the first entry's value, then repeatedly `SeekGT [value]` past the current value's entire duplicate
+/// run to the next distinct value. NULL (if present) sorts first and is emitted once like any value.
+/// Terminates in ≤ #distinct seeks. The probe is a 1-FIELD prefix `[value]`: `SeekGT`'s index upper-bound
+/// (`index_seek_with_bias(UpperBound)`) treats a shorter prefix probe as sorting AFTER every equal-prefix
+/// entry (`compare_index_key_values`: `rhs.len() <= lhs.len() => Less`), so one seek clears the whole run.
+/// bd-distinct-loose-scan.
+#[allow(clippy::unnecessary_wraps)]
+fn codegen_select_distinct_loose_scan(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    scan: &DistinctLooseScan,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        scan.index_root,
+        0,
+        P4::Index(scan.index_name.clone()),
+        0,
+    );
+    let finalize_label = b.emit_label();
+    // Empty index → nothing to emit.
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_top = b.current_addr() as i32;
+    // Emit the current distinct value (index column 0), then skip its whole duplicate run.
+    // The probe copy MUST precede ResultRow: the engine's ResultRow drains its source
+    // registers (`take_reg_range`), so a Copy placed after it reads NULL and the SeekGT
+    // probe becomes a constant `[NULL]` — the loop then re-emits one row forever (the
+    // "skip-scan hang" this bead was blocked on).
+    b.emit_op(Opcode::Column, idx_cursor, 0, out_regs, P4::None, 0);
+    let probe_key_reg = b.alloc_reg();
+    b.emit_op(Opcode::Copy, out_regs, probe_key_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    // Adaptive skip (MySQL-style loose scan): try a few cheap Next steps before paying
+    // for a root-to-leaf SeekGT. Long duplicate runs fall through to the seek (one seek
+    // clears the whole run); short/unique runs leave via the Ne and never seek, so an
+    // all-distinct index degrades to an emit-on-change walk instead of one full-height
+    // seek per row (~11x worse than the sorter when measured). Ne carries NULLEQ (0x80)
+    // + BINARY collation so a NULL run is one distinct value, matching index key order.
+    let cur_reg = b.alloc_reg();
+    for _ in 0..DISTINCT_LOOSE_SCAN_NEXT_PROBES {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let next_addr = b.current_addr() as i32;
+        // Next jumps to p2 when a next entry exists; falls through at EOF.
+        b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        b.emit_op(Opcode::Column, idx_cursor, 0, cur_reg, P4::None, 0);
+        b.emit_op(
+            Opcode::Ne,
+            probe_key_reg,
+            loop_top,
+            cur_reg,
+            P4::Collation("BINARY".to_owned()),
+            0x80,
+        );
+    }
+    let probe_record_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        probe_key_reg,
+        1,
+        probe_record_reg,
+        P4::None,
+        0,
+    );
+    // No entry beyond the [value] prefix run → the run was the last one → done.
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_record_reg,
+        finalize_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Goto, 0, loop_top, 0, P4::None, 0);
+
+    b.resolve_label(finalize_label);
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
 }
 
 /// Emit `SELECT MIN(col), MAX(col)` over one indexed column as TWO seeks to the two index ends — the

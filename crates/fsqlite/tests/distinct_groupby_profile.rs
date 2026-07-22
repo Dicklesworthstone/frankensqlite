@@ -67,20 +67,29 @@ fn distinct_routing(conn: &Connection, sql: &str) -> &'static str {
 #[ignore = "profile; run under --profile release-perf"]
 fn distinct_groupby_indexed_or_scan() {
     let conn = Connection::open(":memory:").expect("open");
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, u INTEGER);")
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, u INTEGER, h INTEGER);")
         .unwrap();
     conn.execute("CREATE INDEX idx_k ON t(k);").unwrap();
-    // k = few distinct (50) indexed; u = few distinct (50) NOT indexed. Pseudo-shuffled.
+    conn.execute("CREATE INDEX idx_h ON t(h);").unwrap();
+    // k = few distinct (50) indexed; u = few distinct (50) NOT indexed; h = all-distinct
+    // indexed (the loose scan's worst case: one seek per row). Pseudo-shuffled.
     for i in 1..=20_000_i64 {
         let key = (i.wrapping_mul(2_654_435_761) >> 8) % 50;
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, {key}, {key});"))
-            .unwrap();
+        conn.execute(&format!(
+            "INSERT INTO t VALUES ({i}, {key}, {key}, {});",
+            i * 7 % 20_011
+        ))
+        .unwrap();
     }
     let n = 2_000u64;
     let cases = [
         ("scan baseline (WHERE u=7)", "SELECT id FROM t WHERE u = 7"),
         ("DISTINCT k (indexed)", "SELECT DISTINCT k FROM t"),
         ("DISTINCT u (NOT indexed)", "SELECT DISTINCT u FROM t"),
+        (
+            "DISTINCT h (indexed, all-distinct)",
+            "SELECT DISTINCT h FROM t",
+        ),
         ("GROUP BY k (indexed)", "SELECT k FROM t GROUP BY k"),
         ("GROUP BY u (NOT indexed)", "SELECT u FROM t GROUP BY u"),
         (

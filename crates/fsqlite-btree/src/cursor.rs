@@ -14029,10 +14029,15 @@ mod tests {
 
         // Interleaved insert order (value = i % DISTINCT) mirrors the failing
         // `SELECT DISTINCT` workload and exercises natural page splits; each
-        // value's run of PER_VALUE entries spans multiple leaves.
+        // value's run of PER_VALUE entries spans multiple leaves. A leading
+        // NULL run (NULL sorts first in index order) pins the [NULL] prefix
+        // probe — the case the SELECT DISTINCT oracle hangs on.
         for i in 0..DISTINCT * PER_VALUE {
-            let key =
-                serialize_record(&[SqliteValue::Integer(i % DISTINCT), SqliteValue::Integer(i)]);
+            let key = if i % 37 == 0 {
+                serialize_record(&[SqliteValue::Null, SqliteValue::Integer(i)])
+            } else {
+                serialize_record(&[SqliteValue::Integer(i % DISTINCT), SqliteValue::Integer(i)])
+            };
             cursor.index_insert(&cx, &key).unwrap();
         }
 
@@ -14042,46 +14047,47 @@ mod tests {
             "populated index has a first row"
         );
         let mut seen = Vec::new();
-        for _ in 0..=DISTINCT {
+        for _ in 0..=DISTINCT + 1 {
             let payload = cursor.payload(&cx).unwrap();
             let fields = parse_record(&payload).unwrap();
-            let SqliteValue::Integer(v) = fields[0] else {
-                panic!("integer index key expected, got {fields:?}");
-            };
-            seen.push(v);
-            let probe = serialize_record(&[SqliteValue::Integer(v)]);
+            let probe = serialize_record(&fields[..1]);
+            match fields[0] {
+                SqliteValue::Integer(v) => seen.push(v),
+                SqliteValue::Null => seen.push(i64::MIN),
+                ref other => panic!("unexpected index key {other:?}"),
+            }
             cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
             if cursor.eof() {
                 break;
             }
         }
+        let expected: Vec<i64> = std::iter::once(i64::MIN).chain(0..DISTINCT).collect();
         assert_eq!(
-            seen,
-            (0..DISTINCT).collect::<Vec<_>>(),
-            "prefix upper-bound loose scan must visit each distinct value exactly once"
+            seen, expected,
+            "prefix upper-bound loose scan must visit NULL then each distinct value exactly once"
         );
 
         // --- 2-field [value, i64::MAX] sentinel probe (the alternate shape). ---
         assert!(cursor.first(&cx).unwrap());
         let mut seen_sentinel = Vec::new();
-        for _ in 0..=DISTINCT {
+        for _ in 0..=DISTINCT + 1 {
             let payload = cursor.payload(&cx).unwrap();
             let fields = parse_record(&payload).unwrap();
-            let SqliteValue::Integer(v) = fields[0] else {
-                panic!("integer index key expected, got {fields:?}");
-            };
-            seen_sentinel.push(v);
-            let probe =
-                serialize_record(&[SqliteValue::Integer(v), SqliteValue::Integer(i64::MAX)]);
+            let first = fields[0].clone();
+            match first {
+                SqliteValue::Integer(v) => seen_sentinel.push(v),
+                SqliteValue::Null => seen_sentinel.push(i64::MIN),
+                ref other => panic!("unexpected index key {other:?}"),
+            }
+            let probe = serialize_record(&[first, SqliteValue::Integer(i64::MAX)]);
             cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
             if cursor.eof() {
                 break;
             }
         }
         assert_eq!(
-            seen_sentinel,
-            (0..DISTINCT).collect::<Vec<_>>(),
-            "sentinel upper-bound loose scan must visit each distinct value exactly once"
+            seen_sentinel, expected,
+            "sentinel upper-bound loose scan must visit NULL then each distinct value exactly once"
         );
     }
 
