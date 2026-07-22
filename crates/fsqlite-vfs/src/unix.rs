@@ -82,6 +82,7 @@ fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> io::Result
     })
 }
 
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
 fn read_owned_at(file: Arc<File>, len: usize, offset: u64) -> io::Result<(Vec<u8>, usize)> {
     let mut data = vec![0_u8; len];
     let mut total = 0_usize;
@@ -97,6 +98,7 @@ fn read_owned_at(file: Arc<File>, len: usize, offset: u64) -> io::Result<(Vec<u8
     Ok((data, total))
 }
 
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
 fn write_owned_at(file: Arc<File>, data: Vec<u8>, offset: u64) -> io::Result<()> {
     let mut total = 0_usize;
     while total < data.len() {

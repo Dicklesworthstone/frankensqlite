@@ -1585,12 +1585,13 @@ mod tests {
         let payload = b"hello async vfs";
         let waker = Waker::noop();
         let mut task_cx = Context::from_waker(waker);
-        let mut write = std::pin::pin!(file.write_async(&cx, payload, 0));
-        assert!(matches!(
-            write.as_mut().poll(&mut task_cx),
-            Poll::Ready(Ok(()))
-        ));
-        drop(write);
+        {
+            let mut write = std::pin::pin!(file.write_async(&cx, payload, 0));
+            assert!(matches!(
+                write.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(()))
+            ));
+        }
 
         let mut buf = [0u8; 15];
         {
@@ -1603,12 +1604,13 @@ mod tests {
         assert_eq!(&buf, payload);
 
         let writes: &[(u64, &[u8])] = &[(0, b"real"), (8, b"batch")];
-        let mut batch = std::pin::pin!(file.write_page_batch_async(&cx, writes));
-        assert!(matches!(
-            batch.as_mut().poll(&mut task_cx),
-            Poll::Ready(Ok(()))
-        ));
-        drop(batch);
+        {
+            let mut batch = std::pin::pin!(file.write_page_batch_async(&cx, writes));
+            assert!(matches!(
+                batch.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(()))
+            ));
+        }
 
         let mut batch_buf = [0_u8; 13];
         {
