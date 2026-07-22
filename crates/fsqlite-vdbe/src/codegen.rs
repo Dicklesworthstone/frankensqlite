@@ -19776,11 +19776,6 @@ pub fn codegen_delete(
 // leading declared columns in declared order; other shapes are rejected with a
 // clear "not yet supported" error rather than silently mis-ordering.
 
-/// Resolve the WITHOUT ROWID primary-key column indices, in PRIMARY KEY order.
-///
-/// Returns the declared table-column index of each PK column. Errors if the
-/// table has no PRIMARY KEY, or if the PK is not the leading declared columns
-/// (a shape the declared-order storage model cannot represent today).
 /// Position a WITHOUT ROWID table cursor on the row referenced by the current
 /// entry of a secondary-index cursor (bd-rjaff).
 ///
@@ -19831,7 +19826,12 @@ fn emit_without_rowid_index_to_table_seek(
     );
 }
 
-fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
+/// Resolve the WITHOUT ROWID primary-key column indices, in PRIMARY KEY order.
+///
+/// Returns the declared table-column index of each PK column. Errors if the
+/// table has no PRIMARY KEY, or if the PK is not the leading declared columns
+/// (a shape the declared-order storage model cannot represent today).
+pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
     let pk_group = table.primary_key_constraints.first().ok_or_else(|| {
         CodegenError::Unsupported(format!(
             "WITHOUT ROWID table {} has no PRIMARY KEY",

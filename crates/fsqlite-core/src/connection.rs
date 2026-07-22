@@ -150,7 +150,7 @@ use fsqlite_vdbe::codegen::{
     CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert, codegen_select,
-    codegen_update, emit_backfill_key_expr, emit_scan_filter,
+    codegen_update, emit_backfill_key_expr, emit_scan_filter, without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -43195,6 +43195,12 @@ impl Connection {
         } else {
             idx_col_positions.len()
         };
+        let without_rowid_pk = table
+            .without_rowid
+            .then(|| without_rowid_pk_indices(table).map_err(codegen_error_to_franken))
+            .transpose()?;
+        let n_row_locator_cols = without_rowid_pk.as_ref().map_or(1, Vec::len);
+        let n_record_cols = n_idx_cols + n_row_locator_cols;
         let mut b = ProgramBuilder::new();
         let halt_label = b.emit_label();
         let loop_label = b.emit_label();
@@ -43225,8 +43231,9 @@ impl Connection {
             emit_scan_filter(&mut b, predicate, 0, table, next_label);
         }
 
-        // Allocate registers for index key: (indexed_cols..., rowid).
-        let key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
+        // Rowid tables append the rowid. WITHOUT ROWID tables append every
+        // PRIMARY KEY column in declared PK order, matching ordinary DML.
+        let key_regs = b.alloc_regs(n_record_cols as i32);
 
         if is_expression_index {
             // Expression index: evaluate each key expression against cursor 0.
@@ -43247,16 +43254,29 @@ impl Connection {
             }
         }
 
-        // Read rowid.
-        let rowid_reg = key_regs + n_idx_cols as i32;
-        b.emit_op(Opcode::Rowid, 0, rowid_reg, 0, P4::None, 0);
+        if let Some(pk_indices) = without_rowid_pk.as_deref() {
+            for (pk_pos, &col_idx) in pk_indices.iter().enumerate() {
+                b.emit_op(
+                    Opcode::Column,
+                    0,
+                    col_idx as i32,
+                    key_regs + (n_idx_cols + pk_pos) as i32,
+                    P4::None,
+                    0,
+                );
+            }
+        } else {
+            let rowid_reg = key_regs + n_idx_cols as i32;
+            b.emit_op(Opcode::Rowid, 0, rowid_reg, 0, P4::None, 0);
+        }
 
-        // MakeRecord from (cols..., rowid).
+        // Pack (index terms..., row locator). Unique checks intentionally use
+        // only `n_idx_cols` below, never the PK suffix.
         let rec_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             key_regs,
-            (n_idx_cols + 1) as i32,
+            n_record_cols as i32,
             rec_reg,
             P4::None,
             0,
@@ -130747,6 +130767,126 @@ mod without_rowid_runtime_tests {
             vec![
                 vec![SqliteValue::Integer(2), SqliteValue::Text("B".into())],
                 vec![SqliteValue::Integer(3), SqliteValue::Text("c".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_create_index_backfill_uses_primary_key_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_index_backfill.db");
+
+        {
+            let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+            conn.execute(
+                "CREATE TABLE wr (key TEXT PRIMARY KEY, payload TEXT) WITHOUT ROWID;
+                 INSERT INTO wr VALUES ('key-c', 'kept'), ('key-a', 'alpha'), ('key-b', 'kept');
+                 CREATE INDEX wr_payload_idx ON wr(payload);",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let rows = sqlite
+            .prepare(
+                "SELECT payload, key
+                 FROM wr INDEXED BY wr_payload_idx
+                 ORDER BY payload, key;",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("alpha".to_owned(), "key-a".to_owned()),
+                ("kept".to_owned(), "key-b".to_owned()),
+                ("kept".to_owned(), "key-c".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_create_index_backfill_preserves_composite_pk_order_and_unique_arity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_composite_index_backfill.db");
+
+        {
+            let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+            conn.execute(
+                "CREATE TABLE wr (
+                     tenant TEXT,
+                     item TEXT,
+                     payload TEXT,
+                     PRIMARY KEY(tenant, item)
+                 ) WITHOUT ROWID;
+                 INSERT INTO wr VALUES
+                     ('tenant-b', 'item-1', 'same'),
+                     ('tenant-a', 'item-2', 'same'),
+                     ('tenant-a', 'item-1', 'other');
+                 CREATE INDEX wr_payload_idx ON wr(payload);",
+            )
+            .unwrap();
+
+            let err = conn
+                .execute("CREATE UNIQUE INDEX wr_payload_unique ON wr(payload);")
+                .unwrap_err();
+            assert!(
+                matches!(err, FrankenError::UniqueViolation { .. }),
+                "the PK suffix must not make duplicate index terms unique: {err:?}"
+            );
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let rows = sqlite
+            .prepare(
+                "SELECT payload, tenant, item
+                 FROM wr INDEXED BY wr_payload_idx
+                 ORDER BY payload, tenant, item;",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "other".to_owned(),
+                    "tenant-a".to_owned(),
+                    "item-1".to_owned(),
+                ),
+                (
+                    "same".to_owned(),
+                    "tenant-a".to_owned(),
+                    "item-2".to_owned(),
+                ),
+                (
+                    "same".to_owned(),
+                    "tenant-b".to_owned(),
+                    "item-1".to_owned(),
+                ),
             ]
         );
     }
