@@ -49,6 +49,12 @@ no breaking API changes.
   schema, including `WITHOUT ROWID` `_idx`/`_config` tables and the
   contentless-delete `_docsize.origin` column. Cross-engine regressions reopen
   the resulting image with stock SQLite and verify integrity and MATCH results.
+- Schema reload now preserves the authoritative contentless FTS5 definition
+  when a legacy database also contains a stale same-name implicit-content
+  schema row whose required `_content` shadow is absent. Inserts after repair
+  retain the correct shadow layout and remain searchable across a second open,
+  fixing CASS legacy-schema repair without weakening strict rejection of a
+  genuinely missing content shadow.
 
 ### Release
 
