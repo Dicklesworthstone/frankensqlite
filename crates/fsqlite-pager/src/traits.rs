@@ -26,8 +26,8 @@ use fsqlite_vfs::UnixVfs;
 #[cfg(all(feature = "native", target_os = "windows"))]
 use fsqlite_vfs::WindowsVfs;
 use fsqlite_wal::{
-    TransactionConflictPageBaseline, TransactionConflictSnapshot, WalGenerationIdentity,
-    checksum::WalChecksumTransform,
+    ParallelWalCommitCertificate, TransactionConflictPageBaseline, TransactionConflictSnapshot,
+    WalGenerationIdentity, checksum::WalChecksumTransform,
 };
 
 // ---------------------------------------------------------------------------
@@ -250,6 +250,45 @@ pub trait WalBackend: Send + Sync {
     ) -> Result<()> {
         let frame_refs = prepared.frame_refs();
         self.append_frames(cx, &frame_refs)
+    }
+
+    /// Append the certificate proof that authorizes the next WAL frame
+    /// interval. Implementations must bind the record to their current WAL
+    /// generation and make it durable when `sync` is true.
+    ///
+    /// `sync` is the transaction's existing WAL synchronous policy. `false`
+    /// preserves SQLite-style synchronous-OFF semantics: the ordered VFS write
+    /// must precede the WAL marker write, but neither write claims stable-media
+    /// survival across power loss. The receipt is therefore policy-relative,
+    /// never a stronger persistence guarantee than the matching WAL commit.
+    ///
+    /// The record is written before the interval's commit marker. A crash may
+    /// therefore leave an orphan certificate, which recovery must ignore
+    /// unless the matching generation, complete interval, and commit marker
+    /// are all present.
+    fn persist_parallel_wal_commit_certificate(
+        &mut self,
+        _cx: &Cx,
+        _certificate: &ParallelWalCommitCertificate,
+        _wal_frame_start: u64,
+        _wal_frame_end: u64,
+        _sync: bool,
+    ) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    /// Return the newest durable certificate whose sidecar record is
+    /// authorized by this backend's live WAL generation, complete frame
+    /// boundary, and commit marker.
+    ///
+    /// File-backed implementations use this under the existing writer gate to
+    /// seed process-local combiner clocks before assigning another interval.
+    /// Backends without a cross-process durable namespace have no seed.
+    fn latest_authorized_parallel_wal_commit_certificate(
+        &mut self,
+        _cx: &Cx,
+    ) -> Result<Option<ParallelWalCommitCertificate>> {
+        Ok(None)
     }
 
     /// Look up the latest version of a page in the current visible WAL snapshot.

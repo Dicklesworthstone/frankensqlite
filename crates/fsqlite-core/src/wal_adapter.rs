@@ -30,6 +30,7 @@ use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksu
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget,
+    ParallelWalCommitCertificate, ParallelWalDurableCertificateRecord,
     TransactionConflictPageBaseline, TransactionConflictSnapshot, WAL_HEADER_SIZE, WalFile,
     WalGenerationIdentity, WalHeader, WalSalts, execute_checkpoint, validate_wal_header_checksum,
 };
@@ -1637,6 +1638,288 @@ where
         }
         Ok(())
     }
+
+    fn certificate_sidecar_path(&self) -> PathBuf {
+        let mut path = self.wal_path.as_os_str().to_owned();
+        path.push("-cert");
+        PathBuf::from(path)
+    }
+
+    fn certificate_checkpoint_handoff_path(&self) -> PathBuf {
+        let mut path = self.wal_path.as_os_str().to_owned();
+        path.push("-cert-head");
+        PathBuf::from(path)
+    }
+
+    fn append_durable_certificate_record(
+        &self,
+        cx: &Cx,
+        certificate: &ParallelWalCommitCertificate,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        sync: bool,
+    ) -> Result<()> {
+        let expected_frame_start = u64::try_from(self.inner.frame_count())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if wal_frame_start != expected_frame_start {
+            return Err(FrankenError::internal(format!(
+                "parallel WAL certificate starts at frame {wal_frame_start}, expected {expected_frame_start}"
+            )));
+        }
+        let record = ParallelWalDurableCertificateRecord::new(
+            self.inner.inner().generation_identity(),
+            wal_frame_start,
+            wal_frame_end,
+            certificate.clone(),
+        )
+        .map_err(|error| {
+            FrankenError::internal(format!(
+                "could not encode parallel WAL durability certificate: {error}"
+            ))
+        })?;
+        let record_bytes = record.to_bytes();
+        let certificate_path = self.certificate_sidecar_path();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
+        let append_offset = file.file_size(cx)?;
+        let write_result = file.write(cx, &record_bytes, append_offset);
+        // Match the WAL's configured synchronous policy exactly. Even when
+        // `sync` is false, this ordered sidecar write precedes the WAL marker;
+        // neither write then claims power-loss-stable persistence.
+        let sync_result = if write_result.is_ok() && sync {
+            file.sync(cx, SyncFlags::NORMAL)
+        } else {
+            Ok(())
+        };
+        let close_result = file.close(cx);
+        write_result?;
+        sync_result?;
+        close_result
+    }
+
+    fn persist_checkpoint_certificate_handoff(
+        &self,
+        cx: &Cx,
+        record: &ParallelWalDurableCertificateRecord,
+    ) -> Result<()> {
+        let handoff_path = self.certificate_checkpoint_handoff_path();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut file, _) = self.vfs.open(cx, Some(&handoff_path), flags)?;
+        let record_bytes = record.to_bytes();
+        let truncate_result = file.truncate(cx, 0);
+        let write_result = if truncate_result.is_ok() {
+            file.write(cx, &record_bytes, 0)
+        } else {
+            Ok(())
+        };
+        let sync_result = if truncate_result.is_ok() && write_result.is_ok() {
+            file.sync(cx, SyncFlags::NORMAL)
+        } else {
+            Ok(())
+        };
+        let close_result = file.close(cx);
+        truncate_result?;
+        write_result?;
+        sync_result?;
+        close_result
+    }
+
+    fn checkpoint_certificate_handoff(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<ParallelWalCommitCertificate>> {
+        const MAX_CERTIFICATE_HANDOFF_SIZE: usize = 64 * 1024;
+
+        let handoff_path = self.certificate_checkpoint_handoff_path();
+        if !self.vfs.access(cx, &handoff_path, AccessFlags::EXISTS)? {
+            return Ok(None);
+        }
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+        let (mut file, _) = self.vfs.open(cx, Some(&handoff_path), flags)?;
+        let read_result = (|| -> Result<Option<ParallelWalCommitCertificate>> {
+            let file_size =
+                usize::try_from(file.file_size(cx)?).map_err(|_| FrankenError::WalCorrupt {
+                    detail: "parallel WAL checkpoint certificate handoff exceeds usize".to_owned(),
+                })?;
+            if file_size == 0 || file_size > MAX_CERTIFICATE_HANDOFF_SIZE {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "parallel WAL checkpoint certificate handoff has invalid size {file_size}"
+                    ),
+                });
+            }
+            let mut bytes = vec![0_u8; file_size];
+            let bytes_read = file.read(cx, &mut bytes, 0)?;
+            if bytes_read != bytes.len() {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "parallel WAL checkpoint certificate handoff was short-read".to_owned(),
+                });
+            }
+            let record =
+                ParallelWalDurableCertificateRecord::from_bytes(&bytes).map_err(|error| {
+                    FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL checkpoint certificate handoff is invalid: {error}"
+                        ),
+                    }
+                })?;
+            Ok(Some(record.certificate))
+        })();
+        let close_result = file.close(cx);
+        match (read_result, close_result) {
+            (Ok(certificate), Ok(())) => Ok(certificate),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(read_error), Err(close_error)) => Err(FrankenError::internal(format!(
+                "parallel WAL checkpoint handoff read failed and close also failed: read={read_error}; close={close_error}"
+            ))),
+        }
+    }
+
+    fn latest_authorized_durable_certificate_record(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<ParallelWalDurableCertificateRecord>> {
+        const MAX_CERTIFICATE_RECORD_SIZE: usize = 64 * 1024;
+        const MAX_ORPHAN_TAIL_LOOKBACK: usize = 64;
+
+        let certificate_path = self.certificate_sidecar_path();
+        if !self
+            .vfs
+            .access(cx, &certificate_path, AccessFlags::EXISTS)?
+        {
+            return Ok(None);
+        }
+        let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+        let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
+        let read_result = (|| -> Result<Option<ParallelWalDurableCertificateRecord>> {
+            let file_size = file.file_size(cx)?;
+            if file_size == 0 {
+                return Ok(None);
+            }
+            let footer_size =
+                u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
+            let valid_frame_count = u64::try_from(self.inner.frame_count()).unwrap_or(u64::MAX);
+            let wal_generation = self.inner.inner().generation_identity();
+            let mut cursor = file_size;
+            for lookback in 0..MAX_ORPHAN_TAIL_LOOKBACK {
+                if cursor == 0 {
+                    return Ok(None);
+                }
+                if cursor < footer_size {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate sidecar has a torn length footer at offset {cursor}"
+                        ),
+                    });
+                }
+                let mut footer = [0_u8; ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE];
+                let footer_offset = cursor - footer_size;
+                let footer_bytes = file.read(cx, &mut footer, footer_offset)?;
+                if footer_bytes != footer.len() {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate sidecar length footer at offset {footer_offset} was short-read"
+                        ),
+                    });
+                }
+                let record_len = usize::try_from(u32::from_le_bytes(footer)).map_err(|_| {
+                    FrankenError::WalCorrupt {
+                        detail: "parallel WAL certificate record length exceeds usize".to_owned(),
+                    }
+                })?;
+                if record_len > MAX_CERTIFICATE_RECORD_SIZE {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate record length {record_len} exceeds bounded maximum {MAX_CERTIFICATE_RECORD_SIZE}"
+                        ),
+                    });
+                }
+                let record_len_u64 =
+                    u64::try_from(record_len).map_err(|_| FrankenError::WalCorrupt {
+                        detail: "parallel WAL certificate record length exceeds u64".to_owned(),
+                    })?;
+                if record_len_u64 > cursor {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate tail declares {record_len} bytes before offset {cursor}"
+                        ),
+                    });
+                }
+                let record_offset = cursor - record_len_u64;
+                let mut record_bytes = vec![0_u8; record_len];
+                let bytes_read = file.read(cx, &mut record_bytes, record_offset)?;
+                if bytes_read != record_bytes.len() {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate record at offset {record_offset} was short-read"
+                        ),
+                    });
+                }
+                let record = ParallelWalDurableCertificateRecord::from_bytes(&record_bytes)
+                    .map_err(|error| FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate record at offset {record_offset} is invalid: {error}"
+                        ),
+                    })?;
+                // Append order is generation order. Once the newest tail
+                // belongs to a prior reset generation, no earlier sidecar
+                // record can authorize the current WAL; checkpoint clock
+                // continuation comes from the fixed handoff anchor instead.
+                if record.wal_generation != wal_generation {
+                    return Ok(None);
+                }
+                let frame_index =
+                    usize::try_from(record.wal_frame_end.saturating_sub(1)).map_err(|_| {
+                        FrankenError::WalCorrupt {
+                            detail: "parallel WAL certificate commit-marker index exceeds usize"
+                                .to_owned(),
+                        }
+                    })?;
+                let commit_marker_frame = if frame_index < self.inner.frame_count()
+                    && self
+                        .inner
+                        .inner()
+                        .read_frame_header(cx, frame_index)?
+                        .is_commit()
+                {
+                    record.wal_frame_end
+                } else {
+                    0
+                };
+                if record.authorizes_wal_boundary(
+                    wal_generation,
+                    valid_frame_count,
+                    commit_marker_frame,
+                ) {
+                    return Ok(Some(record));
+                }
+
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    orphan_certificate_epoch = record.certificate.certificate_epoch,
+                    orphan_commit_seq_hi = record.certificate.commit_seq_hi.get(),
+                    orphan_wal_frame_end = record.wal_frame_end,
+                    lookback = lookback.saturating_add(1),
+                    "ignored unauthorized parallel WAL certificate tail"
+                );
+                cursor = record_offset;
+            }
+            Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "parallel WAL certificate sidecar exceeded bounded orphan lookback {MAX_ORPHAN_TAIL_LOOKBACK}"
+                ),
+            })
+        })();
+        let close_result = file.close(cx);
+        match (read_result, close_result) {
+            (Ok(certificate), Ok(())) => Ok(certificate),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(read_error), Err(close_error)) => Err(FrankenError::internal(format!(
+                "parallel WAL certificate tail read failed and close also failed: read={read_error}; close={close_error}"
+            ))),
+        }
+    }
 }
 
 impl<V> WalBackend for PathRefreshingWalBackend<V>
@@ -1703,6 +1986,35 @@ where
         self.inner.append_prepared_frames(cx, prepared)
     }
 
+    fn persist_parallel_wal_commit_certificate(
+        &mut self,
+        cx: &Cx,
+        certificate: &ParallelWalCommitCertificate,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        sync: bool,
+    ) -> Result<()> {
+        self.ensure_current_wal_path(cx)?;
+        self.append_durable_certificate_record(
+            cx,
+            certificate,
+            wal_frame_start,
+            wal_frame_end,
+            sync,
+        )
+    }
+
+    fn latest_authorized_parallel_wal_commit_certificate(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ParallelWalCommitCertificate>> {
+        self.ensure_current_wal_path(cx)?;
+        if let Some(record) = self.latest_authorized_durable_certificate_record(cx)? {
+            return Ok(Some(record.certificate));
+        }
+        self.checkpoint_certificate_handoff(cx)
+    }
+
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
         self.ensure_current_wal_path(cx)?;
         self.inner.read_page(cx, page_number)
@@ -1760,8 +2072,19 @@ where
         oldest_reader_frame: Option<u32>,
     ) -> Result<CheckpointResult> {
         self.ensure_current_wal_path(cx)?;
-        self.inner
-            .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+        let checkpoint_handoff = self.latest_authorized_durable_certificate_record(cx)?;
+        let result =
+            self.inner
+                .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)?;
+        if result.wal_was_reset
+            && let Some(record) = checkpoint_handoff
+        {
+            // Preserve the last consumed certificate clock across the WAL
+            // generation reset. The checkpoint implementation has already
+            // synced the database image before reporting a successful reset.
+            self.persist_checkpoint_certificate_handoff(cx, &record)?;
+        }
+        Ok(result)
     }
 }
 
@@ -1944,6 +2267,290 @@ mod tests {
         };
         replace_path_visible_wal(vfs, cx);
         (backend, snapshot, page_two)
+    }
+
+    #[test]
+    fn durable_certificate_sidecar_precedes_and_reconstructs_wal_commit() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            std::path::Path::new("test.db"),
+            std::path::Path::new("test.db-wal"),
+            PAGE_SIZE,
+            wal,
+            true,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            None,
+        );
+        let mut certificate = ParallelWalCommitCertificate {
+            format_version: fsqlite_wal::PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
+            residue: fsqlite_wal::ParallelWalOrderedResidue::CommitCertificateThenPublish,
+            certificate_epoch: 1,
+            commit_seq_lo: fsqlite_types::CommitSeq::new(1),
+            commit_seq_hi: fsqlite_types::CommitSeq::new(1),
+            durable_segment_epoch: 1,
+            lane_count: 1,
+            lane_record_counts: vec![1],
+            db_size_pages: 1,
+            page_set_size: 1,
+            certificate_crc32c: 0,
+            fallback_active: false,
+        };
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .expect("persist certificate before WAL commit marker");
+        assert_eq!(
+            backend.inner.frame_count(),
+            0,
+            "certificate persistence must not itself expose a WAL commit marker"
+        );
+
+        let certificate_path = std::path::Path::new("test.db-wal-cert");
+        let (mut certificate_file, _) = vfs
+            .open(
+                &cx,
+                Some(certificate_path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+            )
+            .expect("open certificate sidecar");
+        let certificate_len = usize::try_from(
+            certificate_file
+                .file_size(&cx)
+                .expect("certificate sidecar size"),
+        )
+        .expect("certificate sidecar size fits usize");
+        let mut record_bytes = vec![0_u8; certificate_len];
+        assert_eq!(
+            certificate_file
+                .read(&cx, &mut record_bytes, 0)
+                .expect("read certificate sidecar"),
+            certificate_len
+        );
+        certificate_file
+            .close(&cx)
+            .expect("close certificate sidecar");
+        let reconstructed = ParallelWalDurableCertificateRecord::from_bytes(&record_bytes)
+            .expect("reconstruct durable certificate record");
+        assert_eq!(reconstructed.certificate, certificate);
+        assert_eq!(reconstructed.wal_frame_start, 1);
+        assert_eq!(reconstructed.wal_frame_end, 1);
+        assert_eq!(
+            reconstructed.wal_generation,
+            backend.inner.inner().generation_identity()
+        );
+        assert!(
+            !reconstructed.authorizes_wal_boundary(
+                backend.inner.inner().generation_identity(),
+                0,
+                0,
+            ),
+            "orphan certificate must not authorize visibility before the matching commit marker"
+        );
+
+        backend
+            .append_frame(&cx, 1, &sample_page(0x44), 1)
+            .expect("append matching WAL commit marker");
+        backend.sync(&cx).expect("sync WAL commit marker");
+        assert!(
+            backend
+                .inner
+                .inner()
+                .read_frame_header(&cx, 0)
+                .expect("read matching WAL commit frame")
+                .is_commit()
+        );
+        assert!(reconstructed.authorizes_wal_boundary(
+            backend.inner.inner().generation_identity(),
+            1,
+            1,
+        ));
+
+        let (mut certificate_file, _) = vfs
+            .open(
+                &cx,
+                Some(certificate_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+            )
+            .expect("reopen certificate sidecar");
+        let torn_offset = certificate_file
+            .file_size(&cx)
+            .expect("certificate sidecar size before torn tail");
+        certificate_file
+            .write(&cx, &[0xA5], torn_offset)
+            .expect("append torn footer byte");
+        certificate_file
+            .close(&cx)
+            .expect("close sidecar with torn tail");
+        assert!(matches!(
+            backend.latest_authorized_parallel_wal_commit_certificate(&cx),
+            Err(FrankenError::WalCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn two_backend_instances_continue_authorized_certificate_clocks() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create shared WAL");
+        let mut first_backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            std::path::Path::new("test.db"),
+            std::path::Path::new("test.db-wal"),
+            PAGE_SIZE,
+            wal,
+            true,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            None,
+        );
+        let request = |batch_id| fsqlite_wal::ParallelWalDurabilityRequest {
+            trace_id: batch_id,
+            scenario_id: "two-instance-continuity".to_owned(),
+            certificate_epoch: 0,
+            durable_segment_epoch: 0,
+            batch_size: 1,
+            batch_ids: vec![batch_id],
+            lane_record_counts: vec![1],
+            db_size_pages: 1,
+            page_set_size: 1,
+            control_mode: fsqlite_wal::ParallelWalOperatingMode::Auto,
+            fallback_reason: None,
+            checkpoint_active: false,
+        };
+
+        let first_combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        let first_page = sample_page(0x51);
+        let first_receipt = first_combiner
+            .certify_and_publish(request(1), |certificate| {
+                first_backend
+                    .persist_parallel_wal_commit_certificate(&cx, certificate, 1, 1, true)
+                    .and_then(|()| first_backend.append_frame(&cx, 1, &first_page, 1))
+                    .and_then(|()| first_backend.sync(&cx))
+                    .map_err(|error| error.to_string())
+            })
+            .expect("first backend publishes certificate");
+
+        let second_wal =
+            WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("second backend opens shared WAL");
+        let mut second_backend = PathRefreshingWalBackend::new(
+            vfs.clone(),
+            std::path::Path::new("test.db"),
+            std::path::Path::new("test.db-wal"),
+            PAGE_SIZE,
+            second_wal,
+            true,
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            None,
+        );
+
+        // Simulate a crash after certificate durability but before its WAL
+        // commit marker. Bounded tail lookup must step over this well-formed
+        // orphan and recover the preceding authorized seed.
+        let orphan_combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        orphan_combiner
+            .reconcile_authorized_seed(&first_receipt.certificate)
+            .expect("seed orphan-producing process");
+        let orphan_receipt = orphan_combiner
+            .certify_and_publish(request(99), |_| Ok(()))
+            .expect("construct deterministic orphan certificate");
+        second_backend
+            .persist_parallel_wal_commit_certificate(&cx, &orphan_receipt.certificate, 2, 2, true)
+            .expect("persist well-formed orphan certificate tail");
+        let authorized_seed = second_backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .expect("second backend performs bounded orphan lookback")
+            .expect("preceding first certificate remains authorized");
+        assert_eq!(authorized_seed, first_receipt.certificate);
+
+        let second_combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        second_combiner
+            .reconcile_authorized_seed(&authorized_seed)
+            .expect("seed second process-local combiner");
+        let second_page = sample_page(0x52);
+        let second_receipt = second_combiner
+            .certify_and_publish(request(2), |certificate| {
+                second_backend
+                    .persist_parallel_wal_commit_certificate(&cx, certificate, 2, 2, true)
+                    .and_then(|()| second_backend.append_frame(&cx, 1, &second_page, 1))
+                    .and_then(|()| second_backend.sync(&cx))
+                    .map_err(|error| error.to_string())
+            })
+            .expect("second backend publishes certificate");
+
+        assert_eq!(
+            second_receipt.certificate.commit_seq_lo.get(),
+            first_receipt.certificate.commit_seq_hi.get() + 1
+        );
+        assert_eq!(
+            second_receipt.certificate.certificate_epoch,
+            first_receipt.certificate.certificate_epoch + 1
+        );
+        assert_eq!(
+            second_receipt.certificate, orphan_receipt.certificate,
+            "continuation may reuse an orphan identity but must not overlap any authorized certificate"
+        );
+        let latest = second_backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .expect("read second bounded authorized tail")
+            .expect("second certificate is authorized");
+        assert_eq!(latest, second_receipt.certificate);
+
+        let generation_before_checkpoint = second_backend.inner.inner().generation_identity();
+        let mut checkpoint_writer = MockCheckpointPageWriter;
+        let checkpoint = second_backend
+            .checkpoint(
+                &cx,
+                CheckpointMode::Truncate,
+                &mut checkpoint_writer,
+                0,
+                None,
+            )
+            .expect("truncate checkpoint records certificate clock handoff");
+        assert!(checkpoint.wal_was_reset);
+        assert_ne!(
+            second_backend.inner.inner().generation_identity(),
+            generation_before_checkpoint
+        );
+        let checkpoint_seed = second_backend
+            .latest_authorized_parallel_wal_commit_certificate(&cx)
+            .expect("read checkpoint certificate clock handoff")
+            .expect("reset generation retains the last consumed certificate clock");
+        assert_eq!(checkpoint_seed, second_receipt.certificate);
+
+        let post_checkpoint_combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        post_checkpoint_combiner
+            .reconcile_authorized_seed(&checkpoint_seed)
+            .expect("seed fresh post-checkpoint combiner");
+        let post_checkpoint_page = sample_page(0x53);
+        let post_checkpoint_receipt = post_checkpoint_combiner
+            .certify_and_publish(request(3), |certificate| {
+                second_backend
+                    .persist_parallel_wal_commit_certificate(&cx, certificate, 1, 1, true)
+                    .and_then(|()| second_backend.append_frame(&cx, 1, &post_checkpoint_page, 1))
+                    .and_then(|()| second_backend.sync(&cx))
+                    .map_err(|error| error.to_string())
+            })
+            .expect("publish first certificate in reset WAL generation");
+        assert_eq!(
+            post_checkpoint_receipt.certificate.commit_seq_lo.get(),
+            second_receipt.certificate.commit_seq_hi.get() + 1
+        );
+        assert_eq!(
+            post_checkpoint_receipt.certificate.certificate_epoch,
+            second_receipt.certificate.certificate_epoch + 1
+        );
+        assert_eq!(
+            second_backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .expect("read post-checkpoint current-generation certificate")
+                .expect("post-checkpoint certificate is authorized"),
+            post_checkpoint_receipt.certificate
+        );
     }
 
     fn open_wal_file(vfs: &MemoryVfs, cx: &Cx) -> <MemoryVfs as Vfs>::File {

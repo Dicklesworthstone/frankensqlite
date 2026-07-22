@@ -26,7 +26,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(not(target_arch = "wasm32"))]
 use asupersync::runtime::{BlockingTaskHandle, RuntimeHandle};
@@ -37,6 +37,7 @@ use crate::per_core_buffer::{
     AppendOutcome, BufferConfig, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig, EpochFlushBatch,
     EpochOrderCoordinator, WalRecord, thread_buffer_slot,
 };
+use crate::wal::WalGenerationIdentity;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -148,6 +149,14 @@ pub const PARALLEL_WAL_COMPATIBILITY_SELECTOR: &str = "wal_invariant,integrity_c
 pub const PARALLEL_WAL_STAGE_SCENARIO_ID: &str = "parallel_wal_lane_stage";
 /// Structured-log scenario id for flush-time lane telemetry.
 pub const PARALLEL_WAL_FLUSH_SCENARIO_ID: &str = "parallel_wal_lane_flush";
+/// Structured-log scenario id for the ordered durability/publication residue.
+pub const PARALLEL_WAL_PUBLICATION_SCENARIO_ID: &str = "parallel_wal_publication";
+/// Stable on-disk schema version for commit-certificate canonical bytes.
+pub const PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION: u16 = 1;
+/// Stable envelope version for append-only durable certificate records.
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION: u16 = 2;
+/// Magic prefix for one record in the `-wal-cert` sidecar.
+pub const PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC: [u8; 8] = *b"FSQLCERT";
 /// Lane ids and commit-certificate lane counts are stored as `u16`, so keep
 /// both the count and every generated id representable.
 const MAX_PARALLEL_WAL_LANE_COUNT: usize = 65_535;
@@ -499,18 +508,1210 @@ pub struct ParallelWalCommitCertificate {
     pub fallback_active: bool,
 }
 
+impl ParallelWalCommitCertificate {
+    /// Canonical semantics-bearing bytes covered by `certificate_crc32c`.
+    ///
+    /// The checksum field itself is deliberately excluded. Integer fields use
+    /// little-endian encoding, and the lane cardinalities remain in lane-id
+    /// order, so the same certificate has identical bytes on every target.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            2 + 1 + 8 * 4 + 2 + 4 + self.lane_record_counts.len() * 4 + 4 * 2 + 1,
+        );
+        bytes.extend_from_slice(&self.format_version.to_le_bytes());
+        bytes.push(match self.residue {
+            ParallelWalOrderedResidue::CommitCertificateThenPublish => 1,
+        });
+        bytes.extend_from_slice(&self.certificate_epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.commit_seq_lo.get().to_le_bytes());
+        bytes.extend_from_slice(&self.commit_seq_hi.get().to_le_bytes());
+        bytes.extend_from_slice(&self.durable_segment_epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.lane_count.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(self.lane_record_counts.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        for record_count in &self.lane_record_counts {
+            bytes.extend_from_slice(&record_count.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.db_size_pages.to_le_bytes());
+        bytes.extend_from_slice(&self.page_set_size.to_le_bytes());
+        bytes.push(u8::from(self.fallback_active));
+        bytes
+    }
+
+    #[must_use]
+    pub fn computed_crc32c(&self) -> u32 {
+        crc32c::crc32c(&self.canonical_bytes())
+    }
+
+    #[must_use]
+    pub fn checksum_is_valid(&self) -> bool {
+        self.certificate_crc32c == self.computed_crc32c()
+    }
+}
+
+/// Append-only proof record binding a certificate to one stock-WAL generation
+/// and closed frame interval.
+///
+/// A durable record is authorization, not sufficient evidence by itself.
+/// Recovery must also find the matching generation, complete frame interval,
+/// and valid commit marker before treating the certificate as committed. This
+/// makes a certificate written just before a crash a harmless orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalDurableCertificateRecord {
+    pub wal_generation: WalGenerationIdentity,
+    /// One-based first WAL frame covered by this certificate.
+    pub wal_frame_start: u64,
+    /// One-based final (commit-marker) WAL frame covered by this certificate.
+    pub wal_frame_end: u64,
+    pub certificate: ParallelWalCommitCertificate,
+}
+
+impl ParallelWalDurableCertificateRecord {
+    const FIXED_PREFIX_SIZE: usize = 8 + 2 + 4 + 4 + 4 + 4 + 8 + 8;
+    const MIN_CERTIFICATE_SIZE: usize = 2 + 1 + 8 * 4 + 2 + 4 + 4 + 4 + 1 + 4;
+    const ENVELOPE_CRC_SIZE: usize = 4;
+    /// Duplicate record length stored at the tail for bounded latest-record
+    /// lookup without scanning the append-only sidecar.
+    pub const LENGTH_FOOTER_SIZE: usize = 4;
+
+    pub fn new(
+        wal_generation: WalGenerationIdentity,
+        wal_frame_start: u64,
+        wal_frame_end: u64,
+        certificate: ParallelWalCommitCertificate,
+    ) -> Result<Self, String> {
+        if wal_frame_start == 0 || wal_frame_end < wal_frame_start {
+            return Err(format!(
+                "invalid durable certificate WAL frame interval {wal_frame_start}..={wal_frame_end}"
+            ));
+        }
+        if !certificate.checksum_is_valid() {
+            return Err("durable certificate has invalid certificate checksum".to_owned());
+        }
+        Ok(Self {
+            wal_generation,
+            wal_frame_start,
+            wal_frame_end,
+            certificate,
+        })
+    }
+
+    /// Decide whether this proof record may authorize a reconstructed WAL
+    /// boundary. The caller supplies the already-validated WAL generation,
+    /// valid frame count, and one-based final commit-marker frame.
+    #[must_use]
+    pub fn authorizes_wal_boundary(
+        &self,
+        wal_generation: WalGenerationIdentity,
+        valid_frame_count: u64,
+        commit_marker_frame: u64,
+    ) -> bool {
+        self.wal_generation == wal_generation
+            && self.wal_frame_end <= valid_frame_count
+            && self.wal_frame_end == commit_marker_frame
+    }
+
+    /// Encode one self-delimiting sidecar record.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let certificate_bytes = self.certificate.canonical_bytes();
+        let total_len = Self::FIXED_PREFIX_SIZE
+            .saturating_add(certificate_bytes.len())
+            .saturating_add(4)
+            .saturating_add(Self::ENVELOPE_CRC_SIZE)
+            .saturating_add(Self::LENGTH_FOOTER_SIZE);
+        let mut bytes = Vec::with_capacity(total_len);
+        bytes.extend_from_slice(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC);
+        bytes.extend_from_slice(&PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(total_len).unwrap_or(u32::MAX).to_le_bytes());
+        bytes.extend_from_slice(&self.wal_generation.checkpoint_seq.to_le_bytes());
+        bytes.extend_from_slice(&self.wal_generation.salts.salt1.to_le_bytes());
+        bytes.extend_from_slice(&self.wal_generation.salts.salt2.to_le_bytes());
+        bytes.extend_from_slice(&self.wal_frame_start.to_le_bytes());
+        bytes.extend_from_slice(&self.wal_frame_end.to_le_bytes());
+        bytes.extend_from_slice(&certificate_bytes);
+        bytes.extend_from_slice(&self.certificate.certificate_crc32c.to_le_bytes());
+        let envelope_crc32c = crc32c::crc32c(&bytes);
+        bytes.extend_from_slice(&envelope_crc32c.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(total_len).unwrap_or(u32::MAX).to_le_bytes());
+        bytes
+    }
+
+    /// Strictly decode exactly one sidecar record.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let min_size = Self::FIXED_PREFIX_SIZE
+            .saturating_add(Self::MIN_CERTIFICATE_SIZE)
+            .saturating_add(Self::ENVELOPE_CRC_SIZE)
+            .saturating_add(Self::LENGTH_FOOTER_SIZE);
+        if bytes.len() < min_size {
+            return Err(format!(
+                "durable certificate record too short: expected at least {min_size}, got {}",
+                bytes.len()
+            ));
+        }
+        let mut offset = 0_usize;
+        let magic = read_record_bytes(
+            bytes,
+            &mut offset,
+            PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC.len(),
+            "durable certificate magic",
+        )?;
+        if magic != PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC {
+            return Err("durable certificate record magic mismatch".to_owned());
+        }
+        let version_bytes = read_record_bytes(bytes, &mut offset, 2, "record version")?;
+        let version = u16::from_le_bytes([version_bytes[0], version_bytes[1]]);
+        if version != PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION {
+            return Err(format!(
+                "unsupported durable certificate record version {version}"
+            ));
+        }
+        let declared_len =
+            usize::try_from(read_record_u32(bytes, &mut offset, "record length")?)
+                .map_err(|_| "durable certificate record length exceeds usize".to_owned())?;
+        if declared_len != bytes.len() {
+            return Err(format!(
+                "durable certificate record length mismatch: declared {declared_len}, actual {}",
+                bytes.len()
+            ));
+        }
+
+        let length_footer_offset = bytes.len() - Self::LENGTH_FOOTER_SIZE;
+        let footer_len = usize::try_from(u32::from_le_bytes(
+            bytes[length_footer_offset..]
+                .try_into()
+                .map_err(|_| "durable certificate length footer truncated".to_owned())?,
+        ))
+        .map_err(|_| "durable certificate footer length exceeds usize".to_owned())?;
+        if footer_len != declared_len {
+            return Err(format!(
+                "durable certificate length footer mismatch: header={declared_len}, footer={footer_len}"
+            ));
+        }
+        let envelope_crc_offset = length_footer_offset - Self::ENVELOPE_CRC_SIZE;
+        let expected_envelope_crc = u32::from_le_bytes(
+            bytes[envelope_crc_offset..length_footer_offset]
+                .try_into()
+                .map_err(|_| "durable certificate envelope checksum truncated".to_owned())?,
+        );
+        let actual_envelope_crc = crc32c::crc32c(&bytes[..envelope_crc_offset]);
+        if expected_envelope_crc != actual_envelope_crc {
+            return Err("durable certificate envelope checksum mismatch".to_owned());
+        }
+
+        let checkpoint_seq = read_record_u32(bytes, &mut offset, "WAL checkpoint sequence")?;
+        let salt1 = read_record_u32(bytes, &mut offset, "WAL salt1")?;
+        let salt2 = read_record_u32(bytes, &mut offset, "WAL salt2")?;
+        let wal_frame_start = read_record_u64(bytes, &mut offset, "WAL frame start")?;
+        let wal_frame_end = read_record_u64(bytes, &mut offset, "WAL frame end")?;
+        if wal_frame_start == 0 || wal_frame_end < wal_frame_start {
+            return Err(format!(
+                "invalid durable certificate WAL frame interval {wal_frame_start}..={wal_frame_end}"
+            ));
+        }
+
+        let format_bytes = read_record_bytes(bytes, &mut offset, 2, "certificate format")?;
+        let format_version = u16::from_le_bytes([format_bytes[0], format_bytes[1]]);
+        if format_version != PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION {
+            return Err(format!(
+                "unsupported commit certificate version {format_version}"
+            ));
+        }
+        let residue = match read_record_bytes(bytes, &mut offset, 1, "ordered residue")?[0] {
+            1 => ParallelWalOrderedResidue::CommitCertificateThenPublish,
+            value => return Err(format!("invalid ordered residue tag {value}")),
+        };
+        let certificate_epoch = read_record_u64(bytes, &mut offset, "certificate epoch")?;
+        let commit_seq_lo = CommitSeq::new(read_record_u64(
+            bytes,
+            &mut offset,
+            "certificate commit sequence low",
+        )?);
+        let commit_seq_hi = CommitSeq::new(read_record_u64(
+            bytes,
+            &mut offset,
+            "certificate commit sequence high",
+        )?);
+        if commit_seq_hi < commit_seq_lo {
+            return Err(format!(
+                "invalid certificate commit interval {commit_seq_lo}..={commit_seq_hi}"
+            ));
+        }
+        let durable_segment_epoch = read_record_u64(bytes, &mut offset, "durable segment epoch")?;
+        let lane_count_bytes = read_record_bytes(bytes, &mut offset, 2, "lane count")?;
+        let lane_count = u16::from_le_bytes([lane_count_bytes[0], lane_count_bytes[1]]);
+        let lane_record_count = usize::try_from(read_record_u32(
+            bytes,
+            &mut offset,
+            "lane record count length",
+        )?)
+        .map_err(|_| "lane record count length exceeds usize".to_owned())?;
+        if lane_record_count != usize::from(lane_count)
+            || lane_record_count > MAX_PARALLEL_WAL_LANE_COUNT
+        {
+            return Err(format!(
+                "durable certificate lane count mismatch: header={lane_count}, entries={lane_record_count}"
+            ));
+        }
+        let mut lane_record_counts = Vec::with_capacity(lane_record_count);
+        for _ in 0..lane_record_count {
+            lane_record_counts.push(read_record_u32(
+                bytes,
+                &mut offset,
+                "lane record cardinality",
+            )?);
+        }
+        let db_size_pages = read_record_u32(bytes, &mut offset, "database size pages")?;
+        let page_set_size = read_record_u32(bytes, &mut offset, "page set size")?;
+        let fallback_active = match read_record_bytes(bytes, &mut offset, 1, "fallback flag")?[0] {
+            0 => false,
+            1 => true,
+            value => return Err(format!("invalid certificate fallback flag {value}")),
+        };
+        let certificate_crc32c = read_record_u32(bytes, &mut offset, "certificate checksum")?;
+        if offset != envelope_crc_offset {
+            return Err(format!(
+                "durable certificate record has {} trailing payload bytes",
+                envelope_crc_offset.saturating_sub(offset)
+            ));
+        }
+        let certificate = ParallelWalCommitCertificate {
+            format_version,
+            residue,
+            certificate_epoch,
+            commit_seq_lo,
+            commit_seq_hi,
+            durable_segment_epoch,
+            lane_count,
+            lane_record_counts,
+            db_size_pages,
+            page_set_size,
+            certificate_crc32c,
+            fallback_active,
+        };
+        if !certificate.checksum_is_valid() {
+            return Err("durable certificate checksum mismatch".to_owned());
+        }
+
+        Self::new(
+            WalGenerationIdentity {
+                checkpoint_seq,
+                salts: crate::checksum::WalSalts { salt1, salt2 },
+            },
+            wal_frame_start,
+            wal_frame_end,
+            certificate,
+        )
+    }
+}
+
+/// Strictly decode a complete append-only certificate sidecar.
+///
+/// This helper intentionally rejects torn/trailing bytes. D1.d owns the
+/// recovery policy that selects a valid prefix or conservative fallback after
+/// a crash; D1.c only exposes deterministic record reconstruction.
+pub fn decode_parallel_wal_durable_certificate_records(
+    bytes: &[u8],
+) -> Result<Vec<ParallelWalDurableCertificateRecord>, String> {
+    let mut records = Vec::new();
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let length_offset = offset
+            .checked_add(10)
+            .ok_or_else(|| "durable certificate sidecar offset overflow".to_owned())?;
+        let length_end = length_offset
+            .checked_add(4)
+            .ok_or_else(|| "durable certificate sidecar length overflow".to_owned())?;
+        let length_bytes = bytes.get(length_offset..length_end).ok_or_else(|| {
+            format!("torn durable certificate record header at byte offset {offset}")
+        })?;
+        let record_len = usize::try_from(u32::from_le_bytes([
+            length_bytes[0],
+            length_bytes[1],
+            length_bytes[2],
+            length_bytes[3],
+        ]))
+        .map_err(|_| "durable certificate record length exceeds usize".to_owned())?;
+        let record_end = offset
+            .checked_add(record_len)
+            .ok_or_else(|| "durable certificate record end overflow".to_owned())?;
+        let record_bytes = bytes.get(offset..record_end).ok_or_else(|| {
+            format!(
+                "torn durable certificate record at byte offset {offset}: declared {record_len} bytes"
+            )
+        })?;
+        records.push(ParallelWalDurableCertificateRecord::from_bytes(
+            record_bytes,
+        )?);
+        offset = record_end;
+    }
+    Ok(records)
+}
+
+/// Bounded reader lookup selected by a certificate-backed publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelWalLookupMode {
+    /// The commit-published visibility map is complete for this generation.
+    AuthoritativeIndex,
+    /// The conservative writer path produced the same bounded publication.
+    ConservativeIndex,
+}
+
+/// Input to the irreducible ordered durability/publication residue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalDurabilityRequest {
+    pub trace_id: u64,
+    pub scenario_id: String,
+    /// Caller-provided epoch, or zero to allocate the next combiner epoch.
+    pub certificate_epoch: u64,
+    /// Durable segment generation, or zero to bind it to the certificate epoch.
+    pub durable_segment_epoch: u64,
+    /// Number of commits certified by this group, not the number of frames.
+    pub batch_size: u32,
+    /// Deterministic group-commit order used for per-waiter publication handoff.
+    pub batch_ids: Vec<u64>,
+    /// Frame/record cardinality by lane id, including zero-count lanes.
+    pub lane_record_counts: Vec<u32>,
+    pub db_size_pages: u32,
+    pub page_set_size: u32,
+    pub control_mode: ParallelWalOperatingMode,
+    pub fallback_reason: Option<ParallelWalFallbackReason>,
+    pub checkpoint_active: bool,
+}
+
+/// Conservative shadow candidate derived independently from the raw group
+/// membership and live WAL interval.
+///
+/// The durability combiner uses this only in shadow-compare mode. Keeping the
+/// evidence separate from [`ParallelWalDurabilityRequest`] prevents a clean
+/// verdict from being manufactured by cloning or rebuilding the authoritative
+/// candidate from its own summarized inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalConservativeShadowEvidence {
+    pub certificate_epoch: u64,
+    pub durable_segment_epoch: u64,
+    pub batch_ids: Vec<u64>,
+    pub lane_record_counts: Vec<u32>,
+    pub db_size_pages: u32,
+    pub page_set_size: u32,
+    pub control_mode: ParallelWalOperatingMode,
+    pub fallback_reason: Option<ParallelWalFallbackReason>,
+    pub checkpoint_active: bool,
+    pub wal_frame_start: u64,
+    pub wal_frame_end: u64,
+}
+
+/// Authoritative reader/checkpoint boundary published by the combiner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelWalVisibilitySnapshot {
+    pub certificate_epoch: u64,
+    pub visible_commit_seq: CommitSeq,
+    pub durability_seq: u64,
+    pub publication_generation: u64,
+    pub db_size_pages: u32,
+    pub page_set_size: u32,
+    pub lookup_mode: ParallelWalLookupMode,
+}
+
+impl Default for ParallelWalVisibilitySnapshot {
+    fn default() -> Self {
+        Self {
+            certificate_epoch: 0,
+            visible_commit_seq: CommitSeq::ZERO,
+            durability_seq: 0,
+            publication_generation: 0,
+            db_size_pages: 0,
+            page_set_size: 0,
+            lookup_mode: ParallelWalLookupMode::AuthoritativeIndex,
+        }
+    }
+}
+
+/// Receipt proving that one certificate crossed the configured WAL durability
+/// boundary and was already published.
+///
+/// Under a synchronous policy that disables fsync, "durability" is deliberately
+/// policy-relative: certificate and WAL writes retain their required ordering,
+/// but neither is represented as power-loss-stable media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalDurabilityReceipt {
+    pub certificate: ParallelWalCommitCertificate,
+    pub durability_seq: u64,
+    pub publication_generation: u64,
+    pub ordered_region_ns: u64,
+    pub batch_size: u32,
+    pub member_commit_seqs: Vec<(u64, CommitSeq)>,
+    pub lookup_mode: ParallelWalLookupMode,
+    pub control_mode: ParallelWalOperatingMode,
+    pub shadow_certificate_verdict: ParallelWalShadowVerdict,
+    pub fallback_reason: Option<ParallelWalFallbackReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParallelWalCombinerError {
+    EmptyBatch,
+    BatchIdentityCountMismatch {
+        batch_size: u32,
+        identity_count: usize,
+    },
+    DuplicateBatchIdentity {
+        batch_id: u64,
+    },
+    TooManyLanes {
+        lane_count: usize,
+    },
+    EmptyLaneEvidence,
+    StaleCertificateEpoch {
+        current: u64,
+        proposed: u64,
+    },
+    StaleSegmentEpoch {
+        current: u64,
+        proposed: u64,
+    },
+    CommitSequenceOverflow,
+    DurabilitySequenceOverflow,
+    PublicationGenerationOverflow,
+    CertificateChecksumMismatch,
+    CertificateGap {
+        expected: CommitSeq,
+        actual: CommitSeq,
+    },
+    DuplicateOrStalePublication {
+        published: CommitSeq,
+        proposed: CommitSeq,
+    },
+    ShadowCertificateMismatch,
+    MissingConservativeShadowEvidence,
+    DurabilityWriteFailed(String),
+}
+
+impl std::fmt::Display for ParallelWalCombinerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyBatch => f.write_str("parallel WAL certificate cannot cover zero commits"),
+            Self::BatchIdentityCountMismatch {
+                batch_size,
+                identity_count,
+            } => write!(
+                f,
+                "parallel WAL certificate covers {batch_size} commits but has {identity_count} batch identities"
+            ),
+            Self::DuplicateBatchIdentity { batch_id } => write!(
+                f,
+                "parallel WAL certificate repeats batch identity {batch_id}"
+            ),
+            Self::TooManyLanes { lane_count } => {
+                write!(
+                    f,
+                    "parallel WAL certificate has {lane_count} lanes; maximum is {MAX_PARALLEL_WAL_LANE_COUNT}"
+                )
+            }
+            Self::EmptyLaneEvidence => {
+                f.write_str("parallel WAL certificate requires lane record evidence")
+            }
+            Self::StaleCertificateEpoch { current, proposed } => write!(
+                f,
+                "parallel WAL certificate epoch {proposed} is not newer than {current}"
+            ),
+            Self::StaleSegmentEpoch { current, proposed } => write!(
+                f,
+                "parallel WAL durable segment epoch {proposed} precedes {current}"
+            ),
+            Self::CommitSequenceOverflow => f.write_str("parallel WAL commit sequence overflow"),
+            Self::DurabilitySequenceOverflow => {
+                f.write_str("parallel WAL durability sequence overflow")
+            }
+            Self::PublicationGenerationOverflow => {
+                f.write_str("parallel WAL publication generation overflow")
+            }
+            Self::CertificateChecksumMismatch => {
+                f.write_str("parallel WAL certificate checksum mismatch")
+            }
+            Self::CertificateGap { expected, actual } => write!(
+                f,
+                "parallel WAL certificate gap: expected {expected}, got {actual}"
+            ),
+            Self::DuplicateOrStalePublication {
+                published,
+                proposed,
+            } => write!(
+                f,
+                "parallel WAL publication {proposed} is not newer than {published}"
+            ),
+            Self::ShadowCertificateMismatch => {
+                f.write_str("parallel WAL shadow certificate mismatch")
+            }
+            Self::MissingConservativeShadowEvidence => f.write_str(
+                "parallel WAL shadow mode requires independently-derived conservative evidence",
+            ),
+            Self::DurabilityWriteFailed(detail) => {
+                write!(
+                    f,
+                    "parallel WAL certificate durability write failed: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParallelWalCombinerError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParallelWalCombinerMetricsSnapshot {
+    pub certificates_published: u64,
+    pub commits_published: u64,
+    pub ordered_region_ns_total: u64,
+    pub ordered_region_ns_max: u64,
+    pub fallback_entries: u64,
+    pub shadow_comparisons: u64,
+    pub shadow_mismatches: u64,
+}
+
+#[derive(Debug, Default)]
+struct ParallelWalCombinerState {
+    visibility: ParallelWalVisibilitySnapshot,
+    durable_segment_epoch: u64,
+    last_certificate_crc32c: u32,
+    metrics: ParallelWalCombinerMetricsSnapshot,
+}
+
+/// Tiny serialized residue joining already-parallel lane staging to durable,
+/// authoritative visibility publication.
+///
+/// The supplied callback is the durability boundary. State is advanced only
+/// after it returns success. Callers must write or prove the certificate's
+/// durable equivalent in that callback; page-plane work and structured logging
+/// stay outside this lock.
+#[derive(Debug, Default)]
+pub struct ParallelWalDurabilityCombiner {
+    state: Mutex<ParallelWalCombinerState>,
+}
+
+impl ParallelWalDurabilityCombiner {
+    #[must_use]
+    pub fn new(initial_visibility: ParallelWalVisibilitySnapshot) -> Self {
+        Self {
+            state: Mutex::new(ParallelWalCombinerState {
+                durable_segment_epoch: initial_visibility.certificate_epoch,
+                visibility: initial_visibility,
+                ..ParallelWalCombinerState::default()
+            }),
+        }
+    }
+
+    /// Advance this process-local combiner from an already-authorized durable
+    /// sidecar tail before assigning the next interval.
+    ///
+    /// The caller must validate the record against the live WAL generation,
+    /// complete frame boundary, and commit marker while holding the external
+    /// writer gate. This method only reconciles monotonic certificate clocks;
+    /// it does not publish the imported certificate to readers.
+    pub fn reconcile_authorized_seed(
+        &self,
+        certificate: &ParallelWalCommitCertificate,
+    ) -> Result<(), ParallelWalCombinerError> {
+        if !certificate.checksum_is_valid() {
+            return Err(ParallelWalCombinerError::CertificateChecksumMismatch);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if certificate.commit_seq_hi <= state.visibility.visible_commit_seq {
+            if certificate.commit_seq_hi < state.visibility.visible_commit_seq
+                && state.last_certificate_crc32c != 0
+            {
+                return Ok(());
+            }
+            if state.last_certificate_crc32c != 0
+                && certificate.commit_seq_hi == state.visibility.visible_commit_seq
+                && state.last_certificate_crc32c != certificate.certificate_crc32c
+            {
+                return Err(ParallelWalCombinerError::DuplicateOrStalePublication {
+                    published: state.visibility.visible_commit_seq,
+                    proposed: certificate.commit_seq_hi,
+                });
+            }
+            // A fresh process may already have reconstructed the same or a
+            // newer logical commit clock from the WAL. Seed the independent
+            // certificate clocks as well so its first emitted epoch cannot
+            // reuse the durable tail's identity.
+            state.visibility.certificate_epoch = state
+                .visibility
+                .certificate_epoch
+                .max(certificate.certificate_epoch);
+            state.visibility.durability_seq = state
+                .visibility
+                .durability_seq
+                .max(certificate.certificate_epoch);
+            state.visibility.publication_generation = state
+                .visibility
+                .publication_generation
+                .max(certificate.certificate_epoch);
+            state.durable_segment_epoch = state
+                .durable_segment_epoch
+                .max(certificate.durable_segment_epoch);
+            state.last_certificate_crc32c = certificate.certificate_crc32c;
+            return Ok(());
+        }
+        if certificate.certificate_epoch <= state.visibility.certificate_epoch {
+            return Err(ParallelWalCombinerError::StaleCertificateEpoch {
+                current: state.visibility.certificate_epoch,
+                proposed: certificate.certificate_epoch,
+            });
+        }
+        if certificate.durable_segment_epoch < state.durable_segment_epoch {
+            return Err(ParallelWalCombinerError::StaleSegmentEpoch {
+                current: state.durable_segment_epoch,
+                proposed: certificate.durable_segment_epoch,
+            });
+        }
+
+        let durability_seq = state
+            .visibility
+            .durability_seq
+            .max(certificate.certificate_epoch);
+        let publication_generation = state
+            .visibility
+            .publication_generation
+            .max(certificate.certificate_epoch);
+        state.visibility = ParallelWalVisibilitySnapshot {
+            certificate_epoch: certificate.certificate_epoch,
+            visible_commit_seq: certificate.commit_seq_hi,
+            durability_seq,
+            publication_generation,
+            db_size_pages: certificate.db_size_pages,
+            page_set_size: certificate.page_set_size,
+            lookup_mode: if certificate.fallback_active {
+                ParallelWalLookupMode::ConservativeIndex
+            } else {
+                ParallelWalLookupMode::AuthoritativeIndex
+            },
+        };
+        state.durable_segment_epoch = certificate.durable_segment_epoch;
+        state.last_certificate_crc32c = certificate.certificate_crc32c;
+        Ok(())
+    }
+
+    pub fn certify_and_publish<F>(
+        &self,
+        request: ParallelWalDurabilityRequest,
+        durable_write: F,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
+    {
+        self.certify_and_publish_inner(
+            request,
+            durable_write,
+            Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
+            None,
+        )
+    }
+
+    pub fn certify_and_publish_with_shadow<F, S>(
+        &self,
+        request: ParallelWalDurabilityRequest,
+        durable_write: F,
+        shadow_certificate: S,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
+        S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+    {
+        self.certify_and_publish_inner(request, durable_write, Some(shadow_certificate), None)
+    }
+
+    /// Certify one group while comparing against evidence independently
+    /// reconstructed from raw group membership and live WAL boundaries.
+    pub fn certify_and_publish_with_conservative_shadow<F>(
+        &self,
+        request: ParallelWalDurabilityRequest,
+        shadow_evidence: ParallelWalConservativeShadowEvidence,
+        durable_write: F,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
+    {
+        self.certify_and_publish_inner(
+            request,
+            durable_write,
+            Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
+            Some(shadow_evidence),
+        )
+    }
+
+    fn certify_and_publish_inner<F, S>(
+        &self,
+        request: ParallelWalDurabilityRequest,
+        durable_write: F,
+        shadow_certificate: Option<S>,
+        conservative_shadow_evidence: Option<ParallelWalConservativeShadowEvidence>,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
+        S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+    {
+        let ordered_start = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut certificate, fallback_reason) = build_commit_certificate(&state, &request)?;
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+
+        let shadow_certificate_verdict = if let Some(shadow_certificate) = shadow_certificate {
+            state.metrics.shadow_comparisons = state.metrics.shadow_comparisons.saturating_add(1);
+            let shadow = shadow_certificate(&certificate);
+            if shadow == certificate {
+                ParallelWalShadowVerdict::Clean
+            } else {
+                state.metrics.shadow_mismatches = state.metrics.shadow_mismatches.saturating_add(1);
+                return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
+            }
+        } else if matches!(
+            request.control_mode,
+            ParallelWalOperatingMode::ShadowCompare
+        ) {
+            state.metrics.shadow_comparisons = state.metrics.shadow_comparisons.saturating_add(1);
+            let evidence = conservative_shadow_evidence
+                .as_ref()
+                .ok_or(ParallelWalCombinerError::MissingConservativeShadowEvidence)?;
+            // Reconstruct the conservative candidate from raw group/WAL
+            // evidence through a separate implementation. Every certificate
+            // field and the fallback decision participates in the comparison
+            // before durable publication.
+            let (mut shadow, shadow_fallback_reason) =
+                build_conservative_shadow_certificate(&state, evidence)?;
+            shadow.certificate_crc32c = shadow.computed_crc32c();
+            if shadow == certificate && shadow_fallback_reason == fallback_reason {
+                ParallelWalShadowVerdict::Clean
+            } else {
+                state.metrics.shadow_mismatches = state.metrics.shadow_mismatches.saturating_add(1);
+                return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
+            }
+        } else {
+            ParallelWalShadowVerdict::NotRun
+        };
+
+        durable_write(&certificate).map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
+
+        let durability_seq = state
+            .visibility
+            .durability_seq
+            .checked_add(1)
+            .ok_or(ParallelWalCombinerError::DurabilitySequenceOverflow)?;
+        let publication_generation = state
+            .visibility
+            .publication_generation
+            .checked_add(1)
+            .ok_or(ParallelWalCombinerError::PublicationGenerationOverflow)?;
+        let lookup_mode = if certificate.fallback_active {
+            ParallelWalLookupMode::ConservativeIndex
+        } else {
+            ParallelWalLookupMode::AuthoritativeIndex
+        };
+        state.visibility = ParallelWalVisibilitySnapshot {
+            certificate_epoch: certificate.certificate_epoch,
+            visible_commit_seq: certificate.commit_seq_hi,
+            durability_seq,
+            publication_generation,
+            db_size_pages: certificate.db_size_pages,
+            page_set_size: certificate.page_set_size,
+            lookup_mode,
+        };
+        state.durable_segment_epoch = certificate.durable_segment_epoch;
+        state.last_certificate_crc32c = certificate.certificate_crc32c;
+        state.metrics.certificates_published =
+            state.metrics.certificates_published.saturating_add(1);
+        state.metrics.commits_published = state
+            .metrics
+            .commits_published
+            .saturating_add(u64::from(request.batch_size));
+        if certificate.fallback_active {
+            state.metrics.fallback_entries = state.metrics.fallback_entries.saturating_add(1);
+        }
+        let ordered_region_ns =
+            u64::try_from(ordered_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        state.metrics.ordered_region_ns_total = state
+            .metrics
+            .ordered_region_ns_total
+            .saturating_add(ordered_region_ns);
+        state.metrics.ordered_region_ns_max =
+            state.metrics.ordered_region_ns_max.max(ordered_region_ns);
+        let receipt = ParallelWalDurabilityReceipt {
+            member_commit_seqs: request
+                .batch_ids
+                .iter()
+                .enumerate()
+                .map(|(index, batch_id)| {
+                    (
+                        *batch_id,
+                        CommitSeq::new(
+                            certificate
+                                .commit_seq_lo
+                                .get()
+                                .saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+                        ),
+                    )
+                })
+                .collect(),
+            certificate,
+            durability_seq,
+            publication_generation,
+            ordered_region_ns,
+            batch_size: request.batch_size,
+            lookup_mode,
+            control_mode: request.control_mode,
+            shadow_certificate_verdict,
+            fallback_reason,
+        };
+        drop(state);
+
+        tracing::debug!(
+            target: "fsqlite::wal::durability_combiner",
+            trace_id = request.trace_id,
+            scenario_id = request.scenario_id.as_str(),
+            commit_certificate = receipt.certificate.certificate_crc32c,
+            certificate_epoch = receipt.certificate.certificate_epoch,
+            commit_seq_lo = receipt.certificate.commit_seq_lo.get(),
+            commit_seq_hi = receipt.certificate.commit_seq_hi.get(),
+            durability_seq = receipt.durability_seq,
+            publication_generation = receipt.publication_generation,
+            ordered_region_ns = receipt.ordered_region_ns,
+            batch_size = receipt.batch_size,
+            lookup_mode = parallel_wal_lookup_mode_name(receipt.lookup_mode),
+            control_mode = parallel_wal_mode_name(receipt.control_mode),
+            shadow_certificate_verdict =
+                parallel_wal_shadow_verdict_name(receipt.shadow_certificate_verdict),
+            compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+            fallback_reason = parallel_wal_fallback_reason_name(receipt.fallback_reason),
+            "published durable parallel WAL commit certificate"
+        );
+        Ok(receipt)
+    }
+
+    /// Validate a receipt proposed for publication by an external transport.
+    /// This rejects damaged, duplicate, stale, and non-contiguous handoffs.
+    pub fn validate_external_publication(
+        &self,
+        receipt: &ParallelWalDurabilityReceipt,
+    ) -> Result<(), ParallelWalCombinerError> {
+        if !receipt.certificate.checksum_is_valid() {
+            return Err(ParallelWalCombinerError::CertificateChecksumMismatch);
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if receipt.certificate.commit_seq_hi <= state.visibility.visible_commit_seq {
+            return Err(ParallelWalCombinerError::DuplicateOrStalePublication {
+                published: state.visibility.visible_commit_seq,
+                proposed: receipt.certificate.commit_seq_hi,
+            });
+        }
+        let expected = checked_next_commit_seq(state.visibility.visible_commit_seq)?;
+        if receipt.certificate.commit_seq_lo != expected {
+            return Err(ParallelWalCombinerError::CertificateGap {
+                expected,
+                actual: receipt.certificate.commit_seq_lo,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn visibility_snapshot(&self) -> ParallelWalVisibilitySnapshot {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .visibility
+    }
+
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> ParallelWalCombinerMetricsSnapshot {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .metrics
+    }
+}
+
+impl ParallelWalDurabilityReceipt {
+    #[must_use]
+    pub fn commit_seq_for_batch(&self, batch_id: u64) -> Option<CommitSeq> {
+        self.member_commit_seqs
+            .iter()
+            .find_map(|(member_id, commit_seq)| (*member_id == batch_id).then_some(*commit_seq))
+    }
+}
+
+fn checked_next_commit_seq(seq: CommitSeq) -> Result<CommitSeq, ParallelWalCombinerError> {
+    seq.get()
+        .checked_add(1)
+        .map(CommitSeq::new)
+        .ok_or(ParallelWalCombinerError::CommitSequenceOverflow)
+}
+
+fn build_commit_certificate(
+    state: &ParallelWalCombinerState,
+    request: &ParallelWalDurabilityRequest,
+) -> Result<
+    (
+        ParallelWalCommitCertificate,
+        Option<ParallelWalFallbackReason>,
+    ),
+    ParallelWalCombinerError,
+> {
+    if request.batch_size == 0 {
+        return Err(ParallelWalCombinerError::EmptyBatch);
+    }
+    if usize::try_from(request.batch_size).ok() != Some(request.batch_ids.len()) {
+        return Err(ParallelWalCombinerError::BatchIdentityCountMismatch {
+            batch_size: request.batch_size,
+            identity_count: request.batch_ids.len(),
+        });
+    }
+    let mut batch_ids = HashSet::with_capacity(request.batch_ids.len());
+    for batch_id in &request.batch_ids {
+        if !batch_ids.insert(*batch_id) {
+            return Err(ParallelWalCombinerError::DuplicateBatchIdentity {
+                batch_id: *batch_id,
+            });
+        }
+    }
+    if request.lane_record_counts.is_empty() {
+        return Err(ParallelWalCombinerError::EmptyLaneEvidence);
+    }
+    if request.lane_record_counts.len() > MAX_PARALLEL_WAL_LANE_COUNT {
+        return Err(ParallelWalCombinerError::TooManyLanes {
+            lane_count: request.lane_record_counts.len(),
+        });
+    }
+    let certificate_epoch = if request.certificate_epoch == 0 {
+        state
+            .visibility
+            .certificate_epoch
+            .checked_add(1)
+            .ok_or(ParallelWalCombinerError::PublicationGenerationOverflow)?
+    } else {
+        request.certificate_epoch
+    };
+    if certificate_epoch <= state.visibility.certificate_epoch {
+        return Err(ParallelWalCombinerError::StaleCertificateEpoch {
+            current: state.visibility.certificate_epoch,
+            proposed: certificate_epoch,
+        });
+    }
+    let durable_segment_epoch = if request.durable_segment_epoch == 0 {
+        certificate_epoch
+    } else {
+        request.durable_segment_epoch
+    };
+    if durable_segment_epoch < state.durable_segment_epoch {
+        return Err(ParallelWalCombinerError::StaleSegmentEpoch {
+            current: state.durable_segment_epoch,
+            proposed: durable_segment_epoch,
+        });
+    }
+
+    let commit_seq_lo = checked_next_commit_seq(state.visibility.visible_commit_seq)?;
+    let commit_seq_hi = commit_seq_lo
+        .get()
+        .checked_add(u64::from(request.batch_size).saturating_sub(1))
+        .map(CommitSeq::new)
+        .ok_or(ParallelWalCombinerError::CommitSequenceOverflow)?;
+    let fallback_reason = request.fallback_reason.or({
+        if request.checkpoint_active {
+            Some(ParallelWalFallbackReason::CheckpointConflict)
+        } else if matches!(request.control_mode, ParallelWalOperatingMode::Conservative) {
+            Some(ParallelWalFallbackReason::OperatorForced)
+        } else {
+            None
+        }
+    });
+    let fallback_active = fallback_reason.is_some();
+    let lane_count = u16::try_from(request.lane_record_counts.len()).map_err(|_| {
+        ParallelWalCombinerError::TooManyLanes {
+            lane_count: request.lane_record_counts.len(),
+        }
+    })?;
+    Ok((
+        ParallelWalCommitCertificate {
+            format_version: PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
+            residue: ParallelWalOrderedResidue::CommitCertificateThenPublish,
+            certificate_epoch,
+            commit_seq_lo,
+            commit_seq_hi,
+            durable_segment_epoch,
+            lane_count,
+            lane_record_counts: request.lane_record_counts.clone(),
+            db_size_pages: request.db_size_pages,
+            page_set_size: request.page_set_size,
+            certificate_crc32c: 0,
+            fallback_active,
+        },
+        fallback_reason,
+    ))
+}
+
+fn build_conservative_shadow_certificate(
+    state: &ParallelWalCombinerState,
+    evidence: &ParallelWalConservativeShadowEvidence,
+) -> Result<
+    (
+        ParallelWalCommitCertificate,
+        Option<ParallelWalFallbackReason>,
+    ),
+    ParallelWalCombinerError,
+> {
+    if evidence.batch_ids.is_empty() {
+        return Err(ParallelWalCombinerError::EmptyBatch);
+    }
+    let mut unique_batch_ids = HashSet::with_capacity(evidence.batch_ids.len());
+    for batch_id in &evidence.batch_ids {
+        if !unique_batch_ids.insert(*batch_id) {
+            return Err(ParallelWalCombinerError::DuplicateBatchIdentity {
+                batch_id: *batch_id,
+            });
+        }
+    }
+    if evidence.lane_record_counts.is_empty() {
+        return Err(ParallelWalCombinerError::EmptyLaneEvidence);
+    }
+    if evidence.lane_record_counts.len() > MAX_PARALLEL_WAL_LANE_COUNT {
+        return Err(ParallelWalCombinerError::TooManyLanes {
+            lane_count: evidence.lane_record_counts.len(),
+        });
+    }
+
+    let raw_frame_count = evidence
+        .lane_record_counts
+        .iter()
+        .try_fold(0_u64, |total, count| total.checked_add(u64::from(*count)))
+        .ok_or(ParallelWalCombinerError::ShadowCertificateMismatch)?;
+    let wal_interval_len = evidence
+        .wal_frame_end
+        .checked_sub(evidence.wal_frame_start)
+        .and_then(|span| span.checked_add(1))
+        .filter(|_| evidence.wal_frame_start > 0)
+        .ok_or(ParallelWalCombinerError::ShadowCertificateMismatch)?;
+    if raw_frame_count != wal_interval_len || raw_frame_count != u64::from(evidence.page_set_size) {
+        return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
+    }
+
+    let certificate_epoch = if evidence.certificate_epoch == 0 {
+        state
+            .visibility
+            .certificate_epoch
+            .checked_add(1)
+            .ok_or(ParallelWalCombinerError::PublicationGenerationOverflow)?
+    } else {
+        evidence.certificate_epoch
+    };
+    if certificate_epoch <= state.visibility.certificate_epoch {
+        return Err(ParallelWalCombinerError::StaleCertificateEpoch {
+            current: state.visibility.certificate_epoch,
+            proposed: certificate_epoch,
+        });
+    }
+    let durable_segment_epoch = if evidence.durable_segment_epoch == 0 {
+        certificate_epoch
+    } else {
+        evidence.durable_segment_epoch
+    };
+    if durable_segment_epoch < state.durable_segment_epoch {
+        return Err(ParallelWalCombinerError::StaleSegmentEpoch {
+            current: state.durable_segment_epoch,
+            proposed: durable_segment_epoch,
+        });
+    }
+
+    let commit_seq_lo = state
+        .visibility
+        .visible_commit_seq
+        .get()
+        .checked_add(1)
+        .map(CommitSeq::new)
+        .ok_or(ParallelWalCombinerError::CommitSequenceOverflow)?;
+    let commit_count = u64::try_from(evidence.batch_ids.len())
+        .map_err(|_| ParallelWalCombinerError::CommitSequenceOverflow)?;
+    let commit_seq_hi = commit_seq_lo
+        .get()
+        .checked_add(commit_count.saturating_sub(1))
+        .map(CommitSeq::new)
+        .ok_or(ParallelWalCombinerError::CommitSequenceOverflow)?;
+    let fallback_reason = evidence.fallback_reason.or({
+        if evidence.checkpoint_active {
+            Some(ParallelWalFallbackReason::CheckpointConflict)
+        } else if matches!(
+            evidence.control_mode,
+            ParallelWalOperatingMode::Conservative
+        ) {
+            Some(ParallelWalFallbackReason::OperatorForced)
+        } else {
+            None
+        }
+    });
+    let lane_count = u16::try_from(evidence.lane_record_counts.len()).map_err(|_| {
+        ParallelWalCombinerError::TooManyLanes {
+            lane_count: evidence.lane_record_counts.len(),
+        }
+    })?;
+
+    Ok((
+        ParallelWalCommitCertificate {
+            format_version: PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION,
+            residue: ParallelWalOrderedResidue::CommitCertificateThenPublish,
+            certificate_epoch,
+            commit_seq_lo,
+            commit_seq_hi,
+            durable_segment_epoch,
+            lane_count,
+            lane_record_counts: evidence.lane_record_counts.clone(),
+            db_size_pages: evidence.db_size_pages,
+            page_set_size: evidence.page_set_size,
+            certificate_crc32c: 0,
+            fallback_active: fallback_reason.is_some(),
+        },
+        fallback_reason,
+    ))
+}
+
+#[must_use]
+pub const fn parallel_wal_lookup_mode_name(mode: ParallelWalLookupMode) -> &'static str {
+    match mode {
+        ParallelWalLookupMode::AuthoritativeIndex => "authoritative_index",
+        ParallelWalLookupMode::ConservativeIndex => "conservative_index",
+    }
+}
+
 /// Trace schema shared by lane, combiner, checkpoint, recovery, and
 /// control-plane events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelWalTraceRecord {
     pub component: String,
     pub trace_id: u64,
+    pub scenario_id: String,
     pub decision_id: Option<u64>,
     pub mode: ParallelWalOperatingMode,
     pub lane_id: Option<usize>,
     pub epoch: Option<u64>,
     pub commit_seq_lo: Option<CommitSeq>,
     pub commit_seq_hi: Option<CommitSeq>,
+    pub commit_certificate: Option<u32>,
+    pub durability_seq: Option<u64>,
+    pub publication_generation: Option<u64>,
+    pub ordered_region_ns: Option<u64>,
+    pub batch_size: Option<u32>,
+    pub lookup_mode: Option<ParallelWalLookupMode>,
+    pub shadow_certificate_verdict: ParallelWalShadowVerdict,
+    pub compatibility_selector: String,
     pub checkpoint_epoch: Option<u64>,
     pub recovery_epoch: Option<u64>,
     pub fallback_active: bool,
@@ -3089,12 +4290,21 @@ mod tests {
         let tr = ParallelWalTraceRecord {
             component: "test".into(),
             trace_id: 1,
+            scenario_id: PARALLEL_WAL_PUBLICATION_SCENARIO_ID.to_owned(),
             decision_id: None,
             mode: ParallelWalOperatingMode::Auto,
             lane_id: Some(0),
             epoch: Some(5),
             commit_seq_lo: None,
             commit_seq_hi: None,
+            commit_certificate: None,
+            durability_seq: None,
+            publication_generation: None,
+            ordered_region_ns: None,
+            batch_size: None,
+            lookup_mode: None,
+            shadow_certificate_verdict: ParallelWalShadowVerdict::NotRun,
+            compatibility_selector: PARALLEL_WAL_COMPATIBILITY_SELECTOR.to_owned(),
             checkpoint_epoch: None,
             recovery_epoch: None,
             fallback_active: false,
@@ -3130,5 +4340,371 @@ mod tests {
         assert_eq!(cert.lane_record_counts.len(), 4);
         let dbg = format!("{cert:?}");
         assert!(dbg.contains("ParallelWalCommitCertificate"));
+    }
+
+    fn durability_request(mode: ParallelWalOperatingMode) -> ParallelWalDurabilityRequest {
+        ParallelWalDurabilityRequest {
+            trace_id: 7,
+            scenario_id: PARALLEL_WAL_PUBLICATION_SCENARIO_ID.to_owned(),
+            certificate_epoch: 0,
+            durable_segment_epoch: 0,
+            batch_size: 2,
+            batch_ids: vec![101, 102],
+            lane_record_counts: vec![3, 2],
+            db_size_pages: 17,
+            page_set_size: 5,
+            control_mode: mode,
+            fallback_reason: None,
+            checkpoint_active: false,
+        }
+    }
+
+    #[test]
+    fn durability_combiner_assigns_deterministic_contiguous_certificates() {
+        let first_combiner = ParallelWalDurabilityCombiner::default();
+        let first = first_combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("first certificate should publish");
+        assert_eq!(first.certificate.commit_seq_lo, CommitSeq::new(1));
+        assert_eq!(first.certificate.commit_seq_hi, CommitSeq::new(2));
+        assert_eq!(first.durability_seq, 1);
+        assert_eq!(first.publication_generation, 1);
+        assert_eq!(first.commit_seq_for_batch(101), Some(CommitSeq::new(1)));
+        assert_eq!(first.commit_seq_for_batch(102), Some(CommitSeq::new(2)));
+        assert!(first.certificate.checksum_is_valid());
+
+        let mut next_request = durability_request(ParallelWalOperatingMode::Auto);
+        next_request.batch_size = 3;
+        next_request.batch_ids = vec![201, 202, 203];
+        next_request.certificate_epoch = 2;
+        next_request.durable_segment_epoch = 2;
+        let second = first_combiner
+            .certify_and_publish(next_request, |_| Ok(()))
+            .expect("second certificate should publish");
+        assert_eq!(second.certificate.commit_seq_lo, CommitSeq::new(3));
+        assert_eq!(second.certificate.commit_seq_hi, CommitSeq::new(5));
+
+        let reference_combiner = ParallelWalDurabilityCombiner::default();
+        let reference = reference_combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("reference certificate should publish");
+        assert_eq!(first.certificate, reference.certificate);
+        assert_eq!(
+            first.certificate.canonical_bytes(),
+            reference.certificate.canonical_bytes()
+        );
+    }
+
+    #[test]
+    fn authorized_tail_seeds_fresh_process_certificate_clocks() {
+        let first = ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("first process publishes a certificate");
+        let fresh_process = ParallelWalDurabilityCombiner::new(ParallelWalVisibilitySnapshot {
+            visible_commit_seq: first.certificate.commit_seq_hi,
+            db_size_pages: first.certificate.db_size_pages,
+            ..ParallelWalVisibilitySnapshot::default()
+        });
+        fresh_process
+            .reconcile_authorized_seed(&first.certificate)
+            .expect("authorized tail seeds the fresh process");
+        let next = fresh_process
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("fresh process assigns the next interval");
+        assert_eq!(
+            next.certificate.commit_seq_lo,
+            CommitSeq::new(first.certificate.commit_seq_hi.get() + 1)
+        );
+        assert_eq!(
+            next.certificate.certificate_epoch,
+            first.certificate.certificate_epoch + 1
+        );
+    }
+
+    #[test]
+    fn durable_certificate_record_roundtrips_generation_interval_and_checksum() {
+        let receipt = ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("certificate should publish");
+        let record = ParallelWalDurableCertificateRecord::new(
+            WalGenerationIdentity {
+                checkpoint_seq: 9,
+                salts: crate::checksum::WalSalts {
+                    salt1: 0x1122_3344,
+                    salt2: 0x5566_7788,
+                },
+            },
+            17,
+            21,
+            receipt.certificate,
+        )
+        .expect("durable record should validate");
+        let encoded = record.to_bytes();
+        let footer_offset = encoded.len() - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
+        assert_eq!(
+            usize::try_from(u32::from_le_bytes(
+                encoded[footer_offset..]
+                    .try_into()
+                    .expect("length footer has fixed width")
+            ))
+            .expect("record length fits usize"),
+            encoded.len(),
+            "tail footer must support bounded latest-record lookup"
+        );
+        assert_eq!(
+            ParallelWalDurableCertificateRecord::from_bytes(&encoded)
+                .expect("durable record should decode"),
+            record
+        );
+
+        let mut damaged = encoded.clone();
+        damaged[20] ^= 1;
+        assert!(
+            ParallelWalDurableCertificateRecord::from_bytes(&damaged)
+                .expect_err("envelope checksum drift must fail")
+                .contains("envelope checksum mismatch")
+        );
+
+        let mut damaged_footer = encoded;
+        let last = damaged_footer
+            .last_mut()
+            .expect("encoded record has a length footer");
+        *last ^= 1;
+        assert!(
+            ParallelWalDurableCertificateRecord::from_bytes(&damaged_footer)
+                .expect_err("length footer drift must fail")
+                .contains("length footer mismatch")
+        );
+    }
+
+    #[test]
+    fn durability_failure_does_not_advance_visibility() {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let error = combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Err("injected fsync failure".to_owned())
+            })
+            .expect_err("failed durability callback must reject publication");
+        assert!(matches!(
+            error,
+            ParallelWalCombinerError::DurabilityWriteFailed(_)
+        ));
+        assert_eq!(
+            combiner.visibility_snapshot(),
+            ParallelWalVisibilitySnapshot::default()
+        );
+
+        let receipt = combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("same interval should remain available after failed durability");
+        assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
+    }
+
+    #[test]
+    fn external_publication_rejects_duplicate_gap_and_checksum_drift() {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let receipt = combiner
+            .certify_and_publish(durability_request(ParallelWalOperatingMode::Auto), |_| {
+                Ok(())
+            })
+            .expect("certificate should publish");
+        assert!(matches!(
+            combiner.validate_external_publication(&receipt),
+            Err(ParallelWalCombinerError::DuplicateOrStalePublication { .. })
+        ));
+
+        let mut checksum_drift = receipt.clone();
+        checksum_drift.certificate.certificate_crc32c ^= 1;
+        assert_eq!(
+            combiner.validate_external_publication(&checksum_drift),
+            Err(ParallelWalCombinerError::CertificateChecksumMismatch)
+        );
+
+        let mut gap = receipt;
+        gap.certificate.certificate_epoch = 2;
+        gap.certificate.commit_seq_lo = CommitSeq::new(4);
+        gap.certificate.commit_seq_hi = CommitSeq::new(4);
+        gap.certificate.certificate_crc32c = gap.certificate.computed_crc32c();
+        assert_eq!(
+            combiner.validate_external_publication(&gap),
+            Err(ParallelWalCombinerError::CertificateGap {
+                expected: CommitSeq::new(3),
+                actual: CommitSeq::new(4),
+            })
+        );
+    }
+
+    #[test]
+    fn conservative_and_checkpoint_routes_publish_bounded_visibility() {
+        let conservative = ParallelWalDurabilityCombiner::default()
+            .certify_and_publish(
+                durability_request(ParallelWalOperatingMode::Conservative),
+                |_| Ok(()),
+            )
+            .expect("conservative certificate should publish");
+        assert!(conservative.certificate.fallback_active);
+        assert_eq!(
+            conservative.fallback_reason,
+            Some(ParallelWalFallbackReason::OperatorForced)
+        );
+        assert_eq!(
+            conservative.lookup_mode,
+            ParallelWalLookupMode::ConservativeIndex
+        );
+
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let mut checkpoint_request = durability_request(ParallelWalOperatingMode::Auto);
+        checkpoint_request.checkpoint_active = true;
+        let checkpoint = combiner
+            .certify_and_publish(checkpoint_request, |_| Ok(()))
+            .expect("checkpoint overlap should route through safe publication");
+        assert_eq!(
+            checkpoint.fallback_reason,
+            Some(ParallelWalFallbackReason::CheckpointConflict)
+        );
+        assert_eq!(
+            combiner.visibility_snapshot().visible_commit_seq,
+            checkpoint.certificate.commit_seq_hi
+        );
+    }
+
+    #[test]
+    fn shadow_validation_is_atomic_on_match_and_mismatch() {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let mismatch = combiner
+            .certify_and_publish_with_shadow(
+                durability_request(ParallelWalOperatingMode::ShadowCompare),
+                |_| Ok(()),
+                |certificate| {
+                    let mut shadow = certificate.clone();
+                    shadow.page_set_size = shadow.page_set_size.saturating_add(1);
+                    shadow
+                },
+            )
+            .expect_err("shadow mismatch must reject publication");
+        assert_eq!(
+            mismatch,
+            ParallelWalCombinerError::ShadowCertificateMismatch
+        );
+        assert_eq!(
+            combiner.visibility_snapshot(),
+            ParallelWalVisibilitySnapshot::default()
+        );
+
+        let receipt = combiner
+            .certify_and_publish_with_shadow(
+                durability_request(ParallelWalOperatingMode::ShadowCompare),
+                |_| Ok(()),
+                Clone::clone,
+            )
+            .expect("matching shadow certificate should publish");
+        assert_eq!(
+            receipt.shadow_certificate_verdict,
+            ParallelWalShadowVerdict::Clean
+        );
+
+        let production_combiner = ParallelWalDurabilityCombiner::default();
+        let production_request = durability_request(ParallelWalOperatingMode::ShadowCompare);
+        let production_evidence = ParallelWalConservativeShadowEvidence {
+            certificate_epoch: production_request.certificate_epoch,
+            durable_segment_epoch: production_request.durable_segment_epoch,
+            batch_ids: production_request.batch_ids.clone(),
+            lane_record_counts: production_request.lane_record_counts.clone(),
+            db_size_pages: production_request.db_size_pages,
+            page_set_size: production_request.page_set_size,
+            control_mode: production_request.control_mode,
+            fallback_reason: production_request.fallback_reason,
+            checkpoint_active: production_request.checkpoint_active,
+            wal_frame_start: 1,
+            wal_frame_end: u64::from(production_request.page_set_size),
+        };
+        let production_receipt = production_combiner
+            .certify_and_publish_with_conservative_shadow(
+                production_request,
+                production_evidence,
+                |_| Ok(()),
+            )
+            .expect("production shadow mode should compare independent raw evidence");
+        assert_eq!(
+            production_receipt.shadow_certificate_verdict,
+            ParallelWalShadowVerdict::Clean
+        );
+        assert_eq!(
+            production_combiner.metrics_snapshot().shadow_comparisons,
+            1,
+            "production shadow mode must execute a certificate comparison"
+        );
+        assert_eq!(
+            ParallelWalDurabilityCombiner::default()
+                .certify_and_publish(
+                    durability_request(ParallelWalOperatingMode::ShadowCompare),
+                    |_| Ok(()),
+                )
+                .expect_err("shadow mode must fail closed without independent evidence"),
+            ParallelWalCombinerError::MissingConservativeShadowEvidence
+        );
+        let metrics = combiner.metrics_snapshot();
+        assert_eq!(metrics.shadow_comparisons, 2);
+        assert_eq!(metrics.shadow_mismatches, 1);
+    }
+
+    #[test]
+    fn concurrent_lane_flushes_receive_one_ordered_publication_each() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let combiner = Arc::new(ParallelWalDurabilityCombiner::default());
+        let durable_writes = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for lane_id in 0..8_u32 {
+            let combiner = Arc::clone(&combiner);
+            let durable_writes = Arc::clone(&durable_writes);
+            threads.push(std::thread::spawn(move || {
+                let mut request = durability_request(ParallelWalOperatingMode::Auto);
+                request.batch_size = 1;
+                request.batch_ids = vec![u64::from(lane_id) + 1];
+                request.lane_record_counts = vec![lane_id.saturating_add(1)];
+                combiner.certify_and_publish(request, |_| {
+                    durable_writes.fetch_add(1, AtomicOrdering::Relaxed);
+                    Ok(())
+                })
+            }));
+        }
+        let mut receipts = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .expect("combiner worker should not panic")
+                    .expect("combiner worker should publish")
+            })
+            .collect::<Vec<_>>();
+        receipts.sort_unstable_by_key(|receipt| receipt.certificate.commit_seq_lo);
+        for (index, receipt) in receipts.iter().enumerate() {
+            let expected = CommitSeq::new(u64::try_from(index).unwrap_or(u64::MAX) + 1);
+            assert_eq!(receipt.certificate.commit_seq_lo, expected);
+            assert_eq!(receipt.certificate.commit_seq_hi, expected);
+            assert_eq!(receipt.publication_generation, expected.get());
+        }
+        assert_eq!(durable_writes.load(AtomicOrdering::Relaxed), 8);
+        assert_eq!(
+            combiner.visibility_snapshot().visible_commit_seq,
+            CommitSeq::new(8)
+        );
+        let metrics = combiner.metrics_snapshot();
+        assert_eq!(metrics.certificates_published, 8);
+        assert_eq!(metrics.commits_published, 8);
+        assert!(metrics.ordered_region_ns_total >= metrics.ordered_region_ns_max);
     }
 }
