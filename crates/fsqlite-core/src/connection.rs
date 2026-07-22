@@ -41872,6 +41872,25 @@ impl Connection {
                         )));
                     }
                 }
+                let dependency_table_name = table.name.clone();
+                drop(schema);
+                self.validate_drop_column_view_and_trigger_dependencies(
+                    &dependency_table_name,
+                    col_name,
+                )?;
+
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
                 table.columns.remove(col_idx);
                 table.check_constraints.retain(|check| {
                     !check
@@ -42131,6 +42150,116 @@ impl Connection {
             }
         }
         updates
+    }
+
+    fn validate_drop_column_view_and_trigger_dependencies(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<()> {
+        const PROBE_COLUMN: &str = "__fsqlite_drop_column_dependency_probe__";
+
+        // Column rename and column removal share the same name-binding question:
+        // would this AST reference follow the target table's column? Run the
+        // mature rename resolver against clones so CTEs, aliases, derived
+        // sources, and chained views are handled semantically. Star projections
+        // never rewrite and therefore remain legal, matching SQLite.
+        let mut source_catalog = self.column_rename_source_catalog(table_name, column_name);
+        let mut views = self.views.borrow().clone();
+        for view in &views {
+            source_catalog.set_view_output_status(
+                &view.name,
+                view_column_rename_initial_output_status(view, column_name),
+            );
+        }
+
+        let mut dependent_view = None;
+        for _ in 0..=views.len() {
+            let mut pass_changed = false;
+            for view in &mut views {
+                let view_changed = rename_column_refs_in_select_for_table(
+                    &mut view.query,
+                    table_name,
+                    column_name,
+                    PROBE_COLUMN,
+                    &source_catalog,
+                );
+                if view_changed && dependent_view.is_none() {
+                    dependent_view = Some(view.name.clone());
+                }
+                pass_changed |= view_changed;
+                let output_status = view_column_rename_output_status(
+                    view,
+                    column_name,
+                    PROBE_COLUMN,
+                    &source_catalog,
+                );
+                pass_changed |= source_catalog.set_view_output_status(&view.name, output_status);
+            }
+            if !pass_changed {
+                break;
+            }
+        }
+        if let Some(view_name) = dependent_view {
+            return Err(FrankenError::FunctionError(format!(
+                "error in view {view_name} after drop column: no such column: {column_name}"
+            )));
+        }
+
+        for trigger in self.triggers.borrow().iter() {
+            let mut trigger_probe = trigger.clone();
+            let target_matches = trigger_probe.table_name.eq_ignore_ascii_case(table_name);
+            let mut dependency_found = false;
+            if let Some(when_clause) = &mut trigger_probe.when_clause {
+                let mut target_bindings = ColumnRenameBindings::default();
+                if target_matches {
+                    target_bindings.add_matching_binding(table_name);
+                }
+                dependency_found |= rename_column_refs_in_expr_for_table(
+                    when_clause,
+                    table_name,
+                    column_name,
+                    PROBE_COLUMN,
+                    &target_bindings,
+                    target_matches,
+                    &source_catalog,
+                );
+                if target_matches {
+                    dependency_found |= rename_trigger_row_column_refs_in_expr(
+                        when_clause,
+                        column_name,
+                        PROBE_COLUMN,
+                        &source_catalog,
+                    );
+                }
+            }
+            for statement in &mut trigger_probe.body {
+                dependency_found |= rename_column_refs_in_statement_for_table(
+                    statement,
+                    table_name,
+                    column_name,
+                    PROBE_COLUMN,
+                    &source_catalog,
+                );
+                if target_matches {
+                    dependency_found |= rename_trigger_row_column_refs_in_statement(
+                        statement,
+                        column_name,
+                        PROBE_COLUMN,
+                        &source_catalog,
+                    );
+                }
+            }
+            // UPDATE OF is intentionally excluded: SQLite keeps event-only
+            // references to removed columns as inert trigger metadata.
+            if dependency_found {
+                return Err(FrankenError::FunctionError(format!(
+                    "error in trigger {} after drop column: no such column: {column_name}",
+                    trigger.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn rename_dependent_views_for_column_rename(
@@ -107342,6 +107471,147 @@ mod tests {
                 .unwrap(),
             (2, 202)
         );
+    }
+
+    #[test]
+    fn test_alter_drop_column_rejects_semantic_view_and_trigger_dependencies_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-view-trigger-dependencies.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (kept TEXT, removed TEXT);
+                 INSERT INTO t VALUES ('still-here', 'dependency');
+                 CREATE TABLE audit (value TEXT);
+                 CREATE VIEW t_star AS SELECT * FROM t;
+                 CREATE VIEW dependent_view AS SELECT removed FROM t_star;",
+            )
+            .unwrap();
+
+            let view_error = conn
+                .execute("ALTER TABLE t DROP COLUMN removed;")
+                .unwrap_err();
+            assert_eq!(
+                view_error.to_string(),
+                "error in view dependent_view after drop column: no such column: removed"
+            );
+            assert_eq!(
+                row_values(&conn.query("SELECT kept, removed FROM t;").unwrap()[0]),
+                &[
+                    SqliteValue::Text("still-here".into()),
+                    SqliteValue::Text("dependency".into()),
+                ],
+                "view dependency rejection must precede schema and row mutation"
+            );
+
+            conn.execute("DROP VIEW dependent_view;").unwrap();
+            conn.execute(
+                "CREATE TRIGGER dependent_body AFTER UPDATE ON t BEGIN
+                     INSERT INTO audit SELECT removed FROM t_star;
+                 END;",
+            )
+            .unwrap();
+            let body_error = conn
+                .execute("ALTER TABLE t DROP COLUMN removed;")
+                .unwrap_err();
+            assert_eq!(
+                body_error.to_string(),
+                "error in trigger dependent_body after drop column: no such column: removed"
+            );
+
+            conn.execute("DROP TRIGGER dependent_body;").unwrap();
+            conn.execute(
+                "CREATE TRIGGER dependent_when AFTER UPDATE ON t
+                 WHEN NEW.removed IS NOT NULL BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+            let when_error = conn
+                .execute("ALTER TABLE t DROP COLUMN removed;")
+                .unwrap_err();
+            assert_eq!(
+                when_error.to_string(),
+                "error in trigger dependent_when after drop column: no such column: removed"
+            );
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let columns = sqlite
+            .prepare("SELECT name FROM pragma_table_info('t') ORDER BY cid;")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(columns, vec!["kept".to_owned(), "removed".to_owned()]);
+    }
+
+    #[test]
+    fn test_alter_drop_column_preserves_star_view_event_only_trigger_and_literals_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-legal-view-trigger.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (kept TEXT, removed TEXT);
+                 INSERT INTO t VALUES ('survivor', 'discard');
+                 CREATE TABLE audit (value TEXT);
+                 CREATE VIEW t_star AS SELECT * FROM t;
+                 CREATE VIEW literal_view AS SELECT 'removed' AS text FROM t;
+                 CREATE TRIGGER event_only AFTER UPDATE OF removed ON t BEGIN
+                     INSERT INTO audit VALUES (NEW.kept);
+                     SELECT 'removed';
+                 END;
+                 ALTER TABLE t DROP COLUMN removed;",
+            )
+            .unwrap();
+        }
+
+        let reopened = Connection::open(&db_str).unwrap();
+        let rows = reopened.query("SELECT kept FROM t_star;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[SqliteValue::Text("survivor".into())]
+        );
+        let literal_rows = reopened.query("SELECT text FROM literal_view;").unwrap();
+        assert_eq!(
+            row_values(&literal_rows[0]),
+            &[SqliteValue::Text("removed".into())]
+        );
+        drop(reopened);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let columns = sqlite
+            .prepare("SELECT name FROM pragma_table_info('t') ORDER BY cid;")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(columns, vec!["kept".to_owned()]);
+        let trigger_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='event_only';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains("UPDATE OF removed"), "{trigger_sql}");
+        let view_row: String = sqlite
+            .query_row("SELECT kept FROM t_star;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(view_row, "survivor");
     }
 
     #[test]
