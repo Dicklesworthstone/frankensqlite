@@ -179,8 +179,8 @@ the v1 record version.
 ## Optional sparse index
 
 The index is a rebuildable cache, never an authority. It has a 4096-byte header
-followed by packed 16-byte `{commit_seq, byte_offset}` entries sampled at record
-0 and every 1024 records.
+followed by packed 24-byte `{commit_seq, byte_offset, entry_checksum}` entries
+sampled at record 0 and every 1024 records.
 
 Index header v1:
 
@@ -189,7 +189,7 @@ Index header v1:
 | 0 | 8 | ASCII `FSQLHIX1` |
 | 8 | 2 | format version `1` |
 | 10 | 2 | header length `80` |
-| 12 | 4 | entry length `16` |
+| 12 | 4 | entry length `24` |
 | 16 | 4 | sample stride `1024` |
 | 20 | 4 | reserved zero |
 | 24 | 16 | `database_history_id` |
@@ -197,25 +197,29 @@ Index header v1:
 | 48 | 8 | `database_generation` |
 | 56 | 8 | exact history record count |
 | 64 | 8 | exact final record hash, or zero for an empty log |
-| 72 | 8 | BLAKE3-64 checksum of the entire index with this field zeroed |
+| 72 | 8 | BLAKE3-64 checksum of header bytes 0..80 with this field zeroed |
 
 The remaining header-slot bytes are zero. Entries must be monotone and their
-offsets must equal `(sample_record + 1) * 4096`.
+offsets must equal `(sample_record + 1) * 4096`. Each entry checksum is
+BLAKE3-64 over a domain separator, database identity/generations, exact history
+record count and final hash, entry ordinal, commit sequence, and byte offset.
+This lets a cold lookup validate only the entries it probes without trusting a
+torn entry or reading the entire index.
 
 Rebuild publication is fail-closed:
 
 1. truncate the optional cache and write a complete image with checksum zero;
 2. full-durably sync that unpublished image;
-3. write the header slot containing the final whole-file checksum;
+3. write the header slot containing the final header checksum;
 4. full-durably sync again and sync the parent directory on first creation.
 
 A missing, zero-checksum, malformed, corrupt, wrong-identity, wrong-generation,
 wrong-tail, or wrong-length index is ignored and rebuilt. Rebuild validation is
 a streaming `O(N)` pass with constant record memory; it never materializes the
-history. A loaded index is checked against its exact record-count/final-hash
-tail and sampled VFS records, then cached in-process under that tail identity.
-Warm binary search costs `O(log N)` sample comparisons followed by at most 1024
-VFS record reads. An append or repair invalidates the cache.
+history. A cold lookup reads the tail-bound header, binary-searches entries on
+disk, validates only those `O(log N)` probes against the authoritative history,
+and then reads at most 1024 contiguous history records. It never scans every
+sparse sample. An append changes the exact tail binding and forces a rebuild.
 
 The 10-million-record Criterion benchmark is at
 `tests/perf/history_bisect_bench.rs`; its runnable Cargo wrapper is
@@ -224,9 +228,10 @@ monotone corpus to isolate the linear-versus-sparse lookup algorithm. The
 `ten_million_record_vfs_lookup_does_not_scan_the_full_history` unit test is the
 production-path scale proof: it creates a 40.96 GB sparse logical history,
 materializes only index samples and the selected refinement window, and runs
-both cold-index and cached `HistoryLog::lookup_floor` calls. Any regression to
-`read_all` or another full-history scan encounters an intentionally absent slot
-and fails the test.
+two cold `HistoryLog::lookup_floor` calls. It asserts the complete VFS read
+budget from lookup entry: at most 15 index reads and at most 1044 history reads.
+Any regression to `read_all`, whole-index loading, or all-sample history
+validation fails the budget (and normally encounters an absent history slot).
 
 ## Cross-endian stability
 

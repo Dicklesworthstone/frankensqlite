@@ -782,10 +782,18 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
 
     /// Rebuild and durably publish the optional sparse-index cache.
     pub fn rebuild_sparse_index(&self) -> Result<SparseIndex, HistoryError> {
+        let mut stats = SearchStats::default();
+        self.rebuild_sparse_index_counted(&mut stats)
+    }
+
+    fn rebuild_sparse_index_counted(
+        &self,
+        stats: &mut SearchStats,
+    ) -> Result<SparseIndex, HistoryError> {
         let mut history = self.open_history(true)?;
         history.lock(self.cx, LockLevel::Shared)?;
         let result = (|| {
-            self.validate_header(&history)?;
+            self.validate_header_counted(&history, stats)?;
             let (record_count, partial) = record_count_and_partial(&history, self.cx)?;
             if partial != 0 {
                 return Err(HistoryError::Corrupt {
@@ -800,7 +808,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             let mut entries = Vec::with_capacity(capacity);
             let mut previous = None;
             for position in 0..record_count {
-                let record = self.read_record(&history, position)?;
+                let record = self.read_record_counted(&history, position, stats)?;
                 self.validate_record_position(position, record, previous)?;
                 if position % HISTORY_INDEX_STRIDE == 0 {
                     entries.push(SparseIndexEntry {
@@ -834,29 +842,64 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         // Index preparation and the final lookup deliberately use short-lived
         // locks. An append can therefore race between them. Rebind the pair
         // rather than ever combining an index for one tail with another.
+        let mut stats = SearchStats::default();
         for _ in 0..3 {
-            let tail = self.read_tail_snapshot()?;
-            let index = self.load_or_rebuild_sparse_index(tail)?;
-            let mut history = self.open_history(true)?;
-            history.lock(self.cx, LockLevel::Shared)?;
+            let tail = self.read_tail_snapshot_counted(&mut stats)?;
+            let (mut index_file, binding) = match self.open_sparse_index_for_tail(tail, &mut stats)
+            {
+                Ok(opened) => opened,
+                Err(HistoryError::CorruptIndex(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let mut history = match self.open_history(true) {
+                Ok(history) => history,
+                Err(error) => {
+                    let _ = unlock_and_close(&mut index_file, self.cx);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = history.lock(self.cx, LockLevel::Shared) {
+                let _ = history.close(self.cx);
+                let _ = unlock_and_close(&mut index_file, self.cx);
+                return Err(HistoryError::from(error));
+            }
             let result = (|| {
-                self.validate_header(&history)?;
-                if self.read_tail_locked(&history)? != tail
-                    || index.history_record_count != tail.record_count
-                    || index.last_record_hash != tail.last_record_hash
+                self.validate_header_counted(&history, &mut stats)?;
+                if self.read_tail_locked_counted(&history, &mut stats)? != tail
+                    || binding.tail != tail
                 {
                     return Ok(None);
                 }
-                self.lookup_with_index(&history, &index, target_commit_seq)
-                    .map(Some)
+                self.lookup_with_index_files(
+                    &history,
+                    &index_file,
+                    binding,
+                    target_commit_seq,
+                    &mut stats,
+                )
+                .map(Some)
             })();
             let unlock_result = history
                 .unlock(self.cx, LockLevel::None)
                 .map_err(HistoryError::from);
             let close_result = history.close(self.cx).map_err(HistoryError::from);
-            if let Some(found) = preserve_value_after_cleanup(result, unlock_result, close_result)?
-            {
-                return Ok(found);
+            let result = preserve_value_after_cleanup(result, unlock_result, close_result);
+            let index_unlock_result = index_file
+                .unlock(self.cx, LockLevel::None)
+                .map_err(HistoryError::from);
+            let index_close_result = index_file.close(self.cx).map_err(HistoryError::from);
+            let found =
+                match preserve_value_after_cleanup(result, index_unlock_result, index_close_result)
+                {
+                    Ok(found) => found,
+                    Err(HistoryError::CorruptIndex(_)) => {
+                        self.rebuild_sparse_index_counted(&mut stats)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+            if let Some(record) = found {
+                return Ok((record, stats));
             }
         }
         Err(HistoryError::Corrupt {
@@ -903,12 +946,51 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         Ok(header)
     }
 
-    fn read_tail_snapshot(&self) -> Result<HistoryTail, HistoryError> {
+    fn validate_header_counted(
+        &self,
+        file: &V::File,
+        stats: &mut SearchStats,
+    ) -> Result<HistoryHeader, HistoryError> {
+        let mut slot = [0_u8; HISTORY_SLOT_SIZE];
+        read_exact_at_counted(
+            file,
+            self.cx,
+            &mut slot,
+            0,
+            &mut stats.history_read_calls,
+            &mut stats.history_bytes_read,
+        )?;
+        let header = HistoryHeader::decode_slot(&slot)?;
+        if header.database_history_id != self.expectations.database_history_id {
+            return Err(HistoryError::IdentityMismatch {
+                expected: self.expectations.database_history_id,
+                actual: header.database_history_id,
+            });
+        }
+        if header.format_generation != self.expectations.format_generation {
+            return Err(HistoryError::FormatGenerationMismatch {
+                expected: self.expectations.format_generation,
+                actual: header.format_generation,
+            });
+        }
+        if header.database_generation != self.expectations.database_generation {
+            return Err(HistoryError::DatabaseGenerationMismatch {
+                expected: self.expectations.database_generation,
+                actual: header.database_generation,
+            });
+        }
+        Ok(header)
+    }
+
+    fn read_tail_snapshot_counted(
+        &self,
+        stats: &mut SearchStats,
+    ) -> Result<HistoryTail, HistoryError> {
         let mut history = self.open_history(true)?;
         history.lock(self.cx, LockLevel::Shared)?;
         let result = (|| {
-            self.validate_header(&history)?;
-            self.read_tail_locked(&history)
+            self.validate_header_counted(&history, stats)?;
+            self.read_tail_locked_counted(&history, stats)
         })();
         let unlock_result = history
             .unlock(self.cx, LockLevel::None)
@@ -917,7 +999,11 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         preserve_value_after_cleanup(result, unlock_result, close_result)
     }
 
-    fn read_tail_locked(&self, history: &V::File) -> Result<HistoryTail, HistoryError> {
+    fn read_tail_locked_counted(
+        &self,
+        history: &V::File,
+        stats: &mut SearchStats,
+    ) -> Result<HistoryTail, HistoryError> {
         let (record_count, partial_bytes) = record_count_and_partial(history, self.cx)?;
         if partial_bytes != 0 {
             return Err(HistoryError::Corrupt {
@@ -928,7 +1014,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let last_record_hash = if record_count == 0 {
             0
         } else {
-            let tail = self.read_record(history, record_count - 1)?;
+            let tail = self.read_record_counted(history, record_count - 1, stats)?;
             if tail.commit_seq > self.expectations.recovered_commit_horizon {
                 return Err(HistoryError::Corrupt {
                     slot: Some(record_count - 1),
@@ -955,132 +1041,178 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         })
     }
 
-    fn load_or_rebuild_sparse_index(&self, tail: HistoryTail) -> Result<SparseIndex, HistoryError> {
-        if let Some(index) = self.cached_index(tail) {
-            return Ok(index);
+    fn open_sparse_index_for_tail(
+        &self,
+        tail: HistoryTail,
+        stats: &mut SearchStats,
+    ) -> Result<(V::File, SparseIndexBinding), HistoryError> {
+        match self.try_open_sparse_index_for_tail(tail, stats) {
+            Ok(opened) => Ok(opened),
+            Err(HistoryError::HistoryNotRetained(_) | HistoryError::CorruptIndex(_)) => {
+                self.rebuild_sparse_index_counted(stats)?;
+                self.try_open_sparse_index_for_tail(tail, stats)
+            }
+            Err(error) => Err(error),
         }
-
-        let loaded = match self.read_sparse_index(tail.record_count, tail.last_record_hash) {
-            Ok(index) => match self.sparse_index_matches_history(&index, tail) {
-                Ok(true) => Some(index),
-                Ok(false) => None,
-                Err(error) => return Err(error),
-            },
-            Err(HistoryError::HistoryNotRetained(_) | HistoryError::Corrupt { .. }) => None,
-            Err(error) => return Err(error),
-        };
-        let index = match loaded {
-            Some(index) => index,
-            None => self.rebuild_sparse_index()?,
-        };
-        self.cache_index(index.clone());
-        Ok(index)
     }
 
-    fn sparse_index_matches_history(
+    fn try_open_sparse_index_for_tail(
         &self,
-        index: &SparseIndex,
         tail: HistoryTail,
-    ) -> Result<bool, HistoryError> {
-        let mut history = self.open_history(true)?;
-        history.lock(self.cx, LockLevel::Shared)?;
-        let result = (|| {
-            self.validate_header(&history)?;
-            if self.read_tail_locked(&history)? != tail
-                || index.history_record_count != tail.record_count
-                || index.last_record_hash != tail.last_record_hash
-            {
-                return Ok(false);
-            }
-            for (sample, entry) in index.entries.iter().enumerate() {
-                let sample = u64::try_from(sample).map_err(|_| {
-                    HistoryError::InvalidInput("sparse index position exceeds u64".to_owned())
-                })?;
-                let position = sample.checked_mul(HISTORY_INDEX_STRIDE).ok_or_else(|| {
-                    HistoryError::InvalidInput("sparse index position overflow".to_owned())
-                })?;
-                let record = self.read_record(&history, position)?;
-                let previous = if position == 0 {
-                    None
-                } else {
-                    Some(self.read_record(&history, position - 1)?)
-                };
-                self.validate_record_position(position, record, previous)?;
-                if record.commit_seq != entry.commit_seq {
-                    return Ok(false);
+        stats: &mut SearchStats,
+    ) -> Result<(V::File, SparseIndexBinding), HistoryError> {
+        if !self
+            .vfs
+            .access(self.cx, &self.index_path, AccessFlags::EXISTS)?
+        {
+            return Err(HistoryError::HistoryNotRetained(tail.record_count));
+        }
+        let flags = VfsOpenFlags::MAIN_JOURNAL | VfsOpenFlags::READONLY;
+        let (mut file, _) = self.vfs.open(self.cx, Some(&self.index_path), flags)?;
+        if let Err(error) = file.lock(self.cx, LockLevel::Shared) {
+            let _ = file.close(self.cx);
+            return Err(HistoryError::from(error));
+        }
+        match self.read_sparse_index_binding(&file, tail, stats) {
+            Ok(binding) => Ok((file, binding)),
+            Err(error) => {
+                let unlock_result = file
+                    .unlock(self.cx, LockLevel::None)
+                    .map_err(HistoryError::from);
+                let close_result = file.close(self.cx).map_err(HistoryError::from);
+                let cleanup_result = unlock_result.and(close_result);
+                match cleanup_result {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(cleanup_error),
                 }
             }
-            Ok(true)
-        })();
-        let unlock_result = history
-            .unlock(self.cx, LockLevel::None)
-            .map_err(HistoryError::from);
-        let close_result = history.close(self.cx).map_err(HistoryError::from);
-        preserve_value_after_cleanup(result, unlock_result, close_result)
+        }
     }
 
-    fn lookup_with_index(
+    fn read_sparse_index_binding(
+        &self,
+        file: &V::File,
+        tail: HistoryTail,
+        stats: &mut SearchStats,
+    ) -> Result<SparseIndexBinding, HistoryError> {
+        let mut header = [0_u8; HISTORY_SLOT_SIZE];
+        read_exact_at_counted(
+            file,
+            self.cx,
+            &mut header,
+            0,
+            &mut stats.index_read_calls,
+            &mut stats.index_bytes_read,
+        )?;
+        decode_index_binding(&header, file.file_size(self.cx)?, self.expectations, tail)
+    }
+
+    fn read_index_entry(
+        &self,
+        file: &V::File,
+        binding: SparseIndexBinding,
+        ordinal: u64,
+        stats: &mut SearchStats,
+    ) -> Result<SparseIndexEntry, HistoryError> {
+        if ordinal >= binding.entry_count {
+            return Err(HistoryError::CorruptIndex(
+                "sparse index probe exceeds entry count".to_owned(),
+            ));
+        }
+        let mut bytes = [0_u8; INDEX_ENTRY_SIZE];
+        let offset = index_entry_offset(ordinal)?;
+        read_exact_at_counted(
+            file,
+            self.cx,
+            &mut bytes,
+            offset,
+            &mut stats.index_read_calls,
+            &mut stats.index_bytes_read,
+        )?;
+        decode_index_entry(&bytes, self.expectations, binding.tail, ordinal)
+    }
+
+    fn read_validated_index_probe(
         &self,
         history: &V::File,
-        index: &SparseIndex,
-        target_commit_seq: u64,
-    ) -> Result<(HistoryRecord, SearchStats), HistoryError> {
-        let mut previous = None;
-        let mut candidate = None;
-        let outcome = sparse_bisect_floor_with(index, target_commit_seq, |position| {
-            let record = self.read_record(history, position)?;
-            if let Some((previous_position, previous_record)) = previous {
-                if previous_position + 1 != position {
-                    return Err(HistoryError::Corrupt {
-                        slot: Some(position),
-                        reason: "sparse lookup refinement is not contiguous".to_owned(),
-                    });
-                }
-                self.validate_record_position(position, record, Some(previous_record))?;
-            } else if position == 0 {
-                self.validate_record_position(position, record, None)?;
-            } else if index
-                .entries
-                .get(
-                    usize::try_from(position / HISTORY_INDEX_STRIDE).map_err(|_| {
-                        HistoryError::InvalidInput(
-                            "sparse index position exceeds address space".to_owned(),
-                        )
-                    })?,
-                )
-                .is_none_or(|entry| entry.commit_seq != record.commit_seq)
-            {
-                return Err(HistoryError::Corrupt {
-                    slot: Some(position),
-                    reason: "sparse index sample does not match history record".to_owned(),
-                });
-            } else if record.commit_seq > self.expectations.recovered_commit_horizon {
-                return Err(HistoryError::Corrupt {
-                    slot: Some(position),
-                    reason: format!(
-                        "commit {} exceeds recovered durable horizon {}",
-                        record.commit_seq, self.expectations.recovered_commit_horizon
-                    ),
-                });
-            }
-            previous = Some((position, record));
-            if record.commit_seq <= target_commit_seq {
-                candidate = Some((position, record));
-            }
-            Ok(record.commit_seq)
-        })?;
-        let expected_position = outcome
-            .record_index
-            .ok_or(HistoryError::HistoryNotRetained(target_commit_seq))?;
-        let (actual_position, record) =
-            candidate.ok_or(HistoryError::HistoryNotRetained(target_commit_seq))?;
-        if actual_position != expected_position {
+        index_file: &V::File,
+        binding: SparseIndexBinding,
+        ordinal: u64,
+        stats: &mut SearchStats,
+    ) -> Result<SparseIndexEntry, HistoryError> {
+        let entry = self.read_index_entry(index_file, binding, ordinal, stats)?;
+        let record_index = ordinal
+            .checked_mul(HISTORY_INDEX_STRIDE)
+            .ok_or_else(|| HistoryError::CorruptIndex("sample position overflow".to_owned()))?;
+        let record = self.read_record_counted(history, record_index, stats)?;
+        if record.commit_seq != entry.commit_seq {
+            return Err(HistoryError::CorruptIndex(format!(
+                "sample {ordinal} does not match authoritative history"
+            )));
+        }
+        if record.commit_seq > self.expectations.recovered_commit_horizon {
             return Err(HistoryError::Corrupt {
-                slot: Some(expected_position),
-                reason: "sparse lookup returned an inconsistent candidate".to_owned(),
+                slot: Some(record_index),
+                reason: format!(
+                    "commit {} exceeds recovered durable horizon {}",
+                    record.commit_seq, self.expectations.recovered_commit_horizon
+                ),
             });
         }
-        Ok((record, outcome.stats))
+        Ok(entry)
+    }
+
+    fn lookup_with_index_files(
+        &self,
+        history: &V::File,
+        index_file: &V::File,
+        binding: SparseIndexBinding,
+        target_commit_seq: u64,
+        stats: &mut SearchStats,
+    ) -> Result<HistoryRecord, HistoryError> {
+        if binding.entry_count == 0 {
+            return Err(HistoryError::HistoryNotRetained(target_commit_seq));
+        }
+        let mut low = 0_u64;
+        let mut high = binding.entry_count;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let entry =
+                self.read_validated_index_probe(history, index_file, binding, mid, stats)?;
+            stats.index_probes += 1;
+            if entry.commit_seq <= target_commit_seq {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let start_index = if low == 0 {
+            0
+        } else {
+            (low - 1)
+                .checked_mul(HISTORY_INDEX_STRIDE)
+                .ok_or_else(|| HistoryError::CorruptIndex("lookup position overflow".to_owned()))?
+        };
+        let end_index = start_index
+            .saturating_add(HISTORY_INDEX_STRIDE)
+            .min(binding.tail.record_count);
+        let mut previous = if start_index == 0 {
+            None
+        } else {
+            Some(self.read_record_counted(history, start_index - 1, stats)?)
+        };
+        let mut candidate = None;
+        for position in start_index..end_index {
+            let record = self.read_record_counted(history, position, stats)?;
+            self.validate_record_position(position, record, previous)?;
+            stats.record_probes += 1;
+            previous = Some(record);
+            if record.commit_seq > target_commit_seq {
+                break;
+            }
+            candidate = Some(record);
+        }
+        candidate.ok_or(HistoryError::HistoryNotRetained(target_commit_seq))
     }
 
     fn validate_record_position(
@@ -1121,22 +1253,6 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             });
         }
         Ok(())
-    }
-
-    fn cached_index(&self, tail: HistoryTail) -> Option<SparseIndex> {
-        self.index_cache.read().as_ref().and_then(|index| {
-            let same_record_count = index.history_record_count == tail.record_count;
-            let same_last_hash = index.last_record_hash == tail.last_record_hash;
-            (same_record_count && same_last_hash).then(|| index.clone())
-        })
-    }
-
-    fn cache_index(&self, index: SparseIndex) {
-        *self.index_cache.write() = Some(index);
-    }
-
-    fn clear_index_cache(&self) {
-        *self.index_cache.write() = None;
     }
 
     fn recover_locked(&self, file: &mut V::File) -> Result<RecoveryReport, HistoryError> {
@@ -1215,6 +1331,24 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         HistoryRecord::decode(&bytes).map_err(|error| error_at_slot(error, index))
     }
 
+    fn read_record_counted(
+        &self,
+        file: &V::File,
+        index: u64,
+        stats: &mut SearchStats,
+    ) -> Result<HistoryRecord, HistoryError> {
+        let mut bytes = [0_u8; HISTORY_RECORD_V1_SIZE];
+        read_exact_at_counted(
+            file,
+            self.cx,
+            &mut bytes,
+            record_offset(index)?,
+            &mut stats.history_read_calls,
+            &mut stats.history_bytes_read,
+        )?;
+        HistoryRecord::decode(&bytes).map_err(|error| error_at_slot(error, index))
+    }
+
     fn read_and_validate_prefix(
         &self,
         file: &V::File,
@@ -1233,7 +1367,6 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
     }
 
     fn write_sparse_index(&self, index: &SparseIndex) -> Result<(), HistoryError> {
-        self.clear_index_cache();
         let bytes = encode_index(self.expectations, index)?;
         let exists = self
             .vfs
@@ -1250,7 +1383,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
         let result: Result<(), FrankenError> = (|| {
             let unpublished = {
                 let mut bytes = bytes.clone();
-                bytes[INDEX_CHECKSUM_RANGE].fill(0);
+                bytes[INDEX_HEADER_CHECKSUM_RANGE].fill(0);
                 bytes
             };
             file.truncate(self.cx, 0)?;
@@ -1273,6 +1406,7 @@ impl<'a, V: Vfs> HistoryLog<'a, V> {
             .and(close_result)
     }
 
+    #[cfg(test)]
     fn read_sparse_index(
         &self,
         expected_record_count: u64,
@@ -1322,6 +1456,12 @@ fn preserve_value_after_cleanup<T>(
     }
 }
 
+fn unlock_and_close<F: VfsFile>(file: &mut F, cx: &Cx) -> Result<(), HistoryError> {
+    let unlock_result = file.unlock(cx, LockLevel::None).map_err(HistoryError::from);
+    let close_result = file.close(cx).map_err(HistoryError::from);
+    unlock_result.and(close_result)
+}
+
 fn encode_index(
     expectations: HistoryExpectations,
     index: &SparseIndex,
@@ -1361,12 +1501,27 @@ fn encode_index(
         let offset = HISTORY_SLOT_SIZE + position * INDEX_ENTRY_SIZE;
         put_u64(&mut bytes, offset, entry.commit_seq);
         put_u64(&mut bytes, offset + 8, entry.byte_offset);
+        let ordinal = u64::try_from(position).map_err(|_| {
+            HistoryError::InvalidInput("sparse index position exceeds u64".to_owned())
+        })?;
+        let checksum = index_entry_checksum(
+            expectations,
+            HistoryTail {
+                record_count: index.history_record_count,
+                last_record_hash: index.last_record_hash,
+            },
+            ordinal,
+            *entry,
+        );
+        put_u64(&mut bytes, offset + 16, checksum);
     }
-    let checksum = checksum_with_zeroed_range(&bytes, INDEX_CHECKSUM_RANGE);
+    let checksum =
+        checksum_with_zeroed_range(&bytes[..INDEX_HEADER_V1_SIZE], INDEX_HEADER_CHECKSUM_RANGE);
     put_u64(&mut bytes, 72, checksum);
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn decode_index(
     bytes: &[u8],
     expectations: HistoryExpectations,
@@ -1399,7 +1554,8 @@ fn decode_index(
             reason: "sparse index reserved bytes are non-zero".to_owned(),
         });
     }
-    let actual_checksum = checksum_with_zeroed_range(bytes, INDEX_CHECKSUM_RANGE);
+    let actual_checksum =
+        checksum_with_zeroed_range(&bytes[..INDEX_HEADER_V1_SIZE], INDEX_HEADER_CHECKSUM_RANGE);
     if get_u64(bytes, 72) == 0 || get_u64(bytes, 72) != actual_checksum {
         return Err(HistoryError::Corrupt {
             slot: None,
@@ -1471,6 +1627,17 @@ fn decode_index(
                 reason: "sparse index entries are unaligned or non-monotone".to_owned(),
             });
         }
+        let tail = HistoryTail {
+            record_count: expected_record_count,
+            last_record_hash: expected_last_hash,
+        };
+        if get_u64(bytes, offset + 16)
+            != index_entry_checksum(expectations, tail, position_u64, entry)
+        {
+            return Err(HistoryError::CorruptIndex(format!(
+                "sparse index entry {position_u64} checksum mismatch"
+            )));
+        }
         entries.push(entry);
     }
     Ok(SparseIndex {
@@ -1478,6 +1645,154 @@ fn decode_index(
         history_record_count: expected_record_count,
         last_record_hash: expected_last_hash,
     })
+}
+
+fn decode_index_binding(
+    header: &[u8],
+    file_len: u64,
+    expectations: HistoryExpectations,
+    tail: HistoryTail,
+) -> Result<SparseIndexBinding, HistoryError> {
+    if header.len() < HISTORY_SLOT_SIZE {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index header is incomplete".to_owned(),
+        ));
+    }
+    if header[0..8] != INDEX_MAGIC
+        || get_u16(header, 8) != HISTORY_FORMAT_VERSION
+        || get_u16(header, 10)
+            != u16::try_from(INDEX_HEADER_V1_SIZE).expect("index header size fits u16")
+        || get_u32(header, 12)
+            != u32::try_from(INDEX_ENTRY_SIZE).expect("index entry size fits u32")
+        || get_u32(header, 16)
+            != u32::try_from(HISTORY_INDEX_STRIDE).expect("index stride fits u32")
+    {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index format mismatch".to_owned(),
+        ));
+    }
+    if header[20..24].iter().any(|byte| *byte != 0)
+        || header[INDEX_HEADER_V1_SIZE..HISTORY_SLOT_SIZE]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index reserved bytes are non-zero".to_owned(),
+        ));
+    }
+    let actual_checksum =
+        checksum_with_zeroed_range(&header[..INDEX_HEADER_V1_SIZE], INDEX_HEADER_CHECKSUM_RANGE);
+    if get_u64(header, 72) == 0 || get_u64(header, 72) != actual_checksum {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index header is unpublished or corrupt".to_owned(),
+        ));
+    }
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&header[24..40]);
+    if DatabaseHistoryId(id) != expectations.database_history_id
+        || get_u64(header, 40) != expectations.format_generation
+        || get_u64(header, 48) != expectations.database_generation
+        || get_u64(header, 56) != tail.record_count
+        || get_u64(header, 64) != tail.last_record_hash
+    {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index is stale for this history tail".to_owned(),
+        ));
+    }
+    let entry_count = tail.record_count.div_ceil(HISTORY_INDEX_STRIDE);
+    let expected_len = u64::try_from(HISTORY_SLOT_SIZE)
+        .expect("history slot size fits u64")
+        .checked_add(
+            entry_count
+                .checked_mul(u64::try_from(INDEX_ENTRY_SIZE).expect("entry size fits u64"))
+                .ok_or_else(|| {
+                    HistoryError::CorruptIndex("sparse index byte size overflow".to_owned())
+                })?,
+        )
+        .ok_or_else(|| HistoryError::CorruptIndex("sparse index byte size overflow".to_owned()))?;
+    if file_len != expected_len {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index length mismatch".to_owned(),
+        ));
+    }
+    Ok(SparseIndexBinding { tail, entry_count })
+}
+
+fn decode_index_entry(
+    bytes: &[u8],
+    expectations: HistoryExpectations,
+    tail: HistoryTail,
+    ordinal: u64,
+) -> Result<SparseIndexEntry, HistoryError> {
+    if bytes.len() != INDEX_ENTRY_SIZE {
+        return Err(HistoryError::CorruptIndex(
+            "sparse index entry is incomplete".to_owned(),
+        ));
+    }
+    let entry = SparseIndexEntry {
+        commit_seq: get_u64(bytes, 0),
+        byte_offset: get_u64(bytes, 8),
+    };
+    let record_index = ordinal
+        .checked_mul(HISTORY_INDEX_STRIDE)
+        .ok_or_else(|| HistoryError::CorruptIndex("sample position overflow".to_owned()))?;
+    if entry.commit_seq == 0 || entry.byte_offset != record_offset(record_index)? {
+        return Err(HistoryError::CorruptIndex(format!(
+            "sparse index entry {ordinal} is invalid"
+        )));
+    }
+    if get_u64(bytes, 16) != index_entry_checksum(expectations, tail, ordinal, entry) {
+        return Err(HistoryError::CorruptIndex(format!(
+            "sparse index entry {ordinal} checksum mismatch"
+        )));
+    }
+    Ok(entry)
+}
+
+fn index_entry_checksum(
+    expectations: HistoryExpectations,
+    tail: HistoryTail,
+    ordinal: u64,
+    entry: SparseIndexEntry,
+) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&INDEX_ENTRY_HASH_DOMAIN);
+    hasher.update(&expectations.database_history_id.0);
+    hasher.update(&expectations.format_generation.to_le_bytes());
+    hasher.update(&expectations.database_generation.to_le_bytes());
+    hasher.update(&tail.record_count.to_le_bytes());
+    hasher.update(&tail.last_record_hash.to_le_bytes());
+    hasher.update(&ordinal.to_le_bytes());
+    hasher.update(&entry.commit_seq.to_le_bytes());
+    hasher.update(&entry.byte_offset.to_le_bytes());
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("eight-byte hash"))
+}
+
+fn index_entry_offset(ordinal: u64) -> Result<u64, HistoryError> {
+    u64::try_from(HISTORY_SLOT_SIZE)
+        .expect("history slot size fits u64")
+        .checked_add(
+            ordinal
+                .checked_mul(u64::try_from(INDEX_ENTRY_SIZE).expect("entry size fits u64"))
+                .ok_or_else(|| {
+                    HistoryError::CorruptIndex("sparse index entry offset overflow".to_owned())
+                })?,
+        )
+        .ok_or_else(|| HistoryError::CorruptIndex("sparse index entry offset overflow".to_owned()))
+}
+
+fn read_exact_at_counted<F: VfsFile>(
+    file: &F,
+    cx: &Cx,
+    buffer: &mut [u8],
+    offset: u64,
+    read_calls: &mut u64,
+    bytes_read: &mut u64,
+) -> Result<(), HistoryError> {
+    *read_calls = read_calls.saturating_add(1);
+    *bytes_read = bytes_read.saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+    read_exact_at(file, cx, buffer, offset)
 }
 
 fn read_exact_at<F: VfsFile>(
@@ -2140,9 +2455,9 @@ mod tests {
         log.write_sparse_index(&index)
             .expect("publish internally consistent but incorrect index");
 
-        // Lookup compares every sample with the authoritative history record,
-        // rejects the wrong entry despite its valid whole-file checksum, and
-        // rebuilds before answering.
+        // The disk binary search compares each probed entry with the
+        // authoritative history record. It rejects the wrong entry despite
+        // its valid tail-bound checksum and rebuilds before answering.
         let (record, _) = log.lookup_floor(1).expect("lookup rebuilds index");
         assert_eq!(record.commit_seq, 1);
         let repaired = log
@@ -2273,12 +2588,19 @@ mod tests {
 
         let target = RECORD_COUNT - 17;
         let (cold_record, cold_stats) = log.lookup_floor(target).expect("cold VFS lookup");
-        let (warm_record, warm_stats) = log.lookup_floor(target).expect("cached VFS lookup");
+        let (second_record, second_stats) = log.lookup_floor(target).expect("second VFS lookup");
         assert_eq!(cold_record.commit_seq, target);
-        assert_eq!(warm_record, cold_record);
-        for stats in [cold_stats, warm_stats] {
+        assert_eq!(second_record, cold_record);
+        for stats in [cold_stats, second_stats] {
             assert!(stats.index_probes <= 14);
             assert!(stats.record_probes <= HISTORY_INDEX_STRIDE);
+            assert!(stats.index_read_calls <= 15, "{stats:?}");
+            assert!(
+                stats.history_read_calls <= HISTORY_INDEX_STRIDE + 20,
+                "{stats:?}"
+            );
+            assert!(stats.index_bytes_read <= 4_432, "{stats:?}");
+            assert!(stats.history_bytes_read <= 80_000, "{stats:?}");
         }
     }
 
