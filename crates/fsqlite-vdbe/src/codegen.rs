@@ -353,6 +353,19 @@ pub struct FkDef {
     pub deferred: bool,
 }
 
+/// A CHECK constraint together with its schema-level ownership.
+///
+/// SQLite drops a column-level CHECK with its owning column, while a
+/// table-level CHECK or a CHECK owned by another column remains a dependency
+/// that can prevent `ALTER TABLE ... DROP COLUMN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    /// Constraint expression as SQL text.
+    pub expr: String,
+    /// Owning column for a column-level CHECK; `None` for table-level CHECKs.
+    pub owner_column: Option<String>,
+}
+
 /// Foreign key action type (mirrors `fsqlite_ast::ForeignKeyActionType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FkActionType {
@@ -392,9 +405,8 @@ pub struct TableSchema {
     pub primary_key_constraints: Vec<Vec<String>>,
     /// Foreign key constraints declared on this table (child side).
     pub foreign_keys: Vec<FkDef>,
-    /// CHECK constraint expressions as SQL text, collected from both
-    /// column-level and table-level constraints.
-    pub check_constraints: Vec<String>,
+    /// CHECK constraints with durable column-vs-table ownership.
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 impl TableSchema {
@@ -21989,8 +22001,8 @@ fn emit_check_constraints(
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
 
-    for check_sql in &table.check_constraints {
-        let Some(expr) = parse_default_expr(check_sql) else {
+    for check in &table.check_constraints {
+        let Some(expr) = parse_default_expr(&check.expr) else {
             continue;
         };
 
@@ -22025,7 +22037,7 @@ fn emit_check_constraints(
                 SQLITE_CONSTRAINT,
                 0,
                 0,
-                P4::Str(format!("CHECK constraint failed: {check_sql}")),
+                P4::Str(format!("CHECK constraint failed: {}", check.expr)),
                 0,
             );
         }

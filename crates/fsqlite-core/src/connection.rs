@@ -147,7 +147,7 @@ use fsqlite_types::{
     StrictColumnType, TextEncoding, TypeAffinity,
 };
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
+    CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert, codegen_select,
     codegen_update, emit_backfill_key_expr, emit_scan_filter,
@@ -40495,13 +40495,19 @@ impl Connection {
                 for col in columns {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind {
-                            check_defs.push(format!("{expr}"));
+                            check_defs.push(CheckConstraint {
+                                expr: expr.to_string(),
+                                owner_column: Some(col.name.clone()),
+                            });
                         }
                     }
                 }
                 for tc in constraints {
                     if let TableConstraintKind::Check(ref expr) = tc.kind {
-                        check_defs.push(format!("{expr}"));
+                        check_defs.push(CheckConstraint {
+                            expr: expr.to_string(),
+                            owner_column: None,
+                        });
                     }
                 }
 
@@ -41223,8 +41229,15 @@ impl Connection {
                         rename_column_refs_in_stored_expr_sql(generated_expr, old, new)?;
                     }
                 }
-                for check_expr in &mut renamed_table.check_constraints {
-                    rename_column_refs_in_stored_expr_sql(check_expr, old, new)?;
+                for check in &mut renamed_table.check_constraints {
+                    rename_column_refs_in_stored_expr_sql(&mut check.expr, old, new)?;
+                    if check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(old))
+                    {
+                        check.owner_column = Some(new.clone());
+                    }
                 }
                 for pk in &mut renamed_table.primary_key_constraints {
                     for pk_col in pk {
@@ -41370,7 +41383,10 @@ impl Connection {
                     .constraints
                     .iter()
                     .filter_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::Check(expr) => Some(expr.to_string()),
+                        ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
+                            expr: expr.to_string(),
+                            owner_column: Some(col_def.name.clone()),
+                        }),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -41521,21 +41537,126 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
-                // SQLite rule: cannot drop the last remaining column.
-                if table.columns.len() == 1 {
-                    return Err(FrankenError::Internal(format!(
-                        "cannot drop column {col_name}: only one column remains"
-                    )));
-                }
                 if table.primary_key_constraints.iter().any(|pk| {
                     pk.iter()
                         .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
                 }) {
-                    return Err(FrankenError::Internal(format!(
-                        "cannot drop PRIMARY KEY column {col_name}"
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop PRIMARY KEY column: \"{col_name}\""
                     )));
                 }
+
+                // A column-level UNIQUE constraint is part of the table
+                // definition, not a disposable user index. Silently deleting
+                // its autoindex would weaken the table's data contract.
+                if table.columns[col_idx].unique {
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop UNIQUE column: \"{col_name}\""
+                    )));
+                }
+
+                // SQLite rule: cannot drop the last remaining column.
+                if table.columns.len() == 1 {
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop column \"{col_name}\": no other columns exist"
+                    )));
+                }
+
+                // SQLite requires every table to retain at least one ordinary
+                // (non-generated) column. Check this before dependency errors so
+                // `DROP COLUMN` reports the same primary schema defect as stock
+                // SQLite when the sole base column feeds a generated column.
+                if !table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, column)| idx != col_idx && column.generated_expr.is_none())
+                {
+                    return Err(FrankenError::FunctionError(format!(
+                        "error in table {} after drop column: must have at least one non-generated column",
+                        table.name
+                    )));
+                }
+
+                // Validate every stored table expression before mutating the
+                // schema. Leaving a generated column or CHECK constraint that
+                // names the removed column poisons sqlite_master for stock
+                // SQLite and silently disables constraints in this runtime.
+                for (idx, column) in table.columns.iter().enumerate() {
+                    if idx == col_idx {
+                        continue;
+                    }
+                    if let Some(expr_sql) = column.generated_expr.as_deref()
+                        && stored_expr_references_column(expr_sql, col_name)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+                for check in &table.check_constraints {
+                    if check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                    {
+                        continue;
+                    }
+                    if stored_expr_references_column(&check.expr, col_name)? {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+
+                // Both explicit indexes and implicit table-level UNIQUE
+                // constraints make the column non-droppable. This includes
+                // expression-index terms and partial-index predicates, whose
+                // dependencies are not represented in `IndexSchema::columns`.
+                for index in &table.indexes {
+                    let key_expression_references_column =
+                        index
+                            .key_expressions
+                            .iter()
+                            .try_fold(false, |found, expr_sql| {
+                                Ok::<bool, FrankenError>(
+                                    found || stored_expr_references_column(expr_sql, col_name)?,
+                                )
+                            })?;
+                    let predicate_references_column = index
+                        .where_clause
+                        .as_deref()
+                        .map(|where_sql| stored_expr_references_column(where_sql, col_name))
+                        .transpose()?
+                        .unwrap_or(false);
+                    let references_column = index
+                        .columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(col_name))
+                        || key_expression_references_column
+                        || predicate_references_column;
+                    if references_column {
+                        if self.index_is_implicit_autoindex(&index.name, &table.name) {
+                            return Err(FrankenError::FunctionError(format!(
+                                "error in table {} after drop column: no such column: {col_name}",
+                                table.name
+                            )));
+                        }
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in index {} after drop column: no such column: {col_name}",
+                            index.name
+                        )));
+                    }
+                }
                 table.columns.remove(col_idx);
+                table.check_constraints.retain(|check| {
+                    !check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                });
                 // Remove indexes that reference the dropped column.
                 let dropped_indexes: Vec<String> = table
                     .indexes
@@ -63337,7 +63458,11 @@ impl Connection {
             }
 
             let check_defs = parsed_create_table.as_ref().map_or_else(
-                || crate::compat_persist::extract_check_constraints_from_sql(&create_sql),
+                || {
+                    crate::compat_persist::extract_check_constraints_with_owners_from_sql(
+                        &create_sql,
+                    )
+                },
                 crate::compat_persist::check_constraints_from_create_table_statement,
             );
 
@@ -67581,6 +67706,16 @@ where
                     part.push_str(" VIRTUAL");
                 }
             }
+            for check in table.check_constraints.iter().filter(|check| {
+                check
+                    .owner_column
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+            }) {
+                part.push_str(" CHECK(");
+                part.push_str(&check.expr);
+                part.push(')');
+            }
             part
         })
         .collect();
@@ -67678,9 +67813,13 @@ where
     }
     // Append table-level CHECK constraints.
     let mut check_clauses = String::new();
-    for check_expr in &table.check_constraints {
+    for check in table
+        .check_constraints
+        .iter()
+        .filter(|check| check.owner_column.is_none())
+    {
         use std::fmt::Write;
-        write!(check_clauses, ", CHECK({check_expr})").ok();
+        write!(check_clauses, ", CHECK({})", check.expr).ok();
     }
     let mut table_options = Vec::new();
     if table.without_rowid {
@@ -76199,6 +76338,19 @@ fn rename_column_refs_in_stored_expr_sql(
     Ok(())
 }
 
+fn stored_expr_references_column(expr_sql: &str, column_name: &str) -> Result<bool> {
+    let expr = fsqlite_parser::expr::parse_expr(expr_sql).map_err(|err| {
+        FrankenError::Internal(format!(
+            "failed to parse schema expression `{expr_sql}` during column drop: {err}"
+        ))
+    })?;
+    let mut column_refs = Vec::new();
+    collect_expr_column_refs(&expr, &mut column_refs);
+    Ok(column_refs
+        .iter()
+        .any(|referenced| referenced.eq_ignore_ascii_case(column_name)))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct ColumnRenameOutputStatus {
     exposes_old: bool,
@@ -79895,10 +80047,36 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 }
             }
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
             if let FunctionArgs::List(items) = args {
                 for e in items {
                     collect_expr_column_refs(e, out);
+                }
+            }
+            for term in order_by {
+                collect_expr_column_refs(&term.expr, out);
+            }
+            if let Some(filter_expr) = filter {
+                collect_expr_column_refs(filter_expr, out);
+            }
+            if let Some(window) = over {
+                for partition_expr in &window.partition_by {
+                    collect_expr_column_refs(partition_expr, out);
+                }
+                for term in &window.order_by {
+                    collect_expr_column_refs(&term.expr, out);
+                }
+                if let Some(frame) = &window.frame {
+                    collect_frame_bound_column_refs(&frame.start, out);
+                    if let Some(end) = &frame.end {
+                        collect_frame_bound_column_refs(end, out);
+                    }
                 }
             }
         }
@@ -79931,8 +80109,28 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 collect_expr_column_refs(esc, out);
             }
         }
+        Expr::JsonAccess { expr, path, .. } => {
+            collect_expr_column_refs(expr, out);
+            collect_expr_column_refs(path, out);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                collect_expr_column_refs(value, out);
+            }
+        }
         // Literals, placeholders, subqueries, etc. have no column refs.
         _ => {}
+    }
+}
+
+fn collect_frame_bound_column_refs<'a>(bound: &'a FrameBound, out: &mut Vec<&'a str>) {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            collect_expr_column_refs(expr, out);
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => {}
     }
 }
 
@@ -106695,6 +106893,271 @@ mod tests {
         let rows = conn.query("SELECT a, c FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_last_non_generated_column() {
+        let single = Connection::open(":memory:").unwrap();
+        single.execute("CREATE TABLE single (a INTEGER);").unwrap();
+        let err = single
+            .execute("ALTER TABLE single DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop column \"a\": no other columns exist"
+            ),
+            "{err}"
+        );
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (1) STORED);")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN a;").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must have at least one non-generated column"),
+            "{err}"
+        );
+        conn.execute("INSERT INTO t(a) VALUES (7);").unwrap();
+        let rows = conn.query("SELECT a, b FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[SqliteValue::Integer(7), SqliteValue::Integer(1)]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_generated_column_dependency() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, c INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+        )
+        .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN a;").unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+        conn.execute("INSERT INTO t(a, c) VALUES (5, 9);").unwrap();
+        let rows = conn.query("SELECT a, c, b FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(9),
+                SqliteValue::Integer(10),
+            ]
+        );
+
+        let json_conn = Connection::open(":memory:").unwrap();
+        json_conn
+            .execute(
+                "CREATE TABLE json_generated (payload TEXT, keep INTEGER, extracted TEXT GENERATED ALWAYS AS (payload ->> '$.name') STORED);",
+            )
+            .unwrap();
+        let err = json_conn
+            .execute("ALTER TABLE json_generated DROP COLUMN payload;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: payload"), "{err}");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-generated-fallback.db");
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE fallback_generated(
+                        a INTEGER,
+                        c INTEGER,
+                        b INTEGER GENERATED ALWAYS AS(a * 2) STORED,
+                        CHECK(c > 0) ON CONFLICT FAIL
+                    );",
+                )
+                .unwrap();
+        }
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let err = reopened
+            .execute("ALTER TABLE fallback_generated DROP COLUMN a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+        let rows = reopened
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_generated';")
+            .unwrap();
+        assert!(row_values(&rows[0])[0].to_text().contains("GENERATED"));
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_check_dependency() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, CHECK(a + b > 0));")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap_err();
+        assert!(err.to_string().contains("no such column: b"), "{err}");
+        assert!(
+            conn.execute("INSERT INTO t VALUES (-2, 1);").is_err(),
+            "the rejected ALTER must leave the CHECK constraint active"
+        );
+
+        let row_value_conn = Connection::open(":memory:").unwrap();
+        row_value_conn
+            .execute(
+                "CREATE TABLE row_value_check (a INTEGER, b INTEGER, CHECK((a, b) != (1, 2)));",
+            )
+            .unwrap();
+        let err = row_value_conn
+            .execute("ALTER TABLE row_value_check DROP COLUMN b;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: b"), "{err}");
+
+        let surviving_column_check = Connection::open(":memory:").unwrap();
+        surviving_column_check
+            .execute("CREATE TABLE surviving_column_check (a INTEGER, b INTEGER CHECK(a + b > 0));")
+            .unwrap();
+        let err = surviving_column_check
+            .execute("ALTER TABLE surviving_column_check DROP COLUMN a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+
+        let dropped_column_check = Connection::open(":memory:").unwrap();
+        dropped_column_check
+            .execute("CREATE TABLE dropped_column_check (a INTEGER CHECK(a > 0), b INTEGER);")
+            .unwrap();
+        dropped_column_check
+            .execute("ALTER TABLE dropped_column_check DROP COLUMN a;")
+            .unwrap();
+        dropped_column_check
+            .execute("INSERT INTO dropped_column_check(b) VALUES (-1);")
+            .unwrap();
+        let rows = dropped_column_check
+            .query("SELECT b FROM dropped_column_check;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0]), &[SqliteValue::Integer(-1)]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-check-owner.db");
+        {
+            let persisted = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            persisted
+                .execute("CREATE TABLE persisted (a INTEGER CHECK(a > 0), b INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE persisted RENAME COLUMN a TO renamed_a;")
+                .unwrap();
+        }
+        {
+            let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            reopened
+                .execute("ALTER TABLE persisted DROP COLUMN renamed_a;")
+                .unwrap();
+            reopened
+                .execute("INSERT INTO persisted(b) VALUES (-2);")
+                .unwrap();
+            let rows = reopened.query("SELECT b FROM persisted;").unwrap();
+            assert_eq!(row_values(&rows[0]), &[SqliteValue::Integer(-2)]);
+        }
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_index_dependencies() {
+        for create_index in [
+            "CREATE INDEX idx ON t(a, b);",
+            "CREATE INDEX idx ON t(lower(b));",
+            "CREATE INDEX idx ON t(b ->> '$.name');",
+            "CREATE INDEX idx ON t(a) WHERE b > 0;",
+        ] {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+                .unwrap();
+            conn.execute(create_index).unwrap();
+
+            let err = conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("error in index idx after drop column"),
+                "index SQL `{create_index}` produced unexpected error: {err}"
+            );
+            let rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx';")
+                .unwrap();
+            assert_eq!(rows.len(), 1, "index SQL `{create_index}` was removed");
+        }
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_unique_constraints() {
+        let primary_key_conn = Connection::open(":memory:").unwrap();
+        primary_key_conn
+            .execute("CREATE TABLE one_pk (a INTEGER PRIMARY KEY);")
+            .unwrap();
+        let err = primary_key_conn
+            .execute("ALTER TABLE one_pk DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop PRIMARY KEY column: \"a\""
+            ),
+            "{err}"
+        );
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE single_unique (a INTEGER UNIQUE, b INTEGER);")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE single_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot drop UNIQUE column: \"a\""),
+            "{err}"
+        );
+
+        let table_level_unique = Connection::open(":memory:").unwrap();
+        table_level_unique
+            .execute("CREATE TABLE table_unique (a INTEGER, b INTEGER, UNIQUE(a));")
+            .unwrap();
+        let err = table_level_unique
+            .execute("ALTER TABLE table_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table table_unique after drop column: no such column: a"
+            ),
+            "{err}"
+        );
+
+        conn.execute(
+            "CREATE TABLE unique_generated (a INTEGER UNIQUE, b INTEGER GENERATED ALWAYS AS (a + 1) STORED);",
+        )
+        .unwrap();
+        let err = conn
+            .execute("ALTER TABLE unique_generated DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop UNIQUE column: \"a\""
+            ),
+            "{err}"
+        );
+
+        conn.execute(
+            "CREATE TABLE composite_unique (a INTEGER, b INTEGER, c INTEGER, UNIQUE(a, b));",
+        )
+        .unwrap();
+        let err = conn
+            .execute("ALTER TABLE composite_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("error in table composite_unique after drop column"),
+            "{err}"
+        );
     }
 
     #[test]
