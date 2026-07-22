@@ -147,7 +147,7 @@ use fsqlite_types::{
     StrictColumnType, TextEncoding, TypeAffinity,
 };
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
+    CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert, codegen_select,
     codegen_update, emit_backfill_key_expr, emit_scan_filter,
@@ -7847,6 +7847,8 @@ fn select_indexed_numeric_probe_spec_for_column(
 struct DbSnapshot {
     db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
+    temp_table_names: HashSet<String>,
+    shadowed_main_tables: HashMap<String, TableSchema>,
     views: Vec<ViewDef>,
     triggers: Vec<TriggerDef>,
     rowid_alias_columns: HashMap<String, usize>,
@@ -9105,6 +9107,10 @@ pub struct Connection {
     /// the old connection while leaving the committed image reopenable.
     #[cfg(test)]
     fail_vacuum_rebind_once: Cell<bool>,
+    /// One-shot failure after DROP COLUMN rewrites row storage but before it
+    /// updates the catalog. Proves statement-level rollback spans both sides.
+    #[cfg(test)]
+    fail_alter_drop_after_storage_once: Cell<bool>,
     // ── Cx capability context (bd-2g5.6) ──────────────────────────────────────
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
@@ -9755,6 +9761,8 @@ impl Connection {
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
+            #[cfg(test)]
+            fail_alter_drop_after_storage_once: Cell::new(false),
             root_cx,
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
@@ -10169,6 +10177,8 @@ impl Connection {
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
+            #[cfg(test)]
+            fail_alter_drop_after_storage_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
             eprocess_oracle,
@@ -24209,6 +24219,10 @@ impl Connection {
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::CreateIndex(_)
+                | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
+                    action: AlterTableAction::DropColumn(_),
+                    ..
+                })
                 | Statement::Reindex(_)
         );
         let rollback_on_constraint_violation =
@@ -33776,20 +33790,70 @@ impl Connection {
         table_name: &str,
         removed_slot: usize,
     ) -> Result<()> {
-        let root_page = {
+        let (root_page, without_rowid, temporary) = {
             let schema = self.schema.borrow();
-            schema
+            let table = schema
                 .iter()
                 .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+            (
+                table.root_page,
+                table.without_rowid,
+                self.temp_table_names
+                    .borrow()
+                    .contains(&table.name.to_ascii_lowercase()),
+            )
         };
         if root_page <= 0 {
             return Ok(());
         }
+        if temporary {
+            if self
+                .db
+                .borrow_mut()
+                .remove_column_from_rows(root_page, removed_slot)
+            {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "TEMP table storage could not remove column slot {removed_slot}: {table_name}"
+            )));
+        }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, !without_rowid)?;
+            if without_rowid {
+                // WITHOUT ROWID tables are index b-trees whose full records are
+                // keys. Collect the rewritten keys, clear the old keys, then
+                // insert the new records through the index-cursor API.
+                let mut rewritten = Vec::new();
+                if cursor.first(cx)? {
+                    loop {
+                        let payload = cursor.payload(cx)?;
+                        let mut values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "WITHOUT ROWID table `{table_name}` key is not a valid SQLite record"
+                                ),
+                            }
+                        })?;
+                        if removed_slot < values.len() {
+                            values.remove(removed_slot);
+                        }
+                        rewritten.push(serialize_record(&values));
+                        if !cursor.next(cx)? {
+                            break;
+                        }
+                    }
+                }
+                while cursor.first(cx)? {
+                    cursor.delete(cx)?;
+                }
+                for record in rewritten {
+                    cursor.index_insert(cx, &record)?;
+                }
+                return Ok(());
+            }
             // Collect (rowid, rewritten record) first, then delete+reinsert so we
             // never mutate the tree while iterating it.
             let mut rewritten: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -40465,7 +40529,7 @@ impl Connection {
                 for (i, col) in columns.iter().enumerate() {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
-                            fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                            fk_defs.push(fk_clause_to_def(&[i], Some(col.name.clone()), fk_clause));
                         }
                     }
                 }
@@ -40484,7 +40548,7 @@ impl Connection {
                             })
                             .collect();
                         if !child_indices.is_empty() {
-                            fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                            fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                         }
                     }
                 }
@@ -40495,13 +40559,19 @@ impl Connection {
                 for col in columns {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind {
-                            check_defs.push(format!("{expr}"));
+                            check_defs.push(CheckConstraint {
+                                expr: expr.to_string(),
+                                owner_column: Some(col.name.clone()),
+                            });
                         }
                     }
                 }
                 for tc in constraints {
                     if let TableConstraintKind::Check(ref expr) = tc.kind {
-                        check_defs.push(format!("{expr}"));
+                        check_defs.push(CheckConstraint {
+                            expr: expr.to_string(),
+                            owner_column: None,
+                        });
                     }
                 }
 
@@ -41117,6 +41187,124 @@ impl Connection {
 
     /// Execute an ALTER TABLE statement.
     fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
+        if !matches!(alter.action, AlterTableAction::DropColumn(_)) {
+            return self.execute_alter_table_impl(alter);
+        }
+
+        let table_name_lc = alter.table.name.to_ascii_lowercase();
+        let targets_main_explicit = alter
+            .table
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        if targets_main_explicit
+            && self
+                .shadowed_main_tables
+                .borrow()
+                .contains_key(&table_name_lc)
+        {
+            return self.execute_alter_drop_on_shadowed_main(alter);
+        }
+
+        // DROP COLUMN rewrites physical rows before the catalog update. Keep a
+        // connection-local snapshot as a second line of defence around the
+        // pager statement savepoint: schema metadata is mutated eagerly by the
+        // implementation, and TEMP rows live only in MemDatabase (not in the
+        // pager transaction that an autocommit failure rolls back).
+        let snapshot = self.snapshot();
+        let temp_table_snapshot = (!targets_main_explicit
+            && self.temp_table_names.borrow().contains(&table_name_lc))
+        .then(|| {
+            let root_page = self
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&alter.table.name))
+                .map(|table| table.root_page)?;
+            self.db
+                .borrow()
+                .get_table(root_page)
+                .cloned()
+                .map(|table| (root_page, table))
+        })
+        .flatten();
+
+        let result = self.execute_alter_table_impl(alter);
+        if let Err(statement_error) = result {
+            let cx = self.op_cx()?;
+            self.restore_snapshot(&cx, &snapshot)?;
+            if let Some((root_page, table)) = temp_table_snapshot {
+                self.db.borrow_mut().tables.insert(root_page, table);
+            }
+            return Err(statement_error);
+        }
+        Ok(())
+    }
+
+    /// Temporarily make a shadowed `main.<table>` the visible schema entry so
+    /// the ordinary ALTER machinery can rewrite its pager root and catalog
+    /// row. The connection-local TEMP table is restored as the unqualified
+    /// binding before this function returns, on both success and failure.
+    fn execute_alter_drop_on_shadowed_main(
+        &self,
+        alter: &fsqlite_ast::AlterTableStatement,
+    ) -> Result<()> {
+        let table_name_lc = alter.table.name.to_ascii_lowercase();
+        let visible_slot = self
+            .schema
+            .borrow()
+            .iter()
+            .position(|table| table.name.eq_ignore_ascii_case(&alter.table.name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: alter.table.name.clone(),
+            })?;
+        let main_table = self
+            .shadowed_main_tables
+            .borrow_mut()
+            .remove(&table_name_lc)
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: alter.table.name.clone(),
+            })?;
+        let temp_table = {
+            let mut schema = self.schema.borrow_mut();
+            std::mem::replace(&mut schema[visible_slot], main_table)
+        };
+        let temp_rowid_alias = self.rowid_alias_columns.borrow_mut().remove(&table_name_lc);
+        if let Some(main_alias) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&alter.table.name))
+            .and_then(|table| table.columns.iter().position(|column| column.is_ipk))
+        {
+            self.rowid_alias_columns
+                .borrow_mut()
+                .insert(table_name_lc.clone(), main_alias);
+        }
+        self.temp_table_names.borrow_mut().remove(&table_name_lc);
+        self.rebuild_schema_indices();
+
+        let result = self.execute_alter_table(alter);
+
+        let updated_main = {
+            let mut schema = self.schema.borrow_mut();
+            std::mem::replace(&mut schema[visible_slot], temp_table)
+        };
+        self.shadowed_main_tables
+            .borrow_mut()
+            .insert(table_name_lc.clone(), updated_main);
+        self.rowid_alias_columns.borrow_mut().remove(&table_name_lc);
+        if let Some(temp_alias) = temp_rowid_alias {
+            self.rowid_alias_columns
+                .borrow_mut()
+                .insert(table_name_lc.clone(), temp_alias);
+        }
+        self.temp_table_names.borrow_mut().insert(table_name_lc);
+        self.rebuild_schema_indices();
+        result
+    }
+
+    fn execute_alter_table_impl(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         let table_name = &alter.table.name;
         if matches!(alter.action, AlterTableAction::RenameTo(_))
             && self.has_live_vtab_instance(table_name)
@@ -41223,8 +41411,15 @@ impl Connection {
                         rename_column_refs_in_stored_expr_sql(generated_expr, old, new)?;
                     }
                 }
-                for check_expr in &mut renamed_table.check_constraints {
-                    rename_column_refs_in_stored_expr_sql(check_expr, old, new)?;
+                for check in &mut renamed_table.check_constraints {
+                    rename_column_refs_in_stored_expr_sql(&mut check.expr, old, new)?;
+                    if check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(old))
+                    {
+                        check.owner_column = Some(new.clone());
+                    }
                 }
                 for pk in &mut renamed_table.primary_key_constraints {
                     for pk_col in pk {
@@ -41252,6 +41447,13 @@ impl Connection {
                 }
                 for fk in &mut renamed_table.foreign_keys {
                     rename_fk_parent_columns(fk, &renamed_table.name, old, new);
+                    if fk
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(old))
+                    {
+                        fk.owner_column = Some(new.clone());
+                    }
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
                     if idx == table_idx {
@@ -41370,7 +41572,10 @@ impl Connection {
                     .constraints
                     .iter()
                     .filter_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::Check(expr) => Some(expr.to_string()),
+                        ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
+                            expr: expr.to_string(),
+                            owner_column: Some(col_def.name.clone()),
+                        }),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -41484,6 +41689,7 @@ impl Connection {
                     }
                     table.foreign_keys.push(FkDef {
                         child_columns: vec![new_column_index],
+                        owner_column: Some(col_def.name.clone()),
                         parent_table: clause.table.clone(),
                         parent_columns: clause.columns.clone(),
                         on_delete,
@@ -41521,21 +41727,158 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
-                // SQLite rule: cannot drop the last remaining column.
-                if table.columns.len() == 1 {
-                    return Err(FrankenError::Internal(format!(
-                        "cannot drop column {col_name}: only one column remains"
-                    )));
-                }
                 if table.primary_key_constraints.iter().any(|pk| {
                     pk.iter()
                         .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
                 }) {
-                    return Err(FrankenError::Internal(format!(
-                        "cannot drop PRIMARY KEY column {col_name}"
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop PRIMARY KEY column: \"{col_name}\""
                     )));
                 }
+
+                // A column-level UNIQUE constraint is part of the table
+                // definition, not a disposable user index. Silently deleting
+                // its autoindex would weaken the table's data contract.
+                if table.columns[col_idx].unique {
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop UNIQUE column: \"{col_name}\""
+                    )));
+                }
+
+                // SQLite rule: cannot drop the last remaining column.
+                if table.columns.len() == 1 {
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop column \"{col_name}\": no other columns exist"
+                    )));
+                }
+
+                let index_references_dropped_column = |index: &IndexSchema| -> Result<bool> {
+                    let key_expression_references_column =
+                        index
+                            .key_expressions
+                            .iter()
+                            .try_fold(false, |found, expr_sql| {
+                                Ok::<bool, FrankenError>(
+                                    found || stored_expr_references_column(expr_sql, col_name)?,
+                                )
+                            })?;
+                    let predicate_references_column = index
+                        .where_clause
+                        .as_deref()
+                        .map(|where_sql| stored_expr_references_column(where_sql, col_name))
+                        .transpose()?
+                        .unwrap_or(false);
+                    Ok(index
+                        .columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(col_name))
+                        || key_expression_references_column
+                        || predicate_references_column)
+                };
+
+                // Table-level UNIQUE constraints keep SQLite's schema-error
+                // precedence ahead of table-level foreign keys.
+                for index in &table.indexes {
+                    if self.index_is_implicit_autoindex(&index.name, &table.name)
+                        && index_references_dropped_column(index)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+
+                // A table-level FOREIGN KEY survives independently of its
+                // child columns. SQLite diagnoses this before generated,
+                // CHECK, or explicit-index dependencies. A column-level
+                // REFERENCES clause, by contrast, is owned by and removed
+                // with the dropped column.
+                for fk in &table.foreign_keys {
+                    if !fk.child_columns.contains(&col_idx) {
+                        continue;
+                    }
+                    let is_owned_by_dropped_column = fk
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name));
+                    if !is_owned_by_dropped_column {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: unknown column \"{col_name}\" in foreign key definition",
+                            table.name
+                        )));
+                    }
+                }
+
+                // SQLite requires every table to retain at least one ordinary
+                // (non-generated) column. Check this before dependency errors so
+                // `DROP COLUMN` reports the same primary schema defect as stock
+                // SQLite when the sole base column feeds a generated column.
+                if !table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, column)| idx != col_idx && column.generated_expr.is_none())
+                {
+                    return Err(FrankenError::FunctionError(format!(
+                        "error in table {} after drop column: must have at least one non-generated column",
+                        table.name
+                    )));
+                }
+
+                // Validate every stored table expression before mutating the
+                // schema. Leaving a generated column or CHECK constraint that
+                // names the removed column poisons sqlite_master for stock
+                // SQLite and silently disables constraints in this runtime.
+                for (idx, column) in table.columns.iter().enumerate() {
+                    if idx == col_idx {
+                        continue;
+                    }
+                    if let Some(expr_sql) = column.generated_expr.as_deref()
+                        && stored_expr_references_column(expr_sql, col_name)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+                for check in &table.check_constraints {
+                    if check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                    {
+                        continue;
+                    }
+                    if stored_expr_references_column(&check.expr, col_name)? {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+
+                // Explicit indexes make the column non-droppable. This includes
+                // expression-index terms and partial-index predicates, whose
+                // dependencies are not represented in `IndexSchema::columns`.
+                for index in &table.indexes {
+                    if !self.index_is_implicit_autoindex(&index.name, &table.name)
+                        && index_references_dropped_column(index)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in index {} after drop column: no such column: {col_name}",
+                            index.name
+                        )));
+                    }
+                }
                 table.columns.remove(col_idx);
+                table.check_constraints.retain(|check| {
+                    !check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                });
                 // Remove indexes that reference the dropped column.
                 let dropped_indexes: Vec<String> = table
                     .indexes
@@ -41550,9 +41893,11 @@ impl Connection {
                 // Remove FKs that reference the dropped column, and adjust
                 // column indices for remaining FKs whose child_columns point
                 // past the removed position.
-                table
-                    .foreign_keys
-                    .retain(|fk| !fk.child_columns.contains(&col_idx));
+                table.foreign_keys.retain(|fk| {
+                    !fk.owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                });
                 for fk in &mut table.foreign_keys {
                     for ci in &mut fk.child_columns {
                         if *ci > col_idx {
@@ -41578,7 +41923,7 @@ impl Connection {
                     }
                 }
                 for idx_name in &dropped_indexes {
-                    let _ = self.delete_sqlite_master_typed_row("index", idx_name);
+                    self.delete_sqlite_master_typed_row("index", idx_name)?;
                 }
                 // Physically rewrite stored rows to drop the column's record slot
                 // so trailing columns realign on read (the read path decodes by
@@ -41589,6 +41934,35 @@ impl Connection {
                 table_clone
             }
         };
+
+        #[cfg(test)]
+        if matches!(alter.action, AlterTableAction::DropColumn(_))
+            && self.fail_alter_drop_after_storage_once.replace(false)
+        {
+            return Err(FrankenError::Internal(
+                "injected ALTER DROP COLUMN failure after storage rewrite".to_owned(),
+            ));
+        }
+
+        let targets_main_explicit = alter
+            .table
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        let alters_temp_table = !targets_main_explicit
+            && self
+                .temp_table_names
+                .borrow()
+                .contains(&old_name.to_ascii_lowercase());
+        if alters_temp_table && matches!(alter.action, AlterTableAction::DropColumn(_)) {
+            // TEMP schema and rows are connection-local. There is deliberately
+            // no sqlite_master row to update; trying the main-catalog path is
+            // what previously turned every TEMP DROP COLUMN into a late error.
+            self.rebuild_schema_indices();
+            self.validate_schema_index();
+            self.note_temp_schema_change();
+            return Ok(());
+        }
 
         if let AlterTableAction::RenameTo(new_name) = &alter.action {
             let old_key = old_name.to_ascii_lowercase();
@@ -45226,6 +45600,8 @@ impl Connection {
         DbSnapshot {
             db_version,
             schema: self.schema.borrow().clone(),
+            temp_table_names: self.temp_table_names.borrow().clone(),
+            shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
             views: self.views.borrow().clone(),
             triggers: self.triggers.borrow().clone(),
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
@@ -45241,6 +45617,17 @@ impl Connection {
 
     /// Restore a snapshot, replacing the current database + schema state.
     fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
+        self.restore_snapshot_state(snap);
+        self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
+    }
+
+    /// Restore the MemDatabase and connection-local schema state in a snapshot.
+    ///
+    /// Full transaction rollback uses this before reloading persistent pager
+    /// state so that TEMP tables captured by the reload are the pre-transaction
+    /// versions, not the just-rolled-back ALTER image. Virtual-table registry
+    /// cleanup remains owned by the caller on that path.
+    fn restore_snapshot_state(&self, snap: &DbSnapshot) {
         self.db.borrow_mut().rollback_to(snap.db_version);
         // bd-e6zfc: rebuild the case-insensitive side indices from the snapshot
         // (positions match the about-to-be-cloned Vecs) and publish each data
@@ -45268,6 +45655,8 @@ impl Connection {
             .collect();
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
+        (*self.temp_table_names.borrow_mut()).clone_from(&snap.temp_table_names);
+        (*self.shadowed_main_tables.borrow_mut()).clone_from(&snap.shadowed_main_tables);
         (*self.views.borrow_mut()).clone_from(&snap.views);
         *self.views_by_name.borrow_mut() = new_views_by_name;
         (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
@@ -45280,7 +45669,6 @@ impl Connection {
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
         self.schema_generation.set(snap.schema_generation);
-        self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -46161,6 +46549,11 @@ impl Connection {
                 let vtab_rollback_result = self.live_vtab_rollback_all(cx);
                 let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                 self.clear_pending_memdb_direct_upserts();
+                if rollback_succeeded
+                    && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
+                {
+                    self.restore_snapshot_state(&snapshot);
+                }
                 let reload_result = if txn_has_pending_writes && rollback_succeeded {
                     self.reload_memdb_from_pager(cx)
                 } else {
@@ -46735,6 +47128,15 @@ impl Connection {
             let live_vtab_result = self.live_vtab_rollback_all(cx);
             let live_vtab_registry_result = self.restore_live_vtab_registry_to(cx, 0);
             self.clear_pending_memdb_direct_upserts();
+
+            // Restore the BEGIN-time connection-local image before the pager
+            // reload snapshots TEMP tables. Pager rollback cannot restore
+            // TEMP roots because they never live in the main database.
+            if rollback_result.is_ok()
+                && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
+            {
+                self.restore_snapshot_state(&snapshot);
+            }
 
             // Reload MemDatabase from pager's committed state.
             // This replaces the snapshot-restore approach with reading the
@@ -61854,6 +62256,23 @@ impl Connection {
         Ok(())
     }
 
+    /// Invalidate connection-local compilation state after a TEMP schema
+    /// change without writing the main database header.
+    ///
+    /// TEMP objects have no main `sqlite_master` entry and their roots exist
+    /// only in `MemDatabase`, so advancing the main schema cookie would create
+    /// an unrelated pager write (and can conflict with a concurrent main-db
+    /// snapshot). `schema_generation` is the local prepared-statement guard.
+    fn note_temp_schema_change(&self) {
+        self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
+        self.schema_generation
+            .set(self.schema_generation.get().wrapping_add(1));
+        self.parse_cache.borrow_mut().clear();
+        self.clear_compilation_reuse_caches();
+        self.table_execution_metadata_cache.borrow_mut().take();
+        self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, true);
+    }
+
     /// Increment the file change counter.  Must be called for every
     /// transaction that modifies the database (both DML and DDL).
     /// NOTE: With pager-backed persistence (5D.4), this is now managed by the pager.
@@ -63331,7 +63750,11 @@ impl Connection {
                     for (i, col) in col_defs.iter().enumerate() {
                         for c in &col.constraints {
                             if let ColumnConstraintKind::ForeignKey(fk_clause) = &c.kind {
-                                fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                                fk_defs.push(fk_clause_to_def(
+                                    &[i],
+                                    Some(col.name.clone()),
+                                    fk_clause,
+                                ));
                             }
                         }
                     }
@@ -63351,7 +63774,7 @@ impl Connection {
                                 })
                                 .collect();
                             if !child_indices.is_empty() {
-                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                                fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                             }
                         }
                     }
@@ -63412,9 +63835,17 @@ impl Connection {
                     }
                 }
             }
+            if parsed_create_table.is_none() {
+                fk_defs =
+                    crate::compat_persist::extract_foreign_keys_from_sql(&create_sql, &columns);
+            }
 
             let check_defs = parsed_create_table.as_ref().map_or_else(
-                || crate::compat_persist::extract_check_constraints_from_sql(&create_sql),
+                || {
+                    crate::compat_persist::extract_check_constraints_with_owners_from_sql(
+                        &create_sql,
+                    )
+                },
                 crate::compat_persist::check_constraints_from_create_table_statement,
             );
 
@@ -67658,6 +68089,23 @@ where
                     part.push_str(" VIRTUAL");
                 }
             }
+            for check in table.check_constraints.iter().filter(|check| {
+                check
+                    .owner_column
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+            }) {
+                part.push_str(" CHECK(");
+                part.push_str(&check.expr);
+                part.push(')');
+            }
+            for fk in table.foreign_keys.iter().filter(|fk| {
+                fk.owner_column
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+            }) {
+                append_fk_reference_clause_sql(&mut part, fk);
+            }
             part
         })
         .collect();
@@ -67713,7 +68161,11 @@ where
     // Append table-level FOREIGN KEY constraints so they survive
     // round-tripping through sqlite_master.
     let mut fk_clauses = String::new();
-    for fk in &table.foreign_keys {
+    for fk in table
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.owner_column.is_none())
+    {
         use std::fmt::Write;
         let child_cols: Vec<&str> = fk
             .child_columns
@@ -67725,39 +68177,25 @@ where
         }
         write!(
             fk_clauses,
-            ", FOREIGN KEY({}) REFERENCES {}",
+            ", FOREIGN KEY({})",
             child_cols
                 .iter()
                 .map(|c| maybe_quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            maybe_quote_ident(&fk.parent_table),
         )
         .ok();
-        if !fk.parent_columns.is_empty() {
-            write!(
-                fk_clauses,
-                "({})",
-                fk.parent_columns
-                    .iter()
-                    .map(|c| maybe_quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-            .ok();
-        }
-        if fk.on_delete != FkActionType::NoAction {
-            write!(fk_clauses, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
-        }
-        if fk.on_update != FkActionType::NoAction {
-            write!(fk_clauses, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
-        }
+        append_fk_reference_clause_sql(&mut fk_clauses, fk);
     }
     // Append table-level CHECK constraints.
     let mut check_clauses = String::new();
-    for check_expr in &table.check_constraints {
+    for check in table
+        .check_constraints
+        .iter()
+        .filter(|check| check.owner_column.is_none())
+    {
         use std::fmt::Write;
-        write!(check_clauses, ", CHECK({check_expr})").ok();
+        write!(check_clauses, ", CHECK({})", check.expr).ok();
     }
     let mut table_options = Vec::new();
     if table.without_rowid {
@@ -67784,6 +68222,33 @@ fn fk_action_sql(action: FkActionType) -> &'static str {
         FkActionType::SetNull => "SET NULL",
         FkActionType::SetDefault => "SET DEFAULT",
         FkActionType::Cascade => "CASCADE",
+    }
+}
+
+fn append_fk_reference_clause_sql(sql: &mut String, fk: &FkDef) {
+    use std::fmt::Write;
+
+    write!(sql, " REFERENCES {}", maybe_quote_ident(&fk.parent_table)).ok();
+    if !fk.parent_columns.is_empty() {
+        write!(
+            sql,
+            "({})",
+            fk.parent_columns
+                .iter()
+                .map(|column| maybe_quote_ident(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .ok();
+    }
+    if fk.on_delete != FkActionType::NoAction {
+        write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
+    }
+    if fk.on_update != FkActionType::NoAction {
+        write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
     }
 }
 
@@ -76276,6 +76741,19 @@ fn rename_column_refs_in_stored_expr_sql(
     Ok(())
 }
 
+fn stored_expr_references_column(expr_sql: &str, column_name: &str) -> Result<bool> {
+    let expr = fsqlite_parser::expr::parse_expr(expr_sql).map_err(|err| {
+        FrankenError::Internal(format!(
+            "failed to parse schema expression `{expr_sql}` during column drop: {err}"
+        ))
+    })?;
+    let mut column_refs = Vec::new();
+    collect_expr_column_refs(&expr, &mut column_refs);
+    Ok(column_refs
+        .iter()
+        .any(|referenced| referenced.eq_ignore_ascii_case(column_name)))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct ColumnRenameOutputStatus {
     exposes_old: bool,
@@ -79972,10 +80450,36 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 }
             }
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
             if let FunctionArgs::List(items) = args {
                 for e in items {
                     collect_expr_column_refs(e, out);
+                }
+            }
+            for term in order_by {
+                collect_expr_column_refs(&term.expr, out);
+            }
+            if let Some(filter_expr) = filter {
+                collect_expr_column_refs(filter_expr, out);
+            }
+            if let Some(window) = over {
+                for partition_expr in &window.partition_by {
+                    collect_expr_column_refs(partition_expr, out);
+                }
+                for term in &window.order_by {
+                    collect_expr_column_refs(&term.expr, out);
+                }
+                if let Some(frame) = &window.frame {
+                    collect_frame_bound_column_refs(&frame.start, out);
+                    if let Some(end) = &frame.end {
+                        collect_frame_bound_column_refs(end, out);
+                    }
                 }
             }
         }
@@ -80008,8 +80512,28 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 collect_expr_column_refs(esc, out);
             }
         }
+        Expr::JsonAccess { expr, path, .. } => {
+            collect_expr_column_refs(expr, out);
+            collect_expr_column_refs(path, out);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                collect_expr_column_refs(value, out);
+            }
+        }
         // Literals, placeholders, subqueries, etc. have no column refs.
         _ => {}
+    }
+}
+
+fn collect_frame_bound_column_refs<'a>(bound: &'a FrameBound, out: &mut Vec<&'a str>) {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            collect_expr_column_refs(expr, out);
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => {}
     }
 }
 
@@ -83150,7 +83674,11 @@ fn sort_rows_by_order_terms(
 }
 
 /// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
-fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
+fn fk_clause_to_def(
+    child_indices: &[usize],
+    owner_column: Option<String>,
+    clause: &fsqlite_ast::ForeignKeyClause,
+) -> FkDef {
     let mut on_delete = FkActionType::NoAction;
     let mut on_update = FkActionType::NoAction;
     for action in &clause.actions {
@@ -83168,6 +83696,7 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
     }
     FkDef {
         child_columns: child_indices.to_vec(),
+        owner_column,
         parent_table: clause.table.clone(),
         parent_columns: clause.columns.clone(),
         on_delete,
@@ -106772,6 +107301,932 @@ mod tests {
         let rows = conn.query("SELECT a, c FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_alter_drop_column_file_backed_rowid_and_without_rowid_match_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-storage-layouts.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "
+            CREATE TABLE rowid_table (id INTEGER PRIMARY KEY, removed TEXT, kept INTEGER);
+            INSERT INTO rowid_table VALUES (1, 'discard', 11), (2, 'gone', 22);
+            CREATE TABLE wr_table (key INTEGER, removed TEXT, kept INTEGER,
+                                   PRIMARY KEY(key)) WITHOUT ROWID;
+            CREATE INDEX wr_kept ON wr_table(kept);
+            INSERT INTO wr_table VALUES (1, 'discard', 101), (2, 'gone', 202);
+        ";
+        conn.execute_batch(setup).unwrap();
+        oracle.execute_batch(setup).unwrap();
+
+        drop(conn);
+        let sqlite_pre_alter = rusqlite::Connection::open(&db_path).unwrap();
+        let pre_alter_integrity: String = sqlite_pre_alter
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pre_alter_integrity, "ok");
+        drop(sqlite_pre_alter);
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        for alter in [
+            "ALTER TABLE rowid_table DROP COLUMN removed;",
+            "ALTER TABLE wr_table DROP COLUMN removed;",
+        ] {
+            conn.execute(alter).unwrap();
+            oracle.execute_batch(alter).unwrap();
+        }
+
+        let expected_rowid = oracle
+            .prepare("SELECT id, kept FROM rowid_table ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let expected_wr = oracle
+            .prepare("SELECT key, kept FROM wr_table ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let actual_rowid = conn
+            .query("SELECT id, kept FROM rowid_table ORDER BY id;")
+            .unwrap()
+            .iter()
+            .map(|row| (row.values()[0].to_integer(), row.values()[1].to_integer()))
+            .collect::<Vec<_>>();
+        let actual_wr = conn
+            .query("SELECT key, kept FROM wr_table ORDER BY key;")
+            .unwrap()
+            .iter()
+            .map(|row| (row.values()[0].to_integer(), row.values()[1].to_integer()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_rowid, expected_rowid);
+        assert_eq!(actual_wr, expected_wr);
+        drop(conn);
+
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = reopened
+            .query("SELECT key, kept FROM wr_table ORDER BY key;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[SqliteValue::Integer(2), SqliteValue::Integer(202)]
+        );
+        drop(reopened);
+
+        let sqlite_reopen = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite_reopen
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            sqlite_reopen
+                .query_row("SELECT id, kept FROM rowid_table WHERE id = 2", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (2, 22)
+        );
+        assert_eq!(
+            sqlite_reopen
+                .query_row("SELECT key, kept FROM wr_table WHERE key = 2", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (2, 202)
+        );
+    }
+
+    #[test]
+    fn test_alter_drop_column_temp_success_and_validation_rollback_match_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-temp-routing.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "
+            CREATE TABLE sentinel (id INTEGER PRIMARY KEY, payload TEXT);
+            INSERT INTO sentinel VALUES (1, 'main-unchanged');
+            CREATE TEMP TABLE temp_ok (id INTEGER, removed TEXT, kept INTEGER UNIQUE);
+            INSERT INTO temp_ok VALUES (1, 'discard', 10), (2, 'gone', 20);
+            CREATE TEMP TABLE temp_rollback (
+                id INTEGER, guarded INTEGER, kept INTEGER, CHECK(guarded > 0)
+            );
+            INSERT INTO temp_rollback VALUES (3, 7, 30);
+        ";
+        conn.execute_batch(setup).unwrap();
+        oracle.execute_batch(setup).unwrap();
+
+        let main_schema_cookie_before_temp_alter = conn.schema_cookie();
+        conn.execute("ALTER TABLE temp_ok DROP COLUMN removed;")
+            .unwrap();
+        oracle
+            .execute_batch("ALTER TABLE temp_ok DROP COLUMN removed;")
+            .unwrap();
+        assert_eq!(
+            conn.query("SELECT id, kept FROM temp_ok ORDER BY id;")
+                .unwrap()
+                .iter()
+                .map(|row| (row.values()[0].to_integer(), row.values()[1].to_integer()))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (2, 20)]
+        );
+        assert_eq!(
+            conn.schema_cookie(),
+            main_schema_cookie_before_temp_alter,
+            "TEMP ALTER must not write the main database schema cookie"
+        );
+        assert!(
+            conn.execute("INSERT INTO temp_ok VALUES (3, 20);").is_err(),
+            "TEMP UNIQUE metadata after the dropped slot must stay aligned"
+        );
+        assert!(
+            oracle
+                .execute_batch("INSERT INTO temp_ok VALUES (3, 20);")
+                .is_err()
+        );
+
+        assert!(
+            conn.execute("ALTER TABLE temp_rollback DROP COLUMN guarded;")
+                .is_err()
+        );
+        assert!(
+            oracle
+                .execute_batch("ALTER TABLE temp_rollback DROP COLUMN guarded;")
+                .is_err()
+        );
+        let rows = conn
+            .query("SELECT id, guarded, kept FROM temp_rollback;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(30),
+            ]
+        );
+        let oracle_row = oracle
+            .query_row("SELECT id, guarded, kept FROM temp_rollback", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(oracle_row, (3, 7, 30));
+        drop(conn);
+
+        let sqlite_reopen = rusqlite::Connection::open(&db_path).unwrap();
+        let sentinel: String = sqlite_reopen
+            .query_row("SELECT payload FROM sentinel WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sentinel, "main-unchanged");
+        let integrity: String = sqlite_reopen
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_alter_drop_column_qualified_main_preserves_temp_shadow() {
+        let conn = Connection::open(":memory:").unwrap();
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "
+            CREATE TABLE shadowed (id INTEGER PRIMARY KEY, removed TEXT, kept INTEGER);
+            INSERT INTO shadowed VALUES (1, 'main-removed', 10);
+            CREATE TEMP TABLE shadowed (id INTEGER PRIMARY KEY, removed TEXT, kept INTEGER);
+            INSERT INTO temp.shadowed VALUES (2, 'temp-kept', 20);
+        ";
+        conn.execute_batch(setup).unwrap();
+        oracle.execute_batch(setup).unwrap();
+
+        conn.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            conn.execute("ALTER TABLE main.shadowed DROP COLUMN removed;")
+                .is_err()
+        );
+        assert_eq!(
+            row_values(
+                &conn
+                    .query("SELECT id, removed, kept FROM main.shadowed;")
+                    .unwrap()[0]
+            ),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("main-removed".into()),
+                SqliteValue::Integer(10),
+            ]
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("ALTER TABLE main.shadowed DROP COLUMN removed;")
+            .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+        assert_eq!(
+            row_values(
+                &conn
+                    .query("SELECT id, removed, kept FROM main.shadowed;")
+                    .unwrap()[0]
+            ),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("main-removed".into()),
+                SqliteValue::Integer(10),
+            ],
+            "transaction rollback must restore the parked main schema"
+        );
+        assert_eq!(
+            row_values(
+                &conn
+                    .query("SELECT id, removed, kept FROM temp.shadowed;")
+                    .unwrap()[0]
+            ),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("temp-kept".into()),
+                SqliteValue::Integer(20),
+            ]
+        );
+
+        conn.execute("ALTER TABLE main.shadowed DROP COLUMN removed;")
+            .unwrap();
+        oracle
+            .execute_batch("ALTER TABLE main.shadowed DROP COLUMN removed;")
+            .unwrap();
+
+        let temp_rows = conn
+            .query("SELECT id, removed, kept FROM temp.shadowed;")
+            .unwrap();
+        assert_eq!(
+            row_values(&temp_rows[0]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("temp-kept".into()),
+                SqliteValue::Integer(20),
+            ]
+        );
+        let main_rows = conn.query("SELECT id, kept FROM main.shadowed;").unwrap();
+        assert_eq!(
+            row_values(&main_rows[0]),
+            &[SqliteValue::Integer(1), SqliteValue::Integer(10)]
+        );
+        assert_eq!(
+            oracle
+                .query_row("SELECT id, kept FROM main.shadowed", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (1, 10)
+        );
+    }
+
+    #[test]
+    fn test_alter_drop_column_post_storage_failure_rolls_back_schema_and_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-post-storage-rollback.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE TABLE persisted (id INTEGER, removed TEXT, kept INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO persisted VALUES (1, 'still-here', 9);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE persisted_wr (
+                key INTEGER, removed TEXT, kept INTEGER, PRIMARY KEY(key)
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO persisted_wr VALUES (1, 'wr-still-here', 19);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.fail_alter_drop_after_storage_once.set(true);
+        let error = conn
+            .execute("ALTER TABLE persisted DROP COLUMN removed;")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("after storage rewrite"),
+            "{error}"
+        );
+        let rows = conn
+            .query("SELECT id, removed, kept FROM persisted;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("still-here".into()),
+                SqliteValue::Integer(9),
+            ]
+        );
+        conn.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            conn.execute("ALTER TABLE persisted_wr DROP COLUMN removed;")
+                .is_err()
+        );
+        let wr_rows = conn
+            .query("SELECT key, removed, kept FROM persisted_wr;")
+            .unwrap();
+        assert_eq!(
+            row_values(&wr_rows[0]),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("wr-still-here".into()),
+                SqliteValue::Integer(19),
+            ]
+        );
+        conn.execute("INSERT INTO persisted VALUES (2, 'new-write', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO persisted_wr VALUES (2, 'wr-new-write', 20);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        drop(conn);
+
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = reopened
+            .query("SELECT id, removed, kept FROM persisted ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("new-write".into()),
+                SqliteValue::Integer(10),
+            ]
+        );
+        let wr_rows = reopened
+            .query("SELECT key, removed, kept FROM persisted_wr ORDER BY key;")
+            .unwrap();
+        assert_eq!(wr_rows.len(), 2);
+        assert_eq!(
+            row_values(&wr_rows[1]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("wr-new-write".into()),
+                SqliteValue::Integer(20),
+            ]
+        );
+        drop(reopened);
+        let sqlite_reopen = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite_reopen
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let temp = Connection::open(":memory:").unwrap();
+        temp.execute("CREATE TEMP TABLE local (id INTEGER, removed TEXT, kept INTEGER);")
+            .unwrap();
+        temp.execute("INSERT INTO local VALUES (4, 'temp-still-here', 12);")
+            .unwrap();
+        temp.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            temp.execute("ALTER TABLE local DROP COLUMN removed;")
+                .is_err()
+        );
+        let rows = temp.query("SELECT id, removed, kept FROM local;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(4),
+                SqliteValue::Text("temp-still-here".into()),
+                SqliteValue::Integer(12),
+            ]
+        );
+        temp.execute("BEGIN;").unwrap();
+        temp.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            temp.execute("ALTER TABLE local DROP COLUMN removed;")
+                .is_err()
+        );
+        temp.execute("INSERT INTO local VALUES (5, 'after-error', 13);")
+            .unwrap();
+        temp.execute("COMMIT;").unwrap();
+        let rows = temp
+            .query("SELECT id, removed, kept FROM local ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[
+                SqliteValue::Integer(5),
+                SqliteValue::Text("after-error".into()),
+                SqliteValue::Integer(13),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alter_drop_column_temp_full_and_savepoint_rollback_restore_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TEMP TABLE local (a INTEGER, b TEXT, c INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO local VALUES (1, 'original', 3);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("ALTER TABLE local DROP COLUMN b;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+        let rows = conn.query("SELECT a, b, c FROM local;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("original".into()),
+                SqliteValue::Integer(3),
+            ]
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT before_drop;").unwrap();
+        conn.execute("ALTER TABLE local DROP COLUMN b;").unwrap();
+        conn.execute("ROLLBACK TO before_drop;").unwrap();
+        conn.execute("RELEASE before_drop;").unwrap();
+        conn.execute("INSERT INTO local VALUES (2, 'after-savepoint', 4);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        let rows = conn.query("SELECT a, b, c FROM local ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("after-savepoint".into()),
+                SqliteValue::Integer(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_last_non_generated_column() {
+        let single = Connection::open(":memory:").unwrap();
+        single.execute("CREATE TABLE single (a INTEGER);").unwrap();
+        let err = single
+            .execute("ALTER TABLE single DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop column \"a\": no other columns exist"
+            ),
+            "{err}"
+        );
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (1) STORED);")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN a;").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must have at least one non-generated column"),
+            "{err}"
+        );
+        conn.execute("INSERT INTO t(a) VALUES (7);").unwrap();
+        let rows = conn.query("SELECT a, b FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[SqliteValue::Integer(7), SqliteValue::Integer(1)]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_generated_column_dependency() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, c INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+        )
+        .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN a;").unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+        conn.execute("INSERT INTO t(a, c) VALUES (5, 9);").unwrap();
+        let rows = conn.query("SELECT a, c, b FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(9),
+                SqliteValue::Integer(10),
+            ]
+        );
+
+        let json_conn = Connection::open(":memory:").unwrap();
+        json_conn
+            .execute(
+                "CREATE TABLE json_generated (payload TEXT, keep INTEGER, extracted TEXT GENERATED ALWAYS AS (payload ->> '$.name') STORED);",
+            )
+            .unwrap();
+        let err = json_conn
+            .execute("ALTER TABLE json_generated DROP COLUMN payload;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: payload"), "{err}");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-generated-fallback.db");
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE fallback_generated(
+                        a INTEGER,
+                        c INTEGER,
+                        b INTEGER GENERATED ALWAYS AS(a * 2) STORED,
+                        CHECK(c > 0) ON CONFLICT FAIL
+                    );",
+                )
+                .unwrap();
+        }
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let err = reopened
+            .execute("ALTER TABLE fallback_generated DROP COLUMN a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+        let rows = reopened
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_generated';")
+            .unwrap();
+        assert!(row_values(&rows[0])[0].to_text().contains("GENERATED"));
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_check_dependency() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, CHECK(a + b > 0));")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap_err();
+        assert!(err.to_string().contains("no such column: b"), "{err}");
+        assert!(
+            conn.execute("INSERT INTO t VALUES (-2, 1);").is_err(),
+            "the rejected ALTER must leave the CHECK constraint active"
+        );
+
+        let row_value_conn = Connection::open(":memory:").unwrap();
+        row_value_conn
+            .execute(
+                "CREATE TABLE row_value_check (a INTEGER, b INTEGER, CHECK((a, b) != (1, 2)));",
+            )
+            .unwrap();
+        let err = row_value_conn
+            .execute("ALTER TABLE row_value_check DROP COLUMN b;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: b"), "{err}");
+
+        let surviving_column_check = Connection::open(":memory:").unwrap();
+        surviving_column_check
+            .execute("CREATE TABLE surviving_column_check (a INTEGER, b INTEGER CHECK(a + b > 0));")
+            .unwrap();
+        let err = surviving_column_check
+            .execute("ALTER TABLE surviving_column_check DROP COLUMN a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+
+        let dropped_column_check = Connection::open(":memory:").unwrap();
+        dropped_column_check
+            .execute("CREATE TABLE dropped_column_check (a INTEGER CHECK(a > 0), b INTEGER);")
+            .unwrap();
+        dropped_column_check
+            .execute("ALTER TABLE dropped_column_check DROP COLUMN a;")
+            .unwrap();
+        dropped_column_check
+            .execute("INSERT INTO dropped_column_check(b) VALUES (-1);")
+            .unwrap();
+        let rows = dropped_column_check
+            .query("SELECT b FROM dropped_column_check;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0]), &[SqliteValue::Integer(-1)]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-check-owner.db");
+        {
+            let persisted = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            persisted
+                .execute("CREATE TABLE persisted (a INTEGER CHECK(a > 0), b INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE persisted RENAME COLUMN a TO renamed_a;")
+                .unwrap();
+        }
+        {
+            let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            reopened
+                .execute("ALTER TABLE persisted DROP COLUMN renamed_a;")
+                .unwrap();
+            reopened
+                .execute("INSERT INTO persisted(b) VALUES (-2);")
+                .unwrap();
+            let rows = reopened.query("SELECT b FROM persisted;").unwrap();
+            assert_eq!(row_values(&rows[0]), &[SqliteValue::Integer(-2)]);
+        }
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_index_dependencies() {
+        for create_index in [
+            "CREATE INDEX idx ON t(a, b);",
+            "CREATE INDEX idx ON t(lower(b));",
+            "CREATE INDEX idx ON t(b ->> '$.name');",
+            "CREATE INDEX idx ON t(a) WHERE b > 0;",
+        ] {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+                .unwrap();
+            conn.execute(create_index).unwrap();
+
+            let err = conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("error in index idx after drop column"),
+                "index SQL `{create_index}` produced unexpected error: {err}"
+            );
+            let rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx';")
+                .unwrap();
+            assert_eq!(rows.len(), 1, "index SQL `{create_index}` was removed");
+        }
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_unique_constraints() {
+        let primary_key_conn = Connection::open(":memory:").unwrap();
+        primary_key_conn
+            .execute("CREATE TABLE one_pk (a INTEGER PRIMARY KEY);")
+            .unwrap();
+        let err = primary_key_conn
+            .execute("ALTER TABLE one_pk DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop PRIMARY KEY column: \"a\""
+            ),
+            "{err}"
+        );
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE single_unique (a INTEGER UNIQUE, b INTEGER);")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE single_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot drop UNIQUE column: \"a\""),
+            "{err}"
+        );
+
+        let table_level_unique = Connection::open(":memory:").unwrap();
+        table_level_unique
+            .execute("CREATE TABLE table_unique (a INTEGER, b INTEGER, UNIQUE(a));")
+            .unwrap();
+        let err = table_level_unique
+            .execute("ALTER TABLE table_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table table_unique after drop column: no such column: a"
+            ),
+            "{err}"
+        );
+
+        conn.execute(
+            "CREATE TABLE unique_generated (a INTEGER UNIQUE, b INTEGER GENERATED ALWAYS AS (a + 1) STORED);",
+        )
+        .unwrap();
+        let err = conn
+            .execute("ALTER TABLE unique_generated DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop UNIQUE column: \"a\""
+            ),
+            "{err}"
+        );
+
+        conn.execute(
+            "CREATE TABLE composite_unique (a INTEGER, b INTEGER, c INTEGER, UNIQUE(a, b));",
+        )
+        .unwrap();
+        let err = conn
+            .execute("ALTER TABLE composite_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("error in table composite_unique after drop column"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_preserves_foreign_key_ownership() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE column_owned (
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+                    DEFERRABLE INITIALLY DEFERRED,
+                keep INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE column_owned RENAME COLUMN parent_id TO renamed_parent_id;")
+            .unwrap();
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'column_owned';")
+            .unwrap();
+        let renamed_sql = row_values(&rows[0])[0].to_text();
+        assert!(
+            renamed_sql.contains(
+                "renamed_parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
+            ),
+            "{renamed_sql}"
+        );
+        conn.execute("ALTER TABLE column_owned DROP COLUMN renamed_parent_id;")
+            .unwrap();
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'column_owned';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        assert!(!sql.contains("REFERENCES"), "{sql}");
+
+        conn.execute("CREATE TABLE table_owned (parent_id INTEGER, keep INTEGER, FOREIGN KEY(parent_id) REFERENCES parent(id));")
+            .unwrap();
+        conn.execute("ALTER TABLE table_owned RENAME COLUMN parent_id TO renamed_parent_id;")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE table_owned DROP COLUMN renamed_parent_id;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table table_owned after drop column: unknown column \"renamed_parent_id\" in foreign key definition"
+            ),
+            "{err}"
+        );
+
+        conn.execute("CREATE TABLE add_owned (keep INTEGER);")
+            .unwrap();
+        conn.execute("ALTER TABLE add_owned ADD COLUMN parent_id INTEGER REFERENCES parent(id);")
+            .unwrap();
+        conn.execute("ALTER TABLE add_owned DROP COLUMN parent_id;")
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-fk-owner.db");
+        {
+            let persisted = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            persisted
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_column (parent_id INTEGER REFERENCES parent(id) ON UPDATE RESTRICT, keep INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE reopen_column RENAME COLUMN parent_id TO renamed_parent_id;")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_table (parent_id INTEGER, keep INTEGER, FOREIGN KEY(parent_id) REFERENCES parent(id));")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_add (keep INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE reopen_add ADD COLUMN parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL;")
+                .unwrap();
+        }
+        {
+            let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            reopened
+                .execute("ALTER TABLE reopen_column DROP COLUMN renamed_parent_id;")
+                .unwrap();
+            let err = reopened
+                .execute("ALTER TABLE reopen_table DROP COLUMN parent_id;")
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FrankenError::FunctionError(ref message)
+                        if message == "error in table reopen_table after drop column: unknown column \"parent_id\" in foreign key definition"
+                ),
+                "{err}"
+            );
+            reopened
+                .execute("ALTER TABLE reopen_add DROP COLUMN parent_id;")
+                .unwrap();
+        }
+
+        let fallback_path = temp_dir.path().join("drop-column-fk-fallback.db");
+        {
+            let sqlite = rusqlite::Connection::open(&fallback_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE fallback_column (
+                         parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                         keep INTEGER,
+                         CHECK(keep > 0) ON CONFLICT FAIL
+                     );
+                     CREATE TABLE fallback_table (
+                         parent_id INTEGER,
+                         keep INTEGER,
+                         FOREIGN KEY(parent_id) REFERENCES parent(id),
+                         CHECK(keep > 0) ON CONFLICT FAIL
+                     );
+                     CREATE INDEX fallback_index ON fallback_table(parent_id);",
+                )
+                .unwrap();
+        }
+        let fallback = Connection::open(fallback_path.to_string_lossy().into_owned()).unwrap();
+        fallback.execute("PRAGMA foreign_keys = ON;").unwrap();
+        {
+            let schema = fallback.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name == "fallback_column")
+                .unwrap();
+            let foreign_key = &table.foreign_keys[0];
+            assert_eq!(foreign_key.parent_table, "parent");
+            assert_eq!(foreign_key.parent_columns, vec!["id"]);
+            assert_eq!(
+                foreign_key.on_delete,
+                fsqlite_vdbe::codegen::FkActionType::Cascade
+            );
+            assert_eq!(foreign_key.owner_column.as_deref(), Some("parent_id"));
+        }
+        let err = fallback
+            .execute("INSERT INTO fallback_column(parent_id, keep) VALUES(999, 1);")
+            .expect_err("fallback FK metadata must still enforce the parent lookup");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        fallback
+            .execute("ALTER TABLE fallback_column DROP COLUMN parent_id;")
+            .unwrap();
+        let err = fallback
+            .execute("ALTER TABLE fallback_table DROP COLUMN parent_id;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table fallback_table after drop column: unknown column \"parent_id\" in foreign key definition"
+            ),
+            "{err}"
+        );
+
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        oracle
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE fallback_table (
+                     parent_id INTEGER,
+                     keep INTEGER,
+                     FOREIGN KEY(parent_id) REFERENCES parent(id),
+                     CHECK(keep > 0) ON CONFLICT FAIL
+                 );
+                 CREATE INDEX fallback_index ON fallback_table(parent_id);",
+            )
+            .unwrap();
+        let oracle_err = oracle
+            .execute("ALTER TABLE fallback_table DROP COLUMN parent_id;", [])
+            .unwrap_err();
+        assert!(
+            oracle_err.to_string().contains(
+                "error in table fallback_table after drop column: unknown column \"parent_id\" in foreign key definition"
+            ),
+            "{oracle_err}"
+        );
+
+        let rows = fallback
+            .query("SELECT name FROM sqlite_master WHERE name = 'fallback_index';")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "rejected ALTER removed its explicit index");
+        let rows = fallback
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_table';")
+            .unwrap();
+        assert!(
+            row_values(&rows[0])[0]
+                .to_text()
+                .contains("FOREIGN KEY(parent_id)"),
+            "rejected ALTER rewrote the table schema"
+        );
+        let rows = fallback
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_column';")
+            .unwrap();
+        assert!(
+            !row_values(&rows[0])[0].to_text().contains("REFERENCES"),
+            "column-owned fallback FK survived its dropped column"
+        );
     }
 
     #[test]

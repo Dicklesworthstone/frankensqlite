@@ -53,14 +53,17 @@ type PagePageMap<V> = HashMap<PageNumber, V, PageNumberBuildHasher>;
 use fsqlite_wal::{
     ConsolidationPhase, FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig,
     GroupCommitConsolidator, PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
-    PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalControlSurface,
+    PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_PUBLICATION_SCENARIO_ID,
+    PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalCommitCertificate,
+    ParallelWalConservativeShadowEvidence, ParallelWalControlSurface,
+    ParallelWalDurabilityCombiner, ParallelWalDurabilityReceipt, ParallelWalDurabilityRequest,
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
-    ParallelWalOperatingMode, ParallelWalShadowVerdict, RecoveryFence, SubmitOutcome,
-    TransactionConflictPageBaseline, TransactionConflictSnapshot, TransactionFrameBatch,
-    TransactionFrameBatchContext, WalFile, WalGenerationIdentity, commit_phase_timing_enabled,
-    detailed_consolidation_metrics_enabled, parallel_wal_fallback_reason_name,
-    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
-    resolve_parallel_wal_control_surface_from_env,
+    ParallelWalOperatingMode, ParallelWalShadowVerdict, ParallelWalVisibilitySnapshot,
+    RecoveryFence, SubmitOutcome, TransactionConflictPageBaseline, TransactionConflictSnapshot,
+    TransactionFrameBatch, TransactionFrameBatchContext, WalFile, WalGenerationIdentity,
+    commit_phase_timing_enabled, detailed_consolidation_metrics_enabled,
+    parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -799,12 +802,15 @@ struct GroupCommitQueue {
     /// Failure outcomes by epoch. Kept so late-scheduled waiters cannot miss
     /// a failed flush after a newer epoch completes successfully.
     failed_epochs: Mutex<HashMap<u64, GroupCommitEpochFailure>>,
-    /// Trace-only persisted membership by completed epoch.
+    /// Certificate-backed durable membership by completed epoch.
     ///
-    /// This stays empty unless `FSQLITE_TRACE_GROUP_COMMIT=1` is set. The
-    /// waiter path uses it to prove that an epoch wake actually includes the
-    /// waiter's batch before treating the commit as durable.
+    /// Unlike the former trace-only map, this is part of the publication
+    /// handoff: every waiter must bind its batch id to the certificate before
+    /// Phase C may expose pager visibility.
     persisted_epochs: Mutex<HashMap<u64, PersistedGroupCommitEpoch>>,
+    /// Lazily seeded from the pager's current visible commit clock at the
+    /// first physical flush for this database identity.
+    durability_combiner: Mutex<Option<Arc<ParallelWalDurabilityCombiner>>>,
     /// Narrow per-target-epoch wake slots for waiter coordination.
     epoch_waiters: KeyedWaitRegistry,
     /// Monotonic control-decision epoch for service-policy traces.
@@ -841,6 +847,22 @@ struct PersistedGroupCommitEpoch {
     frames_start: u64,
     frames_end: u64,
     fsync_seq: u64,
+    durability_receipt: ParallelWalDurabilityReceipt,
+}
+
+struct PersistedGroupCommitInput<'a> {
+    trace_id: u64,
+    epoch: u64,
+    batches: &'a [TransactionFrameBatch],
+    frames_start: u64,
+    frames_end: u64,
+    fsync_seq: u64,
+    initial_visible_commit_seq: CommitSeq,
+    db_size_pages: u32,
+    page_set_size: usize,
+    checkpoint_active: bool,
+    fallback_reason: Option<ParallelWalFallbackReason>,
+    authorized_seed: Option<ParallelWalCommitCertificate>,
 }
 
 #[derive(Debug)]
@@ -928,6 +950,7 @@ impl GroupCommitQueue {
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
             persisted_epochs: Mutex::new(HashMap::new()),
+            durability_combiner: Mutex::new(None),
             epoch_waiters: KeyedWaitRegistry::new(),
             commit_service_control_epoch: AtomicU64::new(0),
             commit_service_mode: AtomicU8::new(CommitServiceMode::Balanced.as_u8()),
@@ -989,22 +1012,156 @@ impl GroupCommitQueue {
         self.parallel_wal_lanes.discard_batches_for_flush(&contexts)
     }
 
-    fn record_persisted_epoch(
+    fn durability_combiner(
         &self,
-        epoch: u64,
-        batches: &[TransactionFrameBatch],
-        frames_start: u64,
-        frames_end: u64,
-        fsync_seq: u64,
-    ) {
-        if !group_commit_trace_enabled() {
-            return;
-        }
+        initial_visible_commit_seq: CommitSeq,
+        initial_db_size: u32,
+    ) -> Arc<ParallelWalDurabilityCombiner> {
+        let mut slot = self
+            .durability_combiner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(slot.get_or_insert_with(|| {
+            Arc::new(ParallelWalDurabilityCombiner::new(
+                ParallelWalVisibilitySnapshot {
+                    visible_commit_seq: initial_visible_commit_seq,
+                    db_size_pages: initial_db_size,
+                    ..ParallelWalVisibilitySnapshot::default()
+                },
+            ))
+        }))
+    }
 
-        let members = batches
+    fn record_persisted_epoch<F>(
+        &self,
+        input: PersistedGroupCommitInput<'_>,
+        durable_write: F,
+    ) -> Result<ParallelWalDurabilityReceipt>
+    where
+        F: FnOnce(&fsqlite_wal::ParallelWalCommitCertificate) -> Result<()>,
+    {
+        let members = input
+            .batches
             .iter()
             .map(|batch| batch.context.batch_id)
             .collect::<HashSet<_>>();
+        let max_lane_id = input
+            .batches
+            .iter()
+            .map(|batch| batch.context.lane_id)
+            .max()
+            .unwrap_or(0);
+        let mut lane_record_counts = vec![0_u32; usize::from(max_lane_id) + 1];
+        for batch in input.batches {
+            let lane_record_count = &mut lane_record_counts[usize::from(batch.context.lane_id)];
+            *lane_record_count = lane_record_count
+                .saturating_add(u32::try_from(batch.frames.len()).unwrap_or(u32::MAX));
+        }
+        let batch_ids = input
+            .batches
+            .iter()
+            .map(|batch| batch.context.batch_id)
+            .collect::<Vec<_>>();
+        let combiner =
+            self.durability_combiner(input.initial_visible_commit_seq, input.db_size_pages);
+        if let Some(certificate) = input.authorized_seed.as_ref() {
+            combiner
+                .reconcile_authorized_seed(certificate)
+                .map_err(|error| {
+                    FrankenError::internal(format!(
+                        "parallel WAL authorized tail reconciliation failed: {error}"
+                    ))
+                })?;
+        }
+        let control_mode = self.parallel_wal_control().mode;
+        let request = ParallelWalDurabilityRequest {
+            trace_id: input.trace_id,
+            scenario_id: PARALLEL_WAL_PUBLICATION_SCENARIO_ID.to_owned(),
+            // Allocate both clocks after reconciling the authorized
+            // durable tail. The group-commit epoch is process-local and
+            // therefore cannot serve as a cross-process certificate id.
+            certificate_epoch: 0,
+            durable_segment_epoch: 0,
+            batch_size: u32::try_from(input.batches.len()).unwrap_or(u32::MAX),
+            batch_ids,
+            lane_record_counts,
+            db_size_pages: input.db_size_pages,
+            page_set_size: u32::try_from(input.page_set_size).unwrap_or(u32::MAX),
+            control_mode,
+            fallback_reason: input.fallback_reason,
+            checkpoint_active: input.checkpoint_active,
+        };
+        let conservative_shadow_evidence =
+            matches!(control_mode, ParallelWalOperatingMode::ShadowCompare).then(|| {
+                let raw_max_lane_id = input
+                    .batches
+                    .iter()
+                    .map(|batch| batch.context.lane_id)
+                    .max()
+                    .unwrap_or(0);
+                let mut raw_lane_record_counts =
+                    vec![0_u32; usize::from(raw_max_lane_id).saturating_add(1)];
+                for batch in input.batches {
+                    raw_lane_record_counts[usize::from(batch.context.lane_id)] =
+                        raw_lane_record_counts[usize::from(batch.context.lane_id)]
+                            .saturating_add(u32::try_from(batch.frames.len()).unwrap_or(u32::MAX));
+                }
+                ParallelWalConservativeShadowEvidence {
+                    certificate_epoch: 0,
+                    durable_segment_epoch: 0,
+                    batch_ids: input
+                        .batches
+                        .iter()
+                        .map(|batch| batch.context.batch_id)
+                        .collect(),
+                    lane_record_counts: raw_lane_record_counts,
+                    db_size_pages: input
+                        .batches
+                        .iter()
+                        .flat_map(|batch| batch.frames.iter())
+                        .filter_map(|frame| {
+                            (frame.db_size_if_commit > 0).then_some(frame.db_size_if_commit)
+                        })
+                        .max()
+                        .unwrap_or(input.db_size_pages),
+                    page_set_size: input
+                        .batches
+                        .iter()
+                        .map(|batch| u32::try_from(batch.frames.len()).unwrap_or(u32::MAX))
+                        .fold(0_u32, u32::saturating_add),
+                    control_mode,
+                    fallback_reason: input.fallback_reason,
+                    checkpoint_active: input.checkpoint_active,
+                    wal_frame_start: input.frames_start,
+                    wal_frame_end: input.frames_end,
+                }
+            });
+        let mut durability_error = None;
+        let wrapped_durable_write = |certificate: &fsqlite_wal::ParallelWalCommitCertificate| {
+            durable_write(certificate).map_err(|error| {
+                let detail = error.to_string();
+                durability_error = Some(error);
+                detail
+            })
+        };
+        let durability_receipt_result = if let Some(evidence) = conservative_shadow_evidence {
+            combiner.certify_and_publish_with_conservative_shadow(
+                request,
+                evidence,
+                wrapped_durable_write,
+            )
+        } else {
+            combiner.certify_and_publish(request, wrapped_durable_write)
+        };
+        if let Some(error) = durability_error {
+            return Err(error);
+        }
+        let durability_receipt = durability_receipt_result.map_err(|error| {
+            FrankenError::internal(format!(
+                "parallel WAL durability certificate failed for epoch {}: {error}",
+                input.epoch
+            ))
+        })?;
         let mut members_display = members.iter().copied().collect::<Vec<_>>();
         members_display.sort_unstable();
         let members_display = members_display
@@ -1014,23 +1171,38 @@ impl GroupCommitQueue {
             .join(",");
         let record = PersistedGroupCommitEpoch {
             members,
-            frames_start,
-            frames_end,
-            fsync_seq,
+            frames_start: input.frames_start,
+            frames_end: input.frames_end,
+            fsync_seq: input.fsync_seq,
+            durability_receipt: durability_receipt.clone(),
         };
         self.persisted_epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(epoch, record);
-        trace_group_commit(format_args!(
-            "batch epoch={epoch} members=[{members_display}] frames_written_range={frames_start}..={frames_end} fsync_seq={fsync_seq}"
-        ));
+            .insert(input.epoch, record);
+        if group_commit_trace_enabled() {
+            trace_group_commit(format_args!(
+                "batch epoch={} members=[{members_display}] frames_written_range={}..={} fsync_seq={} commit_certificate={} durability_seq={} publication_generation={} ordered_region_ns={} batch_size={} lookup_mode={:?} control_mode={} shadow_certificate_verdict={} compatibility_selector={} fallback_reason={}",
+                input.epoch,
+                input.frames_start,
+                input.frames_end,
+                input.fsync_seq,
+                durability_receipt.certificate.certificate_crc32c,
+                durability_receipt.durability_seq,
+                durability_receipt.publication_generation,
+                durability_receipt.ordered_region_ns,
+                durability_receipt.batch_size,
+                durability_receipt.lookup_mode,
+                parallel_wal_mode_name(durability_receipt.control_mode),
+                parallel_wal_shadow_verdict_name(durability_receipt.shadow_certificate_verdict),
+                PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+                parallel_wal_fallback_reason_name(durability_receipt.fallback_reason),
+            ));
+        }
+        Ok(durability_receipt)
     }
 
     fn persisted_epoch_for(&self, epoch: u64) -> Option<PersistedGroupCommitEpoch> {
-        if !group_commit_trace_enabled() {
-            return None;
-        }
         self.persisted_epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1099,12 +1271,10 @@ impl GroupCommitQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|&epoch, _| epoch > cutoff);
-        if group_commit_trace_enabled() {
-            self.persisted_epochs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|&epoch, _| epoch > cutoff);
-        }
+        self.persisted_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&epoch, _| epoch > cutoff);
     }
 
     /// Check if a given epoch has completed (for waiters).
@@ -2395,6 +2565,17 @@ impl<F: VfsFile> PagerInner<F> {
             self.committed_wal_generation = None;
             self.committed_wal_visible_commit_count = 0;
         }
+    }
+
+    /// Record one member of an already-certified WAL group without deriving
+    /// commit order from Phase C thread arrival.
+    fn record_local_wal_commit_at(&mut self, certified_commit_seq: CommitSeq) {
+        debug_assert_eq!(self.journal_mode, JournalMode::Wal);
+        self.commit_seq = self.commit_seq.max(certified_commit_seq);
+        self.committed_wal_visible_commit_count = self
+            .committed_wal_visible_commit_count
+            .checked_add(1)
+            .expect("visible WAL commit count overflow after 2^64 commits");
     }
 
     /// Refresh connection-local pager metadata from the latest committed state.
@@ -4124,6 +4305,69 @@ pub struct ParallelWalPublicationIntent {
     pub page_set_size: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ParallelWalPublicationAuthorization {
+    durability_receipt: ParallelWalDurabilityReceipt,
+    batch_id: u64,
+    assigned_commit_seq: CommitSeq,
+}
+
+fn parallel_wal_publication_intent(
+    authorization: &ParallelWalPublicationAuthorization,
+    db_size: u32,
+    journal_mode: JournalMode,
+    freelist_count: usize,
+    checkpoint_active: bool,
+) -> Result<ParallelWalPublicationIntent> {
+    let certificate = &authorization.durability_receipt.certificate;
+    if !certificate.checksum_is_valid() {
+        return Err(FrankenError::internal(
+            "parallel WAL publication rejected a damaged commit certificate",
+        ));
+    }
+    if authorization
+        .durability_receipt
+        .commit_seq_for_batch(authorization.batch_id)
+        != Some(authorization.assigned_commit_seq)
+    {
+        return Err(FrankenError::internal(format!(
+            "parallel WAL publication certificate does not authorize batch {} at {}",
+            authorization.batch_id, authorization.assigned_commit_seq
+        )));
+    }
+    if authorization.assigned_commit_seq < certificate.commit_seq_lo
+        || authorization.assigned_commit_seq > certificate.commit_seq_hi
+    {
+        return Err(FrankenError::internal(format!(
+            "parallel WAL publication sequence {} is outside certificate interval {}..={}",
+            authorization.assigned_commit_seq, certificate.commit_seq_lo, certificate.commit_seq_hi
+        )));
+    }
+    if checkpoint_active
+        && authorization.durability_receipt.fallback_reason
+            != Some(ParallelWalFallbackReason::CheckpointConflict)
+    {
+        return Err(FrankenError::Busy);
+    }
+    Ok(ParallelWalPublicationIntent {
+        certificate_epoch: certificate.certificate_epoch,
+        // The physical group is already durable. Publishing its high-water
+        // mark lets readers bind the complete authoritative WAL index even if
+        // individual pager Phase C callbacks arrive out of batch order.
+        visible_commit_seq: certificate.commit_seq_hi,
+        // The flusher installs the complete certificate group's page images in
+        // one seqlock generation before it wakes any Phase C waiter. The page
+        // plane therefore has the same contiguous high-water mark as the WAL
+        // visibility plane; an out-of-order waiter must never lower it.
+        page_plane_visible_commit_seq: certificate.commit_seq_hi,
+        db_size: db_size.max(certificate.db_size_pages),
+        journal_mode,
+        freelist_count,
+        checkpoint_active,
+        page_set_size: usize::try_from(certificate.page_set_size).unwrap_or(usize::MAX),
+    })
+}
+
 /// Reader-visible pager metadata classes covered by the Track E3 design
 /// contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4656,6 +4900,60 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start, true);
     }
 
+    /// Publish every page image covered by one durable group certificate in a
+    /// single seqlock generation before any individual Phase C waiter can
+    /// expose the certificate high-water mark.
+    fn publish_parallel_wal_group(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        batches: &[TransactionFrameBatch],
+    ) -> Result<()> {
+        let mut complete_group_pages = HashMap::with_capacity(
+            batches
+                .iter()
+                .map(|batch| batch.frames.len())
+                .sum::<usize>(),
+        );
+        for batch in batches {
+            for frame in &batch.frames {
+                let page_no = PageNumber::new(frame.page_number).ok_or_else(|| {
+                    FrankenError::internal(format!(
+                        "parallel WAL group certificate contains page number {}",
+                        frame.page_number
+                    ))
+                })?;
+                // Later frames in certificate order replace earlier images of
+                // the same page, matching WAL replay semantics.
+                complete_group_pages.insert(page_no, PageData::from_vec(frame.page_data.clone()));
+            }
+        }
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.should_skip_stale_publish(cx, update, "stale_parallel_wal_group_publish_skip") {
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
+
+        let previous_db_size = self.db_size.load(AtomicOrdering::Acquire);
+        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
+        if update.db_size < previous_db_size
+            && update.visible_commit_seq.get() >= previous_visible_commit_seq
+        {
+            self.pages.retain(|page_no| page_no.get() <= update.db_size);
+        }
+
+        self.pages.insert_batch(complete_group_pages);
+        let page_set_size = self.pages.len();
+        self.finalize_publish(cx, update, page_set_size, start, true);
+        Ok(())
+    }
+
     fn publish_commit_consuming_pages<I>(&self, cx: &Cx, update: PublishedPagerUpdate, pages: I)
     where
         I: IntoIterator<Item = (PageNumber, StagedPage)>,
@@ -4855,6 +5153,19 @@ impl PublishedPagerState {
             elapsed_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
             "published pager snapshot"
         );
+    }
+
+    /// Bind the pager plane to the certificate-derived handoff after the
+    /// ordinary page/metadata publish finishes.
+    fn bind_parallel_wal_publication(&self, intent: ParallelWalPublicationIntent) {
+        self.visible_commit_seq
+            .fetch_max(intent.visible_commit_seq.get(), AtomicOrdering::Release);
+        self.page_plane_visible_commit_seq.fetch_min(
+            intent.page_plane_visible_commit_seq.get(),
+            AtomicOrdering::Release,
+        );
+        self.db_size
+            .fetch_max(intent.db_size, AtomicOrdering::Release);
     }
 
     fn sync_metadata_without_page_publish(&self, update: PublishedPagerUpdate) {
@@ -10666,10 +10977,12 @@ where
             (inner.db_size, inner.wal_commit_sync_policy)
         };
 
+        let mut publication_authorization = None;
         Self::commit_wal_group_commit_with_snapshot(
             cx,
             wal_backend,
             inner_arc,
+            None,
             current_db_size,
             sync_policy,
             write_set,
@@ -10677,6 +10990,7 @@ where
             conflict_pages,
             &[],
             queue,
+            &mut publication_authorization,
         )
     }
 
@@ -10686,6 +11000,7 @@ where
         cx: &Cx,
         wal_backend: &SharedWalBackend,
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
+        published: Option<&PublishedPagerState>,
         current_db_size: u32,
         sync_policy: WalCommitSyncPolicy,
         write_set: &HashMap<PageNumber, StagedPage, S>,
@@ -10693,6 +11008,7 @@ where
         conflict_pages: &[PageNumber],
         conflict_page_baselines: &[TransactionConflictPageBaseline],
         queue: &GroupCommitQueueRef,
+        publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
     ) -> Result<()> {
         let detailed_metrics = detailed_consolidation_metrics_enabled();
         let lane_staging_debug_enabled =
@@ -10713,7 +11029,10 @@ where
         let (batch, _our_new_db_size) =
             match build_group_commit_batch(current_db_size, write_set, write_pages_sorted)? {
                 Some(b) => b,
-                None => return Ok(()), // Nothing to commit
+                None => {
+                    *publication_authorization = None;
+                    return Ok(());
+                } // Nothing to commit
             };
         let batch_build_us = elapsed_profile_us(t_batch_build_start);
 
@@ -11164,7 +11483,18 @@ where
                     None
                 };
 
-                if prepared_batch.is_none() {
+                // Operator-forced conservative mode is the production
+                // comparator for D1.c: it retains the former centralized
+                // frame serialization/checksum preparation inside the
+                // durability combiner. Every other mode prepares before the
+                // ordered residue, either from a lane-staged batch or through
+                // this safe raw fallback.
+                if prepared_batch.is_none()
+                    && !matches!(
+                        parallel_wal_control.mode,
+                        ParallelWalOperatingMode::Conservative
+                    )
+                {
                     let prepared = with_wal_backend_read(wal_backend, |wal| {
                         let mut prepared_batch = wal.prepare_append_frames(&frame_refs)?;
                         if let Some(prepared) = prepared_batch.as_mut() {
@@ -11191,6 +11521,8 @@ where
                 let mut frames_written_start: u64 = 0;
                 let mut frames_written_end: u64 = 0;
                 let mut fsync_seq: u64 = 0;
+                let mut initial_visible_commit_seq = CommitSeq::ZERO;
+                let mut checkpoint_active = false;
 
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     let t_inner_lock_start = phase_timing.then(Instant::now);
@@ -11199,6 +11531,8 @@ where
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
                         inner_lock_wait_us = elapsed_profile_us(t_inner_lock_start);
+                        initial_visible_commit_seq = inner.commit_seq;
+                        checkpoint_active = inner.checkpoint_active;
 
                         let t_excl_start = phase_timing.then(Instant::now);
                         // WAL appends need a cross-process writer gate, but
@@ -11220,12 +11554,18 @@ where
                             LockLevel::Shared
                         };
 
-                        let t_append_start = phase_timing.then(Instant::now);
                         let flush_io_result = (|| -> Result<()> {
+                            let mut completed_receipt = None;
                             with_wal_backend(wal_backend, |wal| {
-                                frames_written_start = u64::try_from(wal.frame_count())
-                                    .unwrap_or(u64::MAX)
-                                    .saturating_add(1);
+                                // A connection-local WAL backend can lag a
+                                // commit published through a peer backend.
+                                // Refresh it while the cross-process append
+                                // gate is held before deriving the certified
+                                // frame interval. Conflict detection also
+                                // refreshes, so compute the interval only
+                                // after every operation that can advance the
+                                // backend's view of the durable tail.
+                                let _ = wal.refresh_published_snapshot(cx)?;
                                 let t_append_conflict_check_start =
                                     detailed_metrics.then(Instant::now);
                                 let stale_conflict_pages =
@@ -11241,31 +11581,116 @@ where
                                             .join(","),
                                     });
                                 }
-                                let t_append_frames_start = detailed_metrics.then(Instant::now);
-                                if let Some(prepared) = prepared_batch.as_mut() {
-                                    wal.append_prepared_frames(cx, prepared)?;
-                                } else {
-                                    wal.append_frames(cx, &frame_refs)?;
+                                let authorized_seed =
+                                    wal.latest_authorized_parallel_wal_commit_certificate(cx)?;
+                                frames_written_start = u64::try_from(wal.frame_count())
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_add(1);
+                                frames_written_end = frames_written_start
+                                    .checked_add(
+                                        u64::try_from(frame_count)
+                                            .unwrap_or(u64::MAX)
+                                            .saturating_sub(1),
+                                    )
+                                    .ok_or(FrankenError::DatabaseFull)?;
+                                if sync_policy.should_sync_on_commit() {
+                                    fsync_seq = GROUP_COMMIT_TRACE_FSYNC_SEQ
+                                        .fetch_add(1, AtomicOrdering::Relaxed)
+                                        .saturating_add(1);
                                 }
-                                append_frames_us = elapsed_profile_us(t_append_frames_start);
-                                frames_written_end =
-                                    u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
+
+                                let receipt = queue.record_persisted_epoch(
+                                    PersistedGroupCommitInput {
+                                        trace_id: cx.trace_id(),
+                                        epoch: flush_epoch,
+                                        batches: &batches,
+                                        frames_start: frames_written_start,
+                                        frames_end: frames_written_end,
+                                        fsync_seq,
+                                        initial_visible_commit_seq,
+                                        db_size_pages: final_db_size,
+                                        page_set_size: frame_count,
+                                        checkpoint_active,
+                                        fallback_reason,
+                                        authorized_seed,
+                                    },
+                                    |certificate| {
+                                        match wal.persist_parallel_wal_commit_certificate(
+                                            cx,
+                                            certificate,
+                                            frames_written_start,
+                                            frames_written_end,
+                                            sync_policy.should_sync_on_commit(),
+                                        ) {
+                                            Ok(()) => {}
+                                            #[cfg(test)]
+                                            Err(FrankenError::Unsupported) => {
+                                                // Pager unit-test backends are
+                                                // process-local fakes with no
+                                                // durable namespace. Production
+                                                // backends fail closed unless
+                                                // they implement the sidecar.
+                                            }
+                                            Err(error) => return Err(error),
+                                        }
+
+                                        let t_append_frames_start =
+                                            detailed_metrics.then(Instant::now);
+                                        if let Some(prepared) = prepared_batch.as_mut() {
+                                            wal.append_prepared_frames(cx, prepared)?;
+                                        } else {
+                                            wal.append_frames(cx, &frame_refs)?;
+                                        }
+                                        append_frames_us =
+                                            elapsed_profile_us(t_append_frames_start);
+                                        wal_append_us = append_frames_us;
+                                        let actual_frames_written_end =
+                                            u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
+                                        if actual_frames_written_end != frames_written_end {
+                                            return Err(FrankenError::internal(format!(
+                                                "parallel WAL certificate covers frames {frames_written_start}..={frames_written_end}, append ended at {actual_frames_written_end}"
+                                            )));
+                                        }
+
+                                        if sync_policy.should_sync_on_commit() {
+                                            let t_sync_start = phase_timing.then(Instant::now);
+                                            wal.sync(cx)?;
+                                            wal_sync_us = elapsed_profile_us(t_sync_start);
+                                            GLOBAL_CONSOLIDATION_METRICS
+                                                .fsyncs_total
+                                                .fetch_add(1, AtomicOrdering::Relaxed);
+                                        }
+                                        #[cfg(any(test, feature = "fault-injection"))]
+                                        crate::fault_hooks::maybe_inject_after_flush_before_publish(
+                                            flush_epoch,
+                                            batch_count,
+                                            frame_count,
+                                        )?;
+                                        Ok(())
+                                    },
+                                )?;
+                                completed_receipt = Some(receipt);
                                 Ok(())
                             })?;
-                            wal_append_us = elapsed_profile_us(t_append_start);
 
-                            if sync_policy.should_sync_on_commit() {
-                                let t_sync_start = phase_timing.then(Instant::now);
-                                with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-                                wal_sync_us = elapsed_profile_us(t_sync_start);
-                                fsync_seq = GROUP_COMMIT_TRACE_FSYNC_SEQ
-                                    .fetch_add(1, AtomicOrdering::Relaxed)
-                                    .saturating_add(1);
-                                GLOBAL_CONSOLIDATION_METRICS
-                                    .fsyncs_total
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            let receipt = completed_receipt.ok_or_else(|| {
+                                FrankenError::internal(
+                                    "parallel WAL group flush completed without a durability receipt",
+                                )
+                            })?;
+                            if let Some(published) = published {
+                                published.publish_parallel_wal_group(
+                                    cx,
+                                    PublishedPagerUpdate {
+                                        visible_commit_seq: receipt.certificate.commit_seq_hi,
+                                        db_size: final_db_size,
+                                        journal_mode: inner.journal_mode,
+                                        freelist_count: inner.freelist.len(),
+                                        checkpoint_active,
+                                    },
+                                    &batches,
+                                )?;
                             }
-
                             inner.db_size = final_db_size;
                             Ok(())
                         })();
@@ -11302,54 +11727,6 @@ where
 
                 match flush_result {
                     Ok(()) => {
-                        #[cfg(any(test, feature = "fault-injection"))]
-                        if let Err(error) =
-                            crate::fault_hooks::maybe_inject_after_flush_before_publish(
-                                flush_epoch,
-                                batch_count,
-                                frame_count,
-                            )
-                        {
-                            let (abort_result, wake_next_epoch) = {
-                                let mut consolidator = queue
-                                    .consolidator
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let abort_result = consolidator.abort_flush();
-                                let wake_next_epoch =
-                                    abort_result.is_ok() && consolidator.has_flusher_vacancy();
-                                (abort_result, wake_next_epoch)
-                            };
-                            queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
-                            if let Err(abort_error) = abort_result {
-                                if flush_epoch != target_epoch {
-                                    tracing::debug!(
-                                        target: "fsqlite::wal::lock_scope",
-                                        epoch = flush_epoch,
-                                        caller_target_epoch = target_epoch,
-                                        error = %error,
-                                        abort_error = %abort_error,
-                                        "promoted group-commit epoch publish hook abort failed after caller epoch completed"
-                                    );
-                                    return Ok(());
-                                }
-                                return Err(FrankenError::internal(format!(
-                                    "group commit flush hook failed for epoch {flush_epoch} and abort_flush also failed: hook={error}; abort={abort_error}"
-                                )));
-                            }
-                            if flush_epoch != target_epoch {
-                                tracing::debug!(
-                                    target: "fsqlite::wal::lock_scope",
-                                    epoch = flush_epoch,
-                                    caller_target_epoch = target_epoch,
-                                    error = %error,
-                                    "promoted group-commit epoch publish hook failed after caller epoch completed"
-                                );
-                                return Ok(());
-                            }
-                            return Err(error);
-                        }
-
                         GLOBAL_CONSOLIDATION_METRICS
                             .groups_flushed
                             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -11495,14 +11872,6 @@ where
                                 );
                             }
                         }
-                        queue.record_persisted_epoch(
-                            flush_epoch,
-                            &batches,
-                            frames_written_start,
-                            frames_written_end,
-                            fsync_seq,
-                        );
-
                         let (completed_epoch, has_promoted) = {
                             let mut consolidator = queue
                                 .consolidator
@@ -11721,6 +12090,34 @@ where
             }
         }
 
+        let persisted = queue.persisted_epoch_for(target_epoch).ok_or_else(|| {
+            FrankenError::internal(format!(
+                "group commit epoch {target_epoch} completed without a durability certificate"
+            ))
+        })?;
+        if !persisted.members.contains(&waiter_id) {
+            return Err(FrankenError::internal(format!(
+                "group commit certificate for epoch {target_epoch} does not cover batch {waiter_id}"
+            )));
+        }
+        if persisted
+            .durability_receipt
+            .commit_seq_for_batch(waiter_id)
+            .is_none()
+        {
+            return Err(FrankenError::internal(format!(
+                "group commit certificate for epoch {target_epoch} has no sequence assignment for batch {waiter_id}"
+            )));
+        }
+        let assigned_commit_seq = persisted
+            .durability_receipt
+            .commit_seq_for_batch(waiter_id)
+            .expect("checked batch sequence assignment above");
+        *publication_authorization = Some(ParallelWalPublicationAuthorization {
+            durability_receipt: persisted.durability_receipt,
+            batch_id: waiter_id,
+            assigned_commit_seq,
+        });
         Ok(())
     }
 
@@ -12574,6 +12971,7 @@ where
         // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
         // threads can start their Phase A (prepare) while we wait for
         // the consolidator lock. This is the key parallelization win.
+        let mut wal_publication_authorization = None;
         let commit_result = if self.journal_mode == JournalMode::Wal {
             // Drop inner lock BEFORE acquiring consolidator lock.
             // This allows other threads to run Phase A concurrently.
@@ -12587,6 +12985,7 @@ where
                 cx,
                 &self.wal_backend,
                 &self.inner,
+                Some(self.published.as_ref()),
                 wal_current_db_size,
                 wal_sync_policy,
                 &self.write_set,
@@ -12594,6 +12993,7 @@ where
                 &cross_process_conflict_pages,
                 &cross_process_conflict_page_baselines,
                 &self.group_commit_queue,
+                &mut wal_publication_authorization,
             );
             record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
 
@@ -12680,7 +13080,23 @@ where
             // advanced past those page numbers; dropping them here creates
             // permanent in-process holes that later commits can expose as
             // "Page N: never used" once page_count grows past the gap.
-            inner.record_local_commit();
+            let wal_publication_intent = wal_publication_authorization
+                .as_ref()
+                .map(|authorization| {
+                    parallel_wal_publication_intent(
+                        authorization,
+                        inner.db_size,
+                        inner.journal_mode,
+                        inner.freelist.len(),
+                        inner.checkpoint_active,
+                    )
+                })
+                .transpose()?;
+            if let Some(intent) = wal_publication_intent {
+                inner.record_local_wal_commit_at(intent.visible_commit_seq);
+            } else {
+                inner.record_local_commit();
+            }
             let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
             if let Ok(file_size) = inner.db_file.file_size(cx) {
                 inner.committed_db_file_size_bytes = file_size;
@@ -12690,7 +13106,8 @@ where
             let notify_writer_idle =
                 self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
             let publish_update = PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
+                visible_commit_seq: wal_publication_intent
+                    .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
                 db_size: inner.db_size,
                 journal_mode: inner.journal_mode,
                 freelist_count: inner.freelist.len(),
@@ -12733,7 +13150,14 @@ where
             // plane. In isolated single-connection mode, only metadata needs
             // to advance; page bytes stay authoritative in pager/db_file state.
             let t_publish_start = pager_commit_profile_start(pager_commit_profile_active);
-            if metadata_only_single_connection_fast_path {
+            if let Some(intent) = wal_publication_intent {
+                // The physical flusher installed the complete certificate
+                // group before waking this waiter. Re-publishing this
+                // transaction's subset here could overwrite the group's
+                // last-frame-wins image when Phase C callbacks run out of
+                // order, so the waiter only binds certificate metadata.
+                self.published.bind_parallel_wal_publication(intent);
+            } else if metadata_only_single_connection_fast_path {
                 self.publish_single_connection_metadata_only(cx, publish_update);
             } else {
                 self.publish_committed_state(cx, publish_update);
@@ -12899,6 +13323,7 @@ where
         pending_free_pages.extend(self.freed_pages.iter().copied());
         let pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
         self.freed_page_bounds = None;
+        let mut wal_publication_authorization = None;
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
             // Match the normal commit path: capture semantic Page 1 intent
@@ -12996,6 +13421,7 @@ where
                     cx,
                     &self.wal_backend,
                     &self.inner,
+                    Some(self.published.as_ref()),
                     wal_current_db_size,
                     wal_sync_policy,
                     &self.write_set,
@@ -13003,6 +13429,7 @@ where
                     &cross_process_conflict_pages,
                     &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
+                    &mut wal_publication_authorization,
                 );
                 inner = match inner_arc
                     .lock()
@@ -13076,7 +13503,23 @@ where
             // smaller than a peer's just-committed extent.
             inner.db_size = inner.db_size.max(committed_db_size);
             // Keep volatile EOF lease pages in memory; see commit() Phase C1.
-            inner.record_local_commit();
+            let wal_publication_intent = wal_publication_authorization
+                .as_ref()
+                .map(|authorization| {
+                    parallel_wal_publication_intent(
+                        authorization,
+                        inner.db_size,
+                        inner.journal_mode,
+                        inner.freelist.len(),
+                        inner.checkpoint_active,
+                    )
+                })
+                .transpose()?;
+            if let Some(intent) = wal_publication_intent {
+                inner.record_local_wal_commit_at(intent.visible_commit_seq);
+            } else {
+                inner.record_local_commit();
+            }
             // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
             if self.vfs.is_memory() {
                 inner.committed_db_file_size_bytes =
@@ -13087,7 +13530,8 @@ where
             // NOTE: We intentionally do NOT decrement active_transactions or
             // set writer_active=false — the transaction stays "active" for reuse.
             let publish_update = PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
+                visible_commit_seq: wal_publication_intent
+                    .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
                 db_size: inner.db_size,
                 journal_mode: inner.journal_mode,
                 freelist_count: inner.freelist.len(),
@@ -13099,7 +13543,13 @@ where
             // before the seqlock commit_seq advances.
             self.publish_committed_snapshot_from_inner(&inner);
             drop(inner);
-            if metadata_only_single_connection_fast_path {
+            if let Some(intent) = wal_publication_intent {
+                // The group flusher already published every certified page in
+                // WAL order. Retained transactions must not replay their
+                // member-local subset after another member's Phase C.
+                self.retained_memory_overlay_dirty_pages.clear();
+                self.published.bind_parallel_wal_publication(intent);
+            } else if metadata_only_single_connection_fast_path {
                 if defer_private_memory_flush {
                     self.note_retained_memory_overlay_from_write_set();
                 } else {
@@ -33155,6 +33605,185 @@ mod tests {
         assert_ne!(intent, other);
         let dbg = format!("{intent:?}");
         assert!(dbg.contains("ParallelWalPublicationIntent"));
+    }
+
+    fn publication_authorization_for_test(
+        checkpoint_active: bool,
+    ) -> ParallelWalPublicationAuthorization {
+        let combiner = ParallelWalDurabilityCombiner::default();
+        let receipt = combiner
+            .certify_and_publish(
+                ParallelWalDurabilityRequest {
+                    trace_id: 11,
+                    scenario_id: PARALLEL_WAL_PUBLICATION_SCENARIO_ID.to_owned(),
+                    certificate_epoch: 1,
+                    durable_segment_epoch: 1,
+                    batch_size: 2,
+                    batch_ids: vec![41, 42],
+                    lane_record_counts: vec![1, 1],
+                    db_size_pages: 23,
+                    page_set_size: 2,
+                    control_mode: ParallelWalOperatingMode::Auto,
+                    fallback_reason: None,
+                    checkpoint_active,
+                },
+                |_| Ok(()),
+            )
+            .expect("test certificate should publish");
+        ParallelWalPublicationAuthorization {
+            assigned_commit_seq: receipt
+                .commit_seq_for_batch(41)
+                .expect("test batch should have a commit sequence"),
+            durability_receipt: receipt,
+            batch_id: 41,
+        }
+    }
+
+    #[test]
+    fn certificate_authorization_builds_bounded_publication_intent() {
+        let authorization = publication_authorization_for_test(false);
+        let intent =
+            parallel_wal_publication_intent(&authorization, 20, JournalMode::Wal, 3, false)
+                .expect("certificate-backed publication should validate");
+        assert_eq!(intent.certificate_epoch, 1);
+        assert_eq!(intent.visible_commit_seq, CommitSeq::new(2));
+        assert_eq!(intent.page_plane_visible_commit_seq, CommitSeq::new(2));
+        assert_eq!(intent.db_size, 23);
+        assert_eq!(intent.page_set_size, 2);
+    }
+
+    #[test]
+    fn parallel_wal_group_publication_replaces_stale_pages_before_out_of_order_phase_c() {
+        init_publication_test_tracing();
+        let cx = Cx::new();
+        let published = PublishedPagerState::new(3, CommitSeq::ZERO, JournalMode::Wal, 0);
+        let page_two = PageNumber::new(2).expect("page two");
+        let page_three = PageNumber::new(3).expect("page three");
+        let stale_page_two = PageData::from_vec(sample_page(0x20));
+        let committed_page_two = PageData::from_vec(sample_page(0xA2));
+        let committed_page_three = PageData::from_vec(sample_page(0xA3));
+
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::ZERO,
+                db_size: 3,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_two,
+            stale_page_two,
+        );
+
+        let batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: page_two.get(),
+                page_data: committed_page_two.as_bytes().to_vec(),
+                db_size_if_commit: 3,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 41,
+                lane_id: 0,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 0,
+            }),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: page_three.get(),
+                page_data: committed_page_three.as_bytes().to_vec(),
+                db_size_if_commit: 3,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 42,
+                lane_id: 1,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 0,
+            }),
+        ];
+
+        published
+            .publish_parallel_wal_group(
+                &cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: CommitSeq::new(2),
+                    db_size: 3,
+                    journal_mode: JournalMode::Wal,
+                    freelist_count: 0,
+                    checkpoint_active: false,
+                },
+                &batches,
+            )
+            .expect("publish complete certificate group");
+
+        let group_snapshot = published.snapshot();
+        assert_eq!(group_snapshot.visible_commit_seq, CommitSeq::new(2));
+        assert_eq!(
+            published.page_plane_visible_commit_seq(),
+            CommitSeq::new(2),
+            "the complete group page plane must reach the certificate high-water mark before waiters run"
+        );
+        assert_eq!(
+            published.try_get_page(page_two),
+            Some(committed_page_two.clone())
+        );
+        assert_eq!(
+            published.try_get_page(page_three),
+            Some(committed_page_three.clone())
+        );
+
+        // Simulate Phase C for the higher-sequence member running first, then
+        // the lower-sequence member. Neither callback may reveal the stale
+        // pre-group page or regress the contiguous page-plane horizon.
+        let higher_member_intent = ParallelWalPublicationIntent {
+            certificate_epoch: 1,
+            visible_commit_seq: CommitSeq::new(2),
+            page_plane_visible_commit_seq: CommitSeq::new(2),
+            db_size: 3,
+            journal_mode: JournalMode::Wal,
+            freelist_count: 0,
+            checkpoint_active: false,
+            page_set_size: 2,
+        };
+        published.bind_parallel_wal_publication(higher_member_intent);
+        let lower_member_intent = ParallelWalPublicationIntent {
+            visible_commit_seq: CommitSeq::new(2),
+            page_plane_visible_commit_seq: CommitSeq::new(2),
+            ..higher_member_intent
+        };
+        published.bind_parallel_wal_publication(lower_member_intent);
+
+        assert_eq!(published.try_get_page(page_two), Some(committed_page_two));
+        assert_eq!(
+            published.try_get_page(page_three),
+            Some(committed_page_three)
+        );
+        assert_eq!(
+            published.page_plane_visible_commit_seq(),
+            CommitSeq::new(2),
+            "out-of-order Phase C callbacks must preserve the complete group horizon"
+        );
+    }
+
+    #[test]
+    fn certificate_authorization_rejects_checksum_drift_and_checkpoint_overlap() {
+        let mut damaged = publication_authorization_for_test(false);
+        damaged.durability_receipt.certificate.certificate_crc32c ^= 1;
+        assert!(matches!(
+            parallel_wal_publication_intent(&damaged, 23, JournalMode::Wal, 0, false),
+            Err(FrankenError::Internal(_))
+        ));
+
+        let no_checkpoint_fallback = publication_authorization_for_test(false);
+        assert!(matches!(
+            parallel_wal_publication_intent(&no_checkpoint_fallback, 23, JournalMode::Wal, 0, true,),
+            Err(FrankenError::Busy)
+        ));
+
+        let checkpoint_fallback = publication_authorization_for_test(true);
+        assert!(
+            parallel_wal_publication_intent(&checkpoint_fallback, 23, JournalMode::Wal, 0, true,)
+                .is_ok()
+        );
     }
 
     #[test]

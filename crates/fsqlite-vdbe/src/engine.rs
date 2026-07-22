@@ -876,6 +876,28 @@ impl MemTable {
         self.rebuild_unique_indexes();
     }
 
+    /// Remove one declared column from every materialized row.
+    ///
+    /// TEMP tables use `MemTable` as their authoritative storage.  Keep the
+    /// table's direct UNIQUE-constraint column positions aligned with the
+    /// rewritten row image when `ALTER TABLE ... DROP COLUMN` removes a slot.
+    fn remove_column_from_rows(&mut self, removed_slot: usize) {
+        self.num_columns = self.num_columns.saturating_sub(1);
+        for row in &mut self.rows {
+            if removed_slot < row.values.len() {
+                row.values.remove(removed_slot);
+            }
+        }
+        for constraint in &mut self.unique_constraints {
+            for column in &mut constraint.columns {
+                if *column > removed_slot {
+                    *column -= 1;
+                }
+            }
+        }
+        self.rebuild_unique_indexes();
+    }
+
     /// Find a row by rowid. Returns the index.
     #[inline]
     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
@@ -4147,6 +4169,32 @@ impl MemDatabase {
                 old_values,
             });
         }
+    }
+
+    /// Remove a column slot from every row in a TEMP table.
+    ///
+    /// The pre-rewrite table image is recorded as one undo entry, so an
+    /// enclosing statement savepoint restores row widths, UNIQUE metadata,
+    /// and the column count together.
+    pub fn remove_column_from_rows(&mut self, root_page: i32, removed_slot: usize) -> bool {
+        let Some(previous) = self.tables.get(&root_page).cloned() else {
+            return false;
+        };
+        if previous
+            .unique_constraints
+            .iter()
+            .any(|constraint| constraint.columns.contains(&removed_slot))
+        {
+            return false;
+        }
+        self.push_undo(MemDbUndoOp::ClearTable {
+            root_page,
+            table: previous,
+        });
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            table.remove_column_from_rows(removed_slot);
+        }
+        true
     }
 
     /// Allocate an implicit rowid and insert the row, recording one undo entry
