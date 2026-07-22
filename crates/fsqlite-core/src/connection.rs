@@ -63214,9 +63214,40 @@ impl Connection {
                 SqliteValue::Text(s) => s.clone(),
                 _ => continue,
             };
-            new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
-
             let is_virtual_sql = is_virtual_table_sql(&create_sql);
+            let ddl_key = name.to_ascii_lowercase();
+            let implicit_content_shadow = format!("{name}_content");
+            let replacement_is_stale_implicit_fts5 = root_page_num == 0
+                && is_virtual_sql
+                && matches!(
+                    parse_single_statement(&create_sql),
+                    Ok(Statement::CreateVirtualTable(ref stmt))
+                        if stmt.module.eq_ignore_ascii_case("fts5")
+                            && virtual_table_option_value(&stmt.args, "content").is_none()
+                )
+                && !master_entries.iter().any(|candidate| {
+                    candidate.len() >= 2
+                        && matches!(
+                            &candidate[1],
+                            SqliteValue::Text(candidate_name)
+                                if candidate_name.eq_ignore_ascii_case(&implicit_content_shadow)
+                        )
+                });
+            let existing_is_reloadable_contentless_fts5 = new_original_ddl_sql
+                .get(&ddl_key)
+                .is_some_and(|existing_sql| {
+                    matches!(
+                        parse_single_statement(existing_sql),
+                        Ok(Statement::CreateVirtualTable(ref stmt))
+                            if stmt.module.eq_ignore_ascii_case("fts5")
+                                && virtual_table_option_value(&stmt.args, "content")
+                                    .is_some_and(|content| content.is_empty())
+                    )
+                });
+            if !(replacement_is_stale_implicit_fts5 && existing_is_reloadable_contentless_fts5) {
+                new_original_ddl_sql.insert(ddl_key, create_sql.to_string());
+            }
+
             if root_page_num == 0 && is_virtual_sql {
                 let shadowed_by_materialized =
                     materialized_virtual_tables.contains(&name.to_ascii_lowercase());
@@ -133064,6 +133095,8 @@ SELECT x FROM t;
                         body,
                         content=''
                     );
+                    INSERT INTO docs_fts(rowid, title, body)
+                    VALUES(1, 'rust', 'persisted repair');
                     PRAGMA writable_schema = ON;
                     INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
                     VALUES(
@@ -133079,15 +133112,42 @@ SELECT x FROM t;
                 .unwrap();
         }
 
-        let conn = Connection::open(&db_str)
-            .expect("duplicate legacy FTS5 schema row should remain available for repair");
-        conn.execute("INSERT INTO docs_fts(rowid, title, body) VALUES(1, 'rust', 'repair');")
+        {
+            let conn = Connection::open(&db_str)
+                .expect("duplicate legacy FTS5 schema row should remain available for repair");
+            let schema_rows = conn
+                .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'docs_fts';")
+                .unwrap();
+            assert_eq!(schema_rows.len(), 1);
+            assert_eq!(schema_rows[0].values()[0], SqliteValue::Integer(1));
+            let persisted = conn
+                .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'persisted';")
+                .unwrap();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].values()[0], SqliteValue::Integer(1));
+            conn.execute("INSERT INTO docs_fts(rowid, title, body) VALUES(2, 'rust', 'catchup');")
+                .unwrap();
+            let rows = conn
+                .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'rust' ORDER BY rowid;")
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        }
+
+        let reopened = Connection::open(&db_str)
+            .expect("repaired duplicate FTS5 schema should remain reloadable");
+        let schema_rows = reopened
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'docs_fts';")
             .unwrap();
-        let rows = conn
-            .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'repair';")
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(schema_rows[0].values()[0], SqliteValue::Integer(1));
+        let rows = reopened
+            .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'rust' ORDER BY rowid;")
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
     }
 
     #[test]
