@@ -6515,6 +6515,26 @@ where
         Ok(receipt)
     }
 
+    /// Inspect a private database image and prove that no recovery sidecar is
+    /// part of its current state.
+    ///
+    /// `VACUUM INTO` uses this before semantic validation and again at each
+    /// success boundary. Checking companions on both sides of the full-image
+    /// digest closes the window in which a cooperating opener could switch a
+    /// nominally complete main file into a WAL- or journal-backed generation
+    /// without changing the main-file bytes themselves.
+    pub fn inspect_self_contained_database_image(
+        &self,
+        cx: &Cx,
+        image_path: &Path,
+    ) -> Result<DatabaseImageReceipt> {
+        let full_path = self.vfs.full_pathname(cx, image_path)?;
+        self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
+        let receipt = self.inspect_database_image(cx, &full_path)?;
+        self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
+        Ok(receipt)
+    }
+
     /// Install source-derived change-counter provenance on a private VACUUM
     /// candidate without trusting its pathname between inspection and write.
     ///

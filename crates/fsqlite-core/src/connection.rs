@@ -2450,6 +2450,22 @@ impl PagerBackend {
         }
     }
 
+    fn inspect_self_contained_database_image(
+        &self,
+        cx: &Cx,
+        path: &Path,
+    ) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.inspect_self_contained_database_image(cx, path),
+        }
+    }
+
     fn restore_vacuum_candidate_change_counter(
         &self,
         cx: &Cx,
@@ -8595,6 +8611,9 @@ pub(crate) mod fast_path_gate {
 /// (SAVEPOINT/RELEASE/ROLLBACK TO). The default runtime path uses pager/WAL/B-tree
 /// storage, while `MemDatabase` is retained as an execution image and limited
 /// compatibility fallback.
+#[cfg(test)]
+type VacuumRaceHook = Box<dyn FnOnce() + Send>;
+
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -9099,6 +9118,14 @@ pub struct Connection {
     /// published over the source database.
     #[cfg(test)]
     fail_vacuum_rebuild_validation_once: Cell<bool>,
+    /// One-shot race hook after a file-backed VACUUM source receipt is
+    /// captured but before the source is hydrated.
+    #[cfg(test)]
+    vacuum_after_source_receipt_once: RefCell<Option<VacuumRaceHook>>,
+    /// One-shot race hook after a VACUUM INTO image passes semantic validation
+    /// but before its receipt is revalidated and made durable.
+    #[cfg(test)]
+    vacuum_after_target_validation_once: RefCell<Option<VacuumRaceHook>>,
     /// One-shot injection after durable VACUUM publication but before the
     /// masked connection rebind begins.
     #[cfg(test)]
@@ -9758,6 +9785,10 @@ impl Connection {
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
+            vacuum_after_source_receipt_once: RefCell::new(None),
+            #[cfg(test)]
+            vacuum_after_target_validation_once: RefCell::new(None),
+            #[cfg(test)]
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
@@ -10173,6 +10204,10 @@ impl Connection {
             post_vacuum_rebind_failure: RefCell::new(None),
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
+            #[cfg(test)]
+            vacuum_after_source_receipt_once: RefCell::new(None),
+            #[cfg(test)]
+            vacuum_after_target_validation_once: RefCell::new(None),
             #[cfg(test)]
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
@@ -42790,7 +42825,7 @@ impl Connection {
             None
         };
 
-        let source_receipt = if target_value.is_none() && self.path != ":memory:" {
+        let source_receipt = if self.path != ":memory:" {
             Some(self.pager.capture_vacuum_source_image(&cx)?)
         } else {
             None
@@ -42800,7 +42835,21 @@ impl Connection {
             Some(receipt) => receipt.header().clone(),
             None => self.current_database_header(&cx)?,
         };
+        #[cfg(test)]
+        if let Some(hook) = self.vacuum_after_source_receipt_once.borrow_mut().take() {
+            hook();
+        }
         self.reload_memdb_from_pager_with_mode(&cx, true)?;
+        if let Some(source_receipt) = source_receipt.as_ref() {
+            let hydrated_source_receipt = self.pager.capture_vacuum_source_image(&cx)?;
+            if hydrated_source_receipt != *source_receipt {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages:
+                        "VACUUM source image changed while hydrating its receipt-bound snapshot"
+                            .to_owned(),
+                });
+            }
+        }
         let extra_master_entries = self.vacuum_extra_sqlite_master_entries();
         let target_reservation = target_value
             .as_ref()
@@ -42865,29 +42914,67 @@ impl Connection {
             return Err(error);
         }
 
+        let mut finalized_output_receipt = None;
         if let Some(target) = target_reservation.as_ref() {
             match target.kind() {
                 crate::vacuum::VacuumTargetKind::UserOutput => {
-                    if let Err(error) = self.validate_vacuum_rebuild(target) {
-                        if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                            tracing::warn!(
-                                error = %cleanup_error,
-                                path = %target.path().display(),
-                                "VACUUM INTO validation failed and exact-reservation cleanup also failed"
-                            );
+                    let finalization_result = (|| -> Result<DatabaseImageReceipt> {
+                        let persisted_candidate = self
+                            .pager
+                            .inspect_self_contained_database_image(&cx, target.path())?;
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+                        if persisted_candidate.identity() != target.identity() {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "VACUUM INTO candidate no longer has its reserved identity"
+                                    .to_owned(),
+                            });
                         }
-                        return Err(error);
-                    }
-                    if let Err(error) = target.finish_user_output(&cx) {
-                        if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                            tracing::warn!(
-                                error = %cleanup_error,
-                                path = %target.path().display(),
-                                "VACUUM INTO finalization failed and exact-reservation cleanup also failed"
-                            );
+
+                        self.validate_vacuum_rebuild(target)?;
+                        #[cfg(test)]
+                        if let Some(hook) =
+                            self.vacuum_after_target_validation_once.borrow_mut().take()
+                        {
+                            hook();
                         }
-                        return Err(error);
-                    }
+
+                        let validated_candidate = self
+                            .pager
+                            .inspect_self_contained_database_image(&cx, target.path())?;
+                        if validated_candidate != persisted_candidate {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "VACUUM INTO candidate identity or content changed during semantic validation"
+                                    .to_owned(),
+                            });
+                        }
+
+                        target.finish_user_output(&cx)?;
+                        let durable_candidate = self
+                            .pager
+                            .inspect_self_contained_database_image(&cx, target.path())?;
+                        if durable_candidate != validated_candidate {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "VACUUM INTO candidate identity or content changed across its durability barrier"
+                                    .to_owned(),
+                            });
+                        }
+                        Ok(durable_candidate)
+                    })();
+
+                    let candidate_receipt = match finalization_result {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                                tracing::warn!(
+                                    error = %cleanup_error,
+                                    path = %target.path().display(),
+                                    "VACUUM INTO finalization failed and exact-reservation cleanup also failed"
+                                );
+                            }
+                            return Err(error);
+                        }
+                    };
+                    finalized_output_receipt = Some(candidate_receipt);
                 }
                 crate::vacuum::VacuumTargetKind::Discard => {
                     if !target.cleanup_if_owned(&cx)? {
@@ -42981,7 +43068,53 @@ impl Connection {
 
         self.invalidate_cached_read_snapshot(&cx);
         self.invalidate_cached_write_txn(&cx);
-        self.reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows)?;
+        if let Err(error) = self.reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows) {
+            if let Some(target) = target_reservation.as_ref()
+                && let Err(cleanup_error) = target.cleanup_if_owned(&cx)
+            {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    path = %target.path().display(),
+                    "VACUUM INTO source-state restoration failed and exact-reservation cleanup also failed"
+                );
+            }
+            return Err(error);
+        }
+
+        if let Some(expected_receipt) = finalized_output_receipt.as_ref() {
+            let target = target_reservation.as_ref().ok_or_else(|| {
+                FrankenError::internal("VACUUM INTO finalized without an output reservation")
+            })?;
+            let final_receipt = self
+                .pager
+                .inspect_self_contained_database_image(&cx, target.path());
+            match final_receipt {
+                Ok(receipt) if receipt == *expected_receipt => {}
+                Ok(_) => {
+                    if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                        tracing::warn!(
+                            error = %cleanup_error,
+                            path = %target.path().display(),
+                            "VACUUM INTO final receipt changed and exact-reservation cleanup also failed"
+                        );
+                    }
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "VACUUM INTO candidate identity or content changed before success"
+                            .to_owned(),
+                    });
+                }
+                Err(error) => {
+                    if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                        tracing::warn!(
+                            error = %cleanup_error,
+                            path = %target.path().display(),
+                            "VACUUM INTO final receipt failed and exact-reservation cleanup also failed"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -112697,6 +112830,154 @@ mod tests {
             .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_vacuum_into_rejects_source_commit_between_receipt_and_hydration() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-source-race.db");
+        let target_path = dir.path().join("vacuum-into-source-race-output.db");
+        let source = source_path.to_string_lossy().into_owned();
+        let target = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+
+        let writer_path = source.clone();
+        *conn.vacuum_after_source_receipt_once.borrow_mut() = Some(Box::new(move || {
+            let writer = Connection::open(writer_path).unwrap();
+            writer
+                .execute("INSERT INTO items VALUES (3,'gamma');")
+                .unwrap();
+            writer.close().unwrap();
+        }));
+
+        let error = conn
+            .execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target.clone().into())],
+            )
+            .expect_err("a source generation change must reject VACUUM INTO");
+        assert!(
+            matches!(
+                error,
+                FrankenError::Busy | FrankenError::BusySnapshot { .. }
+            ),
+            "unexpected source receipt race error: {error}"
+        );
+        assert!(
+            !target_path.exists(),
+            "source receipt rejection must happen before output reservation"
+        );
+        conn.close().unwrap();
+
+        let source_oracle = rusqlite::Connection::open(&source_path).unwrap();
+        let values: Vec<String> = source_oracle
+            .prepare("SELECT value FROM items ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let integrity: String = source_oracle
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(values, ["alpha", "beta", "gamma"]);
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_vacuum_into_rejects_same_inode_write_after_validation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-target-race.db");
+        let target_path = dir.path().join("vacuum-into-target-race-output.db");
+        let source = source_path.to_string_lossy().into_owned();
+        let target = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+
+        let raced_target = target_path.clone();
+        *conn.vacuum_after_target_validation_once.borrow_mut() = Some(Box::new(move || {
+            let writer = rusqlite::Connection::open(raced_target).unwrap();
+            writer
+                .execute("INSERT INTO items VALUES (3,'intruder');", [])
+                .unwrap();
+        }));
+
+        let error = conn
+            .execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target.clone().into())],
+            )
+            .expect_err("a same-inode target write must reject VACUUM INTO");
+        assert!(
+            matches!(error, FrankenError::DatabaseCorrupt { .. }),
+            "unexpected target receipt race error: {error}"
+        );
+        assert!(
+            !target_path.exists(),
+            "a modified exact reservation must be removed after rejection"
+        );
+
+        let rows = conn.query("SELECT value FROM items ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn test_vacuum_into_preserves_post_validation_path_replacement() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-path-race.db");
+        let target_path = dir.path().join("vacuum-into-path-race-output.db");
+        let displaced_path = dir.path().join("vacuum-into-path-race-displaced.db");
+        let source = source_path.to_string_lossy().into_owned();
+        let target = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+
+        let raced_target = target_path.clone();
+        let raced_displaced = displaced_path.clone();
+        *conn.vacuum_after_target_validation_once.borrow_mut() = Some(Box::new(move || {
+            fsqlite_vfs::host_fs::rename(&raced_target, &raced_displaced).unwrap();
+            fsqlite_vfs::host_fs::write(&raced_target, b"replacement-sentinel").unwrap();
+        }));
+
+        conn.execute_with_params(
+            "VACUUM INTO ?1;",
+            &[SqliteValue::Text(target.clone().into())],
+        )
+        .expect_err("a post-validation path replacement must reject VACUUM INTO");
+        assert_eq!(
+            fsqlite_vfs::host_fs::read(&target_path).unwrap(),
+            b"replacement-sentinel",
+            "identity-bound cleanup must preserve the replacement path entry"
+        );
+        assert!(
+            displaced_path.exists(),
+            "identity drift must preserve the displaced reserved image"
+        );
+
+        let rows = conn.query("SELECT value FROM items ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
+        conn.close().unwrap();
     }
 
     #[test]
