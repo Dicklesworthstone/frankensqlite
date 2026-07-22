@@ -62508,7 +62508,36 @@ impl Connection {
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let mut reloaded = HashMap::new();
 
-        for (table_name, create_sql, _) in specs {
+        for (spec_index, (table_name, create_sql, _)) in specs.iter().enumerate() {
+            let has_reloadable_duplicate_fts5_schema_row = specs.iter().enumerate().any(
+                |(candidate_index, (candidate_name, candidate_sql, _))| {
+                    if candidate_index == spec_index
+                        || !candidate_name.eq_ignore_ascii_case(table_name)
+                    {
+                        return false;
+                    }
+                    let Ok(Statement::CreateVirtualTable(candidate_stmt)) =
+                        parse_single_statement(candidate_sql)
+                    else {
+                        return false;
+                    };
+                    if !candidate_stmt.module.eq_ignore_ascii_case("fts5") {
+                        return false;
+                    }
+                    match virtual_table_option_value(&candidate_stmt.args, "content") {
+                        Some(content_table) if content_table.is_empty() => true,
+                        Some(content_table) => schema
+                            .iter()
+                            .any(|candidate| candidate.name.eq_ignore_ascii_case(&content_table)),
+                        None => {
+                            let content_table_name = format!("{candidate_name}_content");
+                            schema.iter().any(|candidate| {
+                                candidate.name.eq_ignore_ascii_case(&content_table_name)
+                            })
+                        }
+                    }
+                },
+            );
             let table_key = table_name.to_ascii_uppercase();
             if preserve_existing_live_vtabs {
                 if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
@@ -62529,6 +62558,23 @@ impl Connection {
                 }
             };
             let module_key = create_stmt.module.to_ascii_uppercase();
+            if create_stmt.module.eq_ignore_ascii_case("fts5")
+                && has_reloadable_duplicate_fts5_schema_row
+                && virtual_table_option_value(&create_stmt.args, "content").is_none()
+            {
+                let content_table_name = format!("{table_name}_content");
+                if !schema
+                    .iter()
+                    .any(|candidate| candidate.name.eq_ignore_ascii_case(&content_table_name))
+                {
+                    tracing::debug!(
+                        table = %table_name,
+                        missing_shadow = %content_table_name,
+                        "skipping stale duplicate rootpage=0 FTS5 schema row during reload"
+                    );
+                    continue;
+                }
+            }
             let mut instance = {
                 let modules = self.vtab_modules.borrow();
                 let Some(factory) = modules.get(&module_key) else {
@@ -133000,6 +133046,48 @@ SELECT x FROM t;
                 || message.contains("docs_fts_content"),
             "unexpected reconnect error: {message}"
         );
+    }
+
+    #[test]
+    fn test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("duplicate_fts5_schema.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(
+                        title,
+                        body,
+                        content=''
+                    );
+                    PRAGMA writable_schema = ON;
+                    INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                    VALUES(
+                        'table',
+                        'docs_fts',
+                        'docs_fts',
+                        0,
+                        'CREATE VIRTUAL TABLE docs_fts USING fts5(title, body)'
+                    );
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str)
+            .expect("duplicate legacy FTS5 schema row should remain available for repair");
+        conn.execute("INSERT INTO docs_fts(rowid, title, body) VALUES(1, 'rust', 'repair');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'repair';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
     }
 
     #[test]
