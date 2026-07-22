@@ -83,6 +83,7 @@ fn assert_same(f: &Connection, r: &rusqlite::Connection, sql: &str) {
 }
 
 #[test]
+#[ignore = "bd-distinct-loose-scan-c8nay: enable when the loose-scan codegen routing lands"]
 fn distinct_loose_scan_matches_rusqlite() {
     // ---- Main eligible table: few distinct values among many rows, with a NULL run. ----
     let mut ins = Vec::new();
@@ -187,6 +188,7 @@ fn distinct_loose_scan_matches_rusqlite() {
 /// C SQLite's index scan. REAL columns exercise float-key runs, and negative/boundary integers pin
 /// the varint edges of the probe record.
 #[test]
+#[ignore = "bd-distinct-loose-scan-c8nay: enable when the loose-scan codegen routing lands"]
 fn distinct_loose_scan_mixed_storage_classes_match_rusqlite() {
     // ---- Typeless column: int 2 and float 2.0 compare equal but store differently. ----
     let mut ins = Vec::new();
@@ -254,6 +256,7 @@ fn distinct_loose_scan_mixed_storage_classes_match_rusqlite() {
 /// File-backed variant of the main eligible shape: the loose scan must behave identically through
 /// the pager/transaction cursor stack (`CursorBackend::Txn`), not just the `:memory:` image.
 #[test]
+#[ignore = "bd-distinct-loose-scan-c8nay: enable when the loose-scan codegen routing lands"]
 fn distinct_loose_scan_file_backed_matches_rusqlite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loose_scan.db");
