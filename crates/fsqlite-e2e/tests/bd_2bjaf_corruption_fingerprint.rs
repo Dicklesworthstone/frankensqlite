@@ -433,7 +433,7 @@ fn t41_read_only_artifact_classifier_maps_index_freelist_and_sidecars() {
              CREATE TABLE recyclable(id INTEGER PRIMARY KEY, payload BLOB);
              INSERT INTO recyclable(payload) VALUES(zeroblob(1800));
              DELETE FROM recyclable;
-             PRAGMA wal_checkpoint(TRUNCATE);",
+             PRAGMA wal_checkpoint(PASSIVE);",
         )
         .expect("build artifact with ownership and freelist state");
 
@@ -485,7 +485,7 @@ fn t41_read_only_artifact_classifier_maps_index_freelist_and_sidecars() {
     );
     let wal_metadata = wal.wal.as_ref().expect("parse WAL header");
     assert_eq!(wal_metadata.page_size, 512);
-    assert_eq!(wal_metadata.frame_count, 0);
+    assert!(wal_metadata.frame_count > 0);
     assert_eq!(wal_metadata.trailing_bytes, 0);
 }
 

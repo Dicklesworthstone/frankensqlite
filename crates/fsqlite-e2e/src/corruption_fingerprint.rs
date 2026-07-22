@@ -631,6 +631,9 @@ struct OwnershipBuilder {
     overflow_pages: BTreeSet<u32>,
 }
 
+type SchemaObjectCatalog = BTreeMap<String, (String, String, u32, String)>;
+type PageOwnerMap = BTreeMap<u32, Vec<String>>;
+
 fn read_u32_be(bytes: &[u8], offset: usize) -> Option<u32> {
     let value = bytes.get(offset..offset + 4)?;
     Some(u32::from_be_bytes(value.try_into().ok()?))
@@ -817,9 +820,7 @@ fn pointer_map_pages(page_size: u32, usable_size: u32, page_count: u32) -> BTree
     pages
 }
 
-fn schema_objects(
-    connection: &Connection,
-) -> Result<BTreeMap<String, (String, String, u32, String)>, rusqlite::Error> {
+fn schema_objects(connection: &Connection) -> Result<SchemaObjectCatalog, rusqlite::Error> {
     let mut statement = connection.prepare(
         "SELECT name,type,tbl_name,rootpage,coalesce(sql,'') FROM sqlite_schema \
          WHERE rootpage > 0 ORDER BY name",
@@ -837,8 +838,8 @@ fn schema_objects(
 
 fn collect_ownership(
     connection: &Connection,
-    schema: &BTreeMap<String, (String, String, u32, String)>,
-) -> Result<(Vec<BtreeOwnership>, BTreeMap<u32, Vec<String>>), rusqlite::Error> {
+    schema: &SchemaObjectCatalog,
+) -> Result<(Vec<BtreeOwnership>, PageOwnerMap), rusqlite::Error> {
     let mut builders = BTreeMap::<String, OwnershipBuilder>::new();
     builders.insert(
         "sqlite_schema".to_owned(),
@@ -973,7 +974,7 @@ fn incomparable_index(index_name: &str, table_name: &str, reason: String) -> Ind
 
 fn compare_target_index(
     connection: &Connection,
-    schema: &BTreeMap<String, (String, String, u32, String)>,
+    schema: &SchemaObjectCatalog,
     index_name: &str,
 ) -> Result<(IndexConsistency, BTreeSet<Vec<u8>>), rusqlite::Error> {
     let Some((object_type, table_name, _, _)) = schema.get(index_name) else {
@@ -1154,7 +1155,7 @@ fn probe_orphan_pages(
                     .any(|window| window == fragment.as_slice())
             })
             .take(16)
-            .map(|fragment| crate::bytes_to_lower_hex(fragment))
+            .map(crate::bytes_to_lower_hex)
             .collect();
         probes.push(OrphanPageProbe {
             page,
