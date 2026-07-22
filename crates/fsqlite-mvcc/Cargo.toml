@@ -35,6 +35,7 @@ smallvec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -46,6 +47,7 @@ criterion = { workspace = true }
 loom = "0.7.2"
 proptest = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]
@@ -53,4 +55,8 @@ workspace = true
 
 [[bench]]
 name = "mvcc_bench"
+harness = false
+
+[[bench]]
+name = "history_bisect_bench"
 harness = false

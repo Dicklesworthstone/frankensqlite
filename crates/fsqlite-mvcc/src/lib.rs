@@ -28,6 +28,8 @@ pub mod flat_combining;
 pub mod flat_combining_page_locks;
 pub mod gc;
 pub mod history_compression;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod history_sidecar;
 pub mod hot_witness_index;
 pub mod htm_fast_path;
 pub mod index_regen;
