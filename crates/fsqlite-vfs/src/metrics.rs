@@ -285,7 +285,7 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     }
 
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,
@@ -388,7 +388,7 @@ impl<F: VfsFile> TracingFile<F> {
         crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
     }
 }

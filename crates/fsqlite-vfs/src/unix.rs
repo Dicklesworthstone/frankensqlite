@@ -1975,7 +1975,7 @@ impl VfsFile for UnixFile {
     }
 
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,
@@ -2429,7 +2429,7 @@ impl UnixFile {
         crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
     }
 }
@@ -3857,7 +3857,7 @@ mod tests {
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("write_overflow.db");
 
-        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         let err = file.write(&cx, &[1, 2], u64::MAX).unwrap_err();
         assert_invalid_input_error(err, "offset overflow during unix vfs write");
     }

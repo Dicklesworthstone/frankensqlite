@@ -714,7 +714,7 @@ pub trait VfsFile: Send + Sync {
 
     /// Write `buf` starting at byte offset `offset`.
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,
@@ -726,7 +726,7 @@ pub trait VfsFile: Send + Sync {
     /// writes sequentially through [`Self::write`]. VFS backends may override
     /// this to amortize locking or syscall overhead for hot pager commit paths.
     fn write_page_batch<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         writes: &'a [(u64, &'a [u8])],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
@@ -947,7 +947,7 @@ mod tests {
             async fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
+            async fn write(&self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
@@ -1002,7 +1002,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1125,7 +1125,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1177,7 +1177,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -1213,7 +1213,7 @@ mod tests {
 
         WRITE_COUNT.store(0, Ordering::Relaxed);
         let cx = Cx::new();
-        let mut file = CountingFile;
+        let file = CountingFile;
         let data = [0u8; 4096];
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (4096, &data), (8192, &data)];
         poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
@@ -1259,7 +1259,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 panic!("write should not be called for empty batch");
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1293,7 +1293,7 @@ mod tests {
         }
 
         let cx = Cx::new();
-        let mut file = Stub;
+        let file = Stub;
         let writes: Vec<(u64, &[u8])> = vec![];
         poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
     }
@@ -1339,7 +1339,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n >= 1 {
                     return Err(fsqlite_error::FrankenError::Io(std::io::Error::other(
@@ -1380,7 +1380,7 @@ mod tests {
 
         CALL_COUNT.store(0, Ordering::Relaxed);
         let cx = Cx::new();
-        let mut file = FailOnSecond;
+        let file = FailOnSecond;
         let data = [0u8; 64];
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (64, &data), (128, &data)];
         let result = poll_ready(file.write_page_batch(&cx, &writes));
@@ -1402,7 +1402,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1491,7 +1491,7 @@ mod tests {
             async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            async fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1568,14 +1568,13 @@ mod tests {
         let flags = fsqlite_types::flags::VfsOpenFlags::MAIN_DB
             | fsqlite_types::flags::VfsOpenFlags::CREATE
             | fsqlite_types::flags::VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, None, flags).unwrap();
+        let (file, _) = vfs.open(&cx, None, flags).unwrap();
 
         let payload = b"hello async vfs";
         let waker = Waker::noop();
         let mut task_cx = Context::from_waker(waker);
         {
-            let mut write =
-                std::pin::pin!(<MemoryFile as VfsFile>::write(&mut file, &cx, payload, 0));
+            let mut write = std::pin::pin!(<MemoryFile as VfsFile>::write(&file, &cx, payload, 0));
             assert!(matches!(
                 write.as_mut().poll(&mut task_cx),
                 Poll::Ready(Ok(()))
@@ -1595,7 +1594,7 @@ mod tests {
         let writes: &[(u64, &[u8])] = &[(0, b"real"), (8, b"batch")];
         {
             let mut batch = std::pin::pin!(<MemoryFile as VfsFile>::write_page_batch(
-                &mut file, &cx, writes,
+                &file, &cx, writes,
             ));
             assert!(matches!(
                 batch.as_mut().poll(&mut task_cx),

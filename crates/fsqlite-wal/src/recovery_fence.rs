@@ -894,7 +894,8 @@ mod tests {
             }
         }
         let mut target = NoopTarget;
-        let barrier = execute_recovery_barrier(&cx, &mut target, &file, page_size, &lied_expected);
+        let barrier =
+            execute_recovery_barrier(&cx, &mut target, &file, page_size, &lied_expected).wait();
         assert!(
             matches!(barrier, Err(FrankenError::DatabaseCorrupt { .. })),
             "barrier must surface unrecoverable error on mismatch",

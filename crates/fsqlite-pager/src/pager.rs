@@ -2065,7 +2065,7 @@ fn mark_local_journal_header(header: &mut [u8]) {
     header[marker_start..marker_end].copy_from_slice(&LOCAL_JOURNAL_MARKER);
 }
 
-fn local_journal_marker_present<F: VfsFile>(
+async fn local_journal_marker_present<F: VfsFile>(
     cx: &Cx,
     journal_file: &F,
     padded_header_size: u64,
@@ -2078,7 +2078,7 @@ fn local_journal_marker_present<F: VfsFile>(
         return Ok(false);
     }
     let mut marker = [0_u8; LOCAL_JOURNAL_MARKER.len()];
-    let bytes_read = journal_file.read(cx, &mut marker, marker_start)?;
+    let bytes_read = journal_file.read(cx, &mut marker, marker_start).await?;
     if bytes_read != marker.len() {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -2096,17 +2096,19 @@ enum JournalInvalidation {
     Truncate,
 }
 
-fn durable_invalidate_journal<F: VfsFile>(
+async fn durable_invalidate_journal<F: VfsFile>(
     cx: &Cx,
     journal_file: &mut F,
     invalidation: JournalInvalidation,
 ) -> Result<()> {
     match invalidation {
         JournalInvalidation::ZeroMagic => {
-            journal_file.write(cx, &[0_u8; JOURNAL_MAGIC.len()], 0)?;
+            journal_file
+                .write(cx, &[0_u8; JOURNAL_MAGIC.len()], 0)
+                .await?;
             journal_file.durable_sync(cx, SyncKind::FullDurable)?;
             let mut observed = [0_u8; JOURNAL_MAGIC.len()];
-            let bytes_read = journal_file.read(cx, &mut observed, 0)?;
+            let bytes_read = journal_file.read(cx, &mut observed, 0).await?;
             if bytes_read != observed.len() || observed.iter().any(|byte| *byte != 0) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -2131,15 +2133,15 @@ fn durable_invalidate_journal<F: VfsFile>(
     Ok(())
 }
 
-fn durable_write_and_verify_journal_header<F: VfsFile>(
+async fn durable_write_and_verify_journal_header<F: VfsFile>(
     cx: &Cx,
     journal_file: &mut F,
     header: &[u8],
 ) -> Result<()> {
-    journal_file.write(cx, header, 0)?;
+    journal_file.write(cx, header, 0).await?;
     journal_file.durable_sync(cx, SyncKind::FullDurable)?;
     let mut observed = vec![0_u8; header.len()];
-    let bytes_read = journal_file.read(cx, &mut observed, 0)?;
+    let bytes_read = journal_file.read(cx, &mut observed, 0).await?;
     if bytes_read != header.len() || observed != header {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -2151,7 +2153,7 @@ fn durable_write_and_verify_journal_header<F: VfsFile>(
     Ok(())
 }
 
-fn classify_rollback_journal_prefix<F: VfsFile>(
+async fn classify_rollback_journal_prefix<F: VfsFile>(
     cx: &Cx,
     journal_file: &F,
 ) -> Result<(RollbackJournalPrefixState, u64)> {
@@ -2163,7 +2165,9 @@ fn classify_rollback_journal_prefix<F: VfsFile>(
     let prefix_len = usize::try_from(journal_size.min(JOURNAL_MAGIC.len() as u64))
         .expect("rollback-journal magic length fits usize");
     let mut prefix = [0_u8; JOURNAL_MAGIC.len()];
-    let bytes_read = journal_file.read(cx, &mut prefix[..prefix_len], 0)?;
+    let bytes_read = journal_file
+        .read(cx, &mut prefix[..prefix_len], 0)
+        .await?;
     if bytes_read != prefix_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -2326,7 +2330,7 @@ enum CommittedStateRefreshMode {
 
 impl<F: VfsFile> PagerInner<F> {
     /// Read a page through WAL (if present) → cache → disk and return an owned copy.
-    fn read_page_copy(
+    async fn read_page_copy(
         &mut self,
         cx: &Cx,
         cache: &ShardedPageCache,
@@ -2352,27 +2356,33 @@ impl<F: VfsFile> PagerInner<F> {
             return Ok(data);
         }
 
-        match cache.read_page_copy(cx, &mut self.db_file, page_no) {
+        match cache.read_page_copy(cx, &self.db_file, page_no).await {
             Ok(data) => Ok(data),
             Err(FrankenError::OutOfMemory) => {
                 if cache.evict_clean_any() {
-                    match cache.read_page_copy(cx, &mut self.db_file, page_no) {
-                        Err(FrankenError::OutOfMemory) => self.read_page_copy_uncached(cx, page_no),
+                    match cache.read_page_copy(cx, &self.db_file, page_no).await {
+                        Err(FrankenError::OutOfMemory) => {
+                            self.read_page_copy_uncached(cx, page_no).await
+                        }
                         result => result,
                     }
                 } else {
-                    self.read_page_copy_uncached(cx, page_no)
+                    self.read_page_copy_uncached(cx, page_no).await
                 }
             }
             Err(err) => Err(err),
         }
     }
 
-    fn read_page_copy_uncached(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+    async fn read_page_copy_uncached(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+    ) -> Result<Vec<u8>> {
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
         let mut out = vec![0_u8; page_size];
-        let bytes_read = self.db_file.read(cx, &mut out, offset)?;
+        let bytes_read = self.db_file.read(cx, &mut out, offset).await?;
         if bytes_read < page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2390,7 +2400,7 @@ impl<F: VfsFile> PagerInner<F> {
     /// This is used to refresh connection-local pager metadata after another
     /// connection has committed. The local cache may still reflect an older
     /// generation, so committed-state refresh must bypass it.
-    fn read_committed_page_copy(
+    async fn read_committed_page_copy(
         &self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
@@ -2411,7 +2421,7 @@ impl<F: VfsFile> PagerInner<F> {
         }
 
         let mut out = vec![0_u8; page_size];
-        let bytes_read = self.db_file.read(cx, &mut out, offset)?;
+        let bytes_read = self.db_file.read(cx, &mut out, offset).await?;
         if bytes_read < page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2425,7 +2435,7 @@ impl<F: VfsFile> PagerInner<F> {
 
     /// Read just the database header bytes directly from the main database
     /// file, bypassing WAL state.
-    fn read_database_file_header_bytes(
+    async fn read_database_file_header_bytes(
         &self,
         cx: &Cx,
         file_size: u64,
@@ -2435,7 +2445,7 @@ impl<F: VfsFile> PagerInner<F> {
         }
 
         let mut out = [0_u8; DATABASE_HEADER_SIZE];
-        let bytes_read = self.db_file.read(cx, &mut out, 0)?;
+        let bytes_read = self.db_file.read(cx, &mut out, 0).await?;
         if bytes_read < DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2452,7 +2462,7 @@ impl<F: VfsFile> PagerInner<F> {
     /// This is intentionally cheaper than a full committed-state refresh: it
     /// avoids page-1 materialization and freelist reconstruction unless the
     /// visible state actually changed.
-    fn probe_visible_commit_seq(
+    async fn probe_visible_commit_seq(
         &mut self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
@@ -2491,7 +2501,9 @@ impl<F: VfsFile> PagerInner<F> {
         let (base_commit_seq, raw_base_change_counter) = if cached_wal_base_is_current {
             (previous_base_commit_seq, self.committed_db_change_counter)
         } else {
-            let base_header_bytes = self.read_database_file_header_bytes(cx, file_size)?;
+            let base_header_bytes = self
+                .read_database_file_header_bytes(cx, file_size)
+                .await?;
             let raw_base_change_counter = if self.journal_mode == JournalMode::Wal {
                 match DatabaseHeader::from_bytes(&base_header_bytes) {
                     Ok(base_header) => base_header.change_counter,
@@ -2583,7 +2595,7 @@ impl<F: VfsFile> PagerInner<F> {
     /// Reports whether WAL snapshot setup was performed during the refresh and
     /// whether the durable identity change invalidated cached page/publication
     /// entries.
-    fn refresh_committed_state(
+    async fn refresh_committed_state(
         &mut self,
         cx: &Cx,
         cache: &ShardedPageCache,
@@ -2595,9 +2607,10 @@ impl<F: VfsFile> PagerInner<F> {
             wal_backend,
             CommittedStateRefreshMode::Normal,
         )
+        .await
     }
 
-    fn refresh_committed_state_after_recovery(
+    async fn refresh_committed_state_after_recovery(
         &mut self,
         cx: &Cx,
         cache: &ShardedPageCache,
@@ -2609,9 +2622,10 @@ impl<F: VfsFile> PagerInner<F> {
             wal_backend,
             CommittedStateRefreshMode::PostRecovery,
         )
+        .await
     }
 
-    fn refresh_committed_state_with_mode(
+    async fn refresh_committed_state_with_mode(
         &mut self,
         cx: &Cx,
         cache: &ShardedPageCache,
@@ -2622,7 +2636,7 @@ impl<F: VfsFile> PagerInner<F> {
         let previous_committed_wal_generation = self.committed_wal_generation;
         let previous_committed_wal_visible_commit_count = self.committed_wal_visible_commit_count;
         let (new_commit_seq, current_file_size, wal_snapshot_initialized, durable_identity_changed) =
-            self.probe_visible_commit_seq(cx, wal_backend)?;
+            self.probe_visible_commit_seq(cx, wal_backend).await?;
         if mode == CommittedStateRefreshMode::Normal
             && new_commit_seq == self.commit_seq
             && current_file_size == self.committed_db_file_size_bytes
@@ -2638,8 +2652,10 @@ impl<F: VfsFile> PagerInner<F> {
         // full materialization below fails, restore that identity so a retry
         // still observes the same durable composition change and refreshes
         // instead of treating the failed probe as already accepted.
-        let full_refresh_result = (|| -> Result<(u32, Vec<PageNumber>)> {
-            let page1 = self.read_committed_page_copy(cx, wal_backend, PageNumber::ONE)?;
+        let full_refresh_result = (async {
+            let page1 = self
+                .read_committed_page_copy(cx, wal_backend, PageNumber::ONE)
+                .await?;
             if page1.len() < DATABASE_HEADER_SIZE {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -2689,10 +2705,12 @@ impl<F: VfsFile> PagerInner<F> {
                     db_size,
                     header.freelist_trunk,
                     header.freelist_count,
-                )?
+                )
+                .await?
             };
             Ok((db_size, freelist))
-        })();
+        })
+        .await;
         let (db_size, freelist) = match full_refresh_result {
             Ok(refreshed) => refreshed,
             Err(err) => {
@@ -2746,10 +2764,10 @@ impl<F: VfsFile> PagerInner<F> {
     /// consult it without taking the pager metadata mutex. Dirty pages are
     /// staged in the transaction write-set and admitted into the cache only
     /// after commit succeeds.
-    fn flush_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+    async fn flush_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
-        self.db_file.write(cx, data, offset)?;
+        self.db_file.write(cx, data, offset).await?;
         Ok(())
     }
 }
@@ -2833,7 +2851,7 @@ fn return_pages_to_freelist(
     }
 }
 
-fn load_freelist_from_disk<F: VfsFile>(
+async fn load_freelist_from_disk<F: VfsFile>(
     cx: &Cx,
     db_file: &F,
     page_size: PageSize,
@@ -2870,7 +2888,7 @@ fn load_freelist_from_disk<F: VfsFile>(
 
         let mut buf = vec![0u8; ps];
         let offset = u64::from(trunk.saturating_sub(1)) * ps as u64;
-        let bytes_read = db_file.read(cx, &mut buf, offset)?;
+        let bytes_read = db_file.read(cx, &mut buf, offset).await?;
         if bytes_read < ps {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2916,7 +2934,7 @@ fn load_freelist_from_disk<F: VfsFile>(
     Ok(normalize_freelist(&out, db_size))
 }
 
-fn load_freelist_from_committed_state<F: VfsFile>(
+async fn load_freelist_from_committed_state<F: VfsFile>(
     cx: &Cx,
     inner: &PagerInner<F>,
     wal_backend: &SharedWalBackend,
@@ -2951,7 +2969,9 @@ fn load_freelist_from_committed_state<F: VfsFile>(
         })?;
         out.push(trunk_page);
 
-        let buf = inner.read_committed_page_copy(cx, wal_backend, trunk_page)?;
+        let buf = inner
+            .read_committed_page_copy(cx, wal_backend, trunk_page)
+            .await?;
         if buf.len() < ps {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2997,7 +3017,7 @@ fn load_freelist_from_committed_state<F: VfsFile>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
+async fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
     cache: &ShardedPageCache,
@@ -3085,7 +3105,8 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
         }
     }
 
-    let mut page1 = ensure_page_one_in_write_set(cx, inner, cache, wal_backend, pool, write_set)?;
+    let mut page1 =
+        ensure_page_one_in_write_set(cx, inner, cache, wal_backend, pool, write_set).await?;
 
     {
         let page1_bytes = page1.as_page_bytes_mut();
@@ -3097,7 +3118,7 @@ fn serialize_freelist_to_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     Ok(())
 }
 
-fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
+async fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
     cache: &ShardedPageCache,
@@ -3115,7 +3136,9 @@ fn ensure_page_one_in_write_set<F: VfsFile, S: std::hash::BuildHasher>(
             .expect("page one remained staged after successful detach"));
     }
 
-    let page1_vec = inner.read_page_copy(cx, cache, wal_backend, PageNumber::ONE)?;
+    let page1_vec = inner
+        .read_page_copy(cx, cache, wal_backend, PageNumber::ONE)
+        .await?;
     Ok(StagedPage::from_page_data(PageData::from_vec(page1_vec)))
 }
 

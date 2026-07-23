@@ -13,6 +13,8 @@
 //! - **Open (user-implementable):** `Vfs`, `VfsFile` (in `fsqlite-vfs`)
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::pager::SimpleTransaction;
 use fsqlite_error::{FrankenError, Result};
@@ -146,13 +148,15 @@ impl WalPublicationSnapshot {
 ///
 /// The pager calls into this trait during WAL-mode commits and page lookups
 /// instead of writing a rollback journal.
+pub type WalFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 pub trait WalBackend: Send + Sync {
     /// Prepare WAL state for a newly-started transaction.
     ///
     /// Implementations may refresh internal snapshot metadata so reads during
     /// this transaction see a coherent view without per-page refresh costs.
-    fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
-        Ok(())
+    fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     /// Capture the currently published WAL visibility summary for this handle.
@@ -178,8 +182,11 @@ pub trait WalBackend: Send + Sync {
     ///
     /// The default implementation reports the current published snapshot
     /// unchanged.
-    fn refresh_published_snapshot(&mut self, _cx: &Cx) -> Result<Option<WalPublicationSnapshot>> {
-        Ok(self.published_snapshot())
+    fn refresh_published_snapshot<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> WalFuture<'a, Option<WalPublicationSnapshot>> {
+        Box::pin(async { Ok(self.published_snapshot()) })
     }
 
     /// Append a single frame to the WAL.
@@ -188,28 +195,35 @@ pub trait WalBackend: Send + Sync {
     /// `page_data` must be exactly `page_size` bytes.
     /// `db_size_if_commit` is the database size in pages for commit frames,
     /// or 0 for non-commit frames.
-    fn append_frame(
-        &mut self,
-        cx: &Cx,
+    fn append_frame<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_number: u32,
-        page_data: &[u8],
+        page_data: &'a [u8],
         db_size_if_commit: u32,
-    ) -> Result<()>;
+    ) -> WalFuture<'a, ()>;
 
     /// Append a batch of frames to the WAL.
     ///
     /// The default path preserves existing behavior by delegating to
     /// [`Self::append_frame`] one frame at a time.
-    fn append_frames(&mut self, cx: &Cx, frames: &[WalFrameRef<'_>]) -> Result<()> {
-        for frame in frames {
-            self.append_frame(
-                cx,
-                frame.page_number,
-                frame.page_data,
-                frame.db_size_if_commit,
-            )?;
-        }
-        Ok(())
+    fn append_frames<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        frames: &'a [WalFrameRef<'a>],
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            for frame in frames {
+                self.append_frame(
+                    cx,
+                    frame.page_number,
+                    frame.page_data,
+                    frame.db_size_if_commit,
+                )
+                .await?;
+            }
+            Ok(())
+        })
     }
 
     /// Prepare a batch of frames for a later append.
@@ -243,13 +257,15 @@ pub trait WalBackend: Send + Sync {
     /// The default path rebuilds borrowed frame refs and delegates back to
     /// [`Self::append_frames`]. Backends that can preserve more pre-serialized
     /// state should override this.
-    fn append_prepared_frames(
-        &mut self,
-        cx: &Cx,
-        prepared: &mut PreparedWalFrameBatch,
-    ) -> Result<()> {
-        let frame_refs = prepared.frame_refs();
-        self.append_frames(cx, &frame_refs)
+    fn append_prepared_frames<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        prepared: &'a mut PreparedWalFrameBatch,
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            let frame_refs = prepared.frame_refs();
+            self.append_frames(cx, &frame_refs).await
+        })
     }
 
     /// Append the certificate proof that authorizes the next WAL frame

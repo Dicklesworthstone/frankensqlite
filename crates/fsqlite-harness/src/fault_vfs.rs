@@ -637,7 +637,7 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     }
 
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,

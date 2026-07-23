@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::Path;
 
 use fsqlite_types::cx::Cx;
@@ -87,6 +88,14 @@ fn test_cx() -> Cx {
     Cx::default()
 }
 
+fn block_on_test<F: Future>(future: F) -> F::Output {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("test runtime should build");
+    runtime.block_on(future)
+}
+
 fn page_size_usize() -> usize {
     usize::try_from(PAGE_SIZE).expect("PAGE_SIZE fits usize")
 }
@@ -126,14 +135,15 @@ fn open_wal_file(vfs: &MemoryVfs, cx: &Cx) -> <MemoryVfs as Vfs>::File {
 
 fn write_fixture_wal(vfs: &MemoryVfs, cx: &Cx, seed: u64) {
     let file = open_wal_file(vfs, cx);
-    let mut wal = WalFile::create(cx, file, PAGE_SIZE, 0, test_salts(seed)).expect("create wal");
+    let mut wal = block_on_test(WalFile::create(cx, file, PAGE_SIZE, 0, test_salts(seed)))
+        .expect("create wal");
     for (page_number, db_size, marker) in FRAME_LAYOUT {
-        wal.append_frame(
+        block_on_test(wal.append_frame(
             cx,
             page_number,
             &sample_page(seed, page_number, marker),
             db_size,
-        )
+        ))
         .expect("append frame");
     }
     wal.close(cx).expect("close wal");
@@ -202,7 +212,8 @@ fn validate_recovered_prefix(
 
     let mut digest_input = Vec::new();
     for (index, frame_layout) in FRAME_LAYOUT.iter().enumerate().take(frame_count) {
-        let (header, data) = wal.read_frame(cx, index).expect("read recovered frame");
+        let (header, data) =
+            block_on_test(wal.read_frame(cx, index)).expect("read recovered frame");
         assert_eq!(
             header.page_number, frame_layout.0,
             "scenario {} page number mismatch at frame {}",
@@ -241,7 +252,8 @@ fn run_scenario(spec: ScenarioSpec) {
 
     for attempt_index in 0..RESTART_ATTEMPTS {
         let file = open_wal_file(&vfs, &cx);
-        let mut wal = WalFile::open(&cx, file).expect("open wal for crash-loop replay");
+        let mut wal =
+            block_on_test(WalFile::open(&cx, file)).expect("open wal for crash-loop replay");
         let (committed_frames, last_commit, digest) =
             validate_recovered_prefix(spec, &mut wal, &cx);
         wal.close(&cx).expect("close wal after replay validation");

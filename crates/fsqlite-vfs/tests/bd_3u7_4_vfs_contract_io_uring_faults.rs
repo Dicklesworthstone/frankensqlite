@@ -375,7 +375,7 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
     }
 
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,

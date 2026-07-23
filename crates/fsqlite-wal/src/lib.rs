@@ -80,20 +80,6 @@ pub(crate) mod test_support {
             block_on(self).expect_err(message)
         }
 
-        fn unwrap(self) -> T
-        where
-            E: Debug,
-        {
-            block_on(self).unwrap()
-        }
-
-        fn unwrap_err(self) -> E
-        where
-            T: Debug,
-        {
-            block_on(self).unwrap_err()
-        }
-
         fn is_ok(self) -> bool {
             block_on(self).is_ok()
         }

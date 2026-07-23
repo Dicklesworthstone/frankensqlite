@@ -856,7 +856,7 @@ impl VfsFile for MemoryFile {
 
     #[allow(clippy::significant_drop_tightening)]
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,
@@ -871,7 +871,7 @@ impl VfsFile for MemoryFile {
 
     #[allow(clippy::significant_drop_tightening)]
     fn write_page_batch<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         writes: &'a [(u64, &'a [u8])],
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
@@ -1133,11 +1133,11 @@ impl MemoryFile {
         crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
     }
 
-    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+    fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
         crate::block_on_test_io(cx, <Self as VfsFile>::write_page_batch(self, cx, writes))
     }
 }
@@ -1158,7 +1158,7 @@ mod tests {
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         file.write(&cx, b"hello", 0).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 5);
@@ -1180,7 +1180,7 @@ mod tests {
             .map(|idx| u8::try_from(idx % 251).expect("mod value must fit in u8"))
             .collect::<Vec<_>>();
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file.write(&cx, &payload, 0).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), payload.len() as u64);
 
@@ -1197,7 +1197,7 @@ mod tests {
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file.write(&cx, b"hi", 0).unwrap();
 
         let mut buf = [0xFFu8; 10];
@@ -1228,7 +1228,7 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
         file.write(&cx, b"world", 10).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 15);
@@ -1358,7 +1358,7 @@ mod tests {
         let path = Path::new("shared.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file1.write(&cx, b"shared data", 0).unwrap();
 
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
@@ -1413,7 +1413,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
         file.write(&cx, b"AAAAAAAAAA", 0).unwrap();
         file.write(&cx, b"BB", 3).unwrap();
@@ -1460,7 +1460,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("pages.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("pages.db")), flags).unwrap();
 
         let page1 = vec![0xAA_u8; 4096];
         let page2 = vec![0xBB_u8; 4096];
@@ -1484,7 +1484,7 @@ mod tests {
         let vfs2 = vfs1.clone();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs1.open(&cx, Some(Path::new("shared.db")), flags).unwrap();
+        let (file, _) = vfs1.open(&cx, Some(Path::new("shared.db")), flags).unwrap();
         file.write(&cx, b"from vfs1", 0).unwrap();
 
         // vfs2 should see the same file since they share inner state.
@@ -1503,7 +1503,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("zero.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("zero.db")), flags).unwrap();
 
         file.write(&cx, b"abc", 0).unwrap();
         file.write(&cx, b"", 0).unwrap(); // zero-length write
@@ -1519,7 +1519,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("overflow_offset.db")), flags)
             .unwrap();
 
@@ -1546,7 +1546,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("batch_overflow_offset.db")), flags)
             .unwrap();
 
@@ -1561,7 +1561,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("rz.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("rz.db")), flags).unwrap();
 
         file.write(&cx, b"data", 0).unwrap();
         let mut buf = [];
@@ -1574,7 +1574,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("end.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("end.db")), flags).unwrap();
 
         file.write(&cx, b"12345", 0).unwrap();
         let mut buf = [0xFFu8; 4];
@@ -1990,7 +1990,7 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("acc.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("acc.db")), flags).unwrap();
         file.write(&cx, b"test", 0).unwrap();
 
         // MemoryVfs always returns true for access if file exists.
@@ -2029,9 +2029,9 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut f1, _) = vfs.open(&cx, None, flags).unwrap();
-        let (mut f2, _) = vfs.open(&cx, None, flags).unwrap();
-        let (mut f3, _) = vfs.open(&cx, None, flags).unwrap();
+        let (f1, _) = vfs.open(&cx, None, flags).unwrap();
+        let (f2, _) = vfs.open(&cx, None, flags).unwrap();
+        let (f3, _) = vfs.open(&cx, None, flags).unwrap();
 
         f1.write(&cx, b"one", 0).unwrap();
         f2.write(&cx, b"two", 0).unwrap();
@@ -2069,12 +2069,12 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut f1, _) = vfs.open(&cx, Some(Path::new("conc.db")), flags).unwrap();
+        let (f1, _) = vfs.open(&cx, Some(Path::new("conc.db")), flags).unwrap();
         f1.write(&cx, b"AAAA", 0).unwrap();
 
         // Open a second handle to the same file.
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut f2, _) = vfs
+        let (f2, _) = vfs
             .open(&cx, Some(Path::new("conc.db")), open_flags)
             .unwrap();
         f2.write(&cx, b"BB", 1).unwrap();
@@ -2148,7 +2148,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("batch_write.db")), flags)
             .unwrap();
 
@@ -2248,7 +2248,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("batch_write.db")), flags)
             .unwrap();
 
@@ -2382,7 +2382,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("overwrite.db")), flags)
             .unwrap();
 
@@ -2506,7 +2506,7 @@ mod tests {
         let vfs = make_vfs();
         let path = Path::new("read_eof.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         file.write(&cx, &[0xCC; 10], 0).unwrap();
 
@@ -2534,7 +2534,7 @@ mod tests {
         let vfs = make_vfs();
         let path = Path::new("sparse.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         file.write(&cx, &[0xDD; 4], 100).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 104);
@@ -2556,7 +2556,7 @@ mod tests {
         let path = Path::new("shared.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
         f1.write(&cx, &[0x11; 16], 0).unwrap();
 
         let (f2, _) = vfs.open(&cx, Some(path), flags).unwrap();

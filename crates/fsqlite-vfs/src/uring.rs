@@ -949,7 +949,7 @@ impl VfsFile for IoUringFile {
     }
 
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,
@@ -1135,7 +1135,7 @@ impl IoUringFile {
         Ok(total)
     }
 
-    async fn write_data_path(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    async fn write_data_path(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         if buf.is_empty() {
             return Ok(());
@@ -1446,7 +1446,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("uring_metrics.db");
 
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
         block_on_test(&cx, file.write(&cx, b"metrics", 0)).expect("write should succeed");
@@ -1493,7 +1493,7 @@ mod tests {
 
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("shared_ring_100_reads.db");
-            let (mut file, _) = vfs
+            let (file, _) = vfs
                 .open(&cx, Some(&path), open_flags_create_unlocked())
                 .expect("open should succeed");
             let mut seeded = vec![0_u8; READ_COUNT * READ_SIZE];
@@ -1640,7 +1640,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("uring_disabled_runtime_metrics.db");
 
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed via unix fallback");
         block_on_test(&cx, file.write(&cx, b"fallback-metrics", 0))
@@ -1752,7 +1752,7 @@ mod tests {
             | VfsOpenFlags::CREATE
             | VfsOpenFlags::READWRITE
             | VfsOpenFlags::DELETEONCLOSE;
-        let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp file");
+        let (file, _) = vfs.open(&cx, None, flags).expect("open temp file");
 
         block_on_test(&cx, file.write(&cx, b"temp data", 0))
             .expect("write should fall back without disabling runtime");
@@ -1789,7 +1789,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("main_db_direct_unix.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open should succeed");
 
@@ -1836,7 +1836,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("main.db-wal");
         let wal_flags = VfsOpenFlags::WAL | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), wal_flags)
             .expect("open should succeed");
 
@@ -1881,7 +1881,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_abort_propagation.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
@@ -1995,7 +1995,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_init_failure.db");
 
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed via unix fallback");
 
@@ -2031,7 +2031,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_write_failure.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
@@ -2060,7 +2060,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_read_failure.db");
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 

@@ -25,7 +25,7 @@ impl VfsFile for DemoFile {
         async { Ok(0) }
     }
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         _cx: &'a Cx,
         _buf: &'a [u8],
         _offset: u64,

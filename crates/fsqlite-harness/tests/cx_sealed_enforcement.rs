@@ -68,7 +68,7 @@ fn test_cx_param_audit_vfs_traits() {
     async fn _read<F: VfsFile>(f: &F, cx: &Cx, buf: &mut [u8], off: u64) -> Result<usize> {
         f.read(cx, buf, off).await
     }
-    async fn _write<F: VfsFile>(f: &mut F, cx: &Cx, buf: &[u8], off: u64) -> Result<()> {
+    async fn _write<F: VfsFile>(f: &F, cx: &Cx, buf: &[u8], off: u64) -> Result<()> {
         f.write(cx, buf, off).await
     }
     fn _truncate<F: VfsFile>(f: &mut F, cx: &Cx, size: u64) -> Result<()> {
@@ -293,7 +293,7 @@ impl VfsFile for DummyFile {
         async { Ok(0) }
     }
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         _cx: &'a Cx,
         _buf: &'a [u8],
         _offset: u64,
@@ -628,7 +628,7 @@ impl RecordingVfs {
 struct RecordingFile {
     log: RecordingLog,
     fail_write: bool,
-    bytes: Vec<u8>,
+    bytes: Mutex<Vec<u8>>,
 }
 
 impl Vfs for RecordingVfs {
@@ -652,7 +652,7 @@ impl Vfs for RecordingVfs {
             RecordingFile {
                 log: self.log.clone(),
                 fail_write: self.fail_write,
-                bytes: Vec::new(),
+                bytes: Mutex::new(Vec::new()),
             },
             flags,
         ))
@@ -688,12 +688,16 @@ impl VfsFile for RecordingFile {
     ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
         async move {
             self.log.push(format!("read:{offset}:{}", buf.len()));
+            let bytes = self
+                .bytes
+                .lock()
+                .expect("recording file bytes mutex must not be poisoned");
             let start = usize::try_from(offset).expect("offset must fit usize");
-            if start >= self.bytes.len() {
+            if start >= bytes.len() {
                 buf.fill(0);
                 return Ok(0);
             }
-            let available = &self.bytes[start..];
+            let available = &bytes[start..];
             let n = available.len().min(buf.len());
             buf[..n].copy_from_slice(&available[..n]);
             if n < buf.len() {
@@ -704,7 +708,7 @@ impl VfsFile for RecordingFile {
     }
 
     fn write<'a>(
-        &'a mut self,
+        &'a self,
         _cx: &'a Cx,
         buf: &'a [u8],
         offset: u64,
@@ -714,12 +718,16 @@ impl VfsFile for RecordingFile {
             if self.fail_write {
                 return Err(FrankenError::Unsupported);
             }
+            let mut bytes = self
+                .bytes
+                .lock()
+                .expect("recording file bytes mutex must not be poisoned");
             let start = usize::try_from(offset).expect("offset must fit usize");
             let end = start + buf.len();
-            if end > self.bytes.len() {
-                self.bytes.resize(end, 0);
+            if end > bytes.len() {
+                bytes.resize(end, 0);
             }
-            self.bytes[start..end].copy_from_slice(buf);
+            bytes[start..end].copy_from_slice(buf);
             Ok(())
         }
     }
@@ -727,7 +735,10 @@ impl VfsFile for RecordingFile {
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
         self.log.push(format!("truncate:{size}"));
         let new_len = usize::try_from(size).expect("size must fit usize");
-        self.bytes.truncate(new_len);
+        self.bytes
+            .lock()
+            .expect("recording file bytes mutex must not be poisoned")
+            .truncate(new_len);
         Ok(())
     }
 
@@ -737,7 +748,11 @@ impl VfsFile for RecordingFile {
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {
-        Ok(self.bytes.len() as u64)
+        Ok(self
+            .bytes
+            .lock()
+            .expect("recording file bytes mutex must not be poisoned")
+            .len() as u64)
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
