@@ -19732,3 +19732,64 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   below `5%`, at least `10%` median improvement on 100/5, no 1K/10K DELETE
   regression, and a same-window full-quick primary score and C-faster count no
   worse than control.
+
+## 2026-07-22 - REJECT + BLOCKER: thresholded borrowed flush for large owned INSERT page runs
+
+- Target: the worst stable, unowned INSERT frontier exposed by
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`:
+  `INSERT Throughput / Single Transaction / large_10col / 10000 rows` at
+  `9.789121 ms` versus C SQLite `8.664812 ms` (`1.129756x`, C/F CV
+  `0.628%/2.498%`). The adjacent record-size comparison was `9.751029 ms`
+  versus `8.532303 ms` (`1.142837x`) but its FSQLite CV was `5.605%`, so it
+  was a routing/profile row rather than an admissible KEEP baseline.
+- Negative-evidence review found the prior broad eager restore-clone removal
+  and owned-record borrowed-flush attempts CLOSED because large-row gains did
+  not survive the comprehensive matrix. Their retry predicate was newly met
+  only narrowly: this candidate activated exclusively for owned runs of at
+  least 4096 records, leaving small-row, write-single, and concurrent shapes
+  on the unchanged path. `sql_pipeline_candidate_preflight` for operation
+  `large_owned_page_run_borrowed_flush_threshold`, benchmark
+  `comprehensive-bench-insert-large-10col-10000`, and source surface
+  `flush_taken_pending_direct_insert_page_run_with_cursor` returned `allowed`
+  with zero matched no-retry records before editing.
+- Profile-first evidence on release-perf `hz1` showed the exact 10K row owned
+  run flushing once: `direct_insert=10000`, `fast=10000`, `slow=0`, one owned
+  page run containing 10,000 records / 7,218,308 bytes, direct flush
+  `2.609098 ms`, commit roundtrip `2.486255 ms`, and no arena/repeated run.
+  The candidate changed only `crates/fsqlite-core/src/connection.rs`: borrow
+  that large owned run through the existing empty-root/depth-2/fallback flush
+  sequence and avoid cloning it solely for error restoration. The original
+  run was still restored on error. Source was manually restored after the
+  rejection.
+- Same-worker release-perf A/B on `hz1` used identical candidate source and a
+  runtime disable control. On the 10K single-transaction row, control C/F was
+  `12.035619/11.858405 ms`, ratio `0.985276`, CV `1.636%/5.626%`; candidate
+  C/F was `12.211324/11.779788 ms`, ratio `0.964661`, CV
+  `19.528%/26.268%`. The FSQLite median moved only `0.663%`, below the
+  comparator/control drift, while candidate variance failed the mandatory
+  `<5%` gate by more than 5x. The record-size row was also inadmissible:
+  control C/F `14.400164/12.516506 ms` with CV `14.446%/7.783%`, candidate
+  `12.242411/11.834763 ms` with CV `18.738%/25.116%`. A further null arm was
+  not promoted into KEEP evidence because both candidate rows and the control
+  rows had already failed the stability gate; no performance claim is made.
+- Correctness evidence was likewise not admitted: the focused remote
+  release-perf page-run test compiled the edited crate but RCH failed closed
+  after its 1,800-second `ovh-a` SSH timeout (`RCH-E104`), with no local
+  fallback. Result: rejected and fully unwound. Do not retry threshold-only
+  borrowed flush or restore-clone elision. Reconsider only with a different
+  end-to-end ownership representation that profile-attributably removes at
+  least 10% of the large-row INSERT envelope (not just the error clone), plus
+  an interleaved same-worker candidate/control/null run where every C and
+  FSQLite CV is below 5%, at least 10% FSQLite median improvement remains
+  after null drift, the focused error-restoration/conformance test completes,
+  and the same-window full quick matrix is neutral or better.
+- Immediate next-lever routing did not reopen the packed/slab page-run family.
+  The ledger's 2026-05-10 fused empty-root page-builder rejection already
+  tested retaining large rows without one owned `Vec<u8>` each and made its
+  retry predicate a true fused record/body/page builder that removes both row
+  construction and page layout. A standalone packed record slab does not meet
+  that predicate, so no second source edit was made. The active measurement
+  blocker is explicit: the available same-worker window failed the CV gate and
+  the independent remote correctness worker timed out. Resume in a quiescent
+  remote window satisfying the predicate above, then choose a different alien
+  primitive if the ownership representation still lacks profile attribution.
