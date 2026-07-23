@@ -1171,6 +1171,13 @@ impl UnixFile {
             .expect("open UnixFile must retain its canonical descriptor")
     }
 
+    pub(crate) fn canonical_file(&self) -> Result<Arc<File>> {
+        self.file
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))
+    }
+
     fn inode_info_ref(&self) -> &Arc<Mutex<InodeInfo>> {
         self.inode_info
             .as_ref()
