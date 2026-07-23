@@ -108,3 +108,77 @@ fn composite_prefix_range_residual_matches_sqlite() {
         "residual `c = 1` must decline the seek (fall to a scan that enforces c)"
     );
 }
+
+/// bd-bn45n: a PURE range on the LEADING key term of a composite-only index (`WHERE a <range>` on
+/// `index(a, b)`, no equality prefix and no single-column index on `a`) must SEEK the composite index
+/// (SeekGE + range-bounded walk, no IdxGT) instead of falling all the way back to a full table scan.
+/// Byte-identical to C SQLite (compared as a sorted set — no ORDER BY, so emission order is
+/// implementation-defined). Residual predicates on non-key columns still decline to a scan.
+#[test]
+fn composite_pure_leading_range_matches_sqlite() {
+    let f = Connection::open(":memory:").expect("frank");
+    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+    for stmt in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+        "CREATE INDEX idx_ab ON t(a, b);",
+    ] {
+        f.execute(stmt).unwrap();
+        r.execute_batch(stmt).unwrap();
+    }
+    for i in 1..=3000_i64 {
+        // A NULL run in `a` (NULLs must be excluded by any `a <range>`, matching C SQLite).
+        let a = if i % 47 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 12).to_string()
+        };
+        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {}, {});", i % 25, i % 4);
+        f.execute(&stmt).unwrap();
+        r.execute_batch(&stmt).unwrap();
+    }
+    let cmp = |sql: &str| {
+        let mut a = frank_rows(&f, sql);
+        let mut b = sqlite_rows(&r, sql);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "diverged: `{sql}`");
+    };
+    for sql in [
+        // Every bound flavour on the leading term.
+        "SELECT id FROM t WHERE a < 5",
+        "SELECT id FROM t WHERE a <= 4",
+        "SELECT id FROM t WHERE a > 3",
+        "SELECT id FROM t WHERE a >= 7",
+        "SELECT id FROM t WHERE a BETWEEN 2 AND 8",
+        "SELECT id FROM t WHERE a > 2 AND a < 9",
+        // Covering output (a, b are both in the index).
+        "SELECT a, b FROM t WHERE a < 5",
+        // Non-covering output (c requires a table lookup).
+        "SELECT id, c FROM t WHERE a >= 6",
+        // Residual on a non-key column must NOT be dropped (falls to a scan enforcing c).
+        "SELECT id FROM t WHERE a < 5 AND c = 1",
+    ] {
+        cmp(sql);
+    }
+
+    let has_op = |sql: &str, want: &str| {
+        f.query(&format!("EXPLAIN {sql}")).unwrap().iter().any(
+            |row| matches!(row.values().get(1), Some(SqliteValue::Text(op)) if op.to_string() == want),
+        )
+    };
+    // The pure leading range must now SEEK the composite index (SeekGE), not full-scan.
+    assert!(
+        has_op("SELECT id FROM t WHERE a < 5", "SeekGE"),
+        "pure leading range `a < 5` must seek idx_ab (SeekGE), not full-scan"
+    );
+    // Empty-prefix seek uses no prefix IdxGT (range bounds terminate the walk).
+    assert!(
+        !has_op("SELECT id FROM t WHERE a < 5", "IdxGT"),
+        "empty-prefix leading-range seek must not emit a prefix IdxGT"
+    );
+    // A residual on a non-key column must still decline to a scan (residual safety).
+    assert!(
+        !has_op("SELECT id FROM t WHERE a < 5 AND c = 1", "SeekGE"),
+        "residual `c = 1` must decline the leading-range seek"
+    );
+}

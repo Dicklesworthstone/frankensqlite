@@ -20050,3 +20050,53 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   SELECT DISTINCT a, b`.
 - Preflight DistinctLooseScanCompositeIndex=allowed (same lane). Files:
   codegen.rs, distinct_loose_scan_oracle.rs. See bd-azfqc.
+
+## 2026-07-23 - KEEP (conformance-gated): pure range on the LEADING term of a composite-only index now SEEKS instead of full-scanning (bd-bn45n)
+
+- Result type: full-scan -> index-seek KEEP. `WHERE a <range>` (pure range on
+  the leading key term, no equality prefix) over a composite-only `index(a, …)`
+  (no single-column `index(a)`) previously fell all the way back to a full table
+  scan; it now uses the composite index prefix-range seek. Equality
+  (`WHERE a = x`) already index-seeked — this closes the range gap.
+- EVIDENCE of the gap (EXPLAIN probe, idx_ab(a,b) only): `WHERE a < 5` emitted
+  `Init,Transaction,OpenRead,Rewind,Column,…,Ge,…,Next` — a full table scan (no
+  index OpenRead/SeekGE); `WHERE a = 5` emitted `MakeRecord,OpenRead,SeekGE,
+  IdxGT,IdxRowid` — an index seek. Root cause: the single-column range fast path
+  gates on `key_term_count()==1` (declines composite) AND
+  `composite_index_prefix_range_target` required a NON-empty equality prefix
+  (`if prefix_exprs.is_empty() { continue; }`), so a pure leading-term range
+  matched neither path.
+- CHANGE (codegen.rs, 2 edits): (1) `composite_index_prefix_range_target` now
+  allows an EMPTY equality prefix — the existing `else` branch computes the range
+  on `columns[0]`, the residual guard still rejects any conjunct that doesn't pin
+  the (empty) prefix or the leading range, and `index_range_fast_path_is_safe`
+  still gates affinity. (2) `codegen_select_composite_index_prefix_range_scan`
+  skips the prefix-change `IdxGT` when `prefix_len==0` (a zero-column IdxGT is a
+  degenerate no-op); the SeekGE lower anchor + the `Gt`/`Ge` range-upper check
+  alone terminate the walk. `IdxRowid` reads the rowid position-independently.
+- WHY SAFE: ORDER BY is AUTO-DECLINED for the empty-prefix shape —
+  `composite_order_by_satisfied` requires `prefix_len + 1 == key_term_count()`
+  (range on the LAST term), which `0 + 1 == 2` fails on a >=2-term index, so any
+  ORDER BY falls to the sorter (no order-divergence risk, unlike a naive range
+  extension). NULLs in the leading term are excluded by the no-lower-bound
+  `IsNull -> skip` path, matching C SQLite (`a <op> x` is false for NULL).
+  Composite-only (`key_terms >= 2`) so single-column indexes are untouched.
+- GATE (deterministic): byte-exact vs rusqlite (sorted set — no ORDER BY, so
+  emission order is implementation-defined). composite_prefix_range_residual_
+  oracle +1 test `composite_pure_leading_range_matches_sqlite`: `< <= > >=
+  BETWEEN` and two-sided ranges, a NULL run in `a`, covering (a,b) and
+  non-covering (id,c) output, and a non-key residual (`c=1`) that must decline to
+  a scan. EXPLAIN asserts SeekGE fires (not full scan) and NO prefix IdxGT for
+  the empty-prefix seek. All pass; the pre-existing equality-prefix residual test
+  still passes; golden_bytecode_snapshots 8/8 (no drift); clippy -p fsqlite-vdbe
+  --lib -D warnings clean; fmt clean.
+- PERF: magnitude not separately benched; the win is structural (full scan
+  O(rows) -> index seek O(log n + matches) for a selective leading-term range).
+  Common shape: `CREATE INDEX ix ON t(category, created_at); SELECT … WHERE
+  category < X` / `created_at BETWEEN …` on the leading term.
+- FOLLOW-UP (not done): the ORDER-BY-satisfying composite leading-range (stream
+  (a,b,rowid) satisfies `ORDER BY a` but not `ORDER BY a, rowid`) is left to the
+  sorter; wiring a sorter-eliding ordered form would need a stricter
+  order-satisfaction check for the empty-prefix case. Preflight
+  CompositeRangeIndexSeek=allowed. Files: codegen.rs,
+  composite_prefix_range_residual_oracle.rs. See bd-bn45n.

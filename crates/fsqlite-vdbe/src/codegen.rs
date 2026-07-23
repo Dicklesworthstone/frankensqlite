@@ -4724,15 +4724,21 @@ fn codegen_select_composite_index_prefix_range_scan(
     let skip_label = b.emit_label();
 
     // Stop once the equality prefix changes (`IdxGT` compares only the first `prefix_len` columns).
-    #[allow(clippy::cast_possible_truncation)]
-    b.emit_jump_to_label(
-        Opcode::IdxGT,
-        idx_cursor,
-        probe_rec,
-        done_label,
-        P4::None,
-        prefix_len as u16,
-    );
+    // With an EMPTY prefix (pure leading-term range, bd-bn45n) there is nothing to compare, so skip
+    // the IdxGT entirely and let the range bounds alone terminate the walk: the SeekGE anchors the
+    // lower end and the range-upper check below (`Gt`/`Ge` on `range_key_reg`) stops it — a
+    // zero-column IdxGT would be a degenerate no-op we do not want to rely on.
+    if prefix_len > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            idx_cursor,
+            probe_rec,
+            done_label,
+            P4::None,
+            prefix_len as u16,
+        );
+    }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let range_key_reg = b.alloc_reg();
@@ -25194,9 +25200,18 @@ fn composite_index_prefix_range_target<'a>(
         }
         let prefix_exprs =
             extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
-        if prefix_exprs.is_empty() {
-            continue;
-        }
+        // An EMPTY equality prefix is a PURE range on the LEADING key term
+        // (`WHERE a <range>` on `index(a, …)`) — no equality pins. The `else`
+        // branch below then extracts the range on `columns[0]` (declining if the
+        // WHERE has no range on the leading term), and the residual guard rejects
+        // any unpinnable conjunct. This is the composite-index analogue of the
+        // single-column range fast path (bd-bn45n): without it a pure leading
+        // range over a composite-only index falls all the way back to a full
+        // table scan. ORDER BY is auto-declined for this shape
+        // (`composite_order_by_satisfied` requires the range on the LAST key
+        // term, so a leading-term range on a >=2-term index never elides the
+        // sorter), so the empty-prefix seek only serves the no-ORDER-BY case and
+        // any ORDER BY correctly falls to the sorter.
         // When the prefix pins EVERY key column (`WHERE a=? AND b=?` on `(a,b)` — a full composite
         // equality / point lookup), demote the last pinned column to a degenerate range `[c, c]` so the
         // same prefix+range seek resolves it as one seek instead of a full scan.
