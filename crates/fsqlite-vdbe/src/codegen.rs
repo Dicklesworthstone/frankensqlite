@@ -10526,18 +10526,27 @@ fn count_distinct_index_walk_plan(
     }
     let col_idx = agg.arg_col_index?;
     let column = table.columns.get(col_idx)?;
-    let idx = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
-            && idx.key_term_count() == 1
-            && !idx.key_term_descending(0)
-            && idx
-                .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
-            && idx
-                .key_term_collation(0)
-                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-    })?;
+    // A COMPOSITE index whose LEADING key term is this column (ASC BINARY)
+    // qualifies: the walk reads only index column 0 and counts leading-value
+    // changes, so trailing terms are irrelevant. `supports_direct_column_lookup`
+    // still excludes partial (WHERE) and expression indexes (full plain-column
+    // coverage). Prefer the narrowest qualifying index (fewest entries to walk).
+    let idx = table
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx.key_term_count() >= 1
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
+                && idx
+                    .key_term_collation(0)
+                    .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+        })
+        .min_by_key(|idx| idx.key_term_count())?;
     Some(CountDistinctIndexWalk {
         index_name: idx.name.clone(),
         index_root: idx.root_page,
@@ -11241,6 +11250,10 @@ fn codegen_select_count_distinct_index_walk(
 struct DistinctLooseScan {
     index_name: String,
     index_root: i32,
+    /// Number of leading index key terms that equal the DISTINCT output columns
+    /// (in SELECT order). 1 for `SELECT DISTINCT a`; N for `SELECT DISTINCT a, b, …`
+    /// served by an index whose leading N terms are exactly those columns.
+    key_col_count: usize,
 }
 
 /// Cheap `Next` attempts per emitted value before the loose scan pays for a
@@ -11259,41 +11272,64 @@ fn distinct_loose_scan_plan(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Option<DistinctLooseScan> {
-    if table.without_rowid {
+    if table.without_rowid || columns.is_empty() {
         return None;
     }
-    let [ResultColumn::Expr { expr, .. }] = columns else {
-        return None;
-    };
-    let SortKeySource::Column(col_idx) = resolve_column_ref(expr, table, table_alias)? else {
-        return None;
-    };
-    let column = table.columns.get(col_idx)?;
-    // BINARY only: the index's BINARY key order must equal the DISTINCT comparison so adjacent-run
-    // skipping matches C SQLite's grouping. Generated columns decline (first cut).
-    if column.generated_expr.is_some()
-        || column
-            .collation
-            .as_deref()
-            .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
-    {
-        return None;
+    // Every output must be a plain, non-generated, BINARY column reference. Collect their names in
+    // SELECT order — they must equal the chosen index's leading key terms in the SAME order, so the
+    // emitted tuples are exactly the index's leading-prefix groups in index order (byte-identical to
+    // C SQLite, which walks the same covering index for `SELECT DISTINCT <prefix cols>`).
+    let mut col_names: Vec<String> = Vec::with_capacity(columns.len());
+    for rc in columns {
+        let ResultColumn::Expr { expr, .. } = rc else {
+            return None;
+        };
+        let SortKeySource::Column(col_idx) = resolve_column_ref(expr, table, table_alias)? else {
+            return None;
+        };
+        let column = table.columns.get(col_idx)?;
+        // BINARY only: the index's BINARY key order must equal the DISTINCT comparison so adjacent-run
+        // skipping matches C SQLite's grouping. Generated columns decline (first cut).
+        if column.generated_expr.is_some()
+            || column
+                .collation
+                .as_deref()
+                .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+        {
+            return None;
+        }
+        col_names.push(column.name.clone());
     }
-    let idx = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
-            && idx.key_term_count() == 1
-            && !idx.key_term_descending(0)
-            && idx
-                .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
-            && idx
-                .key_term_collation(0)
-                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-    })?;
+    let n = col_names.len();
+    // The loose scan reads index columns 0..N-1 and probes with an N-field prefix `[v0..vN-1]`, so
+    // any index whose LEADING N key terms are exactly these columns (same order, each ASC BINARY)
+    // qualifies — entries sharing that leading tuple (regardless of trailing terms) are all cleared
+    // by one `SeekGT [v0..vN-1]`. `supports_direct_column_lookup` still excludes partial (WHERE) and
+    // expression indexes, so the chosen index is a full-coverage plain-column index. Prefer the
+    // narrowest qualifying index (fewest key terms => smallest entries to scan); this keeps the
+    // historical single-column choice when one exists and never uses a wider composite unnecessarily.
+    let idx = table
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx.key_term_count() >= n
+                && (0..n).all(|i| {
+                    !idx.key_term_descending(i)
+                        && idx
+                            .columns
+                            .get(i)
+                            .is_some_and(|c| c.eq_ignore_ascii_case(&col_names[i]))
+                        && idx
+                            .key_term_collation(i)
+                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                })
+        })
+        .min_by_key(|idx| idx.key_term_count())?;
     Some(DistinctLooseScan {
         index_name: idx.name.clone(),
         index_root: idx.root_page,
+        key_col_count: n,
     })
 }
 
@@ -11328,48 +11364,59 @@ fn codegen_select_distinct_loose_scan(
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_top = b.current_addr() as i32;
-    // Emit the current distinct value (index column 0), then skip its whole duplicate run.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let n = scan.key_col_count as i32;
+    // Emit the current distinct tuple (index columns 0..N-1), then skip its whole duplicate run.
     // The probe copy MUST precede ResultRow: the engine's ResultRow drains its source
     // registers (`take_reg_range`), so a Copy placed after it reads NULL and the SeekGT
-    // probe becomes a constant `[NULL]` — the loop then re-emits one row forever (the
+    // probe becomes a constant `[NULL, …]` — the loop then re-emits one row forever (the
     // "skip-scan hang" this bead was blocked on).
-    b.emit_op(Opcode::Column, idx_cursor, 0, out_regs, P4::None, 0);
-    let probe_key_reg = b.alloc_reg();
-    b.emit_op(Opcode::Copy, out_regs, probe_key_reg, 0, P4::None, 0);
+    for i in 0..n {
+        b.emit_op(Opcode::Column, idx_cursor, i, out_regs + i, P4::None, 0);
+    }
+    let probe_base = b.alloc_regs(n);
+    for i in 0..n {
+        b.emit_op(Opcode::Copy, out_regs + i, probe_base + i, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     // Adaptive skip (MySQL-style loose scan): try a few cheap Next steps before paying
     // for a root-to-leaf SeekGT. Long duplicate runs fall through to the seek (one seek
     // clears the whole run); short/unique runs leave via the Ne and never seek, so an
     // all-distinct index degrades to an emit-on-change walk instead of one full-height
-    // seek per row (~11x worse than the sorter when measured). Ne carries NULLEQ (0x80)
-    // + BINARY collation so a NULL run is one distinct value, matching index key order.
-    let cur_reg = b.alloc_reg();
+    // seek per row (~11x worse than the sorter when measured). Each Ne carries NULLEQ
+    // (0x80) + BINARY collation so a NULL run is one distinct value, matching index key
+    // order; a tuple change on ANY column jumps back to emit the new distinct tuple.
+    let cur_base = b.alloc_regs(n);
     for _ in 0..DISTINCT_LOOSE_SCAN_NEXT_PROBES {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let next_addr = b.current_addr() as i32;
         // Next jumps to p2 when a next entry exists; falls through at EOF.
         b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
-        b.emit_op(Opcode::Column, idx_cursor, 0, cur_reg, P4::None, 0);
-        b.emit_op(
-            Opcode::Ne,
-            probe_key_reg,
-            loop_top,
-            cur_reg,
-            P4::Collation("BINARY".to_owned()),
-            0x80,
-        );
+        for i in 0..n {
+            b.emit_op(Opcode::Column, idx_cursor, i, cur_base + i, P4::None, 0);
+        }
+        for i in 0..n {
+            b.emit_op(
+                Opcode::Ne,
+                probe_base + i,
+                loop_top,
+                cur_base + i,
+                P4::Collation("BINARY".to_owned()),
+                0x80,
+            );
+        }
     }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
-        probe_key_reg,
-        1,
+        probe_base,
+        n,
         probe_record_reg,
         P4::None,
         0,
     );
-    // No entry beyond the [value] prefix run → the run was the last one → done.
+    // No entry beyond the [v0..vN-1] prefix run → the run was the last one → done.
     b.emit_jump_to_label(
         Opcode::SeekGT,
         idx_cursor,

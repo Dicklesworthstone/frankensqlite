@@ -19678,3 +19678,375 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   quiescent same-worker null-controlled A/B improves the 100-row median by at
   least 10% with both variants below 5% CV and no regression in the 1k/10k
   DELETE rows.
+
+## 2026-07-23 - REJECT (misdirected charter): "leader-follower group commit for the compat pager WAL path" (bd-6hgad); the machinery already exists and cannot coalesce in the NORMAL-sync benchmark shape
+
+- Result type: lever REJECT + blocker/premise resolution for bd-6hgad
+  ("wal_group_commits=0 ... group commit machinery never fires; 8w parity row
+  pays 108 solo WAL commits"). The chartered lever was CopperCliff's
+  "leader-follower group commit for the compat pager WAL path" on the premise
+  that the compat path has NO cross-committer group commit.
+- PREMISE DISPROVEN (source read): the compat WAL commit path
+  (`commit_wal_group_commit_with_snapshot`, pager.rs:11019) already implements
+  full leader-follower group commit — a shared per-database `GroupCommitQueue`
+  consolidator (FILLING->FLUSHING->COMPLETE, epoch pipelining, Flusher/Waiter
+  roles via `submit_batch`, waiter takeover via `claim_flusher_vacancy`,
+  cross-batch overlap aborts, durable certificates). BOTH WAL commit call sites
+  (pager.rs:13004 plain, :13440 concurrent/retained) funnel through it. It is
+  not structurally absent.
+- WHY `wal_group_commits=0` (metric wiring, not behavior): the counter the
+  bench prints (`wal_group_commits`) is sourced from
+  `GLOBAL_GROUP_COMMIT_METRICS.record_group_commit`, whose ONLY call site is
+  Native-mode `native_commit.rs:578`. The compat flusher records a DIFFERENT
+  family (`GLOBAL_CONSOLIDATION_METRICS`: groups_flushed, transactions_batched,
+  flusher_commits, waiter_commits). So zero is a native-only counter never
+  incremented on the compat path — not evidence the path never groups.
+- EMPIRICAL (debug binary; FSQLITE_TRACE_GROUP_COMMIT=1 +
+  FSQLITE_WAL_DETAILED_COMMIT_METRICS=1 + FSQLITE_BENCH_PROFILE_CONCURRENT=1,
+  `--filter concurrent`, 2w/4w/8w): 204 group-commit epochs traced; EVERY epoch
+  `batch_size=1`, `members=[single]`, `fsync_seq=0`, `control_mode=conservative`,
+  `fallback_reason=operator_forced`. The machinery FIRES but never COALESCES.
+- ROOT CAUSE of no-coalescing (two independent reasons, either sufficient):
+  (1) `synchronous=NORMAL` => `WalCommitSyncPolicy::Deferred` =>
+  `should_sync_on_commit()` false => NO fsync on commit (fsync_seq=0 confirms).
+  Group commit's entire value is amortizing the expensive fsync across N
+  committers; with no fsync there is nothing to amortize. (2) The benchmark
+  workload is a FEW LARGE transactions (per writer: 1 `BEGIN CONCURRENT` + 1000
+  INSERT + 1 COMMIT), so only ~N commits occur near-simultaneously and the
+  cheap no-fsync flush completes before peers submit into the same FILLING
+  window. Forcing coalescing would require a deliberate arrival-wait (adds
+  latency to every commit) and only helps at high writer counts where
+  FrankenSQLite ALREADY WINS (release artifact cod-fullquick-refresh-20260722:
+  4w 0.90x, 8w 0.42x; the only concurrent LOSS is 2w at 1.22x, the case with
+  the LEAST coalescing opportunity — 2 committers).
+- RETRY PREDICATE: only reconsider a group-commit coalescing lever if the
+  measured workload runs `synchronous=FULL`/`EXTRA` (WalCommitSyncPolicy::
+  PerCommit, real per-commit fsync) AND presents many small concurrent
+  transactions whose commits overlap in wall-clock time, AND a same-worker
+  null-controlled A/B shows the amortized-fsync throughput gain exceeds the
+  added arrival-wait latency at the target writer count with CV<5%. Under
+  NORMAL sync with few large txns, batch_size=1 is optimal, not a defect.
+- SEPARATE (not yet actioned) observation for future levers: every SOLO compat
+  flush still performs certificate-sidecar I/O inside the serialized region
+  (open+backward-scan read via `latest_authorized_durable_certificate_record`,
+  then open+append via `append_durable_certificate_record`, wal_adapter.rs).
+  This is per-commit overhead C SQLite lacks. NOT pursued here: it touches the
+  cross-process durability-publication chain finished today (bd-3wop3.1.3,
+  f190223a) and any in-memory caching of the "latest authorized certificate"
+  must preserve cross-process seed reconciliation (`reconcile_authorized_seed`).
+  Requires release-perf profiling to confirm it is not dwarfed by btree_insert
+  before it is worth the correctness risk.
+- Preflight: `sql_pipeline_candidate_preflight --operation
+  WalGroupCommitEngagement --direction other` => verdict "allowed", zero
+  matched no-retry records. concurrent_mode stays true (untouched).
+
+## 2026-07-23 - CONVERGENCE (no clean lever): comprehensive-bench worst-ratios are now the irreducible MVCC transaction tax on small-N single-threaded writes; the concurrent-writer lane is WON
+
+- Result type: lever-family REJECT + landscape finding. Fresh release-perf
+  `--quick` baseline (14 MB binary built today, `taskset -c 4-11`,
+  Threadripper 5975WX, under heavy shared-host load): the concurrent-writer
+  section — the project's raison d'être — is DECISIVELY WON at every writer
+  count: 2w 0.589x (F 56.2 / C 95.3 ms), 4w 0.562x (F 107 / C 190 ms), 8w
+  0.866x (F 308 / C 355 ms). The 2w 1.22x LOSS seen in the day-old artifact
+  cod-fullquick-refresh-20260722T1800Z is GONE; that artifact's C concurrent
+  medians were ~20x smaller and its 2w row is not reproducible (C concurrent CV
+  here is 15-40%, i.e. file-backed WAL disk noise under load — do NOT A/B the
+  concurrent rows on a loaded host).
+- The remaining worst-ratios are ALL small-N single-threaded `:memory:` write
+  rows, and every one shrinks monotonically as N grows (the fixed-cost
+  signature): DELETE 100/del-5 3.18x, 1000/del-50 1.91x, 10000/del-500 1.24x;
+  INSERT tiny/small 100-row ~1.20x, 10000-row ~1.01x. C wins these because it
+  pays no per-transaction MVCC/safety cost; the amortized-away gap IS that cost.
+- PROFILED both (release-perf, FSQLITE_BENCH_PROFILE_DML / _INSERT):
+  - DELETE 50/1000 (`:memory:`, `direct_delete` fast path): `delete_physical_ns=0`
+    (leaf delete already fully optimized — the ledger's delete_rowid_with_reason
+    micro-levers are all already rejected), the only sizeable delete sub-cost is
+    `delete_seek_ns` ~4.3us/50 = 86 ns/seek (shared B-tree descent, C does the
+    same), rest is begin (2.1us) + commit_roundtrip (3.2us) fixed tax.
+  - INSERT tiny_1col 100/single-txn (F~85 / C~71 us, 14us gap): the gap is the
+    MVCC/safety tax spread across `begin_ns`=2.5us (snapshot/concurrent setup),
+    per-row `change_tracking_ns`=3.1us (MVCC modified-page tracking — REQUIRED
+    for conflict detection), `schema_validation_ns`=3.8us, `memdb_apply_ns`=2.9us,
+    and part of `row_build_ns`=13.9us. No single fat component.
+- Why schema_validation is NOT a lever: `ensure_schema_unchanged*`
+  (connection.rs:5848/5905) is already a minimal cookie+generation integer
+  identity compare (`schema_cookie() != self.schema_cookie`), ~38 ns/insert, not
+  a re-derivation. It is a per-execute safety gate that must run to catch
+  concurrent schema changes; there is nothing to hoist.
+- VERDICT: no fat, un-mined, low-risk lever exists in the small-N write rows.
+  The costs are (a) already minimized, (b) fundamentally required for the
+  concurrent-writer safety guarantees, or (c) heavily mined and rejected (see
+  the 2026-07-10/07-11 prepared-DELETE and rowid-fusion entries, and the
+  2026-07-22 adaptive micro-sampling / prepared-DELETE-batch rejects). The
+  small-N MVCC transaction tax is the PRICE of the concurrent-writer advantage.
+- RETRY PREDICATE: only reopen small-N write optimization if a profiler
+  attributes >30% of a stable (CV<5%, absolute >50us) row to a SINGLE component
+  that is provably not required per-execute for MVCC/SSI correctness, with a
+  same-worker null-controlled A/B clearing the 5% CV gate on a QUIET host.
+  Chasing the 3-4us sub-components individually will not clear noise and risks
+  the concurrent-writer correctness guarantees. Do not A/B concurrent (file-WAL)
+  rows on a loaded host — the disk noise (C CV 15-40%) swamps any engine effect.
+
+## 2026-07-23 - BENCHMARK-INTEGRITY (not a perf lever): the concurrent-writer section compares C-SQLite at synchronous=FULL vs FrankenSQLite at NORMAL — a durability asymmetry that flatters FrankenSQLite; the win must be re-measured at matched sync
+
+- Result type: benchmark fairness finding + charter (bd filed). NOT a perf
+  lever; it corrects the comparison the concurrent-writer claim rests on.
+- OBSERVATION (comprehensive_bench.rs `bench_concurrent_writers`): the C-SQLite
+  writer connections execute only `PRAGMA journal_mode=WAL; PRAGMA
+  busy_timeout=5000;` (line ~3443) and NEVER set `synchronous`. The setup
+  connection sets NORMAL, but `synchronous` is per-connection and does not carry
+  to the writer connections. FrankenSQLite writers explicitly set NORMAL via
+  `apply_pragmas_fsqlite`.
+- EMPIRICAL (build-free, python sqlite3 3.46.1; SQLITE_DEFAULT_SYNCHRONOUS is
+  compile-time-stable at 2=FULL and the repo `.cargo/config` adds only
+  `-DSQLITE_ENABLE_MATH_FUNCTIONS`, no sync override, so rusqlite's bundled
+  libsqlite3-sys 0.38.1 build matches): a fresh connection reports
+  `synchronous=2 (FULL)`, and issuing `PRAGMA journal_mode=WAL` does NOT reduce
+  it. => the concurrent bench's C writers run at FULL = a real WAL fsync on
+  EVERY commit; FrankenSQLite's NORMAL maps to `WalCommitSyncPolicy::Deferred`
+  = NO per-commit fsync (independently confirmed: fsync_seq=0 across 204 traced
+  epochs). The two engines are NOT compared at matched durability.
+- MAGNITUDE (why it matters): in this workload each writer does one COMMIT, so
+  C pays N serialized WAL fsyncs (one per writer) that F pays zero of. On the
+  ext4 `/data/tmp` backing store an fsync is ~1-10 ms; at 8w that is up to tens
+  of ms of pure fsync on C's side alone. The 8w row (F 308 / C 355 ms) could
+  narrow substantially — possibly to parity — once C is set to NORMAL. So the
+  reported concurrent win (2w 0.59x / 4w 0.56x / 8w 0.87x) OVERSTATES the
+  MVCC-parallelism advantage by an unquantified sync-mode component.
+- INSTRUMENT ADDED (uncommitted, default-inert): `concurrent_sync_override()`
+  gated on `FSQLITE_BENCH_CONCURRENT_SYNC` (unset => exact historical baseline;
+  `normal`/`full` => force BOTH engines' writer connections to that identical
+  mode). This enables (a) the fair re-measurement at matched NORMAL and (b) a
+  matched-FULL probe of whether FrankenSQLite group commit amortizes fsyncs
+  across concurrent committers (the real MVCC value proposition, and the retry
+  predicate for the bd-6hgad group-commit lever above).
+- BLOCKER: the release-perf LTO relink was SIGTERM-killed on the rch fleet 3x
+  (exit 143 at the link stage on vmi1149989/vmi1153651/hz1), so the matched-sync
+  A/B could not be run at KEEP quality this session. The finding stands on the
+  code+python evidence; the quantification is filed as a bead.
+- RECOMMENDATION: set the C writer connections to `synchronous=NORMAL` to match
+  intent + FrankenSQLite + the SQLite-recommended WAL default, then RE-MEASURE
+  and honestly restate the concurrent-writer numbers. If FrankenSQLite still
+  wins at matched NORMAL, the claim is clean; if the win shrinks, the README's
+  concurrent-writer numbers need correction per the doc-invariant rules. Also
+  add a matched-FULL row so the durability-serious comparison is on record.
+  Do not "fix" this by lowering C to NORMAL silently and keeping the old
+  numbers — the corrected numbers must be published.
+- QUANTIFIED (debug binary via the `FSQLITE_BENCH_CONCURRENT_SYNC` instrument;
+  C arm is release-compiled bundled libsqlite3-sys so C times are VALID, F debug
+  times ignored). Three configs, `--filter concurrent`, `taskset -c 4-11`, under
+  shared-host load (4w/8w C-normal CV was 105%/20% — noise-wrecked, inconclusive;
+  only the 2w comparison is clean at CV 2.9/5.6/4.8%):
+    * 2w C-default(implicit FULL) 134.0 ms vs C-normal 86.1 ms vs C-full 100.4 ms
+      => C-NORMAL is ~36% faster than C-FULL (norm/def = 0.643). The per-commit
+      WAL fsync is a real, large cost for C at low writer counts, and C-default
+      tracks C-full (both FULL), proving the default is indeed FULL.
+    * Combined with the release baseline (2w F 56.2 / C-default 95.3 ms = 0.59x):
+      a fair 2w C-normal ~= 95.3 * 0.64 ~= 61 ms, so F 56 vs C 61 ~= 0.92x — the
+      headline 1.7x (0.59x) win COLLAPSES to ~1.09x (near parity) once C is set
+      to the same NORMAL durability. 4w/8w fair ratios are unquantified (noise)
+      but 8w was already only 0.87x, so matched sync could flip it to a LOSS.
+- COALESCING PROBE (config 3, both FULL, FSQLITE_TRACE_GROUP_COMMIT=1): real
+  fsyncs confirmed on the FrankenSQLite side (max fsync_seq=168, i.e. PerCommit
+  sync active), yet ALL 204 group-commit epochs are batch_size=1, members=[1].
+  => Even under FULL sync, where the fsync lengthens the flush window, the
+  group-commit consolidator NEVER coalesces for this workload. This closes the
+  bd-6hgad retry predicate's second leg: the batching lever cannot help the
+  concurrent bench regardless of sync mode, because each writer issues exactly
+  ONE commit (1 BEGIN CONCURRENT + 1000 INSERT + 1 COMMIT) so commits never
+  overlap in the FILLING window. Under matched FULL, FrankenSQLite therefore
+  pays N serialized SOLO fsyncs just like C, with no amortization edge, plus its
+  MVCC overhead — a likely LOSS or tie, not a win.
+- BOTTOM LINE: the reported concurrent-writer advantage is substantially a
+  synchronous-mode artifact (C-FULL vs F-NORMAL), not pure MVCC parallelism. The
+  MVCC-parallelism benefit is real but modest and must be re-measured at matched
+  sync on a QUIET host with a release-perf binary before any concurrent-writer
+  speed claim is published. Group-commit coalescing cannot widen the gap for the
+  current few-large-txns workload; a many-small-overlapping-txns workload (e.g.
+  OLTP: many short transactions per connection) is required to exercise it, and
+  is the correct shape for both the fsync-amortization claim and any future
+  group-commit lever. See bd-x5gzk (fairness) and bd-6hgad (group commit).
+- ALL-THREAD-COUNT QUANTIFICATION (2026-07-23, quieter host load ~14; debug
+  binary, C arm release-compiled => C times valid). C-side default(implicit
+  FULL) vs `FSQLITE_BENCH_CONCURRENT_SYNC=normal`: 2w 138.0->105.6 ms (0.765,
+  CV 1.9/6.8); 4w 183.6->132.4 ms (0.721, CV 9.1/16.0); 8w 267.3->215.2 ms
+  (0.805, CV 8.8/14.2). The per-commit WAL fsync inflates C's time ~20-28% at
+  every writer count. Applying these ratios to the release baseline C-default
+  (2w 95 / 4w 190 / 8w 355 ms) against release F (2w 56 / 4w 107 / 8w 308 ms)
+  gives the FAIR (matched-NORMAL) estimate: 2w 0.77x, 4w 0.78x, 8w 1.08x. So the
+  buggy-bench win (2w 0.59x / 4w 0.56x / 8w 0.87x) shrinks to ~1.3x at 2-4w and
+  the 8w row FLIPS from a 0.87x win to a ~1.08x LOSS. Fair concurrent geomean
+  ~0.87x (~1.15x faster) vs the buggy ~0.77x (README line 1230's "1.30x
+  faster"). This IS the correction README line 1230 needs; the mt-mvcc-bench
+  headline rows (README 1240-1253) are already fair and unaffected. Precise
+  release-quality fair F/C ratios still want a genuinely-quiet host (a 3-way
+  local release build storm and file-WAL disk noise cap the F-side precision
+  here); the qualitative conclusion (win shrinks ~20-28%, 8w -> parity/loss) is
+  robust and sufficient to act on the README correction.
+- HONESTY CORRECTION (2026-07-23, later): the definitive release-perf run on a
+  genuinely QUIET host (load 8, zero competing builds, taskset 8-23) REFUTES the
+  precision of the estimate above. Three concurrent runs: DEFAULT(C=FULL) F/C
+  2w 0.595 / 4w 0.694 / 8w 0.987; =NORMAL(fair) 2w 0.464 / 4w 0.805 / 8w 1.184;
+  DEFAULT#2 2w 0.531 / 4w 0.545 / 8w 0.723. The two DEFAULT runs disagree by
+  20-35%, 8w C-FULL hit CV=104%, and DECISIVELY the =NORMAL C-2w median
+  (124.8 ms) came out SLOWER than C-FULL-2w (95.2 ms) — impossible from sync
+  mode alone (NORMAL is strictly less work than FULL), which proves run-to-run
+  disk/scheduling noise (C median spread ~95-138 ms) SWAMPS the ~20-28% fsync
+  effect. So the comprehensive_bench concurrent (file-WAL) section CANNOT
+  cleanly quantify the sync magnitude on this shared host even at load 8; the
+  "~24% at 2w / fair estimate 0.77x/1.08x" above was a lucky-clean debug sample,
+  NOT reproducible — treat it as noise-level, not a measurement. F is stable
+  across runs (2w ~57 / 4w ~106 / 8w ~308 ms); it is C that is wildly variable.
+  WHAT SURVIVES: (a) the sync asymmetry is real (code + python, not a
+  measurement); (b) FIX = add `synchronous=NORMAL` to the C writer connections
+  to match mt_mvcc_bench; (c) do NOT publish any "fair number" from
+  comprehensive_bench concurrent — it is unreliable; cite mt_mvcc_bench (fair,
+  higher-iteration) for the honest concurrent-writer story; (d) README line 1230
+  ("1.30x faster in the full-quick mix") is both unfair AND unreliable — replace
+  it with a caveat that defers to the mt-mvcc-bench section rather than any
+  comprehensive_bench concurrent number.
+
+## 2026-07-23 - PROFILE + DIRECTION (bd-smxhz): concurrent-writer separate-tables scaling collapses under disk contention; root cause is a FrankenSQLite-specific per-commit file-open storm; lever = VFS fd caching
+
+- Result type: profiling finding + chartered lever direction (NOT a reject; a
+  high-value lever handed off because implementation is major + A/B-blocked).
+- SYMPTOM (mt-mvcc-bench at HEAD, release-perf, /data/tmp ext4 shared host with
+  competing builds): SEPARATE-TABLES (250 rows/thread) F/C throughput was 2.6x
+  (1w) / 2.0x (2-4w) / 3.0-3.3x (8w) across two runs, F wps ~23k->53k (nearly
+  FLAT with thread count) — vs README's quiet-dedicated-host 1w 0.42x / 4w 7.66x
+  / 8w 40.99x (F 264k->1022k wps). SHARED-TABLE 8w was CLOSE (mine 3.73x vs
+  README 3.42x). The parallelism advantage collapses 40x -> 3x under contention.
+- DISCRIMINATOR (rules out uniform slow hardware): at 8w separate-tables my C
+  (15.9k wps) is only ~1.5x below README C (24k), while my F (~30-53k) is
+  ~20-35x below README F (1022k). Slow hardware would scale C and F together;
+  it doesn't => the collapse is F-SPECIFIC.
+- ROOT CAUSE (strace openat, tiny 8w/200-row/1-iter separate-tables run, 843
+  total openat): FrankenSQLite does a per-commit/op FILE-OPEN STORM C SQLite
+  lacks — main DB reopened 270x (~17/commit), -wal 147x (~9/commit), -wal-cert
+  (durable certificate sidecar) 31x (~2/commit), plus -fsqlite-ns-gate /
+  -fsqlite-ns-use cross-process namespace lock files 95x each (BOOTSTRAP: begin()
+  is per-CONNECTION-open at pager.rs:8065, ~12 opens/conn across open-phases, not
+  per-commit — acceptable). Every openat/close is a metadata syscall: ~free on a
+  quiet fast disk (README => 40.99x) but serialized under contention, so all
+  writers block on file metadata ops regardless of separate tables.
+- LEVER (direction; NOT implemented — major + correctness-sensitive + A/B needs a
+  quiet host): VFS-level file-descriptor CACHING / persistent handles for the DB
+  + WAL + certificate sidecar across a connection's commits, eliminating the
+  per-commit open/close churn. Touches the unsafe fsqlite-vfs crate + pager;
+  file-locking + durability semantics may depend on some open/close cycles, so it
+  must preserve them (and the certificate read cache must preserve cross-process
+  reconcile_authorized_seed). Steps: (1) add flush-critical-section syscall
+  timing to attribute DB-reopen vs WAL vs sidecar; (2) design the fd cache; (3)
+  same-worker A/B on a genuinely quiet host.
+- IMPLICATION for README: the mt-mvcc-bench 40.99x is a BEST-CASE quiet-fast-disk
+  number; it should be caveated as disk-speed/contention-sensitive. The honest
+  concurrent-writer story is environment-dependent — big win on fast quiet
+  storage, ~3x under contention.
+- CANNOT distinguish "regression since README" from "environment" without the
+  README's exact host; the C-vs-F asymmetry strongly implicates F's commit-path
+  I/O regardless. Preflight ConcurrentCommitPathDiskIO=allowed. concurrent_mode
+  stays true.
+- PRECISE ROOT CAUSE (addendum): the 270 DB reopens are dominated by 222 opens
+  with flags `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC` — these are FILE-IDENTITY
+  PROBES, not I/O. `validate_path_identity` (namespace.rs:238) does
+  open_identity_probe -> open(O_NOFOLLOW|O_NONBLOCK) + FileIdentity::from_file
+  (fstat dev/inode) + close, to verify the DB file was not substituted. It runs
+  at EVERY operation boundary: `ensure_current_wal_path` (wal_adapter.rs:1598,
+  starting ~every WAL op) and `validate_namespace_binding` (pager.rs:6381, ~9
+  pager boundaries incl. commit 12762/13734). A commit doing N WAL ops re-probes
+  N times. This is a DELIBERATE TOCTOU security feature (commit 1136c171
+  "fix(vfs): bind native database namespaces to stable identities"), NOT
+  runtime-disable-able. C SQLite holds ONE fd per connection; the held inode
+  guarantees identity with zero per-op syscalls. FIX (preserves security): hold
+  the DB+WAL fd across a connection's operations — the held inode IS the identity
+  guarantee, so per-op path re-probing AND the reopen churn both vanish. Major
+  fsqlite-vfs change touching deliberately-added security machinery; needs design
+  review + quiet-host A/B. Cheaper interim (probe once/txn not once/op) weakens
+  the TOCTOU window and needs security sign-off — do not do it unilaterally.
+
+## 2026-07-23 - KEEP (conformance-gated, no perf A/B needed): extend DISTINCT loose/skip scan AND COUNT(DISTINCT) index walk to COMPOSITE indexes whose LEADING term is the target column
+
+- Result type: coverage-extension KEEP. Broadens two already-proven fast paths
+  — the `SELECT DISTINCT <col>` loose/skip scan (bd-distinct-loose-scan-c8nay,
+  23.5x vs sorter) and the `COUNT(DISTINCT <col>)` index walk
+  (bd-count-distinct-index-walk, vs full-scan dedup) — from single-column-only
+  to ANY index whose LEADING key term is the target column in ASC BINARY order.
+- CHANGE (codegen.rs): `distinct_loose_scan_plan` (~11282) and
+  `count_distinct_index_walk_plan` (~10529) previously gated on
+  `idx.key_term_count() == 1`. Relaxed to `>= 1` while keeping the term-0 checks
+  (leading column-name match, `!key_term_descending(0)`, `key_term_collation(0)`
+  BINARY), and switched `find(..)` -> `filter(..).min_by_key(key_term_count)` so
+  the NARROWEST qualifying index is chosen (preserves the historical
+  single-column pick when one exists).
+- WHY SAFE: both codegens read ONLY index Column 0, and the loose scan probes
+  with a 1-field prefix `[value]`, so entries sharing the leading value
+  (whatever the trailing terms) are cleared/counted identically to a
+  single-column index. `supports_direct_column_lookup()` (`where_clause.is_none()`
+  + `columns.len() == key_term_count()`) still excludes partial (WHERE) and
+  expression indexes => the chosen index has full plain-column coverage. Only
+  the leading term's ASC+BINARY governs; a trailing DESC term does NOT
+  disqualify (explicitly tested).
+- GATE (deterministic; no perf A/B because it extends already-proven fast
+  paths): byte-exact vs rusqlite. distinct_loose_scan_oracle +1 test
+  (composite int, composite text, `(a ASC, b DESC)`, both-single-and-composite
+  narrowest-pick); count_distinct_index_walk_oracle +1 test (composite-only
+  `(a,b)`/`(c,b)`, trailing-DESC `(a ASC,b DESC)`). All 8 tests in both oracles
+  PASS. EXPLAIN opcode gates confirm the FAST PATH fires: no `SorterOpen` for
+  the loose scan; the COMPOSITE index (not the base table) is walked for
+  COUNT(DISTINCT). No regression: the pre-existing "shadow schema" test still
+  picks the single-column index via min_by_key. fmt clean; `clippy -p
+  fsqlite-vdbe --lib -- -D warnings` clean.
+- PERF: composite-case magnitude NOT separately benched — the benefit is
+  INHERITED (composite DISTINCT/COUNT-DISTINCT now uses the loose scan / index
+  walk instead of the sorter / full-scan dedup, verified by the fast-path-fires
+  EXPLAIN assertions). Do NOT claim a specific N-x for composite without a
+  dedicated same-worker bench; the honest claim is "now served by the proven
+  fast path instead of the fallback."
+- Preflight DistinctLooseScanCompositeIndex=allowed. Files: codegen.rs,
+  distinct_loose_scan_oracle.rs, count_distinct_index_walk_oracle.rs.
+- ENV NOTE (unrelated to this change): `cargo clippy -p fsqlite -p fsqlite-vdbe
+  --all-targets` failed with `unresolved import io_uring` in fsqlite-vfs on the
+  rch worker (a target enabled by --all-targets pulls the io_uring feature which
+  did not resolve there); the normal `-p fsqlite` test build of the full stack
+  compiled cleanly and both oracles ran. Pre-existing/environmental, in a crate
+  this change does not touch.
+
+## 2026-07-23 - KEEP (conformance-gated): extend the DISTINCT loose/skip scan to MULTI-COLUMN `SELECT DISTINCT a, b, …` over a leading-prefix index
+
+- Result type: coverage-extension KEEP, building on the single-column composite
+  KEEP above. `SELECT DISTINCT a, b, …` (N plain BINARY columns in SELECT order)
+  is now served by the loose/skip scan whenever an index's LEADING N key terms
+  are exactly those columns in that order (each ASC BINARY) — instead of the
+  dedup sorter. Work scales with the number of distinct N-tuples, not rows.
+- CHANGE (codegen.rs): `distinct_loose_scan_plan` now collects all output column
+  names (each plain, non-generated, BINARY) and matches them to an index's
+  leading N terms via `(0..n).all(...)` (name-in-order + `!key_term_descending(i)`
+  + BINARY collation), still `min_by_key(key_term_count)` for the narrowest
+  index; `DistinctLooseScan` carries `key_col_count`. `codegen_select_distinct_
+  loose_scan` generalized from 1 to N: reads index columns 0..N-1 into
+  contiguous `out_regs`, `alloc_regs(n)` for the probe + cur blocks, N `Copy`s
+  BEFORE `ResultRow` (drain-safe), the adaptive Next probe does N `Column` reads
+  + N `Ne` checks (NULLEQ 0x80 + BINARY; a change on ANY column jumps back to
+  emit), and an N-field `MakeRecord` + `SeekGT` skips the whole leading-tuple
+  run. n=1 reproduces the original single-column emitter exactly.
+- WHY BYTE-EXACT (the risk that did NOT materialize): for `SELECT DISTINCT
+  <prefix cols>` over a covering index, C SQLite walks the same index and emits
+  the distinct tuples in index order; the skip scan emits the same tuples in the
+  same order (just skipping duplicates faster). Restricting to output-columns =
+  index-leading-prefix IN ORDER keeps the emit order identical; reversed /
+  non-prefix orders DECLINE to the sorter (verified). The N-field prefix probe
+  `[v0..vN-1]` clears all entries sharing that leading tuple via the same
+  UpperBound-bias shorter-prefix rule as the 1-field case.
+- GATE (deterministic): byte-exact vs rusqlite. distinct_loose_scan_oracle +1
+  test (2-col int with NULLs in each column; 2-col DISTINCT as a prefix of a
+  3-term index (a,b,c); TEXT+INT 2-col; `ORDER BY a,b` byte-exact) plus a
+  DECLINE control (`DISTINCT b, a` reversed => SorterOpen fires, set-equal). All
+  5 loose-scan oracle tests pass, no hang (1.04s), no regression (single-column
+  + composite tests still pass). fmt clean; `clippy -p fsqlite-vdbe --lib -D
+  warnings` clean.
+- PERF: multi-column magnitude NOT separately benched; benefit inherited (uses
+  the proven skip scan instead of the dedup sorter, verified by the no-SorterOpen
+  EXPLAIN gate). Common shape now accelerated: `CREATE INDEX ix ON t(a, b);
+  SELECT DISTINCT a, b`.
+- Preflight DistinctLooseScanCompositeIndex=allowed (same lane). Files:
+  codegen.rs, distinct_loose_scan_oracle.rs. See bd-azfqc.

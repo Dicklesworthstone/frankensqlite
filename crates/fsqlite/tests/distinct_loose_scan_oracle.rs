@@ -99,6 +99,196 @@ fn assert_same_set(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     );
 }
 
+/// `SELECT DISTINCT <col>` served by the loose/skip scan over a COMPOSITE index whose LEADING key
+/// term is the DISTINCT column. Only index column 0 is read and the probe is a 1-field prefix, so
+/// entries sharing the leading value (with different trailing terms) are all cleared by one
+/// `SeekGT [value]` exactly like a single-column index. Byte-exact vs rusqlite, and the skip scan
+/// must fire (no dedup sorter) even though only a composite index exists.
+#[test]
+fn distinct_loose_scan_composite_leading_term_matches_rusqlite() {
+    // ---- Composite (a, b) index, NO single-column index on `a`; many dup `a` runs + a NULL run. ----
+    let mut ins = Vec::new();
+    for i in 1..=2000 {
+        let a = if i % 41 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 13).to_string()
+        };
+        // `b` varies within each `a` group so the leading-value run spans multiple composite entries.
+        ins.push(format!("INSERT INTO ct VALUES ({i}, {a}, {});", i % 7));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE ct (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);",
+            "CREATE INDEX idx_ab ON ct(a, b);",
+        ],
+        &ins,
+    );
+    assert!(
+        !has_op(&f, "SELECT DISTINCT a FROM ct", "SorterOpen"),
+        "loose scan should serve SELECT DISTINCT a over the composite index idx_ab(a, b) (no SorterOpen)"
+    );
+    assert_same(&f, &r, "SELECT DISTINCT a FROM ct");
+    assert_same(&f, &r, "SELECT DISTINCT a FROM ct ORDER BY a");
+
+    // ---- TEXT leading term, composite (s, n); dup runs + NULLs. ----
+    let mut tins = Vec::new();
+    for i in 1..=600 {
+        let s = if i % 29 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'g{:02}'", i % 9)
+        };
+        tins.push(format!("INSERT INTO cts VALUES ({i}, {s}, {});", i % 4));
+    }
+    let (f2, r2) = both(
+        &[
+            "CREATE TABLE cts (id INTEGER PRIMARY KEY, s TEXT, n INTEGER);",
+            "CREATE INDEX idx_sn ON cts(s, n);",
+        ],
+        &tins,
+    );
+    assert!(
+        !has_op(&f2, "SELECT DISTINCT s FROM cts", "SorterOpen"),
+        "loose scan should serve SELECT DISTINCT s over composite idx_sn(s, n)"
+    );
+    assert_same(&f2, &r2, "SELECT DISTINCT s FROM cts");
+
+    // ---- A trailing-DESC term must not disqualify: only the ASC BINARY LEADING term governs. ----
+    let mut dins = Vec::new();
+    for i in 1..=800 {
+        dins.push(format!(
+            "INSERT INTO cd VALUES ({i}, {}, {});",
+            i % 6,
+            i % 3
+        ));
+    }
+    let (f3, r3) = both(
+        &[
+            "CREATE TABLE cd (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);",
+            "CREATE INDEX idx_ad ON cd(a ASC, b DESC);",
+        ],
+        &dins,
+    );
+    assert!(
+        !has_op(&f3, "SELECT DISTINCT a FROM cd", "SorterOpen"),
+        "loose scan should serve SELECT DISTINCT a over idx_ad(a ASC, b DESC) — only leading term governs"
+    );
+    assert_same(&f3, &r3, "SELECT DISTINCT a FROM cd");
+
+    // ---- Both a single-column AND a composite index exist: still correct (narrowest preferred). ----
+    let mut bins = Vec::new();
+    for i in 1..=500 {
+        bins.push(format!(
+            "INSERT INTO cb VALUES ({i}, {}, {});",
+            i % 10,
+            i % 5
+        ));
+    }
+    let (f4, r4) = both(
+        &[
+            "CREATE TABLE cb (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);",
+            "CREATE INDEX idx_b_ab ON cb(a, b);",
+            "CREATE INDEX idx_b_a ON cb(a);",
+        ],
+        &bins,
+    );
+    assert!(!has_op(&f4, "SELECT DISTINCT a FROM cb", "SorterOpen"));
+    assert_same(&f4, &r4, "SELECT DISTINCT a FROM cb");
+}
+
+/// `SELECT DISTINCT a, b, …` (N columns) served by the loose/skip scan over an index whose LEADING N
+/// key terms are exactly those columns in SELECT order: the scan reads index columns 0..N-1, emits the
+/// tuple once, and `SeekGT [v0..vN-1]` skips the whole run. Byte-exact vs rusqlite (both walk the same
+/// covering index in the same order); the skip scan must fire (no dedup sorter). Reversed / non-prefix
+/// column orders correctly DECLINE to the sorter (still correct — asserted as a set).
+#[test]
+fn distinct_loose_scan_multi_column_prefix_matches_rusqlite() {
+    // ---- Two-column DISTINCT over index (a, b); dup (a,b) pairs + NULLs in each column. ----
+    let mut ins = Vec::new();
+    for i in 1..=3000 {
+        let a = if i % 43 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 9).to_string()
+        };
+        let b = if i % 31 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 5).to_string()
+        };
+        ins.push(format!("INSERT INTO mt VALUES ({i}, {a}, {b});"));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE mt (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);",
+            "CREATE INDEX idx_ab ON mt(a, b);",
+        ],
+        &ins,
+    );
+    assert!(
+        !has_op(&f, "SELECT DISTINCT a, b FROM mt", "SorterOpen"),
+        "multi-col loose scan should serve SELECT DISTINCT a, b over idx_ab(a, b) (no SorterOpen)"
+    );
+    assert_same(&f, &r, "SELECT DISTINCT a, b FROM mt");
+    assert_same(&f, &r, "SELECT DISTINCT a, b FROM mt ORDER BY a, b");
+
+    // ---- Two-column DISTINCT as a PREFIX of a 3-term index (a, b, c). ----
+    let mut pins = Vec::new();
+    for i in 1..=2000 {
+        pins.push(format!(
+            "INSERT INTO pt VALUES ({i}, {}, {}, {});",
+            i % 7,
+            i % 4,
+            i % 3
+        ));
+    }
+    let (f2, r2) = both(
+        &[
+            "CREATE TABLE pt (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+            "CREATE INDEX idx_abc ON pt(a, b, c);",
+        ],
+        &pins,
+    );
+    assert!(
+        !has_op(&f2, "SELECT DISTINCT a, b FROM pt", "SorterOpen"),
+        "multi-col loose scan should serve SELECT DISTINCT a, b over the 3-term prefix idx_abc(a, b, c)"
+    );
+    assert_same(&f2, &r2, "SELECT DISTINCT a, b FROM pt");
+
+    // ---- TEXT + INTEGER two-column DISTINCT over (s, n). ----
+    let mut tins = Vec::new();
+    for i in 1..=1500 {
+        let s = if i % 37 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'g{}'", i % 6)
+        };
+        tins.push(format!("INSERT INTO st VALUES ({i}, {s}, {});", i % 4));
+    }
+    let (f3, r3) = both(
+        &[
+            "CREATE TABLE st (id INTEGER PRIMARY KEY, s TEXT, n INTEGER);",
+            "CREATE INDEX idx_sn ON st(s, n);",
+        ],
+        &tins,
+    );
+    assert!(
+        !has_op(&f3, "SELECT DISTINCT s, n FROM st", "SorterOpen"),
+        "multi-col loose scan should serve SELECT DISTINCT s, n over idx_sn(s, n)"
+    );
+    assert_same(&f3, &r3, "SELECT DISTINCT s, n FROM st");
+
+    // ---- DECLINE controls: reversed / non-prefix column order falls back to the sorter (still
+    // correct as a SET; bare-DISTINCT row order on the fallback is implementation-defined). ----
+    // `DISTINCT b, a` is NOT the leading prefix of idx_ab(a, b) in order, so it must decline.
+    assert!(
+        has_op(&f, "SELECT DISTINCT b, a FROM mt", "SorterOpen"),
+        "reversed column order must decline the loose scan (falls to the sorter)"
+    );
+    assert_same_set(&f, &r, "SELECT DISTINCT b, a FROM mt");
+}
+
 #[test]
 fn distinct_loose_scan_matches_rusqlite() {
     // ---- Main eligible table: few distinct values among many rows, with a NULL run. ----
