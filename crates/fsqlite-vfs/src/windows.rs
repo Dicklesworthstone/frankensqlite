@@ -1749,54 +1749,40 @@ impl VfsFile for WindowsFile {
         Ok(FileIdentity::from_file(self.file_ref()?)?)
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        let mut total = 0_usize;
-        while total < buf.len() {
-            let read_offset = offset
-                .checked_add(u64::try_from(total).map_err(|_| FrankenError::OutOfRange {
-                    what: "read offset".to_string(),
-                    value: total.to_string(),
-                })?)
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "read offset".to_string(),
-                    value: "overflow".to_string(),
-                })?;
-            let n = self.file_ref()?.seek_read(&mut buf[total..], read_offset)?;
-            if n == 0 {
-                break;
-            }
-            total += n;
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+            let requested = buf.len();
+            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)?;
+            buf.copy_from_slice(&data);
+            Ok(total)
         }
-        if total < buf.len() {
-            buf[total..].fill(0);
-        }
-        Ok(total)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        let mut total = 0_usize;
-        while total < buf.len() {
-            let write_offset = offset
-                .checked_add(u64::try_from(total).map_err(|_| FrankenError::OutOfRange {
-                    what: "write offset".to_string(),
-                    value: total.to_string(),
-                })?)
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "write offset".to_string(),
-                    value: "overflow".to_string(),
-                })?;
-            let n = self.file_mut()?.seek_write(&buf[total..], write_offset)?;
-            if n == 0 {
-                return Err(FrankenError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "seek_write returned 0",
-                )));
-            }
-            total += n;
+    fn write<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+            let data = buf.to_vec();
+            spawn_blocking_io(move || write_owned_at(file, data, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)
         }
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2178,30 +2164,6 @@ impl VfsFile for WindowsFile {
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
         self.ensure_open()?;
         self.release_shm_owner_state(delete)
-    }
-}
-
-impl crate::traits::AsyncVfsDataPath for WindowsFile {
-    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
-        let requested = buf.len();
-        let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
-            .await
-            .map_err(FrankenError::Io)?;
-        checkpoint_or_abort(cx)?;
-        buf.copy_from_slice(&data);
-        Ok(total)
-    }
-
-    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
-        let data = buf.to_vec();
-        spawn_blocking_io(move || write_owned_at(file, data, offset))
-            .await
-            .map_err(FrankenError::Io)?;
-        checkpoint_or_abort(cx)
     }
 }
 

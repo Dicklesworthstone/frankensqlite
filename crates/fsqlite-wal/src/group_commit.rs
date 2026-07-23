@@ -1619,7 +1619,7 @@ impl GroupCommitConsolidator {
 /// frame in the batch, maintaining the checksum chain invariant.
 ///
 /// Returns the number of frames written.
-pub fn write_consolidated_frames<F: VfsFile>(
+pub async fn write_consolidated_frames<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     batches: &[TransactionFrameBatch],
@@ -1650,7 +1650,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
     );
     let _guard = span.enter();
 
-    wal.append_frame_iter(cx, total_frames, frame_refs)?;
+    wal.append_frame_iter(cx, total_frames, frame_refs).await?;
     wal.durable_sync(cx, SyncKind::FullDurable)?;
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
 
@@ -1677,6 +1677,7 @@ mod tests {
 
     use super::*;
     use crate::checksum::WalSalts;
+    use crate::test_support::FutureResultTestExt as _;
 
     const PAGE_SIZE: u32 = 4096;
 

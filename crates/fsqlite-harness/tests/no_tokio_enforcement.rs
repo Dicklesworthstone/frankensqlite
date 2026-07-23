@@ -205,32 +205,30 @@ fn test_cx_parameter_on_vfs_trait() {
     use fsqlite_types::cx::Cx;
     use fsqlite_vfs::VfsFile;
 
-    // Compile-time check: these wrapper functions only compile if the
-    // trait methods accept `&Cx`. Removing `cx` from any call site
-    // would cause a compilation error. We use wrapper functions instead
-    // of function pointer coercions to avoid higher-ranked lifetime issues
-    // with `dyn Trait` objects.
-    fn _close(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    // Compile-time check: these generic wrappers only compile if the trait
+    // methods accept `&Cx`. The async data path makes `VfsFile` intentionally
+    // non-dyn-compatible, so this remains a static-dispatch contract check.
+    fn _close<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.close(cx)
     }
-    fn _read(f: &mut dyn VfsFile, cx: &Cx, buf: &mut [u8], off: u64) -> Result<usize> {
-        f.read(cx, buf, off)
+    async fn _read<F: VfsFile>(f: &F, cx: &Cx, buf: &mut [u8], off: u64) -> Result<usize> {
+        f.read(cx, buf, off).await
     }
-    fn _write(f: &mut dyn VfsFile, cx: &Cx, buf: &[u8], off: u64) -> Result<()> {
-        f.write(cx, buf, off)
+    async fn _write<F: VfsFile>(f: &mut F, cx: &Cx, buf: &[u8], off: u64) -> Result<()> {
+        f.write(cx, buf, off).await
     }
 
-    fn _lock(f: &mut dyn VfsFile, cx: &Cx, level: LockLevel) -> Result<()> {
+    fn _lock<F: VfsFile>(f: &mut F, cx: &Cx, level: LockLevel) -> Result<()> {
         f.lock(cx, level)
     }
-    fn _unlock(f: &mut dyn VfsFile, cx: &Cx, level: LockLevel) -> Result<()> {
+    fn _unlock<F: VfsFile>(f: &mut F, cx: &Cx, level: LockLevel) -> Result<()> {
         f.unlock(cx, level)
     }
-    let _ = _close as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
-    let _ = _read as fn(&mut dyn VfsFile, &Cx, &mut [u8], u64) -> Result<usize>;
-    let _ = _write as fn(&mut dyn VfsFile, &Cx, &[u8], u64) -> Result<()>;
-    let _ = _lock as fn(&mut dyn VfsFile, &Cx, LockLevel) -> Result<()>;
-    let _ = _unlock as fn(&mut dyn VfsFile, &Cx, LockLevel) -> Result<()>;
+    let _ = _close::<fsqlite_vfs::MemoryFile>;
+    let _ = _read::<fsqlite_vfs::MemoryFile>;
+    let _ = _write::<fsqlite_vfs::MemoryFile>;
+    let _ = _lock::<fsqlite_vfs::MemoryFile>;
+    let _ = _unlock::<fsqlite_vfs::MemoryFile>;
 }
 
 // ---------------------------------------------------------------------------

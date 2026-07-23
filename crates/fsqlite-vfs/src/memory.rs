@@ -821,109 +821,129 @@ impl VfsFile for MemoryFile {
         Ok(Some(FileIdentity::from_memory_parts(namespace, object)))
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        let storage = self.storage.lock().map_err(|_| lock_err())?;
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let storage = self.storage.lock().map_err(|_| lock_err())?;
 
-        let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
-        let file_len = storage.data.len();
+            let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
+            let file_len = storage.data.len();
 
-        if offset >= file_len {
+            if offset >= file_len {
+                drop(storage);
+                buf.fill(0);
+                return Ok(0);
+            }
+
+            let available = file_len - offset;
+            let to_read = buf.len().min(available);
+            buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
             drop(storage);
-            buf.fill(0);
-            return Ok(0);
-        }
 
-        let available = file_len - offset;
-        let to_read = buf.len().min(available);
-        buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
-        drop(storage);
-
-        // Zero-fill the rest if short read.
-        if to_read < buf.len() {
-            buf[to_read..].fill(0);
-        }
-
-        Ok(to_read)
-    }
-
-    #[allow(clippy::significant_drop_tightening)]
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-        Self::write_into_storage(&mut inner, &mut storage, buf, offset)
-    }
-
-    #[allow(clippy::significant_drop_tightening)]
-    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        if writes.is_empty() {
-            return Ok(());
-        }
-        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-
-        if writes.len() == 1 {
-            let (offset, data) = writes[0];
-            return Self::write_into_storage(&mut inner, &mut storage, data, offset);
-        }
-
-        let mut normalized_writes = Vec::with_capacity(writes.len());
-        let mut required_len = storage.data.len();
-        for &(offset, data) in writes {
-            if data.is_empty() {
-                continue;
+            // Zero-fill the rest if short read.
+            if to_read < buf.len() {
+                buf[to_read..].fill(0);
             }
-            let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
-            required_len = required_len.max(end);
-            normalized_writes.push((offset, data));
-        }
 
-        if normalized_writes.is_empty() {
-            return Ok(());
+            Ok(to_read)
         }
+    }
 
-        let old_len = storage.data.len();
-        let old_reserved = storage.data.capacity();
-        if required_len > old_reserved {
-            let proposed_reserved = next_growth_target(
+    #[allow(clippy::significant_drop_tightening)]
+    fn write<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+            Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn write_page_batch<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            if writes.is_empty() {
+                return Ok(());
+            }
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+
+            if writes.len() == 1 {
+                let (offset, data) = writes[0];
+                return Self::write_into_storage(&mut inner, &mut storage, data, offset);
+            }
+
+            let mut normalized_writes = Vec::with_capacity(writes.len());
+            let mut required_len = storage.data.len();
+            for &(offset, data) in writes {
+                if data.is_empty() {
+                    continue;
+                }
+                let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
+                required_len = required_len.max(end);
+                normalized_writes.push((offset, data));
+            }
+
+            if normalized_writes.is_empty() {
+                return Ok(());
+            }
+
+            let old_len = storage.data.len();
+            let old_reserved = storage.data.capacity();
+            if required_len > old_reserved {
+                let proposed_reserved = next_growth_target(
+                    old_reserved,
+                    required_len,
+                    inner.config.initial_reserve_bytes,
+                    inner.config.growth_chunk_bytes,
+                );
+                ensure_total_reserved_within_limit(
+                    &inner.usage,
+                    old_reserved,
+                    proposed_reserved,
+                    inner.config.max_bytes,
+                )?;
+                storage
+                    .data
+                    .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                    .map_err(|_| FrankenError::OutOfMemory)?;
+            }
+
+            if required_len > storage.data.len() {
+                storage.data.resize(required_len, 0);
+            }
+
+            for (offset, data) in normalized_writes {
+                let end = offset + data.len();
+                if end == storage.data.len() && offset == storage.data.len() - data.len() {
+                    storage.data[offset..].copy_from_slice(data);
+                } else {
+                    storage.data[offset..end].copy_from_slice(data);
+                }
+            }
+            inner.usage.apply_file_change(
+                old_len,
                 old_reserved,
-                required_len,
-                inner.config.initial_reserve_bytes,
-                inner.config.growth_chunk_bytes,
+                storage.data.len(),
+                storage.data.capacity(),
             );
-            ensure_total_reserved_within_limit(
-                &inner.usage,
-                old_reserved,
-                proposed_reserved,
-                inner.config.max_bytes,
-            )?;
-            storage
-                .data
-                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
-                .map_err(|_| FrankenError::OutOfMemory)?;
+            Ok(())
         }
-
-        if required_len > storage.data.len() {
-            storage.data.resize(required_len, 0);
-        }
-
-        for (offset, data) in normalized_writes {
-            let end = offset + data.len();
-            if end == storage.data.len() && offset == storage.data.len() - data.len() {
-                storage.data[offset..].copy_from_slice(data);
-            } else {
-                storage.data[offset..end].copy_from_slice(data);
-            }
-        }
-        inner.usage.apply_file_change(
-            old_len,
-            old_reserved,
-            storage.data.len(),
-            storage.data.capacity(),
-        );
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -1107,21 +1127,18 @@ impl VfsFile for MemoryFile {
     }
 }
 
-impl crate::traits::AsyncVfsDataPath for MemoryFile {
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        // MemoryFile only takes bounded in-process mutexes. Keeping the work
-        // inside this future makes its first poll complete immediately without
-        // allocating, yielding, or entering the blocking pool.
-        self.read(cx, buf, offset)
+#[cfg(test)]
+impl MemoryFile {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
     }
 
-    #[allow(clippy::significant_drop_tightening, clippy::unused_async_trait_impl)]
-    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-        Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
+    }
+
+    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write_page_batch(self, cx, writes))
     }
 }
 

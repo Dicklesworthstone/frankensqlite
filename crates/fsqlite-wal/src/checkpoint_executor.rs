@@ -97,7 +97,7 @@ pub struct CheckpointExecutionResult {
 ///
 /// Propagates any I/O error from `WalFile`, `CheckpointTarget`, or VFS.
 #[allow(clippy::too_many_lines)]
-pub fn execute_checkpoint<F: VfsFile>(
+pub async fn execute_checkpoint<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     mode: CheckpointMode,
@@ -133,7 +133,7 @@ pub fn execute_checkpoint<F: VfsFile>(
 
         // Pass 1: Find the latest frame index for each page in the checkpoint range.
         for frame_idx in start..end {
-            let header = wal.read_frame_header(cx, frame_idx)?;
+            let header = wal.read_frame_header(cx, frame_idx).await?;
 
             let page_no =
                 PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
@@ -167,7 +167,7 @@ pub fn execute_checkpoint<F: VfsFile>(
                 }
             }
 
-            wal.read_frame_into(cx, *frame_idx, &mut frame_buf)?;
+            wal.read_frame_into(cx, *frame_idx, &mut frame_buf).await?;
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
             target.write_page(cx, *page_no, page_data)?;
 
@@ -212,7 +212,8 @@ pub fn execute_checkpoint<F: VfsFile>(
     // path can verify on-disk DB state matches the post-checkpoint
     // state before truncating (both bd-yfdb6).
     let wal_was_reset =
-        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)?;
+        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)
+            .await?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -241,7 +242,7 @@ pub fn execute_checkpoint<F: VfsFile>(
     })
 }
 
-fn apply_checkpoint_post_action<F: VfsFile>(
+async fn apply_checkpoint_post_action<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
@@ -295,7 +296,7 @@ fn apply_checkpoint_post_action<F: VfsFile>(
                     });
                 }
             }
-            wal.reset(cx, new_seq, new_salts, truncate)?;
+            wal.reset(cx, new_seq, new_salts, truncate).await?;
             info!(
                 new_checkpoint_seq = new_seq,
                 action = ?post_action,
@@ -353,6 +354,7 @@ mod tests {
 
     use super::*;
     use crate::checksum::WalSalts;
+    use crate::test_support::FutureResultTestExt as _;
 
     const PAGE_SIZE: u32 = 4096;
 

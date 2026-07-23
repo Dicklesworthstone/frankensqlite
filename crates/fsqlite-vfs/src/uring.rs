@@ -939,17 +939,22 @@ impl VfsFile for IoUringFile {
         self.inner.file_identity()
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        // The object-safe control-plane trait cannot drive a Future. Keep its
-        // compatibility path honestly synchronous; async callers must use
-        // AsyncVfsDataPath, which never blocks an executor on this fallback.
-        record_io_uring_read_unix_fallback();
-        self.inner.read(cx, buf, offset)
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        self.read_data_path(cx, buf, offset)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        record_io_uring_write_unix_fallback();
-        self.inner.write(cx, buf, offset)
+    fn write<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_data_path(cx, buf, offset)
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -1010,19 +1015,19 @@ impl VfsFile for IoUringFile {
 }
 
 #[cfg(feature = "linux-asupersync-uring")]
-impl crate::traits::AsyncVfsDataPath for IoUringFile {
-    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+impl IoUringFile {
+    async fn read_data_path(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         if buf.is_empty() {
             return Ok(0);
         }
         if !self.runtime.is_available() {
             record_io_uring_read_unix_fallback();
-            return crate::traits::AsyncVfsDataPath::read_async(&self.inner, cx, buf, offset).await;
+            return self.inner.read(cx, buf, offset).await;
         }
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_read_unix_fallback();
-            return crate::traits::AsyncVfsDataPath::read_async(&self.inner, cx, buf, offset).await;
+            return self.inner.read(cx, buf, offset).await;
         };
         let file = self.inner.canonical_file()?;
 
@@ -1049,8 +1054,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
             if FORCE_ASUPERSYNC_READ_FAIL.load(Ordering::Acquire) {
                 self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
                 record_io_uring_read_unix_fallback();
-                return crate::traits::AsyncVfsDataPath::read_async(&self.inner, cx, buf, offset)
-                    .await;
+                return self.inner.read(cx, buf, offset).await;
             }
 
             let chunk_len = chunk_end - total;
@@ -1067,8 +1071,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                     "shared io_uring driver unavailable for this context; using Unix async I/O"
                 );
                 record_io_uring_read_unix_fallback();
-                return crate::traits::AsyncVfsDataPath::read_async(&self.inner, cx, buf, offset)
-                    .await;
+                return self.inner.read(cx, buf, offset).await;
             }
 
             let completion = receiver
@@ -1098,13 +1101,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                         self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
                     }
                     record_io_uring_read_unix_fallback();
-                    return crate::traits::AsyncVfsDataPath::read_async(
-                        &self.inner,
-                        cx,
-                        buf,
-                        offset,
-                    )
-                    .await;
+                    return self.inner.read(cx, buf, offset).await;
                 }
                 DriverCompletion::Write { .. } => {
                     return Err(FrankenError::Io(io::Error::other(
@@ -1138,20 +1135,18 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
         Ok(total)
     }
 
-    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    async fn write_data_path(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         if buf.is_empty() {
             return Ok(());
         }
         if !self.runtime.is_available() {
             record_io_uring_write_unix_fallback();
-            return crate::traits::AsyncVfsDataPath::write_async(&self.inner, cx, buf, offset)
-                .await;
+            return self.inner.write(cx, buf, offset).await;
         }
         let Some(native_cx) = cx.attached_native_cx() else {
             record_io_uring_write_unix_fallback();
-            return crate::traits::AsyncVfsDataPath::write_async(&self.inner, cx, buf, offset)
-                .await;
+            return self.inner.write(cx, buf, offset).await;
         };
         let file = self.inner.canonical_file()?;
 
@@ -1178,8 +1173,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
             if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
                 self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
                 record_io_uring_write_unix_fallback();
-                return crate::traits::AsyncVfsDataPath::write_async(&self.inner, cx, buf, offset)
-                    .await;
+                return self.inner.write(cx, buf, offset).await;
             }
 
             let (request_id, mut receiver) = self.runtime.enqueue_write(
@@ -1199,8 +1193,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                     "shared io_uring driver unavailable for this context; using Unix async I/O"
                 );
                 record_io_uring_write_unix_fallback();
-                return crate::traits::AsyncVfsDataPath::write_async(&self.inner, cx, buf, offset)
-                    .await;
+                return self.inner.write(cx, buf, offset).await;
             }
 
             let completion = receiver
@@ -1227,13 +1220,7 @@ impl crate::traits::AsyncVfsDataPath for IoUringFile {
                         self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
                     }
                     record_io_uring_write_unix_fallback();
-                    return crate::traits::AsyncVfsDataPath::write_async(
-                        &self.inner,
-                        cx,
-                        buf,
-                        offset,
-                    )
-                    .await;
+                    return self.inner.write(cx, buf, offset).await;
                 }
                 DriverCompletion::Read { .. } => {
                     return Err(FrankenError::Io(io::Error::other(
@@ -1277,8 +1264,6 @@ mod tests {
     use fsqlite_types::flags::VfsOpenFlags;
     use std::future::Future;
     use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
-
-    use crate::traits::AsyncVfsDataPath;
 
     static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1442,11 +1427,10 @@ mod tests {
         let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
-        file.write(&cx, b"hello io_uring", 0)
-            .expect("write should succeed");
+        block_on_test(&cx, file.write(&cx, b"hello io_uring", 0)).expect("write should succeed");
 
         let mut buf = [0_u8; 14];
-        let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0)).expect("read should succeed");
         assert_eq!(n, 14);
         assert_eq!(&buf, b"hello io_uring");
         file.close(&cx).expect("close should succeed");
@@ -1465,11 +1449,10 @@ mod tests {
         let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
-        file.write(&cx, b"metrics", 0)
-            .expect("write should succeed");
+        block_on_test(&cx, file.write(&cx, b"metrics", 0)).expect("write should succeed");
 
         let mut buf = [0_u8; 7];
-        let _ = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        let _ = block_on_test(&cx, file.read(&cx, &mut buf, 0)).expect("read should succeed");
 
         let snapshot = io_uring_latency_snapshot();
         if vfs.is_available() {
@@ -1510,14 +1493,14 @@ mod tests {
 
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("shared_ring_100_reads.db");
-            let (file, _) = vfs
+            let (mut file, _) = vfs
                 .open(&cx, Some(&path), open_flags_create_unlocked())
                 .expect("open should succeed");
             let mut seeded = vec![0_u8; READ_COUNT * READ_SIZE];
             for (page_index, page) in seeded.chunks_exact_mut(READ_SIZE).enumerate() {
                 page.fill(u8::try_from(page_index).expect("100 pages fit in u8"));
             }
-            file.write_async(&cx, &seeded, 0)
+            file.write(&cx, &seeded, 0)
                 .await
                 .expect("seed write should succeed");
 
@@ -1535,7 +1518,7 @@ mod tests {
                         NativeCx::current().expect("runtime task should install Cx");
                     task_cx.set_native_cx(task_native_cx);
                     let mut data = vec![0_u8; READ_SIZE];
-                    let bytes_read = task_file.read_async(&task_cx, &mut data, offset).await?;
+                    let bytes_read = task_file.read(&task_cx, &mut data, offset).await?;
                     Ok::<_, FrankenError>((page_index, bytes_read, data))
                 }));
             }
@@ -1660,11 +1643,10 @@ mod tests {
         let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed via unix fallback");
-        file.write(&cx, b"fallback-metrics", 0)
+        block_on_test(&cx, file.write(&cx, b"fallback-metrics", 0))
             .expect("write should succeed via unix path");
         let mut buf = [0_u8; 16];
-        let _ = file
-            .read(&cx, &mut buf, 0)
+        let _ = block_on_test(&cx, file.read(&cx, &mut buf, 0))
             .expect("read should succeed via unix path");
 
         let snapshot = io_uring_latency_snapshot();
@@ -1772,11 +1754,10 @@ mod tests {
             | VfsOpenFlags::DELETEONCLOSE;
         let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp file");
 
-        file.write(&cx, b"temp data", 0)
+        block_on_test(&cx, file.write(&cx, b"temp data", 0))
             .expect("write should fall back without disabling runtime");
         let mut buf = [0_u8; 9];
-        let n = file
-            .read(&cx, &mut buf, 0)
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
             .expect("read should fall back without disabling runtime");
 
         assert_eq!(n, 9);
@@ -1822,10 +1803,10 @@ mod tests {
             .expect("canonical descriptor must remain available");
         assert!(Arc::ptr_eq(&canonical, &canonical_again));
 
-        file.write(&cx, b"main-db", 0)
+        block_on_test(&cx, file.write(&cx, b"main-db", 0))
             .expect("write should succeed via unix path");
         let mut buf = [0_u8; 7];
-        let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0)).expect("read should succeed");
         assert_eq!(n, 7);
         assert_eq!(&buf, b"main-db");
         assert!(
@@ -1869,10 +1850,9 @@ mod tests {
             .expect("canonical descriptor must remain available");
         assert!(Arc::ptr_eq(&canonical, &canonical_again));
 
-        file.write(&cx, b"wal", 0)
-            .expect("write should succeed via unix path");
+        block_on_test(&cx, file.write(&cx, b"wal", 0)).expect("write should succeed via unix path");
         let mut buf = [0_u8; 3];
-        let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0)).expect("read should succeed");
         assert_eq!(n, 3);
         assert_eq!(&buf, b"wal");
         assert!(
@@ -1901,12 +1881,12 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_abort_propagation.db");
-        let (file, _) = vfs
+        let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_ABORT);
-        let err = block_on_test(&cx, file.write_async(&cx, b"abort", 0))
+        let err = block_on_test(&cx, file.write(&cx, b"abort", 0))
             .expect_err("write should propagate abort");
 
         assert!(matches!(err, FrankenError::Abort));
@@ -1939,7 +1919,7 @@ mod tests {
 
         let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_READ_ABORT);
         let mut buf = [0_u8; 4];
-        let err = match block_on_test(&cx, file.read_async(&cx, &mut buf, 0)) {
+        let err = match block_on_test(&cx, file.read(&cx, &mut buf, 0)) {
             Ok(bytes) => {
                 return Err(FrankenError::Io(io::Error::other(format!(
                     "read should propagate abort, read {bytes} bytes"
@@ -1994,11 +1974,10 @@ mod tests {
             }));
         }
 
-        file.write(&cx, b"fallback", 0)
+        block_on_test(&cx, file.write(&cx, b"fallback", 0))
             .expect("write should fall back and succeed");
         let mut buf = [0_u8; 8];
-        let n = file
-            .read(&cx, &mut buf, 0)
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
             .expect("read should fall back and succeed");
         assert_eq!(n, 8);
         assert_eq!(&buf, b"fallback");
@@ -2032,11 +2011,10 @@ mod tests {
             format!("disabled:asupersync-shared-uring:{IO_URING_ASUPERSYNC_INIT_FAILED_MSG}")
         );
 
-        file.write(&cx, b"fallback", 0)
+        block_on_test(&cx, file.write(&cx, b"fallback", 0))
             .expect("write should succeed via unix fallback");
         let mut buf = [0_u8; 8];
-        let n = file
-            .read(&cx, &mut buf, 0)
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
             .expect("read should succeed via unix fallback");
         assert_eq!(n, 8);
         assert_eq!(&buf, b"fallback");
@@ -2053,19 +2031,19 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_write_failure.db");
-        let (file, _) = vfs
+        let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         let _force_write_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_FAIL);
-        block_on_test(&cx, file.write_async(&cx, b"fallback", 0))
+        block_on_test(&cx, file.write(&cx, b"fallback", 0))
             .expect("write should succeed via unix fallback");
 
         assert!(vfs.runtime.is_disabled());
         assert!(!vfs.is_available());
 
         let mut buf = [0_u8; 8];
-        let n = block_on_test(&cx, file.read_async(&cx, &mut buf, 0))
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
             .expect("read should use unix path after runtime disable");
         assert_eq!(n, 8);
         assert_eq!(&buf, b"fallback");
@@ -2082,15 +2060,15 @@ mod tests {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_read_failure.db");
-        let (file, _) = vfs
+        let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
-        block_on_test(&cx, file.write_async(&cx, b"fallback", 0)).expect("write should seed data");
+        block_on_test(&cx, file.write(&cx, b"fallback", 0)).expect("write should seed data");
 
         let _force_read_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_READ_FAIL);
         let mut buf = [0_u8; 8];
-        let n = block_on_test(&cx, file.read_async(&cx, &mut buf, 0))
+        let n = block_on_test(&cx, file.read(&cx, &mut buf, 0))
             .expect("read should succeed via unix fallback");
 
         assert_eq!(n, 8);

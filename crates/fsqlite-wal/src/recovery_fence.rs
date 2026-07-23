@@ -456,7 +456,7 @@ pub struct ExpectedPageChecksum {
 ///
 /// `page_size` must be the true on-disk page size; `expected` lists the
 /// post-checkpoint state. Empty `expected` short-circuits to `Match`.
-pub fn verify_checkpoint_checksum_prefix<F: VfsFile>(
+pub async fn verify_checkpoint_checksum_prefix<F: VfsFile>(
     cx: &Cx,
     db_file: &F,
     page_size: u32,
@@ -477,7 +477,7 @@ pub fn verify_checkpoint_checksum_prefix<F: VfsFile>(
                 what: "checksum verify offset".to_owned(),
                 value: exp.page.get().to_string(),
             })?;
-        let n = db_file.read(cx, &mut page_buf, offset)?;
+        let n = db_file.read(cx, &mut page_buf, offset).await?;
         if n < page_size_usize {
             error!(
                 target: "fsqlite.wal.recovery_fence",
@@ -520,7 +520,7 @@ pub fn verify_checkpoint_checksum_prefix<F: VfsFile>(
 /// Returns `Ok(())` when the WAL truncate may proceed;
 /// `Err(FrankenError::DatabaseCorrupt)` on mismatch, matching the
 /// audit-requested "do not truncate; log unrecoverable-error" policy.
-pub fn execute_recovery_barrier<W, F>(
+pub async fn execute_recovery_barrier<W, F>(
     cx: &Cx,
     target: &mut W,
     db_file: &F,
@@ -532,7 +532,7 @@ where
     F: VfsFile,
 {
     ensure_db_fsync_before_wal_truncate(cx, target)?;
-    match verify_checkpoint_checksum_prefix(cx, db_file, page_size, expected)? {
+    match verify_checkpoint_checksum_prefix(cx, db_file, page_size, expected).await? {
         CheckpointChecksumVerdict::Match => Ok(()),
         CheckpointChecksumVerdict::Mismatch { first_bad_page } => {
             error!(
@@ -566,6 +566,7 @@ mod tests {
     use fsqlite_vfs::traits::Vfs;
 
     use super::*;
+    use crate::test_support::FutureResultTestExt as _;
 
     fn test_cx() -> Cx {
         Cx::new()

@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
-    AggregateFunction, AuthAction, AuthResult, Authorizer, CollationFunction,
-    ColumnContext, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor, WindowFunction,
+    AggregateFunction, AuthAction, AuthResult, Authorizer, CollationFunction, ColumnContext,
+    IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor, WindowFunction,
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -16,11 +16,21 @@ impl VfsFile for DemoFile {
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
-    fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
-        Ok(0)
+    fn read<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _buf: &'a mut [u8],
+        _offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async { Ok(0) }
     }
-    fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
-        Ok(())
+    fn write<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _buf: &'a [u8],
+        _offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
     }
     fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
         Ok(())

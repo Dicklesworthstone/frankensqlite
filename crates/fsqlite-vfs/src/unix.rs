@@ -153,6 +153,7 @@ where
 ///
 /// Returns the number of bytes read before EOF (GH #200: interruption is
 /// retried in place instead of surfacing `Interrupted` mid-buffer).
+#[cfg(test)]
 fn read_full_at<R>(mut read_at: R, buf: &mut [u8], offset: u64, what: &'static str) -> Result<usize>
 where
     R: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
@@ -1949,25 +1950,50 @@ impl VfsFile for UnixFile {
         Ok(Some(self.inode_key))
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "read")?;
-        let file = self.file_ref();
-        let total = read_full_at(|dst, off| file.read_at(dst, off), buf, offset, "read")?;
-
-        // Zero-fill short reads (SQLite requirement).
-        if total < buf.len() {
-            buf[total..].fill(0);
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "read")?;
+            let file = Arc::clone(
+                self.file
+                    .as_ref()
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+            );
+            let requested = buf.len();
+            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)?;
+            buf.copy_from_slice(&data);
+            Ok(total)
         }
-
-        Ok(total)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "write")?;
-        let file = self.file_ref();
-        write_full_at(|src, off| file.write_at(src, off), buf, offset, "write")
+    fn write<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "write")?;
+            let file = Arc::clone(
+                self.file
+                    .as_ref()
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+            );
+            let data = buf.to_vec();
+            spawn_blocking_io(move || write_owned_at(file, data, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)
+        }
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2397,37 +2423,14 @@ impl VfsFile for UnixFile {
     }
 }
 
-impl crate::traits::AsyncVfsDataPath for UnixFile {
-    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "read")?;
-        let file = Arc::clone(
-            self.file
-                .as_ref()
-                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
-        );
-        let requested = buf.len();
-        let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
-            .await
-            .map_err(FrankenError::Io)?;
-        checkpoint_or_abort(cx)?;
-        buf.copy_from_slice(&data);
-        Ok(total)
+#[cfg(test)]
+impl UnixFile {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
     }
 
-    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "write")?;
-        let file = Arc::clone(
-            self.file
-                .as_ref()
-                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
-        );
-        let data = buf.to_vec();
-        spawn_blocking_io(move || write_owned_at(file, data, offset))
-            .await
-            .map_err(FrankenError::Io)?;
-        checkpoint_or_abort(cx)
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
     }
 }
 

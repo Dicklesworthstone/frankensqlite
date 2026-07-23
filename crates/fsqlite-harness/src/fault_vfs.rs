@@ -28,7 +28,7 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_vfs::shm::ShmRegion;
-use fsqlite_vfs::traits::{AsyncVfsDataPath, FileIdentity, Vfs, VfsFile};
+use fsqlite_vfs::traits::{FileIdentity, Vfs, VfsFile};
 use tracing::{debug, debug_span};
 
 /// Bead identifier for tracing/log correlation.
@@ -621,28 +621,42 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
         self.inner.file_identity()
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        match self.state.check_read(&self.path, offset, buf.len()) {
-            ReadDecision::Allow => self.inner.read(cx, buf, offset),
-            ReadDecision::IoError => Err(io_failure_error("fault injection: read failure")),
-            ReadDecision::PoweredOff => Err(power_cut_error()),
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            match self.state.check_read(&self.path, offset, buf.len()) {
+                ReadDecision::Allow => self.inner.read(cx, buf, offset).await,
+                ReadDecision::IoError => Err(io_failure_error("fault injection: read failure")),
+                ReadDecision::PoweredOff => Err(power_cut_error()),
+            }
         }
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        match self.state.check_write(&self.path, offset, buf.len()) {
-            WriteDecision::Allow => self.inner.write(cx, buf, offset),
-            WriteDecision::TornWrite { valid_bytes }
-            | WriteDecision::PartialWrite { valid_bytes } => {
-                let applied = valid_bytes.min(buf.len());
-                if applied > 0 {
-                    self.inner.write(cx, &buf[..applied], offset)?;
+    fn write<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            match self.state.check_write(&self.path, offset, buf.len()) {
+                WriteDecision::Allow => self.inner.write(cx, buf, offset).await,
+                WriteDecision::TornWrite { valid_bytes }
+                | WriteDecision::PartialWrite { valid_bytes } => {
+                    let applied = valid_bytes.min(buf.len());
+                    if applied > 0 {
+                        self.inner.write(cx, &buf[..applied], offset).await?;
+                    }
+                    Err(io_failure_error("fault injection: partial write"))
                 }
-                Err(io_failure_error("fault injection: partial write"))
+                WriteDecision::IoError => Err(io_failure_error("fault injection: write failure")),
+                WriteDecision::DiskFull => Err(FrankenError::DatabaseFull),
+                WriteDecision::PoweredOff => Err(power_cut_error()),
             }
-            WriteDecision::IoError => Err(io_failure_error("fault injection: write failure")),
-            WriteDecision::DiskFull => Err(FrankenError::DatabaseFull),
-            WriteDecision::PoweredOff => Err(power_cut_error()),
         }
     }
 
@@ -692,33 +706,6 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
 
     fn set_busy_timeout_ms(&mut self, ms: u64) {
         self.inner.set_busy_timeout_ms(ms);
-    }
-}
-
-impl<F: AsyncVfsDataPath> AsyncVfsDataPath for FaultInjectingFile<F> {
-    async fn read_async(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        match self.state.check_read(&self.path, offset, buf.len()) {
-            ReadDecision::Allow => self.inner.read_async(cx, buf, offset).await,
-            ReadDecision::IoError => Err(io_failure_error("fault injection: read failure")),
-            ReadDecision::PoweredOff => Err(power_cut_error()),
-        }
-    }
-
-    async fn write_async(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        match self.state.check_write(&self.path, offset, buf.len()) {
-            WriteDecision::Allow => self.inner.write_async(cx, buf, offset).await,
-            WriteDecision::TornWrite { valid_bytes }
-            | WriteDecision::PartialWrite { valid_bytes } => {
-                let applied = valid_bytes.min(buf.len());
-                if applied > 0 {
-                    self.inner.write_async(cx, &buf[..applied], offset).await?;
-                }
-                Err(io_failure_error("fault injection: partial write"))
-            }
-            WriteDecision::IoError => Err(io_failure_error("fault injection: write failure")),
-            WriteDecision::DiskFull => Err(FrankenError::DatabaseFull),
-            WriteDecision::PoweredOff => Err(power_cut_error()),
-        }
     }
 }
 
@@ -1322,6 +1309,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use fsqlite_types::cx::Cx;
     use fsqlite_vfs::MemoryVfs;
     #[cfg(unix)]
@@ -1339,6 +1327,13 @@ mod tests {
 
     fn test_cx() -> Cx {
         Cx::default()
+    }
+
+    fn run_io<F: std::future::Future>(future: F) -> F::Output {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build async VFS test runtime")
+            .block_on(future)
     }
 
     #[cfg(unix)]
@@ -1456,10 +1451,10 @@ mod tests {
         let (mut file, _out_flags) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
         let data = b"hello world";
-        file.write(&cx, data, 0).unwrap();
+        run_io(file.write(&cx, data, 0)).unwrap();
 
         let mut buf = vec![0u8; data.len()];
-        let n = file.read(&cx, &mut buf, 0).unwrap();
+        let n = run_io(file.read(&cx, &mut buf, 0)).unwrap();
         assert_eq!(n, data.len());
         assert_eq!(&buf, data);
 
@@ -1705,9 +1700,8 @@ mod tests {
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
         let (mut file, _) = vfs.open(&cx, Some(Path::new("fault.db")), flags).unwrap();
 
-        let err = file
-            .write(&cx, b"1234", 0)
-            .expect_err("disk-full fault should fail write");
+        let err =
+            run_io(file.write(&cx, b"1234", 0)).expect_err("disk-full fault should fail write");
         assert!(matches!(err, FrankenError::DatabaseFull));
     }
 
