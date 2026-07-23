@@ -25301,23 +25301,29 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                // FK enforcement on DELETE: check/cascade for each row.
-                // Use `fk_cascade_propagation_enabled` (not `fk_enforcement_enabled`)
-                // so that multi-level cascades propagate through intermediate
-                // tables (e.g., grandparent -> parent -> child).
-                if self.fk_cascade_propagation_enabled() {
+                // Validate FK constraints and retain the required actions before
+                // deleting the parent rows. The actions themselves must run only
+                // after the parent delete succeeds and before its AFTER DELETE
+                // triggers, matching SQLite's sqlite3FkActions() ordering.
+                //
+                // Use `fk_cascade_propagation_enabled` (not
+                // `fk_enforcement_enabled`) so that multi-level cascades propagate
+                // through intermediate tables (e.g., grandparent -> parent ->
+                // child).
+                let pending_fk_actions = if self.fk_cascade_propagation_enabled() {
                     let rows_to_check = if !trigger_old_rows.is_empty() {
                         trigger_old_rows.clone()
                     } else {
                         self.collect_delete_trigger_rows(&effective_delete, params)?
                     };
+                    let mut actions = Vec::new();
                     for row_values in &rows_to_check {
-                        let fk_actions = self.check_fk_on_delete(table_name, row_values)?;
-                        for action in &fk_actions {
-                            self.execute_fk_delete_action(action)?;
-                        }
+                        actions.extend(self.check_fk_on_delete(table_name, row_values)?);
                     }
-                }
+                    actions
+                } else {
+                    Vec::new()
+                };
 
                 // Live virtual-table DELETE: route each matching rowid through
                 // the module's xUpdate delete branch so the in-memory module
@@ -25332,6 +25338,10 @@ impl Connection {
                         ));
                     }
                     let affected = self.execute_live_vtab_delete(&effective_delete, params)?;
+
+                    for action in &pending_fk_actions {
+                        self.execute_fk_delete_action(action)?;
+                    }
 
                     // Phase 5G.3: Fire AFTER DELETE triggers.
                     if has_after_delete {
@@ -25376,6 +25386,10 @@ impl Connection {
                     cx,
                     true,
                 )?;
+
+                for action in &pending_fk_actions {
+                    self.execute_fk_delete_action(action)?;
+                }
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -188857,6 +188871,65 @@ mod pager_routing_tests {
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
         let rows = conn.query("SELECT id FROM child;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(4));
+    }
+
+    /// Regression: SQLite executes ON DELETE actions after removing the parent
+    /// row and before firing the parent's AFTER DELETE triggers.
+    #[test]
+    fn test_fk_delete_actions_run_after_parent_delete_before_after_trigger() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL
+                    REFERENCES parent(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER child_parent_must_be_absent
+             BEFORE DELETE ON child
+             WHEN EXISTS (
+                 SELECT 1 FROM parent WHERE id = OLD.parent_id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'cascade ran before parent delete');
+             END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER parent_after_delete_sees_cascade
+             AFTER DELETE ON parent
+             WHEN EXISTS (
+                 SELECT 1 FROM child WHERE parent_id = OLD.id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'parent AFTER DELETE ran before cascade');
+             END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+        conn.execute("INSERT INTO child VALUES (10, 1), (11, 1);")
+            .unwrap();
+
+        conn.execute("DELETE FROM parent WHERE id = 1;")
+            .expect("the parent must be absent before its cascade deletes children");
+
+        let parent_count = conn.query("SELECT COUNT(*) FROM parent;").unwrap();
+        assert_eq!(
+            parent_count[0].values()[0],
+            SqliteValue::Integer(0),
+            "parent row survived successful delete"
+        );
+        let child_count = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(
+            child_count[0].values()[0],
+            SqliteValue::Integer(0),
+            "cascade did not remove child rows"
+        );
     }
 
     /// Regression test for issue #59: INSERT-time FK validation returns wrong
