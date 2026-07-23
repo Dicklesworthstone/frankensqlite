@@ -8,13 +8,16 @@
 use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
+use asupersync::sync::{Notify, RwLock as AsyncRwLock};
 use dashmap::DashMap;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::PageCacheEfficiencySnapshot;
@@ -40,7 +43,9 @@ use crate::page_cache::{
     PageCacheEvictionPolicy, PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache,
 };
 use crate::s3_fifo::S3FifoConfig;
-use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
+use crate::traits::{
+    self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend, WalFuture,
+};
 
 /// Identity-hashed `HashMap<PageNumber, V>` used on the INSERT hot path.
 ///
@@ -692,10 +697,21 @@ enum KeyedWaitResult {
     TimedOut,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct KeyedWaitSlot {
     state: Mutex<u64>,
     cv: Condvar,
+    notify: Notify,
+}
+
+impl Default for KeyedWaitSlot {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+            notify: Notify::new(),
+        }
+    }
 }
 
 impl KeyedWaitSlot {
@@ -727,13 +743,30 @@ impl KeyedWaitSlot {
         }
     }
 
+    async fn wait_for_change_async(&self, observed_generation: u64) -> KeyedWaitResult {
+        if self.generation() != observed_generation {
+            return KeyedWaitResult::Signaled;
+        }
+        match asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK,
+            self.notify.notified(),
+        )
+        .await
+        {
+            Ok(()) => KeyedWaitResult::Signaled,
+            Err(_) => KeyedWaitResult::TimedOut,
+        }
+    }
+
     fn signal(&self) {
         let mut generation = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *generation = generation.saturating_add(1);
+        *generation = generation.wrapping_add(1);
         self.cv.notify_all();
+        self.notify.notify_waiters();
     }
 }
 
@@ -876,6 +909,7 @@ enum WaitForEpochOutcome {
 
 #[derive(Debug, Clone)]
 enum GroupCommitEpochFailure {
+    Abort,
     Busy,
     BusyRecovery,
     BusySnapshot { conflicting_pages: String },
@@ -885,6 +919,7 @@ enum GroupCommitEpochFailure {
 impl GroupCommitEpochFailure {
     fn from_error(error: &FrankenError) -> Self {
         match error {
+            FrankenError::Abort => Self::Abort,
             FrankenError::Busy => Self::Busy,
             FrankenError::BusyRecovery => Self::BusyRecovery,
             FrankenError::BusySnapshot { conflicting_pages } => Self::BusySnapshot {
@@ -896,6 +931,7 @@ impl GroupCommitEpochFailure {
 
     fn into_error(self, target_epoch: u64) -> FrankenError {
         match self {
+            Self::Abort => FrankenError::Abort,
             Self::Busy => FrankenError::Busy,
             Self::BusyRecovery => FrankenError::BusyRecovery,
             Self::BusySnapshot { conflicting_pages } => {
@@ -1032,13 +1068,15 @@ impl GroupCommitQueue {
         }))
     }
 
-    fn record_persisted_epoch<F>(
+    async fn record_persisted_epoch<F, Fut>(
         &self,
+        cx: &Cx,
         input: PersistedGroupCommitInput<'_>,
         durable_write: F,
     ) -> Result<ParallelWalDurabilityReceipt>
     where
-        F: FnOnce(&fsqlite_wal::ParallelWalCommitCertificate) -> Result<()>,
+        F: FnOnce(fsqlite_wal::ParallelWalCommitCertificate) -> Fut,
+        Fut: Future<Output = Result<()>>,
     {
         let members = input
             .batches
@@ -1136,24 +1174,40 @@ impl GroupCommitQueue {
                     wal_frame_end: input.frames_end,
                 }
             });
-        let mut durability_error = None;
-        let wrapped_durable_write = |certificate: &fsqlite_wal::ParallelWalCommitCertificate| {
-            durable_write(certificate).map_err(|error| {
-                let detail = error.to_string();
-                durability_error = Some(error);
-                detail
-            })
+        let durability_error = Arc::new(Mutex::new(None));
+        let durability_error_slot = Arc::clone(&durability_error);
+        let wrapped_durable_write = move |certificate| {
+            let write = durable_write(certificate);
+            let error_slot = Arc::clone(&durability_error_slot);
+            async move {
+                write.await.map_err(|error| {
+                    let detail = error.to_string();
+                    *error_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                    detail
+                })
+            }
         };
         let durability_receipt_result = if let Some(evidence) = conservative_shadow_evidence {
-            combiner.certify_and_publish_with_conservative_shadow(
-                request,
-                evidence,
-                wrapped_durable_write,
-            )
+            combiner
+                .certify_and_publish_with_conservative_shadow_async(
+                    cx,
+                    request,
+                    evidence,
+                    wrapped_durable_write,
+                )
+                .await
         } else {
-            combiner.certify_and_publish(request, wrapped_durable_write)
+            combiner
+                .certify_and_publish_async(cx, request, wrapped_durable_write)
+                .await
         };
-        if let Some(error) = durability_error {
+        if let Some(error) = durability_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             return Err(error);
         }
         let durability_receipt = durability_receipt_result.map_err(|error| {
@@ -1222,10 +1276,14 @@ impl GroupCommitQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.completed_epoch.store(epoch, AtomicOrdering::Release);
 
-        // H11 fault hook: suppress the Condvar notification while still
-        // storing the completed epoch. Waiters must recover via wait_timeout.
+        // H11 fault hook: suppress only the legacy Condvar notification while
+        // still storing the completed epoch. Async waiters use the keyed,
+        // cancel-safe notification and must never depend on a blocking timeout.
         #[cfg(any(test, feature = "fault-injection"))]
-        if crate::fault_hooks::maybe_inject_drop_condvar_notify(epoch) {
+        let suppress_legacy_notify = crate::fault_hooks::maybe_inject_drop_condvar_notify(epoch);
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let suppress_legacy_notify = false;
+        if suppress_legacy_notify {
             tracing::trace!(
                 target: "fsqlite::wal::epoch_wait",
                 wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
@@ -1234,10 +1292,9 @@ impl GroupCommitQueue {
                 fallback = "timeout_recheck",
                 "suppressed direct waiter wake after completion publish"
             );
-            return;
         }
 
-        self.signal_completed_epoch_waiters(epoch, wake_next_epoch);
+        self.signal_completed_epoch_waiters(epoch, wake_next_epoch, !suppress_legacy_notify);
         self.prune_stale_epoch_metadata(epoch);
     }
 
@@ -1257,6 +1314,58 @@ impl GroupCommitQueue {
         failed_epochs.insert(epoch, GroupCommitEpochFailure::from_error(error));
         drop(failed_epochs);
         self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
+    }
+
+    fn abort_cancelled_flush(&self, epoch: u64) {
+        let wake_next_epoch = {
+            let mut consolidator = self
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if consolidator.phase() != ConsolidationPhase::Flushing || consolidator.epoch() != epoch
+            {
+                return;
+            }
+            if let Err(error) = consolidator.abort_flush() {
+                tracing::error!(
+                    %error,
+                    epoch,
+                    "cancelled group-commit flusher could not abort its epoch"
+                );
+                return;
+            }
+            consolidator.has_flusher_vacancy()
+        };
+        self.publish_failed_epoch(epoch, &FrankenError::Abort, wake_next_epoch);
+    }
+
+    fn abort_cancelled_filling(&self, target_epoch: u64) {
+        let failed_epoch = {
+            let mut consolidator = self
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match consolidator.abort_filling() {
+                Ok(failed_epoch) if failed_epoch == target_epoch => failed_epoch,
+                Ok(failed_epoch) => {
+                    tracing::error!(
+                        target_epoch,
+                        failed_epoch,
+                        "cancelled group-commit flusher consumed an unexpected filling epoch"
+                    );
+                    failed_epoch
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target_epoch,
+                        %error,
+                        "cancelled group-commit filling obligation was already resolved"
+                    );
+                    return;
+                }
+            }
+        };
+        self.publish_failed_epoch(failed_epoch, &FrankenError::Abort, false);
     }
 
     /// Evict epoch metadata older than `current_epoch - RETENTION` from
@@ -1282,47 +1391,48 @@ impl GroupCommitQueue {
         self.completed_epoch.load(AtomicOrdering::Acquire) >= epoch
     }
 
-    fn signal_completed_epoch_waiters(&self, epoch: u64, wake_next_epoch: bool) {
-        match GROUP_COMMIT_WAIT_PATH_MODE {
-            WaitPathMode::KeyedEventcount => {
-                let woke_target_epoch = self.epoch_waiters.signal(epoch);
-                let woke_next_epoch = wake_next_epoch
-                    && epoch
-                        .checked_add(1)
-                        .is_some_and(|next_epoch| self.epoch_waiters.signal(next_epoch));
-                tracing::trace!(
-                    target: "fsqlite::wal::epoch_wait",
-                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
-                    published_epoch = epoch,
-                    wake_next_epoch,
-                    woke_target_epoch,
-                    woke_next_epoch,
-                    "published completed epoch to targeted waiters"
-                );
-            }
-            WaitPathMode::LegacyCondvarTimeout => self.flush_complete.notify_all(),
+    fn signal_completed_epoch_waiters(
+        &self,
+        epoch: u64,
+        wake_next_epoch: bool,
+        notify_legacy: bool,
+    ) {
+        let woke_target_epoch = self.epoch_waiters.signal(epoch);
+        let woke_next_epoch = wake_next_epoch
+            && epoch
+                .checked_add(1)
+                .is_some_and(|next_epoch| self.epoch_waiters.signal(next_epoch));
+        tracing::trace!(
+            target: "fsqlite::wal::epoch_wait",
+            wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+            published_epoch = epoch,
+            wake_next_epoch,
+            woke_target_epoch,
+            woke_next_epoch,
+            "published completed epoch to targeted waiters"
+        );
+        if notify_legacy && GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
+            self.flush_complete.notify_all();
         }
     }
 
     fn signal_failed_epoch_waiters(&self, epoch: u64, wake_next_epoch: bool) {
-        match GROUP_COMMIT_WAIT_PATH_MODE {
-            WaitPathMode::KeyedEventcount => {
-                let woke_failed_epoch = self.epoch_waiters.signal(epoch);
-                let woke_next_epoch = wake_next_epoch
-                    && epoch
-                        .checked_add(1)
-                        .is_some_and(|next_epoch| self.epoch_waiters.signal(next_epoch));
-                tracing::trace!(
-                    target: "fsqlite::wal::epoch_wait",
-                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
-                    failed_epoch = epoch,
-                    wake_next_epoch,
-                    woke_failed_epoch,
-                    woke_next_epoch,
-                    "published failed epoch to targeted waiters"
-                );
-            }
-            WaitPathMode::LegacyCondvarTimeout => self.flush_complete.notify_all(),
+        let woke_failed_epoch = self.epoch_waiters.signal(epoch);
+        let woke_next_epoch = wake_next_epoch
+            && epoch
+                .checked_add(1)
+                .is_some_and(|next_epoch| self.epoch_waiters.signal(next_epoch));
+        tracing::trace!(
+            target: "fsqlite::wal::epoch_wait",
+            wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+            failed_epoch = epoch,
+            wake_next_epoch,
+            woke_failed_epoch,
+            woke_next_epoch,
+            "published failed epoch to targeted waiters"
+        );
+        if GROUP_COMMIT_WAIT_PATH_MODE == WaitPathMode::LegacyCondvarTimeout {
+            self.flush_complete.notify_all();
         }
     }
 
@@ -1394,6 +1504,7 @@ impl GroupCommitQueue {
         Ok(None)
     }
 
+    #[cfg(test)]
     fn wait_for_epoch_outcome_legacy(
         &self,
         mut guard: std::sync::MutexGuard<'_, GroupCommitConsolidator>,
@@ -1426,6 +1537,7 @@ impl GroupCommitQueue {
         }
     }
 
+    #[cfg(test)]
     fn wait_for_epoch_outcome_keyed<'a>(
         &'a self,
         mut guard: std::sync::MutexGuard<'a, GroupCommitConsolidator>,
@@ -1469,6 +1581,7 @@ impl GroupCommitQueue {
 
     /// Wait for the target epoch to either complete successfully, fail, or be
     /// taken over by this waiter if the promoted epoch lost its original flusher.
+    #[cfg(test)]
     fn wait_for_epoch_outcome(
         &self,
         guard: std::sync::MutexGuard<'_, GroupCommitConsolidator>,
@@ -1479,6 +1592,105 @@ impl GroupCommitQueue {
             WaitPathMode::LegacyCondvarTimeout => {
                 self.wait_for_epoch_outcome_legacy(guard, target_epoch)
             }
+        }
+    }
+
+    /// Cancellation-safe production wait path. The generation is sampled
+    /// before checking the epoch state, so a publication between the check
+    /// and registration is observed by `wait_for_change_async` without a lost
+    /// wake. No executor thread blocks on a condition variable.
+    async fn wait_for_epoch_outcome_async(
+        &self,
+        cx: &Cx,
+        target_epoch: u64,
+    ) -> Result<WaitForEpochOutcome> {
+        loop {
+            let slot = self.epoch_waiters.slot(target_epoch);
+            let observed_generation = slot.generation();
+            let outcome = {
+                let mut guard = self
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.observe_epoch_outcome(&mut guard, target_epoch)?
+            };
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
+            }
+
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let wait_result = slot.wait_for_change_async(observed_generation).await;
+            if wait_result == KeyedWaitResult::TimedOut {
+                GLOBAL_CONSOLIDATION_METRICS
+                    .wake_reasons
+                    .timeout
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::trace!(
+                    target: "fsqlite::wal::epoch_wait",
+                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                    wake_reason = "timeout",
+                    target_epoch,
+                    fallback = "async_timeout_recheck",
+                    "async epoch waiter timeout fallback fired"
+                );
+            }
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        }
+    }
+}
+
+struct GroupCommitFillingObligation {
+    queue: Arc<GroupCommitQueue>,
+    target_epoch: u64,
+    armed: bool,
+}
+
+impl GroupCommitFillingObligation {
+    fn new(queue: &Arc<GroupCommitQueue>, target_epoch: u64) -> Self {
+        Self {
+            queue: Arc::clone(queue),
+            target_epoch,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupCommitFillingObligation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.queue.abort_cancelled_filling(self.target_epoch);
+        }
+    }
+}
+
+struct GroupCommitFlushObligation {
+    queue: Arc<GroupCommitQueue>,
+    epoch: u64,
+    armed: bool,
+}
+
+impl GroupCommitFlushObligation {
+    fn new(queue: &Arc<GroupCommitQueue>, epoch: u64) -> Self {
+        Self {
+            queue: Arc::clone(queue),
+            epoch,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupCommitFlushObligation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.queue.abort_cancelled_flush(self.epoch);
         }
     }
 }
@@ -1510,11 +1722,148 @@ type GroupCommitQueueRef = Arc<GroupCommitQueue>;
 /// Before this change, all WAL access went through `with_wal_backend` which
 /// always took the write lock. Now, `with_wal_backend_read` takes only the
 /// read lock for `read_page_pinned` when the backend supports pinned reads.
-pub type SharedWalBackend = Arc<std::sync::RwLock<Option<Box<dyn WalBackend>>>>;
+type WalBackendHandle = Arc<AsyncRwLock<Box<dyn WalBackend>>>;
+pub type SharedWalBackend = Arc<std::sync::RwLock<Option<WalBackendHandle>>>;
+type SharedDbFile<F> = Arc<AsyncRwLock<F>>;
+type LocalPagerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+
+async fn async_rwlock_read<'a, T>(
+    lock: &'a AsyncRwLock<T>,
+    cx: &Cx,
+    label: &str,
+) -> Result<asupersync::sync::RwLockReadGuard<'a, T>> {
+    #[cfg(feature = "native")]
+    if let Some(native_cx) = cx.attached_native_cx() {
+        return lock
+            .read(&native_cx)
+            .await
+            .map_err(|error| FrankenError::internal(format!("{label} read lock failed: {error}")));
+    }
+
+    loop {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        match lock.try_read() {
+            Ok(guard) => return Ok(guard),
+            Err(asupersync::sync::TryReadError::Locked) => {
+                asupersync::runtime::yield_now().await;
+            }
+            Err(asupersync::sync::TryReadError::Poisoned) => {
+                return Err(FrankenError::internal(format!(
+                    "{label} read lock failed: rwlock poisoned"
+                )));
+            }
+        }
+    }
+}
+
+async fn async_rwlock_write<'a, T>(
+    lock: &'a AsyncRwLock<T>,
+    cx: &Cx,
+    label: &str,
+) -> Result<asupersync::sync::RwLockWriteGuard<'a, T>> {
+    #[cfg(feature = "native")]
+    if let Some(native_cx) = cx.attached_native_cx() {
+        return lock.write(&native_cx).await.map_err(|error| {
+            FrankenError::internal(format!("{label} write lock failed: {error}"))
+        });
+    }
+
+    loop {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        match lock.try_write() {
+            Ok(guard) => return Ok(guard),
+            Err(asupersync::sync::TryWriteError::Locked) => {
+                asupersync::runtime::yield_now().await;
+            }
+            Err(asupersync::sync::TryWriteError::Poisoned) => {
+                return Err(FrankenError::internal(format!(
+                    "{label} write lock failed: rwlock poisoned"
+                )));
+            }
+        }
+    }
+}
+
+async fn shared_db_file_read<'a, F: VfsFile>(
+    file: &'a SharedDbFile<F>,
+    cx: &Cx,
+) -> Result<asupersync::sync::RwLockReadGuard<'a, F>> {
+    async_rwlock_read(file, cx, "database-file").await
+}
+
+async fn shared_db_file_write<'a, F: VfsFile>(
+    file: &'a SharedDbFile<F>,
+    cx: &Cx,
+) -> Result<asupersync::sync::RwLockWriteGuard<'a, F>> {
+    async_rwlock_write(file, cx, "database-file").await
+}
+
+async fn shared_db_lock_external_snapshot<F: VfsFile>(
+    file: &SharedDbFile<F>,
+    cx: &Cx,
+) -> Result<()> {
+    shared_db_file_write(file, cx)
+        .await?
+        .lock_external_shared_snapshot(cx)
+}
+
+async fn shared_db_unlock_external_snapshot<F: VfsFile>(
+    file: &SharedDbFile<F>,
+    cx: &Cx,
+) -> Result<()> {
+    shared_db_file_write(file, cx)
+        .await?
+        .unlock_external_shared_snapshot(cx)
+}
+
+async fn shared_db_lock_external_maintenance<F: VfsFile>(
+    file: &SharedDbFile<F>,
+    cx: &Cx,
+    wal_mode: bool,
+) -> Result<()> {
+    shared_db_file_write(file, cx)
+        .await?
+        .lock_external_maintenance(cx, wal_mode)
+}
+
+async fn shared_db_unlock_external_maintenance<F: VfsFile>(
+    file: &SharedDbFile<F>,
+    cx: &Cx,
+    wal_mode: bool,
+) -> Result<()> {
+    shared_db_file_write(file, cx)
+        .await?
+        .unlock_external_maintenance(cx, wal_mode)
+}
+
+async fn shared_db_lock<F: VfsFile>(
+    file: &SharedDbFile<F>,
+    cx: &Cx,
+    level: LockLevel,
+) -> Result<()> {
+    shared_db_file_write(file, cx).await?.lock(cx, level)
+}
+
+async fn shared_db_unlock<F: VfsFile>(
+    file: &SharedDbFile<F>,
+    cx: &Cx,
+    level: LockLevel,
+) -> Result<()> {
+    shared_db_file_write(file, cx).await?.unlock(cx, level)
+}
 
 /// Create a new empty shared WAL backend.
 fn new_shared_wal_backend() -> SharedWalBackend {
     Arc::new(std::sync::RwLock::new(None))
+}
+
+fn wal_backend_handle(wal_backend: &SharedWalBackend) -> Result<WalBackendHandle> {
+    wal_backend
+        .read()
+        .map_err(|_| FrankenError::internal("SharedWalBackend registry lock poisoned"))?
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| FrankenError::internal("WAL mode active but no WAL backend installed"))
 }
 
 /// Read access to WAL backend (read_page_pinned, frame_count).
@@ -1524,17 +1873,14 @@ fn new_shared_wal_backend() -> SharedWalBackend {
 /// append path without blocking readers.
 ///
 /// # bd-db300.3.8.7
-fn with_wal_backend_read<T>(
+async fn with_wal_backend_read<T>(
     wal_backend: &SharedWalBackend,
-    f: impl FnOnce(&dyn WalBackend) -> Result<T>,
+    cx: &Cx,
+    f: impl for<'a> FnOnce(&'a dyn WalBackend, &'a Cx) -> LocalPagerFuture<'a, T>,
 ) -> Result<T> {
-    let guard = wal_backend
-        .read()
-        .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
-    let wal = guard
-        .as_deref()
-        .ok_or_else(|| FrankenError::internal("WAL mode active but no WAL backend installed"))?;
-    f(wal)
+    let backend = wal_backend_handle(wal_backend)?;
+    let guard = async_rwlock_read(&backend, cx, "WAL backend").await?;
+    f(guard.as_ref(), cx).await
 }
 
 enum WalReadLookup {
@@ -1542,38 +1888,40 @@ enum WalReadLookup {
     NeedsWriteFallback,
 }
 
-fn read_page_from_wal_backend(
+async fn read_page_from_wal_backend(
     wal_backend: &SharedWalBackend,
     cx: &Cx,
     page_no: PageNumber,
 ) -> Result<Option<Vec<u8>>> {
-    match with_wal_backend_read(wal_backend, |wal| {
-        if wal.supports_pinned_reads() {
-            wal.read_page_pinned(cx, page_no.get())
-                .map(WalReadLookup::Ready)
-        } else {
-            Ok(WalReadLookup::NeedsWriteFallback)
-        }
-    })? {
+    match with_wal_backend_read(wal_backend, cx, |wal, cx| {
+        Box::pin(async move {
+            if wal.supports_pinned_reads() {
+                wal.read_page_pinned(cx, page_no.get())
+                    .await
+                    .map(WalReadLookup::Ready)
+            } else {
+                Ok(WalReadLookup::NeedsWriteFallback)
+            }
+        })
+    })
+    .await?
+    {
         WalReadLookup::Ready(data) => Ok(data),
         WalReadLookup::NeedsWriteFallback => {
-            with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))
+            with_wal_backend(wal_backend, cx, |wal, cx| wal.read_page(cx, page_no.get())).await
         }
     }
 }
 
 /// Write access to WAL backend (append_frames, sync, set_wal_backend).
-fn with_wal_backend<T>(
+async fn with_wal_backend<T>(
     wal_backend: &SharedWalBackend,
-    f: impl FnOnce(&mut dyn WalBackend) -> Result<T>,
+    cx: &Cx,
+    f: impl for<'a> FnOnce(&'a mut dyn WalBackend, &'a Cx) -> LocalPagerFuture<'a, T>,
 ) -> Result<T> {
-    let mut guard = wal_backend
-        .write()
-        .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
-    let wal = guard
-        .as_deref_mut()
-        .ok_or_else(|| FrankenError::internal("WAL mode active but no WAL backend installed"))?;
-    f(wal)
+    let backend = wal_backend_handle(wal_backend)?;
+    let mut guard = async_rwlock_write(&backend, cx, "WAL backend").await?;
+    f(guard.as_mut(), cx).await
 }
 
 fn has_wal_backend(wal_backend: &SharedWalBackend) -> Result<bool> {
@@ -2165,9 +2513,7 @@ async fn classify_rollback_journal_prefix<F: VfsFile>(
     let prefix_len = usize::try_from(journal_size.min(JOURNAL_MAGIC.len() as u64))
         .expect("rollback-journal magic length fits usize");
     let mut prefix = [0_u8; JOURNAL_MAGIC.len()];
-    let bytes_read = journal_file
-        .read(cx, &mut prefix[..prefix_len], 0)
-        .await?;
+    let bytes_read = journal_file.read(cx, &mut prefix[..prefix_len], 0).await?;
     if bytes_read != prefix_len {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -2196,16 +2542,17 @@ async fn classify_rollback_journal_prefix<F: VfsFile>(
     }
 }
 
-fn with_main_shared_lock<F, T>(
+async fn with_main_shared_lock<F, S, T>(
     cx: &Cx,
     db_file: &mut F,
-    operation: impl FnOnce(&F) -> Result<T>,
+    state: &mut S,
+    operation: impl for<'a> FnOnce(&'a Cx, &'a F, &'a mut S) -> LocalPagerFuture<'a, T>,
 ) -> Result<T>
 where
     F: VfsFile,
 {
     db_file.lock_external_shared_snapshot(cx)?;
-    let operation_result = operation(&*db_file);
+    let operation_result = operation(cx, &*db_file, state).await;
     let cleanup_cx = cleanup_child_cx(cx);
     let _cleanup_mask = cleanup_cx.masked();
     let unlock_result = db_file.unlock_external_shared_snapshot(&cleanup_cx);
@@ -2265,7 +2612,7 @@ impl PagerCommittedSnapshot {
 /// The inner mutable pager state protected by a mutex.
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
-    db_file: F,
+    db_file: SharedDbFile<F>,
     /// Page size for this database.
     page_size: PageSize,
     /// Current database size in pages.
@@ -2340,7 +2687,7 @@ impl<F: VfsFile> PagerInner<F> {
         // In WAL mode, check the WAL for the latest version of the page first.
         // bd-db300.3.8.7: try shared-lock path when the backend supports pinned reads.
         if self.journal_mode == JournalMode::Wal {
-            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no)? {
+            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await? {
                 return Ok(data);
             }
         }
@@ -2356,11 +2703,19 @@ impl<F: VfsFile> PagerInner<F> {
             return Ok(data);
         }
 
-        match cache.read_page_copy(cx, &self.db_file, page_no).await {
+        let first_read = {
+            let db_file = shared_db_file_read(&self.db_file, cx).await?;
+            cache.read_page_copy(cx, &*db_file, page_no).await
+        };
+        match first_read {
             Ok(data) => Ok(data),
             Err(FrankenError::OutOfMemory) => {
                 if cache.evict_clean_any() {
-                    match cache.read_page_copy(cx, &self.db_file, page_no).await {
+                    let retry = {
+                        let db_file = shared_db_file_read(&self.db_file, cx).await?;
+                        cache.read_page_copy(cx, &*db_file, page_no).await
+                    };
+                    match retry {
                         Err(FrankenError::OutOfMemory) => {
                             self.read_page_copy_uncached(cx, page_no).await
                         }
@@ -2374,15 +2729,12 @@ impl<F: VfsFile> PagerInner<F> {
         }
     }
 
-    async fn read_page_copy_uncached(
-        &self,
-        cx: &Cx,
-        page_no: PageNumber,
-    ) -> Result<Vec<u8>> {
+    async fn read_page_copy_uncached(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
         let mut out = vec![0_u8; page_size];
-        let bytes_read = self.db_file.read(cx, &mut out, offset).await?;
+        let db_file = shared_db_file_read(&self.db_file, cx).await?;
+        let bytes_read = db_file.read(cx, &mut out, offset).await?;
         if bytes_read < page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2408,20 +2760,21 @@ impl<F: VfsFile> PagerInner<F> {
     ) -> Result<Vec<u8>> {
         // bd-db300.3.8.7: try shared-lock path first for WAL reads.
         if self.journal_mode == JournalMode::Wal {
-            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no)? {
+            if let Some(data) = read_page_from_wal_backend(wal_backend, cx, page_no).await? {
                 return Ok(data);
             }
         }
 
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
-        let file_size = self.db_file.file_size(cx)?;
+        let db_file = shared_db_file_read(&self.db_file, cx).await?;
+        let file_size = db_file.file_size(cx)?;
         if offset >= file_size {
             return Ok(vec![0_u8; page_size]);
         }
 
         let mut out = vec![0_u8; page_size];
-        let bytes_read = self.db_file.read(cx, &mut out, offset).await?;
+        let bytes_read = db_file.read(cx, &mut out, offset).await?;
         if bytes_read < page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2445,7 +2798,8 @@ impl<F: VfsFile> PagerInner<F> {
         }
 
         let mut out = [0_u8; DATABASE_HEADER_SIZE];
-        let bytes_read = self.db_file.read(cx, &mut out, 0).await?;
+        let db_file = shared_db_file_read(&self.db_file, cx).await?;
+        let bytes_read = db_file.read(cx, &mut out, 0).await?;
         if bytes_read < DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2467,7 +2821,9 @@ impl<F: VfsFile> PagerInner<F> {
         cx: &Cx,
         wal_backend: &SharedWalBackend,
     ) -> Result<(CommitSeq, u64, bool, bool)> {
-        let file_size = self.db_file.file_size(cx)?;
+        let file_size = shared_db_file_read(&self.db_file, cx)
+            .await?
+            .file_size(cx)?;
         let previous_file_size = self.committed_db_file_size_bytes;
         let previous_db_change_counter = self.committed_db_change_counter;
         let previous_wal_generation = self.committed_wal_generation;
@@ -2477,13 +2833,19 @@ impl<F: VfsFile> PagerInner<F> {
             .get()
             .saturating_sub(previous_wal_visible_commit_count);
         let (wal_visible_commit_count, wal_generation) = if self.journal_mode == JournalMode::Wal {
-            with_wal_backend(wal_backend, |wal| {
-                wal.begin_transaction(cx)?;
-                let snapshot = wal.pinned_read_snapshot();
-                let commit_count =
-                    snapshot.map_or_else(|| wal.committed_txn_count(cx), |s| Ok(s.commit_count))?;
-                Ok((commit_count, snapshot.map(|s| s.generation)))
-            })?
+            with_wal_backend(wal_backend, cx, |wal, cx| {
+                Box::pin(async move {
+                    wal.begin_transaction(cx).await?;
+                    let snapshot = wal.pinned_read_snapshot();
+                    let commit_count = if let Some(snapshot) = snapshot {
+                        snapshot.commit_count
+                    } else {
+                        wal.committed_txn_count(cx).await?
+                    };
+                    Ok((commit_count, snapshot.map(|s| s.generation)))
+                })
+            })
+            .await?
         } else {
             (0, None)
         };
@@ -2501,9 +2863,7 @@ impl<F: VfsFile> PagerInner<F> {
         let (base_commit_seq, raw_base_change_counter) = if cached_wal_base_is_current {
             (previous_base_commit_seq, self.committed_db_change_counter)
         } else {
-            let base_header_bytes = self
-                .read_database_file_header_bytes(cx, file_size)
-                .await?;
+            let base_header_bytes = self.read_database_file_header_bytes(cx, file_size).await?;
             let raw_base_change_counter = if self.journal_mode == JournalMode::Wal {
                 match DatabaseHeader::from_bytes(&base_header_bytes) {
                     Ok(base_header) => base_header.change_counter,
@@ -2688,7 +3048,9 @@ impl<F: VfsFile> PagerInner<F> {
             // page_count stale even when the stale marker is not set.  Using
             // max(header, file) ensures newly-committed pages are visible and
             // avoids BusySnapshot errors on startup (see GH issue #49).
-            let file_size = self.db_file.file_size(cx)?;
+            let file_size = shared_db_file_read(&self.db_file, cx)
+                .await?
+                .file_size(cx)?;
             let file_derived = header
                 .page_count_from_file_size(file_size)
                 .unwrap_or(header.page_count);
@@ -2756,19 +3118,6 @@ impl<F: VfsFile> PagerInner<F> {
             wal_snapshot_initialized,
             page_cache_invalidated,
         })
-    }
-
-    /// Flush page data directly to disk.
-    ///
-    /// The shared cache only tracks committed content now that readers can
-    /// consult it without taking the pager metadata mutex. Dirty pages are
-    /// staged in the transaction write-set and admitted into the cache only
-    /// after commit succeeds.
-    async fn flush_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        let page_size = self.page_size.as_usize();
-        let offset = u64::from(page_no.get() - 1) * page_size as u64;
-        self.db_file.write(cx, data, offset).await?;
-        Ok(())
     }
 }
 
@@ -3312,7 +3661,7 @@ fn attach_group_commit_conflict_metadata(
     batch
 }
 
-fn conflicting_pages_since_batch_snapshots(
+async fn conflicting_pages_since_batch_snapshots(
     cx: &Cx,
     wal: &mut dyn WalBackend,
     batches: &[TransactionFrameBatch],
@@ -3322,12 +3671,14 @@ fn conflicting_pages_since_batch_snapshots(
         let Some(snapshot) = batch.conflict_snapshot else {
             continue;
         };
-        let batch_conflicts = wal.conflicting_pages_since_snapshot(
-            cx,
-            snapshot,
-            &batch.conflict_pages,
-            &batch.conflict_page_baselines,
-        )?;
+        let batch_conflicts = wal
+            .conflicting_pages_since_snapshot(
+                cx,
+                snapshot,
+                &batch.conflict_pages,
+                &batch.conflict_page_baselines,
+            )
+            .await?;
         conflicts.extend(batch_conflicts);
     }
     conflicts.sort_unstable();
@@ -3441,7 +3792,7 @@ fn should_shadow_compare_batches(
         .any(|batch| parallel_wal_should_shadow_compare(control, batch.context.batch_id))
 }
 
-fn prepare_group_commit_batch_for_lane(
+async fn prepare_group_commit_batch_for_lane(
     cx: &Cx,
     wal_backend: &SharedWalBackend,
     batch: &TransactionFrameBatch,
@@ -3465,13 +3816,13 @@ fn prepare_group_commit_batch_for_lane(
     }
 
     let started = Instant::now();
-    let mut prepared = with_wal_backend_read(wal_backend, |wal| {
-        let mut prepared = wal.prepare_append_frames(&frame_refs)?;
-        if let Some(prepared) = prepared.as_mut() {
-            wal.finalize_prepared_frames(cx, prepared)?;
-        }
-        Ok(prepared)
-    })?;
+    let backend = wal_backend_handle(wal_backend)?;
+    let wal = async_rwlock_read(&backend, cx, "WAL backend").await?;
+    let mut prepared = wal.prepare_append_frames(&frame_refs)?;
+    if let Some(prepared) = prepared.as_mut() {
+        wal.finalize_prepared_frames(cx, prepared)?;
+    }
+    drop(wal);
     let Some(prepared) = prepared.take() else {
         return Ok(None);
     };
@@ -5443,7 +5794,7 @@ fn exact_database_page_count(file_size: u64, page_size: PageSize) -> Result<u32>
     })
 }
 
-fn database_image_receipt_for_open_file<F: VfsFile>(
+async fn database_image_receipt_for_open_file<F: VfsFile>(
     cx: &Cx,
     file: &F,
     expected_page_size: Option<PageSize>,
@@ -5453,7 +5804,7 @@ fn database_image_receipt_for_open_file<F: VfsFile>(
     })?;
     let file_size = file.file_size(cx)?;
     let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-    let header_read = file.read(cx, &mut header_bytes, 0)?;
+    let header_read = file.read(cx, &mut header_bytes, 0).await?;
     if header_read != DATABASE_HEADER_SIZE {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -5498,7 +5849,7 @@ fn database_image_receipt_for_open_file<F: VfsFile>(
             continue;
         }
         let offset = u64::from(page_no - 1) * u64::from(header.page_size.get());
-        let bytes_read = file.read(cx, &mut page, offset)?;
+        let bytes_read = file.read(cx, &mut page, offset).await?;
         if bytes_read != page_size {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -5595,7 +5946,7 @@ fn stale_main_header_change_counter_under_wal(
     Some(u64::from(change_counter_from_header_bytes(header_bytes)))
 }
 
-fn wal_contains_valid_database_page1<F: VfsFile>(
+async fn wal_contains_valid_database_page1<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     expected_page_size: PageSize,
@@ -5614,7 +5965,7 @@ fn wal_contains_valid_database_page1<F: VfsFile>(
     };
 
     for frame_index in (0..=last_commit_frame).rev() {
-        let Ok((frame_header, page_data)) = wal.read_frame(cx, frame_index) else {
+        let Ok((frame_header, page_data)) = wal.read_frame(cx, frame_index).await else {
             return false;
         };
         if frame_header.page_number != PageNumber::ONE.get() {
@@ -5632,7 +5983,7 @@ fn wal_contains_valid_database_page1<F: VfsFile>(
     false
 }
 
-fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
+async fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
     cx: &Cx,
     vfs: &V,
     path: &Path,
@@ -5676,11 +6027,11 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
         }
         Err(_) => return Ok(false),
     };
-    let Ok(mut wal) = WalFile::open(cx, wal_file) else {
+    let Ok(mut wal) = WalFile::open(cx, wal_file).await else {
         return Ok(false);
     };
     let wal_contains_valid_page1 =
-        wal_contains_valid_database_page1(cx, &mut wal, expected_page_size);
+        wal_contains_valid_database_page1(cx, &mut wal, expected_page_size).await;
     let _ = wal.close(cx);
     Ok(wal_contains_valid_page1)
 }
@@ -5785,54 +6136,160 @@ where
 {
     type Txn = SimpleTransaction<V>;
 
-    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
-        let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
-        self.validate_namespace_binding()?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+    fn begin<'a>(
+        &'a self,
+        cx: &'a Cx,
+        mode: TransactionMode,
+    ) -> impl Future<Output = Result<Self::Txn>> + 'a {
+        async move {
+            let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
+            self.validate_namespace_binding()?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
-        if inner.checkpoint_active {
-            let active_transactions = inner.active_transactions;
-            let checkpoint_active = inner.checkpoint_active;
-            drop(inner);
-            log_checkpoint_coordination(
-                cx,
-                &pager_group_commit_queue(self),
-                "active_gate",
-                "begin",
-                transaction_mode_name(mode),
-                "checkpoint_excludes_new_transactions",
-                true,
-                active_transactions,
-                checkpoint_active,
-            );
-            return Err(FrankenError::Busy);
-        }
+            if inner.checkpoint_active {
+                let active_transactions = inner.active_transactions;
+                let checkpoint_active = inner.checkpoint_active;
+                drop(inner);
+                log_checkpoint_coordination(
+                    cx,
+                    &pager_group_commit_queue(self),
+                    "active_gate",
+                    "begin",
+                    transaction_mode_name(mode),
+                    "checkpoint_excludes_new_transactions",
+                    true,
+                    active_transactions,
+                    checkpoint_active,
+                );
+                return Err(FrankenError::Busy);
+            }
 
-        let eager_writer = transaction_mode_is_eager_writer(mode);
-        if eager_writer && inner.access_mode.is_readonly() {
-            return Err(FrankenError::ReadOnly);
-        }
-        if eager_writer {
-            inner = wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
-        }
+            let eager_writer = transaction_mode_is_eager_writer(mode);
+            if eager_writer && inner.access_mode.is_readonly() {
+                return Err(FrankenError::ReadOnly);
+            }
+            if eager_writer {
+                inner = wait_for_single_writer_baton(&self.inner, &self.writer_idle, inner)?;
+            }
 
-        let active_transactions_before_begin = inner.active_transactions;
+            let active_transactions_before_begin = inner.active_transactions;
 
-        // ── In-memory fast path ─────────────────────────────────────
-        // For in-memory VFS, skip persistent shared-lock ownership between
-        // local transactions. We still need to recover any externally-created
-        // hot journal and refresh connection-local metadata/publication state
-        // when the first local transaction starts, because another pager
-        // sharing the same `MemoryVfs` can mutate the durable image or the
-        // shared WAL backend between transactions.
-        if self.vfs.is_memory() {
+            // ── In-memory fast path ─────────────────────────────────────
+            // For in-memory VFS, skip persistent shared-lock ownership between
+            // local transactions. We still need to recover any externally-created
+            // hot journal and refresh connection-local metadata/publication state
+            // when the first local transaction starts, because another pager
+            // sharing the same `MemoryVfs` can mutate the durable image or the
+            // shared WAL backend between transactions.
+            if self.vfs.is_memory() {
+                let commit_seq_before_refresh = inner.commit_seq;
+                let (committed_refresh, journal_visibility_invalidation) =
+                    if active_transactions_before_begin == 0 {
+                        self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)
+                            .await?
+                    } else {
+                        (
+                            CommittedStateRefresh {
+                                wal_snapshot_initialized: false,
+                                page_cache_invalidated: false,
+                            },
+                            false,
+                        )
+                    };
+
+                if active_transactions_before_begin == 0 {
+                    let clear_published_pages = journal_visibility_invalidation
+                        || committed_refresh.page_cache_invalidated
+                        || inner.commit_seq != commit_seq_before_refresh;
+                    // D1-CRITICAL Change 3: Use sharded publish_clear_if.
+                    self.published.publish_clear_if(
+                        cx,
+                        PublishedPagerUpdate {
+                            visible_commit_seq: inner.commit_seq,
+                            db_size: inner.db_size,
+                            journal_mode: inner.journal_mode,
+                            freelist_count: inner.freelist.len(),
+                            checkpoint_active: inner.checkpoint_active,
+                        },
+                        clear_published_pages,
+                    );
+                }
+
+                if eager_writer && inner.writer_active {
+                    return Err(FrankenError::Busy);
+                }
+                if eager_writer {
+                    inner.writer_active = true;
+                }
+                inner.active_transactions += 1;
+                let original_db_size = inner.db_size;
+                let journal_mode = inner.journal_mode;
+                let published_snapshot = self.published.snapshot();
+                // Honor the "inner is at least as fresh as published" invariant by
+                // taking the per-field max of the two views; this guards against
+                // a transaction starting with stale visibility when a recent
+                // commit already advanced inner.* but the publication plane has
+                // not yet been re-advertised. (Regression-covered by
+                // self_alloc_extension_not_conflict; see 18faea82.)
+                let bound_visible_commit_seq =
+                    std::cmp::max(published_snapshot.visible_commit_seq, inner.commit_seq);
+                let bound_db_size = published_snapshot.db_size.max(original_db_size);
+                let pool = self.pool.clone();
+                let cleanup_cx = cx.clone();
+                let memory_db_bump_alloc =
+                    self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
+                return Ok(SimpleTransaction {
+                    vfs: Arc::clone(&self.vfs),
+                    journal_path: Self::journal_path(&self.db_path),
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    namespace_binding: self.namespace_binding.clone(),
+                    group_commit_queue: Arc::clone(&self.group_commit_queue),
+                    inner: Arc::clone(&self.inner),
+                    writer_idle: Arc::clone(&self.writer_idle),
+                    cache: Arc::clone(&self.cache),
+                    published: Arc::clone(&self.published),
+                    wal_backend: Arc::clone(&self.wal_backend),
+                    committed_snapshot: Arc::clone(&self.committed_snapshot),
+                    shared_connection_count: self.shared_connection_count.get().cloned(),
+                    maintenance_lease: Some(maintenance_lease),
+                    recovery_fence: Arc::clone(&self.recovery_fence),
+                    read_only_pager: inner.access_mode.is_readonly(),
+                    published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
+                    published_db_size: Cell::new(bound_db_size),
+                    write_set: PagePageMap::default(),
+                    write_pages_sorted: Vec::new(),
+                    freed_pages: Vec::new(),
+                    freed_page_bounds: None,
+                    allocated_from_freelist: Vec::new(),
+                    allocated_from_eof: Vec::new(),
+                    writes_observed: false,
+                    mode,
+                    is_writer: eager_writer,
+                    committed: false,
+                    finished: false,
+                    original_db_size,
+                    savepoint_stack: Vec::new(),
+                    journal_mode,
+                    pool,
+                    cleanup_cx,
+                    page_lease: Vec::new(),
+                    memory_db_bump_alloc,
+                    rolled_back_pages: HashSet::new(),
+                    txn_read_cache: RefCell::new(PagePageMap::default()),
+                    retained_memory_overlay_dirty_pages: BTreeSet::new(),
+                    scratch_arena: bumpalo::Bump::new(),
+                });
+            }
+
+            // ── File-backed path (full locking + recovery) ──────────────
             let commit_seq_before_refresh = inner.commit_seq;
             let (committed_refresh, journal_visibility_invalidation) =
                 if active_transactions_before_begin == 0 {
-                    self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?
+                    self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)
+                        .await?
                 } else {
                     (
                         CommittedStateRefresh {
@@ -5842,6 +6299,13 @@ where
                         false,
                     )
                 };
+            if active_transactions_before_begin == 0 {
+                // Retain one stock-visible SHARED snapshot fence for the lifetime
+                // of the first local transaction. Later local transactions share
+                // this file handle and the last one releases it.
+                let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
+                db_file.lock_external_shared_snapshot(cx)?;
+            }
 
             if active_transactions_before_begin == 0 {
                 let clear_published_pages = journal_visibility_invalidation
@@ -5861,30 +6325,119 @@ where
                 );
             }
 
+            let published_snapshot = self.published.snapshot();
+            let commit_seq_lagged = published_snapshot.visible_commit_seq < inner.commit_seq;
+            let db_size_lagged = published_snapshot.db_size < inner.db_size;
+            let journal_mode_lagged = published_snapshot.journal_mode != inner.journal_mode;
+            let freelist_lagged = published_snapshot.freelist_count != inner.freelist.len();
+            let checkpoint_lagged = published_snapshot.checkpoint_active != inner.checkpoint_active;
+            let publication_lagged = commit_seq_lagged
+                || db_size_lagged
+                || journal_mode_lagged
+                || freelist_lagged
+                || checkpoint_lagged;
+            if publication_lagged {
+                let publication_update = PublishedPagerUpdate {
+                    visible_commit_seq: std::cmp::max(
+                        published_snapshot.visible_commit_seq,
+                        inner.commit_seq,
+                    ),
+                    db_size: published_snapshot.db_size.max(inner.db_size),
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: inner.checkpoint_active,
+                };
+                let clear_published_pages = published_snapshot.visible_commit_seq
+                    != publication_update.visible_commit_seq
+                    || published_snapshot.db_size != publication_update.db_size
+                    || published_snapshot.journal_mode != publication_update.journal_mode;
+                self.published
+                    .publish_clear_if(cx, publication_update, clear_published_pages);
+            }
+
             if eager_writer && inner.writer_active {
+                if active_transactions_before_begin == 0 {
+                    let busy = FrankenError::Busy;
+                    return match release_snapshot_after_failed_begin(
+                        cx,
+                        &mut inner,
+                        active_transactions_before_begin,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(busy),
+                        Err(cleanup_error) => Err(FrankenError::internal(format!(
+                            "writer admission was busy and could not release its snapshot fence: admission={busy}; cleanup={cleanup_error}"
+                        ))),
+                    };
+                }
                 return Err(FrankenError::Busy);
             }
+
+            // For write transactions, escalate to RESERVED to signal write intent
+            // to other processes. This is a non-blocking advisory lock that
+            // prevents multiple processes from writing simultaneously.
             if eager_writer {
+                let lock_result = {
+                    let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
+                    db_file.lock(cx, LockLevel::Reserved)
+                };
+                if let Err(err) = lock_result {
+                    return match release_snapshot_after_failed_begin(
+                        cx,
+                        &mut inner,
+                        active_transactions_before_begin,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(err),
+                        Err(cleanup_error) => Err(FrankenError::internal(format!(
+                            "writer lock acquisition failed and could not restore the retained snapshot lock: lock={err}; cleanup={cleanup_error}"
+                        ))),
+                    };
+                }
                 inner.writer_active = true;
             }
-            inner.active_transactions += 1;
+
+            if inner.journal_mode == JournalMode::Wal && !committed_refresh.wal_snapshot_initialized
+            {
+                let wal_begin_result =
+                    with_wal_backend(&self.wal_backend, cx, |wal, cx| wal.begin_transaction(cx))
+                        .await;
+                if let Err(err) = wal_begin_result {
+                    let notify_writer_idle =
+                        eager_writer && release_single_writer_baton(&mut inner);
+                    let cleanup_result = release_snapshot_after_failed_begin(
+                        cx,
+                        &mut inner,
+                        active_transactions_before_begin,
+                    )
+                    .await;
+                    drop(inner);
+                    if notify_writer_idle {
+                        self.writer_idle.notify_one();
+                    }
+                    return match cleanup_result {
+                        Ok(()) => Err(err),
+                        Err(cleanup_error) => Err(FrankenError::internal(format!(
+                            "WAL snapshot acquisition failed and could not restore the retained snapshot lock: wal={err}; cleanup={cleanup_error}"
+                        ))),
+                    };
+                }
+            }
+
+            inner.active_transactions = inner.active_transactions.saturating_add(1);
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
-            let published_snapshot = self.published.snapshot();
-            // Honor the "inner is at least as fresh as published" invariant by
-            // taking the per-field max of the two views; this guards against
-            // a transaction starting with stale visibility when a recent
-            // commit already advanced inner.* but the publication plane has
-            // not yet been re-advertised. (Regression-covered by
-            // self_alloc_extension_not_conflict; see 18faea82.)
-            let bound_visible_commit_seq =
-                std::cmp::max(published_snapshot.visible_commit_seq, inner.commit_seq);
-            let bound_db_size = published_snapshot.db_size.max(original_db_size);
             let pool = self.pool.clone();
-            let cleanup_cx = cx.clone();
+            let published_snapshot = self.published.snapshot();
+            let cleanup_cx = cleanup_child_cx(cx);
             let memory_db_bump_alloc =
                 self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
-            return Ok(SimpleTransaction {
+            let read_only_pager = inner.access_mode.is_readonly();
+            drop(inner);
+
+            Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
                 journal_path: Self::journal_path(&self.db_path),
                 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -5899,9 +6452,9 @@ where
                 shared_connection_count: self.shared_connection_count.get().cloned(),
                 maintenance_lease: Some(maintenance_lease),
                 recovery_fence: Arc::clone(&self.recovery_fence),
-                read_only_pager: inner.access_mode.is_readonly(),
-                published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
-                published_db_size: Cell::new(bound_db_size),
+                read_only_pager,
+                published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
+                published_db_size: Cell::new(published_snapshot.db_size),
                 write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
@@ -5924,188 +6477,8 @@ where
                 txn_read_cache: RefCell::new(PagePageMap::default()),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
-            });
+            })
         }
-
-        // ── File-backed path (full locking + recovery) ──────────────
-        let commit_seq_before_refresh = inner.commit_seq;
-        let (committed_refresh, journal_visibility_invalidation) =
-            if active_transactions_before_begin == 0 {
-                self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?
-            } else {
-                (
-                    CommittedStateRefresh {
-                        wal_snapshot_initialized: false,
-                        page_cache_invalidated: false,
-                    },
-                    false,
-                )
-            };
-        if active_transactions_before_begin == 0 {
-            // Retain one stock-visible SHARED snapshot fence for the lifetime
-            // of the first local transaction. Later local transactions share
-            // this file handle and the last one releases it.
-            inner.db_file.lock_external_shared_snapshot(cx)?;
-        }
-
-        if active_transactions_before_begin == 0 {
-            let clear_published_pages = journal_visibility_invalidation
-                || committed_refresh.page_cache_invalidated
-                || inner.commit_seq != commit_seq_before_refresh;
-            // D1-CRITICAL Change 3: Use sharded publish_clear_if.
-            self.published.publish_clear_if(
-                cx,
-                PublishedPagerUpdate {
-                    visible_commit_seq: inner.commit_seq,
-                    db_size: inner.db_size,
-                    journal_mode: inner.journal_mode,
-                    freelist_count: inner.freelist.len(),
-                    checkpoint_active: inner.checkpoint_active,
-                },
-                clear_published_pages,
-            );
-        }
-
-        let published_snapshot = self.published.snapshot();
-        let commit_seq_lagged = published_snapshot.visible_commit_seq < inner.commit_seq;
-        let db_size_lagged = published_snapshot.db_size < inner.db_size;
-        let journal_mode_lagged = published_snapshot.journal_mode != inner.journal_mode;
-        let freelist_lagged = published_snapshot.freelist_count != inner.freelist.len();
-        let checkpoint_lagged = published_snapshot.checkpoint_active != inner.checkpoint_active;
-        let publication_lagged = commit_seq_lagged
-            || db_size_lagged
-            || journal_mode_lagged
-            || freelist_lagged
-            || checkpoint_lagged;
-        if publication_lagged {
-            let publication_update = PublishedPagerUpdate {
-                visible_commit_seq: std::cmp::max(
-                    published_snapshot.visible_commit_seq,
-                    inner.commit_seq,
-                ),
-                db_size: published_snapshot.db_size.max(inner.db_size),
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            };
-            let clear_published_pages = published_snapshot.visible_commit_seq
-                != publication_update.visible_commit_seq
-                || published_snapshot.db_size != publication_update.db_size
-                || published_snapshot.journal_mode != publication_update.journal_mode;
-            self.published
-                .publish_clear_if(cx, publication_update, clear_published_pages);
-        }
-
-        if eager_writer && inner.writer_active {
-            if active_transactions_before_begin == 0 {
-                let busy = FrankenError::Busy;
-                return match release_snapshot_after_failed_begin(
-                    cx,
-                    &mut inner,
-                    active_transactions_before_begin,
-                ) {
-                    Ok(()) => Err(busy),
-                    Err(cleanup_error) => Err(FrankenError::internal(format!(
-                        "writer admission was busy and could not release its snapshot fence: admission={busy}; cleanup={cleanup_error}"
-                    ))),
-                };
-            }
-            return Err(FrankenError::Busy);
-        }
-
-        // For write transactions, escalate to RESERVED to signal write intent
-        // to other processes. This is a non-blocking advisory lock that
-        // prevents multiple processes from writing simultaneously.
-        if eager_writer {
-            if let Err(err) = inner.db_file.lock(cx, LockLevel::Reserved) {
-                return match release_snapshot_after_failed_begin(
-                    cx,
-                    &mut inner,
-                    active_transactions_before_begin,
-                ) {
-                    Ok(()) => Err(err),
-                    Err(cleanup_error) => Err(FrankenError::internal(format!(
-                        "writer lock acquisition failed and could not restore the retained snapshot lock: lock={err}; cleanup={cleanup_error}"
-                    ))),
-                };
-            }
-            inner.writer_active = true;
-        }
-
-        if inner.journal_mode == JournalMode::Wal && !committed_refresh.wal_snapshot_initialized {
-            let wal_begin_result =
-                with_wal_backend(&self.wal_backend, |wal| wal.begin_transaction(cx));
-            if let Err(err) = wal_begin_result {
-                let notify_writer_idle = eager_writer && release_single_writer_baton(&mut inner);
-                let cleanup_result = release_snapshot_after_failed_begin(
-                    cx,
-                    &mut inner,
-                    active_transactions_before_begin,
-                );
-                drop(inner);
-                if notify_writer_idle {
-                    self.writer_idle.notify_one();
-                }
-                return match cleanup_result {
-                    Ok(()) => Err(err),
-                    Err(cleanup_error) => Err(FrankenError::internal(format!(
-                        "WAL snapshot acquisition failed and could not restore the retained snapshot lock: wal={err}; cleanup={cleanup_error}"
-                    ))),
-                };
-            }
-        }
-
-        inner.active_transactions = inner.active_transactions.saturating_add(1);
-        let original_db_size = inner.db_size;
-        let journal_mode = inner.journal_mode;
-        let pool = self.pool.clone();
-        let published_snapshot = self.published.snapshot();
-        let cleanup_cx = cleanup_child_cx(cx);
-        let memory_db_bump_alloc = self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
-        let read_only_pager = inner.access_mode.is_readonly();
-        drop(inner);
-
-        Ok(SimpleTransaction {
-            vfs: Arc::clone(&self.vfs),
-            journal_path: Self::journal_path(&self.db_path),
-            #[cfg(all(feature = "native", any(unix, windows)))]
-            namespace_binding: self.namespace_binding.clone(),
-            group_commit_queue: Arc::clone(&self.group_commit_queue),
-            inner: Arc::clone(&self.inner),
-            writer_idle: Arc::clone(&self.writer_idle),
-            cache: Arc::clone(&self.cache),
-            published: Arc::clone(&self.published),
-            wal_backend: Arc::clone(&self.wal_backend),
-            committed_snapshot: Arc::clone(&self.committed_snapshot),
-            shared_connection_count: self.shared_connection_count.get().cloned(),
-            maintenance_lease: Some(maintenance_lease),
-            recovery_fence: Arc::clone(&self.recovery_fence),
-            read_only_pager,
-            published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
-            published_db_size: Cell::new(published_snapshot.db_size),
-            write_set: PagePageMap::default(),
-            write_pages_sorted: Vec::new(),
-            freed_pages: Vec::new(),
-            freed_page_bounds: None,
-            allocated_from_freelist: Vec::new(),
-            allocated_from_eof: Vec::new(),
-            writes_observed: false,
-            mode,
-            is_writer: eager_writer,
-            committed: false,
-            finished: false,
-            original_db_size,
-            savepoint_stack: Vec::new(),
-            journal_mode,
-            pool,
-            cleanup_cx,
-            page_lease: Vec::new(),
-            memory_db_bump_alloc,
-            rolled_back_pages: HashSet::new(),
-            txn_read_cache: RefCell::new(PagePageMap::default()),
-            retained_memory_overlay_dirty_pages: BTreeSet::new(),
-            scratch_arena: bumpalo::Bump::new(),
-        })
     }
 
     fn journal_mode(&self) -> JournalMode {
@@ -6120,79 +6493,86 @@ where
         inner.access_mode.is_readonly()
     }
 
-    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
-        let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
-        self.validate_namespace_binding()?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+    fn set_journal_mode<'a>(
+        &'a self,
+        cx: &'a Cx,
+        mode: JournalMode,
+    ) -> impl Future<Output = Result<JournalMode>> + 'a {
+        async move {
+            let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
+            self.validate_namespace_binding()?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
-        if inner.journal_mode == mode {
+            if inner.journal_mode == mode {
+                if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
+                    return Err(FrankenError::Unsupported);
+                }
+                if mode == JournalMode::Wal {
+                    self.cache.evict(PageNumber::ONE);
+                    self.published.publish_remove_page(
+                        cx,
+                        PublishedPagerUpdate {
+                            visible_commit_seq: inner.commit_seq,
+                            db_size: inner.db_size,
+                            journal_mode: inner.journal_mode,
+                            freelist_count: inner.freelist.len(),
+                            checkpoint_active: inner.checkpoint_active,
+                        },
+                        PageNumber::ONE,
+                    );
+                }
+                return Ok(mode);
+            }
+
+            if inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            if inner.active_transactions > 0 {
+                // Cannot switch journal mode while any transaction is active.
+                return Err(FrankenError::Busy);
+            }
+
             if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
                 return Err(FrankenError::Unsupported);
             }
-            if mode == JournalMode::Wal {
-                self.cache.evict(PageNumber::ONE);
-                self.published.publish_remove_page(
-                    cx,
-                    PublishedPagerUpdate {
-                        visible_commit_seq: inner.commit_seq,
-                        db_size: inner.db_size,
-                        journal_mode: inner.journal_mode,
-                        freelist_count: inner.freelist.len(),
-                        checkpoint_active: inner.checkpoint_active,
-                    },
-                    PageNumber::ONE,
-                );
+
+            // Update the file format version in the database header (bytes 18-19).
+            // WAL mode uses version 2; all rollback journal modes use version 1.
+            // Without this, standard SQLite tools cannot detect WAL mode from the
+            // on-disk header and will fail to look for the WAL file.
+            let version_byte: u8 = if mode == JournalMode::Wal { 2 } else { 1 };
+            if inner.db_size > 0 && !inner.access_mode.is_readonly() {
+                let page_size = inner.page_size.as_usize();
+                let mut page1 = vec![0u8; page_size];
+                let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+                let bytes_read = db_file.read(cx, &mut page1, 0).await?;
+                if bytes_read >= DATABASE_HEADER_SIZE {
+                    page1[18] = version_byte;
+                    page1[19] = version_byte;
+                    db_file.write(cx, &page1, 0).await?;
+                    self.cache.evict(PageNumber::ONE);
+                }
             }
-            return Ok(mode);
-        }
 
-        if inner.checkpoint_active {
-            return Err(FrankenError::Busy);
+            inner.journal_mode = mode;
+            // D1-CRITICAL Change 3: Use sharded publish_remove_page.
+            self.published.publish_remove_page(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: inner.checkpoint_active,
+                },
+                PageNumber::ONE,
+            );
+            drop(inner);
+            Ok(mode)
         }
-        if inner.active_transactions > 0 {
-            // Cannot switch journal mode while any transaction is active.
-            return Err(FrankenError::Busy);
-        }
-
-        if mode == JournalMode::Wal && !has_wal_backend(&self.wal_backend)? {
-            return Err(FrankenError::Unsupported);
-        }
-
-        // Update the file format version in the database header (bytes 18-19).
-        // WAL mode uses version 2; all rollback journal modes use version 1.
-        // Without this, standard SQLite tools cannot detect WAL mode from the
-        // on-disk header and will fail to look for the WAL file.
-        let version_byte: u8 = if mode == JournalMode::Wal { 2 } else { 1 };
-        if inner.db_size > 0 && !inner.access_mode.is_readonly() {
-            let page_size = inner.page_size.as_usize();
-            let mut page1 = vec![0u8; page_size];
-            let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
-            if bytes_read >= DATABASE_HEADER_SIZE {
-                page1[18] = version_byte;
-                page1[19] = version_byte;
-                inner.db_file.write(cx, &page1, 0)?;
-                self.cache.evict(PageNumber::ONE);
-            }
-        }
-
-        inner.journal_mode = mode;
-        // D1-CRITICAL Change 3: Use sharded publish_remove_page.
-        self.published.publish_remove_page(
-            cx,
-            PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            },
-            PageNumber::ONE,
-        );
-        drop(inner);
-        Ok(mode)
     }
 
     fn set_wal_backend(&self, backend: Box<dyn WalBackend>) -> Result<()> {
@@ -6210,7 +6590,7 @@ where
             .wal_backend
             .write()
             .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
-        *wal_guard = Some(backend);
+        *wal_guard = Some(Arc::new(AsyncRwLock::with_name("wal_backend", backend)));
         drop(wal_guard);
         Ok(())
     }
@@ -6222,7 +6602,7 @@ where
 {
     const EXPORT_COPY_CHUNK_SIZE: usize = 64 * 1024;
 
-    fn prepare_fresh_journal_for_maintenance(&self, cx: &Cx) -> Result<()> {
+    async fn prepare_fresh_journal_for_maintenance(&self, cx: &Cx) -> Result<()> {
         let journal_path = Self::journal_path(&self.db_path);
         if !self.vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
             return Ok(());
@@ -6230,13 +6610,15 @@ where
 
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
         let (mut journal, _) = self.vfs.open(cx, Some(&journal_path), flags)?;
-        let result = classify_rollback_journal_prefix(cx, &journal).and_then(|(state, _)| {
-            if state == RollbackJournalPrefixState::NonHot {
-                Ok(())
-            } else {
-                Err(FrankenError::Busy)
-            }
-        });
+        let result = classify_rollback_journal_prefix(cx, &journal)
+            .await
+            .and_then(|(state, _)| {
+                if state == RollbackJournalPrefixState::NonHot {
+                    Ok(())
+                } else {
+                    Err(FrankenError::Busy)
+                }
+            });
         let close_result = journal.close(cx);
         result?;
         close_result?;
@@ -6251,10 +6633,16 @@ where
         Ok(())
     }
 
-    fn with_exclusive_maintenance<T>(
+    async fn with_exclusive_maintenance<S, T>(
         &self,
         cx: &Cx,
-        operation: impl FnOnce(&mut PagerInner<V::File>) -> Result<T>,
+        state: &mut S,
+        operation: impl for<'a> FnOnce(
+            &'a Self,
+            &'a Cx,
+            &'a mut PagerInner<V::File>,
+            &'a mut S,
+        ) -> LocalPagerFuture<'a, T>,
     ) -> Result<T> {
         let _maintenance_lease = self.maintenance_gate.enter_exclusive_maintenance()?;
         self.validate_namespace_binding()?;
@@ -6283,10 +6671,10 @@ where
             },
         );
 
-        let mut wal_guard = if inner.journal_mode == JournalMode::Wal {
-            match self.wal_backend.write() {
-                Ok(guard) => Some(guard),
-                Err(_) => {
+        let wal_handle = if inner.journal_mode == JournalMode::Wal {
+            match wal_backend_handle(&self.wal_backend) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
                     inner.checkpoint_active = false;
                     self.published.publish_metadata_only(
                         cx,
@@ -6298,7 +6686,7 @@ where
                             checkpoint_active: false,
                         },
                     );
-                    return Err(FrankenError::internal("SharedWalBackend lock poisoned"));
+                    return Err(error);
                 }
             }
         } else {
@@ -6310,7 +6698,11 @@ where
         // the default hook; Windows additionally takes the real byte ranges
         // used by stock SQLite rather than relying on FrankenSQLite sidecars.
         let wal_mode = inner.journal_mode == JournalMode::Wal;
-        if let Err(err) = inner.db_file.lock_external_maintenance(cx, wal_mode) {
+        let maintenance_lock_result = {
+            let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
+            db_file.lock_external_maintenance(cx, wal_mode)
+        };
+        if let Err(err) = maintenance_lock_result {
             inner.checkpoint_active = false;
             self.published.publish_metadata_only(
                 cx,
@@ -6325,24 +6717,23 @@ where
             return Err(err);
         }
 
-        let preflight = (|| -> Result<()> {
-            self.prepare_fresh_journal_for_maintenance(cx)?;
-            if let Some(wal_guard) = wal_guard.as_mut() {
-                let wal = wal_guard.as_deref_mut().ok_or_else(|| {
-                    FrankenError::internal("WAL mode active but no WAL backend installed")
-                })?;
+        let preflight = async {
+            self.prepare_fresh_journal_for_maintenance(cx).await?;
+            if let Some(wal_handle) = wal_handle.as_ref() {
+                let mut wal = async_rwlock_write(wal_handle, cx, "WAL backend").await?;
                 // Refresh from the durable WAL while the main-file EXCLUSIVE
                 // lock prevents external SQLite readers/writers from entering.
-                wal.begin_transaction(cx)?;
+                wal.begin_transaction(cx).await?;
                 if wal.frame_count() != 0 {
                     return Err(FrankenError::Busy);
                 }
             }
             Ok(())
-        })();
+        }
+        .await;
 
         let operation_result = match preflight {
-            Ok(()) => operation(&mut inner),
+            Ok(()) => operation(self, cx, &mut inner, state).await,
             Err(err) => Err(err),
         };
 
@@ -6353,9 +6744,12 @@ where
         // masked child so inherited cancellation cannot strand either lock.
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = inner
-            .db_file
-            .unlock_external_maintenance(&cleanup_cx, wal_mode);
+        let unlock_result = match shared_db_file_write(&inner.db_file, &cleanup_cx).await {
+            Ok(mut db_file) => db_file.unlock_external_maintenance(&cleanup_cx, wal_mode),
+            Err(error) => Err(FrankenError::internal(format!(
+                "database-file write lock failed during maintenance cleanup: {error}"
+            ))),
+        };
         inner.checkpoint_active = false;
         self.published.publish_metadata_only(
             cx,
@@ -6368,7 +6762,7 @@ where
             },
         );
         self.publish_committed_snapshot_from_inner(&inner);
-        drop(wal_guard);
+        drop(wal_handle);
 
         match (operation_result, unlock_result) {
             (Ok(value), Ok(())) => Ok(value),
@@ -6446,20 +6840,28 @@ where
     ///
     /// The VFS implementation determines whether a stable descriptor identity
     /// is available. The pager never re-resolves [`Self::db_path`] here.
-    pub fn file_identity(&self) -> Result<Option<FileIdentity>> {
+    pub async fn file_identity(&self, cx: &Cx) -> Result<Option<FileIdentity>> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-        inner.db_file.file_identity()
+        let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+        db_file.file_identity()
     }
 
     /// Propagate the connection's busy-timeout to the underlying VFS file so
     /// that `posix_lock` retries with backoff instead of returning BUSY
     /// immediately on cross-process contention.
-    pub fn set_vfs_busy_timeout_ms(&self, ms: u64) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.db_file.set_busy_timeout_ms(ms);
+    pub async fn set_vfs_busy_timeout_ms(&self, cx: &Cx, ms: u64) {
+        let db_file = self
+            .inner
+            .lock()
+            .ok()
+            .map(|inner| Arc::clone(&inner.db_file));
+        if let Some(db_file) = db_file
+            && let Ok(mut db_file) = shared_db_file_write(&db_file, cx).await
+        {
+            db_file.set_busy_timeout_ms(ms);
         }
     }
 
@@ -6495,7 +6897,10 @@ where
                 ));
             }
         };
-        *wal_guard = Some(Box::new(backend));
+        *wal_guard = Some(Arc::new(AsyncRwLock::with_name(
+            "wal_backend",
+            Box::new(backend),
+        )));
         drop(wal_guard);
         Ok(())
     }
@@ -6523,7 +6928,7 @@ where
     /// Inspect a fully-written candidate database image without creating any
     /// SQLite sidecars. Callers should perform semantic validation first, then
     /// retain this receipt for identity/hash verification at publication.
-    pub fn inspect_database_image(
+    pub async fn inspect_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -6531,7 +6936,7 @@ where
         let full_path = self.vfs.full_pathname(cx, image_path)?;
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
         let (mut file, _) = self.vfs.open(cx, Some(&full_path), flags)?;
-        let result = database_image_receipt_for_open_file(cx, &file, Some(self.page_size()));
+        let result = database_image_receipt_for_open_file(cx, &file, Some(self.page_size())).await;
         let close_result = file.close(cx);
         let receipt = result?;
         close_result?;
@@ -6546,14 +6951,14 @@ where
     /// digest closes the window in which a cooperating opener could switch a
     /// nominally complete main file into a WAL- or journal-backed generation
     /// without changing the main-file bytes themselves.
-    pub fn inspect_self_contained_database_image(
+    pub async fn inspect_self_contained_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
     ) -> Result<DatabaseImageReceipt> {
         let full_path = self.vfs.full_pathname(cx, image_path)?;
         self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
-        let receipt = self.inspect_database_image(cx, &full_path)?;
+        let receipt = self.inspect_database_image(cx, &full_path).await?;
         self.ensure_vacuum_candidate_is_self_contained(cx, &full_path)?;
         Ok(receipt)
     }
@@ -6566,7 +6971,7 @@ where
     /// complete page-1 image, durably syncs it, verifies that every byte outside
     /// offsets 24..28 and 92..96 is unchanged, and returns the final full-image
     /// receipt for later semantic validation and publication CAS.
-    pub fn restore_vacuum_candidate_change_counter(
+    pub async fn restore_vacuum_candidate_change_counter(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -6580,7 +6985,7 @@ where
                 .open_with_expected_identity(cx, &full_path, flags, provisional.identity)?;
 
         let mut lock_held = false;
-        let update_result = (|| -> Result<DatabaseImageReceipt> {
+        let update_result = async {
             file.lock(cx, LockLevel::Exclusive)?;
             lock_held = true;
 
@@ -6588,7 +6993,8 @@ where
                 cx,
                 &file,
                 Some(provisional.header.page_size),
-            )?;
+            )
+            .await?;
             if current != *provisional {
                 return Err(FrankenError::BusySnapshot {
                     conflicting_pages:
@@ -6599,7 +7005,7 @@ where
 
             let page_size = provisional.header.page_size.as_usize();
             let mut page_one = vec![0_u8; page_size];
-            let bytes_read = file.read(cx, &mut page_one, 0)?;
+            let bytes_read = file.read(cx, &mut page_one, 0).await?;
             if bytes_read != page_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -6612,11 +7018,11 @@ where
             expected_page_one[24..28].copy_from_slice(&counter_bytes);
             expected_page_one[92..96].copy_from_slice(&counter_bytes);
 
-            file.write(cx, &expected_page_one, 0)?;
+            file.write(cx, &expected_page_one, 0).await?;
             file.durable_sync(cx, SyncKind::FullDurable)?;
 
             let mut verified_page_one = vec![0_u8; page_size];
-            let verified_read = file.read(cx, &mut verified_page_one, 0)?;
+            let verified_read = file.read(cx, &mut verified_page_one, 0).await?;
             if verified_read != page_size || verified_page_one != expected_page_one {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "VACUUM candidate page 1 changed outside the intended counter fields"
@@ -6628,7 +7034,8 @@ where
                 cx,
                 &file,
                 Some(provisional.header.page_size),
-            )?;
+            )
+            .await?;
             let mut expected_header = provisional.header.clone();
             expected_header.change_counter = change_counter;
             expected_header.version_valid_for = change_counter;
@@ -6642,7 +7049,8 @@ where
                 });
             }
             Ok(final_receipt)
-        })();
+        }
+        .await;
 
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
@@ -6675,10 +7083,14 @@ where
     /// Capture the exact post-checkpoint source image used to build VACUUM's
     /// candidate. Publication later recomputes this logical digest under the
     /// same exclusive maintenance protocol and aborts if any page changed.
-    pub fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
-        self.with_exclusive_maintenance(cx, |inner| {
-            database_image_receipt_for_open_file(cx, &inner.db_file, Some(inner.page_size))
+    pub async fn capture_vacuum_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+        self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, _| {
+            Box::pin(async move {
+                let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+                database_image_receipt_for_open_file(cx, &*db_file, Some(inner.page_size)).await
+            })
         })
+        .await
     }
 
     fn ensure_vacuum_candidate_is_self_contained(&self, cx: &Cx, image_path: &Path) -> Result<()> {
@@ -6707,7 +7119,7 @@ where
     /// recomputed from their original open handles inside the exclusive
     /// maintenance epoch before any durable source byte is changed.
     #[allow(clippy::too_many_lines)]
-    pub fn publish_validated_database_image(
+    pub async fn publish_validated_database_image(
         &self,
         cx: &Cx,
         image_path: &Path,
@@ -6729,17 +7141,33 @@ where
             });
         }
         let candidate_flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
-        let (mut candidate_file, _) = self.vfs.open_with_expected_identity(
+        let (candidate_file, _) = self.vfs.open_with_expected_identity(
             cx,
             &image_full_path,
             candidate_flags,
             candidate.identity,
         )?;
 
-        let publication_result = self.with_exclusive_maintenance(cx, |inner| {
-            self.ensure_vacuum_candidate_is_self_contained(cx, &image_full_path)?;
-            let current_source =
-                database_image_receipt_for_open_file(cx, &inner.db_file, Some(inner.page_size))?;
+        let mut publication_state = (
+            candidate_file,
+            image_full_path,
+            source.clone(),
+            candidate.clone(),
+        );
+        let publication_result = self.with_exclusive_maintenance(
+            cx,
+            &mut publication_state,
+            |pager, cx, inner, state| {
+            let (candidate_file, image_full_path, source, candidate) = state;
+            Box::pin(async move {
+            pager.ensure_vacuum_candidate_is_self_contained(cx, image_full_path)?;
+            let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
+            let current_source = database_image_receipt_for_open_file(
+                cx,
+                &*db_file,
+                Some(inner.page_size),
+            )
+            .await?;
             if current_source != *source {
                 return Err(FrankenError::BusySnapshot {
                     conflicting_pages: "VACUUM source image changed while rebuilding".to_owned(),
@@ -6748,9 +7176,10 @@ where
 
             let current_candidate = database_image_receipt_for_open_file(
                 cx,
-                &candidate_file,
+                &*candidate_file,
                 Some(inner.page_size),
-            )?;
+            )
+            .await?;
             if current_candidate != *candidate {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "VACUUM candidate identity or content changed after validation"
@@ -6804,14 +7233,14 @@ where
             let journal_page_count = i32::try_from(journal_record_count).unwrap_or(-1);
 
             let mut nonce_bytes = [0_u8; 4];
-            self.vfs.randomness(cx, &mut nonce_bytes);
+            pager.vfs.randomness(cx, &mut nonce_bytes);
             let nonce = u32::from_be_bytes(nonce_bytes);
-            let journal_path = Self::journal_path(&self.db_path);
+            let journal_path = Self::journal_path(&pager.db_path);
             let journal_flags = VfsOpenFlags::CREATE
                 | VfsOpenFlags::EXCLUSIVE
                 | VfsOpenFlags::READWRITE
                 | VfsOpenFlags::MAIN_JOURNAL;
-            let (mut journal_file, _) = self.vfs.open(cx, Some(&journal_path), journal_flags)?;
+            let (mut journal_file, _) = pager.vfs.open(cx, Some(&journal_path), journal_flags)?;
             let journal_identity = journal_file.file_identity()?.ok_or_else(|| {
                 FrankenError::internal(
                     "rollback-journal VFS did not provide a stable file identity",
@@ -6830,12 +7259,9 @@ where
             // image while the maintenance fence is still held.
             let _cleanup_mask = cleanup_cx.masked();
 
-            let mut publish_result = (|| -> Result<Vec<PageNumber>> {
+            let mut publish_result = async {
                 journal_file.truncate(cx, 0)?;
-                let requested_sector_size = inner
-                    .db_file
-                    .sector_size()
-                    .max(journal_file.sector_size());
+                let requested_sector_size = db_file.sector_size().max(journal_file.sector_size());
                 let sector_size = if (512..=65_536).contains(&requested_sector_size)
                     && requested_sector_size.is_power_of_two()
                 {
@@ -6859,7 +7285,7 @@ where
                 // untouched. The complete, magic-bearing header is installed
                 // and synced immediately before the first database write.
                 initial_header_bytes[..JOURNAL_MAGIC.len()].fill(0);
-                journal_file.write(cx, &initial_header_bytes, 0)?;
+                journal_file.write(cx, &initial_header_bytes, 0).await?;
 
                 let mut journal_offset = u64::try_from(initial_header_bytes.len()).map_err(|_| {
                     FrankenError::OutOfRange {
@@ -6879,7 +7305,7 @@ where
                             what: "VACUUM source page offset".to_owned(),
                             value: raw_page_no.to_string(),
                         })?;
-                    let bytes_read = inner.db_file.read(cx, &mut page, offset)?;
+                    let bytes_read = db_file.read(cx, &mut page, offset).await?;
                     if bytes_read != page_size_usize {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -6889,7 +7315,7 @@ where
                     }
                     let record = JournalPageRecord::new(raw_page_no, page.clone(), nonce);
                     let encoded = record.encode();
-                    journal_file.write(cx, &encoded, journal_offset)?;
+                    journal_file.write(cx, &encoded, journal_offset).await?;
                     journal_offset = journal_offset
                         .checked_add(u64::try_from(encoded.len()).map_err(|_| {
                             FrankenError::OutOfRange {
@@ -6921,7 +7347,7 @@ where
                     )));
                 }
                 journal_file.durable_sync(cx, SyncKind::FullDurable)?;
-                self.vfs.sync_parent_directory(cx, &journal_path)?;
+                pager.vfs.sync_parent_directory(cx, &journal_path)?;
 
                 // The final record count is the commit point for the journal,
                 // not for the database. Once this barrier succeeds, recovery
@@ -6936,7 +7362,8 @@ where
                     cx,
                     &mut journal_file,
                     &final_header_bytes,
-                )?;
+                )
+                .await?;
                 journal_is_hot = true;
                 inner.rollback_journal_recovery_state =
                     RollbackJournalRecoveryState::ReplayPending;
@@ -6955,8 +7382,9 @@ where
                             what: "VACUUM candidate page offset".to_owned(),
                             value: raw_page_no.to_string(),
                         })?;
-                    let bytes_read =
-                        candidate_file.read(&cleanup_cx, &mut candidate_page, offset)?;
+                    let bytes_read = candidate_file
+                        .read(&cleanup_cx, &mut candidate_page, offset)
+                        .await?;
                     if bytes_read != page_size_usize {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -6964,22 +7392,21 @@ where
                             ),
                         });
                     }
-                    inner.db_file.write(&cleanup_cx, &candidate_page, offset)?;
+                    db_file
+                        .write(&cleanup_cx, &candidate_page, offset)
+                        .await?;
                     #[cfg(any(test, feature = "fault-injection"))]
                     crate::fault_hooks::maybe_inject_vacuum_after_target_page(raw_page_no)?;
                 }
-                inner
-                    .db_file
-                    .truncate(&cleanup_cx, candidate.file_size)?;
-                inner
-                    .db_file
-                    .durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
+                db_file.truncate(&cleanup_cx, candidate.file_size)?;
+                db_file.durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
 
                 let published_receipt = database_image_receipt_for_open_file(
                     &cleanup_cx,
-                    &inner.db_file,
+                    &*db_file,
                     Some(inner.page_size),
-                )?;
+                )
+                .await?;
                 if published_receipt.identity != source.identity
                     || published_receipt.file_size != candidate.file_size
                     || published_receipt.header != candidate.header
@@ -6993,12 +7420,13 @@ where
 
                 let rebuilt_freelist = load_freelist_from_disk(
                     &cleanup_cx,
-                    &inner.db_file,
+                    &*db_file,
                     page_size,
                     new_page_count,
                     candidate.header.freelist_trunk,
                     candidate.header.freelist_count,
-                )?;
+                )
+                .await?;
                 if rebuilt_freelist.len()
                     != usize::try_from(candidate.header.freelist_count).map_err(|_| {
                         FrankenError::OutOfRange {
@@ -7027,19 +7455,22 @@ where
                     &cleanup_cx,
                     &mut journal_file,
                     JournalInvalidation::ZeroMagic,
-                );
+                )
+                .await;
                 if let Err(invalidate_err) = invalidate_result {
                     let restore_result = durable_write_and_verify_journal_header(
                         &cleanup_cx,
                         &mut journal_file,
                         &final_header_bytes,
-                    );
+                    )
+                    .await;
                     if let Err(restore_err) = restore_result {
                         let truncate_commit_result = durable_invalidate_journal(
                             &cleanup_cx,
                             &mut journal_file,
                             JournalInvalidation::Truncate,
-                        );
+                        )
+                        .await;
                         if let Err(truncate_err) = truncate_commit_result {
                             journal_is_recoverable = false;
                             return Err(FrankenError::internal(format!(
@@ -7058,14 +7489,16 @@ where
                 let _ = journal_file.truncate(&cleanup_cx, 0);
                 let _ = journal_file.durable_sync(&cleanup_cx, SyncKind::FullDurable);
                 Ok(rebuilt_freelist)
-            })();
+            }
+            .await;
 
             if publish_result.is_err() && !journal_is_hot {
                 let pre_hot_cleanup = durable_invalidate_journal(
                     &cleanup_cx,
                     &mut journal_file,
                     JournalInvalidation::ZeroMagic,
-                );
+                )
+                .await;
                 if let Err(cleanup_err) = pre_hot_cleanup {
                     let publication_err = publish_result
                         .expect_err("pre-hot cleanup only runs after publication failure");
@@ -7081,7 +7514,7 @@ where
                     match close_result {
                         Ok(()) => {
                             if let Err(delete_err) =
-                                self.vfs.delete(&cleanup_cx, &journal_path, true)
+                                pager.vfs.delete(&cleanup_cx, &journal_path, true)
                             {
                                 tracing::warn!(
                                     error = %delete_err,
@@ -7101,33 +7534,38 @@ where
                     freelist
                 }
                 Err(publication_err) if journal_is_hot && journal_is_recoverable => {
+                    let publication_error_detail = publication_err.to_string();
+                    let expected_source = source.clone();
+                    let publication_error_detail = publication_error_detail.clone();
                     let rollback_result = Self::replay_journal_with_validator(
                         &cleanup_cx,
-                        self.vfs.as_ref(),
-                        &mut inner.db_file,
+                        pager.vfs.as_ref(),
+                        &mut *db_file,
                         &journal_path,
                         page_size,
-                        |restored_file, _journal_page_size| {
+                        move |validator_cx, restored_file, _journal_page_size| Box::pin(async move {
                             let restored = database_image_receipt_for_open_file(
-                                &cleanup_cx,
+                                validator_cx,
                                 restored_file,
                                 Some(page_size),
-                            )?;
-                            if restored != *source {
+                            )
+                            .await?;
+                            if restored != expected_source {
                                 return Err(FrankenError::DatabaseCorrupt {
                                     detail: format!(
-                                        "VACUUM rollback completed but the source receipt did not match: publication={publication_err}"
+                                        "VACUUM rollback completed but the source receipt did not match: publication={publication_error_detail}"
                                     ),
                                 });
                             }
                             Ok(())
-                        },
-                    );
+                        }),
+                    )
+                    .await;
                     match rollback_result {
                         Ok(()) => {
                             inner.rollback_journal_recovery_state =
                                 RollbackJournalRecoveryState::Clean;
-                            let _ = self.vfs.delete(&cleanup_cx, &journal_path, true);
+                            let _ = pager.vfs.delete(&cleanup_cx, &journal_path, true);
                             return Err(publication_err);
                         }
                         Err(rollback_err) => {
@@ -7145,7 +7583,7 @@ where
                         inner.rollback_journal_recovery_state =
                             RollbackJournalRecoveryState::Clean;
                         if close_result.is_ok() {
-                            let _ = self.vfs.delete(&cleanup_cx, &journal_path, true);
+                            let _ = pager.vfs.delete(&cleanup_cx, &journal_path, true);
                         }
                     }
                     return Err(match close_result {
@@ -7158,7 +7596,7 @@ where
             };
 
             let next_commit_seq = inner.commit_seq.next();
-            self.cache.clear();
+            pager.cache.clear();
             inner.page_size = candidate.header.page_size;
             inner.db_size = new_page_count;
             inner.next_page = if new_page_count >= 2 {
@@ -7177,7 +7615,7 @@ where
             inner.committed_wal_generation = None;
             inner.committed_wal_visible_commit_count = 0;
             inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
-            self.published.publish_replaced_image(
+            pager.published.publish_replaced_image(
                 &cleanup_cx,
                 PublishedPagerUpdate {
                     visible_commit_seq: inner.commit_seq,
@@ -7187,11 +7625,14 @@ where
                     checkpoint_active: true,
                 },
             );
-            self.publish_committed_snapshot_from_inner(inner);
-            remove_group_commit_queue(&self.db_path);
+            pager.publish_committed_snapshot_from_inner(inner);
+            remove_group_commit_queue(&pager.db_path);
             Ok(())
-        });
+            })
+        })
+        .await;
 
+        let (mut candidate_file, image_full_path, _, _) = publication_state;
         let close_result = candidate_file.close(cx);
         match publication_result {
             Ok(()) => {
@@ -7217,7 +7658,7 @@ where
     ///
     /// The pager must be quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the returned bytes contain the durable main image.
-    pub fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
+    pub async fn export_database_bytes(&self, cx: &Cx) -> Result<Vec<u8>> {
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_full = self.vfs.full_pathname(cx, &self.db_path)?;
@@ -7234,13 +7675,14 @@ where
         };
 
         if journal_mode == JournalMode::Wal {
-            self.checkpoint(cx, traits::CheckpointMode::Truncate)?;
+            self.checkpoint(cx, traits::CheckpointMode::Truncate)
+                .await?;
         }
 
         let source_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
         let (mut source_file, _) = self.vfs.open(cx, Some(&source_full), source_flags)?;
 
-        let export_result = (|| -> Result<Vec<u8>> {
+        let export_result = async {
             let file_size = source_file.file_size(cx)?;
             let output_len = usize::try_from(file_size).map_err(|_| FrankenError::OutOfRange {
                 what: "database export size".to_owned(),
@@ -7250,8 +7692,9 @@ where
             let mut copied = 0_usize;
             while copied < output_len {
                 let chunk_len = (output_len - copied).min(Self::EXPORT_COPY_CHUNK_SIZE);
-                let bytes_read =
-                    source_file.read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)?;
+                let bytes_read = source_file
+                    .read(cx, &mut bytes[copied..copied + chunk_len], copied as u64)
+                    .await?;
                 if bytes_read == 0 {
                     return Err(FrankenError::internal(
                         "unexpected EOF while exporting database image",
@@ -7262,7 +7705,8 @@ where
                     .ok_or_else(|| FrankenError::internal("export size overflow"))?;
             }
             Ok(bytes)
-        })();
+        }
+        .await;
 
         let source_close = source_file.close(cx);
 
@@ -7277,7 +7721,7 @@ where
     /// like `VACUUM INTO` and backup/canonicalization flows. The copy is only
     /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
     /// truncate the WAL so the destination contains a self-contained main DB.
-    pub fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+    pub async fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
         let _maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let source_path = self.db_path.clone();
@@ -7302,7 +7746,8 @@ where
         };
 
         if journal_mode == JournalMode::Wal {
-            self.checkpoint(cx, traits::CheckpointMode::Truncate)?;
+            self.checkpoint(cx, traits::CheckpointMode::Truncate)
+                .await?;
         }
 
         let source_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
@@ -7313,7 +7758,7 @@ where
         let (mut source_file, _) = self.vfs.open(cx, Some(&source_full), source_flags)?;
         let (mut target_file, _) = self.vfs.open(cx, Some(&target_full), target_flags)?;
 
-        let copy_result = (|| -> Result<()> {
+        let copy_result = async {
             let file_size = source_file.file_size(cx)?;
             let mut copied = 0_u64;
             let mut buffer = vec![0_u8; Self::EXPORT_COPY_CHUNK_SIZE];
@@ -7321,13 +7766,15 @@ where
                 let remaining = file_size - copied;
                 let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
                     .map_err(|_| FrankenError::internal("copy chunk length overflow"))?;
-                let bytes_read = source_file.read(cx, &mut buffer[..chunk_len], copied)?;
+                let bytes_read = source_file
+                    .read(cx, &mut buffer[..chunk_len], copied)
+                    .await?;
                 if bytes_read == 0 {
                     return Err(FrankenError::internal(
                         "unexpected EOF while copying database image",
                     ));
                 }
-                target_file.write(cx, &buffer[..bytes_read], copied)?;
+                target_file.write(cx, &buffer[..bytes_read], copied).await?;
                 copied = copied
                     .checked_add(
                         u64::try_from(bytes_read)
@@ -7338,7 +7785,8 @@ where
             target_file.truncate(cx, file_size)?;
             target_file.sync(cx, SyncFlags::FULL)?;
             Ok(())
-        })();
+        }
+        .await;
 
         let source_close = source_file.close(cx);
         let target_close = target_file.close(cx);
@@ -7392,7 +7840,7 @@ where
     /// This is used by upper layers that need a coherent published visibility
     /// snapshot before starting a new transaction or deciding whether a
     /// connection-local execution image is stale.
-    pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+    pub async fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
         let mut maintenance_lease = self.maintenance_gate.enter_transaction()?;
         self.validate_namespace_binding()?;
         let mut inner = self
@@ -7406,8 +7854,9 @@ where
 
         let had_recovery_pending = inner.rollback_journal_recovery_state.is_pending();
         let commit_seq_before_refresh = inner.commit_seq;
-        let (refresh, journal_visibility_invalidation) =
-            self.refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)?;
+        let (refresh, journal_visibility_invalidation) = self
+            .refresh_runtime_committed_state(cx, &mut maintenance_lease, &mut inner)
+            .await?;
 
         let clear_published_pages = had_recovery_pending
             || journal_visibility_invalidation
@@ -7437,11 +7886,11 @@ where
     /// required cross-process visibility probe; taking the database-file shared
     /// lock and probing the rollback journal only adds work to the hot read
     /// path.
-    pub fn refresh_published_snapshot_for_clean_wal_read(
+    pub async fn refresh_published_snapshot_for_clean_wal_read(
         &self,
         cx: &Cx,
     ) -> Result<PagerPublishedSnapshot> {
-        self.refresh_published_snapshot(cx)
+        self.refresh_published_snapshot(cx).await
     }
 
     /// Number of snapshot retries steady-state readers have taken.
@@ -7539,8 +7988,12 @@ where
     /// on every commit, so under MT-writer workloads it turned each
     /// post-commit poll into a global WAL RwLock write-contention
     /// point.
-    pub fn wal_frame_count(&self) -> usize {
-        with_wal_backend_read(&self.wal_backend, |wal| Ok(wal.frame_count())).unwrap_or(0)
+    pub async fn wal_frame_count(&self, cx: &Cx) -> usize {
+        with_wal_backend_read(&self.wal_backend, cx, |wal, _| {
+            Box::pin(async move { Ok(wal.frame_count()) })
+        })
+        .await
+        .unwrap_or(0)
     }
 
     /// Compute the journal path from the database path.
@@ -7571,7 +8024,7 @@ where
     /// the same epoch. If the rebuild fails after durable replay, the distinct
     /// `MetadataRefreshPending` state makes a later attempt retry metadata
     /// without requiring the already-invalidated journal.
-    fn recover_runtime_rollback_journal(
+    async fn recover_runtime_rollback_journal(
         cx: &Cx,
         vfs: &V,
         inner: &mut PagerInner<V::File>,
@@ -7580,8 +8033,8 @@ where
         wal_backend: &SharedWalBackend,
     ) -> Result<bool> {
         let wal_mode = inner.journal_mode == JournalMode::Wal;
-        inner.db_file.lock_external_maintenance(cx, wal_mode)?;
-        let recovery_result = (|| -> Result<bool> {
+        shared_db_lock_external_maintenance(&inner.db_file, cx, wal_mode).await?;
+        let recovery_result = async {
             let journal_exists = vfs.access(cx, journal_path, AccessFlags::EXISTS)?;
             if inner.rollback_journal_recovery_state.needs_replay() && !journal_exists {
                 return Err(FrankenError::internal(
@@ -7592,14 +8045,16 @@ where
             let mut journal_observed = false;
             if journal_exists {
                 journal_observed = true;
+                let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
                 let outcome = Self::replay_journal_with_optional_page_size_validator(
                     cx,
                     vfs,
-                    &mut inner.db_file,
+                    &mut *db_file,
                     journal_path,
                     Some(inner.page_size),
-                    |_, _| Ok(()),
-                )?;
+                    |_, _, _| Box::pin(async { Ok(()) }),
+                )
+                .await?;
                 match outcome {
                     RollbackJournalReplayOutcome::Replayed(_) => {
                         inner.rollback_journal_recovery_state =
@@ -7621,7 +8076,9 @@ where
                 RollbackJournalRecoveryState::MetadataRefreshPending
             ) {
                 cache.clear();
-                inner.refresh_committed_state_after_recovery(cx, cache, wal_backend)?;
+                inner
+                    .refresh_committed_state_after_recovery(cx, cache, wal_backend)
+                    .await?;
                 inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::Clean;
             }
 
@@ -7639,12 +8096,12 @@ where
                 );
             }
             Ok(journal_observed)
-        })();
+        }
+        .await;
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = inner
-            .db_file
-            .unlock_external_maintenance(&cleanup_cx, wal_mode);
+        let unlock_result =
+            shared_db_unlock_external_maintenance(&inner.db_file, &cleanup_cx, wal_mode).await;
         match (recovery_result, unlock_result) {
             (Ok(recovered), Ok(())) => Ok(recovered),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -7654,7 +8111,7 @@ where
         }
     }
 
-    fn recover_rollback_journal_for_open(
+    async fn recover_rollback_journal_for_open(
         cx: &Cx,
         vfs: &V,
         db_file: &mut V::File,
@@ -7669,7 +8126,7 @@ where
         // main-file users; this is safe for rollback-mode files and prevents a
         // crashed WAL-mode whole-image publication racing recovery.
         db_file.lock_external_maintenance(cx, true)?;
-        let recovery_result = (|| -> Result<Option<RollbackJournalReplayOutcome>> {
+        let recovery_result = async {
             if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
                 return Ok(None);
             }
@@ -7679,8 +8136,8 @@ where
                 db_file,
                 journal_path,
                 None,
-                |restored_file, journal_page_size| {
-                    let restored_size = restored_file.file_size(cx)?;
+                |validator_cx, restored_file, journal_page_size| Box::pin(async move {
+                    let restored_size = restored_file.file_size(validator_cx)?;
                     if restored_size == 0 {
                         return Ok(());
                     }
@@ -7692,7 +8149,9 @@ where
                         });
                     }
                     let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                    let bytes_read = restored_file.read(cx, &mut header_bytes, 0)?;
+                    let bytes_read = restored_file
+                        .read(validator_cx, &mut header_bytes, 0)
+                        .await?;
                     if bytes_read != DATABASE_HEADER_SIZE {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -7718,8 +8177,9 @@ where
                         });
                     }
                     Ok(())
-                },
-            )?;
+                }),
+            )
+            .await?;
             if let Err(error) = vfs.delete(cx, journal_path, true) {
                 tracing::warn!(
                     %error,
@@ -7732,7 +8192,8 @@ where
                 });
             }
             Ok(Some(outcome))
-        })();
+        }
+        .await;
 
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
@@ -7746,14 +8207,18 @@ where
         }
     }
 
-    fn verify_readonly_rollback_journal_state(cx: &Cx, vfs: &V, journal_path: &Path) -> Result<()> {
+    async fn verify_readonly_rollback_journal_state(
+        cx: &Cx,
+        vfs: &V,
+        journal_path: &Path,
+    ) -> Result<()> {
         if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
             return Ok(());
         }
 
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_JOURNAL;
         let (mut journal_file, _) = vfs.open(cx, Some(journal_path), flags)?;
-        let classification = classify_rollback_journal_prefix(cx, &journal_file);
+        let classification = classify_rollback_journal_prefix(cx, &journal_file).await;
         let close_result = journal_file.close(cx);
         match (classification, close_result) {
             (Ok((RollbackJournalPrefixState::NonHot, _)), Ok(())) => Ok(()),
@@ -7772,21 +8237,21 @@ where
     /// under main-file SHARED, then SHARED is released before the lease is
     /// upgraded and the canonical WAL-slots -> main-EXCLUSIVE recovery epoch
     /// begins. Read-only pagers only classify and fail closed.
-    fn refresh_runtime_committed_state(
+    async fn refresh_runtime_committed_state(
         &self,
         cx: &Cx,
         maintenance_lease: &mut PagerMaintenanceLease,
         inner: &mut PagerInner<V::File>,
     ) -> Result<(CommittedStateRefresh, bool)> {
         let journal_path = Self::journal_path(&self.db_path);
-        inner.db_file.lock_external_shared_snapshot(cx)?;
+        shared_db_lock_external_snapshot(&inner.db_file, cx).await?;
 
         let journal_exists = match self.vfs.access(cx, &journal_path, AccessFlags::EXISTS) {
             Ok(exists) => exists,
             Err(error) => {
                 let cleanup_cx = cleanup_child_cx(cx);
                 let _cleanup_mask = cleanup_cx.masked();
-                return match inner.db_file.unlock_external_shared_snapshot(&cleanup_cx) {
+                return match shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await {
                     Ok(()) => Err(error),
                     Err(unlock_error) => Err(FrankenError::internal(format!(
                         "rollback-journal probe failed and could not release SHARED: probe={error}; unlock={unlock_error}"
@@ -7800,14 +8265,21 @@ where
             let operation_result = if had_pending {
                 Err(FrankenError::BusyRecovery)
             } else {
-                Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
-                    .and_then(|()| {
-                        inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)
-                    })
+                match Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
+                    .await
+                {
+                    Ok(()) => {
+                        inner
+                            .refresh_committed_state(cx, &self.cache, &self.wal_backend)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
             };
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
-            let unlock_result = inner.db_file.unlock_external_shared_snapshot(&cleanup_cx);
+            let unlock_result =
+                shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await;
             return match (operation_result, unlock_result) {
                 (Ok(refresh), Ok(())) => Ok((refresh, journal_exists)),
                 (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -7823,7 +8295,7 @@ where
             // canonical order.
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
-            inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)?;
+            shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await?;
             let _recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive()?;
             let recovery_result = Self::recover_runtime_rollback_journal(
@@ -7833,7 +8305,8 @@ where
                 &journal_path,
                 &self.cache,
                 &self.wal_backend,
-            );
+            )
+            .await;
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
             let downgrade_result = maintenance_lease.downgrade_from_exclusive(prior_kind);
@@ -7847,16 +8320,16 @@ where
                 }
             }
 
-            inner.db_file.lock_external_shared_snapshot(cx)?;
+            shared_db_lock_external_snapshot(&inner.db_file, cx).await?;
             // A non-hot leftover is harmless if deletion failed. A new hot
             // record here means another process won a publication race after
             // our recovery epoch; fail closed instead of reading through it.
             if let Err(error) =
-                Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path)
+                Self::verify_readonly_rollback_journal_state(cx, &*self.vfs, &journal_path).await
             {
                 let cleanup_cx = cleanup_child_cx(cx);
                 let _cleanup_mask = cleanup_cx.masked();
-                return match inner.db_file.unlock_external_shared_snapshot(&cleanup_cx) {
+                return match shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await {
                     Ok(()) => Err(error),
                     Err(unlock_error) => Err(FrankenError::internal(format!(
                         "post-recovery journal verification failed and could not release SHARED: verification={error}; unlock={unlock_error}"
@@ -7865,10 +8338,12 @@ where
             }
         }
 
-        let refresh_result = inner.refresh_committed_state(cx, &self.cache, &self.wal_backend);
+        let refresh_result = inner
+            .refresh_committed_state(cx, &self.cache, &self.wal_backend)
+            .await;
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
-        let unlock_result = inner.db_file.unlock_external_shared_snapshot(&cleanup_cx);
+        let unlock_result = shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await;
         match (refresh_result, unlock_result) {
             (Ok(refresh), Ok(())) => Ok((refresh, had_pending || journal_exists)),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -7884,7 +8359,7 @@ where
     /// successfully initialized connection.
     #[doc(hidden)]
     #[allow(clippy::too_many_lines)]
-    pub fn open_for_connection_with_cx_and_page_buffer_max(
+    pub async fn open_for_connection_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -7906,6 +8381,7 @@ where
                         finish_namespace_bootstrap: false,
                     },
                 )
+                .await
             }
             ConnectionPagerOpenMode::ExistingOnly(expected_identity) => {
                 Self::open_readwrite_with_cx_and_page_buffer_max(
@@ -7920,6 +8396,7 @@ where
                         finish_namespace_bootstrap: false,
                     },
                 )
+                .await
             }
             ConnectionPagerOpenMode::ReservedEmpty(expected_identity) => {
                 Self::open_readwrite_with_cx_and_page_buffer_max(
@@ -7934,6 +8411,7 @@ where
                         finish_namespace_bootstrap: false,
                     },
                 )
+                .await
             }
             ConnectionPagerOpenMode::ReadOnly(expected_identity) => {
                 Self::open_readonly_with_optional_expected_identity(
@@ -7945,6 +8423,7 @@ where
                     page_buffer_max,
                     false,
                 )
+                .await
             }
         }
     }
@@ -7960,13 +8439,13 @@ where
     /// If a hot journal is detected (leftover from a crash), it is replayed
     /// to restore the database to a consistent state before returning.
     #[allow(clippy::too_many_lines)]
-    pub fn open_with_cx(
+    pub async fn open_with_cx(
         cx: &Cx,
         vfs: V,
         path: &Path,
         requested_page_size: PageSize,
     ) -> Result<Self> {
-        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None)
+        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None).await
     }
 
     /// Like [`open_with_cx`](Self::open_with_cx) but allows overriding the
@@ -7976,7 +8455,7 @@ where
     /// uses that value directly, `None` checks the `FSQLITE_PAGE_BUFFER_MAX`
     /// env var, then falls back to [`crate::DEFAULT_PAGE_BUFFER_MAX`] (262 144).
     #[allow(clippy::too_many_lines)]
-    pub fn open_with_cx_and_page_buffer_max(
+    pub async fn open_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -7995,6 +8474,7 @@ where
                 finish_namespace_bootstrap: true,
             },
         )
+        .await
     }
 
     /// Initialize a caller-reserved empty file only if the opened VFS handle
@@ -8005,7 +8485,7 @@ where
     /// pre-existing rollback journal, WAL, WAL-FEC, or shared-memory sidecar.
     /// The identity and sidecar checks precede database initialization, and
     /// this path never performs recovery.
-    pub fn open_reserved_with_cx_and_page_buffer_max(
+    pub async fn open_reserved_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8025,6 +8505,7 @@ where
                 finish_namespace_bootstrap: true,
             },
         )
+        .await
     }
 
     /// Open an existing database for reading and writing without creating or
@@ -8036,7 +8517,7 @@ where
     /// When `expected_identity` is present, it is compared with the identity
     /// of the already-open VFS handle before any file read or recovery action.
     #[allow(clippy::too_many_lines)]
-    pub fn open_existing_with_cx_and_page_buffer_max(
+    pub async fn open_existing_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8056,10 +8537,11 @@ where
                 finish_namespace_bootstrap: true,
             },
         )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
-    fn open_readwrite_with_cx_and_page_buffer_max(
+    async fn open_readwrite_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8151,7 +8633,11 @@ where
 
         let journal_path = Self::journal_path(&db_path);
         if disposition == ReadWriteOpenDisposition::ExistingOnly
-            && with_main_shared_lock(cx, &mut db_file, |db_file| db_file.file_size(cx))? == 0
+            && with_main_shared_lock(cx, &mut db_file, &mut (), |cx, db_file, _| {
+                Box::pin(async move { db_file.file_size(cx) })
+            })
+            .await?
+                == 0
         {
             // Existing-only open never lets a sidecar bootstrap an empty main
             // file, even if that sidecar looks like a valid hot journal.
@@ -8179,7 +8665,8 @@ where
                         &*vfs,
                         &mut db_file,
                         &journal_path,
-                    );
+                    )
+                    .await;
                     let cleanup_cx = cleanup_child_cx(cx);
                     let _cleanup_mask = cleanup_cx.masked();
                     let downgrade_result =
@@ -8198,27 +8685,44 @@ where
                     continue;
                 }
 
-                let snapshot = with_main_shared_lock(cx, &mut db_file, |db_file| {
+                let mut snapshot_state = (
+                    Arc::clone(&vfs),
+                    journal_path.clone(),
+                    accept_proven_non_hot_leftover,
+                    disposition,
+                    db_path.clone(),
+                );
+                let snapshot = with_main_shared_lock(
+                    cx,
+                    &mut db_file,
+                    &mut snapshot_state,
+                    |cx, db_file, state| {
+                    let (vfs, journal_path, accept_non_hot, disposition, db_path) = state;
+                    Box::pin(async move {
                     if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
-                        if !accept_proven_non_hot_leftover {
+                        if !*accept_non_hot {
                             return Ok(None);
                         }
-                        match Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)
-                        {
+                        match Self::verify_readonly_rollback_journal_state(
+                            cx,
+                            &*vfs,
+                            &journal_path,
+                        )
+                        .await {
                             Ok(()) => {}
                             Err(FrankenError::BusyRecovery) => return Ok(None),
                             Err(error) => return Err(error),
                         }
                     }
                     let file_size = db_file.file_size(cx)?;
-                    if disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
+                    if *disposition == ReadWriteOpenDisposition::ExistingOnly && file_size == 0 {
                         return Err(FrankenError::CannotOpen {
                             path: db_path.clone(),
                         });
                     }
                     let header_bytes = if file_size >= DATABASE_HEADER_SIZE as u64 {
                         let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                        let bytes_read = db_file.read(cx, &mut header_bytes, 0)?;
+                        let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
                         if bytes_read != DATABASE_HEADER_SIZE {
                             return Err(FrankenError::DatabaseCorrupt {
                                 detail: format!(
@@ -8231,7 +8735,9 @@ where
                         None
                     };
                     Ok(Some((file_size, header_bytes)))
-                })?;
+                    })
+                })
+                .await?;
                 if let Some((file_size, header_bytes)) = snapshot {
                     break (file_size, header_bytes, accept_proven_non_hot_leftover);
                 }
@@ -8250,7 +8756,8 @@ where
                         header_bytes,
                         &error,
                         false,
-                    )? =>
+                    )
+                    .await? =>
                 {
                     page_size_from_header_bytes(header_bytes).unwrap_or(requested_page_size)
                 }
@@ -8280,7 +8787,7 @@ where
                 db_file.lock(cx, LockLevel::Exclusive)?;
             }
 
-            let bootstrap_result = (|| -> Result<(DatabaseHeader, u64)> {
+            let bootstrap_result = async {
                 if reserved_bootstrap {
                     if db_file.file_identity()? != expected_identity || db_file.file_size(cx)? != 0
                     {
@@ -8323,10 +8830,11 @@ where
                 let usable = page_size.usable(header.reserved_per_page);
                 BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
 
-                db_file.write(cx, &page1, 0)?;
+                db_file.write(cx, &page1, 0).await?;
                 db_file.sync(cx, SyncFlags::NORMAL)?;
                 Ok((header, db_file.file_size(cx)?))
-            })();
+            }
+            .await;
 
             let unlock_result = if reserved_bootstrap {
                 db_file.unlock(cx, LockLevel::None)
@@ -8367,7 +8875,8 @@ where
                             &header_bytes,
                             &error,
                             false,
-                        )? =>
+                        )
+                        .await? =>
                     {
                         // A live SQLite WAL can carry the authoritative page-1
                         // header while the main file still contains the stale
@@ -8426,32 +8935,64 @@ where
                     "validated database header could not be re-encoded: {error}"
                 ))
             })?;
-            with_main_shared_lock(cx, &mut db_file, |db_file| {
-                if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
-                    if !accept_proven_non_hot_leftover {
-                        return Err(FrankenError::BusyRecovery);
-                    }
-                    Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)?;
-                }
-                if db_file.file_size(cx)? != file_size {
-                    return Err(FrankenError::BusyRecovery);
-                }
-                let mut observed_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-                let bytes_read = db_file.read(cx, &mut observed_header_bytes, 0)?;
-                if bytes_read != DATABASE_HEADER_SIZE
-                    || observed_header_bytes != expected_header_bytes
-                {
-                    return Err(FrankenError::BusyRecovery);
-                }
-                load_freelist_from_disk(
-                    cx,
-                    db_file,
-                    page_size,
-                    db_size,
-                    header.freelist_trunk,
-                    header.freelist_count,
-                )
-            })?
+            let mut freelist_state = (
+                Arc::clone(&vfs),
+                journal_path.clone(),
+                accept_proven_non_hot_leftover,
+                file_size,
+                expected_header_bytes,
+                page_size,
+                db_size,
+                header.freelist_trunk,
+                header.freelist_count,
+            );
+            with_main_shared_lock(
+                cx,
+                &mut db_file,
+                &mut freelist_state,
+                |cx, db_file, state| {
+                    let (
+                        vfs,
+                        journal_path,
+                        accept_non_hot,
+                        file_size,
+                        expected_header_bytes,
+                        page_size,
+                        db_size,
+                        freelist_trunk,
+                        freelist_count,
+                    ) = state;
+                    Box::pin(async move {
+                        if vfs.access(cx, &journal_path, AccessFlags::EXISTS)? {
+                            if !*accept_non_hot {
+                                return Err(FrankenError::BusyRecovery);
+                            }
+                            Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)
+                                .await?;
+                        }
+                        if db_file.file_size(cx)? != *file_size {
+                            return Err(FrankenError::BusyRecovery);
+                        }
+                        let mut observed_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+                        let bytes_read = db_file.read(cx, &mut observed_header_bytes, 0).await?;
+                        if bytes_read != DATABASE_HEADER_SIZE
+                            || observed_header_bytes != *expected_header_bytes
+                        {
+                            return Err(FrankenError::BusyRecovery);
+                        }
+                        load_freelist_from_disk(
+                            cx,
+                            db_file,
+                            *page_size,
+                            *db_size,
+                            *freelist_trunk,
+                            *freelist_count,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await?
         };
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
@@ -8472,7 +9013,7 @@ where
             recovery_fence,
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
-                db_file,
+                db_file: Arc::new(AsyncRwLock::with_name("pager_db_file", db_file)),
                 page_size,
                 db_size,
                 next_page,
@@ -8549,13 +9090,14 @@ where
     /// minutes, because it avoids the expensive freelist scan and journal
     /// recovery that the read-write path performs.
     #[allow(clippy::too_many_lines)]
-    pub fn open_readonly_with_cx(
+    pub async fn open_readonly_with_cx(
         cx: &Cx,
         vfs: V,
         path: &Path,
         _requested_page_size: PageSize,
     ) -> Result<Self> {
         Self::open_readonly_with_cx_and_page_buffer_max(cx, vfs, path, _requested_page_size, None)
+            .await
     }
 
     /// Like [`open_readonly_with_cx`](Self::open_readonly_with_cx) but allows
@@ -8563,7 +9105,7 @@ where
     ///
     /// See [`open_with_cx_and_page_buffer_max`](Self::open_with_cx_and_page_buffer_max)
     /// for parameter semantics.
-    pub fn open_readonly_with_cx_and_page_buffer_max(
+    pub async fn open_readonly_with_cx_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8579,6 +9121,7 @@ where
             page_buffer_max,
             true,
         )
+        .await
     }
 
     /// Open an existing database read-only only if its VFS handle has
@@ -8586,7 +9129,7 @@ where
     ///
     /// The identity-bound VFS open occurs before the header or any live-WAL
     /// sidecar is inspected.
-    pub fn open_readonly_with_expected_identity_and_page_buffer_max(
+    pub async fn open_readonly_with_expected_identity_and_page_buffer_max(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8603,10 +9146,11 @@ where
             page_buffer_max,
             true,
         )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
-    fn open_readonly_with_optional_expected_identity(
+    async fn open_readonly_with_optional_expected_identity(
         cx: &Cx,
         vfs: V,
         path: &Path,
@@ -8691,11 +9235,18 @@ where
         };
 
         let journal_path = Self::journal_path(&db_path);
-        let (file_size, header_bytes) = with_main_shared_lock(cx, &mut db_file, |db_file| {
+        let mut header_state = (Arc::clone(&vfs), journal_path.clone(), db_path.clone());
+        let (file_size, header_bytes) = with_main_shared_lock(
+            cx,
+            &mut db_file,
+            &mut header_state,
+            |cx, db_file, state| {
+            let (vfs, journal_path, db_path) = state;
+            Box::pin(async move {
             // Read-only and schema-only opens cannot replay. They may accept a
             // proven non-hot construction leftover, but they must never cache
             // a database image for which recovery is required or ambiguous.
-            Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path)?;
+            Self::verify_readonly_rollback_journal_state(cx, &*vfs, &journal_path).await?;
             let file_size = db_file.file_size(cx)?;
             if file_size == 0 {
                 return Err(FrankenError::CannotOpen {
@@ -8711,7 +9262,7 @@ where
             }
 
             let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-            let bytes_read = db_file.read(cx, &mut header_bytes, 0)?;
+            let bytes_read = db_file.read(cx, &mut header_bytes, 0).await?;
             if bytes_read != DATABASE_HEADER_SIZE {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -8720,7 +9271,9 @@ where
                 });
             }
             Ok((file_size, header_bytes))
-        })?;
+            })
+        })
+        .await?;
         let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
             Ok(header) => {
                 let page_size = header.page_size;
@@ -8734,7 +9287,8 @@ where
                     &header_bytes,
                     &error,
                     true,
-                )? =>
+                )
+                .await? =>
             {
                 let page_size = page_size_from_header_bytes(&header_bytes).ok_or_else(|| {
                     FrankenError::DatabaseCorrupt {
@@ -8795,7 +9349,7 @@ where
             recovery_fence,
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
-                db_file,
+                db_file: Arc::new(AsyncRwLock::with_name("pager_db_file", db_file)),
                 page_size,
                 db_size,
                 next_page,
@@ -8846,28 +9400,24 @@ where
     /// Open (or create) a database and return a pager using a detached test context.
     #[cfg(test)]
     #[allow(clippy::too_many_lines)]
-    pub fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
+    pub async fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
         let cx = Cx::new();
-        Self::open_with_cx(&cx, vfs, path, page_size)
+        Self::open_with_cx(&cx, vfs, path, page_size).await
     }
 
     /// Replay a hot journal by writing original pages back to the database.
     #[cfg(test)]
-    fn replay_journal(
+    async fn replay_journal(
         cx: &Cx,
         vfs: &V,
         db_file: &mut V::File,
         journal_path: &Path,
         page_size: PageSize,
     ) -> Result<()> {
-        Self::replay_journal_with_validator(
-            cx,
-            vfs,
-            db_file,
-            journal_path,
-            page_size,
-            |_, _| Ok(()),
-        )
+        Self::replay_journal_with_validator(cx, vfs, db_file, journal_path, page_size, |_, _, _| {
+            Box::pin(async { Ok(()) })
+        })
+        .await
     }
 
     /// Replay a hot journal, verify the durable restored image, and only then
@@ -8878,7 +9428,7 @@ where
     /// `validate_restored` adds any caller-specific whole-image invariant while
     /// the same hot-journal handle is still open. A validation error closes the
     /// handle without invalidating it, leaving recovery retryable and fail-closed.
-    fn replay_journal_with_validator<Validate>(
+    async fn replay_journal_with_validator<Validate>(
         cx: &Cx,
         vfs: &V,
         db_file: &mut V::File,
@@ -8887,7 +9437,7 @@ where
         validate_restored: Validate,
     ) -> Result<()>
     where
-        Validate: FnOnce(&V::File, PageSize) -> Result<()>,
+        Validate: for<'a> FnOnce(&'a Cx, &'a V::File, PageSize) -> WalFuture<'a, ()>,
     {
         Self::replay_journal_with_optional_page_size_validator(
             cx,
@@ -8897,10 +9447,11 @@ where
             Some(page_size),
             validate_restored,
         )
+        .await
         .map(|_| ())
     }
 
-    fn replay_journal_with_optional_page_size_validator<Validate>(
+    async fn replay_journal_with_optional_page_size_validator<Validate>(
         cx: &Cx,
         vfs: &V,
         db_file: &mut V::File,
@@ -8909,12 +9460,12 @@ where
         validate_restored: Validate,
     ) -> Result<RollbackJournalReplayOutcome>
     where
-        Validate: FnOnce(&V::File, PageSize) -> Result<()>,
+        Validate: for<'a> FnOnce(&'a Cx, &'a V::File, PageSize) -> WalFuture<'a, ()>,
     {
         let jrnl_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
         let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
 
-        let (prefix_state, jrnl_size) = classify_rollback_journal_prefix(cx, &jrnl_file)?;
+        let (prefix_state, jrnl_size) = classify_rollback_journal_prefix(cx, &jrnl_file).await?;
         if prefix_state == RollbackJournalPrefixState::NonHot {
             jrnl_file.close(cx)?;
             return Ok(RollbackJournalReplayOutcome::NonHot);
@@ -8929,7 +9480,7 @@ where
 
         // Read and parse the journal header.
         let mut hdr_buf = vec![0u8; crate::journal::JOURNAL_HEADER_SIZE];
-        let header_read = jrnl_file.read(cx, &mut hdr_buf, 0)?;
+        let header_read = jrnl_file.read(cx, &mut hdr_buf, 0).await?;
         if header_read != hdr_buf.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -8977,7 +9528,7 @@ where
                 ),
             });
         }
-        let is_local_journal = local_journal_marker_present(cx, &jrnl_file, hdr_padded)?;
+        let is_local_journal = local_journal_marker_present(cx, &jrnl_file, hdr_padded).await?;
         let record_size_u64 = u64::try_from(record_size).expect("journal record size fits u64");
         if header.page_count < 0 && (jrnl_size - hdr_padded) % record_size_u64 != 0 {
             if is_local_journal {
@@ -9046,7 +9597,7 @@ where
         let mut validated_pages = HashSet::new();
         for _ in 0..page_count {
             let mut rec_buf = vec![0u8; record_size];
-            let bytes_read = jrnl_file.read(cx, &mut rec_buf, validation_offset)?;
+            let bytes_read = jrnl_file.read(cx, &mut rec_buf, validation_offset).await?;
             if bytes_read != record_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -9105,7 +9656,7 @@ where
 
         for _ in 0..page_count {
             let mut rec_buf = vec![0u8; record_size];
-            let bytes_read = jrnl_file.read(cx, &mut rec_buf, offset)?;
+            let bytes_read = jrnl_file.read(cx, &mut rec_buf, offset).await?;
             if bytes_read < record_size {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -9146,7 +9697,7 @@ where
                 });
             }
             let page_offset = u64::from(page_no.get() - 1) * ps as u64;
-            db_file.write(cx, &record.content, page_offset)?;
+            db_file.write(cx, &record.content, page_offset).await?;
 
             offset += record_size as u64;
         }
@@ -9169,7 +9720,7 @@ where
         // has been re-read and proven to equal every pre-image in this journal.
         // Growth pages deliberately have no records; exact file-size
         // verification proves they were removed by rollback.
-        let verification_result = (|| -> Result<()> {
+        let verification_result = async {
             let restored_size = db_file.file_size(cx)?;
             if restored_size != target_size {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -9183,7 +9734,9 @@ where
             let mut restored_page = vec![0_u8; ps];
             for _ in 0..page_count {
                 let mut rec_buf = vec![0_u8; record_size];
-                let bytes_read = jrnl_file.read(cx, &mut rec_buf, verification_offset)?;
+                let bytes_read = jrnl_file
+                    .read(cx, &mut rec_buf, verification_offset)
+                    .await?;
                 if bytes_read != record_size {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -9228,7 +9781,9 @@ where
                         what: "rollback recovery verification page offset".to_owned(),
                         value: page_no.get().to_string(),
                     })?;
-                let restored_read = db_file.read(cx, &mut restored_page, page_offset)?;
+                let restored_read = db_file
+                    .read(cx, &mut restored_page, page_offset)
+                    .await?;
                 if restored_read != ps || restored_page != record.content {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -9245,8 +9800,9 @@ where
                     })?;
             }
 
-            validate_restored(db_file, page_size)
-        })();
+            validate_restored(cx, db_file, page_size).await
+        }
+        .await;
 
         if let Err(verification_error) = verification_result {
             let close_result = jrnl_file.close(cx);
@@ -9262,7 +9818,7 @@ where
         // journal before best-effort deletion so a later delete failure does
         // not replay the same pre-images on every open.
         let invalidate_result =
-            durable_invalidate_journal(cx, &mut jrnl_file, JournalInvalidation::Truncate);
+            durable_invalidate_journal(cx, &mut jrnl_file, JournalInvalidation::Truncate).await;
         let close_result = jrnl_file.close(cx);
         match (invalidate_result, close_result) {
             (Ok(()), Ok(())) => Ok(RollbackJournalReplayOutcome::Replayed(page_size)),
@@ -9751,7 +10307,7 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// fence and maintenance lease are acquired, then restored before return
     /// so ordinary transaction finalization still owns exactly one snapshot
     /// fence to release.
-    fn recover_pending_rollback_journal(&mut self, cx: &Cx) -> Result<bool> {
+    async fn recover_pending_rollback_journal(&mut self, cx: &Cx) -> Result<bool> {
         if !self.is_writer || self.journal_mode == JournalMode::Wal {
             return Ok(false);
         }
@@ -9764,11 +10320,11 @@ impl<V: Vfs> SimpleTransaction<V> {
             return Ok(false);
         }
 
-        inner.db_file.unlock_external_shared_snapshot(cx)?;
+        shared_db_unlock_external_snapshot(&inner.db_file, cx).await?;
         let recovery_guard = match self.recovery_fence.acquire_for_recovery() {
             Ok(guard) => guard,
             Err(error) => {
-                return match inner.db_file.lock_external_shared_snapshot(cx) {
+                return match shared_db_lock_external_snapshot(&inner.db_file, cx).await {
                     Ok(()) => Err(error),
                     Err(relock_error) => Err(FrankenError::internal(format!(
                         "could not enter rollback recovery or restore the transaction snapshot lock: recovery={error}; relock={relock_error}"
@@ -9782,7 +10338,7 @@ impl<V: Vfs> SimpleTransaction<V> {
         let prior_kind = match maintenance_lease.upgrade_to_exclusive() {
             Ok(prior_kind) => prior_kind,
             Err(error) => {
-                return match inner.db_file.lock_external_shared_snapshot(cx) {
+                return match shared_db_lock_external_snapshot(&inner.db_file, cx).await {
                     Ok(()) => Err(error),
                     Err(relock_error) => Err(FrankenError::internal(format!(
                         "could not exclude same-process pagers for rollback recovery or restore the transaction snapshot lock: recovery={error}; relock={relock_error}"
@@ -9798,11 +10354,12 @@ impl<V: Vfs> SimpleTransaction<V> {
             &self.journal_path,
             &self.cache,
             &self.wal_backend,
-        );
+        )
+        .await;
         let cleanup_cx = cleanup_child_cx(cx);
         let _cleanup_mask = cleanup_cx.masked();
         let downgrade_result = maintenance_lease.downgrade_from_exclusive(prior_kind);
-        let relock_result = inner.db_file.lock_external_shared_snapshot(&cleanup_cx);
+        let relock_result = shared_db_lock_external_snapshot(&inner.db_file, &cleanup_cx).await;
         let operation_result = match (recovery_result, downgrade_result, relock_result) {
             (Ok(recovered), Ok(()), Ok(())) => Ok(recovered),
             (Err(error), Ok(()), Ok(()))
@@ -9822,7 +10379,8 @@ impl<V: Vfs> SimpleTransaction<V> {
             &cleanup_cx,
             &*self.vfs,
             &self.journal_path,
-        )?;
+        )
+        .await?;
         drop(recovery_guard);
         self.published.publish_clear_if(
             &cleanup_cx,
@@ -10478,7 +11036,7 @@ impl<V: Vfs> SimpleTransaction<V> {
             .collect::<Result<Vec<_>>>()
     }
 
-    fn flush_retained_memory_overlay_pages_to_db_file(
+    async fn flush_retained_memory_overlay_pages_to_db_file(
         cx: &Cx,
         inner: &mut PagerInner<V::File>,
         original_db_size: u32,
@@ -10494,9 +11052,10 @@ impl<V: Vfs> SimpleTransaction<V> {
             let offset = u64::from(page_no.get() - 1) * page_size_bytes;
             batched_writes.push((offset, page.as_bytes()));
         }
-        inner
-            .db_file
-            .write_page_batch(cx, batched_writes.as_slice())?;
+        let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+        db_file
+            .write_page_batch(cx, batched_writes.as_slice())
+            .await?;
         inner.committed_db_file_size_bytes =
             u64::from(original_db_size) * u64::from(inner.page_size.get());
         Ok(())
@@ -10632,8 +11191,8 @@ where
     V: Vfs + Send,
     V::File: Send + Sync,
 {
-    fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
-        durable_invalidate_journal(cx, journal_file, JournalInvalidation::ZeroMagic)
+    async fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
+        durable_invalidate_journal(cx, journal_file, JournalInvalidation::ZeroMagic).await
     }
 
     /// Commit using the rollback journal protocol.
@@ -10643,7 +11202,7 @@ where
     /// needed to reconstruct the transaction's begin-time view of the
     /// committed freelist for the cross-connection aliasing check below.
     #[allow(clippy::too_many_lines)]
-    fn commit_journal<S: std::hash::BuildHasher>(
+    async fn commit_journal<S: std::hash::BuildHasher>(
         cx: &Cx,
         vfs: &Arc<V>,
         journal_path: &Path,
@@ -10656,7 +11215,8 @@ where
             // Escalate to EXCLUSIVE before writing to the database file.
             // This prevents concurrent processes from reading partially
             // written pages during the commit.
-            inner.db_file.lock(cx, LockLevel::Exclusive)?;
+            let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
+            db_file.lock(cx, LockLevel::Exclusive)?;
 
             let mut nonce_bytes = [0_u8; 4];
             vfs.randomness(cx, &mut nonce_bytes);
@@ -10717,7 +11277,7 @@ where
                 && original_db_size >= PageNumber::ONE.get()
             {
                 let mut image = vec![0u8; ps];
-                let bytes_read = inner.db_file.read(cx, &mut image, 0)?;
+                let bytes_read = db_file.read(cx, &mut image, 0).await?;
                 if bytes_read < ps {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -10772,12 +11332,13 @@ where
                 if !(snapshot_freelist.is_empty() && (first_trunk == 0 || freelist_count == 0)) {
                     let committed_freelist: HashSet<u32> = load_freelist_from_disk(
                         cx,
-                        &inner.db_file,
+                        &*db_file,
                         page_size,
                         committed_db_size,
                         first_trunk,
                         freelist_count,
-                    )?
+                    )
+                    .await?
                     .into_iter()
                     .map(|page| page.get())
                     .filter(|&page| page <= original_db_size)
@@ -10811,7 +11372,7 @@ where
                 | VfsOpenFlags::MAIN_JOURNAL;
             let (mut jrnl_file, _) = vfs.open(cx, Some(journal_path), jrnl_flags)?;
 
-            let requested_sector_size = inner.db_file.sector_size().max(jrnl_file.sector_size());
+            let requested_sector_size = db_file.sector_size().max(jrnl_file.sector_size());
             let sector_size = if (512..=65_536).contains(&requested_sector_size)
                 && requested_sector_size.is_power_of_two()
             {
@@ -10832,7 +11393,7 @@ where
             mark_local_journal_header(&mut hdr_bytes);
             hdr_bytes[..JOURNAL_MAGIC.len()].fill(0);
             jrnl_file.truncate(cx, 0)?;
-            jrnl_file.write(cx, &hdr_bytes, 0)?;
+            jrnl_file.write(cx, &hdr_bytes, 0).await?;
 
             let mut jrnl_offset = hdr_bytes.len() as u64;
             for &page_no in &journal_pages {
@@ -10849,7 +11410,7 @@ where
                 } else {
                     let mut pre_image = vec![0u8; ps];
                     let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
-                    let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
+                    let bytes_read = db_file.read(cx, &mut pre_image, disk_offset).await?;
                     if bytes_read < ps {
                         return Err(FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -10863,7 +11424,7 @@ where
 
                 let record = JournalPageRecord::new(page_no.get(), pre_image, nonce);
                 let rec_bytes = record.encode();
-                jrnl_file.write(cx, &rec_bytes, jrnl_offset)?;
+                jrnl_file.write(cx, &rec_bytes, jrnl_offset).await?;
                 jrnl_offset += rec_bytes.len() as u64;
             }
 
@@ -10874,7 +11435,7 @@ where
             vfs.sync_parent_directory(cx, journal_path)?;
             let mut final_hdr_bytes = header.encode_padded();
             mark_local_journal_header(&mut final_hdr_bytes);
-            durable_write_and_verify_journal_header(cx, &mut jrnl_file, &final_hdr_bytes)?;
+            durable_write_and_verify_journal_header(cx, &mut jrnl_file, &final_hdr_bytes).await?;
             inner.rollback_journal_recovery_state = RollbackJournalRecoveryState::ReplayPending;
 
             // Phase 2: Write dirty pages to database. Once the journal is hot,
@@ -10884,35 +11445,39 @@ where
             let _mask = cleanup_cx.masked();
             let saved_db_size = inner.db_size;
             for (page_no, staged) in write_set {
-                if let Err(e) = inner.flush_page(&cleanup_cx, *page_no, staged.as_page_bytes()) {
+                let offset = u64::from(page_no.get() - 1) * u64::from(inner.page_size.get());
+                if let Err(e) = db_file
+                    .write(&cleanup_cx, staged.as_page_bytes(), offset)
+                    .await
+                {
                     inner.db_size = saved_db_size;
                     return Err(e);
                 }
                 inner.db_size = inner.db_size.max(page_no.get());
             }
 
-            inner
-                .db_file
-                .durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
+            db_file.durable_sync(&cleanup_cx, SyncKind::FullDurable)?;
 
             // Phase 3: Make the journal non-hot before best-effort deletion.
             // If invalidation fails, restore and sync the complete hot header
             // so rollback is definite. Only if restoration itself fails may a
             // truncate+sync choose the already-durable database as committed.
             if let Err(invalidate_err) =
-                Self::invalidate_journal_after_commit(&cleanup_cx, &mut jrnl_file)
+                Self::invalidate_journal_after_commit(&cleanup_cx, &mut jrnl_file).await
             {
                 let restore_result = durable_write_and_verify_journal_header(
                     &cleanup_cx,
                     &mut jrnl_file,
                     &final_hdr_bytes,
-                );
+                )
+                .await;
                 if let Err(restore_err) = restore_result {
                     let truncate_commit_result = durable_invalidate_journal(
                         &cleanup_cx,
                         &mut jrnl_file,
                         JournalInvalidation::Truncate,
-                    );
+                    )
+                    .await;
                     if let Err(truncate_err) = truncate_commit_result {
                         return Err(FrankenError::internal(format!(
                             "rollback-journal commit outcome is indeterminate: invalidate={invalidate_err}; restore={restore_err}; truncate_commit={truncate_err}"
@@ -10949,7 +11514,7 @@ where
         Ok(())
     }
 
-    fn flush_write_set_to_db_file_batch<S: std::hash::BuildHasher>(
+    async fn flush_write_set_to_db_file_batch<S: std::hash::BuildHasher>(
         cx: &Cx,
         inner: &mut PagerInner<V::File>,
         write_set: &HashMap<PageNumber, StagedPage, S>,
@@ -10973,9 +11538,10 @@ where
             batched_writes.push((offset, staged.as_page_bytes()));
         }
 
-        inner
-            .db_file
+        let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+        db_file
             .write_page_batch(cx, batched_writes.as_slice())
+            .await
     }
 
     /// Commit using the WAL protocol with group commit batching.
@@ -11004,7 +11570,7 @@ where
     /// The CALLER drops their inner.lock() before calling this function, allowing
     /// other transactions to start their prepare phase while we wait/batch.
     #[cfg(test)]
-    fn commit_wal_group_commit<S: std::hash::BuildHasher>(
+    async fn commit_wal_group_commit<S: std::hash::BuildHasher>(
         cx: &Cx,
         wal_backend: &SharedWalBackend,
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
@@ -11035,11 +11601,12 @@ where
             queue,
             &mut publication_authorization,
         )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_arguments)]
-    fn commit_wal_group_commit_with_snapshot<S: std::hash::BuildHasher>(
+    async fn commit_wal_group_commit_with_snapshot<S: std::hash::BuildHasher>(
         cx: &Cx,
         wal_backend: &SharedWalBackend,
         inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
@@ -11080,8 +11647,10 @@ where
         let batch_build_us = elapsed_profile_us(t_batch_build_start);
 
         let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
-        let conflict_snapshot =
-            with_wal_backend_read(wal_backend, |wal| Ok(wal.pinned_read_snapshot()))?;
+        let conflict_snapshot = with_wal_backend_read(wal_backend, cx, |wal, _| {
+            Box::pin(async move { Ok(wal.pinned_read_snapshot()) })
+        })
+        .await?;
         let batch = attach_group_commit_conflict_metadata(
             batch,
             conflict_pages,
@@ -11130,7 +11699,8 @@ where
                 batch_id,
                 lane_id,
                 &parallel_wal_control,
-            )?;
+            )
+            .await?;
             lane_prepare_us = elapsed_profile_us(t_lane_prepare_start);
             if let Some(staged_prepared) = staged_prepared {
                 let staged_frame_count = staged_prepared.staged_frame_count;
@@ -11229,8 +11799,12 @@ where
 
         let run_flusher_loop = |mut record_initial_metrics: bool,
                                 mut needs_arrival_wait: bool,
-                                mut prefetched_flush: Option<(Vec<TransactionFrameBatch>, u64)>|
-         -> Result<()> {
+                                mut filling_obligation: Option<GroupCommitFillingObligation>,
+                                mut prefetched_flush: Option<(
+            Vec<TransactionFrameBatch>,
+            u64,
+            GroupCommitFlushObligation,
+        )>| async move {
             'flusher_loop: loop {
                 let arrival_wait_decision = {
                     let (observation, max_wait) = {
@@ -11280,7 +11854,8 @@ where
                         if should_flush || Instant::now() >= deadline {
                             break;
                         }
-                        std::hint::spin_loop();
+                        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                        asupersync::runtime::yield_now().await;
                     }
                     Instant::now()
                         .duration_since(t_arrival_wait_start)
@@ -11292,28 +11867,34 @@ where
                     u64::try_from(Duration::from_micros(arrival_wait_us).as_nanos())
                         .unwrap_or(u64::MAX);
 
-                let (mut batches, flush_epoch) = if let Some(prefetched) = prefetched_flush.take() {
-                    prefetched
-                } else {
-                    let maybe_flush = {
-                        let mut consolidator = queue
-                            .consolidator
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if !record_initial_metrics
-                            && consolidator.phase() != fsqlite_wal::ConsolidationPhase::Filling
-                        {
-                            None
-                        } else {
-                            let batches = consolidator.begin_flush()?;
-                            Some((batches, consolidator.epoch()))
+                let (mut batches, flush_epoch, mut flush_obligation) =
+                    if let Some(prefetched) = prefetched_flush.take() {
+                        prefetched
+                    } else {
+                        let maybe_flush = {
+                            let mut consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if !record_initial_metrics
+                                && consolidator.phase() != fsqlite_wal::ConsolidationPhase::Filling
+                            {
+                                None
+                            } else {
+                                let batches = consolidator.begin_flush()?;
+                                let flush_epoch = consolidator.epoch();
+                                Some((batches, flush_epoch))
+                            }
+                        };
+                        let Some(flush) = maybe_flush else {
+                            break;
+                        };
+                        if let Some(obligation) = filling_obligation.as_mut() {
+                            obligation.disarm();
                         }
+                        let flush_obligation = GroupCommitFlushObligation::new(queue, flush.1);
+                        (flush.0, flush.1, flush_obligation)
                     };
-                    let Some(flush) = maybe_flush else {
-                        break;
-                    };
-                    flush
-                };
 
                 let t_flush_frame_prep_start = detailed_metrics.then(Instant::now);
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
@@ -11383,6 +11964,9 @@ where
                         (abort_result, wake_next_epoch)
                     };
                     queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
+                    if abort_result.is_ok() {
+                        flush_obligation.disarm();
+                    }
                     if let Err(abort_error) = abort_result {
                         if flush_epoch != target_epoch {
                             tracing::debug!(
@@ -11538,13 +12122,13 @@ where
                         ParallelWalOperatingMode::Conservative
                     )
                 {
-                    let prepared = with_wal_backend_read(wal_backend, |wal| {
-                        let mut prepared_batch = wal.prepare_append_frames(&frame_refs)?;
-                        if let Some(prepared) = prepared_batch.as_mut() {
-                            wal.finalize_prepared_frames(cx, prepared)?;
-                        }
-                        Ok(prepared_batch)
-                    })?;
+                    let backend = wal_backend_handle(wal_backend)?;
+                    let wal = async_rwlock_read(&backend, cx, "WAL backend").await?;
+                    let mut prepared = wal.prepare_append_frames(&frame_refs)?;
+                    if let Some(prepared) = prepared.as_mut() {
+                        wal.finalize_prepared_frames(cx, prepared)?;
+                    }
+                    drop(wal);
                     prepared_batch = prepared;
                 }
                 let flush_frame_prep_us = elapsed_profile_us(t_flush_frame_prep_start);
@@ -11569,7 +12153,7 @@ where
 
                 for attempt in 0..MAX_FLUSH_RETRIES {
                     let t_inner_lock_start = phase_timing.then(Instant::now);
-                    flush_result = (|| -> Result<()> {
+                    flush_result = async {
                         let mut inner = inner_arc.lock().map_err(|_| {
                             FrankenError::internal("SimpleTransaction lock poisoned")
                         })?;
@@ -11584,7 +12168,7 @@ where
                         // main database file. SQLite's RESERVED byte is the
                         // narrow lock for this: one appender at a time, while
                         // peer SHARED holders keep running.
-                        inner.db_file.lock(cx, LockLevel::Reserved)?;
+                        shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
                         exclusive_lock_us = elapsed_profile_us(t_excl_start);
                         let restore_lock_level = if inner.writer_active {
                             // Immediate/exclusive transactions enter commit
@@ -11597,9 +12181,11 @@ where
                             LockLevel::Shared
                         };
 
-                        let flush_io_result = (|| -> Result<()> {
-                            let mut completed_receipt = None;
-                            with_wal_backend(wal_backend, |wal| {
+                        let flush_io_result = async {
+                            let backend = wal_backend_handle(wal_backend)?;
+                            let mut wal_guard =
+                                async_rwlock_write(&backend, cx, "WAL backend").await?;
+                            let wal = wal_guard.as_mut();
                                 // A connection-local WAL backend can lag a
                                 // commit published through a peer backend.
                                 // Refresh it while the cross-process append
@@ -11608,11 +12194,12 @@ where
                                 // refreshes, so compute the interval only
                                 // after every operation that can advance the
                                 // backend's view of the durable tail.
-                                let _ = wal.refresh_published_snapshot(cx)?;
+                                let _ = wal.refresh_published_snapshot(cx).await?;
                                 let t_append_conflict_check_start =
                                     detailed_metrics.then(Instant::now);
                                 let stale_conflict_pages =
-                                    conflicting_pages_since_batch_snapshots(cx, wal, &batches)?;
+                                    conflicting_pages_since_batch_snapshots(cx, wal, &batches)
+                                        .await?;
                                 append_conflict_check_us =
                                     elapsed_profile_us(t_append_conflict_check_start);
                                 if !stale_conflict_pages.is_empty() {
@@ -11624,8 +12211,9 @@ where
                                             .join(","),
                                     });
                                 }
-                                let authorized_seed =
-                                    wal.latest_authorized_parallel_wal_commit_certificate(cx)?;
+                                let authorized_seed = wal
+                                    .latest_authorized_parallel_wal_commit_certificate(cx)
+                                    .await?;
                                 frames_written_start = u64::try_from(wal.frame_count())
                                     .unwrap_or(u64::MAX)
                                     .saturating_add(1);
@@ -11642,7 +12230,14 @@ where
                                         .saturating_add(1);
                                 }
 
+                                let wal_ref = &mut *wal;
+                                let prepared_ref = &mut prepared_batch;
+                                let frame_refs_ref = &frame_refs;
+                                let append_frames_us_ref = &mut append_frames_us;
+                                let wal_append_us_ref = &mut wal_append_us;
+                                let wal_sync_us_ref = &mut wal_sync_us;
                                 let receipt = queue.record_persisted_epoch(
+                                    cx,
                                     PersistedGroupCommitInput {
                                         trace_id: cx.trace_id(),
                                         epoch: flush_epoch,
@@ -11657,14 +12252,14 @@ where
                                         fallback_reason,
                                         authorized_seed,
                                     },
-                                    |certificate| {
-                                        match wal.persist_parallel_wal_commit_certificate(
+                                    move |certificate| async move {
+                                        match wal_ref.persist_parallel_wal_commit_certificate(
                                             cx,
-                                            certificate,
+                                            &certificate,
                                             frames_written_start,
                                             frames_written_end,
                                             sync_policy.should_sync_on_commit(),
-                                        ) {
+                                        ).await {
                                             Ok(()) => {}
                                             #[cfg(test)]
                                             Err(FrankenError::Unsupported) => {
@@ -11679,16 +12274,16 @@ where
 
                                         let t_append_frames_start =
                                             detailed_metrics.then(Instant::now);
-                                        if let Some(prepared) = prepared_batch.as_mut() {
-                                            wal.append_prepared_frames(cx, prepared)?;
+                                        if let Some(prepared) = prepared_ref.as_mut() {
+                                            wal_ref.append_prepared_frames(cx, prepared).await?;
                                         } else {
-                                            wal.append_frames(cx, &frame_refs)?;
+                                            wal_ref.append_frames(cx, frame_refs_ref).await?;
                                         }
-                                        append_frames_us =
+                                        *append_frames_us_ref =
                                             elapsed_profile_us(t_append_frames_start);
-                                        wal_append_us = append_frames_us;
+                                        *wal_append_us_ref = *append_frames_us_ref;
                                         let actual_frames_written_end =
-                                            u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
+                                            u64::try_from(wal_ref.frame_count()).unwrap_or(u64::MAX);
                                         if actual_frames_written_end != frames_written_end {
                                             return Err(FrankenError::internal(format!(
                                                 "parallel WAL certificate covers frames {frames_written_start}..={frames_written_end}, append ended at {actual_frames_written_end}"
@@ -11697,8 +12292,8 @@ where
 
                                         if sync_policy.should_sync_on_commit() {
                                             let t_sync_start = phase_timing.then(Instant::now);
-                                            wal.sync(cx)?;
-                                            wal_sync_us = elapsed_profile_us(t_sync_start);
+                                            wal_ref.sync(cx)?;
+                                            *wal_sync_us_ref = elapsed_profile_us(t_sync_start);
                                             GLOBAL_CONSOLIDATION_METRICS
                                                 .fsyncs_total
                                                 .fetch_add(1, AtomicOrdering::Relaxed);
@@ -11711,16 +12306,8 @@ where
                                         )?;
                                         Ok(())
                                     },
-                                )?;
-                                completed_receipt = Some(receipt);
-                                Ok(())
-                            })?;
-
-                            let receipt = completed_receipt.ok_or_else(|| {
-                                FrankenError::internal(
-                                    "parallel WAL group flush completed without a durability receipt",
-                                )
-                            })?;
+                                ).await?;
+                            drop(wal_guard);
                             if let Some(published) = published {
                                 published.publish_parallel_wal_group(
                                     cx,
@@ -11736,9 +12323,11 @@ where
                             }
                             inner.db_size = final_db_size;
                             Ok(())
-                        })();
+                        }
+                        .await;
 
-                        let restore_result = inner.db_file.unlock(cx, restore_lock_level);
+                        let restore_result =
+                            shared_db_unlock(&inner.db_file, cx, restore_lock_level).await;
                         match (flush_io_result, restore_result) {
                             (Ok(()), Ok(())) => Ok(()),
                             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -11748,7 +12337,8 @@ where
                                 )))
                             }
                         }
-                    })();
+                    }
+                    .await;
 
                     match &flush_result {
                         Err(
@@ -11928,6 +12518,7 @@ where
                             completed_epoch,
                             has_promoted && caller_target_completed,
                         );
+                        flush_obligation.disarm();
 
                         if has_promoted {
                             if caller_target_completed {
@@ -12000,6 +12591,9 @@ where
                             (abort_result, wake_next_epoch)
                         };
                         queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
+                        if abort_result.is_ok() {
+                            flush_obligation.disarm();
+                        }
                         if let Err(abort_error) = abort_result {
                             if flush_epoch != target_epoch {
                                 tracing::debug!(
@@ -12038,7 +12632,8 @@ where
 
         match outcome {
             SubmitOutcome::Flusher => {
-                run_flusher_loop(true, true, None)?;
+                let filling_obligation = GroupCommitFillingObligation::new(queue, target_epoch);
+                run_flusher_loop(true, true, Some(filling_obligation), None).await?;
             }
 
             SubmitOutcome::Waiter => {
@@ -12049,11 +12644,7 @@ where
                 // flushing is queued for the promoted next epoch, so deriving
                 // `epoch_at_queue + 1` here can wake too early.
                 let t_waiter_start = phase_timing.then(Instant::now);
-                let guard = queue
-                    .consolidator
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let wait_outcome = queue.wait_for_epoch_outcome(guard, target_epoch)?;
+                let wait_outcome = queue.wait_for_epoch_outcome_async(cx, target_epoch).await?;
                 let waiter_epoch_wait_us = elapsed_profile_us(t_waiter_start);
 
                 match wait_outcome {
@@ -12127,7 +12718,14 @@ where
                         flush_epoch,
                     } => {
                         let _ = waiter_epoch_wait_us;
-                        run_flusher_loop(true, false, Some((batches, flush_epoch)))?;
+                        let flush_obligation = GroupCommitFlushObligation::new(queue, flush_epoch);
+                        run_flusher_loop(
+                            true,
+                            false,
+                            None,
+                            Some((batches, flush_epoch, flush_obligation)),
+                        )
+                        .await?;
                     }
                 }
             }
@@ -12164,7 +12762,7 @@ where
         Ok(())
     }
 
-    fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
+    async fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
         if self.read_only_pager {
             return Err(FrankenError::ReadOnly);
         }
@@ -12247,7 +12845,7 @@ where
                     return Err(FrankenError::Busy);
                 }
                 // Escalate to RESERVED lock for cross-process writer exclusion.
-                inner.db_file.lock(cx, LockLevel::Reserved)?;
+                shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
                 inner.writer_active = true;
                 drop(inner);
                 self.is_writer = true;
@@ -12273,7 +12871,7 @@ const fn retained_lock_level_after_txn_exit(
     }
 }
 
-fn release_snapshot_after_failed_begin<F: VfsFile>(
+async fn release_snapshot_after_failed_begin<F: VfsFile>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
     active_transactions_before_begin: u32,
@@ -12281,28 +12879,28 @@ fn release_snapshot_after_failed_begin<F: VfsFile>(
     let cleanup_cx = cleanup_child_cx(cx);
     let _cleanup_mask = cleanup_cx.masked();
     if active_transactions_before_begin == 0 {
-        inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)
+        shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await
     } else {
         let preserve_level = retained_lock_level_after_txn_exit(
             active_transactions_before_begin,
             inner.writer_active,
         );
-        inner.db_file.unlock(&cleanup_cx, preserve_level)
+        shared_db_unlock(&inner.db_file, &cleanup_cx, preserve_level).await
     }
 }
 
-fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
+async fn release_retained_snapshot_after_txn_exit<F: VfsFile>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
 ) -> Result<()> {
     let cleanup_cx = cleanup_child_cx(cx);
     let _cleanup_mask = cleanup_cx.masked();
     if inner.active_transactions == 0 {
-        inner.db_file.unlock_external_shared_snapshot(&cleanup_cx)
+        shared_db_unlock_external_snapshot(&inner.db_file, &cleanup_cx).await
     } else {
         let preserve_level =
             retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-        inner.db_file.unlock(&cleanup_cx, preserve_level)
+        shared_db_unlock(&inner.db_file, &cleanup_cx, preserve_level).await
     }
 }
 
@@ -12311,207 +12909,221 @@ where
     V: Vfs + Send,
     V::File: Send + Sync,
 {
-    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        if self.contains_freed_page(page_no) {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "page {} was freed earlier in this transaction",
-                    page_no.get()
-                ),
-            });
-        }
-
-        if let Some(staged) = self.write_set.get(&page_no) {
-            return Ok(staged.published_page());
-        }
-
-        // Pages that were allocated after a savepoint and then rolled back
-        // should return zeros, not BusySnapshot error.
-        if self.rolled_back_pages.contains(&page_no) {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            return Ok(PageData::zeroed(inner.page_size));
-        }
-
-        // MVCC db_size guard: pages beyond the transaction's snapshot db_size
-        // did not exist when this snapshot was taken. A transaction handle is
-        // bound to one coherent snapshot for its lifetime, so a later commit
-        // must never expand this boundary in-place. Callers that need the
-        // latest state must begin a new transaction at the statement boundary.
-        //
-        // Exception: pages allocated by THIS transaction (in allocated_from_eof
-        // or allocated_from_freelist) are allowed even if beyond published_db_size.
-        if page_no.get() > self.published_db_size.get() {
-            let page_allocated_by_this_txn = self.allocated_from_eof.contains(&page_no)
-                || self.allocated_from_freelist.contains(&page_no)
-                || self.page_lease.contains(&page_no);
-            if !page_allocated_by_this_txn {
-                let latest_snapshot = self.published.snapshot();
-                tracing::trace!(
-                    target: "fsqlite.snapshot_publication",
-                    trace_id = cx.trace_id(),
-                    run_id = "pager-publication",
-                    scenario_id = "page_beyond_fixed_snapshot_db_size",
-                    page_no = page_no.get(),
-                    published_db_size = self.published_db_size.get(),
-                    latest_db_size = latest_snapshot.db_size,
-                    published_commit_seq = self.published_visible_commit_seq.get().get(),
-                    latest_commit_seq = latest_snapshot.visible_commit_seq.get(),
-                    "refused to advance a transaction's fixed snapshot"
-                );
-                return Err(FrankenError::BusySnapshot {
-                    conflicting_pages: format!(
-                        "page {} > snapshot db_size {} (latest: {})",
-                        page_no.get(),
-                        self.published_db_size.get(),
-                        latest_snapshot.db_size
+    fn get_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
+            if self.contains_freed_page(page_no) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "page {} was freed earlier in this transaction",
+                        page_no.get()
                     ),
                 });
             }
-        }
 
-        // A transaction that has already observed a page owns that exact
-        // snapshot image for the rest of its lifetime.  Consult the local
-        // cache before every shared publication/cache source; otherwise a
-        // concurrent commit can replace those global latest-image planes and
-        // make a re-read return different bytes even though this handle's
-        // visible commit sequence remains fixed (GH #129).
-        if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
-            return Ok(cached.clone());
-        }
-        let single_connection_fast_path = self.single_connection_fast_path_enabled();
-        let trace_read_start =
-            tracing::enabled!(target: "fsqlite.snapshot_publication", tracing::Level::TRACE)
-                .then(Instant::now);
-        let mut published_retry_count = 0_usize;
-        while self.published.page_plane_visible_commit_seq()
-            == self.published_visible_commit_seq.get()
-        {
-            let snapshot = self.published.snapshot();
-            if page_no.get() > snapshot.db_size {
-                if self.published.current_sequence_gen() == snapshot.snapshot_gen {
+            if let Some(staged) = self.write_set.get(&page_no) {
+                return Ok(staged.published_page());
+            }
+
+            // Pages that were allocated after a savepoint and then rolled back
+            // should return zeros, not BusySnapshot error.
+            if self.rolled_back_pages.contains(&page_no) {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                return Ok(PageData::zeroed(inner.page_size));
+            }
+
+            // MVCC db_size guard: pages beyond the transaction's snapshot db_size
+            // did not exist when this snapshot was taken. A transaction handle is
+            // bound to one coherent snapshot for its lifetime, so a later commit
+            // must never expand this boundary in-place. Callers that need the
+            // latest state must begin a new transaction at the statement boundary.
+            //
+            // Exception: pages allocated by THIS transaction (in allocated_from_eof
+            // or allocated_from_freelist) are allowed even if beyond published_db_size.
+            if page_no.get() > self.published_db_size.get() {
+                let page_allocated_by_this_txn = self.allocated_from_eof.contains(&page_no)
+                    || self.allocated_from_freelist.contains(&page_no)
+                    || self.page_lease.contains(&page_no);
+                if !page_allocated_by_this_txn {
+                    let latest_snapshot = self.published.snapshot();
                     tracing::trace!(
                         target: "fsqlite.snapshot_publication",
                         trace_id = cx.trace_id(),
                         run_id = "pager-publication",
-                        scenario_id = "zero_fill_read",
-                        snapshot_gen = snapshot.snapshot_gen,
-                        visible_commit_seq = snapshot.visible_commit_seq.get(),
-                        publication_mode = SNAPSHOT_PUBLICATION_MODE,
-                        read_retry_count = self.published.read_retry_count(),
-                        page_set_size = snapshot.page_set_size,
-                        elapsed_ns = trace_read_start
-                            .map_or(0, |start| {
-                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-                            }),
-                        "resolved zero-filled page from published metadata"
+                        scenario_id = "page_beyond_fixed_snapshot_db_size",
+                        page_no = page_no.get(),
+                        published_db_size = self.published_db_size.get(),
+                        latest_db_size = latest_snapshot.db_size,
+                        published_commit_seq = self.published_visible_commit_seq.get().get(),
+                        latest_commit_seq = latest_snapshot.visible_commit_seq.get(),
+                        "refused to advance a transaction's fixed snapshot"
                     );
-                    let page = PageData::from_vec(vec![0_u8; self.pool.page_size()]);
+                    return Err(FrankenError::BusySnapshot {
+                        conflicting_pages: format!(
+                            "page {} > snapshot db_size {} (latest: {})",
+                            page_no.get(),
+                            self.published_db_size.get(),
+                            latest_snapshot.db_size
+                        ),
+                    });
+                }
+            }
+
+            // A transaction that has already observed a page owns that exact
+            // snapshot image for the rest of its lifetime.  Consult the local
+            // cache before every shared publication/cache source; otherwise a
+            // concurrent commit can replace those global latest-image planes and
+            // make a re-read return different bytes even though this handle's
+            // visible commit sequence remains fixed (GH #129).
+            if let Some(cached) = self.txn_read_cache.borrow().get(&page_no) {
+                return Ok(cached.clone());
+            }
+            let single_connection_fast_path = self.single_connection_fast_path_enabled();
+            let trace_read_start =
+                tracing::enabled!(target: "fsqlite.snapshot_publication", tracing::Level::TRACE)
+                    .then(Instant::now);
+            let mut published_retry_count = 0_usize;
+            while self.published.page_plane_visible_commit_seq()
+                == self.published_visible_commit_seq.get()
+            {
+                let snapshot = self.published.snapshot();
+                if page_no.get() > snapshot.db_size {
+                    if self.published.current_sequence_gen() == snapshot.snapshot_gen {
+                        tracing::trace!(
+                            target: "fsqlite.snapshot_publication",
+                            trace_id = cx.trace_id(),
+                            run_id = "pager-publication",
+                            scenario_id = "zero_fill_read",
+                            snapshot_gen = snapshot.snapshot_gen,
+                            visible_commit_seq = snapshot.visible_commit_seq.get(),
+                            publication_mode = SNAPSHOT_PUBLICATION_MODE,
+                            read_retry_count = self.published.read_retry_count(),
+                            page_set_size = snapshot.page_set_size,
+                            elapsed_ns = trace_read_start
+                                .map_or(0, |start| {
+                                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                                }),
+                            "resolved zero-filled page from published metadata"
+                        );
+                        let page = PageData::from_vec(vec![0_u8; self.pool.page_size()]);
+                        self.txn_read_cache
+                            .borrow_mut()
+                            .insert(page_no, page.clone());
+                        return Ok(page);
+                    }
+                    self.published.record_retry();
+                    if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
+                        break;
+                    }
+                    self.published.wait_for_sequence_change(
+                        snapshot.snapshot_gen,
+                        PUBLISHED_SNAPSHOT_WAIT_SLICE,
+                    );
+                    published_retry_count = published_retry_count.saturating_add(1);
+                    continue;
+                }
+
+                if let Some(page) = self.published.try_get_page(page_no) {
+                    if self.published.current_sequence_gen() == snapshot.snapshot_gen {
+                        self.published.note_published_hit();
+                        tracing::trace!(
+                            target: "fsqlite.snapshot_publication",
+                            trace_id = cx.trace_id(),
+                            run_id = "pager-publication",
+                            scenario_id = "published_read_hit",
+                            snapshot_gen = snapshot.snapshot_gen,
+                            visible_commit_seq = snapshot.visible_commit_seq.get(),
+                            publication_mode = SNAPSHOT_PUBLICATION_MODE,
+                            read_retry_count = self.published.read_retry_count(),
+                            page_set_size = snapshot.page_set_size,
+                            elapsed_ns = trace_read_start
+                                .map_or(0, |start| {
+                                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                                }),
+                            "served page from published snapshot"
+                        );
+                        self.txn_read_cache
+                            .borrow_mut()
+                            .insert(page_no, page.clone());
+                        return Ok(page);
+                    }
+                    self.published.record_retry();
+                    if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
+                        break;
+                    }
+                    self.published.wait_for_sequence_change(
+                        snapshot.snapshot_gen,
+                        PUBLISHED_SNAPSHOT_WAIT_SLICE,
+                    );
+                    published_retry_count = published_retry_count.saturating_add(1);
+                    continue;
+                }
+
+                break;
+            }
+
+            let committed_snapshot = self.published.snapshot();
+            if committed_snapshot.visible_commit_seq == self.published_visible_commit_seq.get()
+                && committed_snapshot.journal_mode != JournalMode::Wal
+                && page_no.get() <= committed_snapshot.db_size
+            {
+                // bd-perf (V1.2): Use get_shared to get PageData directly,
+                // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
+                if let Some(page_data) = self.cache.get_shared(page_no) {
+                    self.txn_read_cache
+                        .borrow_mut()
+                        .insert(page_no, page_data.clone());
+                    return Ok(page_data);
+                }
+            }
+
+            // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
+            if self.journal_mode == JournalMode::Wal {
+                if let Some(data) =
+                    read_page_from_wal_backend(&self.wal_backend, cx, page_no).await?
+                {
+                    let page = PageData::from_vec(data);
                     self.txn_read_cache
                         .borrow_mut()
                         .insert(page_no, page.clone());
                     return Ok(page);
                 }
-                self.published.record_retry();
-                if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
-                    break;
-                }
+            }
+
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            let data = inner
+                .read_page_copy(cx, &self.cache, &self.wal_backend, page_no)
+                .await?;
+            let page = PageData::from_vec(data);
+            let publish_update = PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            };
+            let publish_page = page_no.get() <= inner.db_size
+                && inner.commit_seq == self.published_visible_commit_seq.get();
+            drop(inner);
+            if publish_page && !single_connection_fast_path {
                 self.published
-                    .wait_for_sequence_change(snapshot.snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
-                published_retry_count = published_retry_count.saturating_add(1);
-                continue;
+                    .publish_observed_page(cx, publish_update, page_no, page.clone());
             }
-
-            if let Some(page) = self.published.try_get_page(page_no) {
-                if self.published.current_sequence_gen() == snapshot.snapshot_gen {
-                    self.published.note_published_hit();
-                    tracing::trace!(
-                        target: "fsqlite.snapshot_publication",
-                        trace_id = cx.trace_id(),
-                        run_id = "pager-publication",
-                        scenario_id = "published_read_hit",
-                        snapshot_gen = snapshot.snapshot_gen,
-                        visible_commit_seq = snapshot.visible_commit_seq.get(),
-                        publication_mode = SNAPSHOT_PUBLICATION_MODE,
-                        read_retry_count = self.published.read_retry_count(),
-                        page_set_size = snapshot.page_set_size,
-                        elapsed_ns = trace_read_start
-                            .map_or(0, |start| {
-                                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-                            }),
-                        "served page from published snapshot"
-                    );
-                    self.txn_read_cache
-                        .borrow_mut()
-                        .insert(page_no, page.clone());
-                    return Ok(page);
-                }
-                self.published.record_retry();
-                if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
-                    break;
-                }
-                self.published
-                    .wait_for_sequence_change(snapshot.snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
-                published_retry_count = published_retry_count.saturating_add(1);
-                continue;
-            }
-
-            break;
+            // Cache the page read from inner.lock() for future reads.
+            self.txn_read_cache
+                .borrow_mut()
+                .insert(page_no, page.clone());
+            Ok(page)
         }
-
-        let committed_snapshot = self.published.snapshot();
-        if committed_snapshot.visible_commit_seq == self.published_visible_commit_seq.get()
-            && committed_snapshot.journal_mode != JournalMode::Wal
-            && page_no.get() <= committed_snapshot.db_size
-        {
-            // bd-perf (V1.2): Use get_shared to get PageData directly,
-            // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
-            if let Some(page_data) = self.cache.get_shared(page_no) {
-                self.txn_read_cache
-                    .borrow_mut()
-                    .insert(page_no, page_data.clone());
-                return Ok(page_data);
-            }
-        }
-
-        // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
-        if self.journal_mode == JournalMode::Wal {
-            if let Some(data) = read_page_from_wal_backend(&self.wal_backend, cx, page_no)? {
-                let page = PageData::from_vec(data);
-                self.txn_read_cache
-                    .borrow_mut()
-                    .insert(page_no, page.clone());
-                return Ok(page);
-            }
-        }
-
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-        let data = inner.read_page_copy(cx, &self.cache, &self.wal_backend, page_no)?;
-        let page = PageData::from_vec(data);
-        let publish_update = PublishedPagerUpdate {
-            visible_commit_seq: inner.commit_seq,
-            db_size: inner.db_size,
-            journal_mode: inner.journal_mode,
-            freelist_count: inner.freelist.len(),
-            checkpoint_active: inner.checkpoint_active,
-        };
-        let publish_page = page_no.get() <= inner.db_size
-            && inner.commit_seq == self.published_visible_commit_seq.get();
-        drop(inner);
-        if publish_page && !single_connection_fast_path {
-            self.published
-                .publish_observed_page(cx, publish_update, page_no, page.clone());
-        }
-        // Cache the page read from inner.lock() for future reads.
-        self.txn_read_cache
-            .borrow_mut()
-            .insert(page_no, page.clone());
-        Ok(page)
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -12534,75 +13146,89 @@ where
         self.cache.prefetch_page_hint(page_no);
     }
 
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.ensure_writer(cx)?;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.ensure_writer(cx).await?;
 
-        // Fast path: a second (or Nth) write to the same page within the
-        // same transaction reuses the already-allocated StagedPage buffer
-        // instead of allocating a fresh PageBuf from the pool and dropping
-        // the old one. This is a frequent pattern for cursor-driven
-        // workloads that repeatedly restamp the same B-tree leaf as rows
-        // accumulate.
-        if let Some(existing) = self.write_set.get_mut(&page_no)
-            && existing.try_overwrite_bytes_in_place(data)
-        {
-            self.writes_observed = true;
-            self.remove_freed_page_if_present(page_no);
-            STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-            return Ok(());
-        }
-
-        let staged = self.stage_page_bytes(data)?;
-        // Mutate transaction bookkeeping only after fallible staging succeeds;
-        // a capacity error must leave the prior free/write state untouched.
-        self.writes_observed = true;
-        self.remove_freed_page_if_present(page_no);
-        insert_staged_page(
-            &mut self.write_set,
-            &mut self.write_pages_sorted,
-            page_no,
-            staged,
-        );
-        Ok(())
-    }
-
-    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        self.ensure_writer(cx)?;
-
-        // Same-page steal fast path (see `write_page`). If the existing staged
-        // image cannot be overwritten because it has been published or is no
-        // longer single-owner, replace that map entry directly. Routing through
-        // `insert_staged_page` would hash and insert the same key again even
-        // though `write_pages_sorted` is already correct.
-        if let Some(existing) = self.write_set.get_mut(&page_no) {
-            if existing.try_overwrite_page_data_in_place(&data) {
+            // Fast path: a second (or Nth) write to the same page within the
+            // same transaction reuses the already-allocated StagedPage buffer
+            // instead of allocating a fresh PageBuf from the pool and dropping
+            // the old one. This is a frequent pattern for cursor-driven
+            // workloads that repeatedly restamp the same B-tree leaf as rows
+            // accumulate.
+            if let Some(existing) = self.write_set.get_mut(&page_no)
+                && existing.try_overwrite_bytes_in_place(data)
+            {
                 self.writes_observed = true;
                 self.remove_freed_page_if_present(page_no);
                 STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                 return Ok(());
             }
-        }
 
-        let staged = StagedPage::from_page_data_with_cache_recovery(
-            &self.pool,
-            &self.cache,
-            data,
-            "transaction_write_page_data",
-        )?;
-        self.writes_observed = true;
-        self.remove_freed_page_if_present(page_no);
-        if let Some(existing) = self.write_set.get_mut(&page_no) {
-            *existing = staged;
-            return Ok(());
+            let staged = self.stage_page_bytes(data)?;
+            // Mutate transaction bookkeeping only after fallible staging succeeds;
+            // a capacity error must leave the prior free/write state untouched.
+            self.writes_observed = true;
+            self.remove_freed_page_if_present(page_no);
+            insert_staged_page(
+                &mut self.write_set,
+                &mut self.write_pages_sorted,
+                page_no,
+                staged,
+            );
+            Ok(())
         }
+    }
 
-        insert_staged_page(
-            &mut self.write_set,
-            &mut self.write_pages_sorted,
-            page_no,
-            staged,
-        );
-        Ok(())
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.ensure_writer(cx).await?;
+
+            // Same-page steal fast path (see `write_page`). If the existing staged
+            // image cannot be overwritten because it has been published or is no
+            // longer single-owner, replace that map entry directly. Routing through
+            // `insert_staged_page` would hash and insert the same key again even
+            // though `write_pages_sorted` is already correct.
+            if let Some(existing) = self.write_set.get_mut(&page_no) {
+                if existing.try_overwrite_page_data_in_place(&data) {
+                    self.writes_observed = true;
+                    self.remove_freed_page_if_present(page_no);
+                    STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(());
+                }
+            }
+
+            let staged = StagedPage::from_page_data_with_cache_recovery(
+                &self.pool,
+                &self.cache,
+                data,
+                "transaction_write_page_data",
+            )?;
+            self.writes_observed = true;
+            self.remove_freed_page_if_present(page_no);
+            if let Some(existing) = self.write_set.get_mut(&page_no) {
+                *existing = staged;
+                return Ok(());
+            }
+
+            insert_staged_page(
+                &mut self.write_set,
+                &mut self.write_pages_sorted,
+                page_no,
+                staged,
+            );
+            Ok(())
+        }
     }
 
     fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
@@ -12637,829 +13263,412 @@ where
         true
     }
 
-    fn restore_staged_page_data(
-        &mut self,
-        cx: &Cx,
+    fn restore_staged_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> Result<()> {
-        self.ensure_writer(cx)?;
-        let staged = StagedPage::from_page_data_with_cache_recovery(
-            &self.pool,
-            &self.cache,
-            data,
-            "restore_staged_page_data",
-        )?;
-        // #70 ghost-commit guard: mark only after fallible staging succeeds.
-        self.writes_observed = true;
-        insert_staged_page(
-            &mut self.write_set,
-            &mut self.write_pages_sorted,
-            page_no,
-            staged,
-        );
-        Ok(())
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.ensure_writer(cx).await?;
+            let staged = StagedPage::from_page_data_with_cache_recovery(
+                &self.pool,
+                &self.cache,
+                data,
+                "restore_staged_page_data",
+            )?;
+            // #70 ghost-commit guard: mark only after fallible staging succeeds.
+            self.writes_observed = true;
+            insert_staged_page(
+                &mut self.write_set,
+                &mut self.write_pages_sorted,
+                page_no,
+                staged,
+            );
+            Ok(())
+        }
     }
 
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        self.ensure_writer(cx)?;
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            self.ensure_writer(cx).await?;
 
-        // ── Local lease fast path ──────────────────────────────────────
-        // If we have pre-allocated pages from a previous batch, hand one
-        // out without touching the global `inner` mutex at all.
-        if let Some(page) = self.page_lease.pop() {
-            self.allocated_from_eof.push(page);
-            return Ok(page);
-        }
-
-        // Pages freed earlier in the same transaction stay quarantined until
-        // commit. Reusing them immediately lets one B-tree operation hand a
-        // page to another tree before the old ownership is durably retired,
-        // which can surface as cross-tree page aliasing on disk.
-
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-
-        if !self.memory_db_bump_alloc {
-            let committed_freelist_is_snapshot_pinned =
-                self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
-
-            if committed_freelist_is_snapshot_pinned {
-                // Concurrent writers always read against a fixed snapshot. So do
-                // immediate/deferred writers when another local transaction is
-                // still active, because that older reader snapshot can still
-                // observe the committed image being replaced. In both cases, pages
-                // at or below db_size are part of some still-visible committed
-                // state and cannot be safely reused from the live global freelist
-                // without versioned freelist metadata. Pages above db_size are
-                // different: they only exist because an earlier transaction
-                // allocated EOF pages and then rolled back, so reusing them cannot
-                // violate snapshot visibility and avoids page-count holes.
-                if let Some(idx) = inner
-                    .freelist
-                    .iter()
-                    .rposition(|page| page.get() > inner.db_size)
-                {
-                    let page = inner.freelist.remove(idx);
-                    self.allocated_from_freelist.push(page);
-                    return Ok(page);
-                }
-            } else if let Some(page) = inner.freelist.pop() {
-                self.allocated_from_freelist.push(page);
+            // ── Local lease fast path ──────────────────────────────────────
+            // If we have pre-allocated pages from a previous batch, hand one
+            // out without touching the global `inner` mutex at all.
+            if let Some(page) = self.page_lease.pop() {
+                self.allocated_from_eof.push(page);
                 return Ok(page);
             }
-        }
 
-        // ── EOF allocation ──────────────────────────────────────────────
-        // For concurrent transactions that have already allocated at least
-        // one page, batch-allocate PAGE_LEASE_BATCH_SIZE pages in one lock
-        // acquisition to reduce mutex contention during B-tree splits.
-        // The first allocation is always single-page to avoid over-reserving
-        // for short transactions. Non-concurrent writers always allocate
-        // one page at a time since there's no lock convoy to avoid.
-        let pending_byte_page = (0x4000_0000 / inner.page_size.get()) + 1;
-        let already_allocated =
-            !self.allocated_from_eof.is_empty() || !self.allocated_from_freelist.is_empty();
-        let batch = if self.mode == TransactionMode::Concurrent && already_allocated {
-            PAGE_LEASE_BATCH_SIZE
-        } else {
-            1
-        };
-        let mut first_page: Option<PageNumber> = None;
+            // Pages freed earlier in the same transaction stay quarantined until
+            // commit. Reusing them immediately lets one B-tree operation hand a
+            // page to another tree before the old ownership is durably retired,
+            // which can surface as cross-tree page aliasing on disk.
 
-        for _ in 0..batch {
-            let mut raw = inner.next_page;
-            if raw == pending_byte_page {
-                raw = raw.saturating_add(1);
-            }
-            let next = raw.saturating_add(1);
-            // Stop the batch if next_page can no longer advance (u32::MAX
-            // saturation).  Continuing would hand out duplicate page numbers.
-            if next == raw {
-                break;
-            }
-            inner.next_page = next;
-            if let Some(page) = PageNumber::new(raw) {
-                if first_page.is_none() {
-                    first_page = Some(page);
-                } else {
-                    self.page_lease.push(page);
-                }
-            }
-        }
-        drop(inner);
-
-        let page = first_page.ok_or_else(|| FrankenError::OutOfRange {
-            what: "allocated page number".to_owned(),
-            value: "0".to_owned(),
-        })?;
-        self.allocated_from_eof.push(page);
-        Ok(page)
-    }
-
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.ensure_writer(cx)?;
-        if page_no == PageNumber::ONE {
-            return Err(FrankenError::OutOfRange {
-                what: "free page number".to_owned(),
-                value: page_no.get().to_string(),
-            });
-        }
-        if !self.contains_freed_page(page_no) {
-            self.freed_pages.push(page_no);
-            self.note_freed_page_bound(page_no);
-        }
-        if self.write_set.remove(&page_no).is_some() {
-            remove_page_sorted(&mut self.write_pages_sorted, page_no);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn commit(&mut self, cx: &Cx) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.validate_namespace_binding()?;
-        if !self.is_writer {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            // Return any unused lease pages to the freelist so they can
-            // be reused by other transactions.
-            return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-            inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
-            drop(inner);
-            self.committed = true;
-            self.maintenance_lease.take();
-            self.finished = true;
-            // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
-            self.scratch_arena.reset();
-            return Ok(());
-        }
-        if self.vfs.is_memory()
-            && self.memory_db_bump_alloc
-            && !self.retained_memory_overlay_dirty_pages.is_empty()
-        {
-            self.materialize_retained_memory_overlay_into_write_set()?;
-        }
-        if !self.has_pending_writes() {
-            // #70 BUG-A ghost-commit guard: if writes were staged earlier on
-            // this transaction (write_page / write_page_data / allocate_page)
-            // but the write_set and freelist-dirty are BOTH empty now,
-            // something dropped the staged state without rolling the
-            // transaction back. Silently returning Ok here is what produced
-            // the swarm's "INSERT and same-txn UPDATE both atomically
-            // disappear, commit returns Ok" failure mode. Surface as a
-            // retryable Busy instead so retry_fsqlite can reissue the
-            // transaction rather than claiming success for lost writes.
-            if self.writes_observed {
-                return Err(FrankenError::internal(
-                    "transaction committed with observed writes but empty write_set; \
-                     state was dropped between staging and commit",
-                ));
+
+            if !self.memory_db_bump_alloc {
+                let committed_freelist_is_snapshot_pinned =
+                    self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
+
+                if committed_freelist_is_snapshot_pinned {
+                    // Concurrent writers always read against a fixed snapshot. So do
+                    // immediate/deferred writers when another local transaction is
+                    // still active, because that older reader snapshot can still
+                    // observe the committed image being replaced. In both cases, pages
+                    // at or below db_size are part of some still-visible committed
+                    // state and cannot be safely reused from the live global freelist
+                    // without versioned freelist metadata. Pages above db_size are
+                    // different: they only exist because an earlier transaction
+                    // allocated EOF pages and then rolled back, so reusing them cannot
+                    // violate snapshot visibility and avoids page-count holes.
+                    if let Some(idx) = inner
+                        .freelist
+                        .iter()
+                        .rposition(|page| page.get() > inner.db_size)
+                    {
+                        let page = inner.freelist.remove(idx);
+                        self.allocated_from_freelist.push(page);
+                        return Ok(page);
+                    }
+                } else if let Some(page) = inner.freelist.pop() {
+                    self.allocated_from_freelist.push(page);
+                    return Ok(page);
+                }
             }
+
+            // ── EOF allocation ──────────────────────────────────────────────
+            // For concurrent transactions that have already allocated at least
+            // one page, batch-allocate PAGE_LEASE_BATCH_SIZE pages in one lock
+            // acquisition to reduce mutex contention during B-tree splits.
+            // The first allocation is always single-page to avoid over-reserving
+            // for short transactions. Non-concurrent writers always allocate
+            // one page at a time since there's no lock convoy to avoid.
+            let pending_byte_page = (0x4000_0000 / inner.page_size.get()) + 1;
+            let already_allocated =
+                !self.allocated_from_eof.is_empty() || !self.allocated_from_freelist.is_empty();
+            let batch = if self.mode == TransactionMode::Concurrent && already_allocated {
+                PAGE_LEASE_BATCH_SIZE
+            } else {
+                1
+            };
+            let mut first_page: Option<PageNumber> = None;
+
+            for _ in 0..batch {
+                let mut raw = inner.next_page;
+                if raw == pending_byte_page {
+                    raw = raw.saturating_add(1);
+                }
+                let next = raw.saturating_add(1);
+                // Stop the batch if next_page can no longer advance (u32::MAX
+                // saturation).  Continuing would hand out duplicate page numbers.
+                if next == raw {
+                    break;
+                }
+                inner.next_page = next;
+                if let Some(page) = PageNumber::new(raw) {
+                    if first_page.is_none() {
+                        first_page = Some(page);
+                    } else {
+                        self.page_lease.push(page);
+                    }
+                }
+            }
+            drop(inner);
+
+            let page = first_page.ok_or_else(|| FrankenError::OutOfRange {
+                what: "allocated page number".to_owned(),
+                value: "0".to_owned(),
+            })?;
+            self.allocated_from_eof.push(page);
+            Ok(page)
+        }
+    }
+
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.ensure_writer(cx).await?;
+            if page_no == PageNumber::ONE {
+                return Err(FrankenError::OutOfRange {
+                    what: "free page number".to_owned(),
+                    value: page_no.get().to_string(),
+                });
+            }
+            if !self.contains_freed_page(page_no) {
+                self.freed_pages.push(page_no);
+                self.note_freed_page_bound(page_no);
+            }
+            if self.write_set.remove(&page_no).is_some() {
+                remove_page_sorted(&mut self.write_pages_sorted, page_no);
+            }
+            Ok(())
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            if self.finished {
+                return Ok(());
+            }
+            self.validate_namespace_binding()?;
+            if !self.is_writer {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                // Return any unused lease pages to the freelist so they can
+                // be reused by other transactions.
+                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                inner.active_transactions = inner.active_transactions.saturating_sub(1);
+                let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner).await;
+                drop(inner);
+                self.committed = true;
+                self.maintenance_lease.take();
+                self.finished = true;
+                // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
+                self.scratch_arena.reset();
+                return Ok(());
+            }
+            if self.vfs.is_memory()
+                && self.memory_db_bump_alloc
+                && !self.retained_memory_overlay_dirty_pages.is_empty()
+            {
+                self.materialize_retained_memory_overlay_into_write_set()?;
+            }
+            if !self.has_pending_writes() {
+                // #70 BUG-A ghost-commit guard: if writes were staged earlier on
+                // this transaction (write_page / write_page_data / allocate_page)
+                // but the write_set and freelist-dirty are BOTH empty now,
+                // something dropped the staged state without rolling the
+                // transaction back. Silently returning Ok here is what produced
+                // the swarm's "INSERT and same-txn UPDATE both atomically
+                // disappear, commit returns Ok" failure mode. Surface as a
+                // retryable Busy instead so retry_fsqlite can reissue the
+                // transaction rather than claiming success for lost writes.
+                if self.writes_observed {
+                    return Err(FrankenError::internal(
+                        "transaction committed with observed writes but empty write_set; \
+                     state was dropped between staging and commit",
+                    ));
+                }
+                let inner_arc = Arc::clone(&self.inner);
+                let mut inner = inner_arc
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
+                inner.active_transactions = inner.active_transactions.saturating_sub(1);
+                let notify_writer_idle = self.mode != TransactionMode::Concurrent
+                    && release_single_writer_baton(&mut inner);
+                let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner).await;
+                drop(inner);
+                if notify_writer_idle {
+                    self.writer_idle.notify_one();
+                }
+                self.committed = true;
+                self.maintenance_lease.take();
+                self.finished = true;
+                // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
+                self.scratch_arena.reset();
+                return Ok(());
+            }
+
+            // =====================================================================
+            // D1-CRITICAL: Split inner lock into prepare/IO/publish phases (bd-3wop3.8)
+            //
+            // REMAINING CLIFF (bd-wee9a, 2026-04-24): even with Phase A shrunk to
+            // ~20 µs, the per-pager `self.inner.lock()` taken below still
+            // serializes all writers of this pager. At MT 2t,
+            // `FSQLITE_TRACE_GROUP_COMMIT=1` shows every flush with
+            // `members=[N]` (size-1 batches) — writers never arrive in the
+            // GroupCommitQueue simultaneously because peer N+1 is blocked on
+            // this mutex while peer N completes Phases A+B+C. Raising
+            // `GROUP_COMMIT_SPARSE_ARRIVAL_WAIT` to 2 ms did not change the
+            // batching pattern. See bd-wee9a for the full analysis and
+            // candidate fixes (shrink Phase A further / per-txn prep buffers /
+            // optimistic BEGIN CONCURRENT fast path).
+            //
+            // BEFORE: inner.lock() held for entire commit (~100us) serializing all threads
+            // AFTER:
+            //   Phase A (prepare, ~20us): Hold inner.lock() briefly to snapshot state
+            //   DROP inner.lock() <-- allows Thread B to start Phase A while Thread A does I/O
+            //   Phase B (WAL I/O, ~50us): Acquires inner.lock() only when needed
+            //   Phase C (publish, ~10us): Re-acquires inner.lock() for finalization
+            //
+            // This allows N threads to overlap their prepare phases, reducing
+            // serialization from N*100us to N*20us + 50us + 10us.
+            // =====================================================================
+
+            // ── Full commit path timing instrumentation ──
+            let phase_timing = commit_phase_timing_enabled();
+            let t_commit_start = phase_timing.then(Instant::now);
+            let pager_commit_profile_active = pager_commit_profile_enabled();
+            record_pager_commit_call(pager_commit_profile_active);
+            let t_pager_phase_a_start = pager_commit_profile_start(pager_commit_profile_active);
+
+            // Phase A: Prepare write_set under inner lock (~20us)
+            // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
             let inner_arc = Arc::clone(&self.inner);
             let mut inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            self.restore_uncommitted_allocations_for_clean_commit(&mut inner);
-            inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let notify_writer_idle =
-                self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
-            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
-            drop(inner);
-            if notify_writer_idle {
-                self.writer_idle.notify_one();
-            }
-            self.committed = true;
-            self.maintenance_lease.take();
-            self.finished = true;
-            // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
-            self.scratch_arena.reset();
-            return Ok(());
-        }
+            let committed_db_size = self.committed_db_size_with_inner(&inner);
+            let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
+            pending_returned_pages.append(&mut self.page_lease);
+            let mut pending_free_pages = pending_returned_pages.clone();
+            pending_free_pages.extend(self.freed_pages.iter().copied());
 
-        // =====================================================================
-        // D1-CRITICAL: Split inner lock into prepare/IO/publish phases (bd-3wop3.8)
-        //
-        // REMAINING CLIFF (bd-wee9a, 2026-04-24): even with Phase A shrunk to
-        // ~20 µs, the per-pager `self.inner.lock()` taken below still
-        // serializes all writers of this pager. At MT 2t,
-        // `FSQLITE_TRACE_GROUP_COMMIT=1` shows every flush with
-        // `members=[N]` (size-1 batches) — writers never arrive in the
-        // GroupCommitQueue simultaneously because peer N+1 is blocked on
-        // this mutex while peer N completes Phases A+B+C. Raising
-        // `GROUP_COMMIT_SPARSE_ARRIVAL_WAIT` to 2 ms did not change the
-        // batching pattern. See bd-wee9a for the full analysis and
-        // candidate fixes (shrink Phase A further / per-txn prep buffers /
-        // optimistic BEGIN CONCURRENT fast path).
-        //
-        // BEFORE: inner.lock() held for entire commit (~100us) serializing all threads
-        // AFTER:
-        //   Phase A (prepare, ~20us): Hold inner.lock() briefly to snapshot state
-        //   DROP inner.lock() <-- allows Thread B to start Phase A while Thread A does I/O
-        //   Phase B (WAL I/O, ~50us): Acquires inner.lock() only when needed
-        //   Phase C (publish, ~10us): Re-acquires inner.lock() for finalization
-        //
-        // This allows N threads to overlap their prepare phases, reducing
-        // serialization from N*100us to N*20us + 50us + 10us.
-        // =====================================================================
-
-        // ── Full commit path timing instrumentation ──
-        let phase_timing = commit_phase_timing_enabled();
-        let t_commit_start = phase_timing.then(Instant::now);
-        let pager_commit_profile_active = pager_commit_profile_enabled();
-        record_pager_commit_call(pager_commit_profile_active);
-        let t_pager_phase_a_start = pager_commit_profile_start(pager_commit_profile_active);
-
-        // Phase A: Prepare write_set under inner lock (~20us)
-        // Snapshot state needed for WAL I/O, then DROP inner.lock() immediately.
-        let inner_arc = Arc::clone(&self.inner);
-        let mut inner = inner_arc
-            .lock()
-            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-        let committed_db_size = self.committed_db_size_with_inner(&inner);
-        let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
-        pending_returned_pages.append(&mut self.page_lease);
-        let mut pending_free_pages = pending_returned_pages.clone();
-        pending_free_pages.extend(self.freed_pages.iter().copied());
-
-        // Declared outside the block so it survives to Phase C where freed
-        // pages are promoted into inner.freelist after successful WAL commit.
-        let pending_freed: Vec<PageNumber>;
-        let cross_process_conflict_pages: Vec<PageNumber>;
-        {
-            // ShardedPageCache uses per-shard internal locking
-            //
-            let freelist_dirty = self.freelist_metadata_dirty_with_pending_free_pages(
-                &inner,
-                committed_db_size,
-                &pending_free_pages,
-            );
-            // CRITICAL FIX (beads_rust#138): Do NOT push pages that become
-            // free into inner.freelist during Phase A. In the split-lock WAL
-            // commit path, inner.lock() is released between Phase A and Phase B.
-            // If free pages are pushed here, a concurrent transaction's Phase A
-            // can observe and reuse them before this commit is durable, creating
-            // orphaned pages ("page N is never used") if WAL ordering flips.
-            //
-            // Instead, drain them into local vectors and pass the combined
-            // pending_free_pages to the serializer, which builds a predicted
-            // freelist without mutating inner.freelist. The actual promotion is
-            // deferred to Phase C (after WAL success), or to the failure cleanup
-            // for pages that were merely unused allocations.
-            //
-            // Capture the semantic Page 1 plan before freelist serialization
-            // injects synthetic Page 1 metadata into the write_set. Otherwise
-            // pure freelist bookkeeping would masquerade as a direct Page 1
-            // write and become a cross-process first-committer-wins conflict.
-            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-            pending_freed = std::mem::take(&mut self.freed_pages);
-            self.freed_page_bounds = None;
-            if freelist_dirty {
-                if let Err(e) = serialize_freelist_to_write_set(
-                    cx,
-                    &mut inner,
-                    &self.cache,
-                    &self.wal_backend,
-                    &self.pool,
-                    &mut self.write_set,
-                    &mut self.write_pages_sorted,
+            // Declared outside the block so it survives to Phase C where freed
+            // pages are promoted into inner.freelist after successful WAL commit.
+            let pending_freed: Vec<PageNumber>;
+            let cross_process_conflict_pages: Vec<PageNumber>;
+            {
+                // ShardedPageCache uses per-shard internal locking
+                //
+                let freelist_dirty = self.freelist_metadata_dirty_with_pending_free_pages(
+                    &inner,
                     committed_db_size,
                     &pending_free_pages,
-                ) {
-                    self.restore_pending_freed_pages(pending_freed);
-                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                    return Err(e);
-                }
-            }
-
-            // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
-            // only when it was explicitly dirty, but also when the database
-            // grows (new pages allocated beyond current db_size). Without this,
-            // other connections reading page 1 from WAL won't see the updated
-            // page_count header, causing BusySnapshot errors.
-            let must_write_page1 = if self.journal_mode == JournalMode::Wal {
-                wal_page1_plan.requires_page_one_rewrite()
-                    || wal_page1_plan.requires_page_count_advance()
-            } else {
-                true
-            };
-            if must_write_page1 {
-                let mut page1 = match ensure_page_one_in_write_set(
-                    cx,
-                    &mut inner,
-                    &self.cache,
-                    &self.wal_backend,
-                    &self.pool,
-                    &mut self.write_set,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.restore_pending_freed_pages(pending_freed);
-                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                        return Err(e);
-                    }
-                };
-                let page1_bytes = page1.as_page_bytes_mut();
-                if page1_bytes.len() >= DATABASE_HEADER_SIZE {
-                    let mut page_count_bytes = [0_u8; 4];
-                    page_count_bytes.copy_from_slice(&page1_bytes[28..32]);
-                    let existing_page_count = u32::from_be_bytes(page_count_bytes);
-                    let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
-
-                    // Offset 24..28: change counter (big-endian u32)
-                    page1_bytes[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-                    if self.journal_mode != JournalMode::Wal
-                        || wal_page1_plan.requires_page_count_advance()
-                    {
-                        let new_db_size = committed_db_size.max(existing_page_count);
-                        // Offset 28..32: page count (big-endian u32)
-                        page1_bytes[28..32].copy_from_slice(&new_db_size.to_be_bytes());
-                    }
-                    // Offset 92..96: version-valid-for
-                    page1_bytes[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
-                }
-                insert_staged_page(
-                    &mut self.write_set,
-                    &mut self.write_pages_sorted,
-                    PageNumber::ONE,
-                    page1,
                 );
-            }
-            cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
-                self.predicted_conflict_pages_for_wal_commit_with_inner(
-                    &inner,
-                    wal_page1_plan,
-                    &pending_free_pages,
-                )
-            } else {
-                Vec::new()
-            };
-        }
-        let cross_process_conflict_page_baselines =
-            self.conflict_page_baselines(&cross_process_conflict_pages);
-        let wal_current_db_size = inner.db_size;
-        let wal_sync_policy = inner.wal_commit_sync_policy;
-
-        let t_phase_a_done = phase_timing.then(Instant::now);
-        record_pager_commit_duration(&PAGER_COMMIT_PHASE_A_TIME_NS, t_pager_phase_a_start);
-
-        // Phase B: Commit via WAL or journal
-        // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
-        // threads can start their Phase A (prepare) while we wait for
-        // the consolidator lock. This is the key parallelization win.
-        let mut wal_publication_authorization = None;
-        let commit_result = if self.journal_mode == JournalMode::Wal {
-            // Drop inner lock BEFORE acquiring consolidator lock.
-            // This allows other threads to run Phase A concurrently.
-            drop(inner);
-
-            // WAL mode: Use group commit for same-process batching.
-            // commit_wal_group_commit will acquire consolidator.lock() first,
-            // then briefly inner.lock() for the actual WAL I/O.
-            let t_wal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
-            let result = Self::commit_wal_group_commit_with_snapshot(
-                cx,
-                &self.wal_backend,
-                &self.inner,
-                Some(self.published.as_ref()),
-                wal_current_db_size,
-                wal_sync_policy,
-                &self.write_set,
-                &self.write_pages_sorted,
-                &cross_process_conflict_pages,
-                &cross_process_conflict_page_baselines,
-                &self.group_commit_queue,
-                &mut wal_publication_authorization,
-            );
-            record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
-
-            // Re-acquire inner lock for Phase C (finalize).
-            inner = match inner_arc
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
-            {
-                Ok(guard) => guard,
-                Err(e) => {
-                    self.restore_pending_freed_pages(pending_freed);
-                    if let Ok(mut recovery_inner) = inner_arc.lock() {
-                        return_pages_to_freelist(
-                            &mut recovery_inner.freelist,
-                            pending_returned_pages,
-                        );
-                    }
-                    return Err(e);
-                }
-            };
-
-            result
-        } else if self.memory_db_bump_alloc {
-            // Private `:memory:` commits do not need rollback-journal
-            // creation/sync. Page 1 has already been staged above, so flush
-            // the final committed image directly once at the release boundary.
-            let t_memory_flush_start = pager_commit_profile_start(pager_commit_profile_active);
-            let result = Self::flush_write_set_to_db_file_batch(
-                cx,
-                &mut inner,
-                &self.write_set,
-                &self.write_pages_sorted,
-            );
-            record_pager_commit_duration(&PAGER_COMMIT_MEMORY_FLUSH_TIME_NS, t_memory_flush_start);
-            result
-        } else {
-            // Journal mode: Direct commit (no group commit)
-            // Journal mode keeps inner locked throughout - no parallelization.
-            let t_journal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
-            // The freelist-alias check needs the transaction's FULL set of
-            // freelist pops. `drain_unstaged_allocated_pages` (Phase A) has
-            // already moved never-written allocations out of
-            // `allocated_from_freelist` into `pending_returned_pages`, so
-            // restore both when reconstructing the begin-time freelist view
-            // (EOF-origin entries are filtered out by the db-size bound).
-            let mut alias_check_restored = self.allocated_from_freelist.clone();
-            alias_check_restored.extend_from_slice(&pending_returned_pages);
-            let result = Self::commit_journal(
-                cx,
-                &self.vfs,
-                &self.journal_path,
-                &mut inner,
-                &self.write_set,
-                self.original_db_size,
-                &alias_check_restored,
-            );
-            record_pager_commit_duration(&PAGER_COMMIT_JOURNAL_TIME_NS, t_journal_commit_start);
-            result
-        };
-
-        let t_phase_b_done = phase_timing.then(Instant::now);
-
-        if commit_result.is_ok() {
-            let t_phase_c_metadata_start = pager_commit_profile_start(pager_commit_profile_active);
-            // Phase C1 (FAST, under inner.lock): Update metadata only.
-            // Now that WAL I/O has succeeded, promote pages that became free
-            // into inner.freelist. This is the deferred half of the Phase A
-            // fix: reusable pages become visible only after the WAL commit is
-            // durable.
-            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-            return_pages_to_freelist(&mut inner.freelist, pending_freed);
-            // Cross-process #70: the group-commit flusher already set
-            // inner.db_size to final_db_size in WAL mode, but with concurrent
-            // peer commits extending the same file, our flusher's view of
-            // the consolidated db_size can lag the actual max committed page.
-            // Use fetch_max semantics so inner.db_size never regresses below
-            // what we just committed, and so peer extensions we subsequently
-            // observe in refresh_committed_state keep monotonic visibility.
-            inner.db_size = inner.db_size.max(committed_db_size);
-            // Keep volatile EOF lease pages in the in-memory freelist even
-            // when they are above the durable page_count. They are deliberately
-            // filtered out by serialize_freelist_to_write_set(), so page 1
-            // stays SQLite-compatible on disk. But next_page has already
-            // advanced past those page numbers; dropping them here creates
-            // permanent in-process holes that later commits can expose as
-            // "Page N: never used" once page_count grows past the gap.
-            let wal_publication_intent = wal_publication_authorization
-                .as_ref()
-                .map(|authorization| {
-                    parallel_wal_publication_intent(
-                        authorization,
-                        inner.db_size,
-                        inner.journal_mode,
-                        inner.freelist.len(),
-                        inner.checkpoint_active,
+                // CRITICAL FIX (beads_rust#138): Do NOT push pages that become
+                // free into inner.freelist during Phase A. In the split-lock WAL
+                // commit path, inner.lock() is released between Phase A and Phase B.
+                // If free pages are pushed here, a concurrent transaction's Phase A
+                // can observe and reuse them before this commit is durable, creating
+                // orphaned pages ("page N is never used") if WAL ordering flips.
+                //
+                // Instead, drain them into local vectors and pass the combined
+                // pending_free_pages to the serializer, which builds a predicted
+                // freelist without mutating inner.freelist. The actual promotion is
+                // deferred to Phase C (after WAL success), or to the failure cleanup
+                // for pages that were merely unused allocations.
+                //
+                // Capture the semantic Page 1 plan before freelist serialization
+                // injects synthetic Page 1 metadata into the write_set. Otherwise
+                // pure freelist bookkeeping would masquerade as a direct Page 1
+                // write and become a cross-process first-committer-wins conflict.
+                let wal_page1_plan =
+                    self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+                pending_freed = std::mem::take(&mut self.freed_pages);
+                self.freed_page_bounds = None;
+                if freelist_dirty {
+                    if let Err(e) = serialize_freelist_to_write_set(
+                        cx,
+                        &mut inner,
+                        &self.cache,
+                        &self.wal_backend,
+                        &self.pool,
+                        &mut self.write_set,
+                        &mut self.write_pages_sorted,
+                        committed_db_size,
+                        &pending_free_pages,
                     )
-                })
-                .transpose()?;
-            if let Some(intent) = wal_publication_intent {
-                inner.record_local_wal_commit_at(intent.visible_commit_seq);
-            } else {
-                inner.record_local_commit();
-            }
-            let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
-            if let Ok(file_size) = inner.db_file.file_size(cx) {
-                inner.committed_db_file_size_bytes = file_size;
-            }
-            record_pager_commit_duration(&PAGER_COMMIT_FILE_SIZE_TIME_NS, t_file_size_start);
-            inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let notify_writer_idle =
-                self.mode != TransactionMode::Concurrent && release_single_writer_baton(&mut inner);
-            let publish_update = PublishedPagerUpdate {
-                visible_commit_seq: wal_publication_intent
-                    .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            };
-            let single_connection_fast_path = self.single_connection_fast_path_enabled();
-            // In an isolated single-connection commit, page-plane publication
-            // is unnecessary even when page 1 was staged for internal durable
-            // bookkeeping such as change-counter/page-count maintenance. The
-            // committed bytes are already authoritative in the pager/cache.
-            let metadata_only_single_connection_fast_path = single_connection_fast_path;
-            // bd-db300.5.3.3.1: publish immutable snapshot while inner is
-            // still held so any later multi-connection readers inherit the
-            // committed metadata even if this commit skipped page-plane publish.
-            self.publish_committed_snapshot_from_inner(&inner);
-            let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
-            let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner);
-            record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
-            drop(inner);
-            if notify_writer_idle {
-                self.writer_idle.notify_one();
-            }
-            record_pager_commit_duration(
-                &PAGER_COMMIT_PHASE_C_METADATA_TIME_NS,
-                t_phase_c_metadata_start,
-            );
-
-            let t_phase_c1_done = phase_timing.then(Instant::now);
-
-            // H4 fault hook: crash during Phase C, after commit_seq update
-            // but before snapshot publish. WAL frames are durable, commit_seq
-            // incremented in-memory, but snapshot plane not yet updated.
-            #[cfg(any(test, feature = "fault-injection"))]
-            crate::fault_hooks::maybe_inject_during_phase_c(
-                publish_update.visible_commit_seq.get(),
-                publish_update.db_size,
-            )?;
-
-            // Phase C2 (outside inner.lock): publish to the shared snapshot
-            // plane. In isolated single-connection mode, only metadata needs
-            // to advance; page bytes stay authoritative in pager/db_file state.
-            let t_publish_start = pager_commit_profile_start(pager_commit_profile_active);
-            if let Some(intent) = wal_publication_intent {
-                // The physical flusher installed the complete certificate
-                // group before waking this waiter. Re-publishing this
-                // transaction's subset here could overwrite the group's
-                // last-frame-wins image when Phase C callbacks run out of
-                // order, so the waiter only binds certificate metadata.
-                self.published.bind_parallel_wal_publication(intent);
-            } else if metadata_only_single_connection_fast_path {
-                self.publish_single_connection_metadata_only(cx, publish_update);
-            } else {
-                self.publish_committed_state(cx, publish_update);
-            }
-            record_pager_commit_duration(&PAGER_COMMIT_PUBLISH_TIME_NS, t_publish_start);
-
-            // Keep the transaction-local published snapshot hint aligned with
-            // the commit we just published so post-commit callers querying the
-            // still-live handle see committed metadata rather than the
-            // pre-commit snapshot boundary.
-            self.published_visible_commit_seq
-                .set(publish_update.visible_commit_seq);
-            self.published_db_size.set(publish_update.db_size);
-
-            let t_phase_c2_done = phase_timing.then(Instant::now);
-
-            // Record full commit path timing.
-            if self.journal_mode == JournalMode::Wal
-                && let (
-                    Some(t_commit_start),
-                    Some(t_phase_a_done),
-                    Some(t_phase_b_done),
-                    Some(t_phase_c1_done),
-                    Some(t_phase_c2_done),
-                ) = (
-                    t_commit_start,
-                    t_phase_a_done,
-                    t_phase_b_done,
-                    t_phase_c1_done,
-                    t_phase_c2_done,
-                )
-            {
-                let phase_a_us = t_phase_a_done.duration_since(t_commit_start).as_micros() as u64;
-                let phase_b_us = t_phase_b_done.duration_since(t_phase_a_done).as_micros() as u64;
-                let phase_c1_us = t_phase_c1_done.duration_since(t_phase_b_done).as_micros() as u64;
-                let phase_c2_us =
-                    t_phase_c2_done.duration_since(t_phase_c1_done).as_micros() as u64;
-                GLOBAL_CONSOLIDATION_METRICS.record_commit_phases(
-                    phase_a_us,
-                    phase_b_us,
-                    phase_c1_us,
-                    phase_c2_us,
-                );
-            }
-
-            // Metadata-only single-connection commits intentionally leave the
-            // published page plane stale, so keep the just-committed pages in
-            // shared cache even under WAL mode to give the next statement a
-            // cheap committed read surface.
-            let t_cache_finish_start = pager_commit_profile_start(pager_commit_profile_active);
-            if publish_update.journal_mode == JournalMode::Wal
-                && !metadata_only_single_connection_fast_path
-            {
-                self.discard_committed_pages();
-            } else if metadata_only_single_connection_fast_path {
-                self.drain_committed_cache_pages_into_cache();
-            } else {
-                let committed_cache_pages = self.drain_committed_cache_pages();
-                if !committed_cache_pages.is_empty() {
-                    let inner = self
-                        .inner
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if inner.commit_seq == publish_update.visible_commit_seq {
-                        for (page_no, buf) in committed_cache_pages {
-                            self.cache.insert_buffer(page_no, buf);
-                        }
-                    }
-                }
-            }
-            self.retained_memory_overlay_dirty_pages.clear();
-            self.committed = true;
-            self.maintenance_lease.take();
-            self.finished = true;
-            // IMPL-3 / AG-4B: reset scratch arena after successful commit so
-            // transient per-transaction allocations do not linger. The arena
-            // is dropped when the transaction drops; this reset is the
-            // amortization hook that keeps the txn-committed state compact.
-            self.scratch_arena.reset();
-            record_pager_commit_duration(&PAGER_COMMIT_CACHE_FINISH_TIME_NS, t_cache_finish_start);
-        } else {
-            // Keep the writer lock held on commit failure so no other writer
-            // can interleave while the caller decides to retry or roll back.
-            //
-            // CRITICAL FIX (beads_rust#138): Restore pending freed pages so
-            // a retry or rollback can still observe them. In the old code
-            // they leaked into inner.freelist regardless of commit outcome;
-            // now we only promote on success and restore on failure.
-            self.restore_pending_freed_pages(pending_freed);
-            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-            drop(inner);
-        }
-        commit_result
-    }
-
-    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
-        // Only supported for in-memory pagers where we can skip I/O.
-        if !self.vfs.is_memory() {
-            self.commit(cx)?;
-            return Ok(false);
-        }
-
-        // If not a writer or no pending writes, just commit normally.
-        if !self.is_writer || !self.has_pending_writes() {
-            self.commit(cx)?;
-            return Ok(false);
-        }
-
-        // Perform the full commit but don't release writer state.
-        // This is the same as commit() except we:
-        //  - Don't decrement active_transactions
-        //  - Don't set writer_active = false
-        //  - Don't set committed/finished = true
-        //  - Clear write_set for reuse instead
-        let inner_arc = Arc::clone(&self.inner);
-        let mut inner = inner_arc
-            .lock()
-            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-        let mut committed_db_size = self.committed_db_size_with_inner(&inner);
-        let mut pending_free_pages_for_retain = self.pending_free_pages_for_commit();
-        let mut freelist_dirty_for_retain = self.freelist_metadata_dirty_with_pending_free_pages(
-            &inner,
-            committed_db_size,
-            &pending_free_pages_for_retain,
-        );
-        let mut single_connection_fast_path = self.single_connection_fast_path_enabled();
-        let mut metadata_only_single_connection_fast_path = single_connection_fast_path
-            && !freelist_dirty_for_retain
-            && !self.write_set.contains_key(&PageNumber::ONE);
-        let mut defer_private_memory_flush =
-            self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
-        if self.vfs.is_memory()
-            && self.memory_db_bump_alloc
-            && !defer_private_memory_flush
-            && !self.retained_memory_overlay_dirty_pages.is_empty()
-        {
-            drop(inner);
-            self.materialize_retained_memory_overlay_into_write_set()?;
-            inner = inner_arc
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            committed_db_size = self.committed_db_size_with_inner(&inner);
-            pending_free_pages_for_retain = self.pending_free_pages_for_commit();
-            freelist_dirty_for_retain = self.freelist_metadata_dirty_with_pending_free_pages(
-                &inner,
-                committed_db_size,
-                &pending_free_pages_for_retain,
-            );
-            single_connection_fast_path = self.single_connection_fast_path_enabled();
-            metadata_only_single_connection_fast_path = single_connection_fast_path
-                && !freelist_dirty_for_retain
-                && !self.write_set.contains_key(&PageNumber::ONE);
-            defer_private_memory_flush =
-                self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
-        }
-        // Drain freed_pages AFTER dirty check but do NOT push into
-        // inner.freelist. The serializer receives pending_free_pages so
-        // inner.freelist remains untouched until Phase C (after successful
-        // commit).
-        let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
-        pending_returned_pages.append(&mut self.page_lease);
-        let mut pending_free_pages = pending_returned_pages.clone();
-        pending_free_pages.extend(self.freed_pages.iter().copied());
-        let pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
-        self.freed_page_bounds = None;
-        let mut wal_publication_authorization = None;
-        let commit_result = {
-            let freelist_dirty = freelist_dirty_for_retain;
-            // Match the normal commit path: capture semantic Page 1 intent
-            // before freelist serialization can inject bookkeeping Page 1.
-            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-            if freelist_dirty {
-                if let Err(e) = serialize_freelist_to_write_set(
-                    cx,
-                    &mut inner,
-                    &self.cache,
-                    &self.wal_backend,
-                    &self.pool,
-                    &mut self.write_set,
-                    &mut self.write_pages_sorted,
-                    committed_db_size,
-                    &pending_free_pages,
-                ) {
-                    self.restore_pending_freed_pages(pending_freed);
-                    return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                    return Err(e);
-                }
-            }
-
-            // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
-            // only when it was explicitly dirty, but also when the database
-            // grows (new pages allocated beyond current db_size). Without this,
-            // other connections reading page 1 from WAL won't see the updated
-            // page_count header, causing BusySnapshot errors.
-            let must_write_page1 = if self.journal_mode == JournalMode::Wal {
-                wal_page1_plan.requires_page_one_rewrite()
-                    || wal_page1_plan.requires_page_count_advance()
-            } else if self.vfs.is_memory() {
-                // B3.4: :memory: journal mode skips page 1 header update unless:
-                // 1. freelist_dirty (freelist count in header must match), OR
-                // 2. page 1 is explicitly dirty in write_set
-                freelist_dirty || self.write_set.contains_key(&PageNumber::ONE)
-            } else {
-                true
-            };
-            if must_write_page1 {
-                let mut page1 = match ensure_page_one_in_write_set(
-                    cx,
-                    &mut inner,
-                    &self.cache,
-                    &self.wal_backend,
-                    &self.pool,
-                    &mut self.write_set,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
+                    .await
+                    {
                         self.restore_pending_freed_pages(pending_freed);
                         return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
                         return Err(e);
                     }
-                };
-                let page1_bytes = page1.as_page_bytes_mut();
-                if page1_bytes.len() >= DATABASE_HEADER_SIZE {
-                    let mut page_count_bytes = [0_u8; 4];
-                    page_count_bytes.copy_from_slice(&page1_bytes[28..32]);
-                    let existing_page_count = u32::from_be_bytes(page_count_bytes);
-                    let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
-                    page1_bytes[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-                    if self.journal_mode != JournalMode::Wal
-                        || wal_page1_plan.requires_page_count_advance()
-                    {
-                        let new_db_size = committed_db_size.max(existing_page_count);
-                        page1_bytes[28..32].copy_from_slice(&new_db_size.to_be_bytes());
-                    }
-                    page1_bytes[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
                 }
-                insert_staged_page(
-                    &mut self.write_set,
-                    &mut self.write_pages_sorted,
-                    PageNumber::ONE,
-                    page1,
-                );
+
+                // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
+                // only when it was explicitly dirty, but also when the database
+                // grows (new pages allocated beyond current db_size). Without this,
+                // other connections reading page 1 from WAL won't see the updated
+                // page_count header, causing BusySnapshot errors.
+                let must_write_page1 = if self.journal_mode == JournalMode::Wal {
+                    wal_page1_plan.requires_page_one_rewrite()
+                        || wal_page1_plan.requires_page_count_advance()
+                } else {
+                    true
+                };
+                if must_write_page1 {
+                    let mut page1 = match ensure_page_one_in_write_set(
+                        cx,
+                        &mut inner,
+                        &self.cache,
+                        &self.wal_backend,
+                        &self.pool,
+                        &mut self.write_set,
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.restore_pending_freed_pages(pending_freed);
+                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            return Err(e);
+                        }
+                    };
+                    let page1_bytes = page1.as_page_bytes_mut();
+                    if page1_bytes.len() >= DATABASE_HEADER_SIZE {
+                        let mut page_count_bytes = [0_u8; 4];
+                        page_count_bytes.copy_from_slice(&page1_bytes[28..32]);
+                        let existing_page_count = u32::from_be_bytes(page_count_bytes);
+                        let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
+
+                        // Offset 24..28: change counter (big-endian u32)
+                        page1_bytes[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                        if self.journal_mode != JournalMode::Wal
+                            || wal_page1_plan.requires_page_count_advance()
+                        {
+                            let new_db_size = committed_db_size.max(existing_page_count);
+                            // Offset 28..32: page count (big-endian u32)
+                            page1_bytes[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                        }
+                        // Offset 92..96: version-valid-for
+                        page1_bytes[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                    }
+                    insert_staged_page(
+                        &mut self.write_set,
+                        &mut self.write_pages_sorted,
+                        PageNumber::ONE,
+                        page1,
+                    );
+                }
+                cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
+                    self.predicted_conflict_pages_for_wal_commit_with_inner(
+                        &inner,
+                        wal_page1_plan,
+                        &pending_free_pages,
+                    )
+                } else {
+                    Vec::new()
+                };
             }
-            let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
-                self.predicted_conflict_pages_for_wal_commit_with_inner(
-                    &inner,
-                    wal_page1_plan,
-                    &pending_free_pages,
-                )
-            } else {
-                Vec::new()
-            };
             let cross_process_conflict_page_baselines =
                 self.conflict_page_baselines(&cross_process_conflict_pages);
             let wal_current_db_size = inner.db_size;
             let wal_sync_policy = inner.wal_commit_sync_policy;
 
-            if self.journal_mode == JournalMode::Wal {
+            let t_phase_a_done = phase_timing.then(Instant::now);
+            record_pager_commit_duration(&PAGER_COMMIT_PHASE_A_TIME_NS, t_pager_phase_a_start);
+
+            // Phase B: Commit via WAL or journal
+            // D1-CRITICAL: For WAL mode, we release inner.lock() here so other
+            // threads can start their Phase A (prepare) while we wait for
+            // the consolidator lock. This is the key parallelization win.
+            let mut wal_publication_authorization = None;
+            let commit_result = if self.journal_mode == JournalMode::Wal {
+                // Drop inner lock BEFORE acquiring consolidator lock.
+                // This allows other threads to run Phase A concurrently.
                 drop(inner);
+
+                // WAL mode: Use group commit for same-process batching.
+                // commit_wal_group_commit will acquire consolidator.lock() first,
+                // then briefly inner.lock() for the actual WAL I/O.
+                let t_wal_commit_start = pager_commit_profile_start(pager_commit_profile_active);
                 let result = Self::commit_wal_group_commit_with_snapshot(
                     cx,
                     &self.wal_backend,
@@ -13473,7 +13682,11 @@ where
                     &cross_process_conflict_page_baselines,
                     &self.group_commit_queue,
                     &mut wal_publication_authorization,
-                );
+                )
+                .await;
+                record_pager_commit_duration(&PAGER_COMMIT_WAL_TIME_NS, t_wal_commit_start);
+
+                // Re-acquire inner lock for Phase C (finalize).
                 inner = match inner_arc
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
@@ -13490,40 +13703,39 @@ where
                         return Err(e);
                     }
                 };
+
                 result
-            } else if self.vfs.is_memory() {
-                if defer_private_memory_flush {
-                    // For a real private `:memory:` database, a retained
-                    // single-connection metadata-only commit does not need to
-                    // rewrite the VFS backing store on every row. Keep the
-                    // committed page image in `txn_read_cache` and flush once
-                    // when the retained writer is actually released.
-                } else {
-                    // bd-wwqen.3: :memory: retained-commit fast path.
-                    // Skip journal creation, pre-image backup, sync, and deletion.
-                    // Batch dirty-page flushes through the VFS so MemoryFile can
-                    // hold its backing-storage lock once for the whole retained
-                    // commit. Keep the staged pages in the write set for the later
-                    // publish step so the flush path avoids an eager drain/move of
-                    // the whole staging map on every autocommit write.
-                    if let Err(e) = Self::flush_write_set_to_db_file_batch(
-                        cx,
-                        &mut inner,
-                        &self.write_set,
-                        &self.write_pages_sorted,
-                    ) {
-                        self.restore_pending_freed_pages(pending_freed);
-                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-                        return Err(e);
-                    }
-                }
-                Ok(())
+            } else if self.memory_db_bump_alloc {
+                // Private `:memory:` commits do not need rollback-journal
+                // creation/sync. Page 1 has already been staged above, so flush
+                // the final committed image directly once at the release boundary.
+                let t_memory_flush_start = pager_commit_profile_start(pager_commit_profile_active);
+                let result = Self::flush_write_set_to_db_file_batch(
+                    cx,
+                    &mut inner,
+                    &self.write_set,
+                    &self.write_pages_sorted,
+                )
+                .await;
+                record_pager_commit_duration(
+                    &PAGER_COMMIT_MEMORY_FLUSH_TIME_NS,
+                    t_memory_flush_start,
+                );
+                result
             } else {
-                // See commit(): restore drained never-written freelist pops
-                // (`pending_returned_pages`) for the freelist-alias check.
+                // Journal mode: Direct commit (no group commit)
+                // Journal mode keeps inner locked throughout - no parallelization.
+                let t_journal_commit_start =
+                    pager_commit_profile_start(pager_commit_profile_active);
+                // The freelist-alias check needs the transaction's FULL set of
+                // freelist pops. `drain_unstaged_allocated_pages` (Phase A) has
+                // already moved never-written allocations out of
+                // `allocated_from_freelist` into `pending_returned_pages`, so
+                // restore both when reconstructing the begin-time freelist view
+                // (EOF-origin entries are filtered out by the db-size bound).
                 let mut alias_check_restored = self.allocated_from_freelist.clone();
                 alias_check_restored.extend_from_slice(&pending_returned_pages);
-                Self::commit_journal(
+                let result = Self::commit_journal(
                     cx,
                     &self.vfs,
                     &self.journal_path,
@@ -13532,109 +13744,579 @@ where
                     self.original_db_size,
                     &alias_check_restored,
                 )
-            }
-        };
-
-        if commit_result.is_ok() {
-            // For journal mode, update db_size from our computed value.
-            // For WAL mode with group commit, the flusher already set inner.db_size
-            // to the consolidated max across all batched transactions - don't revert it.
-            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-            return_pages_to_freelist(&mut inner.freelist, pending_freed);
-            // See commit() Phase C1: keep inner.db_size monotonic across
-            // concurrent cross-process commits so we never publish a db_size
-            // smaller than a peer's just-committed extent.
-            inner.db_size = inner.db_size.max(committed_db_size);
-            // Keep volatile EOF lease pages in memory; see commit() Phase C1.
-            let wal_publication_intent = wal_publication_authorization
-                .as_ref()
-                .map(|authorization| {
-                    parallel_wal_publication_intent(
-                        authorization,
-                        inner.db_size,
-                        inner.journal_mode,
-                        inner.freelist.len(),
-                        inner.checkpoint_active,
-                    )
-                })
-                .transpose()?;
-            if let Some(intent) = wal_publication_intent {
-                inner.record_local_wal_commit_at(intent.visible_commit_seq);
-            } else {
-                inner.record_local_commit();
-            }
-            // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
-            if self.vfs.is_memory() {
-                inner.committed_db_file_size_bytes =
-                    u64::from(inner.db_size) * u64::from(inner.page_size.get());
-            } else if let Ok(file_size) = inner.db_file.file_size(cx) {
-                inner.committed_db_file_size_bytes = file_size;
-            }
-            // NOTE: We intentionally do NOT decrement active_transactions or
-            // set writer_active=false — the transaction stays "active" for reuse.
-            let publish_update = PublishedPagerUpdate {
-                visible_commit_seq: wal_publication_intent
-                    .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
+                .await;
+                record_pager_commit_duration(&PAGER_COMMIT_JOURNAL_TIME_NS, t_journal_commit_start);
+                result
             };
-            // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
-            // held — MUST happen before publish_committed_state (same order as
-            // `commit()`), so concurrent readers see the immutable snapshot
-            // before the seqlock commit_seq advances.
-            self.publish_committed_snapshot_from_inner(&inner);
-            drop(inner);
-            if let Some(intent) = wal_publication_intent {
-                // The group flusher already published every certified page in
-                // WAL order. Retained transactions must not replay their
-                // member-local subset after another member's Phase C.
+
+            let t_phase_b_done = phase_timing.then(Instant::now);
+
+            if commit_result.is_ok() {
+                let t_phase_c_metadata_start =
+                    pager_commit_profile_start(pager_commit_profile_active);
+                // Phase C1 (FAST, under inner.lock): Update metadata only.
+                // Now that WAL I/O has succeeded, promote pages that became free
+                // into inner.freelist. This is the deferred half of the Phase A
+                // fix: reusable pages become visible only after the WAL commit is
+                // durable.
+                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                return_pages_to_freelist(&mut inner.freelist, pending_freed);
+                // Cross-process #70: the group-commit flusher already set
+                // inner.db_size to final_db_size in WAL mode, but with concurrent
+                // peer commits extending the same file, our flusher's view of
+                // the consolidated db_size can lag the actual max committed page.
+                // Use fetch_max semantics so inner.db_size never regresses below
+                // what we just committed, and so peer extensions we subsequently
+                // observe in refresh_committed_state keep monotonic visibility.
+                inner.db_size = inner.db_size.max(committed_db_size);
+                // Keep volatile EOF lease pages in the in-memory freelist even
+                // when they are above the durable page_count. They are deliberately
+                // filtered out by serialize_freelist_to_write_set(), so page 1
+                // stays SQLite-compatible on disk. But next_page has already
+                // advanced past those page numbers; dropping them here creates
+                // permanent in-process holes that later commits can expose as
+                // "Page N: never used" once page_count grows past the gap.
+                let wal_publication_intent = wal_publication_authorization
+                    .as_ref()
+                    .map(|authorization| {
+                        parallel_wal_publication_intent(
+                            authorization,
+                            inner.db_size,
+                            inner.journal_mode,
+                            inner.freelist.len(),
+                            inner.checkpoint_active,
+                        )
+                    })
+                    .transpose()?;
+                if let Some(intent) = wal_publication_intent {
+                    inner.record_local_wal_commit_at(intent.visible_commit_seq);
+                } else {
+                    inner.record_local_commit();
+                }
+                let t_file_size_start = pager_commit_profile_start(pager_commit_profile_active);
+                let committed_file_size = match shared_db_file_read(&inner.db_file, cx).await {
+                    Ok(db_file) => db_file.file_size(cx).ok(),
+                    Err(_) => None,
+                };
+                if let Some(file_size) = committed_file_size {
+                    inner.committed_db_file_size_bytes = file_size;
+                }
+                record_pager_commit_duration(&PAGER_COMMIT_FILE_SIZE_TIME_NS, t_file_size_start);
+                inner.active_transactions = inner.active_transactions.saturating_sub(1);
+                let notify_writer_idle = self.mode != TransactionMode::Concurrent
+                    && release_single_writer_baton(&mut inner);
+                let publish_update = PublishedPagerUpdate {
+                    visible_commit_seq: wal_publication_intent
+                        .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: inner.checkpoint_active,
+                };
+                let single_connection_fast_path = self.single_connection_fast_path_enabled();
+                // In an isolated single-connection commit, page-plane publication
+                // is unnecessary even when page 1 was staged for internal durable
+                // bookkeeping such as change-counter/page-count maintenance. The
+                // committed bytes are already authoritative in the pager/cache.
+                let metadata_only_single_connection_fast_path = single_connection_fast_path;
+                // bd-db300.5.3.3.1: publish immutable snapshot while inner is
+                // still held so any later multi-connection readers inherit the
+                // committed metadata even if this commit skipped page-plane publish.
+                self.publish_committed_snapshot_from_inner(&inner);
+                let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
+                let _ = release_retained_snapshot_after_txn_exit(cx, &mut inner).await;
+                record_pager_commit_duration(&PAGER_COMMIT_UNLOCK_TIME_NS, t_unlock_start);
+                drop(inner);
+                if notify_writer_idle {
+                    self.writer_idle.notify_one();
+                }
+                record_pager_commit_duration(
+                    &PAGER_COMMIT_PHASE_C_METADATA_TIME_NS,
+                    t_phase_c_metadata_start,
+                );
+
+                let t_phase_c1_done = phase_timing.then(Instant::now);
+
+                // H4 fault hook: crash during Phase C, after commit_seq update
+                // but before snapshot publish. WAL frames are durable, commit_seq
+                // incremented in-memory, but snapshot plane not yet updated.
+                #[cfg(any(test, feature = "fault-injection"))]
+                crate::fault_hooks::maybe_inject_during_phase_c(
+                    publish_update.visible_commit_seq.get(),
+                    publish_update.db_size,
+                )?;
+
+                // Phase C2 (outside inner.lock): publish to the shared snapshot
+                // plane. In isolated single-connection mode, only metadata needs
+                // to advance; page bytes stay authoritative in pager/db_file state.
+                let t_publish_start = pager_commit_profile_start(pager_commit_profile_active);
+                if let Some(intent) = wal_publication_intent {
+                    // The physical flusher installed the complete certificate
+                    // group before waking this waiter. Re-publishing this
+                    // transaction's subset here could overwrite the group's
+                    // last-frame-wins image when Phase C callbacks run out of
+                    // order, so the waiter only binds certificate metadata.
+                    self.published.bind_parallel_wal_publication(intent);
+                } else if metadata_only_single_connection_fast_path {
+                    self.publish_single_connection_metadata_only(cx, publish_update);
+                } else {
+                    self.publish_committed_state(cx, publish_update);
+                }
+                record_pager_commit_duration(&PAGER_COMMIT_PUBLISH_TIME_NS, t_publish_start);
+
+                // Keep the transaction-local published snapshot hint aligned with
+                // the commit we just published so post-commit callers querying the
+                // still-live handle see committed metadata rather than the
+                // pre-commit snapshot boundary.
+                self.published_visible_commit_seq
+                    .set(publish_update.visible_commit_seq);
+                self.published_db_size.set(publish_update.db_size);
+
+                let t_phase_c2_done = phase_timing.then(Instant::now);
+
+                // Record full commit path timing.
+                if self.journal_mode == JournalMode::Wal
+                    && let (
+                        Some(t_commit_start),
+                        Some(t_phase_a_done),
+                        Some(t_phase_b_done),
+                        Some(t_phase_c1_done),
+                        Some(t_phase_c2_done),
+                    ) = (
+                        t_commit_start,
+                        t_phase_a_done,
+                        t_phase_b_done,
+                        t_phase_c1_done,
+                        t_phase_c2_done,
+                    )
+                {
+                    let phase_a_us =
+                        t_phase_a_done.duration_since(t_commit_start).as_micros() as u64;
+                    let phase_b_us =
+                        t_phase_b_done.duration_since(t_phase_a_done).as_micros() as u64;
+                    let phase_c1_us =
+                        t_phase_c1_done.duration_since(t_phase_b_done).as_micros() as u64;
+                    let phase_c2_us =
+                        t_phase_c2_done.duration_since(t_phase_c1_done).as_micros() as u64;
+                    GLOBAL_CONSOLIDATION_METRICS.record_commit_phases(
+                        phase_a_us,
+                        phase_b_us,
+                        phase_c1_us,
+                        phase_c2_us,
+                    );
+                }
+
+                // Metadata-only single-connection commits intentionally leave the
+                // published page plane stale, so keep the just-committed pages in
+                // shared cache even under WAL mode to give the next statement a
+                // cheap committed read surface.
+                let t_cache_finish_start = pager_commit_profile_start(pager_commit_profile_active);
+                if publish_update.journal_mode == JournalMode::Wal
+                    && !metadata_only_single_connection_fast_path
+                {
+                    self.discard_committed_pages();
+                } else if metadata_only_single_connection_fast_path {
+                    self.drain_committed_cache_pages_into_cache();
+                } else {
+                    let committed_cache_pages = self.drain_committed_cache_pages();
+                    if !committed_cache_pages.is_empty() {
+                        let inner = self
+                            .inner
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if inner.commit_seq == publish_update.visible_commit_seq {
+                            for (page_no, buf) in committed_cache_pages {
+                                self.cache.insert_buffer(page_no, buf);
+                            }
+                        }
+                    }
+                }
                 self.retained_memory_overlay_dirty_pages.clear();
-                self.published.bind_parallel_wal_publication(intent);
-            } else if metadata_only_single_connection_fast_path {
-                if defer_private_memory_flush {
-                    self.note_retained_memory_overlay_from_write_set();
+                self.committed = true;
+                self.maintenance_lease.take();
+                self.finished = true;
+                // IMPL-3 / AG-4B: reset scratch arena after successful commit so
+                // transient per-transaction allocations do not linger. The arena
+                // is dropped when the transaction drops; this reset is the
+                // amortization hook that keeps the txn-committed state compact.
+                self.scratch_arena.reset();
+                record_pager_commit_duration(
+                    &PAGER_COMMIT_CACHE_FINISH_TIME_NS,
+                    t_cache_finish_start,
+                );
+            } else {
+                // Keep the writer lock held on commit failure so no other writer
+                // can interleave while the caller decides to retry or roll back.
+                //
+                // CRITICAL FIX (beads_rust#138): Restore pending freed pages so
+                // a retry or rollback can still observe them. In the old code
+                // they leaked into inner.freelist regardless of commit outcome;
+                // now we only promote on success and restore on failure.
+                self.restore_pending_freed_pages(pending_freed);
+                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                drop(inner);
+            }
+            commit_result
+        }
+    }
+
+    fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
+        async move {
+            // Only supported for in-memory pagers where we can skip I/O.
+            if !self.vfs.is_memory() {
+                self.commit(cx).await?;
+                return Ok(false);
+            }
+
+            // If not a writer or no pending writes, just commit normally.
+            if !self.is_writer || !self.has_pending_writes() {
+                self.commit(cx).await?;
+                return Ok(false);
+            }
+
+            // Perform the full commit but don't release writer state.
+            // This is the same as commit() except we:
+            //  - Don't decrement active_transactions
+            //  - Don't set writer_active = false
+            //  - Don't set committed/finished = true
+            //  - Clear write_set for reuse instead
+            let inner_arc = Arc::clone(&self.inner);
+            let mut inner = inner_arc
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            let mut committed_db_size = self.committed_db_size_with_inner(&inner);
+            let mut pending_free_pages_for_retain = self.pending_free_pages_for_commit();
+            let mut freelist_dirty_for_retain = self
+                .freelist_metadata_dirty_with_pending_free_pages(
+                    &inner,
+                    committed_db_size,
+                    &pending_free_pages_for_retain,
+                );
+            let mut single_connection_fast_path = self.single_connection_fast_path_enabled();
+            let mut metadata_only_single_connection_fast_path = single_connection_fast_path
+                && !freelist_dirty_for_retain
+                && !self.write_set.contains_key(&PageNumber::ONE);
+            let mut defer_private_memory_flush =
+                self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
+            if self.vfs.is_memory()
+                && self.memory_db_bump_alloc
+                && !defer_private_memory_flush
+                && !self.retained_memory_overlay_dirty_pages.is_empty()
+            {
+                drop(inner);
+                self.materialize_retained_memory_overlay_into_write_set()?;
+                inner = inner_arc
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                committed_db_size = self.committed_db_size_with_inner(&inner);
+                pending_free_pages_for_retain = self.pending_free_pages_for_commit();
+                freelist_dirty_for_retain = self.freelist_metadata_dirty_with_pending_free_pages(
+                    &inner,
+                    committed_db_size,
+                    &pending_free_pages_for_retain,
+                );
+                single_connection_fast_path = self.single_connection_fast_path_enabled();
+                metadata_only_single_connection_fast_path = single_connection_fast_path
+                    && !freelist_dirty_for_retain
+                    && !self.write_set.contains_key(&PageNumber::ONE);
+                defer_private_memory_flush =
+                    self.memory_db_bump_alloc && metadata_only_single_connection_fast_path;
+            }
+            // Drain freed_pages AFTER dirty check but do NOT push into
+            // inner.freelist. The serializer receives pending_free_pages so
+            // inner.freelist remains untouched until Phase C (after successful
+            // commit).
+            let mut pending_returned_pages = self.drain_unstaged_allocated_pages();
+            pending_returned_pages.append(&mut self.page_lease);
+            let mut pending_free_pages = pending_returned_pages.clone();
+            pending_free_pages.extend(self.freed_pages.iter().copied());
+            let pending_freed: Vec<PageNumber> = std::mem::take(&mut self.freed_pages);
+            self.freed_page_bounds = None;
+            let mut wal_publication_authorization = None;
+            let commit_result = {
+                let freelist_dirty = freelist_dirty_for_retain;
+                // Match the normal commit path: capture semantic Page 1 intent
+                // before freelist serialization can inject bookkeeping Page 1.
+                let wal_page1_plan =
+                    self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+                if freelist_dirty {
+                    if let Err(e) = serialize_freelist_to_write_set(
+                        cx,
+                        &mut inner,
+                        &self.cache,
+                        &self.wal_backend,
+                        &self.pool,
+                        &mut self.write_set,
+                        &mut self.write_pages_sorted,
+                        committed_db_size,
+                        &pending_free_pages,
+                    )
+                    .await
+                    {
+                        self.restore_pending_freed_pages(pending_freed);
+                        return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                        return Err(e);
+                    }
+                }
+
+                // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
+                // only when it was explicitly dirty, but also when the database
+                // grows (new pages allocated beyond current db_size). Without this,
+                // other connections reading page 1 from WAL won't see the updated
+                // page_count header, causing BusySnapshot errors.
+                let must_write_page1 = if self.journal_mode == JournalMode::Wal {
+                    wal_page1_plan.requires_page_one_rewrite()
+                        || wal_page1_plan.requires_page_count_advance()
+                } else if self.vfs.is_memory() {
+                    // B3.4: :memory: journal mode skips page 1 header update unless:
+                    // 1. freelist_dirty (freelist count in header must match), OR
+                    // 2. page 1 is explicitly dirty in write_set
+                    freelist_dirty || self.write_set.contains_key(&PageNumber::ONE)
+                } else {
+                    true
+                };
+                if must_write_page1 {
+                    let mut page1 = match ensure_page_one_in_write_set(
+                        cx,
+                        &mut inner,
+                        &self.cache,
+                        &self.wal_backend,
+                        &self.pool,
+                        &mut self.write_set,
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.restore_pending_freed_pages(pending_freed);
+                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            return Err(e);
+                        }
+                    };
+                    let page1_bytes = page1.as_page_bytes_mut();
+                    if page1_bytes.len() >= DATABASE_HEADER_SIZE {
+                        let mut page_count_bytes = [0_u8; 4];
+                        page_count_bytes.copy_from_slice(&page1_bytes[28..32]);
+                        let existing_page_count = u32::from_be_bytes(page_count_bytes);
+                        let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
+                        page1_bytes[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                        if self.journal_mode != JournalMode::Wal
+                            || wal_page1_plan.requires_page_count_advance()
+                        {
+                            let new_db_size = committed_db_size.max(existing_page_count);
+                            page1_bytes[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                        }
+                        page1_bytes[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                    }
+                    insert_staged_page(
+                        &mut self.write_set,
+                        &mut self.write_pages_sorted,
+                        PageNumber::ONE,
+                        page1,
+                    );
+                }
+                let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
+                    self.predicted_conflict_pages_for_wal_commit_with_inner(
+                        &inner,
+                        wal_page1_plan,
+                        &pending_free_pages,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let cross_process_conflict_page_baselines =
+                    self.conflict_page_baselines(&cross_process_conflict_pages);
+                let wal_current_db_size = inner.db_size;
+                let wal_sync_policy = inner.wal_commit_sync_policy;
+
+                if self.journal_mode == JournalMode::Wal {
+                    drop(inner);
+                    let result = Self::commit_wal_group_commit_with_snapshot(
+                        cx,
+                        &self.wal_backend,
+                        &self.inner,
+                        Some(self.published.as_ref()),
+                        wal_current_db_size,
+                        wal_sync_policy,
+                        &self.write_set,
+                        &self.write_pages_sorted,
+                        &cross_process_conflict_pages,
+                        &cross_process_conflict_page_baselines,
+                        &self.group_commit_queue,
+                        &mut wal_publication_authorization,
+                    )
+                    .await;
+                    inner = match inner_arc
+                        .lock()
+                        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
+                    {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            self.restore_pending_freed_pages(pending_freed);
+                            if let Ok(mut recovery_inner) = inner_arc.lock() {
+                                return_pages_to_freelist(
+                                    &mut recovery_inner.freelist,
+                                    pending_returned_pages,
+                                );
+                            }
+                            return Err(e);
+                        }
+                    };
+                    result
+                } else if self.vfs.is_memory() {
+                    if defer_private_memory_flush {
+                        // For a real private `:memory:` database, a retained
+                        // single-connection metadata-only commit does not need to
+                        // rewrite the VFS backing store on every row. Keep the
+                        // committed page image in `txn_read_cache` and flush once
+                        // when the retained writer is actually released.
+                    } else {
+                        // bd-wwqen.3: :memory: retained-commit fast path.
+                        // Skip journal creation, pre-image backup, sync, and deletion.
+                        // Batch dirty-page flushes through the VFS so MemoryFile can
+                        // hold its backing-storage lock once for the whole retained
+                        // commit. Keep the staged pages in the write set for the later
+                        // publish step so the flush path avoids an eager drain/move of
+                        // the whole staging map on every autocommit write.
+                        if let Err(e) = Self::flush_write_set_to_db_file_batch(
+                            cx,
+                            &mut inner,
+                            &self.write_set,
+                            &self.write_pages_sorted,
+                        )
+                        .await
+                        {
+                            self.restore_pending_freed_pages(pending_freed);
+                            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                            return Err(e);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    // See commit(): restore drained never-written freelist pops
+                    // (`pending_returned_pages`) for the freelist-alias check.
+                    let mut alias_check_restored = self.allocated_from_freelist.clone();
+                    alias_check_restored.extend_from_slice(&pending_returned_pages);
+                    Self::commit_journal(
+                        cx,
+                        &self.vfs,
+                        &self.journal_path,
+                        &mut inner,
+                        &self.write_set,
+                        self.original_db_size,
+                        &alias_check_restored,
+                    )
+                    .await
+                }
+            };
+
+            if commit_result.is_ok() {
+                // For journal mode, update db_size from our computed value.
+                // For WAL mode with group commit, the flusher already set inner.db_size
+                // to the consolidated max across all batched transactions - don't revert it.
+                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                return_pages_to_freelist(&mut inner.freelist, pending_freed);
+                // See commit() Phase C1: keep inner.db_size monotonic across
+                // concurrent cross-process commits so we never publish a db_size
+                // smaller than a peer's just-committed extent.
+                inner.db_size = inner.db_size.max(committed_db_size);
+                // Keep volatile EOF lease pages in memory; see commit() Phase C1.
+                let wal_publication_intent = wal_publication_authorization
+                    .as_ref()
+                    .map(|authorization| {
+                        parallel_wal_publication_intent(
+                            authorization,
+                            inner.db_size,
+                            inner.journal_mode,
+                            inner.freelist.len(),
+                            inner.checkpoint_active,
+                        )
+                    })
+                    .transpose()?;
+                if let Some(intent) = wal_publication_intent {
+                    inner.record_local_wal_commit_at(intent.visible_commit_seq);
+                } else {
+                    inner.record_local_commit();
+                }
+                // B3.4: :memory: derives file size from db_size * page_size — skip VFS roundtrip
+                if self.vfs.is_memory() {
+                    inner.committed_db_file_size_bytes =
+                        u64::from(inner.db_size) * u64::from(inner.page_size.get());
+                } else {
+                    let committed_file_size = match shared_db_file_read(&inner.db_file, cx).await {
+                        Ok(db_file) => db_file.file_size(cx).ok(),
+                        Err(_) => None,
+                    };
+                    if let Some(file_size) = committed_file_size {
+                        inner.committed_db_file_size_bytes = file_size;
+                    }
+                }
+                // NOTE: We intentionally do NOT decrement active_transactions or
+                // set writer_active=false — the transaction stays "active" for reuse.
+                let publish_update = PublishedPagerUpdate {
+                    visible_commit_seq: wal_publication_intent
+                        .map_or(inner.commit_seq, |intent| intent.visible_commit_seq),
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: inner.checkpoint_active,
+                };
+                // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
+                // held — MUST happen before publish_committed_state (same order as
+                // `commit()`), so concurrent readers see the immutable snapshot
+                // before the seqlock commit_seq advances.
+                self.publish_committed_snapshot_from_inner(&inner);
+                drop(inner);
+                if let Some(intent) = wal_publication_intent {
+                    // The group flusher already published every certified page in
+                    // WAL order. Retained transactions must not replay their
+                    // member-local subset after another member's Phase C.
+                    self.retained_memory_overlay_dirty_pages.clear();
+                    self.published.bind_parallel_wal_publication(intent);
+                } else if metadata_only_single_connection_fast_path {
+                    if defer_private_memory_flush {
+                        self.note_retained_memory_overlay_from_write_set();
+                    } else {
+                        self.retained_memory_overlay_dirty_pages.clear();
+                    }
+                    self.publish_single_connection_metadata_only(cx, publish_update);
+                    self.retain_committed_pages_in_txn_read_cache();
                 } else {
                     self.retained_memory_overlay_dirty_pages.clear();
+                    self.publish_committed_state_draining_write_set(cx, publish_update);
                 }
-                self.publish_single_connection_metadata_only(cx, publish_update);
-                self.retain_committed_pages_in_txn_read_cache();
-            } else {
-                self.retained_memory_overlay_dirty_pages.clear();
-                self.publish_committed_state_draining_write_set(cx, publish_update);
-            }
 
-            // Clear retained transaction state for reuse.
-            self.write_pages_sorted.clear();
-            self.clear_freed_pages();
-            self.allocated_from_freelist.clear();
-            self.allocated_from_eof.clear();
-            self.savepoint_stack.clear();
-            self.rolled_back_pages.clear();
-            self.writes_observed = false;
-            if !metadata_only_single_connection_fast_path {
-                self.txn_read_cache.borrow_mut().clear();
+                // Clear retained transaction state for reuse.
+                self.write_pages_sorted.clear();
+                self.clear_freed_pages();
+                self.allocated_from_freelist.clear();
+                self.allocated_from_eof.clear();
+                self.savepoint_stack.clear();
+                self.rolled_back_pages.clear();
+                self.writes_observed = false;
+                if !metadata_only_single_connection_fast_path {
+                    self.txn_read_cache.borrow_mut().clear();
+                }
+                // IMPL-3 / AG-4B: reset scratch arena on retained commit. The
+                // transaction stays active for reuse, but arena-allocated scratch
+                // from the committed logical transaction must not leak into the
+                // next one.
+                self.scratch_arena.reset();
+                self.original_db_size = committed_db_size;
+                self.published_visible_commit_seq
+                    .set(publish_update.visible_commit_seq);
+                self.published_db_size.set(publish_update.db_size);
+                // Transaction stays active — committed/finished remain false.
+                Ok(true)
+            } else {
+                // CRITICAL FIX (beads_rust#138): Restore pending freed pages on
+                // commit failure so rollback can still see them.
+                self.restore_pending_freed_pages(pending_freed);
+                return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
+                drop(inner);
+                commit_result?;
+                unreachable!()
             }
-            // IMPL-3 / AG-4B: reset scratch arena on retained commit. The
-            // transaction stays active for reuse, but arena-allocated scratch
-            // from the committed logical transaction must not leak into the
-            // next one.
-            self.scratch_arena.reset();
-            self.original_db_size = committed_db_size;
-            self.published_visible_commit_seq
-                .set(publish_update.visible_commit_seq);
-            self.published_db_size.set(publish_update.db_size);
-            // Transaction stays active — committed/finished remain false.
-            Ok(true)
-        } else {
-            // CRITICAL FIX (beads_rust#138): Restore pending freed pages on
-            // commit failure so rollback can still see them.
-            self.restore_pending_freed_pages(pending_freed);
-            return_pages_to_freelist(&mut inner.freelist, pending_returned_pages);
-            drop(inner);
-            commit_result?;
-            unreachable!()
         }
     }
 
@@ -13750,118 +14432,127 @@ where
         Ok(self.write_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
     }
 
-    fn rollback(&mut self, cx: &Cx) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.validate_namespace_binding()?;
+    fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            if self.finished {
+                return Ok(());
+            }
+            self.validate_namespace_binding()?;
 
-        // Rollback is mandatory cleanup. A caller may reach it precisely
-        // because its parent context was cancelled during a commit, so every
-        // recovery, refresh, unlock, and journal cleanup below must run from a
-        // masked child rather than inherit that cancellation.
-        let cleanup_cx = cleanup_child_cx(cx);
-        let _cleanup_mask = cleanup_cx.masked();
-        if self.vfs.is_memory()
-            && self.memory_db_bump_alloc
-            && !self.retained_memory_overlay_dirty_pages.is_empty()
-        {
-            let overlay_pages = self.collect_retained_memory_overlay_pages()?;
+            // Rollback is mandatory cleanup. A caller may reach it precisely
+            // because its parent context was cancelled during a commit, so every
+            // recovery, refresh, unlock, and journal cleanup below must run from a
+            // masked child rather than inherit that cancellation.
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            if self.vfs.is_memory()
+                && self.memory_db_bump_alloc
+                && !self.retained_memory_overlay_dirty_pages.is_empty()
+            {
+                let overlay_pages = self.collect_retained_memory_overlay_pages()?;
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                Self::flush_retained_memory_overlay_pages_to_db_file(
+                    &cleanup_cx,
+                    &mut inner,
+                    self.original_db_size,
+                    &overlay_pages,
+                )
+                .await?;
+                drop(inner);
+                self.retained_memory_overlay_dirty_pages.clear();
+            }
+            self.write_set.clear();
+            self.write_pages_sorted.clear();
+            self.clear_freed_pages();
+            self.savepoint_stack.clear();
+            self.rolled_back_pages.clear();
+            // #70 ghost-commit guard: after rollback, staged writes were
+            // explicitly discarded, so a subsequent commit entry with an empty
+            // write_set must not trip the defensive assertion.
+            self.writes_observed = false;
+            let restored_from_journal = self.recover_pending_rollback_journal(&cleanup_cx).await?;
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            Self::flush_retained_memory_overlay_pages_to_db_file(
-                &cleanup_cx,
-                &mut inner,
-                self.original_db_size,
-                &overlay_pages,
-            )?;
-            drop(inner);
-            self.retained_memory_overlay_dirty_pages.clear();
-        }
-        self.write_set.clear();
-        self.write_pages_sorted.clear();
-        self.clear_freed_pages();
-        self.savepoint_stack.clear();
-        self.rolled_back_pages.clear();
-        // #70 ghost-commit guard: after rollback, staged writes were
-        // explicitly discarded, so a subsequent commit entry with an empty
-        // write_set must not trip the defensive assertion.
-        self.writes_observed = false;
-        let restored_from_journal = self.recover_pending_rollback_journal(&cleanup_cx)?;
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        let mut notify_writer_idle = false;
-        if restored_from_journal {
-            self.allocated_from_freelist.clear();
-            self.allocated_from_eof.clear();
-            // Lease pages were EOF allocations that were never written to
-            // disk. After journal recovery rebuilds committed state, these
-            // page numbers don't exist — just drop them.
-            self.page_lease.clear();
-            if self.mode != TransactionMode::Concurrent {
-                notify_writer_idle |= release_single_writer_baton(&mut inner);
-            }
-        } else {
-            // Restore pages allocated from the freelist.
-            return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
-
-            if self.is_writer && self.mode != TransactionMode::Concurrent {
-                // Non-concurrent: next_page will be reset below, so lease
-                // pages (which were EOF allocations) will be re-issued
-                // naturally by future transactions. Just drop them — putting
-                // them on the freelist would create sparse page holes since
-                // the freelist consumer could pick a high page number while
-                // next_page restarts from db_size+1.
+            let mut notify_writer_idle = false;
+            if restored_from_journal {
+                self.allocated_from_freelist.clear();
+                self.allocated_from_eof.clear();
+                // Lease pages were EOF allocations that were never written to
+                // disk. After journal recovery rebuilds committed state, these
+                // page numbers don't exist — just drop them.
                 self.page_lease.clear();
-
-                inner.db_size = self.original_db_size;
-
-                // Reset next_page to avoid holes if we allocated pages that are now discarded.
-                // Logic matches SimplePager::open.
-                let db_size = inner.db_size;
-                inner.next_page = if db_size >= 2 {
-                    db_size.saturating_add(1)
-                } else {
-                    2
-                };
-
-                notify_writer_idle |= release_single_writer_baton(&mut inner);
-            } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                // Concurrent: next_page is NOT reset, so lease pages and
-                // aborted EOF allocations must return to the in-memory
-                // freelist. Otherwise next_page skips over them permanently
-                // and a later commit can grow page_count past those holes,
-                // yielding "Page N: never used" corruption.
-                return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
-                return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+                if self.mode != TransactionMode::Concurrent {
+                    notify_writer_idle |= release_single_writer_baton(&mut inner);
+                }
             } else {
-                // Read-only transaction: lease should be empty (only writers
-                // allocate pages), but clear defensively.
-                self.page_lease.clear();
+                // Restore pages allocated from the freelist.
+                return_pages_to_freelist(
+                    &mut inner.freelist,
+                    self.allocated_from_freelist.drain(..),
+                );
+
+                if self.is_writer && self.mode != TransactionMode::Concurrent {
+                    // Non-concurrent: next_page will be reset below, so lease
+                    // pages (which were EOF allocations) will be re-issued
+                    // naturally by future transactions. Just drop them — putting
+                    // them on the freelist would create sparse page holes since
+                    // the freelist consumer could pick a high page number while
+                    // next_page restarts from db_size+1.
+                    self.page_lease.clear();
+
+                    inner.db_size = self.original_db_size;
+
+                    // Reset next_page to avoid holes if we allocated pages that are now discarded.
+                    // Logic matches SimplePager::open.
+                    let db_size = inner.db_size;
+                    inner.next_page = if db_size >= 2 {
+                        db_size.saturating_add(1)
+                    } else {
+                        2
+                    };
+
+                    notify_writer_idle |= release_single_writer_baton(&mut inner);
+                } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                    // Concurrent: next_page is NOT reset, so lease pages and
+                    // aborted EOF allocations must return to the in-memory
+                    // freelist. Otherwise next_page skips over them permanently
+                    // and a later commit can grow page_count past those holes,
+                    // yielding "Page N: never used" corruption.
+                    return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                    return_pages_to_freelist(
+                        &mut inner.freelist,
+                        self.allocated_from_eof.drain(..),
+                    );
+                } else {
+                    // Read-only transaction: lease should be empty (only writers
+                    // allocate pages), but clear defensively.
+                    self.page_lease.clear();
+                }
             }
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner).await;
+            drop(inner);
+            if notify_writer_idle {
+                self.writer_idle.notify_one();
+            }
+            if self.is_writer {
+                // Delete any partial journal file.
+                let _ = self.vfs.delete(&cleanup_cx, &self.journal_path, true);
+            }
+            self.committed = false;
+            self.maintenance_lease.take();
+            self.finished = true;
+            // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
+            // carry across transaction boundaries.
+            self.scratch_arena.reset();
+            Ok(())
         }
-        inner.active_transactions = inner.active_transactions.saturating_sub(1);
-        let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner);
-        drop(inner);
-        if notify_writer_idle {
-            self.writer_idle.notify_one();
-        }
-        if self.is_writer {
-            // Delete any partial journal file.
-            let _ = self.vfs.delete(&cleanup_cx, &self.journal_path, true);
-        }
-        self.committed = false;
-        self.maintenance_lease.take();
-        self.finished = true;
-        // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
-        // carry across transaction boundaries.
-        self.scratch_arena.reset();
-        Ok(())
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
@@ -14012,9 +14703,10 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             return;
         }
         let mut notify_writer_idle = false;
-        // Drop is the last fail-safe after a caller abandons a failed commit.
-        // Keep recovery and lock release alive even if that caller's context
-        // was cancelled while the journal was hot.
+        // Drop is the last synchronous fail-safe after a caller abandons a
+        // transaction. A hot journal stays marked pending for the pager's next
+        // explicit async recovery epoch; Drop only restores in-memory state and
+        // releases the already-held snapshot lock without blocking an executor.
         let cleanup_cx = self.cleanup_cx.clone();
         let _cleanup_mask = cleanup_cx.masked();
         let recovery_was_pending = self
@@ -14026,31 +14718,13 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                     && inner.rollback_journal_recovery_state.is_pending()
             })
             .unwrap_or(false);
-        let restored_from_journal = if recovery_was_pending {
-            match self.recover_pending_rollback_journal(&cleanup_cx) {
-                Ok(restored) => restored,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "drop-time recovery could not finish the pending rollback journal"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
+        if recovery_was_pending {
+            tracing::warn!(
+                "drop left a pending rollback journal for the pager's next recovery epoch"
+            );
+        }
         if let Ok(mut inner) = self.inner.lock() {
-            if restored_from_journal {
-                // The refreshed durable freelist is authoritative; transaction
-                // allocations belong to the discarded candidate image.
-                self.allocated_from_freelist.clear();
-                self.allocated_from_eof.clear();
-                self.page_lease.clear();
-                if self.mode != TransactionMode::Concurrent {
-                    notify_writer_idle = release_single_writer_baton(&mut inner);
-                }
-            } else if recovery_was_pending {
+            if recovery_was_pending {
                 // Never merge transaction-local allocation state into an
                 // image whose recovery failed. Keep Pending set so every
                 // subsequent begin retries or fails closed.
@@ -14093,7 +14767,27 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                 }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let _ = release_retained_snapshot_after_txn_exit(&cleanup_cx, &mut inner);
+            let preserve_level =
+                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
+            match inner.db_file.try_write() {
+                Ok(mut db_file) => {
+                    let release_result = if inner.active_transactions == 0 {
+                        db_file.unlock_external_shared_snapshot(&cleanup_cx)
+                    } else {
+                        db_file.unlock(&cleanup_cx, preserve_level)
+                    };
+                    if let Err(error) = release_result {
+                        tracing::error!(
+                            %error,
+                            "drop-time transaction snapshot lock release failed"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(
+                    %error,
+                    "drop-time transaction snapshot lock was still in use"
+                ),
+            }
         }
         if notify_writer_idle {
             self.writer_idle.notify_one();
@@ -14141,19 +14835,27 @@ where
     /// - a valid change counter (24..28),
     /// - the true on-disk page count (28..32),
     /// - matching version-valid-for (92..96).
-    fn patch_page1_header(
-        inner: &mut PagerInner<V::File>,
-        cache: &ShardedPageCache,
-        cx: &Cx,
-    ) -> Result<()> {
-        // SQLite databases always keep page 1 when non-empty.
-        if inner.db_size == 0 {
-            return Ok(());
-        }
+    async fn patch_page1_header(&self, cx: &Cx) -> Result<()> {
+        let (db_file, db_size, page_size, current_change_counter) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+            // SQLite databases always keep page 1 when non-empty.
+            if inner.db_size == 0 {
+                return Ok(());
+            }
+            (
+                Arc::clone(&inner.db_file),
+                inner.db_size,
+                inner.page_size.as_usize(),
+                inner.commit_seq.get() as u32,
+            )
+        };
 
-        let page_size = inner.page_size.as_usize();
         let mut page1 = vec![0u8; page_size];
-        let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
+        let db_file = shared_db_file_read(&db_file, cx).await?;
+        let bytes_read = db_file.read(cx, &mut page1, 0).await?;
         if bytes_read < DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -14162,14 +14864,11 @@ where
             });
         }
 
-        let new_page_count = inner.db_size;
-        let current_change_counter = inner.commit_seq.get() as u32;
-
         page1[24..28].copy_from_slice(&current_change_counter.to_be_bytes());
-        page1[28..32].copy_from_slice(&new_page_count.to_be_bytes());
+        page1[28..32].copy_from_slice(&db_size.to_be_bytes());
         page1[92..96].copy_from_slice(&current_change_counter.to_be_bytes());
-        inner.db_file.write(cx, &page1, 0)?;
-        cache.evict(PageNumber::ONE);
+        db_file.write(cx, &page1, 0).await?;
+        self.cache.evict(PageNumber::ONE);
         Ok(())
     }
 }
@@ -14179,34 +14878,132 @@ where
     V: Vfs + Send + Sync,
     V::File: Send + Sync,
 {
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            let (db_file, page_size) = {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                (Arc::clone(&inner.db_file), inner.page_size.as_usize())
+            };
+            let offset = u64::from(page_no.get() - 1) * page_size as u64;
+            {
+                let db_file = shared_db_file_read(&db_file, cx).await?;
+                db_file.write(cx, data, offset).await?;
+            }
 
-        // Write directly to the database file, bypassing the cache.
-        // The WAL checkpoint is authoritative, so we overwrite any cached version.
-        let page_size = inner.page_size.as_usize();
-        let offset = u64::from(page_no.get() - 1) * page_size as u64;
+            {
+                let mut inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                inner.db_size = inner.db_size.max(page_no.get());
+            }
+            if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
+                self.patch_page1_header(cx).await?;
+            }
 
-        // For page 1, repair header fields after writing the frame bytes.
-        // A final repair also occurs in sync() so page_count remains correct
-        // even when page 1 was checkpointed before higher-numbered pages.
-        inner.db_file.write(cx, data, offset)?;
-        // Advance db_size only after the write lands (failure-atomic, like
-        // truncate() below): a failed write must not leave an inflated
-        // db_size behind for the checkpoint error path to publish or for a
-        // later sync() to stamp into the page-1 header as a page count
-        // exceeding the true file size (GH #194).
-        inner.db_size = inner.db_size.max(page_no.get());
-        if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
-            Self::patch_page1_header(&mut inner, &self.cache, cx)?;
-        }
+            self.cache.evict(page_no);
+            if page_no == PageNumber::ONE {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                self.published.publish_remove_page(
+                    cx,
+                    PublishedPagerUpdate {
+                        visible_commit_seq: inner.commit_seq,
+                        db_size: inner.db_size,
+                        journal_mode: inner.journal_mode,
+                        freelist_count: inner.freelist.len(),
+                        checkpoint_active: inner.checkpoint_active,
+                    },
+                    PageNumber::ONE,
+                );
+            }
+            Ok(())
+        })
+    }
 
-        // Invalidate cache entry if present to avoid stale reads.
-        self.cache.evict(page_no);
-        if page_no == PageNumber::ONE {
+    fn truncate<'a>(&'a mut self, cx: &'a Cx, n_pages: u32) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            let (db_file, old_db_size, page_size) = {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                (
+                    Arc::clone(&inner.db_file),
+                    inner.db_size,
+                    inner.page_size.as_usize(),
+                )
+            };
+            let target_size = u64::from(n_pages) * page_size as u64;
+            shared_db_file_write(&db_file, cx)
+                .await?
+                .truncate(cx, target_size)?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+            inner.db_size = n_pages;
+
+            // Invalidate cached pages beyond the new size.
+            // ShardedPageCache is internally synchronized, so no lock needed.
+            for pgno in (n_pages.saturating_add(1))..=old_db_size {
+                if let Some(page_no) = PageNumber::new(pgno) {
+                    self.cache.evict(page_no);
+                }
+            }
+            // D1-CRITICAL Change 3: Use sharded publish_truncate_checkpoint.
+            self.published.publish_truncate_checkpoint(
+                cx,
+                PublishedPagerUpdate {
+                    visible_commit_seq: inner.commit_seq,
+                    db_size: inner.db_size,
+                    journal_mode: inner.journal_mode,
+                    freelist_count: inner.freelist.len(),
+                    checkpoint_active: inner.checkpoint_active,
+                },
+                n_pages,
+            );
+
+            Ok(())
+        })
+    }
+
+    fn sync<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            // Ensure header page_count reflects the final db_size after all
+            // checkpoint writes/truncation, even if page 1 was checkpointed early.
+            // ShardedPageCache is internally synchronized, so no lock needed.
+            self.patch_page1_header(cx).await?;
+            // Durability barrier FIRST, publication second (GH #195): the
+            // published pager plane must never advertise checkpoint state whose
+            // backing writes have not survived their sync barrier. On sync
+            // failure nothing is published and the WAL remains authoritative.
+            //
+            // GH #198: this sync is the checkpoint recovery fence — the WAL
+            // generation may be invalidated right after it, so it must be the
+            // strongest platform durability barrier. `durable_sync(FullDurable)`
+            // reaches F_FULLFSYNC on macOS (plain `sync(FULL)` stops at fsync,
+            // which does not flush the drive cache there) and a full fsync
+            // including metadata everywhere else.
+            let db_file = {
+                let inner = self.inner.lock().map_err(|_| {
+                    FrankenError::internal("SimplePagerCheckpointWriter lock poisoned")
+                })?;
+                Arc::clone(&inner.db_file)
+            };
+            shared_db_file_write(&db_file, cx)
+                .await?
+                .durable_sync(cx, SyncKind::FullDurable)?;
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
             // D1-CRITICAL Change 3: Use sharded publish_remove_page.
             self.published.publish_remove_page(
                 cx,
@@ -14219,82 +15016,8 @@ where
                 },
                 PageNumber::ONE,
             );
-        }
-
-        drop(inner);
-        Ok(())
-    }
-
-    fn truncate(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
-
-        let old_db_size = inner.db_size;
-        let page_size = inner.page_size.as_usize();
-        let target_size = u64::from(n_pages) * page_size as u64;
-        inner.db_file.truncate(cx, target_size)?;
-        inner.db_size = n_pages;
-
-        // Invalidate cached pages beyond the new size.
-        // ShardedPageCache is internally synchronized, so no lock needed.
-        for pgno in (n_pages.saturating_add(1))..=old_db_size {
-            if let Some(page_no) = PageNumber::new(pgno) {
-                self.cache.evict(page_no);
-            }
-        }
-        // D1-CRITICAL Change 3: Use sharded publish_truncate_checkpoint.
-        self.published.publish_truncate_checkpoint(
-            cx,
-            PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            },
-            n_pages,
-        );
-
-        drop(inner);
-        Ok(())
-    }
-
-    fn sync(&mut self, cx: &Cx) -> Result<()> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
-        // Ensure header page_count reflects the final db_size after all
-        // checkpoint writes/truncation, even if page 1 was checkpointed early.
-        // ShardedPageCache is internally synchronized, so no lock needed.
-        Self::patch_page1_header(&mut inner, &self.cache, cx)?;
-        // Durability barrier FIRST, publication second (GH #195): the
-        // published pager plane must never advertise checkpoint state whose
-        // backing writes have not survived their sync barrier. On sync
-        // failure nothing is published and the WAL remains authoritative.
-        //
-        // GH #198: this sync is the checkpoint recovery fence — the WAL
-        // generation may be invalidated right after it, so it must be the
-        // strongest platform durability barrier. `durable_sync(FullDurable)`
-        // reaches F_FULLFSYNC on macOS (plain `sync(FULL)` stops at fsync,
-        // which does not flush the drive cache there) and a full fsync
-        // including metadata everywhere else.
-        inner.db_file.durable_sync(cx, SyncKind::FullDurable)?;
-        // D1-CRITICAL Change 3: Use sharded publish_remove_page.
-        self.published.publish_remove_page(
-            cx,
-            PublishedPagerUpdate {
-                visible_commit_seq: inner.commit_seq,
-                db_size: inner.db_size,
-                journal_mode: inner.journal_mode,
-                freelist_count: inner.freelist.len(),
-                checkpoint_active: inner.checkpoint_active,
-            },
-            PageNumber::ONE,
-        );
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -14349,7 +15072,7 @@ where
     /// to `FULL` so we never reset or truncate WAL based on incomplete reader
     /// visibility. For incremental, reader-aware checkpointing, use the
     /// lower-level WAL backend API.
-    pub fn checkpoint(
+    pub async fn checkpoint(
         &self,
         cx: &Cx,
         mode: traits::CheckpointMode,
@@ -14358,7 +15081,7 @@ where
         self.validate_namespace_binding()?;
         let cleanup_cx = cleanup_child_cx(cx);
         let checkpoint_gate_state;
-        // Take the WAL backend out of the pager while marking checkpoint active.
+        // Reserve exclusive checkpoint ownership while marking checkpoint active.
         // `begin()` and deferred writer upgrades are blocked while this flag is
         // set so commits cannot observe "WAL mode but no backend".
         let wal = {
@@ -14408,24 +15131,15 @@ where
                 return Err(FrankenError::Busy);
             }
 
-            let mut wal_guard = self
-                .wal_backend
-                .write()
-                .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
-            let Some(wal) = wal_guard.take() else {
-                inner.checkpoint_active = false;
-                return Err(FrankenError::internal(
-                    "WAL mode active but no WAL backend installed",
-                ));
-            };
+            let wal = wal_backend_handle(&self.wal_backend)?;
 
             // Participate in the same VFS-defined whole-image fence used by
             // VACUUM. On Windows this includes stock SQLite's real main-file
             // and -shm byte ranges in addition to FrankenSQLite's cooperative
             // sidecars; on Unix the default hook is the native lock protocol.
-            let cross_process_fence_result = inner.db_file.lock_external_maintenance(cx, true);
+            let cross_process_fence_result =
+                shared_db_lock_external_maintenance(&inner.db_file, cx, true).await;
             if let Err(err) = cross_process_fence_result {
-                *wal_guard = Some(wal);
                 return Err(err);
             }
 
@@ -14460,8 +15174,6 @@ where
         struct CheckpointGuard<'a, F: VfsFile> {
             inner: &'a std::sync::Mutex<PagerInner<F>>,
             published: &'a PublishedPagerState,
-            wal_backend: &'a SharedWalBackend,
-            wal: Option<Box<dyn WalBackend>>,
             cleanup_cx: Cx,
             cross_process_fence_held: bool,
         }
@@ -14470,20 +15182,22 @@ where
             fn drop(&mut self) {
                 if let Ok(mut inner) = self.inner.lock() {
                     let _mask = self.cleanup_cx.masked();
-                    if let Some(wal) = self.wal.take() {
-                        if let Ok(mut wal_guard) = self.wal_backend.write() {
-                            *wal_guard = Some(wal);
-                        }
-                    }
                     if self.cross_process_fence_held {
-                        if let Err(error) = inner
-                            .db_file
-                            .unlock_external_maintenance(&self.cleanup_cx, true)
-                        {
-                            tracing::error!(
+                        match inner.db_file.try_write() {
+                            Ok(mut db_file) => {
+                                if let Err(error) =
+                                    db_file.unlock_external_maintenance(&self.cleanup_cx, true)
+                                {
+                                    tracing::error!(
+                                        %error,
+                                        "checkpoint could not release its external maintenance fence"
+                                    );
+                                }
+                            }
+                            Err(error) => tracing::error!(
                                 %error,
-                                "checkpoint could not release its external maintenance fence"
-                            );
+                                "checkpoint database file was still in use during fence release"
+                            ),
                         }
                         self.cross_process_fence_held = false;
                     }
@@ -14503,11 +15217,9 @@ where
             }
         }
 
-        let mut guard = CheckpointGuard {
+        let _guard = CheckpointGuard {
             inner: &self.inner,
             published: self.published.as_ref(),
-            wal_backend: &self.wal_backend,
-            wal: Some(wal),
             cleanup_cx,
             cross_process_fence_held: true,
         };
@@ -14540,11 +15252,11 @@ where
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
-        let checkpoint_result = guard
-            .wal
-            .as_mut()
-            .expect("wal was just inserted")
-            .checkpoint(cx, effective_mode, &mut writer, 0, None);
+        let mut wal = async_rwlock_write(&wal, cx, "WAL backend").await?;
+        let checkpoint_result = wal
+            .checkpoint(cx, effective_mode, &mut writer, 0, None)
+            .await;
+        drop(wal);
         if let Err(error) = &checkpoint_result {
             let queue_snapshot =
                 checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(self));

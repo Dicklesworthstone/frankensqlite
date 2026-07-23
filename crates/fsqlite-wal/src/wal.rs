@@ -2545,20 +2545,25 @@ mod tests {
         // Verify that a Restart checkpoint resets WAL to 0 frames,
         // preventing unbounded growth.
         use crate::checkpoint::{CheckpointMode, CheckpointState};
-        use crate::checkpoint_executor::CheckpointTarget;
         use crate::checkpoint_executor::execute_checkpoint;
+        use crate::checkpoint_executor::{CheckpointTarget, CheckpointTargetFuture};
         use fsqlite_types::PageNumber;
 
         struct DummyTarget;
         impl CheckpointTarget for DummyTarget {
-            fn write_page(&mut self, _: &Cx, _: PageNumber, _: &[u8]) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn write_page<'a>(
+                &'a mut self,
+                _: &'a Cx,
+                _: PageNumber,
+                _: &'a [u8],
+            ) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
-            fn truncate_db(&mut self, _: &Cx, _: u32) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn truncate_db<'a>(&'a mut self, _: &'a Cx, _: u32) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
-            fn sync_db(&mut self, _: &Cx) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn sync_db<'a>(&'a mut self, _: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
         }
 

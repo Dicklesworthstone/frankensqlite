@@ -131574,26 +131574,29 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
-        fn begin_transaction(&mut self, cx: &Cx) -> Result<()> {
-            self.inner.begin_transaction(cx)
+        fn begin_transaction<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.begin_transaction(cx).await })
         }
 
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-            _page_data: &[u8],
+            _page_data: &'a [u8],
             _db_size_if_commit: u32,
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            _frames: &[fsqlite_pager::traits::WalFrameRef<'_>],
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _frames: &'a [fsqlite_pager::traits::WalFrameRef<'a>],
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
         fn prepare_append_frames(
@@ -131611,32 +131614,47 @@ mod autocommit_txn_tests {
             self.inner.finalize_prepared_frames(cx, prepared)
         }
 
-        fn append_prepared_frames(
-            &mut self,
-            _cx: &Cx,
-            _prepared: &mut fsqlite_pager::traits::PreparedWalFrameBatch,
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _prepared: &'a mut fsqlite_pager::traits::PreparedWalFrameBatch,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
-        fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-            self.inner.read_page(cx, page_number)
+        fn read_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page(cx, page_number).await })
         }
 
-        fn read_page_pinned(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-            self.inner.read_page_pinned(cx, page_number)
+        fn read_page_pinned<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
         }
 
         fn supports_pinned_reads(&self) -> bool {
             self.inner.supports_pinned_reads()
         }
 
-        fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
-            self.inner.committed_txns_since_page(cx, page_number)
+        fn committed_txns_since_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txns_since_page(cx, page_number).await })
         }
 
-        fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {
-            self.inner.committed_txn_count(cx)
+        fn committed_txn_count<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txn_count(cx).await })
         }
 
         fn sync(&mut self, cx: &Cx) -> Result<()> {
@@ -131647,16 +131665,19 @@ mod autocommit_txn_tests {
             self.inner.frame_count()
         }
 
-        fn checkpoint(
-            &mut self,
-            cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             mode: fsqlite_pager::traits::CheckpointMode,
-            writer: &mut dyn fsqlite_pager::traits::CheckpointPageWriter,
+            writer: &'a mut dyn fsqlite_pager::traits::CheckpointPageWriter,
             backfilled_frames: u32,
             oldest_reader_frame: Option<u32>,
-        ) -> Result<fsqlite_pager::traits::CheckpointResult> {
-            self.inner
-                .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+        ) -> fsqlite_pager::traits::WalFuture<'a, fsqlite_pager::traits::CheckpointResult> {
+            Box::pin(async move {
+                self.inner
+                    .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+                    .await
+            })
         }
     }
 

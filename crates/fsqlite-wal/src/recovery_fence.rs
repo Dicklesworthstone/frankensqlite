@@ -38,6 +38,8 @@ use fsqlite_vfs::VfsFile;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_executor::CheckpointTarget;
+#[cfg(test)]
+use crate::checkpoint_executor::CheckpointTargetFuture;
 
 // ---------------------------------------------------------------------------
 // RecoveryFence
@@ -219,13 +221,13 @@ impl Drop for RecoveryFenceGuard<'_> {
 /// Propagates the VFS sync failure. Callers MUST NOT proceed to truncate
 /// the WAL on error, otherwise recovery may observe the WAL-reset but still
 /// see stale committed pages on disk.
-pub fn ensure_db_fsync_before_wal_truncate<W>(cx: &Cx, target: &mut W) -> Result<()>
+pub async fn ensure_db_fsync_before_wal_truncate<W>(cx: &Cx, target: &mut W) -> Result<()>
 where
     W: CheckpointTarget + ?Sized,
 {
     // The CheckpointTarget's sync_db is expected to issue FULL. We rely on
     // it here and on a post-audit assertion in tests via MockCheckpointTarget.
-    target.sync_db(cx).map_err(|err| {
+    target.sync_db(cx).await.map_err(|err| {
         error!(
             target: "fsqlite.wal.recovery_fence",
             error = %err,
@@ -531,7 +533,7 @@ where
     W: CheckpointTarget + ?Sized,
     F: VfsFile,
 {
-    ensure_db_fsync_before_wal_truncate(cx, target)?;
+    ensure_db_fsync_before_wal_truncate(cx, target).await?;
     match verify_checkpoint_checksum_prefix(cx, db_file, page_size, expected).await? {
         CheckpointChecksumVerdict::Match => Ok(()),
         CheckpointChecksumVerdict::Mismatch { first_bad_page } => {
@@ -759,23 +761,38 @@ mod tests {
     }
 
     impl CheckpointTarget for SyncAuditTarget {
-        fn write_page(&mut self, _cx: &Cx, _page: PageNumber, _data: &[u8]) -> Result<()> {
-            self.writes += 1;
-            Ok(())
+        fn write_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _page: PageNumber,
+            _data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.writes += 1;
+                Ok(())
+            })
         }
 
-        fn truncate_db(&mut self, _cx: &Cx, n_pages: u32) -> Result<()> {
-            self.truncate_after_sync = Some(self.sync_count > 0);
-            self.truncate_at = Some(n_pages);
-            Ok(())
+        fn truncate_db<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.truncate_after_sync = Some(self.sync_count > 0);
+                self.truncate_at = Some(n_pages);
+                Ok(())
+            })
         }
 
-        fn sync_db(&mut self, _cx: &Cx) -> Result<()> {
-            if self.sync_should_fail {
-                return Err(FrankenError::internal("mock sync failure"));
-            }
-            self.sync_count += 1;
-            Ok(())
+        fn sync_db<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                if self.sync_should_fail {
+                    return Err(FrankenError::internal("mock sync failure"));
+                }
+                self.sync_count += 1;
+                Ok(())
+            })
         }
     }
 
@@ -784,9 +801,11 @@ mod tests {
         let cx = test_cx();
         let mut target = SyncAuditTarget::default();
         // The barrier helper issues sync_db before any truncate path runs.
-        ensure_db_fsync_before_wal_truncate(&cx, &mut target).expect("fsync ok");
+        ensure_db_fsync_before_wal_truncate(&cx, &mut target)
+            .wait()
+            .expect("fsync ok");
         // Simulate the truncate that would follow.
-        target.truncate_db(&cx, 3).expect("truncate");
+        target.truncate_db(&cx, 3).wait().expect("truncate");
         assert_eq!(target.sync_count, 1, "sync_db must run once");
         assert_eq!(
             target.truncate_after_sync,
@@ -802,7 +821,7 @@ mod tests {
             sync_should_fail: true,
             ..SyncAuditTarget::default()
         };
-        let res = ensure_db_fsync_before_wal_truncate(&cx, &mut target);
+        let res = ensure_db_fsync_before_wal_truncate(&cx, &mut target).wait();
         assert!(res.is_err(), "sync failure must propagate");
         assert!(
             target.truncate_at.is_none(),
@@ -883,14 +902,19 @@ mod tests {
         // that the caller cannot proceed to truncate.
         struct NoopTarget;
         impl CheckpointTarget for NoopTarget {
-            fn write_page(&mut self, _: &Cx, _: PageNumber, _: &[u8]) -> Result<()> {
-                Ok(())
+            fn write_page<'a>(
+                &'a mut self,
+                _: &'a Cx,
+                _: PageNumber,
+                _: &'a [u8],
+            ) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
-            fn truncate_db(&mut self, _: &Cx, _: u32) -> Result<()> {
-                Ok(())
+            fn truncate_db<'a>(&'a mut self, _: &'a Cx, _: u32) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
-            fn sync_db(&mut self, _: &Cx) -> Result<()> {
-                Ok(())
+            fn sync_db<'a>(&'a mut self, _: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
         }
         let mut target = NoopTarget;

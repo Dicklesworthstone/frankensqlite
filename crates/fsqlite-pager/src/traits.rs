@@ -263,8 +263,17 @@ pub trait WalBackend: Send + Sync {
         prepared: &'a mut PreparedWalFrameBatch,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
-            let frame_refs = prepared.frame_refs();
-            self.append_frames(cx, &frame_refs).await
+            for index in 0..prepared.frame_count() {
+                let meta = prepared.frame_metas[index];
+                self.append_frame(
+                    cx,
+                    meta.page_number,
+                    prepared.page_data(index),
+                    meta.db_size_if_commit,
+                )
+                .await?;
+            }
+            Ok(())
         })
     }
 
@@ -282,15 +291,15 @@ pub trait WalBackend: Send + Sync {
     /// therefore leave an orphan certificate, which recovery must ignore
     /// unless the matching generation, complete interval, and commit marker
     /// are all present.
-    fn persist_parallel_wal_commit_certificate(
-        &mut self,
-        _cx: &Cx,
-        _certificate: &ParallelWalCommitCertificate,
+    fn persist_parallel_wal_commit_certificate<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _certificate: &'a ParallelWalCommitCertificate,
         _wal_frame_start: u64,
         _wal_frame_end: u64,
         _sync: bool,
-    ) -> Result<()> {
-        Err(FrankenError::Unsupported)
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async { Err(FrankenError::Unsupported) })
     }
 
     /// Return the newest durable certificate whose sidecar record is
@@ -300,11 +309,11 @@ pub trait WalBackend: Send + Sync {
     /// File-backed implementations use this under the existing writer gate to
     /// seed process-local combiner clocks before assigning another interval.
     /// Backends without a cross-process durable namespace have no seed.
-    fn latest_authorized_parallel_wal_commit_certificate(
-        &mut self,
-        _cx: &Cx,
-    ) -> Result<Option<ParallelWalCommitCertificate>> {
-        Ok(None)
+    fn latest_authorized_parallel_wal_commit_certificate<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> WalFuture<'a, Option<ParallelWalCommitCertificate>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Look up the latest version of a page in the current visible WAL snapshot.
@@ -313,7 +322,7 @@ pub trait WalBackend: Send + Sync {
     /// structure for the steady-state path. Any slower fallback path should be
     /// explicit and reserved for exceptional cases such as a deliberately
     /// partial index or recovery-oriented handling.
-    fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
+    fn read_page<'a>(&'a mut self, cx: &'a Cx, page_number: u32) -> WalFuture<'a, Option<Vec<u8>>>;
 
     /// Read a page from the WAL using a previously pinned read snapshot.
     ///
@@ -327,12 +336,18 @@ pub trait WalBackend: Send + Sync {
     /// the append path.
     ///
     /// # bd-db300.3.8.7: write-lock-scope narrowing
-    fn read_page_pinned(&self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
-        // Default: signal that the implementation doesn't support pinned reads.
-        // Callers must fall back to read_page(&mut self) via write lock.
-        Err(FrankenError::internal(
-            "read_page_pinned not supported by this WalBackend; use read_page",
-        ))
+    fn read_page_pinned<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _page_number: u32,
+    ) -> WalFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async {
+            // Default: signal that the implementation doesn't support pinned reads.
+            // Callers must fall back to read_page(&mut self) via write lock.
+            Err(FrankenError::internal(
+                "read_page_pinned not supported by this WalBackend; use read_page",
+            ))
+        })
     }
 
     /// Whether this backend supports `read_page_pinned` (shared-lock reads).
@@ -348,8 +363,12 @@ pub trait WalBackend: Send + Sync {
     /// This lets the pager derive an exact visible commit sequence even when a
     /// WAL commit does not need to rewrite page 1. Implementations may return
     /// 0 when they cannot provide a more precise answer.
-    fn committed_txns_since_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<u64> {
-        Ok(0)
+    fn committed_txns_since_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_number: u32,
+    ) -> WalFuture<'a, u64> {
+        Box::pin(async { Ok(0) })
     }
 
     /// Return conflict pages that were committed after `snapshot`.
@@ -360,14 +379,14 @@ pub trait WalBackend: Send + Sync {
     /// images race with commits made by another process. Implementations that
     /// can inspect the WAL frame stream should reject those stale batches
     /// before append.
-    fn conflicting_pages_since_snapshot(
-        &mut self,
-        _cx: &Cx,
+    fn conflicting_pages_since_snapshot<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
         _snapshot: TransactionConflictSnapshot,
-        _page_numbers: &[u32],
-        _page_baselines: &[TransactionConflictPageBaseline],
-    ) -> Result<Vec<u32>> {
-        Ok(Vec::new())
+        _page_numbers: &'a [u32],
+        _page_baselines: &'a [TransactionConflictPageBaseline],
+    ) -> WalFuture<'a, Vec<u32>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     /// Count committed transactions visible in the current WAL snapshot.
@@ -376,8 +395,8 @@ pub trait WalBackend: Send + Sync {
     /// from the durable database header change-counter plus the currently
     /// visible WAL commit horizon, without depending on whether page 1 was
     /// rewritten in recent WAL commits.
-    fn committed_txn_count(&mut self, _cx: &Cx) -> Result<u64> {
-        Ok(0)
+    fn committed_txn_count<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, u64> {
+        Box::pin(async { Ok(0) })
     }
 
     /// Sync the WAL file to stable storage.
@@ -402,14 +421,14 @@ pub trait WalBackend: Send + Sync {
     /// # Returns
     ///
     /// A `CheckpointResult` describing what was accomplished.
-    fn checkpoint(
-        &mut self,
-        cx: &Cx,
+    fn checkpoint<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         mode: CheckpointMode,
-        writer: &mut dyn CheckpointPageWriter,
+        writer: &'a mut dyn CheckpointPageWriter,
         backfilled_frames: u32,
         oldest_reader_frame: Option<u32>,
-    ) -> Result<CheckpointResult>;
+    ) -> WalFuture<'a, CheckpointResult>;
 }
 
 /// Borrowed frame descriptor used for WAL batch appends.
@@ -628,7 +647,11 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// Returns a [`TransactionHandle`] that provides page-level access
     /// within the transaction's snapshot. The handle is `Send` so it
     /// can be moved to another thread if needed.
-    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn>;
+    fn begin<'a>(
+        &'a self,
+        cx: &'a Cx,
+        mode: TransactionMode,
+    ) -> impl Future<Output = Result<Self::Txn>> + 'a;
 
     /// Return the current journal mode.
     fn journal_mode(&self) -> JournalMode;
@@ -643,7 +666,11 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// call returns `FrankenError::Unsupported`.
     ///
     /// Returns the mode that is actually in effect after the call.
-    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode>;
+    fn set_journal_mode<'a>(
+        &'a self,
+        cx: &'a Cx,
+        mode: JournalMode,
+    ) -> impl Future<Output = Result<JournalMode>> + 'a;
 
     /// Install a WAL backend for WAL-mode operation.
     ///
@@ -676,7 +703,11 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// Resolution order: local write-set → version chain → on-disk.
     /// Records the read in SSI witness tracking for conflict detection
     /// at commit time.
-    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData>;
+    fn get_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a;
 
     /// Hint that `page_no` is likely to be read soon.
     ///
@@ -688,14 +719,24 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     ///
     /// Acquires a page-level lock and records the write for SSI
     /// validation at commit time.
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Write owned page data within this transaction.
     ///
     /// The default implementation borrows the page bytes, but implementations
     /// can override this to adopt owned buffers without another copy.
-    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        self.write_page(cx, page_no, data.as_bytes())
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { self.write_page(cx, page_no, data.as_bytes()).await }
     }
 
     /// Temporarily take ownership of an unpublished staged page image.
@@ -726,29 +767,34 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// The default implementation routes through `write_page_data`, which is
     /// correct but may copy. Implementations can override this to restore the
     /// staged page without extra allocation.
-    fn restore_staged_page_data(
-        &mut self,
-        cx: &Cx,
+    fn restore_staged_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
         page_no: PageNumber,
         data: PageData,
-    ) -> Result<()> {
-        self.write_page_data(cx, page_no, data)
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { self.write_page_data(cx, page_no, data).await }
     }
 
     /// Allocate a new page and return its page number.
     ///
     /// Searches the freelist first, then extends the database file.
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
+    fn allocate_page<'a>(&'a mut self, cx: &'a Cx)
+    -> impl Future<Output = Result<PageNumber>> + 'a;
 
     /// Free a page, returning it to the freelist.
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()>;
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a;
 
     /// Commit this transaction.
     ///
     /// Performs SSI validation, First-Committer-Wins check, merge ladder,
     /// WAL append, and version publish. Returns `SQLITE_BUSY_SNAPSHOT`
     /// (via `FrankenError::Busy`) on serialization failure.
-    fn commit(&mut self, cx: &Cx) -> Result<()>;
+    fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
 
     /// Commit dirty pages and reset for immediate reuse without destroying
     /// the transaction handle.
@@ -765,9 +811,11 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// as finished).
     ///
     /// Default implementation falls back to regular `commit`.
-    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
-        self.commit(cx)?;
-        Ok(false)
+    fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
+        async move {
+            self.commit(cx).await?;
+            Ok(false)
+        }
     }
 
     /// Whether this transaction has been upgraded to a writer.
@@ -890,7 +938,7 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// Rollback is infallible in the MVCC model (we simply discard the
     /// local write-set and release page locks), but returns `Result` for
     /// consistency with the trait surface.
-    fn rollback(&mut self, cx: &Cx) -> Result<()>;
+    fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a;
 
     /// Record a granular write witness for fine-grained SSI bookkeeping.
     ///
@@ -936,13 +984,18 @@ pub trait TransactionHandle: sealed::Sealed + Send {
 /// This trait is sealed — only this crate can implement it.
 pub trait CheckpointPageWriter: sealed::Sealed + Send {
     /// Write a page directly to the database file (bypassing the cache).
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> WalFuture<'a, ()>;
 
     /// Truncate the database file to `n_pages` pages.
-    fn truncate(&mut self, cx: &Cx, n_pages: u32) -> Result<()>;
+    fn truncate<'a>(&'a mut self, cx: &'a Cx, n_pages: u32) -> WalFuture<'a, ()>;
 
     /// Sync the database file to stable storage.
-    fn sync(&mut self, cx: &Cx) -> Result<()>;
+    fn sync<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -958,12 +1011,18 @@ impl sealed::Sealed for MockMvccPager {}
 impl MvccPager for MockMvccPager {
     type Txn = MockTransaction;
 
-    fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
-        Ok(MockTransaction {
-            committed: false,
-            next_page: 2,
-            savepoint_names: Vec::new(),
-        })
+    fn begin<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _mode: TransactionMode,
+    ) -> impl Future<Output = Result<Self::Txn>> + 'a {
+        async {
+            Ok(MockTransaction {
+                committed: false,
+                next_page: 2,
+                savepoint_names: Vec::new(),
+            })
+        }
     }
 
     fn journal_mode(&self) -> JournalMode {
@@ -974,8 +1033,12 @@ impl MvccPager for MockMvccPager {
         false
     }
 
-    fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
-        Ok(mode)
+    fn set_journal_mode<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        mode: JournalMode,
+    ) -> impl Future<Output = Result<JournalMode>> + 'a {
+        async move { Ok(mode) }
     }
 
     fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
@@ -994,32 +1057,53 @@ pub struct MockTransaction {
 impl sealed::Sealed for MockTransaction {}
 
 impl TransactionHandle for MockTransaction {
-    fn get_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        let size = fsqlite_types::PageSize::default();
-        let mut data = PageData::zeroed(size);
-        // Stamp the page number in the first 4 bytes for test verification.
-        data.as_bytes_mut()[..4].copy_from_slice(&page_no.get().to_le_bytes());
-        Ok(data)
+    fn get_page<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
+            let size = fsqlite_types::PageSize::default();
+            let mut data = PageData::zeroed(size);
+            data.as_bytes_mut()[..4].copy_from_slice(&page_no.get().to_le_bytes());
+            Ok(data)
+        }
     }
 
-    fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
-        Ok(())
+    fn write_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_no: PageNumber,
+        _data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
     }
 
-    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-        let page = PageNumber::new(self.next_page)
-            .expect("mock allocator must always produce non-zero page numbers");
-        self.next_page += 1;
-        Ok(page)
+    fn allocate_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            let page = PageNumber::new(self.next_page)
+                .expect("mock allocator must always produce non-zero page numbers");
+            self.next_page += 1;
+            Ok(page)
+        }
     }
 
-    fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
-        Ok(())
+    fn free_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
     }
 
-    fn commit(&mut self, _cx: &Cx) -> Result<()> {
-        self.committed = true;
-        Ok(())
+    fn commit<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.committed = true;
+            Ok(())
+        }
     }
 
     fn is_writer(&self) -> bool {
@@ -1034,8 +1118,8 @@ impl TransactionHandle for MockTransaction {
         Ok(Vec::new())
     }
 
-    fn rollback(&mut self, _cx: &Cx) -> Result<()> {
-        Ok(())
+    fn rollback<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async { Ok(()) }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
@@ -1078,13 +1162,19 @@ impl sealed::Sealed for MemoryMockMvccPager {}
 impl MvccPager for MemoryMockMvccPager {
     type Txn = MemoryMockTransaction;
 
-    fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
-        Ok(MemoryMockTransaction {
-            committed: false,
-            next_page: 2,
-            pages: HashMap::new(),
-            savepoints: Vec::new(),
-        })
+    fn begin<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _mode: TransactionMode,
+    ) -> impl Future<Output = Result<Self::Txn>> + 'a {
+        async {
+            Ok(MemoryMockTransaction {
+                committed: false,
+                next_page: 2,
+                pages: HashMap::new(),
+                savepoints: Vec::new(),
+            })
+        }
     }
 
     fn journal_mode(&self) -> JournalMode {
@@ -1095,8 +1185,12 @@ impl MvccPager for MemoryMockMvccPager {
         false
     }
 
-    fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
-        Ok(mode)
+    fn set_journal_mode<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        mode: JournalMode,
+    ) -> impl Future<Output = Result<JournalMode>> + 'a {
+        async move { Ok(mode) }
     }
 
     fn set_wal_backend(&self, _backend: Box<dyn WalBackend>) -> Result<()> {
@@ -1124,54 +1218,87 @@ pub struct MemoryMockTransaction {
 impl sealed::Sealed for MemoryMockTransaction {}
 
 impl TransactionHandle for MemoryMockTransaction {
-    fn get_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        Ok(self
-            .pages
-            .get(&page_no)
-            .cloned()
-            .unwrap_or_else(|| PageData::zeroed(fsqlite_types::PageSize::default())))
+    fn get_page<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
+            Ok(self
+                .pages
+                .get(&page_no)
+                .cloned()
+                .unwrap_or_else(|| PageData::zeroed(fsqlite_types::PageSize::default())))
+        }
     }
 
-    fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.committed = false;
-        let page_size = fsqlite_types::PageSize::default().as_usize();
-        let mut page = vec![0_u8; page_size];
-        let copy_len = data.len().min(page_size);
-        page[..copy_len].copy_from_slice(&data[..copy_len]);
-        self.pages.insert(page_no, PageData::from_vec(page));
-        Ok(())
+    fn write_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.committed = false;
+            let page_size = fsqlite_types::PageSize::default().as_usize();
+            let mut page = vec![0_u8; page_size];
+            let copy_len = data.len().min(page_size);
+            page[..copy_len].copy_from_slice(&data[..copy_len]);
+            self.pages.insert(page_no, PageData::from_vec(page));
+            Ok(())
+        }
     }
 
-    fn write_page_data(&mut self, _cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        self.committed = false;
-        let page_size = fsqlite_types::PageSize::default().as_usize();
-        let mut page = vec![0_u8; page_size];
-        let copy_len = data.len().min(page_size);
-        page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
-        self.pages.insert(page_no, PageData::from_vec(page));
-        Ok(())
+    fn write_page_data<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.committed = false;
+            let page_size = fsqlite_types::PageSize::default().as_usize();
+            let mut page = vec![0_u8; page_size];
+            let copy_len = data.len().min(page_size);
+            page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
+            self.pages.insert(page_no, PageData::from_vec(page));
+            Ok(())
+        }
     }
 
-    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-        self.committed = false;
-        let page = PageNumber::new(self.next_page)
-            .expect("mock allocator must always produce non-zero page numbers");
-        self.next_page += 1;
-        self.pages
-            .entry(page)
-            .or_insert_with(|| PageData::zeroed(fsqlite_types::PageSize::default()));
-        Ok(page)
+    fn allocate_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move {
+            self.committed = false;
+            let page = PageNumber::new(self.next_page)
+                .expect("mock allocator must always produce non-zero page numbers");
+            self.next_page += 1;
+            self.pages
+                .entry(page)
+                .or_insert_with(|| PageData::zeroed(fsqlite_types::PageSize::default()));
+            Ok(page)
+        }
     }
 
-    fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.committed = false;
-        self.pages.remove(&page_no);
-        Ok(())
+    fn free_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.committed = false;
+            self.pages.remove(&page_no);
+            Ok(())
+        }
     }
 
-    fn commit(&mut self, _cx: &Cx) -> Result<()> {
-        self.committed = true;
-        Ok(())
+    fn commit<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.committed = true;
+            Ok(())
+        }
     }
 
     fn is_writer(&self) -> bool {
@@ -1188,12 +1315,14 @@ impl TransactionHandle for MemoryMockTransaction {
         Ok(pages)
     }
 
-    fn rollback(&mut self, _cx: &Cx) -> Result<()> {
-        self.committed = false;
-        self.next_page = 2;
-        self.pages.clear();
-        self.savepoints.clear();
-        Ok(())
+    fn rollback<'a>(&'a mut self, _cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            self.committed = false;
+            self.next_page = 2;
+            self.pages.clear();
+            self.savepoints.clear();
+            Ok(())
+        }
     }
 
     fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
@@ -1314,48 +1443,25 @@ impl TransactionKind {
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
         }
     }
+}
 
-    fn with_handle<R>(&self, f: impl FnOnce(&dyn TransactionHandle) -> R) -> R {
-        match self {
-            Self::Memory(txn) => f(txn),
+macro_rules! dispatch_transaction_kind {
+    ($value:expr, $txn:ident => $body:expr) => {
+        match $value {
+            TransactionKind::Memory($txn) => $body,
             #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(txn) => f(txn),
+            TransactionKind::IoUring($txn) => $body,
             #[cfg(all(feature = "native", unix))]
-            Self::Unix(txn) => f(txn),
+            TransactionKind::Unix($txn) => $body,
             #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(txn) => f(txn),
-            Self::Mock(txn) => f(txn),
-            Self::MemoryMock(txn) => f(txn),
-            Self::Drained => panic!(
-                "BUG: TransactionKind::Drained accessed — a retained cursor tried to \
-                 read/write pages while the transaction was extracted. This sentinel \
-                 only exists between engine.drain_transaction() and the next \
-                 engine.refill_transaction(). If you see this, a cursor was accessed \
-                 outside the VDBE execution window."
-            ),
+            TransactionKind::Windows($txn) => $body,
+            TransactionKind::Mock($txn) => $body,
+            TransactionKind::MemoryMock($txn) => $body,
+            TransactionKind::Drained => {
+                panic!("BUG: TransactionKind::Drained accessed while the transaction was extracted")
+            }
         }
-    }
-
-    fn with_handle_mut<R>(&mut self, f: impl FnOnce(&mut dyn TransactionHandle) -> R) -> R {
-        match self {
-            Self::Memory(txn) => f(txn),
-            #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(txn) => f(txn),
-            #[cfg(all(feature = "native", unix))]
-            Self::Unix(txn) => f(txn),
-            #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(txn) => f(txn),
-            Self::Mock(txn) => f(txn),
-            Self::MemoryMock(txn) => f(txn),
-            Self::Drained => panic!(
-                "BUG: TransactionKind::Drained accessed — a retained cursor tried to \
-                 read/write pages while the transaction was extracted. This sentinel \
-                 only exists between engine.drain_transaction() and the next \
-                 engine.refill_transaction(). If you see this, a cursor was accessed \
-                 outside the VDBE execution window."
-            ),
-        }
-    }
+    };
 }
 
 impl From<SimpleTransaction<MemoryVfs>> for TransactionKind {
@@ -1407,48 +1513,35 @@ impl TransactionHandle for TransactionKind {
     // LLVM see the concrete type and dispatch statically; the rest of
     // `with_handle`'s callers are cold or shape-uniform enough to keep sharing
     // the smaller helper.
-    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        match self {
-            Self::Memory(txn) => txn.get_page(cx, page_no),
-            #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(txn) => txn.get_page(cx, page_no),
-            #[cfg(all(feature = "native", unix))]
-            Self::Unix(txn) => txn.get_page(cx, page_no),
-            #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(txn) => txn.get_page(cx, page_no),
-            Self::Mock(txn) => txn.get_page(cx, page_no),
-            Self::MemoryMock(txn) => txn.get_page(cx, page_no),
-            Self::Drained => panic!(
-                "BUG: TransactionKind::Drained accessed in get_page — a retained \
-                 cursor tried to read pages while the transaction was extracted."
-            ),
-        }
+    fn get_page<'a>(
+        &'a self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.get_page(cx, page_no).await) }
     }
 
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
-        self.with_handle(|txn| txn.prefetch_page_hint(cx, page_no));
+        dispatch_transaction_kind!(self, txn => txn.prefetch_page_hint(cx, page_no));
     }
 
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.with_handle_mut(|txn| txn.write_page(cx, page_no, data))
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.write_page(cx, page_no, data).await) }
     }
 
-    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        match self {
-            Self::Memory(txn) => txn.write_page_data(cx, page_no, data),
-            #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(txn) => txn.write_page_data(cx, page_no, data),
-            #[cfg(all(feature = "native", unix))]
-            Self::Unix(txn) => txn.write_page_data(cx, page_no, data),
-            #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(txn) => txn.write_page_data(cx, page_no, data),
-            Self::Mock(txn) => txn.write_page_data(cx, page_no, data),
-            Self::MemoryMock(txn) => txn.write_page_data(cx, page_no, data),
-            Self::Drained => panic!(
-                "BUG: TransactionKind::Drained accessed in write_page_data — a \
-                 retained cursor tried to write pages while the transaction was \
-                 extracted."
-            ),
+    fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move {
+            dispatch_transaction_kind!(self, txn => txn.write_page_data(cx, page_no, data).await)
         }
     }
 
@@ -1457,105 +1550,98 @@ impl TransactionHandle for TransactionKind {
         page_no: PageNumber,
         f: &mut dyn FnMut(&mut PageData),
     ) -> bool {
-        self.with_handle_mut(|txn| txn.try_mutate_staged_page_data(page_no, f))
+        dispatch_transaction_kind!(self, txn => txn.try_mutate_staged_page_data(page_no, f))
     }
 
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        self.with_handle_mut(|txn| txn.allocate_page(cx))
+    fn allocate_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+    ) -> impl Future<Output = Result<PageNumber>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.allocate_page(cx).await) }
     }
 
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        match self {
-            Self::Memory(txn) => txn.free_page(cx, page_no),
-            #[cfg(all(feature = "native", target_os = "linux"))]
-            Self::IoUring(txn) => txn.free_page(cx, page_no),
-            #[cfg(all(feature = "native", unix))]
-            Self::Unix(txn) => txn.free_page(cx, page_no),
-            #[cfg(all(feature = "native", target_os = "windows"))]
-            Self::Windows(txn) => txn.free_page(cx, page_no),
-            Self::Mock(txn) => txn.free_page(cx, page_no),
-            Self::MemoryMock(txn) => txn.free_page(cx, page_no),
-            Self::Drained => panic!(
-                "BUG: TransactionKind::Drained accessed in free_page — a retained \
-                 cursor tried to free pages while the transaction was extracted."
-            ),
-        }
+    fn free_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<()>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.free_page(cx, page_no).await) }
     }
 
-    fn commit(&mut self, cx: &Cx) -> Result<()> {
-        self.with_handle_mut(|txn| txn.commit(cx))
+    fn commit<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.commit(cx).await) }
     }
 
-    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
-        self.with_handle_mut(|txn| txn.commit_and_retain(cx))
+    fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.commit_and_retain(cx).await) }
     }
 
     fn is_writer(&self) -> bool {
-        self.with_handle(|txn| txn.is_writer())
+        dispatch_transaction_kind!(self, txn => txn.is_writer())
     }
 
     fn has_pending_writes(&self) -> bool {
-        self.with_handle(|txn| txn.has_pending_writes())
+        dispatch_transaction_kind!(self, txn => txn.has_pending_writes())
     }
 
     fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {
-        self.with_handle(|txn| txn.published_visible_commit_seq_hint())
+        dispatch_transaction_kind!(self, txn => txn.published_visible_commit_seq_hint())
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
-        self.with_handle(|txn| txn.pending_commit_pages())
+        dispatch_transaction_kind!(self, txn => txn.pending_commit_pages())
     }
 
     fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
-        self.with_handle(|txn| txn.pending_conflict_pages())
+        dispatch_transaction_kind!(self, txn => txn.pending_conflict_pages())
     }
 
     fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
-        self.with_handle(|txn| txn.pending_conflict_pages_conservative())
+        dispatch_transaction_kind!(self, txn => txn.pending_conflict_pages_conservative())
     }
 
     fn write_set_page_numbers(&self) -> Vec<PageNumber> {
-        self.with_handle(|txn| txn.write_set_page_numbers())
+        dispatch_transaction_kind!(self, txn => txn.write_set_page_numbers())
     }
 
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
-        self.with_handle(|txn| txn.page_one_in_pending_commit_surface())
+        dispatch_transaction_kind!(self, txn => txn.page_one_in_pending_commit_surface())
     }
 
     fn page_size(&self) -> PageSize {
-        self.with_handle(|txn| txn.page_size())
+        dispatch_transaction_kind!(self, txn => txn.page_size())
     }
 
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
-        self.with_handle(|txn| txn.allocate_page_requires_page_one_conflict_tracking())
+        dispatch_transaction_kind!(self, txn => txn.allocate_page_requires_page_one_conflict_tracking())
     }
 
     fn free_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
-        self.with_handle(|txn| txn.free_page_requires_page_one_conflict_tracking(page_no))
+        dispatch_transaction_kind!(self, txn => txn.free_page_requires_page_one_conflict_tracking(page_no))
     }
 
     fn write_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
-        self.with_handle(|txn| txn.write_page_requires_page_one_conflict_tracking(page_no))
+        dispatch_transaction_kind!(self, txn => txn.write_page_requires_page_one_conflict_tracking(page_no))
     }
 
-    fn rollback(&mut self, cx: &Cx) -> Result<()> {
-        self.with_handle_mut(|txn| txn.rollback(cx))
+    fn rollback<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<()>> + 'a {
+        async move { dispatch_transaction_kind!(self, txn => txn.rollback(cx).await) }
     }
 
     fn record_write_witness(&mut self, cx: &Cx, key: fsqlite_types::WitnessKey) {
-        self.with_handle_mut(|txn| txn.record_write_witness(cx, key));
+        dispatch_transaction_kind!(self, txn => txn.record_write_witness(cx, key));
     }
 
     fn savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
-        self.with_handle_mut(|txn| txn.savepoint(cx, name))
+        dispatch_transaction_kind!(self, txn => txn.savepoint(cx, name))
     }
 
     fn release_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
-        self.with_handle_mut(|txn| txn.release_savepoint(cx, name))
+        dispatch_transaction_kind!(self, txn => txn.release_savepoint(cx, name))
     }
 
     fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
-        self.with_handle_mut(|txn| txn.rollback_to_savepoint(cx, name))
+        dispatch_transaction_kind!(self, txn => txn.rollback_to_savepoint(cx, name))
     }
 }
 
@@ -1566,16 +1652,21 @@ pub struct MockCheckpointPageWriter;
 impl sealed::Sealed for MockCheckpointPageWriter {}
 
 impl CheckpointPageWriter for MockCheckpointPageWriter {
-    fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
-        Ok(())
+    fn write_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_no: PageNumber,
+        _data: &'a [u8],
+    ) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
-    fn truncate(&mut self, _cx: &Cx, _n_pages: u32) -> Result<()> {
-        Ok(())
+    fn truncate<'a>(&'a mut self, _cx: &'a Cx, _n_pages: u32) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
-    fn sync(&mut self, _cx: &Cx) -> Result<()> {
-        Ok(())
+    fn sync<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 }
 
