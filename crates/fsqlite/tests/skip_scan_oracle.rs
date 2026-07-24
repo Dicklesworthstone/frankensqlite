@@ -458,6 +458,56 @@ fn skip_scan_order_by_streams_without_sorter() {
     cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x DESC, id");
     cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY a, x, id");
     cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, id"); // range needs `a` in ORDER BY
+
+    // LIMIT / OFFSET stream a deterministic top-N off the ordered emission — no sorter, byte-exact.
+    assert!(
+        !has_op(
+            &f,
+            "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 10",
+            "SorterOpen"
+        ),
+        "ORDER BY + LIMIT must stream without a sorter"
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 10",
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 10 OFFSET 7",
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT id, c FROM t WHERE a = 5 ORDER BY x, id LIMIT 25 OFFSET 3",
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, a, id LIMIT 15",
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12 ORDER BY x, a, id LIMIT 8 OFFSET 4",
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a < 8 ORDER BY x, a, id LIMIT 20",
+    );
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id LIMIT 0",
+    ); // empty
+    // A bare LIMIT with no ORDER BY is non-deterministic (which rows) — must decline the skip scan.
+    assert!(
+        !has_op(&f, "SELECT x, a FROM t WHERE a = 5 LIMIT 10", "SeekGT"),
+        "bare LIMIT without ORDER BY must decline the skip scan"
+    );
 }
 
 #[test]

@@ -2362,11 +2362,11 @@ pub fn codegen_select(
         && distinct == Distinctness::All
         && group_by.is_empty()
         && having.is_none()
-        && stmt.limit.is_none()
         && let Some(skip) = skip_scan_eq_target(where_clause.as_deref(), table, table_alias)
-        // ORDER BY is elided when it matches the emission order `leading ASC, rowid ASC` (the 2nd
-        // column is a constant here); otherwise decline so the sorter runs.
-        && (stmt.order_by.is_empty()
+        // ORDER BY `x, id` (the 2nd column is a constant here) is served in the emission order with no
+        // sorter, and a satisfied ORDER BY makes a LIMIT's top-N deterministic so it may stream too. A
+        // bare LIMIT with no ORDER BY (non-deterministic which-rows) declines.
+        && ((stmt.order_by.is_empty() && stmt.limit.is_none())
             || skip_scan_order_by_satisfied(skip.index, false, &stmt.order_by, table, table_alias))
     {
         return codegen_select_skip_scan(
@@ -2382,6 +2382,7 @@ pub fn codegen_select(
             end_label,
             skip.index,
             skip.const_expr,
+            stmt.limit.as_ref(),
         );
     }
     // Range skip scan (bd-nax2y): the same shape but the constrained second key term carries an
@@ -2392,11 +2393,10 @@ pub fn codegen_select(
         && distinct == Distinctness::All
         && group_by.is_empty()
         && having.is_none()
-        && stmt.limit.is_none()
         && let Some(skip) = skip_scan_range_target(where_clause.as_deref(), table, table_alias)
-        // ORDER BY is elided when it matches the emission order `leading ASC, second ASC, rowid ASC`;
-        // otherwise decline so the sorter runs.
-        && (stmt.order_by.is_empty()
+        // ORDER BY `x, second, id` streams with no sorter, and a satisfied ORDER BY makes a LIMIT's
+        // top-N deterministic so it may stream too. A bare LIMIT with no ORDER BY declines.
+        && ((stmt.order_by.is_empty() && stmt.limit.is_none())
             || skip_scan_order_by_satisfied(skip.index, true, &stmt.order_by, table, table_alias))
     {
         return codegen_select_skip_scan_range(
@@ -2412,6 +2412,7 @@ pub fn codegen_select(
             end_label,
             skip.index,
             &skip.range,
+            stmt.limit.as_ref(),
         );
     }
 
@@ -11583,6 +11584,7 @@ fn codegen_select_skip_scan(
     end_label: crate::Label,
     idx_schema: &IndexSchema,
     const_expr: &Expr,
+    limit_clause: Option<&LimitClause>,
 ) -> Result<(), CodegenError> {
     let idx_cursor = cursor + 1;
     let target_aff = idx_schema
@@ -11607,6 +11609,23 @@ fn codegen_select_skip_scan(
     }
     // `col = NULL` matches nothing in SQLite: a NULL constant yields zero rows.
     b.emit_jump_to_label(Opcode::IsNull, const_reg, 0, done_label, P4::None, 0);
+
+    // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off, r);
+            r
+        })
+    });
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -11723,12 +11742,18 @@ fn codegen_select_skip_scan(
     if needs_table {
         b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, emit_next, P4::None, 0);
     }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, emit_next, P4::None, 0);
+    }
     if let Some(cov) = &covering {
         emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
     } else {
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
     b.resolve_label(emit_next);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let emit_next_addr = b.current_addr() as i32;
@@ -11811,6 +11836,7 @@ fn codegen_select_skip_scan_range(
     end_label: crate::Label,
     idx_schema: &IndexSchema,
     range: &ColumnRangeTarget<'_>,
+    limit_clause: Option<&LimitClause>,
 ) -> Result<(), CodegenError> {
     let idx_cursor = cursor + 1;
     let target_aff = idx_schema
@@ -11851,6 +11877,23 @@ fn codegen_select_skip_scan_range(
         b.emit_jump_to_label(Opcode::IsNull, up_reg, 0, done_label, P4::None, 0);
         (up_reg, bound.inclusive)
     });
+
+    // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off, r);
+            r
+        })
+    });
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
 
     let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table = covering.is_none();
@@ -11988,12 +12031,18 @@ fn codegen_select_skip_scan_range(
     if needs_table {
         b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, emit_next, P4::None, 0);
     }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, emit_next, P4::None, 0);
+    }
     if let Some(cov) = &covering {
         emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
     } else {
         emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
     b.resolve_label(emit_next);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let emit_next_addr = b.current_addr() as i32;
