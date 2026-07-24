@@ -20227,3 +20227,30 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
 - STILL DEFERRED (fall to a correct scan, not this cycle): exclusive lower `>` (needs a post-seek skip
   of the `==lo` run), no-lower `<`/`<=` (needs a NULL-run walk; seeking to NULL would loop), IN-list,
   ORDER BY streaming, DESC/non-BINARY.
+
+### 2026-07-24 addendum 2 — skip-scan RANGE coverage completed (bd-nax2y)
+
+- Exclusive lower `> k` (commit 5270ac80): a 2-field `SeekGT(x, lo)` lands past the whole `(x, lo, *)`
+  run on the first `b > lo` (engine UpperBound bias: shorter equal-prefix probe sorts less-than). No
+  post-seek skip loop.
+- No-lower `< k` / `<= k` (commit 1e10f770): no seekable lower, so each block is walked from its start
+  by an unbounded null-skip loop (NULLs sort first + excluded → the only sub-range values); the required
+  upper bound terminates the run, `SeekGT` still skips leading values. `NotNull(a) → emit_run` classifies.
+- Skip scan is now COMPREHENSIVE for the WHERE shape: equality (any-arity ASC BINARY index) + range
+  (inclusive/exclusive lower, no-lower, optional inclusive/exclusive upper). All passed conformance FIRST
+  try (comparisons grounded in the composite operand order + [[vdbe-comparison-opcode-operand-order]]).
+- GATE (whole cycle): skip_scan_oracle 9 tests; golden 8/8; clippy clean; FULL 56-oracle sweep GREEN
+  (batched --jobs 4, [[rch-parallel-link-oom-bus-error]]).
+- STILL DEFERRED (each falls to a correct scan; ledgered as next levers, none proven infeasible):
+  * ORDER BY streaming — the emission is already `leading ASC(NULLs first), second ASC, rowid ASC`, so
+    no emitter change is needed; only an order-satisfaction check + relaxing the `order_by.is_empty()`
+    gate. Deferred for ordering-correctness subtlety (collation / NULLS / the b-constant equality case),
+    not complexity. Reference: `range_order_by_is_deterministic` / `fixed_order_by_equality_prefix_len`.
+  * IN-list `b IN (…)` — needs a nested loop (distinct leading × IN values).
+  * DESC / non-BINARY collation index — needs reverse iteration.
+- FRONTIER note (worst-ratio comprehensive-bench, now sole-producer): the worst ratio is small-N DELETE
+  (`delete 5 rows / 100 rows`, C 2.354us vs F 7.902us, 3.36x), already REJECTED by cod on 2026-07-24 —
+  MVCC per-txn `begin_ns`+`commit_roundtrip_ns` dominate (~42%) with NO single removable component ≥30%
+  and CVs >5%; reducing it crosses into the security-sensitive MVCC/identity-probe lane (commit
+  1136c171). Retry predicate unmet (needs a same-worker improvement signal on a quiet host). Frontier
+  stays REJECT-gated; the architectural skip-scan lane carried this cycle.
