@@ -406,6 +406,25 @@ fn bench_env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Optional symmetric `synchronous` override for the concurrent-writer section.
+///
+/// Returns `None` (env unset) to preserve the historical concurrent baseline
+/// exactly: C writer connections inherit the compiled default and FrankenSQLite
+/// writers keep `apply_pragmas_fsqlite`'s NORMAL. When
+/// `FSQLITE_BENCH_CONCURRENT_SYNC` is set to `normal`/`full`, BOTH engines'
+/// writer connections are forced to that identical mode — used to (a) audit the
+/// fairness of the default (is C implicitly at FULL while F is at NORMAL?) and
+/// (b) probe whether group-commit coalescing engages under real per-commit
+/// fsync. Never defaults anything on; the baseline is unchanged unless the
+/// operator opts in.
+fn concurrent_sync_override() -> Option<&'static str> {
+    match std::env::var("FSQLITE_BENCH_CONCURRENT_SYNC") {
+        Ok(value) if value.eq_ignore_ascii_case("normal") => Some("NORMAL"),
+        Ok(value) if value.eq_ignore_ascii_case("full") => Some("FULL"),
+        _ => None,
+    }
+}
+
 fn collect_rusqlite_rows<P: rusqlite::Params>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
@@ -3442,6 +3461,10 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         let conn = rusqlite::Connection::open(&p).unwrap();
                         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
                             .unwrap();
+                        if let Some(mode) = concurrent_sync_override() {
+                            conn.execute_batch(&format!("PRAGMA synchronous={mode};"))
+                                .unwrap();
+                        }
 
                         conn.execute_batch("BEGIN").unwrap();
                         #[allow(clippy::cast_possible_wrap)]
@@ -3509,6 +3532,9 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                         bar.wait();
                         let conn = fsqlite::Connection::open(&p).unwrap();
                         apply_pragmas_fsqlite(&conn);
+                        if let Some(mode) = concurrent_sync_override() {
+                            let _ = conn.execute(&format!("PRAGMA synchronous={mode};"));
+                        }
                         let concurrent_ok =
                             conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
                         let _ = conn.execute("PRAGMA busy_timeout=5000;");

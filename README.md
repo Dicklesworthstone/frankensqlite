@@ -1227,7 +1227,7 @@ Per-category geomean F/C time ratio:
 | mixed | 1 | `0.289x` | ≈ 3.46× faster |
 | read_single | 33 | `0.235x` | ≈ 4.26× faster |
 | write_bulk | 22 | `0.866x` | ≈ 1.15× faster |
-| concurrent_writers | 3 | `0.769x` | ≈ 1.30× faster in the full-quick file-backed mix |
+| concurrent_writers | 3 | `0.769x` | ⚠ not a fair comparison — this full-quick section runs C SQLite at `synchronous=FULL` (a WAL fsync per commit) vs FrankenSQLite at `NORMAL` (no per-commit fsync), and the file-backed rows are too disk-noisy to A/B reliably (bd-x5gzk). Use the fair `mt-mvcc-bench` rows below for the concurrent-writer result. |
 | **write_single** | **9** | **`1.376x`** | **The remaining gap (corrected prepared-DML DELETE tail)** |
 
 #### Concurrent writers (the headline MVCC win)
