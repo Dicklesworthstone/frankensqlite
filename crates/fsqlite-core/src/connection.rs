@@ -25534,23 +25534,29 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
-                // FK enforcement on DELETE: check/cascade for each row.
-                // Use `fk_cascade_propagation_enabled` (not `fk_enforcement_enabled`)
-                // so that multi-level cascades propagate through intermediate
-                // tables (e.g., grandparent -> parent -> child).
-                if self.fk_cascade_propagation_enabled() {
+                // Validate FK constraints and retain the required actions before
+                // deleting the parent rows. The actions themselves must run only
+                // after the parent delete succeeds and before its AFTER DELETE
+                // triggers, matching SQLite's sqlite3FkActions() ordering.
+                //
+                // Use `fk_cascade_propagation_enabled` (not
+                // `fk_enforcement_enabled`) so that multi-level cascades propagate
+                // through intermediate tables (e.g., grandparent -> parent ->
+                // child).
+                let pending_fk_actions = if self.fk_cascade_propagation_enabled() {
                     let rows_to_check = if !trigger_old_rows.is_empty() {
                         trigger_old_rows.clone()
                     } else {
                         self.collect_delete_trigger_rows(&effective_delete, params)?
                     };
+                    let mut actions = Vec::new();
                     for row_values in &rows_to_check {
-                        let fk_actions = self.check_fk_on_delete(table_name, row_values)?;
-                        for action in &fk_actions {
-                            self.execute_fk_delete_action(action)?;
-                        }
+                        actions.extend(self.check_fk_on_delete(table_name, row_values)?);
                     }
-                }
+                    actions
+                } else {
+                    Vec::new()
+                };
 
                 // Live virtual-table DELETE: route each matching rowid through
                 // the module's xUpdate delete branch so the in-memory module
@@ -25565,6 +25571,10 @@ impl Connection {
                         ));
                     }
                     let affected = self.execute_live_vtab_delete(&effective_delete, params)?;
+
+                    for action in &pending_fk_actions {
+                        self.execute_fk_delete_action(action)?;
+                    }
 
                     // Phase 5G.3: Fire AFTER DELETE triggers.
                     if has_after_delete {
@@ -25609,6 +25619,10 @@ impl Connection {
                     cx,
                     true,
                 )?;
+
+                for action in &pending_fk_actions {
+                    self.execute_fk_delete_action(action)?;
+                }
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -131574,26 +131588,29 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
-        fn begin_transaction(&mut self, cx: &Cx) -> Result<()> {
-            self.inner.begin_transaction(cx)
+        fn begin_transaction<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.begin_transaction(cx).await })
         }
 
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-            _page_data: &[u8],
+            _page_data: &'a [u8],
             _db_size_if_commit: u32,
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            _frames: &[fsqlite_pager::traits::WalFrameRef<'_>],
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _frames: &'a [fsqlite_pager::traits::WalFrameRef<'a>],
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
         fn prepare_append_frames(
@@ -131611,32 +131628,47 @@ mod autocommit_txn_tests {
             self.inner.finalize_prepared_frames(cx, prepared)
         }
 
-        fn append_prepared_frames(
-            &mut self,
-            _cx: &Cx,
-            _prepared: &mut fsqlite_pager::traits::PreparedWalFrameBatch,
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _prepared: &'a mut fsqlite_pager::traits::PreparedWalFrameBatch,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
-        fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-            self.inner.read_page(cx, page_number)
+        fn read_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page(cx, page_number).await })
         }
 
-        fn read_page_pinned(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-            self.inner.read_page_pinned(cx, page_number)
+        fn read_page_pinned<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
         }
 
         fn supports_pinned_reads(&self) -> bool {
             self.inner.supports_pinned_reads()
         }
 
-        fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
-            self.inner.committed_txns_since_page(cx, page_number)
+        fn committed_txns_since_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txns_since_page(cx, page_number).await })
         }
 
-        fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {
-            self.inner.committed_txn_count(cx)
+        fn committed_txn_count<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txn_count(cx).await })
         }
 
         fn sync(&mut self, cx: &Cx) -> Result<()> {
@@ -131647,16 +131679,19 @@ mod autocommit_txn_tests {
             self.inner.frame_count()
         }
 
-        fn checkpoint(
-            &mut self,
-            cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             mode: fsqlite_pager::traits::CheckpointMode,
-            writer: &mut dyn fsqlite_pager::traits::CheckpointPageWriter,
+            writer: &'a mut dyn fsqlite_pager::traits::CheckpointPageWriter,
             backfilled_frames: u32,
             oldest_reader_frame: Option<u32>,
-        ) -> Result<fsqlite_pager::traits::CheckpointResult> {
-            self.inner
-                .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+        ) -> fsqlite_pager::traits::WalFuture<'a, fsqlite_pager::traits::CheckpointResult> {
+            Box::pin(async move {
+                self.inner
+                    .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+                    .await
+            })
         }
     }
 
@@ -193126,6 +193161,65 @@ mod pager_routing_tests {
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
         let rows = conn.query("SELECT id FROM child;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(4));
+    }
+
+    /// Regression: SQLite executes ON DELETE actions after removing the parent
+    /// row and before firing the parent's AFTER DELETE triggers.
+    #[test]
+    fn test_fk_delete_actions_run_after_parent_delete_before_after_trigger() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL
+                    REFERENCES parent(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER child_parent_must_be_absent
+             BEFORE DELETE ON child
+             WHEN EXISTS (
+                 SELECT 1 FROM parent WHERE id = OLD.parent_id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'cascade ran before parent delete');
+             END;",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER parent_after_delete_sees_cascade
+             AFTER DELETE ON parent
+             WHEN EXISTS (
+                 SELECT 1 FROM child WHERE parent_id = OLD.id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'parent AFTER DELETE ran before cascade');
+             END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+        conn.execute("INSERT INTO child VALUES (10, 1), (11, 1);")
+            .unwrap();
+
+        conn.execute("DELETE FROM parent WHERE id = 1;")
+            .expect("the parent must be absent before its cascade deletes children");
+
+        let parent_count = conn.query("SELECT COUNT(*) FROM parent;").unwrap();
+        assert_eq!(
+            parent_count[0].values()[0],
+            SqliteValue::Integer(0),
+            "parent row survived successful delete"
+        );
+        let child_count = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(
+            child_count[0].values()[0],
+            SqliteValue::Integer(0),
+            "cascade did not remove child rows"
+        );
     }
 
     /// Regression test for issue #59: INSERT-time FK validation returns wrong

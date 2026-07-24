@@ -42,6 +42,56 @@ pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::fmt::Debug;
+    use std::future::Future;
+
+    std::thread_local! {
+        static TEST_RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(1, 2)
+                .build()
+                .expect("WAL test runtime should build");
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        TEST_RUNTIME.with(|runtime| runtime.block_on(future))
+    }
+
+    pub(crate) trait FutureResultTestExt<T, E>:
+        Future<Output = Result<T, E>> + Sized
+    {
+        fn wait(self) -> Result<T, E> {
+            block_on(self)
+        }
+
+        fn expect(self, message: &str) -> T
+        where
+            E: Debug,
+        {
+            block_on(self).expect(message)
+        }
+
+        fn expect_err(self, message: &str) -> E
+        where
+            T: Debug,
+        {
+            block_on(self).expect_err(message)
+        }
+
+        fn is_ok(self) -> bool {
+            block_on(self).is_ok()
+        }
+
+        fn is_err(self) -> bool {
+            block_on(self).is_err()
+        }
+    }
+
+    impl<F, T, E> FutureResultTestExt<T, E> for F where F: Future<Output = Result<T, E>> + Sized {}
+}
+
 pub use cell_delta_commit::{
     CellDeltaDescriptor, FullPageFrame, MixedCommitStats, MixedFrameSubmission,
     build_cell_delta_frames, serialize_mixed_frames,

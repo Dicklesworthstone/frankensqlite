@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
+use asupersync::runtime::spawn_blocking_io;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
@@ -52,6 +53,52 @@ const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
 const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 const ERROR_NOT_LOCKED: i32 = 158;
+
+fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> std::io::Result<u64> {
+    let total = u64::try_from(total).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "I/O offset is too large")
+    })?;
+    offset.checked_add(total).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("offset overflow during async windows vfs {op}"),
+        )
+    })
+}
+
+fn read_owned_at(file: File, len: usize, offset: u64) -> std::io::Result<(Vec<u8>, usize)> {
+    let mut data = vec![0_u8; len];
+    let mut total = 0_usize;
+    while total < data.len() {
+        let current = blocking_io_offset(offset, total, "read")?;
+        match file.seek_read(&mut data[total..], current) {
+            Ok(0) => break,
+            Ok(read) => total += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((data, total))
+}
+
+fn write_owned_at(file: File, data: Vec<u8>, offset: u64) -> std::io::Result<()> {
+    let mut total = 0_usize;
+    while total < data.len() {
+        let current = blocking_io_offset(offset, total, "write")?;
+        match file.seek_write(&data[total..], current) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "async windows vfs seek_write returned 0",
+                ));
+            }
+            Ok(written) => total += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 /// Layout-compatible subset of Win32 `OVERLAPPED` used for byte-range locks.
 ///
@@ -1702,54 +1749,40 @@ impl VfsFile for WindowsFile {
         Ok(FileIdentity::from_file(self.file_ref()?)?)
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        let mut total = 0_usize;
-        while total < buf.len() {
-            let read_offset = offset
-                .checked_add(u64::try_from(total).map_err(|_| FrankenError::OutOfRange {
-                    what: "read offset".to_string(),
-                    value: total.to_string(),
-                })?)
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "read offset".to_string(),
-                    value: "overflow".to_string(),
-                })?;
-            let n = self.file_ref()?.seek_read(&mut buf[total..], read_offset)?;
-            if n == 0 {
-                break;
-            }
-            total += n;
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+            let requested = buf.len();
+            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)?;
+            buf.copy_from_slice(&data);
+            Ok(total)
         }
-        if total < buf.len() {
-            buf[total..].fill(0);
-        }
-        Ok(total)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        let mut total = 0_usize;
-        while total < buf.len() {
-            let write_offset = offset
-                .checked_add(u64::try_from(total).map_err(|_| FrankenError::OutOfRange {
-                    what: "write offset".to_string(),
-                    value: total.to_string(),
-                })?)
-                .ok_or_else(|| FrankenError::OutOfRange {
-                    what: "write offset".to_string(),
-                    value: "overflow".to_string(),
-                })?;
-            let n = self.file_mut()?.seek_write(&buf[total..], write_offset)?;
-            if n == 0 {
-                return Err(FrankenError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "seek_write returned 0",
-                )));
-            }
-            total += n;
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+            let data = buf.to_vec();
+            spawn_blocking_io(move || write_owned_at(file, data, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)
         }
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2133,8 +2166,6 @@ impl VfsFile for WindowsFile {
         self.release_shm_owner_state(delete)
     }
 }
-
-impl crate::traits::AsyncVfsDataPath for WindowsFile {}
 
 impl Drop for WindowsFile {
     fn drop(&mut self) {

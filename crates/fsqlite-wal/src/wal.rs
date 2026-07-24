@@ -132,7 +132,7 @@ impl<F: VfsFile> WalFile<F> {
     ///
     /// This keeps `frame_count` and `running_checksum` coherent across
     /// multiple concurrently-open `WalFile` handles.
-    pub fn refresh(&mut self, cx: &Cx) -> Result<()> {
+    pub async fn refresh(&mut self, cx: &Cx) -> Result<()> {
         let frame_size = self.frame_size();
         let expected_size = u64::try_from(WAL_HEADER_SIZE)
             .expect("WAL header size fits u64")
@@ -148,14 +148,14 @@ impl<F: VfsFile> WalFile<F> {
         // rebuild state from the on-disk WAL from scratch.
         if file_size < expected_size {
             log_replay_decision("refresh", 0, self.frame_count, "file_shrank_rebuild");
-            return self.rebuild_state_from_file(cx);
+            return self.rebuild_state_from_file(cx).await;
         }
 
         // Validate current on-disk header and confirm it matches our view.
         // This is necessary even if file_size == expected_size to detect ABA
         // where the WAL was reset and then appended back to the exact same size.
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read = self.file.read(cx, &mut header_buf, 0)?;
+        let header_read = self.file.read(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
             log_replay_decision("refresh", 0, self.frame_count, "header_short_read_corrupt");
             return Err(FrankenError::WalCorrupt {
@@ -194,7 +194,7 @@ impl<F: VfsFile> WalFile<F> {
                 self.frame_count,
                 "header_generation_changed_rebuild",
             );
-            return self.rebuild_state_from_file(cx);
+            return self.rebuild_state_from_file(cx).await;
         }
 
         if file_size == expected_size {
@@ -228,7 +228,7 @@ impl<F: VfsFile> WalFile<F> {
         for frame_index in self.frame_count..available_frames {
             let frame_no = frame_index.saturating_add(1);
             let offset = self.frame_offset(frame_index);
-            let bytes_read = self.file.read(cx, &mut frame_buf, offset)?;
+            let bytes_read = self.file.read(cx, &mut frame_buf, offset).await?;
             if bytes_read < frame_size {
                 log_replay_decision(
                     "refresh_incremental",
@@ -295,9 +295,9 @@ impl<F: VfsFile> WalFile<F> {
         Ok(())
     }
 
-    fn rebuild_state_from_file(&mut self, cx: &Cx) -> Result<()> {
+    async fn rebuild_state_from_file(&mut self, cx: &Cx) -> Result<()> {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read = self.file.read(cx, &mut header_buf, 0)?;
+        let header_read = self.file.read(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
             log_replay_decision("rebuild", 0, self.frame_count, "header_short_read_corrupt");
             return Err(FrankenError::WalCorrupt {
@@ -347,7 +347,7 @@ impl<F: VfsFile> WalFile<F> {
         for frame_index in 0..max_frames {
             let frame_no = frame_index.saturating_add(1);
             let offset = self.frame_offset(frame_index);
-            let bytes_read = self.file.read(cx, &mut frame_buf, offset)?;
+            let bytes_read = self.file.read(cx, &mut frame_buf, offset).await?;
             if bytes_read < frame_size {
                 log_replay_decision(
                     "rebuild",
@@ -474,7 +474,7 @@ impl<F: VfsFile> WalFile<F> {
     ///
     /// The file should already be opened via the VFS. This overwrites any
     /// existing content by writing the header at offset 0 and truncating.
-    pub fn create(
+    pub async fn create(
         cx: &Cx,
         mut file: F,
         page_size: u32,
@@ -490,7 +490,7 @@ impl<F: VfsFile> WalFile<F> {
             checksum: SqliteWalChecksum::default(), // computed by to_bytes()
         };
         let header_bytes = header.to_bytes()?;
-        file.write(cx, &header_bytes, 0)?;
+        file.write(cx, &header_bytes, 0).await?;
         file.truncate(
             cx,
             u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64"),
@@ -532,10 +532,10 @@ impl<F: VfsFile> WalFile<F> {
     /// then scanning frames to determine the valid frame count and
     /// running checksum.
     #[allow(clippy::too_many_lines)]
-    pub fn open(cx: &Cx, file: F) -> Result<Self> {
+    pub async fn open(cx: &Cx, file: F) -> Result<Self> {
         // Read and parse the 32-byte header.
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let bytes_read = file.read(cx, &mut header_buf, 0)?;
+        let bytes_read = file.read(cx, &mut header_buf, 0).await?;
         if bytes_read < WAL_HEADER_SIZE {
             log_replay_decision("startup_open", 0, 0, "header_short_read_corrupt");
             return Err(FrankenError::WalCorrupt {
@@ -585,7 +585,7 @@ impl<F: VfsFile> WalFile<F> {
             let frame_sz = frame_size as u64;
             let file_offset = header_size.saturating_add(idx.saturating_mul(frame_sz));
 
-            let bytes_read = file.read(cx, &mut frame_buf, file_offset)?;
+            let bytes_read = file.read(cx, &mut frame_buf, file_offset).await?;
             if bytes_read < frame_size {
                 log_replay_decision(
                     "startup_open",
@@ -707,7 +707,7 @@ impl<F: VfsFile> WalFile<F> {
     /// `page_data` must be exactly `page_size` bytes.
     /// `db_size_if_commit` should be the database size in pages for commit
     /// frames, or 0 for non-commit frames.
-    pub fn append_frame(
+    pub async fn append_frame(
         &mut self,
         cx: &Cx,
         page_number: u32,
@@ -741,7 +741,7 @@ impl<F: VfsFile> WalFile<F> {
         if frame_scratch.capacity() < frame_size {
             frame_scratch.reserve(frame_size - frame_scratch.capacity());
         }
-        let append_result = (|| -> Result<SqliteWalChecksum> {
+        let append_result = async {
             push_wal_frame_bytes(
                 &mut frame_scratch,
                 page_number,
@@ -755,9 +755,10 @@ impl<F: VfsFile> WalFile<F> {
             let new_checksum =
                 write_wal_frame_checksum(frame, page_size, running_checksum, big_endian_checksum)?;
 
-            self.file.write(cx, frame, offset)?;
-            Ok(new_checksum)
-        })();
+            self.file.write(cx, frame, offset).await?;
+            Ok::<_, FrankenError>(new_checksum)
+        }
+        .await;
         self.frame_scratch = frame_scratch;
         let new_checksum = append_result?;
 
@@ -898,7 +899,7 @@ impl<F: VfsFile> WalFile<F> {
     /// This is a cheap ABA-resistant probe used after a pre-lock finalize
     /// pass. If the generation identity and frame count still match, no other
     /// writer could have changed the append seed or target offset.
-    pub fn prepared_append_window_still_current(
+    pub async fn prepared_append_window_still_current(
         &self,
         cx: &Cx,
         generation: WalGenerationIdentity,
@@ -916,7 +917,7 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
-        let header_read = self.file.read(cx, &mut header_buf, 0)?;
+        let header_read = self.file.read(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -973,7 +974,7 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Append a batch whose frame bytes were already finalized against the
     /// current append window.
-    pub fn append_finalized_prepared_frame_bytes(
+    pub async fn append_finalized_prepared_frame_bytes(
         &mut self,
         cx: &Cx,
         prepared_frame_bytes: &[u8],
@@ -1015,7 +1016,7 @@ impl<F: VfsFile> WalFile<F> {
             &format!("start_frame={start_frame_index} frame_count={frame_count}"),
         )?;
 
-        self.file.write(cx, prepared_frame_bytes, offset)?;
+        self.file.write(cx, prepared_frame_bytes, offset).await?;
         self.advance_state_after_write(frame_count, final_running_checksum)?;
         if let Some(last_commit_offset) = last_commit_offset {
             self.last_commit_frame = Some(start_frame_index + last_commit_offset);
@@ -1060,7 +1061,7 @@ impl<F: VfsFile> WalFile<F> {
     /// records in WAL frame layout with page number, db_size, salts, and
     /// payload already serialized. The checksum bytes are overwritten in-place
     /// using the live rolling checksum seed from this WAL handle.
-    pub fn append_prepared_frame_bytes(
+    pub async fn append_prepared_frame_bytes(
         &mut self,
         cx: &Cx,
         prepared_frame_bytes: &mut [u8],
@@ -1102,6 +1103,7 @@ impl<F: VfsFile> WalFile<F> {
             running_checksum,
             last_commit_offset,
         )
+        .await
     }
 
     /// Append a batch of frames to the WAL using a single contiguous write.
@@ -1109,13 +1111,14 @@ impl<F: VfsFile> WalFile<F> {
     /// This preserves the checksum chain while avoiding per-frame write
     /// syscalls on hot commit paths. Durability is still controlled by
     /// [`Self::sync`] or a higher-level caller.
-    pub fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
+    pub async fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
         self.append_frame_iter(cx, frames.len(), frames.iter().copied())
+            .await
     }
 
     /// Append a known-size iterator of frame references without first
     /// materializing a borrowed descriptor slice.
-    pub(crate) fn append_frame_iter<'a, I>(
+    pub(crate) async fn append_frame_iter<'a, I>(
         &mut self,
         cx: &Cx,
         frame_count: usize,
@@ -1150,7 +1153,7 @@ impl<F: VfsFile> WalFile<F> {
         // single pass, eliminating the intermediate Vec<WalChecksumTransform>
         // allocation and the redundant second write_wal_frame_salts call that
         // finalize_prepared_frame_bytes performed.
-        let append_result = (|| -> Result<()> {
+        let append_result = async {
             let mut running_checksum = self.running_checksum;
             let mut last_commit_offset: Option<usize> = None;
             let mut observed_frame_count = 0usize;
@@ -1215,7 +1218,9 @@ impl<F: VfsFile> WalFile<F> {
                 running_checksum,
                 last_commit_offset,
             )
-        })();
+            .await
+        }
+        .await;
         self.frame_scratch = frame_scratch;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -1227,10 +1232,14 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Read a frame by 0-based index, returning header and page data.
-    pub fn read_frame(&self, cx: &Cx, frame_index: usize) -> Result<(WalFrameHeader, Vec<u8>)> {
+    pub async fn read_frame(
+        &self,
+        cx: &Cx,
+        frame_index: usize,
+    ) -> Result<(WalFrameHeader, Vec<u8>)> {
         let frame_size = self.frame_size();
         let mut buf = vec![0u8; frame_size];
-        let header = self.read_frame_into(cx, frame_index, &mut buf)?;
+        let header = self.read_frame_into(cx, frame_index, &mut buf).await?;
         let page_data = buf[WAL_FRAME_HEADER_SIZE..].to_vec();
         Ok((header, page_data))
     }
@@ -1240,7 +1249,7 @@ impl<F: VfsFile> WalFile<F> {
     /// `buf` must be at least `frame_size` bytes. The frame header is parsed
     /// from the beginning of the buffer, and the page data follows immediately
     /// after at offset `WAL_FRAME_HEADER_SIZE`.
-    pub fn read_frame_into(
+    pub async fn read_frame_into(
         &self,
         cx: &Cx,
         frame_index: usize,
@@ -1265,7 +1274,7 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         let offset = self.frame_offset(frame_index);
-        let bytes_read = self.file.read(cx, &mut buf[..frame_size], offset)?;
+        let bytes_read = self.file.read(cx, &mut buf[..frame_size], offset).await?;
         if bytes_read < frame_size {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -1278,7 +1287,7 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// Read just the frame header at a given 0-based index.
-    pub fn read_frame_header(&self, cx: &Cx, frame_index: usize) -> Result<WalFrameHeader> {
+    pub async fn read_frame_header(&self, cx: &Cx, frame_index: usize) -> Result<WalFrameHeader> {
         if frame_index >= self.frame_count {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -1290,7 +1299,7 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
         let offset = self.frame_offset(frame_index);
-        let bytes_read = self.file.read(cx, &mut header_buf, offset)?;
+        let bytes_read = self.file.read(cx, &mut header_buf, offset).await?;
         if bytes_read < WAL_FRAME_HEADER_SIZE {
             return Err(FrankenError::WalCorrupt {
                 detail: format!("short header read at frame {frame_index}: got {bytes_read}"),
@@ -1390,7 +1399,7 @@ impl<F: VfsFile> WalFile<F> {
     /// Writes a new header with updated checkpoint sequence and salts,
     /// and resets the running checksum and frame count to zero.
     /// If `truncate_file` is true, also truncates the file to header-only.
-    pub fn reset(
+    pub async fn reset(
         &mut self,
         cx: &Cx,
         new_checkpoint_seq: u32,
@@ -1413,7 +1422,7 @@ impl<F: VfsFile> WalFile<F> {
             &format!("checkpoint_seq={new_checkpoint_seq}"),
         )?;
 
-        self.file.write(cx, &header_bytes, 0)?;
+        self.file.write(cx, &header_bytes, 0).await?;
 
         // H9 fault hook: crash after header write, before truncate.
         // Simulates power loss leaving new salts in the header but old
@@ -1483,6 +1492,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::test_support::FutureResultTestExt as _;
 
     /// Shared, panic-safe ownership guard for process-global fault hooks.
     static FAULT_TEST_LOCK: crate::fault_hooks::FaultInjectionSessionLock =
@@ -1625,6 +1635,7 @@ mod tests {
             })
             .collect::<Result<Vec<_>>>()?;
         wal.append_prepared_frame_bytes(cx, &mut frame_buf, &frame_transforms)
+            .wait()
     }
 
     fn track_c_measure_single_frame_case(
@@ -2534,20 +2545,25 @@ mod tests {
         // Verify that a Restart checkpoint resets WAL to 0 frames,
         // preventing unbounded growth.
         use crate::checkpoint::{CheckpointMode, CheckpointState};
-        use crate::checkpoint_executor::CheckpointTarget;
         use crate::checkpoint_executor::execute_checkpoint;
+        use crate::checkpoint_executor::{CheckpointTarget, CheckpointTargetFuture};
         use fsqlite_types::PageNumber;
 
         struct DummyTarget;
         impl CheckpointTarget for DummyTarget {
-            fn write_page(&mut self, _: &Cx, _: PageNumber, _: &[u8]) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn write_page<'a>(
+                &'a mut self,
+                _: &'a Cx,
+                _: PageNumber,
+                _: &'a [u8],
+            ) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
-            fn truncate_db(&mut self, _: &Cx, _: u32) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn truncate_db<'a>(&'a mut self, _: &'a Cx, _: u32) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
-            fn sync_db(&mut self, _: &Cx) -> fsqlite_error::Result<()> {
-                Ok(())
+            fn sync_db<'a>(&'a mut self, _: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
             }
         }
 

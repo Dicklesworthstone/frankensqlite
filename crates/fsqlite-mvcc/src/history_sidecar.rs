@@ -2030,7 +2030,7 @@ mod tests {
             self.inner.read(cx, buffer, offset)
         }
 
-        fn write(&mut self, cx: &Cx, buffer: &[u8], offset: u64) -> Result<(), FrankenError> {
+        fn write(&self, cx: &Cx, buffer: &[u8], offset: u64) -> Result<(), FrankenError> {
             self.inner.write(cx, buffer, offset)
         }
 

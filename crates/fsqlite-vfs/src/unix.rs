@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use asupersync::runtime::spawn_blocking_io;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -70,6 +71,53 @@ fn checked_io_offset(offset: u64, total: usize, op: &'static str) -> Result<u64>
         .ok_or_else(|| invalid_io_input(format!("offset overflow during unix vfs {op}")))
 }
 
+fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> io::Result<u64> {
+    let total = u64::try_from(total)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "I/O offset is too large"))?;
+    offset.checked_add(total).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("offset overflow during async unix vfs {op}"),
+        )
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn read_owned_at(file: Arc<File>, len: usize, offset: u64) -> io::Result<(Vec<u8>, usize)> {
+    let mut data = vec![0_u8; len];
+    let mut total = 0_usize;
+    while total < data.len() {
+        let current = blocking_io_offset(offset, total, "read")?;
+        match file.read_at(&mut data[total..], current) {
+            Ok(0) => break,
+            Ok(read) => total += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((data, total))
+}
+
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn write_owned_at(file: Arc<File>, data: Vec<u8>, offset: u64) -> io::Result<()> {
+    let mut total = 0_usize;
+    while total < data.len() {
+        let current = blocking_io_offset(offset, total, "write")?;
+        match file.write_at(&data[total..], current) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "async unix vfs write_at returned 0",
+                ));
+            }
+            Ok(written) => total += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Write the whole buffer at `offset`, retrying short writes and `EINTR`.
 ///
 /// GH #200: `pwrite(2)` can be interrupted by a signal at any iteration,
@@ -105,6 +153,7 @@ where
 ///
 /// Returns the number of bytes read before EOF (GH #200: interruption is
 /// retried in place instead of surfacing `Interrupted` mid-buffer).
+#[cfg(test)]
 fn read_full_at<R>(mut read_at: R, buf: &mut [u8], offset: u64, what: &'static str) -> Result<usize>
 where
     R: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
@@ -1123,6 +1172,13 @@ impl UnixFile {
             .expect("open UnixFile must retain its canonical descriptor")
     }
 
+    pub(crate) fn canonical_file(&self) -> Result<Arc<File>> {
+        self.file
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))
+    }
+
     fn inode_info_ref(&self) -> &Arc<Mutex<InodeInfo>> {
         self.inode_info
             .as_ref()
@@ -1894,25 +1950,50 @@ impl VfsFile for UnixFile {
         Ok(Some(self.inode_key))
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "read")?;
-        let file = self.file_ref();
-        let total = read_full_at(|dst, off| file.read_at(dst, off), buf, offset, "read")?;
-
-        // Zero-fill short reads (SQLite requirement).
-        if total < buf.len() {
-            buf[total..].fill(0);
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "read")?;
+            let file = Arc::clone(
+                self.file
+                    .as_ref()
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+            );
+            let requested = buf.len();
+            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)?;
+            buf.copy_from_slice(&data);
+            Ok(total)
         }
-
-        Ok(total)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "write")?;
-        let file = self.file_ref();
-        write_full_at(|src, off| file.write_at(src, off), buf, offset, "write")
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "write")?;
+            let file = Arc::clone(
+                self.file
+                    .as_ref()
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+            );
+            let data = buf.to_vec();
+            spawn_blocking_io(move || write_owned_at(file, data, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)
+        }
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2342,7 +2423,16 @@ impl VfsFile for UnixFile {
     }
 }
 
-impl crate::traits::AsyncVfsDataPath for UnixFile {}
+#[cfg(test)]
+impl UnixFile {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
+    }
+
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
+    }
+}
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
@@ -3767,7 +3857,7 @@ mod tests {
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("write_overflow.db");
 
-        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         let err = file.write(&cx, &[1, 2], u64::MAX).unwrap_err();
         assert_invalid_input_error(err, "offset overflow during unix vfs write");
     }

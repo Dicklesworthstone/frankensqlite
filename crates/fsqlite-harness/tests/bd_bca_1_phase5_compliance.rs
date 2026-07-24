@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Output};
 
+use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::cursor::{BtCursor, TransactionPageIo};
 use fsqlite_btree::{BtreeCursorOps, SeekResult};
 use fsqlite_pager::{
@@ -20,6 +21,7 @@ use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
+use fsqlite_wal::checkpoint_executor::CheckpointTargetFuture;
 use fsqlite_wal::{
     CheckpointMode, CheckpointState, CheckpointTarget, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
     WalChainInvalidReason, WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord,
@@ -223,24 +225,30 @@ struct RecordingCheckpointTarget {
 }
 
 impl CheckpointTarget for RecordingCheckpointTarget {
-    fn write_page(
-        &mut self,
-        _cx: &Cx,
+    fn write_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
         _page_no: fsqlite_types::PageNumber,
-        data: &[u8],
-    ) -> fsqlite_error::Result<()> {
-        self.writes.push(data.to_vec());
-        Ok(())
+        data: &'a [u8],
+    ) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move {
+            self.writes.push(data.to_vec());
+            Ok(())
+        })
     }
 
-    fn truncate_db(&mut self, _cx: &Cx, n_pages: u32) -> fsqlite_error::Result<()> {
-        self.truncated_to = Some(n_pages);
-        Ok(())
+    fn truncate_db<'a>(&'a mut self, _cx: &'a Cx, n_pages: u32) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move {
+            self.truncated_to = Some(n_pages);
+            Ok(())
+        })
     }
 
-    fn sync_db(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
-        self.sync_calls += 1;
-        Ok(())
+    fn sync_db<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move {
+            self.sync_calls += 1;
+            Ok(())
+        })
     }
 }
 
@@ -1278,6 +1286,9 @@ fn test_encryption_aad_swap_resistance() -> Result<(), String> {
 #[test]
 fn test_checkpoint_all_4_modes() -> Result<(), String> {
     let cx = test_cx();
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|error| format!("checkpoint_test_runtime_build_failed error={error}"))?;
     let page_size = PageSize::DEFAULT.as_usize();
     let page_size_u32 =
         u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
@@ -1315,8 +1326,9 @@ fn test_checkpoint_all_4_modes() -> Result<(), String> {
             backfilled_frames: 0,
             oldest_reader_frame: None,
         };
-        let result =
-            execute_checkpoint(&cx, &mut wal, mode, state, &mut target).map_err(|error| {
+        let result = runtime
+            .block_on(execute_checkpoint(&cx, &mut wal, mode, state, &mut target))
+            .map_err(|error| {
                 format!("execute_checkpoint_failed mode={mode_label} error={error}")
             })?;
 

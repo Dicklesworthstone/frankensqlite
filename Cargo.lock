@@ -158,7 +158,6 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
- "io-uring 0.7.12",
  "js-sys",
  "libc",
  "memchr",
@@ -1446,12 +1445,13 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
+ "io-uring 0.7.12",
  "libc",
  "nix",
- "pollster",
  "smallvec",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "uring-fs",
  "windows-sys",
 ]
@@ -2601,12 +2601,6 @@ dependencies = [
  "rustix",
  "windows-sys",
 ]
-
-[[package]]
-name = "pollster"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
 name = "poly1305"
