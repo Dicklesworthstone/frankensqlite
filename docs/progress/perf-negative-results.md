@@ -20153,3 +20153,57 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   order-satisfaction check for the empty-prefix case. Preflight
   CompositeRangeIndexSeek=allowed. Files: codegen.rs,
   composite_prefix_range_residual_oracle.rs. See bd-bn45n.
+
+## 2026-07-24 - KEEP: MySQL-style skip scan for `WHERE b = <const>` on a 2-col index (bd-nax2y approach B) + surfaced/fixed a bf19adc0 composite-range regression
+
+- LEVER: a `SELECT <cols> FROM t WHERE b = <const>` where `b` is the SECOND term
+  of a 2-column ASC BINARY index whose LEADING term is unconstrained (and no
+  single-column index on `b` exists — that declines so a normal equality seek
+  wins) was full-scanning. Now `skip_scan_eq_target` detects the shape and
+  `codegen_select_skip_scan` enumerates distinct leading values (SeekGT past each
+  leading run) and per value seeks the `(leading, const)` run.
+- PERF-SAFETY WITHOUT STATS: an adaptive walk probes `SKIP_SCAN_WALK_PROBES` (3)
+  `Next`s before paying a root-to-leaf `SeekGE(leading, const, i64::MIN)`, so a
+  near-unique leading column degrades to a full index WALK (at-worst == full
+  scan, no high-cardinality regression). No planner/stats dependency (mirrors the
+  DISTINCT loose-scan adaptive-Next idiom).
+- TWO BUGS FOUND + FIXED DURING IMPL (both cost real cycles):
+  (1) COMPARISON-OPCODE OPERAND ORDER. `emit_jump_to_label(OP, p1, p3, label)`
+  jumps when `reg[P3] OP reg[P1]` — p3 is the LEFT operand. The directional `Gt`
+  that advances past a block on `a > const` must be emitted `Gt(const_reg,
+  a_reg)`, NOT `Gt(a_reg, const_reg)` (which tests `const > a` == `a < const`, so
+  it advanced past every block on its first sub-const row and the seek path never
+  ran; multi-row runs returned empty). BOTH the outer and the walk-copy sites
+  needed it; a `replace_all` on the 8-space walk line missed the 4-space outer
+  line — verify indentation when replace_all touches "identical" lines. NULL
+  leading values MASKED the bug (NULL comparisons never jump), and blocks whose
+  min-`a` == const were caught by the symmetric `Eq` before the bad `Gt`, so 3/5
+  oracle cases passed while the seek was totally dead. Diagnosed by dumping
+  EXPLAIN bytecode + an engine-side eprintln on the index seek opcodes (only
+  `SeekGT` ever fired — `SeekGE` was never reached).
+  (2) The `SeekGE(x, const, MIN)` probe is a FULL 3-field key with an `i64::MIN`
+  rowid sentinel (this engine pads a SHORT seek probe toward the HIGH end, which
+  is why the 1-field `SeekGT` advance correctly lands past the whole `(x,*)` run;
+  a bare 2-field probe would overshoot the run).
+- SURFACED + FIXED A bf19adc0 REGRESSION (found via this feature's conformance
+  sweep, not its own tests): the empty-prefix composite leading-range
+  (`composite_index_prefix_range_target`, bd-bn45n) seeked the WIDER composite
+  `idx_ab` for `WHERE a <range>` even when a narrower single-column `idx_a` was
+  declared — undoing bd-agg-range-shadowed-index for the non-aggregate path
+  (results correct; only the opcode-gate `opens idx_a` failed). FIX: when
+  `range_pos == 0` (empty prefix), decline the composite if a usable single-column
+  ascending index on the leading column exists (criteria mirror the single-col
+  range planner VERBATIM so we never decline into a full-table scan). bd-bn45n's
+  own composite-ONLY tests still seek the composite (guard inert without idx_a).
+- GATE (deterministic): byte-exact vs rusqlite (sorted set — no ORDER BY).
+  skip_scan_oracle (5 tests): low/high-cardinality leading columns (seek vs walk
+  paths), NULLs in both columns, covering + non-covering output, TEXT + long
+  duplicate runs, empty/all-same/all-null/single edges, and the decline controls
+  (single-col index on target; leading-column constraint). Full 56-oracle
+  conformance sweep GREEN (118 result binaries, 0 failed) — no other regression.
+  golden_bytecode_snapshots 8/8 (no drift); clippy -p fsqlite-vdbe --lib -D
+  warnings clean; fmt clean.
+- FOLLOW-UP (bd-nax2y remaining scope, NOT this cut): range / IN / BETWEEN on the
+  2nd column, >2-col indexes, DESC/collation, ORDER BY streaming. Preflight
+  SkipScanNonLeadingTerm=allowed. Files: codegen.rs, skip_scan_oracle.rs. Memory:
+  [[vdbe-comparison-opcode-operand-order]].
