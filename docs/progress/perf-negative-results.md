@@ -20205,6 +20205,156 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   order-satisfaction check for the empty-prefix case. Preflight
   CompositeRangeIndexSeek=allowed. Files: codegen.rs,
   composite_prefix_range_residual_oracle.rs. See bd-bn45n.
+
+## 2026-07-24 - KEEP: MySQL-style skip scan for `WHERE b = <const>` on a 2-col index (bd-nax2y approach B) + surfaced/fixed a bf19adc0 composite-range regression
+
+- LEVER: a `SELECT <cols> FROM t WHERE b = <const>` where `b` is the SECOND term
+  of a 2-column ASC BINARY index whose LEADING term is unconstrained (and no
+  single-column index on `b` exists — that declines so a normal equality seek
+  wins) was full-scanning. Now `skip_scan_eq_target` detects the shape and
+  `codegen_select_skip_scan` enumerates distinct leading values (SeekGT past each
+  leading run) and per value seeks the `(leading, const)` run.
+- PERF-SAFETY WITHOUT STATS: an adaptive walk probes `SKIP_SCAN_WALK_PROBES` (3)
+  `Next`s before paying a root-to-leaf `SeekGE(leading, const, i64::MIN)`, so a
+  near-unique leading column degrades to a full index WALK (at-worst == full
+  scan, no high-cardinality regression). No planner/stats dependency (mirrors the
+  DISTINCT loose-scan adaptive-Next idiom).
+- TWO BUGS FOUND + FIXED DURING IMPL (both cost real cycles):
+  (1) COMPARISON-OPCODE OPERAND ORDER. `emit_jump_to_label(OP, p1, p3, label)`
+  jumps when `reg[P3] OP reg[P1]` — p3 is the LEFT operand. The directional `Gt`
+  that advances past a block on `a > const` must be emitted `Gt(const_reg,
+  a_reg)`, NOT `Gt(a_reg, const_reg)` (which tests `const > a` == `a < const`, so
+  it advanced past every block on its first sub-const row and the seek path never
+  ran; multi-row runs returned empty). BOTH the outer and the walk-copy sites
+  needed it; a `replace_all` on the 8-space walk line missed the 4-space outer
+  line — verify indentation when replace_all touches "identical" lines. NULL
+  leading values MASKED the bug (NULL comparisons never jump), and blocks whose
+  min-`a` == const were caught by the symmetric `Eq` before the bad `Gt`, so 3/5
+  oracle cases passed while the seek was totally dead. Diagnosed by dumping
+  EXPLAIN bytecode + an engine-side eprintln on the index seek opcodes (only
+  `SeekGT` ever fired — `SeekGE` was never reached).
+  (2) The `SeekGE(x, const, MIN)` probe is a FULL 3-field key with an `i64::MIN`
+  rowid sentinel (this engine pads a SHORT seek probe toward the HIGH end, which
+  is why the 1-field `SeekGT` advance correctly lands past the whole `(x,*)` run;
+  a bare 2-field probe would overshoot the run).
+- SURFACED + FIXED A bf19adc0 REGRESSION (found via this feature's conformance
+  sweep, not its own tests): the empty-prefix composite leading-range
+  (`composite_index_prefix_range_target`, bd-bn45n) seeked the WIDER composite
+  `idx_ab` for `WHERE a <range>` even when a narrower single-column `idx_a` was
+  declared — undoing bd-agg-range-shadowed-index for the non-aggregate path
+  (results correct; only the opcode-gate `opens idx_a` failed). FIX: when
+  `range_pos == 0` (empty prefix), decline the composite if a usable single-column
+  ascending index on the leading column exists (criteria mirror the single-col
+  range planner VERBATIM so we never decline into a full-table scan). bd-bn45n's
+  own composite-ONLY tests still seek the composite (guard inert without idx_a).
+- GATE (deterministic): byte-exact vs rusqlite (sorted set — no ORDER BY).
+  skip_scan_oracle (5 tests): low/high-cardinality leading columns (seek vs walk
+  paths), NULLs in both columns, covering + non-covering output, TEXT + long
+  duplicate runs, empty/all-same/all-null/single edges, and the decline controls
+  (single-col index on target; leading-column constraint). Full 56-oracle
+  conformance sweep GREEN (118 result binaries, 0 failed) — no other regression.
+  golden_bytecode_snapshots 8/8 (no drift); clippy -p fsqlite-vdbe --lib -D
+  warnings clean; fmt clean.
+- FOLLOW-UP (bd-nax2y remaining scope, NOT this cut): range / IN / BETWEEN on the
+  2nd column, >2-col indexes, DESC/collation, ORDER BY streaming. Preflight
+  SkipScanNonLeadingTerm=allowed. Files: codegen.rs, skip_scan_oracle.rs. Memory:
+  [[vdbe-comparison-opcode-operand-order]].
+
+### 2026-07-24 addendum — skip scan extended (same KEEP, bd-nax2y): >2-column indexes + inclusive-lower RANGE
+
+- >2-COLUMN (commit bdb4a596): `WHERE b = <const>` on `idx(a, b, c, …)` (b the 2nd term) now fires,
+  not just 2-col. Probe fills trailing KEY terms with NULL (sorts before every value → lands on the
+  FIRST `(a, const, …)`; a MIN integer skips past `(…, NULL, …)` rows) and the rowid slot with
+  `i64::MIN`. Bug found+fixed: initially used MIN for trailing key cols → dropped every trailing-NULL
+  row. 2-col path byte-identical (empty trailing loop).
+- RANGE (commit f5138ff6): `WHERE b <range>` with an INCLUSIVE lower (optional upper) — `>=`,
+  `BETWEEN`, `>= AND <`. Separate `skip_scan_range_target` (residual-safe: EVERY conjunct must be a
+  bound on the target) + `codegen_select_skip_scan_range`, leaving the equality path untouched.
+  Per-entry classified by `emit_skip_scan_range_decision` (above upper → advance; in range → emit;
+  below/NULL → walk); seek anchors `(x, lo, NULL…, -inf)`. PASSED conformance first try (comparisons
+  grounded in the composite prefix+range operand order + [[vdbe-comparison-opcode-operand-order]]).
+- GATE: skip_scan_oracle 9 tests (2-col eq, >2-col eq, 3 range, decline controls); golden 8/8; clippy
+  clean; FULL 56-oracle sweep GREEN (batched --jobs 4 to dodge the parallel-link OOM,
+  [[rch-parallel-link-oom-bus-error]]).
+- STILL DEFERRED (fall to a correct scan, not this cycle): exclusive lower `>` (needs a post-seek skip
+  of the `==lo` run), no-lower `<`/`<=` (needs a NULL-run walk; seeking to NULL would loop), IN-list,
+  ORDER BY streaming, DESC/non-BINARY.
+
+### 2026-07-24 addendum 2 — skip-scan RANGE coverage completed (bd-nax2y)
+
+- Exclusive lower `> k` (commit 5270ac80): a 2-field `SeekGT(x, lo)` lands past the whole `(x, lo, *)`
+  run on the first `b > lo` (engine UpperBound bias: shorter equal-prefix probe sorts less-than). No
+  post-seek skip loop.
+- No-lower `< k` / `<= k` (commit 1e10f770): no seekable lower, so each block is walked from its start
+  by an unbounded null-skip loop (NULLs sort first + excluded → the only sub-range values); the required
+  upper bound terminates the run, `SeekGT` still skips leading values. `NotNull(a) → emit_run` classifies.
+- Skip scan is now COMPREHENSIVE for the WHERE shape: equality (any-arity ASC BINARY index) + range
+  (inclusive/exclusive lower, no-lower, optional inclusive/exclusive upper). All passed conformance FIRST
+  try (comparisons grounded in the composite operand order + [[vdbe-comparison-opcode-operand-order]]).
+- GATE (whole cycle): skip_scan_oracle 9 tests; golden 8/8; clippy clean; FULL 56-oracle sweep GREEN
+  (batched --jobs 4, [[rch-parallel-link-oom-bus-error]]).
+- STILL DEFERRED (each falls to a correct scan; ledgered as next levers, none proven infeasible):
+  * ORDER BY streaming — the emission is already `leading ASC(NULLs first), second ASC, rowid ASC`, so
+    no emitter change is needed; only an order-satisfaction check + relaxing the `order_by.is_empty()`
+    gate. Deferred for ordering-correctness subtlety (collation / NULLS / the b-constant equality case),
+    not complexity. Reference: `range_order_by_is_deterministic` / `fixed_order_by_equality_prefix_len`.
+  * IN-list `b IN (…)` — needs a nested loop (distinct leading × IN values).
+  * DESC / non-BINARY collation index — needs reverse iteration.
+- FRONTIER note (worst-ratio comprehensive-bench, now sole-producer): the worst ratio is small-N DELETE
+  (`delete 5 rows / 100 rows`, C 2.354us vs F 7.902us, 3.36x), already REJECTED by cod on 2026-07-24 —
+  MVCC per-txn `begin_ns`+`commit_roundtrip_ns` dominate (~42%) with NO single removable component ≥30%
+  and CVs >5%; reducing it crosses into the security-sensitive MVCC/identity-probe lane (commit
+  1136c171). Retry predicate unmet (needs a same-worker improvement signal on a quiet host). Frontier
+  stays REJECT-gated; the architectural skip-scan lane carried this cycle.
+
+## 2026-07-24 - BLOCKER (frontier, sole-producer confirm): every comprehensive-bench loser is WRITE-side + host too noisy for a KEEP-quality A/B
+
+- Analyzed the refreshed `cod-fullquick-refresh-20260724T0030Z/full-quick.json` (93 scenarios).
+  ALL 10 scenarios where FrankenSQLite is slower than C SQLite (`ratio_fsqlite_over_csqlite > 1.12`)
+  are WRITE-side; there are ZERO read/query losers — FrankenSQLite BEATS C SQLite on every SELECT
+  workload (the skip-scan / read lane is won, not a frontier):
+  * write_single (DELETE/UPDATE): delete-5/100 3.36x, delete-50/1000 2.00x, delete-500/10000 1.80x,
+    update-10/100 1.44x, update-100/1000 1.35x.
+  * write_bulk (INSERT): large-10col 1000-row 1.50x, large-10col 10000-row 1.29x, small-3col batched
+    1.27x, small-3col autocommit 1.18x, tiny-1col 100-row 1.15x.
+- ROOT SHAPE: two write costs. (a) small-N DELETE/UPDATE — dominated by MVCC per-transaction
+  begin_ns+commit_roundtrip_ns (~42%, cod's 2026-07-24 REJECT); (b) single-transaction BULK INSERT
+  (large-10col) — per-ROW cost (record encode / index insert / MVCC version), transaction overhead
+  amortized. (b) is the more addressable shape (not transaction-control), but see the gate below.
+- BLOCKER: EVERY loser's fsqlite CV exceeds 5% (7.0% / 18.3% / 12.9% / 18.2% / 47.1% / 4.3%* / 12.3% /
+  13.7% / 22.7% / 11.6%) — so no lever here can pass the KEEP-quality gate (same-worker A/B, CV<5%,
+  null-control) on the current shared remote host, which is under load (a `ld` signal-7 Bus error hit
+  this cycle, [[rch-parallel-link-oom-bus-error]]). The DELETE/UPDATE family additionally crosses into
+  the security-sensitive MVCC/identity-probe lane (commit 1136c171 — no touch without sign-off).
+- RETRY PREDICATE: reopen the frontier when a QUIET dedicated host is available (fsqlite CV < 5% on the
+  target scenario). First target then = the single-transaction large-10col BULK INSERT per-row path
+  (profile with FSQLITE_BENCH_PROFILE_DML, look for a >=30% removable non-txn component); the small-N
+  DELETE/UPDATE stays behind the MVCC sign-off. (*update-100/1000 shows 4.3% but is only 1.35x and its
+  cost is transaction-control — same MVCC lane.)
+- VERDICT: frontier is a ledgered BLOCKER (host-quietness + MVCC-security). The read/skip-scan lane is
+  comprehensively complete AND winning on every read workload — no read-side frontier exists.
+
+## 2026-07-24 - REJECT (frontier, code screen, no A/B needed): bulk-INSERT per-row path is already optimized; residual is inherent MVCC/COW
+
+- Retry-target from the BLOCKER entry above (single-transaction large-10col bulk INSERT, 1.50x). Screened
+  the `Opcode::Insert` hot path (engine.rs ~9904) WITHOUT a perf A/B, looking for a per-row algorithmic
+  inefficiency justifiable on code alone. Found the path is ALREADY heavily optimized (all prior bd-*):
+  * MakeRecord SIDEBAND buffer — the record bytes are taken from a lookaside, avoiding an Arc alloc for
+    the Blob/Text record (`sideband_is_armed_for` / `take_buf`); `take_reg` moves instead of cloning.
+  * APPEND fast-path (bd-p666i/bd-0zxi6) — a strictly-increasing rowid skips the full B-tree seek
+    entirely (matches C SQLite BTREE_APPEND).
+  * `table_insert_prechecked_absent` — when the existence probe already proved the row absent, the
+    insert reuses that leaf position instead of re-seeking.
+  * rightmost-leaf cache refresh on append; decode-cache invalidation scoped to the write.
+- CONCLUSION: no removable per-row redundancy remains. The residual vs C SQLite is INHERENT to the MVCC
+  design — copy-on-write page duplication for concurrent writers, per-row version tracking, and RaptorQ
+  durability — i.e. the concurrent-writer capability that IS the product (concurrent_mode default true,
+  never to be weakened). Reducing it means weakening MVCC/durability, out of scope.
+- VERDICT: REJECTED on code screen (no eligible micro-perf A/B was entered — the host is also too noisy,
+  per the BLOCKER entry). This is the 2nd frontier REJECT (after cod's small-N DELETE). Combined with the
+  all-write-side BLOCKER, the comprehensive-bench frontier is firmly blocked: reads are won, writes are
+  inherent-MVCC-cost. Retry predicate unchanged (quiet host + MVCC sign-off for any deeper write lever).
+
 ## 2026-07-22 - BLOCKER: live B-epsilon/cell-delta DELETE bridge is not a one-lever edit
 
 - Target after the second consecutive DELETE rejection: the refreshed worst

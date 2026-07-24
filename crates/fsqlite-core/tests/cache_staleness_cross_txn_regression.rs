@@ -259,6 +259,163 @@ fn prepared_select_stops_returning_row_deleted_by_other_connection_after_cache_w
     Ok(())
 }
 
+// --- Memory-backend prepared statements warmed before the FIRST write ---
+//
+// Regression tests for bd-md5pf (root-caused from downstream
+// hedge_fund_data_tool live persistence): on the MEMORY backend, a prepared
+// statement whose shape is an index-seek equality on a TEXT column (TEXT
+// PRIMARY KEY or UNIQUE index) that is first EXECUTED before the connection's
+// first write transaction served frozen (pre-transaction) results forever
+// after that transaction committed — and could not see the transaction's own
+// inserts while it was open. A second write transaction on the connection
+// flipped the statement fully current. Fresh statements, non-indexed shapes,
+// scans, and other connections were all correct: the defect lived in the
+// clean-memory prepared indexed-equality fast path, whose
+// `PreparedIndexedEqualityCacheKey` is derived from `memdb_visible_commit_seq`
+// plus the MemDatabase mirror's `undo_version()` — neither of which advanced
+// on the first same-connection write commit, so the pre-transaction rowid
+// cache and last-result memo still matched.
+
+fn text_value(value: &str) -> SqliteValue {
+    SqliteValue::Text(value.to_owned().into())
+}
+
+fn open_memory_artifact_db() -> TestResult<Connection> {
+    let conn = Connection::open(":memory:")?;
+    // The field trigger ran with foreign keys enforced; the FK-checked insert
+    // into `runs` is what rehydrates the MemDatabase mirror from the ACTIVE
+    // transaction (bound at the pre-transaction snapshot seq), which is the
+    // condition that freezes pre-warmed statements after COMMIT. A plain
+    // single-table insert abandons the mirror instead and heals on the next
+    // read boundary, masking the defect.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute_batch(
+        "CREATE TABLE artifact_refs (
+             artifact_id TEXT PRIMARY KEY,
+             content_hash TEXT NOT NULL,
+             kind TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX idx_artifact_refs_content_hash
+             ON artifact_refs(content_hash);
+         CREATE TABLE runs (
+             run_id TEXT PRIMARY KEY,
+             artifact_id TEXT REFERENCES artifact_refs(artifact_id)
+         );",
+    )?;
+    Ok(conn)
+}
+
+fn insert_artifact(conn: &Connection, artifact_id: &str, content_hash: &str) -> TestResult {
+    conn.execute_with_params(
+        "INSERT INTO artifact_refs (artifact_id, content_hash, kind) VALUES (?1, ?2, ?3)",
+        &[
+            text_value(artifact_id),
+            text_value(content_hash),
+            text_value("filing_diff"),
+        ],
+    )?;
+    conn.execute_with_params(
+        "INSERT INTO runs (run_id, artifact_id) VALUES (?1, ?2)",
+        &[text_value("run-00000"), text_value(artifact_id)],
+    )?;
+    Ok(())
+}
+
+const ARTIFACT_ID: &str = "art-00000";
+const CONTENT_HASH: &str = "00000000000000000000000000000000000000000000feedbeef000000000000";
+
+#[test]
+fn memory_text_pk_statement_warmed_before_first_write_tx_sees_committed_row() -> TestResult {
+    let conn = open_memory_artifact_db()?;
+
+    let sql = "SELECT artifact_id, kind FROM artifact_refs WHERE artifact_id = ?1";
+    let stmt = conn.prepare(sql)?;
+    // Warm the statement on the empty table so its result shape predates the
+    // connection's first write transaction.
+    let warm = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert!(warm.is_empty(), "warm run on empty table must be empty");
+
+    conn.execute("BEGIN IMMEDIATE")?;
+    insert_artifact(&conn, ARTIFACT_ID, CONTENT_HASH)?;
+    conn.execute("COMMIT")?;
+
+    let rows = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "pre-warmed TEXT-PK equality statement must see the first write \
+         transaction's committed row"
+    );
+    assert_eq!(text_at(&rows[0], 0)?, ARTIFACT_ID);
+
+    // Repeat executions must stay current (the field failure was frozen
+    // forever, not a single stale read).
+    let again = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert_eq!(again.len(), 1, "re-execution must remain current");
+
+    // A fresh statement was always correct; keep that pinned.
+    let fresh = conn.query_with_params(sql, &[text_value(ARTIFACT_ID)])?;
+    assert_eq!(fresh.len(), 1, "fresh statement must see the committed row");
+    Ok(())
+}
+
+#[test]
+fn memory_text_pk_statement_warmed_before_first_write_tx_sees_own_insert_inside_tx() -> TestResult {
+    let conn = open_memory_artifact_db()?;
+
+    let stmt =
+        conn.prepare("SELECT artifact_id, kind FROM artifact_refs WHERE artifact_id = ?1")?;
+    let warm = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert!(warm.is_empty(), "warm run on empty table must be empty");
+
+    conn.execute("BEGIN IMMEDIATE")?;
+    let before_insert = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert!(
+        before_insert.is_empty(),
+        "row must not exist before the transaction's insert"
+    );
+    insert_artifact(&conn, ARTIFACT_ID, CONTENT_HASH)?;
+    let inside = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert_eq!(
+        inside.len(),
+        1,
+        "pre-warmed statement must see the open transaction's own insert"
+    );
+    conn.execute("COMMIT")?;
+
+    let after = stmt.query_with_params(&[text_value(ARTIFACT_ID)])?;
+    assert_eq!(
+        after.len(),
+        1,
+        "pre-warmed statement must stay current after COMMIT"
+    );
+    Ok(())
+}
+
+#[test]
+fn memory_unique_text_statement_warmed_before_first_write_tx_sees_committed_row() -> TestResult {
+    let conn = open_memory_artifact_db()?;
+
+    let stmt = conn
+        .prepare("SELECT artifact_id, content_hash FROM artifact_refs WHERE content_hash = ?1")?;
+    let warm = stmt.query_with_params(&[text_value(CONTENT_HASH)])?;
+    assert!(warm.is_empty(), "warm run on empty table must be empty");
+
+    conn.execute("BEGIN IMMEDIATE")?;
+    insert_artifact(&conn, ARTIFACT_ID, CONTENT_HASH)?;
+    conn.execute("COMMIT")?;
+
+    let rows = stmt.query_with_params(&[text_value(CONTENT_HASH)])?;
+    assert_eq!(
+        rows.len(),
+        1,
+        "pre-warmed UNIQUE-index equality statement must see the first write \
+         transaction's committed row"
+    );
+    assert_eq!(text_at(&rows[0], 0)?, ARTIFACT_ID);
+    Ok(())
+}
+
 #[test]
 fn stale_prepared_statement_rejects_schema_change_from_other_connection() -> TestResult {
     let dir = tempfile::tempdir()?;
