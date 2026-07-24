@@ -511,6 +511,104 @@ fn skip_scan_order_by_streams_without_sorter() {
 }
 
 #[test]
+fn skip_scan_is_null_matches_sqlite() {
+    // `WHERE a IS NULL` where `a` is the SECOND term of idx(x, a) with x unconstrained: the (x, NULL)
+    // run is at each leading block's start, so the scan emits it and advances. NULLs in both columns.
+    let mut ins = Vec::new();
+    for i in 1..=4000_i64 {
+        let x = if i % 53 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 12).to_string()
+        };
+        let a = if i % 7 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 20).to_string()
+        };
+        ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+        ],
+        &ins,
+    );
+    assert!(
+        has_op(&f, "SELECT x, a FROM t WHERE a IS NULL", "SeekGT"),
+        "IS NULL skip scan should serve WHERE a IS NULL over idx_xa(x, a)"
+    );
+    cmp(&f, &r, "SELECT x, a FROM t WHERE a IS NULL"); // covering
+    cmp(&f, &r, "SELECT id, c FROM t WHERE a IS NULL"); // non-covering
+    // ORDER BY x, id streams with no sorter (the NULL 2nd key is constant within the run).
+    assert!(
+        !has_op(
+            &f,
+            "SELECT x, a FROM t WHERE a IS NULL ORDER BY x, id",
+            "SorterOpen"
+        ),
+        "IS NULL + ORDER BY x, id must elide the sorter"
+    );
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a IS NULL ORDER BY x, id");
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT id, c FROM t WHERE a IS NULL ORDER BY x, id LIMIT 12 OFFSET 5",
+    );
+    // `IS NOT NULL` must NOT use this path (declines; still correct).
+    cmp(&f, &r, "SELECT x, a FROM t WHERE a IS NOT NULL");
+}
+
+#[test]
+fn skip_scan_is_null_edge_cases_match_sqlite() {
+    for (label, rows) in [
+        (
+            "no-null-a",
+            (1..=200)
+                .map(|i| format!("INSERT INTO t VALUES ({i}, {}, {}, 0);", i % 8, i % 5))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "all-null-a",
+            (1..=200)
+                .map(|i| format!("INSERT INTO t VALUES ({i}, {}, NULL, 0);", i % 8))
+                .collect(),
+        ),
+        (
+            "null-leading-too",
+            (1..=200)
+                .map(|i| {
+                    let x = if i % 9 == 0 {
+                        "NULL".to_owned()
+                    } else {
+                        (i % 8).to_string()
+                    };
+                    let a = if i % 3 == 0 {
+                        "NULL".to_owned()
+                    } else {
+                        (i % 5).to_string()
+                    };
+                    format!("INSERT INTO t VALUES ({i}, {x}, {a}, 0);")
+                })
+                .collect(),
+        ),
+    ] {
+        let (f, r) = both(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+                "CREATE INDEX idx_xa ON t(x, a);",
+            ],
+            &rows,
+        );
+        cmp(&f, &r, "SELECT x, a FROM t WHERE a IS NULL");
+        cmp(&f, &r, "SELECT id FROM t WHERE a IS NULL");
+        cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a IS NULL ORDER BY x, id");
+        let _ = label;
+    }
+}
+
+#[test]
 fn skip_scan_declines_when_avoidable() {
     let (f, r) = both(
         &[

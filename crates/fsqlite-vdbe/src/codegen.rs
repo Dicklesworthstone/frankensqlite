@@ -2415,6 +2415,33 @@ pub fn codegen_select(
             stmt.limit.as_ref(),
         );
     }
+    // IS-NULL skip scan (bd-nax2y): `WHERE <second_col> IS NULL`; the 2nd key is constant (NULL) within
+    // the run, so ORDER BY treats it like the equality case (`second_varies = false`).
+    if !is_aggregate
+        && time_travel.is_none()
+        && from_index_hint.is_none()
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && let Some(skip) = skip_scan_is_null_target(where_clause.as_deref(), table, table_alias)
+        && ((stmt.order_by.is_empty() && stmt.limit.is_none())
+            || skip_scan_order_by_satisfied(skip.index, false, &stmt.order_by, table, table_alias))
+    {
+        return codegen_select_skip_scan_is_null(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            skip.index,
+            stmt.limit.as_ref(),
+        );
+    }
 
     // bd-rowid-range-before-directive: `SELECT ... FROM t WHERE <rowid> <range>` receives a
     // `FullTableScan` planner directive — `PlannerSelectAccessKind` has no rowid-range variant, so the
@@ -11396,6 +11423,84 @@ fn skip_scan_eq_target<'a>(
     Some(SkipScanEqTarget { index, const_expr })
 }
 
+/// The `>= 2`-column ASC BINARY index whose SECOND key term is `col_name` (a plain non-generated BINARY
+/// column) and whose LEADING term differs — the skip-scan candidate for a constraint on `col_name`.
+/// Declines when a single-column index on `col_name` exists (it serves the constraint directly).
+fn skip_scan_second_col_index<'a>(
+    table: &'a TableSchema,
+    col_name: &str,
+) -> Option<&'a IndexSchema> {
+    let column = table
+        .column_index(col_name)
+        .and_then(|i| table.columns.get(i))?;
+    if column.generated_expr.is_some()
+        || column
+            .collation
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+    {
+        return None;
+    }
+    if table.indexes.iter().any(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() == 1
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+    }) {
+        return None;
+    }
+    table.indexes.iter().find(|idx| {
+        let kt = idx.key_term_count();
+        idx.supports_direct_column_lookup()
+            && kt >= 2
+            && idx.columns.len() == kt
+            && (0..kt).all(|i| {
+                !idx.key_term_descending(i)
+                    && idx
+                        .key_term_collation(i)
+                        .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            })
+            && idx
+                .columns
+                .get(1)
+                .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| !c.eq_ignore_ascii_case(col_name))
+    })
+}
+
+/// `SELECT <cols> FROM t WHERE <second_col> IS NULL` where `<second_col>` is the SECOND key term of a
+/// `>= 2`-column ASC BINARY index with an unconstrained leading term. bd-nax2y IS-NULL extension.
+struct SkipScanIsNullTarget<'a> {
+    index: &'a IndexSchema,
+}
+
+/// Detect `WHERE <col> IS NULL` on the second key term of a skip-scan-able index. The `(x, NULL)` run is
+/// at the START of each leading block (NULLs sort first), so the scan emits it and advances past the
+/// rest of the block — no seek within a block.
+fn skip_scan_is_null_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+) -> Option<SkipScanIsNullTarget<'a>> {
+    if table.without_rowid {
+        return None;
+    }
+    let Expr::IsNull {
+        expr, not: false, ..
+    } = where_clause?
+    else {
+        return None;
+    };
+    let col_name = column_name(expr, table, table_alias)?;
+    let index = skip_scan_second_col_index(table, &col_name)?;
+    Some(SkipScanIsNullTarget { index })
+}
+
 /// A range skip-scan target: the constrained SECOND key term carries a range (with an inclusive lower
 /// bound) instead of an equality. bd-nax2y range extension.
 struct SkipScanRangeTarget<'a> {
@@ -12026,6 +12131,141 @@ fn codegen_select_skip_scan_range(
         let above = if up_inclusive { Opcode::Gt } else { Opcode::Ge };
         b.emit_jump_to_label(above, up_reg, a_reg, advance, bin(), 0);
     }
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    let emit_next = b.emit_label();
+    if needs_table {
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, emit_next, P4::None, 0);
+    }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, emit_next, P4::None, 0);
+    }
+    if let Some(cov) = &covering {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, cov, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+    b.resolve_label(emit_next);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let emit_next_addr = b.current_addr() as i32;
+    b.emit_op(Opcode::Next, idx_cursor, emit_next_addr + 2, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.emit_op(Opcode::Goto, 0, emit_run_addr, 0, P4::None, 0);
+
+    // advance: skip to the next distinct leading value.
+    b.resolve_label(advance);
+    b.emit_op(Opcode::Copy, x_reg, probe_base, 0, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, probe_base, 1, probe_rec, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_rec,
+        done_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Goto, 0, outer, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// IS-NULL skip scan (bd-nax2y): `WHERE <second_col> IS NULL`. The `(x, NULL)` run sits at the START of
+/// each leading block (NULLs sort first), so per distinct leading value the scan emits that run and
+/// `SeekGT [x]` to the next value — no walk or seek within a block. Streams `x ASC (NULLs first), rowid
+/// ASC`, so a matching ORDER BY elides the sorter and LIMIT/OFFSET stream. Byte-identical to C SQLite.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_skip_scan_is_null(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    limit_clause: Option<&LimitClause>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    // LIMIT/OFFSET streaming (only reached when a matching ORDER BY makes the top-N deterministic).
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off, r);
+            r
+        })
+    });
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
+    let covering = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table = covering.is_none();
+    if needs_table {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+
+    let x_reg = b.alloc_reg();
+    let cur_x_reg = b.alloc_reg();
+    let a_reg = b.alloc_reg();
+    let probe_base = b.alloc_reg();
+    let probe_rec = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+
+    let emit_run = b.emit_label();
+    let advance = b.emit_label();
+    let bin = || P4::Collation("BINARY".to_owned());
+
+    // outer: at the first entry of a new distinct leading value (the block's NULL run, if any).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let outer = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, idx_cursor, 0, x_reg, P4::None, 0);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    // A non-NULL second key at the block start means the block has no NULL run — advance.
+    b.emit_jump_to_label(Opcode::NotNull, a_reg, 0, advance, P4::None, 0);
+    // fall through to emit_run (the second key is NULL).
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let emit_run_addr = b.current_addr() as i32;
+    b.resolve_label(emit_run);
+    b.emit_op(Opcode::Column, idx_cursor, 0, cur_x_reg, P4::None, 0);
+    b.emit_op(Opcode::Ne, x_reg, outer, cur_x_reg, bin(), 0x80);
+    b.emit_op(Opcode::Column, idx_cursor, 1, a_reg, P4::None, 0);
+    // The NULL run ends at the first non-NULL second key (sorted ascending, NULLs first) — advance.
+    b.emit_jump_to_label(Opcode::NotNull, a_reg, 0, advance, P4::None, 0);
     b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
     let emit_next = b.emit_label();
     if needs_table {
