@@ -12,6 +12,9 @@
 //! but is defined here to avoid a circular crate dependency.  Higher layers
 //! (`fsqlite-core`) provide an adapter bridging the two at runtime.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
@@ -30,20 +33,31 @@ use crate::wal::WalFile;
 // CheckpointTarget trait
 // ---------------------------------------------------------------------------
 
+/// Object-safe future returned by [`CheckpointTarget`] operations.
+///
+/// Keeping the future behind a box allows checkpoint targets to remain usable
+/// through `dyn CheckpointTarget` while each I/O step is awaited in sequence.
+pub type CheckpointTargetFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 /// Write-back interface for checkpoint page transfers.
 ///
 /// Implementors push WAL frame content into the main database file.
 /// This trait is intentionally **not** sealed so that `fsqlite-core` can
 /// provide the concrete adapter at runtime.
-pub trait CheckpointTarget {
+pub trait CheckpointTarget: Send {
     /// Write `data` for `page_no` directly to the database file.
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> CheckpointTargetFuture<'a, ()>;
 
     /// Truncate the database file to exactly `n_pages` pages.
-    fn truncate_db(&mut self, cx: &Cx, n_pages: u32) -> Result<()>;
+    fn truncate_db<'a>(&'a mut self, cx: &'a Cx, n_pages: u32) -> CheckpointTargetFuture<'a, ()>;
 
     /// Sync the database file to stable storage.
-    fn sync_db(&mut self, cx: &Cx) -> Result<()>;
+    fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()>;
 
     /// Read back a page's current on-disk content, if the target supports
     /// it.  Used by the post-checkpoint checksum verification path
@@ -53,13 +67,13 @@ pub trait CheckpointTarget {
     /// The default implementation returns `None`, which skips verification.
     /// Concrete `CheckpointTarget`s that back a real VFS file should
     /// override this with the equivalent of `vfs.read(db_fd, buf, offset)`.
-    fn read_page_if_supported(
-        &self,
-        _cx: &Cx,
+    fn read_page_if_supported<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
         _page_no: PageNumber,
-        _buf: &mut [u8],
-    ) -> Result<Option<usize>> {
-        Ok(None)
+        _buf: &'a mut [u8],
+    ) -> CheckpointTargetFuture<'a, Option<usize>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -97,7 +111,7 @@ pub struct CheckpointExecutionResult {
 ///
 /// Propagates any I/O error from `WalFile`, `CheckpointTarget`, or VFS.
 #[allow(clippy::too_many_lines)]
-pub fn execute_checkpoint<F: VfsFile>(
+pub async fn execute_checkpoint<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     mode: CheckpointMode,
@@ -133,7 +147,7 @@ pub fn execute_checkpoint<F: VfsFile>(
 
         // Pass 1: Find the latest frame index for each page in the checkpoint range.
         for frame_idx in start..end {
-            let header = wal.read_frame_header(cx, frame_idx)?;
+            let header = wal.read_frame_header(cx, frame_idx).await?;
 
             let page_no =
                 PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
@@ -167,9 +181,9 @@ pub fn execute_checkpoint<F: VfsFile>(
                 }
             }
 
-            wal.read_frame_into(cx, *frame_idx, &mut frame_buf)?;
+            wal.read_frame_into(cx, *frame_idx, &mut frame_buf).await?;
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
-            target.write_page(cx, *page_no, page_data)?;
+            target.write_page(cx, *page_no, page_data).await?;
 
             // bd-yfdb6: capture the expected post-checkpoint checksum so the
             // truncate path can verify disk state before discarding WAL
@@ -194,14 +208,14 @@ pub fn execute_checkpoint<F: VfsFile>(
         }
 
         // Sync database after all frame writes.
-        target.sync_db(cx)?;
+        target.sync_db(cx).await?;
 
         // If the checkpoint completed fully, truncate the database to the last
         // committed size.
         if matches!(plan.progress, CheckpointProgress::Complete) {
             if let Some(db_size) = last_db_size {
-                target.truncate_db(cx, db_size)?;
-                target.sync_db(cx)?;
+                target.truncate_db(cx, db_size).await?;
+                target.sync_db(cx).await?;
             }
         }
     }
@@ -212,7 +226,8 @@ pub fn execute_checkpoint<F: VfsFile>(
     // path can verify on-disk DB state matches the post-checkpoint
     // state before truncating (both bd-yfdb6).
     let wal_was_reset =
-        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)?;
+        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)
+            .await?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -241,7 +256,7 @@ pub fn execute_checkpoint<F: VfsFile>(
     })
 }
 
-fn apply_checkpoint_post_action<F: VfsFile>(
+async fn apply_checkpoint_post_action<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
@@ -266,7 +281,14 @@ fn apply_checkpoint_post_action<F: VfsFile>(
             // prior generation; recovery can no longer replay them, so the
             // database file must be durably up to date first. A failure here
             // MUST prevent the reset; `?` accomplishes that.
-            crate::recovery_fence::ensure_db_fsync_before_wal_truncate(cx, target)?;
+            target.sync_db(cx).await.map_err(|err| {
+                tracing::error!(
+                    target: "fsqlite.wal.recovery_fence",
+                    error = %err,
+                    "fsync(db) before WAL truncate failed; refusing to truncate"
+                );
+                err
+            })?;
 
             // bd-yfdb6: if the target supports read-back, verify that
             // every page we just checkpointed still matches its
@@ -279,7 +301,8 @@ fn apply_checkpoint_post_action<F: VfsFile>(
                     target,
                     wal.page_size(),
                     expected_checksums,
-                )?;
+                )
+                .await?;
                 if let CheckpointChecksumVerdict::Mismatch { first_bad_page } = verdict {
                     tracing::error!(
                         target: "fsqlite.wal.recovery_fence",
@@ -295,7 +318,7 @@ fn apply_checkpoint_post_action<F: VfsFile>(
                     });
                 }
             }
-            wal.reset(cx, new_seq, new_salts, truncate)?;
+            wal.reset(cx, new_seq, new_salts, truncate).await?;
             info!(
                 new_checkpoint_seq = new_seq,
                 action = ?post_action,
@@ -313,15 +336,17 @@ fn apply_checkpoint_post_action<F: VfsFile>(
 /// (`read_page_if_supported` returns `None`), verification is silently
 /// skipped — which matches the audit-requested behaviour of "additive
 /// insurance, not a hard invariant" for targets without a read path.
-fn verify_checkpoint_checksums_via_target(
+async fn verify_checkpoint_checksums_via_target(
     cx: &Cx,
-    target: &impl CheckpointTarget,
+    target: &mut impl CheckpointTarget,
     page_size: usize,
     expected: &[ExpectedPageChecksum],
 ) -> Result<CheckpointChecksumVerdict> {
     let mut buf = vec![0u8; page_size];
     for exp in expected {
-        let maybe_read = target.read_page_if_supported(cx, exp.page, &mut buf)?;
+        let maybe_read = target
+            .read_page_if_supported(cx, exp.page, &mut buf)
+            .await?;
         let Some(n) = maybe_read else {
             // Target does not support read-back; abort further checks.
             return Ok(CheckpointChecksumVerdict::Match);
@@ -353,6 +378,7 @@ mod tests {
 
     use super::*;
     use crate::checksum::WalSalts;
+    use crate::test_support::FutureResultTestExt as _;
 
     const PAGE_SIZE: u32 = 4096;
 
@@ -403,19 +429,34 @@ mod tests {
     }
 
     impl CheckpointTarget for RecordingTarget {
-        fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.pages.push((page_no, data.to_vec()));
-            Ok(())
+        fn write_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.pages.push((page_no, data.to_vec()));
+                Ok(())
+            })
         }
 
-        fn truncate_db(&mut self, _cx: &Cx, n_pages: u32) -> Result<()> {
-            self.truncate_to = Some(n_pages);
-            Ok(())
+        fn truncate_db<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.truncate_to = Some(n_pages);
+                Ok(())
+            })
         }
 
-        fn sync_db(&mut self, _cx: &Cx) -> Result<()> {
-            self.sync_count += 1;
-            Ok(())
+        fn sync_db<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.sync_count += 1;
+                Ok(())
+            })
         }
     }
 
@@ -866,7 +907,7 @@ mod tests {
     #[test]
     fn test_recording_target_read_page_default_returns_none() {
         let cx = test_cx();
-        let target = RecordingTarget::new();
+        let mut target = RecordingTarget::new();
         let mut buf = vec![0u8; 4096];
         let page = PageNumber::new(1).expect("valid page");
         let result = target
@@ -1092,7 +1133,7 @@ mod tests {
 
     #[test]
     fn checkpoint_target_default_read_page_returns_none() {
-        let target = RecordingTarget::new();
+        let mut target = RecordingTarget::new();
         let cx = test_cx();
         let page = PageNumber::new(1).expect("valid");
         let mut buf = [0u8; 4096];
@@ -1174,22 +1215,33 @@ mod tests {
     }
 
     impl CheckpointTarget for FailingSyncTarget {
-        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.inner.write_page(cx, page_no, data)
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move { self.inner.write_page(cx, page_no, data).await })
         }
 
-        fn truncate_db(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
-            self.inner.truncate_db(cx, n_pages)
+        fn truncate_db<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move { self.inner.truncate_db(cx, n_pages).await })
         }
 
-        fn sync_db(&mut self, cx: &Cx) -> Result<()> {
-            self.inner.sync_db(cx)?;
-            if self.inner.sync_count >= self.fail_from_call {
-                return Err(FrankenError::Io(std::io::Error::other(
-                    "injected sync_db failure at durability fence",
-                )));
-            }
-            Ok(())
+        fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.inner.sync_db(cx).await?;
+                if self.inner.sync_count >= self.fail_from_call {
+                    return Err(FrankenError::Io(std::io::Error::other(
+                        "injected sync_db failure at durability fence",
+                    )));
+                }
+                Ok(())
+            })
         }
     }
 

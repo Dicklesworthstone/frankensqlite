@@ -41,12 +41,12 @@ hashbrown.workspace = true
 dashmap.workspace = true
 tracing.workspace = true
 blake3 = { workspace = true }
+asupersync.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-asupersync.workspace = true
 proptest = { workspace = true }
 tempfile = { workspace = true }
 fsqlite-mvcc = { path = "../fsqlite-mvcc", version = "0.1.19" }

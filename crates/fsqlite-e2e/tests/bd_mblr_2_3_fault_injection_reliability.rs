@@ -305,7 +305,7 @@ impl<F: VfsFile> VfsFile for TargetedFaultFile<F> {
         }
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         self.inner.write(cx, buf, offset)
     }
 
@@ -1013,7 +1013,7 @@ impl<F: VfsFile> VfsFile for VacuumFaultFile<F> {
         self.inner.read(cx, buf, offset)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         match take_silent_replay_write_action(&self.state, self.role) {
             Some(SilentReplayWriteAction::TriggerRollback) => {
                 self.inner.write(cx, buf, offset)?;

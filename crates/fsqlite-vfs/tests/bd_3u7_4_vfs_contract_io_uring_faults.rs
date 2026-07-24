@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(all(feature = "native", target_os = "linux"))]
 use std::time::Instant;
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -24,6 +25,12 @@ const BENCH_PAGE_COUNT: u64 = 128;
 #[cfg(all(feature = "native", target_os = "linux"))]
 const DEFAULT_BENCH_ITERS: usize = 1024;
 
+fn test_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("build async VFS test runtime")
+}
+
 fn open_main_rw_file<V: Vfs>(vfs: &V, cx: &Cx, path: &Path) -> Result<(V::File, VfsOpenFlags)> {
     vfs.open(
         cx,
@@ -42,59 +49,63 @@ fn open_data_path_file<V: Vfs>(vfs: &V, cx: &Cx, path: &Path) -> Result<(V::File
 }
 
 fn exercise_named_file_contract<V: Vfs>(vfs: &V, path: &Path) -> Result<()> {
-    let cx = Cx::new();
-    assert!(!vfs.access(&cx, path, AccessFlags::EXISTS)?);
+    test_runtime().block_on(async {
+        let cx = Cx::new();
+        assert!(!vfs.access(&cx, path, AccessFlags::EXISTS)?);
 
-    let (mut file, out_flags) = open_main_rw_file(vfs, &cx, path)?;
-    assert!(out_flags.contains(VfsOpenFlags::READWRITE));
+        let (mut file, out_flags) = open_main_rw_file(vfs, &cx, path)?;
+        assert!(out_flags.contains(VfsOpenFlags::READWRITE));
 
-    file.write(&cx, b"xyz", 5)?;
-    assert_eq!(file.file_size(&cx)?, 8);
+        file.write(&cx, b"xyz", 5).await?;
+        assert_eq!(file.file_size(&cx)?, 8);
 
-    file.sync(&cx, SyncFlags::NORMAL)?;
-    file.sync(&cx, SyncFlags::FULL)?;
-    file.sync(&cx, SyncFlags::DATAONLY)?;
+        file.sync(&cx, SyncFlags::NORMAL)?;
+        file.sync(&cx, SyncFlags::FULL)?;
+        file.sync(&cx, SyncFlags::DATAONLY)?;
 
-    let mut buf = [0_u8; 10];
-    let read = file.read(&cx, &mut buf, 0)?;
-    assert_eq!(read, 8);
-    assert_eq!(&buf[..5], &[0_u8; 5]);
-    assert_eq!(&buf[5..8], b"xyz");
-    assert_eq!(&buf[8..], &[0_u8; 2]);
+        let mut buf = [0_u8; 10];
+        let read = file.read(&cx, &mut buf, 0).await?;
+        assert_eq!(read, 8);
+        assert_eq!(&buf[..5], &[0_u8; 5]);
+        assert_eq!(&buf[5..8], b"xyz");
+        assert_eq!(&buf[8..], &[0_u8; 2]);
 
-    file.close(&cx)?;
-    file.close(&cx)?;
-    assert!(vfs.access(&cx, path, AccessFlags::EXISTS)?);
+        file.close(&cx)?;
+        file.close(&cx)?;
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS)?);
 
-    let (mut reopened, _) = open_main_rw_file(vfs, &cx, path)?;
-    let mut reopened_buf = [0_u8; 8];
-    let reopened_read = reopened.read(&cx, &mut reopened_buf, 0)?;
-    assert_eq!(reopened_read, 8);
-    assert_eq!(&reopened_buf[..5], &[0_u8; 5]);
-    assert_eq!(&reopened_buf[5..], b"xyz");
-    reopened.close(&cx)?;
+        let (mut reopened, _) = open_main_rw_file(vfs, &cx, path)?;
+        let mut reopened_buf = [0_u8; 8];
+        let reopened_read = reopened.read(&cx, &mut reopened_buf, 0).await?;
+        assert_eq!(reopened_read, 8);
+        assert_eq!(&reopened_buf[..5], &[0_u8; 5]);
+        assert_eq!(&reopened_buf[5..], b"xyz");
+        reopened.close(&cx)?;
 
-    vfs.delete(&cx, path, false)?;
-    assert!(!vfs.access(&cx, path, AccessFlags::EXISTS)?);
-    Ok(())
+        vfs.delete(&cx, path, false)?;
+        assert!(!vfs.access(&cx, path, AccessFlags::EXISTS)?);
+        Ok(())
+    })
 }
 
 fn exercise_delete_on_close_contract<V: Vfs>(vfs: &V, path: &Path) -> Result<()> {
-    let cx = Cx::new();
-    let (mut file, out_flags) = vfs.open(
-        &cx,
-        Some(path),
-        VfsOpenFlags::READWRITE
-            | VfsOpenFlags::CREATE
-            | VfsOpenFlags::MAIN_DB
-            | VfsOpenFlags::DELETEONCLOSE,
-    )?;
-    assert!(out_flags.contains(VfsOpenFlags::READWRITE));
-    file.write(&cx, b"drop-me", 0)?;
-    file.close(&cx)?;
-    file.close(&cx)?;
-    assert!(!vfs.access(&cx, path, AccessFlags::EXISTS)?);
-    Ok(())
+    test_runtime().block_on(async {
+        let cx = Cx::new();
+        let (mut file, out_flags) = vfs.open(
+            &cx,
+            Some(path),
+            VfsOpenFlags::READWRITE
+                | VfsOpenFlags::CREATE
+                | VfsOpenFlags::MAIN_DB
+                | VfsOpenFlags::DELETEONCLOSE,
+        )?;
+        assert!(out_flags.contains(VfsOpenFlags::READWRITE));
+        file.write(&cx, b"drop-me", 0).await?;
+        file.close(&cx)?;
+        file.close(&cx)?;
+        assert!(!vfs.access(&cx, path, AccessFlags::EXISTS)?);
+        Ok(())
+    })
 }
 
 #[test]
@@ -140,29 +151,31 @@ fn lcg_next(state: &mut u64) -> u64 {
 
 #[cfg(all(feature = "native", target_os = "linux"))]
 fn run_random_4k_read_benchmark<V: Vfs>(vfs: &V, path: &Path, iterations: usize) -> Result<f64> {
-    let cx = Cx::new();
-    let (mut file, _) = open_data_path_file(vfs, &cx, path)?;
-    let page = [0xAB_u8; PAGE_SIZE];
+    test_runtime().block_on(async {
+        let cx = Cx::new();
+        let (mut file, _) = open_data_path_file(vfs, &cx, path)?;
+        let page = [0xAB_u8; PAGE_SIZE];
 
-    for page_index in 0..BENCH_PAGE_COUNT {
-        file.write(&cx, &page, page_index * PAGE_SIZE_U64)?;
-    }
-    file.sync(&cx, SyncFlags::NORMAL)?;
+        for page_index in 0..BENCH_PAGE_COUNT {
+            file.write(&cx, &page, page_index * PAGE_SIZE_U64).await?;
+        }
+        file.sync(&cx, SyncFlags::NORMAL)?;
 
-    let mut seed = 0x3A7D_4F4A_u64;
-    let mut buf = [0_u8; PAGE_SIZE];
-    let started = Instant::now();
-    for _ in 0..iterations {
-        let page_index = lcg_next(&mut seed) % BENCH_PAGE_COUNT;
-        let read = file.read(&cx, &mut buf, page_index * PAGE_SIZE_U64)?;
-        assert_eq!(read, PAGE_SIZE);
-        std::hint::black_box(buf[0]);
-    }
+        let mut seed = 0x3A7D_4F4A_u64;
+        let mut buf = [0_u8; PAGE_SIZE];
+        let started = Instant::now();
+        for _ in 0..iterations {
+            let page_index = lcg_next(&mut seed) % BENCH_PAGE_COUNT;
+            let read = file.read(&cx, &mut buf, page_index * PAGE_SIZE_U64).await?;
+            assert_eq!(read, PAGE_SIZE);
+            std::hint::black_box(buf[0]);
+        }
 
-    file.close(&cx)?;
-    let elapsed = started.elapsed().as_secs_f64();
-    assert!(elapsed > 0.0);
-    Ok(iterations as f64 / elapsed)
+        file.close(&cx)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        assert!(elapsed > 0.0);
+        Ok(iterations as f64 / elapsed)
+    })
 }
 
 #[cfg(all(feature = "native", target_os = "linux"))]
@@ -339,38 +352,54 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
         self.inner.close(cx)
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let maybe_fault = self
-            .faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_read
-            .take();
-        match maybe_fault {
-            Some(InjectedReadFault::Io) => Err(injected_io_error("fault injection: read failure")),
-            None => self.inner.read(cx, buf, offset),
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            let maybe_fault = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_read
+                .take();
+            match maybe_fault {
+                Some(InjectedReadFault::Io) => {
+                    Err(injected_io_error("fault injection: read failure"))
+                }
+                None => self.inner.read(cx, buf, offset).await,
+            }
         }
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        let maybe_fault = self
-            .faults
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_write
-            .take();
-        match maybe_fault {
-            Some(InjectedWriteFault::Io) => {
-                Err(injected_io_error("fault injection: write failure"))
-            }
-            Some(InjectedWriteFault::Partial { valid_bytes }) => {
-                let applied = valid_bytes.min(buf.len());
-                if applied > 0 {
-                    self.inner.write(cx, &buf[..applied], offset)?;
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            let maybe_fault = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_write
+                .take();
+            match maybe_fault {
+                Some(InjectedWriteFault::Io) => {
+                    Err(injected_io_error("fault injection: write failure"))
                 }
-                Err(injected_io_error("fault injection: partial write"))
+                Some(InjectedWriteFault::Partial { valid_bytes }) => {
+                    let applied = valid_bytes.min(buf.len());
+                    if applied > 0 {
+                        self.inner.write(cx, &buf[..applied], offset).await?;
+                    }
+                    Err(injected_io_error("fault injection: partial write"))
+                }
+                None => self.inner.write(cx, buf, offset).await,
             }
-            None => self.inner.write(cx, buf, offset),
         }
     }
 
@@ -444,49 +473,54 @@ impl<F: VfsFile> VfsFile for TestFaultFile<F> {
 
 #[test]
 fn fault_injection_wrapper_surfaces_read_write_sync_and_partial_write_errors() -> Result<()> {
-    let cx = Cx::new();
-    let vfs = TestFaultVfs::new(MemoryVfs::new());
-    let (mut file, _) = open_main_rw_file(&vfs, &cx, Path::new("bd_3u7_4_faults.db"))?;
+    test_runtime().block_on(async {
+        let cx = Cx::new();
+        let vfs = TestFaultVfs::new(MemoryVfs::new());
+        let (mut file, _) = open_main_rw_file(&vfs, &cx, Path::new("bd_3u7_4_faults.db"))?;
 
-    file.write(&cx, b"abcdefgh", 0)?;
+        file.write(&cx, b"abcdefgh", 0).await?;
 
-    vfs.inject_read_io();
-    let mut read_buf = [0_u8; 8];
-    let read_err = file
-        .read(&cx, &mut read_buf, 0)
-        .expect_err("faulted read should fail");
-    assert!(matches!(read_err, FrankenError::Io(_)));
+        vfs.inject_read_io();
+        let mut read_buf = [0_u8; 8];
+        let read_err = file
+            .read(&cx, &mut read_buf, 0)
+            .await
+            .expect_err("faulted read should fail");
+        assert!(matches!(read_err, FrankenError::Io(_)));
 
-    let read = file.read(&cx, &mut read_buf, 0)?;
-    assert_eq!(read, 8);
-    assert_eq!(&read_buf, b"abcdefgh");
+        let read = file.read(&cx, &mut read_buf, 0).await?;
+        assert_eq!(read, 8);
+        assert_eq!(&read_buf, b"abcdefgh");
 
-    vfs.inject_write_io();
-    let write_err = file
-        .write(&cx, b"ZZ", 0)
-        .expect_err("faulted write should fail");
-    assert!(matches!(write_err, FrankenError::Io(_)));
+        vfs.inject_write_io();
+        let write_err = file
+            .write(&cx, b"ZZ", 0)
+            .await
+            .expect_err("faulted write should fail");
+        assert!(matches!(write_err, FrankenError::Io(_)));
 
-    let read = file.read(&cx, &mut read_buf, 0)?;
-    assert_eq!(read, 8);
-    assert_eq!(&read_buf, b"abcdefgh");
+        let read = file.read(&cx, &mut read_buf, 0).await?;
+        assert_eq!(read, 8);
+        assert_eq!(&read_buf, b"abcdefgh");
 
-    vfs.inject_partial_write(3);
-    let partial_err = file
-        .write(&cx, b"XYZW", 4)
-        .expect_err("partial write fault should fail");
-    assert!(matches!(partial_err, FrankenError::Io(_)));
+        vfs.inject_partial_write(3);
+        let partial_err = file
+            .write(&cx, b"XYZW", 4)
+            .await
+            .expect_err("partial write fault should fail");
+        assert!(matches!(partial_err, FrankenError::Io(_)));
 
-    let read = file.read(&cx, &mut read_buf, 0)?;
-    assert_eq!(read, 8);
-    assert_eq!(&read_buf, b"abcdXYZh");
+        let read = file.read(&cx, &mut read_buf, 0).await?;
+        assert_eq!(read, 8);
+        assert_eq!(&read_buf, b"abcdXYZh");
 
-    vfs.inject_sync_io();
-    let sync_err = file
-        .sync(&cx, SyncFlags::FULL)
-        .expect_err("faulted sync should fail");
-    assert!(matches!(sync_err, FrankenError::Io(_)));
+        vfs.inject_sync_io();
+        let sync_err = file
+            .sync(&cx, SyncFlags::FULL)
+            .expect_err("faulted sync should fail");
+        assert!(matches!(sync_err, FrankenError::Io(_)));
 
-    file.close(&cx)?;
-    Ok(())
+        file.close(&cx)?;
+        Ok(())
+    })
 }

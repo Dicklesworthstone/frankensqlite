@@ -1543,6 +1543,45 @@ impl GroupCommitConsolidator {
         false
     }
 
+    /// Abort a not-yet-started filling epoch after its elected flusher is
+    /// cancelled.
+    ///
+    /// No WAL bytes have been written while the consolidator is still in
+    /// `Filling`, so every queued batch can fail atomically. The failed epoch
+    /// is consumed before returning; the next submitter therefore receives a
+    /// fresh target epoch instead of colliding with retained failure metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless a non-empty filling epoch is active.
+    pub fn abort_filling(&mut self) -> Result<u64> {
+        if self.phase != ConsolidationPhase::Filling || self.pending_batches.is_empty() {
+            return Err(FrankenError::Internal(format!(
+                "abort_filling called in {:?} phase with {} pending batches",
+                self.phase,
+                self.pending_batches.len()
+            )));
+        }
+
+        let failed_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(FrankenError::DatabaseFull)?;
+        self.epoch = failed_epoch;
+        self.pending_batches.clear();
+        self.pending_frame_count = 0;
+        self.filling_started = None;
+        self.phase = ConsolidationPhase::Complete;
+        self.promoted_epoch_flusher_vacant = false;
+
+        debug!(
+            target: "fsqlite_wal::group_commit",
+            epoch = failed_epoch,
+            "abort_filling: FILLING → COMPLETE"
+        );
+        Ok(failed_epoch)
+    }
+
     /// Abort the current flush after the flusher observed an I/O error.
     ///
     /// This transitions the state machine out of `Flushing` so waiters can be
@@ -1619,7 +1658,7 @@ impl GroupCommitConsolidator {
 /// frame in the batch, maintaining the checksum chain invariant.
 ///
 /// Returns the number of frames written.
-pub fn write_consolidated_frames<F: VfsFile>(
+pub async fn write_consolidated_frames<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     batches: &[TransactionFrameBatch],
@@ -1650,7 +1689,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
     );
     let _guard = span.enter();
 
-    wal.append_frame_iter(cx, total_frames, frame_refs)?;
+    wal.append_frame_iter(cx, total_frames, frame_refs).await?;
     wal.durable_sync(cx, SyncKind::FullDurable)?;
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
 
@@ -1677,6 +1716,7 @@ mod tests {
 
     use super::*;
     use crate::checksum::WalSalts;
+    use crate::test_support::FutureResultTestExt as _;
 
     const PAGE_SIZE: u32 = 4096;
 
@@ -1777,6 +1817,43 @@ mod tests {
         );
         assert_eq!(c.pending_frame_count(), 2);
         assert_eq!(c.pending_batch_count(), 2);
+    }
+
+    #[test]
+    fn test_consolidator_cancelled_filling_epoch_is_consumed_atomically() {
+        let mut c = GroupCommitConsolidator::new(GroupCommitConfig::default());
+        for page_number in 1..=2 {
+            let receipt = c
+                .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                    page_number,
+                    page_data: sample_page(u8::try_from(page_number).unwrap()),
+                    db_size_if_commit: page_number,
+                }]))
+                .unwrap();
+            assert_eq!(
+                receipt.target_epoch, 1,
+                "every member of the filling group must share the failed epoch"
+            );
+        }
+
+        assert_eq!(c.abort_filling().unwrap(), 1);
+        assert_eq!(c.phase(), ConsolidationPhase::Complete);
+        assert_eq!(c.epoch(), 1);
+        assert_eq!(c.pending_batch_count(), 0);
+        assert_eq!(c.pending_frame_count(), 0);
+
+        let replacement = c
+            .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 3,
+                page_data: sample_page(0x03),
+                db_size_if_commit: 3,
+            }]))
+            .unwrap();
+        assert_eq!(replacement.outcome, SubmitOutcome::Flusher);
+        assert_eq!(
+            replacement.target_epoch, 2,
+            "a retained failure for epoch 1 must not poison the next group"
+        );
     }
 
     #[test]

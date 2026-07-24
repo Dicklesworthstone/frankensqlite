@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
@@ -22,6 +23,13 @@ use fsqlite_vfs::{MemoryVfs, ShmRegion, Vfs, VfsFile};
 use serde_json::json;
 
 const BEAD_ID: &str = "bd-ggxs";
+
+fn run_io<F: std::future::Future>(future: F) -> F::Output {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("build async VFS test runtime")
+        .block_on(future)
+}
 
 fn workspace_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -54,40 +62,40 @@ fn test_cx_param_audit_vfs_traits() {
         v.full_pathname(cx, Path::new("x.db"))
     }
 
-    fn _close(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    fn _close<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.close(cx)
     }
-    fn _read(f: &mut dyn VfsFile, cx: &Cx, buf: &mut [u8], off: u64) -> Result<usize> {
-        f.read(cx, buf, off)
+    async fn _read<F: VfsFile>(f: &F, cx: &Cx, buf: &mut [u8], off: u64) -> Result<usize> {
+        f.read(cx, buf, off).await
     }
-    fn _write(f: &mut dyn VfsFile, cx: &Cx, buf: &[u8], off: u64) -> Result<()> {
-        f.write(cx, buf, off)
+    async fn _write<F: VfsFile>(f: &F, cx: &Cx, buf: &[u8], off: u64) -> Result<()> {
+        f.write(cx, buf, off).await
     }
-    fn _truncate(f: &mut dyn VfsFile, cx: &Cx, size: u64) -> Result<()> {
+    fn _truncate<F: VfsFile>(f: &mut F, cx: &Cx, size: u64) -> Result<()> {
         f.truncate(cx, size)
     }
-    fn _sync(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    fn _sync<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.sync(cx, SyncFlags::NORMAL)
     }
-    fn _file_size(f: &dyn VfsFile, cx: &Cx) -> Result<u64> {
+    fn _file_size<F: VfsFile>(f: &F, cx: &Cx) -> Result<u64> {
         f.file_size(cx)
     }
-    fn _lock(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    fn _lock<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.lock(cx, LockLevel::Shared)
     }
-    fn _unlock(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    fn _unlock<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.unlock(cx, LockLevel::None)
     }
-    fn _check_reserved_lock(f: &dyn VfsFile, cx: &Cx) -> Result<bool> {
+    fn _check_reserved_lock<F: VfsFile>(f: &F, cx: &Cx) -> Result<bool> {
         f.check_reserved_lock(cx)
     }
-    fn _shm_map(f: &mut dyn VfsFile, cx: &Cx) -> Result<ShmRegion> {
+    fn _shm_map<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<ShmRegion> {
         f.shm_map(cx, 0, 32 * 1024, false)
     }
-    fn _shm_lock(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    fn _shm_lock<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.shm_lock(cx, 0, 1, 0)
     }
-    fn _shm_unmap(f: &mut dyn VfsFile, cx: &Cx) -> Result<()> {
+    fn _shm_unmap<F: VfsFile>(f: &mut F, cx: &Cx) -> Result<()> {
         f.shm_unmap(cx, false)
     }
 
@@ -96,18 +104,18 @@ fn test_cx_param_audit_vfs_traits() {
     let _ = _delete::<MemoryVfs> as fn(&MemoryVfs, &Cx) -> Result<()>;
     let _ = _access::<MemoryVfs> as fn(&MemoryVfs, &Cx) -> Result<bool>;
     let _ = _full_pathname::<MemoryVfs> as fn(&MemoryVfs, &Cx) -> Result<PathBuf>;
-    let _ = _close as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
-    let _ = _read as fn(&mut dyn VfsFile, &Cx, &mut [u8], u64) -> Result<usize>;
-    let _ = _write as fn(&mut dyn VfsFile, &Cx, &[u8], u64) -> Result<()>;
-    let _ = _truncate as fn(&mut dyn VfsFile, &Cx, u64) -> Result<()>;
-    let _ = _sync as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
-    let _ = _file_size as fn(&dyn VfsFile, &Cx) -> Result<u64>;
-    let _ = _lock as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
-    let _ = _unlock as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
-    let _ = _check_reserved_lock as fn(&dyn VfsFile, &Cx) -> Result<bool>;
-    let _ = _shm_map as fn(&mut dyn VfsFile, &Cx) -> Result<ShmRegion>;
-    let _ = _shm_lock as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
-    let _ = _shm_unmap as fn(&mut dyn VfsFile, &Cx) -> Result<()>;
+    let _ = _close::<fsqlite_vfs::MemoryFile>;
+    let _ = _read::<fsqlite_vfs::MemoryFile>;
+    let _ = _write::<fsqlite_vfs::MemoryFile>;
+    let _ = _truncate::<fsqlite_vfs::MemoryFile>;
+    let _ = _sync::<fsqlite_vfs::MemoryFile>;
+    let _ = _file_size::<fsqlite_vfs::MemoryFile>;
+    let _ = _lock::<fsqlite_vfs::MemoryFile>;
+    let _ = _unlock::<fsqlite_vfs::MemoryFile>;
+    let _ = _check_reserved_lock::<fsqlite_vfs::MemoryFile>;
+    let _ = _shm_map::<fsqlite_vfs::MemoryFile>;
+    let _ = _shm_lock::<fsqlite_vfs::MemoryFile>;
+    let _ = _shm_unmap::<fsqlite_vfs::MemoryFile>;
 }
 
 #[test]
@@ -276,11 +284,21 @@ impl VfsFile for DummyFile {
     fn close(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
-    fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
-        Ok(0)
+    fn read<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _buf: &'a mut [u8],
+        _offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async { Ok(0) }
     }
-    fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
-        Ok(())
+    fn write<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _buf: &'a [u8],
+        _offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
     }
     fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
         Ok(())
@@ -497,15 +515,13 @@ fn test_cx_cancellation_propagates_on_real_vfs_io_path() {
     let (mut file, _) = vfs
         .open(&open_cx, Some(Path::new("cancel-smoke.db")), flags)
         .expect("open should succeed before cancellation");
-    file.write(&open_cx, b"x", 0)
-        .expect("initial write should succeed");
+    run_io(file.write(&open_cx, b"x", 0)).expect("initial write should succeed");
 
     let cancelled_cx = Cx::new();
     cancelled_cx.cancel();
 
     let mut buf = [0_u8; 1];
-    let err = file
-        .read(&cancelled_cx, &mut buf, 0)
+    let err = run_io(file.read(&cancelled_cx, &mut buf, 0))
         .expect_err("read should fail once Cx is cancelled");
     assert!(matches!(err, FrankenError::Abort));
 }
@@ -612,7 +628,7 @@ impl RecordingVfs {
 struct RecordingFile {
     log: RecordingLog,
     fail_write: bool,
-    bytes: Vec<u8>,
+    bytes: Mutex<Vec<u8>>,
 }
 
 impl Vfs for RecordingVfs {
@@ -636,7 +652,7 @@ impl Vfs for RecordingVfs {
             RecordingFile {
                 log: self.log.clone(),
                 fail_write: self.fail_write,
-                bytes: Vec::new(),
+                bytes: Mutex::new(Vec::new()),
             },
             flags,
         ))
@@ -664,40 +680,65 @@ impl VfsFile for RecordingFile {
         Ok(())
     }
 
-    fn read(&self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        self.log.push(format!("read:{offset}:{}", buf.len()));
-        let start = usize::try_from(offset).expect("offset must fit usize");
-        if start >= self.bytes.len() {
-            buf.fill(0);
-            return Ok(0);
+    fn read<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            self.log.push(format!("read:{offset}:{}", buf.len()));
+            let bytes = self
+                .bytes
+                .lock()
+                .expect("recording file bytes mutex must not be poisoned");
+            let start = usize::try_from(offset).expect("offset must fit usize");
+            if start >= bytes.len() {
+                buf.fill(0);
+                return Ok(0);
+            }
+            let available = &bytes[start..];
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            if n < buf.len() {
+                buf[n..].fill(0);
+            }
+            Ok(n)
         }
-        let available = &self.bytes[start..];
-        let n = available.len().min(buf.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        if n < buf.len() {
-            buf[n..].fill(0);
-        }
-        Ok(n)
     }
 
-    fn write(&mut self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        self.log.push(format!("write:{offset}:{}", buf.len()));
-        if self.fail_write {
-            return Err(FrankenError::Unsupported);
+    fn write<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            self.log.push(format!("write:{offset}:{}", buf.len()));
+            if self.fail_write {
+                return Err(FrankenError::Unsupported);
+            }
+            let mut bytes = self
+                .bytes
+                .lock()
+                .expect("recording file bytes mutex must not be poisoned");
+            let start = usize::try_from(offset).expect("offset must fit usize");
+            let end = start + buf.len();
+            if end > bytes.len() {
+                bytes.resize(end, 0);
+            }
+            bytes[start..end].copy_from_slice(buf);
+            Ok(())
         }
-        let start = usize::try_from(offset).expect("offset must fit usize");
-        let end = start + buf.len();
-        if end > self.bytes.len() {
-            self.bytes.resize(end, 0);
-        }
-        self.bytes[start..end].copy_from_slice(buf);
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
         self.log.push(format!("truncate:{size}"));
         let new_len = usize::try_from(size).expect("size must fit usize");
-        self.bytes.truncate(new_len);
+        self.bytes
+            .lock()
+            .expect("recording file bytes mutex must not be poisoned")
+            .truncate(new_len);
         Ok(())
     }
 
@@ -707,7 +748,11 @@ impl VfsFile for RecordingFile {
     }
 
     fn file_size(&self, _cx: &Cx) -> Result<u64> {
-        Ok(self.bytes.len() as u64)
+        Ok(self
+            .bytes
+            .lock()
+            .expect("recording file bytes mutex must not be poisoned")
+            .len() as u64)
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
@@ -740,7 +785,7 @@ impl VfsFile for RecordingFile {
 }
 
 #[test]
-fn test_pager_owns_vfs_file() {
+fn test_pager_owns_vfs_file_with_static_dispatch() {
     let cx = Cx::new();
     let vfs = RecordingVfs::new(false);
     let (file, _) = vfs
@@ -751,12 +796,9 @@ fn test_pager_owns_vfs_file() {
         )
         .expect("open should succeed");
 
-    let mut boxed: Box<dyn VfsFile> = Box::new(file);
-    boxed
-        .write(&cx, b"abc", 0)
-        .expect("boxed file write should succeed");
-    boxed
-        .sync(&cx, SyncFlags::NORMAL)
+    let mut file = file;
+    run_io(file.write(&cx, b"abc", 0)).expect("statically dispatched file write should succeed");
+    file.sync(&cx, SyncFlags::NORMAL)
         .expect("sync should succeed");
 
     let log = vfs.log.snapshot();
@@ -905,9 +947,8 @@ fn test_mock_vfs_configurable_errors() {
         )
         .expect("open should succeed");
 
-    let err = file
-        .write(&cx, b"fail-me", 0)
-        .expect_err("write should fail when configured");
+    let err =
+        run_io(file.write(&cx, b"fail-me", 0)).expect_err("write should fail when configured");
     assert!(matches!(err, FrankenError::Unsupported));
 }
 
@@ -1023,7 +1064,7 @@ fn test_e2e_full_layer_stack() {
             VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE,
         )
         .expect("open should succeed");
-    file.write(&cx, b"stack", 0).expect("write should succeed");
+    run_io(file.write(&cx, b"stack", 0)).expect("write should succeed");
 
     let pager = MockMvccPager;
     let txn = pager
@@ -1078,9 +1119,8 @@ fn test_e2e_mock_vfs_error_propagation() {
         )
         .expect("open should succeed");
 
-    let err = file
-        .write(&cx, b"boom", 0)
-        .expect_err("configured write failure should propagate");
+    let err =
+        run_io(file.write(&cx, b"boom", 0)).expect_err("configured write failure should propagate");
     assert!(matches!(err, FrankenError::Unsupported));
 }
 

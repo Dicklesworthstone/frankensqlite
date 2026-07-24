@@ -1,4 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
@@ -45,6 +46,14 @@ fn test_cx() -> Cx {
     Cx::default()
 }
 
+fn block_on_test<F: Future>(future: F) -> F::Output {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("test runtime should build");
+    runtime.block_on(future)
+}
+
 fn page_size_usize() -> usize {
     usize::try_from(PAGE_SIZE).expect("PAGE_SIZE fits usize")
 }
@@ -80,14 +89,15 @@ fn open_wal_file(vfs: &MemoryVfs, cx: &Cx) -> <MemoryVfs as Vfs>::File {
 
 fn write_frames(vfs: &MemoryVfs, cx: &Cx, seed: u64, frames: &[(u32, u32, u8)]) {
     let file = open_wal_file(vfs, cx);
-    let mut wal = WalFile::create(cx, file, PAGE_SIZE, 0, test_salts(seed)).expect("create wal");
+    let mut wal = block_on_test(WalFile::create(cx, file, PAGE_SIZE, 0, test_salts(seed)))
+        .expect("create wal");
     for (page_number, db_size, marker) in frames {
-        wal.append_frame(
+        block_on_test(wal.append_frame(
             cx,
             *page_number,
             &sample_page(seed, *page_number, *marker),
             *db_size,
-        )
+        ))
         .expect("append frame");
     }
     wal.close(cx).expect("close wal");
@@ -107,20 +117,19 @@ fn flip_byte(vfs: &MemoryVfs, cx: &Cx, offset: usize, xor_mask: u8) {
     let mut file = open_wal_file(vfs, cx);
     let offset_u64 = u64::try_from(offset).expect("offset fits u64");
     let mut byte = [0_u8; 1];
-    file.read(cx, &mut byte, offset_u64).expect("read byte");
+    block_on_test(file.read(cx, &mut byte, offset_u64)).expect("read byte");
     byte[0] ^= xor_mask;
-    file.write(cx, &byte, offset_u64)
-        .expect("write flipped byte");
+    block_on_test(file.write(cx, &byte, offset_u64)).expect("write flipped byte");
 }
 
 fn collect_snapshot(vfs: &MemoryVfs, cx: &Cx) -> (usize, Option<usize>, Vec<FrameSnapshot>) {
     let file = open_wal_file(vfs, cx);
-    let mut wal = WalFile::open(cx, file).expect("open wal");
+    let mut wal = block_on_test(WalFile::open(cx, file)).expect("open wal");
     let frame_count = wal.frame_count();
     let last_commit = wal.last_commit_frame(cx).expect("last commit");
     let mut frames = Vec::with_capacity(frame_count);
     for idx in 0..frame_count {
-        let (header, data) = wal.read_frame(cx, idx).expect("read frame");
+        let (header, data) = block_on_test(wal.read_frame(cx, idx)).expect("read frame");
         frames.push(FrameSnapshot {
             page_number: header.page_number,
             db_size: header.db_size,

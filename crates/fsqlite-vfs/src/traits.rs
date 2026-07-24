@@ -705,21 +705,37 @@ pub trait VfsFile: Send + Sync {
     ///
     /// Returns the number of bytes actually read. If fewer bytes are read
     /// than requested (short read), the remaining bytes in `buf` are zeroed.
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize>;
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a;
 
     /// Write `buf` starting at byte offset `offset`.
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()>;
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a;
 
     /// Write multiple page-sized buffers in one logical operation.
     ///
     /// The default implementation preserves existing semantics by issuing the
     /// writes sequentially through [`Self::write`]. VFS backends may override
     /// this to amortize locking or syscall overhead for hot pager commit paths.
-    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
-        for (offset, data) in writes {
-            self.write(cx, data, *offset)?;
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            for (offset, data) in writes {
+                self.write(cx, data, *offset).await?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Truncate the file to `size` bytes.
@@ -891,80 +907,33 @@ pub trait VfsFile: Send + Sync {
     fn set_busy_timeout_ms(&mut self, _ms: u64) {}
 }
 
-/// Async data-path trait for VFS file I/O (bd-2jpu6.1 Phase 0).
-///
-/// Separates the async read/write data path from the sync `VfsFile` trait
-/// so callers that can drive a future (e.g. pager hot path with io_uring)
-/// avoid `pollster::block_on` overhead. Implementations that have a native
-/// async backend (io_uring via asupersync) override these to submit SQEs
-/// directly; sync-only backends get a default that delegates to `VfsFile`.
-pub trait AsyncVfsDataPath: VfsFile {
-    /// Async read into `buf` at byte `offset`. Returns bytes read; short
-    /// reads zero-fill the remainder (same contract as `VfsFile::read`).
-    fn read_async(
-        &self,
-        cx: &Cx,
-        buf: &mut [u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<usize>> + Send
-    where
-        Self: Sync,
-    {
-        let result = self.read(cx, buf, offset);
-        async move { result }
-    }
-
-    /// Async write of `buf` at byte `offset`.
-    fn write_async(
-        &self,
-        cx: &Cx,
-        buf: &[u8],
-        offset: u64,
-    ) -> impl std::future::Future<Output = Result<()>> + Send
-    where
-        Self: Sync,
-    {
-        // Default: synchronous write — the `&mut self` requirement of
-        // `VfsFile::write` cannot be met through `&self`, so sync-only
-        // backends should override this if they want async write support.
-        let _ = (cx, buf, offset);
-        async { Err(fsqlite_error::FrankenError::Unsupported) }
-    }
-
-    /// Async batch write of page-sized buffers. Default delegates to
-    /// sequential `write_async` calls.
-    fn write_page_batch_async(
-        &self,
-        cx: &Cx,
-        writes: &[(u64, &[u8])],
-    ) -> impl std::future::Future<Output = Result<()>> + Send
-    where
-        Self: Sync,
-    {
-        let results: Vec<Result<()>> = writes
-            .iter()
-            .map(|(offset, data)| {
-                let _ = (cx, *data, *offset);
-                Ok(())
-            })
-            .collect();
-        async move {
-            for r in results {
-                r?;
-            }
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verify that the trait is object-safe for VfsFile (can be used as dyn).
+    fn poll_ready<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+
+        let mut future = std::pin::pin!(future);
+        let mut task_cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut task_cx) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly yielded"),
+        }
+    }
+
+    /// The async data path uses static dispatch so each backend can expose a
+    /// concrete future without boxing page I/O.
     #[test]
-    fn vfs_file_is_object_safe() {
-        fn _accepts_dyn(_f: &dyn VfsFile) {}
+    fn vfs_file_supports_static_dispatch_without_boxing() {
+        fn accepts_static<T: VfsFile>(_file: &T) {}
+
+        let cx = Cx::new();
+        let vfs = crate::memory::MemoryVfs::new();
+        let (file, _) = vfs
+            .open(&cx, None, VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE)
+            .expect("open memory file");
+        accepts_static(&file);
     }
 
     /// Verify default implementations exist and don't panic.
@@ -975,10 +944,10 @@ mod tests {
             fn close(&mut self, _cx: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+            async fn read(&self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
+            async fn write(&self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
@@ -1030,10 +999,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1153,10 +1122,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1205,10 +1174,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
@@ -1244,10 +1213,10 @@ mod tests {
 
         WRITE_COUNT.store(0, Ordering::Relaxed);
         let cx = Cx::new();
-        let mut file = CountingFile;
+        let file = CountingFile;
         let data = [0u8; 4096];
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (4096, &data), (8192, &data)];
-        file.write_page_batch(&cx, &writes).unwrap();
+        poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
         assert_eq!(WRITE_COUNT.load(Ordering::Relaxed), 3);
     }
 
@@ -1287,10 +1256,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 panic!("write should not be called for empty batch");
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1324,9 +1293,9 @@ mod tests {
         }
 
         let cx = Cx::new();
-        let mut file = Stub;
+        let file = Stub;
         let writes: Vec<(u64, &[u8])> = vec![];
-        file.write_page_batch(&cx, &writes).unwrap();
+        poll_ready(file.write_page_batch(&cx, &writes)).unwrap();
     }
 
     #[test]
@@ -1367,10 +1336,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 let n = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
                 if n >= 1 {
                     return Err(fsqlite_error::FrankenError::Io(std::io::Error::other(
@@ -1411,10 +1380,10 @@ mod tests {
 
         CALL_COUNT.store(0, Ordering::Relaxed);
         let cx = Cx::new();
-        let mut file = FailOnSecond;
+        let file = FailOnSecond;
         let data = [0u8; 64];
         let writes: Vec<(u64, &[u8])> = vec![(0, &data), (64, &data), (128, &data)];
-        let result = file.write_page_batch(&cx, &writes);
+        let result = poll_ready(file.write_page_batch(&cx, &writes));
         assert!(result.is_err());
         assert_eq!(
             CALL_COUNT.load(Ordering::Relaxed),
@@ -1430,10 +1399,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1519,10 +1488,10 @@ mod tests {
             fn close(&mut self, _: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
+            async fn read(&self, _: &Cx, _: &mut [u8], _: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
+            async fn write(&self, _: &Cx, _: &[u8], _: u64) -> Result<()> {
                 Ok(())
             }
             fn truncate(&mut self, _: &Cx, _: u64) -> Result<()> {
@@ -1580,30 +1549,68 @@ mod tests {
     }
 
     #[test]
-    fn async_vfs_data_path_trait_is_implementable() {
+    fn vfs_file_async_data_path_is_implementable() {
         use crate::memory::MemoryFile;
 
-        fn assert_impl<T: AsyncVfsDataPath>() {}
+        fn assert_impl<T: VfsFile>() {}
         assert_impl::<MemoryFile>();
     }
 
     #[test]
-    fn async_vfs_data_path_default_read_resolves_immediately() {
-        use crate::memory::MemoryVfs;
+    fn async_memory_data_path_resolves_immediately_and_writes_real_bytes() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        use crate::memory::{MemoryFile, MemoryVfs};
 
         let cx = Cx::new();
         let vfs = MemoryVfs::new();
         let flags = fsqlite_types::flags::VfsOpenFlags::MAIN_DB
             | fsqlite_types::flags::VfsOpenFlags::CREATE
             | fsqlite_types::flags::VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, None, flags).unwrap();
+        let (file, _) = vfs.open(&cx, None, flags).unwrap();
 
         let payload = b"hello async vfs";
-        file.write(&cx, payload, 0).unwrap();
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(waker);
+        {
+            let mut write = std::pin::pin!(<MemoryFile as VfsFile>::write(&file, &cx, payload, 0));
+            assert!(matches!(
+                write.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(()))
+            ));
+        }
 
         let mut buf = [0u8; 15];
-        let n = pollster::block_on(AsyncVfsDataPath::read_async(&file, &cx, &mut buf, 0)).unwrap();
-        assert_eq!(n, 15);
+        {
+            let mut read = std::pin::pin!(<MemoryFile as VfsFile>::read(&file, &cx, &mut buf, 0));
+            assert!(matches!(
+                read.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(15))
+            ));
+        }
         assert_eq!(&buf, payload);
+
+        let writes: &[(u64, &[u8])] = &[(0, b"real"), (8, b"batch")];
+        {
+            let mut batch = std::pin::pin!(<MemoryFile as VfsFile>::write_page_batch(
+                &file, &cx, writes,
+            ));
+            assert!(matches!(
+                batch.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(()))
+            ));
+        }
+
+        let mut batch_buf = [0_u8; 13];
+        {
+            let mut verify =
+                std::pin::pin!(<MemoryFile as VfsFile>::read(&file, &cx, &mut batch_buf, 0,));
+            assert!(matches!(
+                verify.as_mut().poll(&mut task_cx),
+                Poll::Ready(Ok(13))
+            ));
+        }
+        assert_eq!(&batch_buf, b"realo asbatch");
     }
 }

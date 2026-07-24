@@ -20153,3 +20153,117 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   order-satisfaction check for the empty-prefix case. Preflight
   CompositeRangeIndexSeek=allowed. Files: codegen.rs,
   composite_prefix_range_residual_oracle.rs. See bd-bn45n.
+## 2026-07-22 - BLOCKER: live B-epsilon/cell-delta DELETE bridge is not a one-lever edit
+
+- Target after the second consecutive DELETE rejection: the refreshed worst
+  raw ratio, `UPDATE/DELETE Throughput / 100 rows / delete 5 rows` at
+  `3.318815x`, and its stable large-row control, `10000 rows / delete 500
+  rows` at `1.847112x`. The raw worst row is not itself an admissible KEEP
+  baseline (`C/F CV=14.03%/35.91%`); the 10K/500 row is stable
+  (`C/F CV=1.48%/1.08%`). Both come from
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+- Mandatory negative-evidence review blocked the next narrow candidate before
+  source editing. A dense first/last-key exact-slot predictor for
+  `TableLeafDeleteRun::search_table_leaf` is an exact repeat of the CLOSED
+  2026-05-12 candidate: it already reduced the 500-delete search bucket from
+  `39,571 ns` to `17,444 ns` and moved that row from `0.282699 ms` to
+  `0.236423 ms`, but worsened the full-quick primary score
+  `0.3676859704 -> 0.3732603712` and C-faster count `9 -> 10`. Its retry
+  predicate (same-window full-quick neutrality/better, or a broader logical
+  mutation operator) is not satisfied by another standalone search patch.
+- Profile-first evidence from the exact current 100-row/5-delete envelope
+  distributes time across `execute_body=4.659-5.620 us`, commit roundtrip
+  `1.493-2.214 us`, retained active probe `1.011-1.303 us`, seek
+  `0.742-1.133 us`, leaf flush `1.112-1.373 us`, and five memory-sync calls
+  totaling `0.331-0.551 us`. The immediately preceding prepared vector batch
+  proved that collapsing those five publications to two changes the median by
+  only `1.146%`; no remaining single micro-boundary dominates this envelope.
+- The different alien primitive selected was B-epsilon/Bw-tree logical DELETE
+  messages backed by the existing MVCC cell-delta substrate. Current source
+  inspection found a concrete integration blocker:
+  `MvccManager::read_page_with_cell_deltas` and cell-log savepoint/rollback support exist in
+  `crates/fsqlite-mvcc/src/lifecycle.rs`, but every call site is still an
+  inline MVCC test. The live B-tree adapter in
+  `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo::{read_page,read_page_data,read_btree_page_data}`) reads
+  pager transaction page images;
+  its `ConcurrentContext` carries only `SharedConcurrentHandle`, lock table,
+  and commit index, with no `MvccManager`/`CellVisibilityLog` bridge. The core
+  direct DELETE path likewise records quotient-filter bookkeeping, not cell
+  deltas. A record-delete-only hook would therefore report an affected row
+  while point/scan reads still observe the physical row, violating
+  read-your-writes and behavior isomorphism.
+- Result: explicit integration blocker; no source patch was attempted and no
+  CLOSED lever was reopened. This is not a throughput-limit claim. The next
+  admissible attempt is a distinct representation change that first lands the
+  live adapter contract: route point and scan reads through the same
+  transaction-owned cell-delta view, bind logical DELETE messages to the live
+  concurrent handle and page witnesses, preserve duplicate/missing affected
+  counts plus index/FK/QF/count-cache effects, and prove savepoint, rollback,
+  structural fallback, commit/recovery, and concurrent visibility. Retry the
+  performance candidate only after that contract exists, then require an
+  interleaved same-worker null-controlled focused DELETE A/B with both CVs
+  below `5%`, at least `10%` median improvement on 100/5, no 1K/10K DELETE
+  regression, and a same-window full-quick primary score and C-faster count no
+  worse than control.
+
+## 2026-07-22 - REJECT + BLOCKER: thresholded borrowed flush for large owned INSERT page runs
+
+- Target: the worst stable, unowned INSERT frontier exposed by
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`:
+  `INSERT Throughput / Single Transaction / large_10col / 10000 rows` at
+  `9.789121 ms` versus C SQLite `8.664812 ms` (`1.129756x`, C/F CV
+  `0.628%/2.498%`). The adjacent record-size comparison was `9.751029 ms`
+  versus `8.532303 ms` (`1.142837x`) but its FSQLite CV was `5.605%`, so it
+  was a routing/profile row rather than an admissible KEEP baseline.
+- Negative-evidence review found the prior broad eager restore-clone removal
+  and owned-record borrowed-flush attempts CLOSED because large-row gains did
+  not survive the comprehensive matrix. Their retry predicate was newly met
+  only narrowly: this candidate activated exclusively for owned runs of at
+  least 4096 records, leaving small-row, write-single, and concurrent shapes
+  on the unchanged path. `sql_pipeline_candidate_preflight` for operation
+  `large_owned_page_run_borrowed_flush_threshold`, benchmark
+  `comprehensive-bench-insert-large-10col-10000`, and source surface
+  `flush_taken_pending_direct_insert_page_run_with_cursor` returned `allowed`
+  with zero matched no-retry records before editing.
+- Profile-first evidence on release-perf `hz1` showed the exact 10K row owned
+  run flushing once: `direct_insert=10000`, `fast=10000`, `slow=0`, one owned
+  page run containing 10,000 records / 7,218,308 bytes, direct flush
+  `2.609098 ms`, commit roundtrip `2.486255 ms`, and no arena/repeated run.
+  The candidate changed only `crates/fsqlite-core/src/connection.rs`: borrow
+  that large owned run through the existing empty-root/depth-2/fallback flush
+  sequence and avoid cloning it solely for error restoration. The original
+  run was still restored on error. Source was manually restored after the
+  rejection.
+- Same-worker release-perf A/B on `hz1` used identical candidate source and a
+  runtime disable control. On the 10K single-transaction row, control C/F was
+  `12.035619/11.858405 ms`, ratio `0.985276`, CV `1.636%/5.626%`; candidate
+  C/F was `12.211324/11.779788 ms`, ratio `0.964661`, CV
+  `19.528%/26.268%`. The FSQLite median moved only `0.663%`, below the
+  comparator/control drift, while candidate variance failed the mandatory
+  `<5%` gate by more than 5x. The record-size row was also inadmissible:
+  control C/F `14.400164/12.516506 ms` with CV `14.446%/7.783%`, candidate
+  `12.242411/11.834763 ms` with CV `18.738%/25.116%`. A further null arm was
+  not promoted into KEEP evidence because both candidate rows and the control
+  rows had already failed the stability gate; no performance claim is made.
+- Correctness evidence was likewise not admitted: the focused remote
+  release-perf page-run test compiled the edited crate but RCH failed closed
+  after its 1,800-second `ovh-a` SSH timeout (`RCH-E104`), with no local
+  fallback. Result: rejected and fully unwound. Do not retry threshold-only
+  borrowed flush or restore-clone elision. Reconsider only with a different
+  end-to-end ownership representation that profile-attributably removes at
+  least 10% of the large-row INSERT envelope (not just the error clone), plus
+  an interleaved same-worker candidate/control/null run where every C and
+  FSQLite CV is below 5%, at least 10% FSQLite median improvement remains
+  after null drift, the focused error-restoration/conformance test completes,
+  and the same-window full quick matrix is neutral or better.
+- Immediate next-lever routing did not reopen the packed/slab page-run family.
+  The ledger's 2026-05-10 fused empty-root page-builder rejection already
+  tested retaining large rows without one owned `Vec<u8>` each and made its
+  retry predicate a true fused record/body/page builder that removes both row
+  construction and page layout. A standalone packed record slab does not meet
+  that predicate, so no second source edit was made. The active measurement
+  blocker is explicit: the available same-worker window failed the CV gate and
+  the independent remote correctness worker timed out. Resume in a quiescent
+  remote window satisfying the predicate above, then choose a different alien
+  primitive if the ownership representation still lacks profile attribution.

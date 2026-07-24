@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::Path;
 
 use fsqlite_types::cx::Cx;
@@ -108,6 +109,14 @@ fn test_cx() -> Cx {
     Cx::default()
 }
 
+fn block_on_test<F: Future>(future: F) -> F::Output {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("test runtime should build");
+    runtime.block_on(future)
+}
+
 fn page_size_usize() -> usize {
     usize::try_from(PAGE_SIZE).expect("PAGE_SIZE fits usize")
 }
@@ -145,7 +154,8 @@ fn build_two_transaction_wal(seed: u64) -> MemoryVfs {
     let cx = test_cx();
     let vfs = MemoryVfs::new();
     let file = open_wal_file(&vfs, &cx);
-    let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts(seed)).expect("create wal");
+    let mut wal = block_on_test(WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts(seed)))
+        .expect("create wal");
 
     let frame_specs = [
         (1_u32, 0_u32),
@@ -156,7 +166,7 @@ fn build_two_transaction_wal(seed: u64) -> MemoryVfs {
         (6_u32, 6_u32),
     ];
     for (page_number, db_size) in frame_specs {
-        wal.append_frame(&cx, page_number, &sample_page(seed, page_number), db_size)
+        block_on_test(wal.append_frame(&cx, page_number, &sample_page(seed, page_number), db_size))
             .expect("append frame");
     }
     wal.close(&cx).expect("close wal");
@@ -172,17 +182,15 @@ fn flip_one_byte(vfs: &MemoryVfs, cx: &Cx, offset: usize, xor_mask: u8) {
     let mut file = open_wal_file(vfs, cx);
     let mut byte = [0_u8; 1];
     let offset_u64 = u64::try_from(offset).expect("offset fits u64");
-    file.read(cx, &mut byte, offset_u64).expect("read byte");
+    block_on_test(file.read(cx, &mut byte, offset_u64)).expect("read byte");
     byte[0] ^= xor_mask;
-    file.write(cx, &byte, offset_u64)
-        .expect("write flipped byte");
+    block_on_test(file.write(cx, &byte, offset_u64)).expect("write flipped byte");
 }
 
 fn write_zeroes(vfs: &MemoryVfs, cx: &Cx, start: usize, len: usize) {
     let mut file = open_wal_file(vfs, cx);
     let start_u64 = u64::try_from(start).expect("start fits u64");
-    file.write(cx, &vec![0_u8; len], start_u64)
-        .expect("write zeroes");
+    block_on_test(file.write(cx, &vec![0_u8; len], start_u64)).expect("write zeroes");
 }
 
 fn truncate_wal(vfs: &MemoryVfs, cx: &Cx, cut_at: usize) {
@@ -257,7 +265,7 @@ fn validate_recovered_prefix(spec: ScenarioSpec, wal: &WalFile<<MemoryVfs as Vfs
 
     let mut commit_indices = Vec::new();
     for idx in 0..wal.frame_count() {
-        let (header, data) = wal.read_frame(cx, idx).expect("read recovered frame");
+        let (header, data) = block_on_test(wal.read_frame(cx, idx)).expect("read recovered frame");
         let page_number = u32::try_from(idx + 1).expect("frame index fits u32");
         assert_eq!(
             header.page_number, page_number,
@@ -295,7 +303,7 @@ fn run_scenario(spec: ScenarioSpec) -> ObservedOutcome {
     let mut observed_frames = Vec::with_capacity(spec.restart_iterations);
     for _ in 0..spec.restart_iterations {
         let file = open_wal_file(&vfs, &cx);
-        let wal = WalFile::open(&cx, file).expect("open wal after fault");
+        let wal = block_on_test(WalFile::open(&cx, file)).expect("open wal after fault");
         validate_recovered_prefix(spec, &wal, &cx);
         observed_frames.push(wal.frame_count());
         wal.close(&cx).expect("close wal after verification");

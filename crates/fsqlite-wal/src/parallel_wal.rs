@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::hash::BuildHasher;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -953,6 +954,7 @@ pub struct ParallelWalDurabilityReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParallelWalCombinerError {
+    OrderedResidueBusy,
     EmptyBatch,
     BatchIdentityCountMismatch {
         batch_size: u32,
@@ -993,6 +995,9 @@ pub enum ParallelWalCombinerError {
 impl std::fmt::Display for ParallelWalCombinerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::OrderedResidueBusy => {
+                f.write_str("parallel WAL ordered durability residue is already active")
+            }
             Self::EmptyBatch => f.write_str("parallel WAL certificate cannot cover zero commits"),
             Self::BatchIdentityCountMismatch {
                 batch_size,
@@ -1072,7 +1077,7 @@ pub struct ParallelWalCombinerMetricsSnapshot {
     pub shadow_mismatches: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ParallelWalCombinerState {
     visibility: ParallelWalVisibilitySnapshot,
     durable_segment_epoch: u64,
@@ -1089,13 +1094,35 @@ struct ParallelWalCombinerState {
 /// stay outside this lock.
 #[derive(Debug, Default)]
 pub struct ParallelWalDurabilityCombiner {
+    ordered_residue_claimed: AtomicBool,
     state: Mutex<ParallelWalCombinerState>,
+}
+
+struct ParallelWalOrderedResidueGuard<'a> {
+    claimed: &'a AtomicBool,
+}
+
+impl Drop for ParallelWalOrderedResidueGuard<'_> {
+    fn drop(&mut self) {
+        self.claimed.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct PreparedParallelWalPublication {
+    certificate: ParallelWalCommitCertificate,
+    fallback_reason: Option<ParallelWalFallbackReason>,
+    shadow_certificate_verdict: ParallelWalShadowVerdict,
+    durability_seq: u64,
+    publication_generation: u64,
+    lookup_mode: ParallelWalLookupMode,
 }
 
 impl ParallelWalDurabilityCombiner {
     #[must_use]
     pub fn new(initial_visibility: ParallelWalVisibilitySnapshot) -> Self {
         Self {
+            ordered_residue_claimed: AtomicBool::new(false),
             state: Mutex::new(ParallelWalCombinerState {
                 durable_segment_epoch: initial_visibility.certificate_epoch,
                 visibility: initial_visibility,
@@ -1115,6 +1142,7 @@ impl ParallelWalDurabilityCombiner {
         &self,
         certificate: &ParallelWalCommitCertificate,
     ) -> Result<(), ParallelWalCombinerError> {
+        let _ordered_residue = self.try_claim_ordered_residue()?;
         if !certificate.checksum_is_valid() {
             return Err(ParallelWalCombinerError::CertificateChecksumMismatch);
         }
@@ -1198,6 +1226,35 @@ impl ParallelWalDurabilityCombiner {
         Ok(())
     }
 
+    fn try_claim_ordered_residue(
+        &self,
+    ) -> Result<ParallelWalOrderedResidueGuard<'_>, ParallelWalCombinerError> {
+        self.ordered_residue_claimed
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ParallelWalCombinerError::OrderedResidueBusy)?;
+        Ok(ParallelWalOrderedResidueGuard {
+            claimed: &self.ordered_residue_claimed,
+        })
+    }
+
+    async fn claim_ordered_residue(
+        &self,
+        cx: &Cx,
+    ) -> Result<ParallelWalOrderedResidueGuard<'_>, ParallelWalCombinerError> {
+        loop {
+            cx.checkpoint().map_err(|error| {
+                ParallelWalCombinerError::DurabilityWriteFailed(error.to_string())
+            })?;
+            match self.try_claim_ordered_residue() {
+                Ok(guard) => return Ok(guard),
+                Err(ParallelWalCombinerError::OrderedResidueBusy) => {
+                    asupersync::runtime::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn certify_and_publish<F>(
         &self,
         request: ParallelWalDurabilityRequest,
@@ -1212,6 +1269,32 @@ impl ParallelWalDurabilityCombiner {
             Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
             None,
         )
+    }
+
+    /// Asynchronously persist a commit certificate and publish it atomically.
+    ///
+    /// The combiner's visibility, clocks, checksum, and metrics remain exactly
+    /// unchanged until `durable_write` resolves successfully. A durability
+    /// error or cancellation while the callback is pending discards all staged
+    /// state, leaving the same certificate interval available for retry.
+    pub async fn certify_and_publish_async<F, Fut>(
+        &self,
+        cx: &Cx,
+        request: ParallelWalDurabilityRequest,
+        durable_write: F,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(ParallelWalCommitCertificate) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        self.certify_and_publish_inner_async(
+            cx,
+            request,
+            durable_write,
+            Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
+            None,
+        )
+        .await
     }
 
     pub fn certify_and_publish_with_shadow<F, S>(
@@ -1246,6 +1329,32 @@ impl ParallelWalDurabilityCombiner {
         )
     }
 
+    /// Asynchronously certify and publish while independently reconstructing
+    /// the conservative shadow certificate from raw group/WAL evidence.
+    ///
+    /// As with [`Self::certify_and_publish_async`], no combiner state becomes
+    /// visible until the awaited durability callback succeeds.
+    pub async fn certify_and_publish_with_conservative_shadow_async<F, Fut>(
+        &self,
+        cx: &Cx,
+        request: ParallelWalDurabilityRequest,
+        shadow_evidence: ParallelWalConservativeShadowEvidence,
+        durable_write: F,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(ParallelWalCommitCertificate) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        self.certify_and_publish_inner_async(
+            cx,
+            request,
+            durable_write,
+            Option::<fn(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate>::None,
+            Some(shadow_evidence),
+        )
+        .await
+    }
+
     fn certify_and_publish_inner<F, S>(
         &self,
         request: ParallelWalDurabilityRequest,
@@ -1257,146 +1366,88 @@ impl ParallelWalDurabilityCombiner {
         F: FnOnce(&ParallelWalCommitCertificate) -> Result<(), String>,
         S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
     {
+        let _ordered_residue = self.try_claim_ordered_residue()?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Measure the actual serialized durability/publication residue. Lock
-        // acquisition delay is queueing time, not time spent in the ordered
-        // region, and including it makes the critical-section metric depend
-        // on scheduler noise rather than the work this combiner owns.
         let ordered_start = Instant::now();
-        let (mut certificate, fallback_reason) = build_commit_certificate(&state, &request)?;
-        certificate.certificate_crc32c = certificate.computed_crc32c();
-
-        let shadow_certificate_verdict = if let Some(shadow_certificate) = shadow_certificate {
-            state.metrics.shadow_comparisons = state.metrics.shadow_comparisons.saturating_add(1);
-            let shadow = shadow_certificate(&certificate);
-            if shadow == certificate {
-                ParallelWalShadowVerdict::Clean
-            } else {
-                state.metrics.shadow_mismatches = state.metrics.shadow_mismatches.saturating_add(1);
-                return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
-            }
-        } else if matches!(
-            request.control_mode,
-            ParallelWalOperatingMode::ShadowCompare
+        let mut staged_state = state.clone();
+        let prepared = match prepare_parallel_wal_publication(
+            &mut staged_state,
+            &request,
+            shadow_certificate,
+            conservative_shadow_evidence.as_ref(),
         ) {
-            state.metrics.shadow_comparisons = state.metrics.shadow_comparisons.saturating_add(1);
-            let evidence = conservative_shadow_evidence
-                .as_ref()
-                .ok_or(ParallelWalCombinerError::MissingConservativeShadowEvidence)?;
-            // Reconstruct the conservative candidate from raw group/WAL
-            // evidence through a separate implementation. Every certificate
-            // field and the fallback decision participates in the comparison
-            // before durable publication.
-            let (mut shadow, shadow_fallback_reason) =
-                build_conservative_shadow_certificate(&state, evidence)?;
-            shadow.certificate_crc32c = shadow.computed_crc32c();
-            if shadow == certificate && shadow_fallback_reason == fallback_reason {
-                ParallelWalShadowVerdict::Clean
-            } else {
-                state.metrics.shadow_mismatches = state.metrics.shadow_mismatches.saturating_add(1);
-                return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
+            Ok(prepared) => prepared,
+            Err(error) => {
+                preserve_shadow_failure_metrics(&mut state, &staged_state);
+                return Err(error);
             }
-        } else {
-            ParallelWalShadowVerdict::NotRun
         };
 
-        durable_write(&certificate).map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
+        durable_write(&prepared.certificate)
+            .map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
 
-        let durability_seq = state
-            .visibility
-            .durability_seq
-            .checked_add(1)
-            .ok_or(ParallelWalCombinerError::DurabilitySequenceOverflow)?;
-        let publication_generation = state
-            .visibility
-            .publication_generation
-            .checked_add(1)
-            .ok_or(ParallelWalCombinerError::PublicationGenerationOverflow)?;
-        let lookup_mode = if certificate.fallback_active {
-            ParallelWalLookupMode::ConservativeIndex
-        } else {
-            ParallelWalLookupMode::AuthoritativeIndex
-        };
-        state.visibility = ParallelWalVisibilitySnapshot {
-            certificate_epoch: certificate.certificate_epoch,
-            visible_commit_seq: certificate.commit_seq_hi,
-            durability_seq,
-            publication_generation,
-            db_size_pages: certificate.db_size_pages,
-            page_set_size: certificate.page_set_size,
-            lookup_mode,
-        };
-        state.durable_segment_epoch = certificate.durable_segment_epoch;
-        state.last_certificate_crc32c = certificate.certificate_crc32c;
-        state.metrics.certificates_published =
-            state.metrics.certificates_published.saturating_add(1);
-        state.metrics.commits_published = state
-            .metrics
-            .commits_published
-            .saturating_add(u64::from(request.batch_size));
-        if certificate.fallback_active {
-            state.metrics.fallback_entries = state.metrics.fallback_entries.saturating_add(1);
-        }
-        let ordered_region_ns =
-            u64::try_from(ordered_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        state.metrics.ordered_region_ns_total = state
-            .metrics
-            .ordered_region_ns_total
-            .saturating_add(ordered_region_ns);
-        state.metrics.ordered_region_ns_max =
-            state.metrics.ordered_region_ns_max.max(ordered_region_ns);
-        let receipt = ParallelWalDurabilityReceipt {
-            member_commit_seqs: request
-                .batch_ids
-                .iter()
-                .enumerate()
-                .map(|(index, batch_id)| {
-                    (
-                        *batch_id,
-                        CommitSeq::new(
-                            certificate
-                                .commit_seq_lo
-                                .get()
-                                .saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
-                        ),
-                    )
-                })
-                .collect(),
-            certificate,
-            durability_seq,
-            publication_generation,
-            ordered_region_ns,
-            batch_size: request.batch_size,
-            lookup_mode,
-            control_mode: request.control_mode,
-            shadow_certificate_verdict,
-            fallback_reason,
+        let receipt =
+            finalize_parallel_wal_publication(&mut staged_state, &request, prepared, ordered_start);
+        *state = staged_state;
+        drop(state);
+        trace_parallel_wal_publication(&request, &receipt);
+        Ok(receipt)
+    }
+
+    // The atomic claim spans the durability await, but the state mutex does
+    // not. Contenders cooperatively yield, while synchronous visibility and
+    // metrics readers can still inspect the last published snapshot without
+    // blocking an executor thread on disk I/O.
+    async fn certify_and_publish_inner_async<F, Fut, S>(
+        &self,
+        cx: &Cx,
+        request: ParallelWalDurabilityRequest,
+        durable_write: F,
+        shadow_certificate: Option<S>,
+        conservative_shadow_evidence: Option<ParallelWalConservativeShadowEvidence>,
+    ) -> Result<ParallelWalDurabilityReceipt, ParallelWalCombinerError>
+    where
+        F: FnOnce(ParallelWalCommitCertificate) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+        S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+    {
+        let _ordered_residue = self.claim_ordered_residue(cx).await?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ordered_start = Instant::now();
+        let mut staged_state = state.clone();
+        let prepared = match prepare_parallel_wal_publication(
+            &mut staged_state,
+            &request,
+            shadow_certificate,
+            conservative_shadow_evidence.as_ref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                preserve_shadow_failure_metrics(&mut state, &staged_state);
+                return Err(error);
+            }
         };
         drop(state);
 
-        tracing::debug!(
-            target: "fsqlite::wal::durability_combiner",
-            trace_id = request.trace_id,
-            scenario_id = request.scenario_id.as_str(),
-            commit_certificate = receipt.certificate.certificate_crc32c,
-            certificate_epoch = receipt.certificate.certificate_epoch,
-            commit_seq_lo = receipt.certificate.commit_seq_lo.get(),
-            commit_seq_hi = receipt.certificate.commit_seq_hi.get(),
-            durability_seq = receipt.durability_seq,
-            publication_generation = receipt.publication_generation,
-            ordered_region_ns = receipt.ordered_region_ns,
-            batch_size = receipt.batch_size,
-            lookup_mode = parallel_wal_lookup_mode_name(receipt.lookup_mode),
-            control_mode = parallel_wal_mode_name(receipt.control_mode),
-            shadow_certificate_verdict =
-                parallel_wal_shadow_verdict_name(receipt.shadow_certificate_verdict),
-            compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
-            fallback_reason = parallel_wal_fallback_reason_name(receipt.fallback_reason),
-            "published durable parallel WAL commit certificate"
-        );
+        durable_write(prepared.certificate.clone())
+            .await
+            .map_err(ParallelWalCombinerError::DurabilityWriteFailed)?;
+
+        let receipt =
+            finalize_parallel_wal_publication(&mut staged_state, &request, prepared, ordered_start);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = staged_state;
+        drop(state);
+        trace_parallel_wal_publication(&request, &receipt);
         Ok(receipt)
     }
 
@@ -1444,6 +1495,186 @@ impl ParallelWalDurabilityCombiner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .metrics
     }
+}
+
+fn prepare_parallel_wal_publication<S>(
+    state: &mut ParallelWalCombinerState,
+    request: &ParallelWalDurabilityRequest,
+    shadow_certificate: Option<S>,
+    conservative_shadow_evidence: Option<&ParallelWalConservativeShadowEvidence>,
+) -> Result<PreparedParallelWalPublication, ParallelWalCombinerError>
+where
+    S: FnOnce(&ParallelWalCommitCertificate) -> ParallelWalCommitCertificate,
+{
+    let (mut certificate, fallback_reason) = build_commit_certificate(state, request)?;
+    certificate.certificate_crc32c = certificate.computed_crc32c();
+
+    let shadow_certificate_verdict = if let Some(shadow_certificate) = shadow_certificate {
+        state.metrics.shadow_comparisons = state.metrics.shadow_comparisons.saturating_add(1);
+        let shadow = shadow_certificate(&certificate);
+        if shadow == certificate {
+            ParallelWalShadowVerdict::Clean
+        } else {
+            state.metrics.shadow_mismatches = state.metrics.shadow_mismatches.saturating_add(1);
+            return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
+        }
+    } else if matches!(
+        request.control_mode,
+        ParallelWalOperatingMode::ShadowCompare
+    ) {
+        state.metrics.shadow_comparisons = state.metrics.shadow_comparisons.saturating_add(1);
+        let evidence = conservative_shadow_evidence
+            .ok_or(ParallelWalCombinerError::MissingConservativeShadowEvidence)?;
+        // Reconstruct the conservative candidate from raw group/WAL evidence
+        // through a separate implementation. Every certificate field and the
+        // fallback decision participates in the comparison before durability.
+        let (mut shadow, shadow_fallback_reason) =
+            build_conservative_shadow_certificate(state, evidence)?;
+        shadow.certificate_crc32c = shadow.computed_crc32c();
+        if shadow == certificate && shadow_fallback_reason == fallback_reason {
+            ParallelWalShadowVerdict::Clean
+        } else {
+            state.metrics.shadow_mismatches = state.metrics.shadow_mismatches.saturating_add(1);
+            return Err(ParallelWalCombinerError::ShadowCertificateMismatch);
+        }
+    } else {
+        ParallelWalShadowVerdict::NotRun
+    };
+
+    // Validate every fallible publication clock before crossing the durable
+    // boundary. Once the callback succeeds, finalization must be infallible.
+    let durability_seq = state
+        .visibility
+        .durability_seq
+        .checked_add(1)
+        .ok_or(ParallelWalCombinerError::DurabilitySequenceOverflow)?;
+    let publication_generation = state
+        .visibility
+        .publication_generation
+        .checked_add(1)
+        .ok_or(ParallelWalCombinerError::PublicationGenerationOverflow)?;
+    let lookup_mode = if certificate.fallback_active {
+        ParallelWalLookupMode::ConservativeIndex
+    } else {
+        ParallelWalLookupMode::AuthoritativeIndex
+    };
+
+    Ok(PreparedParallelWalPublication {
+        certificate,
+        fallback_reason,
+        shadow_certificate_verdict,
+        durability_seq,
+        publication_generation,
+        lookup_mode,
+    })
+}
+
+fn preserve_shadow_failure_metrics(
+    state: &mut ParallelWalCombinerState,
+    staged_state: &ParallelWalCombinerState,
+) {
+    // Preparation failures historically remain observable even though no
+    // publication occurs. Copy only those diagnostic counters; durability
+    // failures never call this helper and therefore leave all state unchanged.
+    state.metrics.shadow_comparisons = staged_state.metrics.shadow_comparisons;
+    state.metrics.shadow_mismatches = staged_state.metrics.shadow_mismatches;
+}
+
+fn finalize_parallel_wal_publication(
+    state: &mut ParallelWalCombinerState,
+    request: &ParallelWalDurabilityRequest,
+    prepared: PreparedParallelWalPublication,
+    ordered_start: Instant,
+) -> ParallelWalDurabilityReceipt {
+    let PreparedParallelWalPublication {
+        certificate,
+        fallback_reason,
+        shadow_certificate_verdict,
+        durability_seq,
+        publication_generation,
+        lookup_mode,
+    } = prepared;
+
+    state.visibility = ParallelWalVisibilitySnapshot {
+        certificate_epoch: certificate.certificate_epoch,
+        visible_commit_seq: certificate.commit_seq_hi,
+        durability_seq,
+        publication_generation,
+        db_size_pages: certificate.db_size_pages,
+        page_set_size: certificate.page_set_size,
+        lookup_mode,
+    };
+    state.durable_segment_epoch = certificate.durable_segment_epoch;
+    state.last_certificate_crc32c = certificate.certificate_crc32c;
+    state.metrics.certificates_published = state.metrics.certificates_published.saturating_add(1);
+    state.metrics.commits_published = state
+        .metrics
+        .commits_published
+        .saturating_add(u64::from(request.batch_size));
+    if certificate.fallback_active {
+        state.metrics.fallback_entries = state.metrics.fallback_entries.saturating_add(1);
+    }
+    let ordered_region_ns = u64::try_from(ordered_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    state.metrics.ordered_region_ns_total = state
+        .metrics
+        .ordered_region_ns_total
+        .saturating_add(ordered_region_ns);
+    state.metrics.ordered_region_ns_max =
+        state.metrics.ordered_region_ns_max.max(ordered_region_ns);
+
+    ParallelWalDurabilityReceipt {
+        member_commit_seqs: request
+            .batch_ids
+            .iter()
+            .enumerate()
+            .map(|(index, batch_id)| {
+                (
+                    *batch_id,
+                    CommitSeq::new(
+                        certificate
+                            .commit_seq_lo
+                            .get()
+                            .saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+                    ),
+                )
+            })
+            .collect(),
+        certificate,
+        durability_seq,
+        publication_generation,
+        ordered_region_ns,
+        batch_size: request.batch_size,
+        lookup_mode,
+        control_mode: request.control_mode,
+        shadow_certificate_verdict,
+        fallback_reason,
+    }
+}
+
+fn trace_parallel_wal_publication(
+    request: &ParallelWalDurabilityRequest,
+    receipt: &ParallelWalDurabilityReceipt,
+) {
+    tracing::debug!(
+        target: "fsqlite::wal::durability_combiner",
+        trace_id = request.trace_id,
+        scenario_id = request.scenario_id.as_str(),
+        commit_certificate = receipt.certificate.certificate_crc32c,
+        certificate_epoch = receipt.certificate.certificate_epoch,
+        commit_seq_lo = receipt.certificate.commit_seq_lo.get(),
+        commit_seq_hi = receipt.certificate.commit_seq_hi.get(),
+        durability_seq = receipt.durability_seq,
+        publication_generation = receipt.publication_generation,
+        ordered_region_ns = receipt.ordered_region_ns,
+        batch_size = receipt.batch_size,
+        lookup_mode = parallel_wal_lookup_mode_name(receipt.lookup_mode),
+        control_mode = parallel_wal_mode_name(receipt.control_mode),
+        shadow_certificate_verdict =
+            parallel_wal_shadow_verdict_name(receipt.shadow_certificate_verdict),
+        compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+        fallback_reason = parallel_wal_fallback_reason_name(receipt.fallback_reason),
+        "published durable parallel WAL commit certificate"
+    );
 }
 
 impl ParallelWalDurabilityReceipt {
@@ -4514,6 +4745,99 @@ mod tests {
             })
             .expect("same interval should remain available after failed durability");
         assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
+    }
+
+    #[test]
+    fn async_durability_callback_is_awaited_before_publication() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let combiner = ParallelWalDurabilityCombiner::default();
+            let callback_completed = Arc::new(AtomicBool::new(false));
+            let callback_completed_for_write = Arc::clone(&callback_completed);
+            let receipt = combiner
+                .certify_and_publish_async(
+                    &cx,
+                    durability_request(ParallelWalOperatingMode::Auto),
+                    move |_| {
+                        Box::pin(async move {
+                            asupersync::runtime::yield_now().await;
+                            callback_completed_for_write.store(true, AtomicOrdering::Release);
+                            Ok(())
+                        })
+                    },
+                )
+                .await
+                .expect("successful async durability callback should publish");
+
+            assert!(callback_completed.load(AtomicOrdering::Acquire));
+            assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
+            assert_eq!(
+                combiner.visibility_snapshot().visible_commit_seq,
+                receipt.certificate.commit_seq_hi
+            );
+        });
+    }
+
+    #[test]
+    fn async_conservative_shadow_durability_failure_leaves_state_unchanged() {
+        let runtime = test_runtime();
+        let cx = test_cx();
+        runtime.block_on(async {
+            let combiner = ParallelWalDurabilityCombiner::default();
+            let request = durability_request(ParallelWalOperatingMode::ShadowCompare);
+            let evidence = ParallelWalConservativeShadowEvidence {
+                certificate_epoch: request.certificate_epoch,
+                durable_segment_epoch: request.durable_segment_epoch,
+                batch_ids: request.batch_ids.clone(),
+                lane_record_counts: request.lane_record_counts.clone(),
+                db_size_pages: request.db_size_pages,
+                page_set_size: request.page_set_size,
+                control_mode: request.control_mode,
+                fallback_reason: request.fallback_reason,
+                checkpoint_active: request.checkpoint_active,
+                wal_frame_start: 1,
+                wal_frame_end: u64::from(request.page_set_size),
+            };
+            let visibility_before = combiner.visibility_snapshot();
+            let metrics_before = combiner.metrics_snapshot();
+
+            let error = combiner
+                .certify_and_publish_with_conservative_shadow_async(
+                    &cx,
+                    request.clone(),
+                    evidence.clone(),
+                    |_| {
+                        Box::pin(async {
+                            asupersync::runtime::yield_now().await;
+                            Err("injected async fsync failure".to_owned())
+                        })
+                    },
+                )
+                .await
+                .expect_err("failed async durability must reject publication");
+            assert!(matches!(
+                error,
+                ParallelWalCombinerError::DurabilityWriteFailed(_)
+            ));
+            assert_eq!(combiner.visibility_snapshot(), visibility_before);
+            assert_eq!(combiner.metrics_snapshot(), metrics_before);
+
+            let receipt = combiner
+                .certify_and_publish_with_conservative_shadow_async(&cx, request, evidence, |_| {
+                    Box::pin(async { Ok(()) })
+                })
+                .await
+                .expect("failed interval should remain available for retry");
+            assert_eq!(receipt.certificate.commit_seq_lo, CommitSeq::new(1));
+            assert_eq!(
+                receipt.shadow_certificate_verdict,
+                ParallelWalShadowVerdict::Clean
+            );
+            assert_eq!(combiner.metrics_snapshot().shadow_comparisons, 1);
+        });
     }
 
     #[test]
