@@ -19514,6 +19514,59 @@ UpperBound, so `index_seek_upper_bound` mis-positions when a value's run spans m
 bead) — likely the interior descent must propagate the UpperBound bias, or the leaf-crossing successor logic
 (cursor.rs:4247) must re-seek. Codegen WIP is correct in shape; unblocking is a btree-cursor fix. Did NOT ship.
 
+## 2026-07-24 - REJECT/SURFACE: refreshed worst ratio still fails the small-N DELETE retry gate
+
+- Result type: profile-gated lever REJECT with no source mutation. The fresh
+  comprehensive quick artifact is
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/full-quick.json`
+  (SHA-256
+  `d8d6fa76bc0641879b3b97bbb67bfacb4ea43bdd4f50b883596356297e50c534`).
+  It was built and run remotely on `vmi1227854` from exact source commit
+  `d2ec37bf627df1d0351d68b6bfa0f394fd0ae97c` with
+  `RCH_REQUIRE_REMOTE=1 rch exec -- cargo run -j2 --profile release-perf -p
+  fsqlite-e2e --bin comprehensive-bench -- --quick --json-out
+  tests/artifacts/perf/darkbarn-full-quick-20260724T0030Z.json --no-html`.
+  The report's dirty flag is the RCH transfer scratch directory; its recorded
+  source SHA is exact and the release-perf binary is newer than that HEAD.
+- Refresh result: 93 scenarios in 13.382 seconds; 75 FrankenSQLite-faster, 6
+  comparable, 12 C-SQLite-faster; primary category-weighted score
+  `0.4271456883` and geomean ratio `0.3125652025`. The worst raw ratio is again
+  `UPDATE/DELETE Throughput / 100 rows / delete 5 rows`: C `2.354 us`
+  (CV `3.81%`) versus FrankenSQLite `7.902 us` (CV `6.96%`), ratio
+  `3.356839x`.
+- One lever screened: elide/coalesce the retained direct-DELETE run's
+  top-level direct-write flush or explicit-COMMIT boundary. A second
+  same-worker remote profile run used the same release-perf source and
+  `FSQLITE_BENCH_PROFILE_DML=1`, filtered to `update-delete`; its JSON is
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/update-delete-profile.json`
+  (SHA-256
+  `b2bb4fde4541183f9bc41f885445de1622b5c10a6a0386b737ece2a0ac35b6e5`).
+  The target repeated at C `3.696 us` (CV `9.61%`) versus FrankenSQLite
+  `10.166 us` (CV `11.95%`), ratio `2.750541x`. Phase counters showed no
+  dominant removable component: `begin_ns=2163`, `commit_roundtrip_ns=2103`,
+  `delete_seek_ns=1192`, `delete_leaf_flush_ns=2283`, and the complete
+  top-level `direct_flush_ns=2774` (27.3% of the measured F median). This
+  reproduces the 2026-05-10 direct-write-flush-wrapper rejection rather than
+  admitting another wrapper or transaction-control edit.
+- Verdict: rejected before implementation. The row is only `10.166 us`
+  absolute, both focused comparator CVs exceed 5%, and no single removable
+  component clears 30%. Therefore source A/B, null-control, and conformance
+  gates were not entered; inventing a candidate here would violate the
+  profile-first eligibility rule and cross into the architectural MVCC
+  transaction lane.
+- `zz_*` triage refresh: all 30 preserved probe files are still present and
+  still carry their `EPHEMERAL ... Not for commit` marker. None is useful as a
+  durable test as-is; the complete preserved filename list and promotion
+  requirements remain in the 2026-07-22 untracked-probe entry below. No probe
+  was edited, committed, archived, or deleted.
+- Retry predicate: reopen this small-N DELETE family only when a same-worker
+  baseline is stable below 5% CV, exceeds `50 us` absolute, and attributes
+  more than 30% to one correctness-optional component not already rejected in
+  this ledger. Any candidate must then clear an interleaved same-worker A/B
+  with a null control, both variants below 5% CV, at least a 10% target
+  improvement, no 1K/10K DELETE regression, and SQLite differential
+  conformance.
+
 ## 2026-07-22 - KEEP + BLOCKER ROOT-CAUSED: adaptive DISTINCT loose/skip scan lands at 23.5x; the "skip-scan hang" was ResultRow register drain, never the btree (bd-distinct-loose-scan-c8nay)
 
 - Result type: lever KEEP + blocker resolution. Prior state: 2026-07-11 (reverted, hang),
