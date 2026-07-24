@@ -183,3 +183,69 @@ fn agg_composite_prefix_range_matches_sqlite() {
         "residual `c = 1` must decline the composite prefix+range seek"
     );
 }
+
+/// bd-bn45n follow-up: aggregates over a PURE range on the LEADING key term of a composite-only index
+/// (`SELECT COUNT(*)/SUM(...) FROM t WHERE a <range>`, no equality prefix) reuse the same
+/// `composite_index_prefix_range_target` (now empty-prefix-capable) and the aggregate composite-range
+/// emitter. The emitter must SKIP the prefix `IdxGT` when `prefix_len==0` (the range bounds terminate
+/// the walk); this asserts byte-identical results and that the seek fires with no prefix IdxGT.
+#[test]
+fn agg_composite_pure_leading_range_matches_sqlite() {
+    let f = Connection::open(":memory:").expect("frank");
+    let r = rusqlite::Connection::open_in_memory().expect("sqlite");
+    for stmt in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);",
+        "CREATE INDEX idx_ab ON t(a, b);",
+    ] {
+        f.execute(stmt).unwrap();
+        r.execute_batch(stmt).unwrap();
+    }
+    for i in 1..=3000_i64 {
+        // NULL run in the LEADING term `a` (excluded by any `a <range>`, matching C SQLite).
+        let a = if i % 47 == 0 {
+            "NULL".to_owned()
+        } else {
+            format!("{}", i % 12)
+        };
+        let stmt = format!("INSERT INTO t VALUES ({i}, {a}, {}, {});", i % 25, i % 5);
+        f.execute(&stmt).unwrap();
+        r.execute_batch(&stmt).unwrap();
+    }
+    let cmp = |sql: &str| {
+        assert_eq!(
+            frank_rows(&f, sql),
+            sqlite_rows(&r, sql),
+            "diverged: `{sql}`"
+        );
+    };
+    for sql in [
+        "SELECT COUNT(*) FROM t WHERE a < 5",
+        "SELECT COUNT(*) FROM t WHERE a <= 4",
+        "SELECT COUNT(*) FROM t WHERE a > 7",
+        "SELECT COUNT(*) FROM t WHERE a >= 6",
+        "SELECT COUNT(*) FROM t WHERE a BETWEEN 2 AND 8",
+        "SELECT SUM(c) FROM t WHERE a < 5",
+        "SELECT SUM(a) FROM t WHERE a < 5",
+        "SELECT MIN(b) FROM t WHERE a < 5",
+        "SELECT MAX(c) FROM t WHERE a >= 6",
+        "SELECT COALESCE(SUM(c), -1) FROM t WHERE a > 100000",
+        // Residual on a non-key column must NOT be dropped (declines to a scan enforcing c).
+        "SELECT COUNT(*) FROM t WHERE a < 5 AND c = 1",
+    ] {
+        cmp(sql);
+    }
+
+    // Pure leading range seeks (SeekGE) with NO prefix IdxGT (empty prefix); residual declines.
+    assert!(
+        has_op(&f, "SELECT COUNT(*) FROM t WHERE a < 5", "SeekGE"),
+        "COUNT(*) pure leading range must seek idx_ab (SeekGE)"
+    );
+    assert!(
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a < 5", "IdxGT"),
+        "empty-prefix aggregate leading-range seek must not emit a prefix IdxGT"
+    );
+    assert!(
+        !has_op(&f, "SELECT COUNT(*) FROM t WHERE a < 5 AND c = 1", "SeekGE"),
+        "residual `c = 1` must decline the aggregate leading-range seek"
+    );
+}

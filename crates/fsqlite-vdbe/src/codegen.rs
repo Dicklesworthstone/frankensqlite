@@ -13646,15 +13646,20 @@ fn codegen_select_aggregate(
         let loop_top = b.current_addr();
         let skip_label = b.emit_label();
         // Stop once the equality prefix changes (`IdxGT` compares only the first `prefix_len` columns).
-        #[allow(clippy::cast_possible_truncation)]
-        b.emit_jump_to_label(
-            Opcode::IdxGT,
-            idx_cursor,
-            probe_rec,
-            finalize_label,
-            P4::None,
-            prefix_len as u16,
-        );
+        // With an EMPTY prefix (pure leading-term range, bd-bn45n) there is nothing to compare, so skip
+        // the IdxGT and let the range bounds alone terminate the walk (mirrors the non-aggregate
+        // `codegen_select_composite_index_prefix_range_scan`): a zero-column IdxGT is a degenerate no-op.
+        if prefix_len > 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            b.emit_jump_to_label(
+                Opcode::IdxGT,
+                idx_cursor,
+                probe_rec,
+                finalize_label,
+                P4::None,
+                prefix_len as u16,
+            );
+        }
 
         let range_key_reg = b.alloc_reg();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
