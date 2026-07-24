@@ -2362,9 +2362,12 @@ pub fn codegen_select(
         && distinct == Distinctness::All
         && group_by.is_empty()
         && having.is_none()
-        && stmt.order_by.is_empty()
         && stmt.limit.is_none()
         && let Some(skip) = skip_scan_eq_target(where_clause.as_deref(), table, table_alias)
+        // ORDER BY is elided when it matches the emission order `leading ASC, rowid ASC` (the 2nd
+        // column is a constant here); otherwise decline so the sorter runs.
+        && (stmt.order_by.is_empty()
+            || skip_scan_order_by_satisfied(skip.index, false, &stmt.order_by, table, table_alias))
     {
         return codegen_select_skip_scan(
             b,
@@ -2389,9 +2392,12 @@ pub fn codegen_select(
         && distinct == Distinctness::All
         && group_by.is_empty()
         && having.is_none()
-        && stmt.order_by.is_empty()
         && stmt.limit.is_none()
         && let Some(skip) = skip_scan_range_target(where_clause.as_deref(), table, table_alias)
+        // ORDER BY is elided when it matches the emission order `leading ASC, second ASC, rowid ASC`;
+        // otherwise decline so the sorter runs.
+        && (stmt.order_by.is_empty()
+            || skip_scan_order_by_satisfied(skip.index, true, &stmt.order_by, table, table_alias))
     {
         return codegen_select_skip_scan_range(
             b,
@@ -11508,6 +11514,52 @@ fn skip_scan_range_target<'a>(
         return Some(SkipScanRangeTarget { index, range });
     }
     None
+}
+
+/// Whether the skip scan's emission — leading key column ASC (NULLs first, as the leftmost index
+/// entries), then the second key column ASC, then rowid ASC — satisfies `order_by` as a deterministic
+/// TOTAL order, so the sorter can be elided. `second_varies` is true for the range scan (the 2nd column
+/// is a live sort key) and false for the equality scan (the 2nd column is a constant, so it may be
+/// present or absent). Every term must be plain-ASC (no DESC, no explicit NULLS) with a collation
+/// matching the (BINARY) index term; the final term is the rowid, the unique tiebreaker.
+fn skip_scan_order_by_satisfied(
+    index: &IndexSchema,
+    second_varies: bool,
+    order_by: &[OrderingTerm],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let asc_plain = |term: &OrderingTerm| {
+        term.nulls.is_none() && !matches!(term.direction, Some(SortDirection::Desc))
+    };
+    let is_key = |term: &OrderingTerm, key_pos: usize| {
+        asc_plain(term)
+            && index.columns.get(key_pos).is_some_and(|col| {
+                matches!(
+                    resolve_column_ref(&term.expr, table, table_alias),
+                    Some(SortKeySource::Column(idx))
+                        if table.columns.get(idx).is_some_and(|c| c.name.eq_ignore_ascii_case(col))
+                )
+            })
+            && collation_names_equivalent(
+                column_collation(&term.expr, table, table_alias),
+                index.key_term_collation(key_pos),
+            )
+    };
+    let is_rowid = |term: &OrderingTerm| {
+        asc_plain(term)
+            && matches!(
+                resolve_column_ref(&term.expr, table, table_alias),
+                Some(SortKeySource::Rowid)
+            )
+    };
+    match order_by {
+        // `leading, rowid` — equality only (the constant 2nd column may be omitted).
+        [t0, t1] if !second_varies => is_key(t0, 0) && is_rowid(t1),
+        // `leading, second, rowid`.
+        [t0, t1, t2] => is_key(t0, 0) && is_key(t1, 1) && is_rowid(t2),
+        _ => false,
+    }
 }
 
 /// Emit the skip scan. Enumerate distinct leading values; per value, adaptively WALK a few entries

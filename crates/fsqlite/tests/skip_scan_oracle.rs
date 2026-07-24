@@ -77,6 +77,16 @@ fn cmp(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     assert_eq!(a, b, "diverged: `{sql}`");
 }
 
+/// Compare WITH order preserved — for ORDER BY queries the skip scan must emit exactly the sorted order
+/// (no sorter), so the raw emission sequence must equal C SQLite's.
+fn cmp_ordered(f: &Connection, r: &rusqlite::Connection, sql: &str) {
+    assert_eq!(
+        frank_rows(f, sql),
+        sqlite_rows(r, sql),
+        "ordered diverged: `{sql}`"
+    );
+}
+
 #[test]
 fn skip_scan_low_cardinality_leading_matches_sqlite() {
     // Few distinct leading `x` values (12), many rows each -> the seek path dominates. NULLs in both.
@@ -375,6 +385,79 @@ fn skip_scan_range_declines_when_unsafe() {
         &r,
         "SELECT x, a FROM t WHERE a >= 5 AND a <= 8 AND c = 2",
     );
+}
+
+#[test]
+fn skip_scan_order_by_streams_without_sorter() {
+    // The skip scan emits `leading ASC (NULLs first), second ASC, rowid ASC`, so an ORDER BY matching
+    // that prefix + rowid tiebreaker is served WITHOUT a sorter and must be byte-identical WITH order.
+    let mut ins = Vec::new();
+    for i in 1..=4000_i64 {
+        let x = if i % 53 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 12).to_string()
+        };
+        let a = if i % 37 == 0 {
+            "NULL".to_owned()
+        } else {
+            (i % 20).to_string()
+        };
+        ins.push(format!("INSERT INTO t VALUES ({i}, {x}, {a}, {});", i % 4));
+    }
+    let (f, r) = both(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, a INTEGER, c INTEGER);",
+            "CREATE INDEX idx_xa ON t(x, a);",
+        ],
+        &ins,
+    );
+    // Equality: `ORDER BY x, id` matches (x ASC NULLs-first, rowid ASC) → skip scan + no sorter.
+    assert!(has_op(
+        &f,
+        "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id",
+        "SeekGT"
+    ));
+    assert!(
+        !has_op(
+            &f,
+            "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id",
+            "SorterOpen"
+        ),
+        "equality ORDER BY x, id must elide the sorter"
+    );
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x, id");
+    cmp_ordered(&f, &r, "SELECT id, c FROM t WHERE a = 5 ORDER BY x, id"); // non-covering
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x, a, id"); // constant a harmless
+    // Range: `ORDER BY x, a, id` matches (x, a, rowid) → skip scan + no sorter.
+    assert!(
+        !has_op(
+            &f,
+            "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, a, id",
+            "SorterOpen"
+        ),
+        "range ORDER BY x, a, id must elide the sorter"
+    );
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, a, id");
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a > 5 ORDER BY x, a, id");
+    cmp_ordered(
+        &f,
+        &r,
+        "SELECT x, a FROM t WHERE a BETWEEN 5 AND 12 ORDER BY x, a, id",
+    );
+    cmp_ordered(&f, &r, "SELECT id FROM t WHERE a < 8 ORDER BY x, a, id");
+    // A non-matching ORDER BY must DECLINE the stream (sorter runs) but stay correct.
+    assert!(
+        has_op(
+            &f,
+            "SELECT x, a FROM t WHERE a = 5 ORDER BY x DESC, id",
+            "SorterOpen"
+        ),
+        "descending ORDER BY must fall to the sorter"
+    );
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY x DESC, id");
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a = 5 ORDER BY a, x, id");
+    cmp_ordered(&f, &r, "SELECT x, a FROM t WHERE a >= 5 ORDER BY x, id"); // range needs `a` in ORDER BY
 }
 
 #[test]
