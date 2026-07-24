@@ -2,7 +2,7 @@
 //!
 //! An e-process is a non-negative supermartingale under H₀ with E₀ = 1.
 //! When the running e-value exceeds 1/α we reject H₀ (anomaly detected).
-//! This module provides a self-contained implementation used by [`Cx`] to
+//! This module provides a self-contained implementation used by [`crate::Cx`] to
 //! shed low-priority queries when anomaly pressure is high.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

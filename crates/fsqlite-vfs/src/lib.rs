@@ -200,6 +200,29 @@ mod host_fs_security_tests {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn block_on_test_io<F: std::future::Future>(
+    cx: &fsqlite_types::cx::Cx,
+    future: F,
+) -> F::Output {
+    std::thread_local! {
+        static TEST_IO_RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(1, 2)
+                .build()
+                .expect("VFS test runtime should build");
+    }
+
+    TEST_IO_RUNTIME.with(|runtime| {
+        runtime.block_on(async {
+            let native_cx = asupersync::Cx::current()
+                .expect("VFS test runtime should install a capability context");
+            cx.set_native_cx(native_cx);
+            future.await
+        })
+    })
+}
+
 pub use memory::{MemoryFile, MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
 pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -208,7 +231,7 @@ pub use namespace::{
     cleanup_abandoned_private_database, validate_reserved_database_artifacts,
 };
 pub use shm::ShmRegion;
-pub use traits::{AsyncVfsDataPath, FileIdentity, SyncKind, Vfs, VfsFile};
+pub use traits::{FileIdentity, SyncKind, Vfs, VfsFile};
 #[cfg(all(feature = "native", unix))]
 pub use unix::{UnixFile, UnixVfs};
 #[cfg(all(feature = "native", target_os = "linux"))]

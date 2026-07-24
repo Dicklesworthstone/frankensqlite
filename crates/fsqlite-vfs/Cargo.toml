@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-vfs"
-version = "0.1.16"
+version = "0.1.19"
 description = "Virtual filesystem abstraction layer"
 edition.workspace = true
 license-file.workspace = true
@@ -11,23 +11,25 @@ rust-version.workspace = true
 default = ["linux-asupersync-uring"]
 native = ["fsqlite-types/native", "linux-asupersync-uring"]
 wasm = ["fsqlite-types/wasm"]
-linux-asupersync-uring = ["native", "dep:asupersync", "dep:pollster"]
+linux-asupersync-uring = ["native", "dep:asupersync"]
 # Deprecated compatibility toggle; guarded by compile_error in src/uring.rs.
-linux-uring-fs = ["native", "dep:uring-fs", "dep:pollster"]
+linux-uring-fs = ["native", "dep:uring-fs"]
 
 [dependencies]
 smallvec = "1.15"
-fsqlite-types = { version = "0.1.16", path = "../fsqlite-types", default-features = false }
+fsqlite-types = { version = "0.1.19", path = "../fsqlite-types", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
-asupersync = { workspace = true, optional = true, features = ["io-uring"] }
-pollster = { version = "0.4", optional = true }
+asupersync = { workspace = true, optional = true }
 tracing = { workspace = true }
 uring-fs = { version = "1.4.0", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 nix = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.12"
 
 [target.'cfg(any(unix, windows))'.dependencies]
 advisory-lock = "0.3.0"
@@ -36,7 +38,9 @@ advisory-lock = "0.3.0"
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
 
 # Cannot inherit workspace lints because workspace forbids unsafe_code
 # and VFS requires unsafe for mmap.

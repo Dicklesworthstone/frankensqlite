@@ -669,6 +669,82 @@ impl MemTable {
         self.unique_constraints.push(constraint);
     }
 
+    /// Remove one matching UNIQUE constraint from the in-memory table.
+    ///
+    /// TEMP indexes are represented by direct `MemTable` constraints rather
+    /// than a separate B-tree, so `DROP INDEX` uses this to retire exactly the
+    /// enforcement rule that `CREATE UNIQUE INDEX` installed.
+    pub fn remove_unique_column_group_with_collations(
+        &mut self,
+        cols: &[usize],
+        collations: &[Option<String>],
+    ) -> bool {
+        let normalized = UniqueConstraintState::new(cols.to_vec(), collations.to_vec());
+        let Some(position) = self.unique_constraints.iter().rposition(|constraint| {
+            constraint.columns == normalized.columns
+                && constraint.collations.len() == normalized.collations.len()
+                && constraint
+                    .collations
+                    .iter()
+                    .zip(&normalized.collations)
+                    .all(|(left, right)| match (left, right) {
+                        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                        (None, None) => true,
+                        _ => false,
+                    })
+        }) else {
+            return false;
+        };
+        self.unique_constraints.remove(position);
+        true
+    }
+
+    /// Return whether the current rows satisfy a proposed UNIQUE constraint.
+    ///
+    /// This is used by TEMP `CREATE UNIQUE INDEX` before mutating schema
+    /// metadata. Builtin collations use the same canonical key encoding as the
+    /// installed constraint; custom collations use the exact comparison path.
+    pub fn unique_column_group_is_valid(
+        &self,
+        cols: &[usize],
+        collations: &[Option<String>],
+    ) -> bool {
+        let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec());
+        if constraint.index.is_some() {
+            let mut seen = HashSet::new();
+            for row in &self.rows {
+                if let Some(key) = Self::unique_key_for_constraint(
+                    &row.values,
+                    &constraint.columns,
+                    &constraint.collations,
+                ) && !seen.insert(key)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        let registry = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (idx, row) in self.rows.iter().enumerate() {
+            if self.rows[idx + 1..].iter().any(|other| {
+                Self::unique_constraint_matches_row(
+                    &row.values,
+                    &other.values,
+                    &constraint.columns,
+                    &constraint.collations,
+                    &registry,
+                )
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Find rows that conflict with `new_values` on any UNIQUE constraint.
     /// Returns the rowids of all conflicting rows.
     pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
@@ -795,6 +871,28 @@ impl MemTable {
         for row in &mut self.rows {
             while row.values.len() < target_cols {
                 row.values.push(default_val.clone());
+            }
+        }
+        self.rebuild_unique_indexes();
+    }
+
+    /// Remove one declared column from every materialized row.
+    ///
+    /// TEMP tables use `MemTable` as their authoritative storage.  Keep the
+    /// table's direct UNIQUE-constraint column positions aligned with the
+    /// rewritten row image when `ALTER TABLE ... DROP COLUMN` removes a slot.
+    fn remove_column_from_rows(&mut self, removed_slot: usize) {
+        self.num_columns = self.num_columns.saturating_sub(1);
+        for row in &mut self.rows {
+            if removed_slot < row.values.len() {
+                row.values.remove(removed_slot);
+            }
+        }
+        for constraint in &mut self.unique_constraints {
+            for column in &mut constraint.columns {
+                if *column > removed_slot {
+                    *column -= 1;
+                }
             }
         }
         self.rebuild_unique_indexes();
@@ -1726,7 +1824,7 @@ impl ConcurrentContext {
 /// Shared wrapper around a boxed [`TransactionHandle`] so multiple
 /// storage cursors can share one transaction.
 ///
-/// Optionally includes [`ConcurrentContext`] for MVCC page-level locking
+/// Optionally includes a `ConcurrentContext` for MVCC page-level locking
 /// (bd-kivg / 5E.2).
 #[derive(Clone)]
 pub struct SharedTxnPageIo {
@@ -4071,6 +4169,32 @@ impl MemDatabase {
                 old_values,
             });
         }
+    }
+
+    /// Remove a column slot from every row in a TEMP table.
+    ///
+    /// The pre-rewrite table image is recorded as one undo entry, so an
+    /// enclosing statement savepoint restores row widths, UNIQUE metadata,
+    /// and the column count together.
+    pub fn remove_column_from_rows(&mut self, root_page: i32, removed_slot: usize) -> bool {
+        let Some(previous) = self.tables.get(&root_page).cloned() else {
+            return false;
+        };
+        if previous
+            .unique_constraints
+            .iter()
+            .any(|constraint| constraint.columns.contains(&removed_slot))
+        {
+            return false;
+        }
+        self.push_undo(MemDbUndoOp::ClearTable {
+            root_page,
+            table: previous,
+        });
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            table.remove_column_from_rows(removed_slot);
+        }
+        true
     }
 
     /// Allocate an implicit rowid and insert the row, recording one undo entry
@@ -6955,6 +7079,42 @@ impl VdbeEngine {
         key_values
     }
 
+    fn delete_index_entry_for_rowid(&mut self, cursor_id: i32, rowid: i64) -> Result<()> {
+        let Some(sc) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(());
+        };
+        if !sc.writable || !sc.cursor.first(&sc.cx)? {
+            return Ok(());
+        }
+
+        loop {
+            let key = sc.cursor.payload(&sc.cx)?;
+            let values = parse_record(&key).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "REPLACE cleanup encountered a malformed secondary-index record".to_owned(),
+            })?;
+            let entry_rowid = values
+                .last()
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail:
+                        "REPLACE cleanup encountered a secondary-index record without a rowid suffix"
+                            .to_owned(),
+                })?;
+            if entry_rowid == rowid {
+                sc.cursor.delete(&sc.cx)?;
+                invalidate_storage_cursor_row_cache_with_reason(
+                    sc,
+                    self.collect_vdbe_metrics,
+                    DecodeCacheInvalidationReason::WriteMutation,
+                );
+                return Ok(());
+            }
+            if !sc.cursor.next(&sc.cx)? {
+                return Ok(());
+            }
+        }
+    }
+
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
     /// Deletes the conflicting row from the table AND from all associated indexes.
     fn native_replace_row(&mut self, tbl_cursor_id: i32, conflict_rowid: i64) -> Result<()> {
@@ -6988,6 +7148,14 @@ impl VdbeEngine {
         let table_index_meta = Arc::clone(&self.table_index_meta);
         if let Some(index_metas) = table_index_meta.get(&tbl_cursor_id) {
             for meta in index_metas.iter() {
+                if meta.column_indices.is_empty() {
+                    // Partial and expression index keys cannot be rebuilt
+                    // from plain column offsets alone. Every rowid-table
+                    // secondary key ends with the table rowid, so scan for
+                    // that exact victim suffix instead of leaving an orphan.
+                    self.delete_index_entry_for_rowid(meta.cursor_id, conflict_rowid)?;
+                    continue;
+                }
                 let key_values = self.index_key_values_from_table_payload(
                     table_root_page,
                     &old_row,
@@ -7126,6 +7294,14 @@ impl VdbeEngine {
                         )
                     })?;
                     for meta in index_metas.iter() {
+                        // Empty column metadata denotes an expression or
+                        // partial index. These indexes were not restorable by
+                        // this path before they were registered for REPLACE
+                        // cleanup, so do not synthesize an invalid `(rowid)`
+                        // key here.
+                        if meta.column_indices.is_empty() {
+                            continue;
+                        }
                         let key_values = self.index_key_values_from_table_payload(
                             table_root_page,
                             &old_row,
@@ -7360,7 +7536,7 @@ impl VdbeEngine {
     /// Like [`set_transaction`](Self::set_transaction), but also enables
     /// MVCC page-level locking for concurrent writers. When the concurrent
     /// context is present:
-    /// - Write operations acquire page-level locks via [`concurrent_write_page`]
+    /// - Write operations acquire page-level locks via [`fsqlite_mvcc::concurrent_write_page`]
     /// - Written pages are recorded in the write set for FCW validation at commit
     pub fn set_transaction_concurrent(
         &mut self,
@@ -8685,6 +8861,23 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     self.pending_next_after_delete.remove(&cursor_id);
+                    if op.p3 == 1 {
+                        let has_temp_root = self
+                            .db
+                            .as_ref()
+                            .is_some_and(|db| db.get_table(root_page).is_some());
+                        if !has_temp_root {
+                            return Err(FrankenError::Internal(format!(
+                                "OpenRead failed: TEMP root page {root_page} is not attached"
+                            )));
+                        }
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, false));
+                        self.cursor_root_pages.insert(cursor_id, root_page);
+                        pc += 1;
+                        continue;
+                    }
                     if !self.open_storage_cursor(cursor_id, root_page, false) {
                         return Err(FrankenError::Internal(format!(
                             "OpenRead failed: could not open storage cursor on root page {root_page}"
@@ -8713,6 +8906,23 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     self.pending_next_after_delete.remove(&cursor_id);
+                    if op.p3 == 1 {
+                        let has_temp_root = self
+                            .db
+                            .as_ref()
+                            .is_some_and(|db| db.get_table(root_page).is_some());
+                        if !has_temp_root {
+                            return Err(FrankenError::Internal(format!(
+                                "OpenWrite failed: TEMP root page {root_page} is not attached"
+                            )));
+                        }
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, true));
+                        self.cursor_root_pages.insert(cursor_id, root_page);
+                        pc += 1;
+                        continue;
+                    }
                     if !self.open_storage_cursor(cursor_id, root_page, true) {
                         return Err(FrankenError::Internal(format!(
                             "OpenWrite failed: could not open storage cursor on root page {root_page}"
@@ -13050,9 +13260,58 @@ impl VdbeEngine {
                             "FusedAppendInsert: cursor is not writable",
                         ));
                     }
+                } else if let Some(root_page) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
+                    // TEMP tables deliberately use the direct MemDatabase
+                    // cursor backend. Preserve the fused opcode's semantics
+                    // there instead of requiring a pager-backed cursor.
+                    let rowid = self.db.as_mut().map_or(1, |db| db.alloc_rowid(root_page));
+                    let mut rec_buf = self.make_record_lookaside.take_buf();
+                    self.serialize_record_from_register_range(
+                        first_reg,
+                        num_cols,
+                        &op.p4,
+                        &mut rec_buf,
+                    );
+                    let values = parse_record(&rec_buf).ok_or_else(|| {
+                        FrankenError::internal("malformed SQLite record in TEMP FusedAppendInsert")
+                    })?;
+                    rec_buf.clear();
+                    self.make_record_lookaside.replace_buf(rec_buf);
+
+                    let unique_conflicts = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.get_table(root_page))
+                        .map(|table| table.find_unique_conflicts(&values))
+                        .unwrap_or_default();
+                    if !unique_conflicts.is_empty() {
+                        return Err(FrankenError::UniqueViolation {
+                            columns: "TEMP table unique constraint".to_owned(),
+                        });
+                    }
+                    let db = self.db.as_mut().ok_or_else(|| {
+                        FrankenError::internal(
+                            "FusedAppendInsert: TEMP MemDatabase is not attached",
+                        )
+                    })?;
+                    db.upsert_row(root_page, rowid, values);
+
+                    self.changes += 1;
+                    self.last_insert_rowid = rowid;
+                    self.last_insert_rowid_valid = true;
+                    self.last_insert_cursor_id = Some(cursor_id);
+                    self.set_conflict_skip_idx(false);
+                    self.set_pending_insert_rollback(Some(PendingInsertRollback {
+                        cursor_id,
+                        rowid,
+                        previous_last_insert_rowid,
+                        previous_last_insert_rowid_valid,
+                        update_restore: None,
+                    }));
+                    self.pending_next_after_delete.remove(&cursor_id);
                 } else {
                     return Err(FrankenError::internal(format!(
-                        "FusedAppendInsert: no storage cursor for id {cursor_id}"
+                        "FusedAppendInsert: no cursor for id {cursor_id}"
                     )));
                 }
                 *pc += 1;
@@ -27531,6 +27790,86 @@ mod tests {
                 .unwrap()
                 .is_found(),
             "non-conflicting index entries must remain intact"
+        );
+    }
+
+    #[test]
+    fn test_native_replace_row_scans_expression_index_for_victim_rowid() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut db = MemDatabase::new();
+        let table_root = db.create_table(2);
+        let index_root = 256;
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_transaction(txn);
+        engine.table_index_meta = Arc::new(HashMap::from([(
+            0,
+            vec![IndexCursorMeta {
+                cursor_id: 1,
+                column_indices: Vec::new(),
+            }]
+            .into_boxed_slice(),
+        )]));
+
+        assert!(engine.open_storage_cursor(0, table_root, true));
+        assert!(engine.open_storage_cursor(1, index_root, true));
+        engine.cursor_root_pages.insert(0, table_root);
+        engine.cursor_root_pages.insert(1, index_root);
+
+        let victim_row =
+            encode_record(&[SqliteValue::Text("VICTIM".into()), SqliteValue::Integer(1)]);
+        let keep_row = encode_record(&[SqliteValue::Text("KEEP".into()), SqliteValue::Integer(2)]);
+        let victim_index =
+            encode_record(&[SqliteValue::Text("victim".into()), SqliteValue::Integer(1)]);
+        let keep_index =
+            encode_record(&[SqliteValue::Text("keep".into()), SqliteValue::Integer(2)]);
+
+        {
+            let table_cursor = engine.storage_cursors.get_mut(&0).unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 1, &victim_row)
+                .unwrap();
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &keep_row)
+                .unwrap();
+        }
+        {
+            let index_cursor = engine.storage_cursors.get_mut(&1).unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &victim_index)
+                .unwrap();
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &keep_index)
+                .unwrap();
+        }
+
+        engine.native_replace_row(0, 1).unwrap();
+
+        let index_cursor = engine.storage_cursors.get_mut(&1).unwrap();
+        assert!(
+            !index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &victim_index)
+                .unwrap()
+                .is_found(),
+            "expression-index cleanup must remove the victim's rowid-suffixed key"
+        );
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &keep_index)
+                .unwrap()
+                .is_found(),
+            "rowid-suffix scanning must preserve other expression-index entries"
         );
     }
 

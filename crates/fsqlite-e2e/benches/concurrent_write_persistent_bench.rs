@@ -54,7 +54,13 @@ use serde::{Deserialize, Serialize};
 
 const ROWS_PER_THREAD: i64 = 1000;
 /// Maximum retries before giving up on a transaction (applies to both engines).
-const MAX_TXN_RETRIES: u32 = 100;
+///
+/// With the deliberately zero SQLite busy timeout, 100 retries represented
+/// only 10 ms of backoff. A preempted lock holder on a saturated benchmark host
+/// could therefore make a healthy peer abort before it was scheduled again.
+/// Ten seconds of bounded backoff preserves fail-fast behavior for a genuine
+/// wedge without turning ordinary scheduler latency into a benchmark failure.
+const MAX_TXN_RETRIES: u32 = 100_000;
 const RETRY_BACKOFF: Duration = Duration::from_micros(100);
 const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
 const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
@@ -360,7 +366,7 @@ fn flusher_lock_wait_fraction_basis_points(metrics: &ConsolidationMetricsSnapsho
     let lock_wait_total = metrics.flusher_lock_wait_us_total();
     let wal_service_total = metrics.wal_service_us_total();
     let total = lock_wait_total.saturating_add(wal_service_total);
-    (total > 0).then_some(lock_wait_total.saturating_mul(10_000) / total)
+    (total > 0).then(|| lock_wait_total.saturating_mul(10_000) / total)
 }
 
 fn persistent_phase_base_group(benchmark_group: &str) -> &str {

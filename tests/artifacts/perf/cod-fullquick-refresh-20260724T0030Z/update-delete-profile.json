@@ -1,0 +1,336 @@
+{
+  "schema_version": "fsqlite-e2e.comprehensive-bench-report.v3",
+  "generated_at_utc": "2026-07-24 01:31:16 UTC",
+  "total_elapsed_ms": 220,
+  "config": {
+    "quick": true,
+    "filter": "update-delete",
+    "warmup_iterations": 2,
+    "min_iterations": 3,
+    "max_iterations": 10,
+    "target_duration_secs": 5,
+    "row_counts": [
+      100,
+      1000,
+      10000
+    ],
+    "html_output_path": null,
+    "json_output_path": "tests/artifacts/perf/darkbarn-update-delete-profile-20260724T0115Z.json",
+    "json_stdout": false
+  },
+  "environment": {
+    "os": "Ubuntu 25.10",
+    "arch": "x86_64",
+    "kernel_release": "6.17.0-35-generic",
+    "cpu_model": "AMD EPYC Processor (with IBPB)",
+    "cpu_cores": 10,
+    "ram_gb": 58.85670471191406,
+    "active_toolchain": "nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)",
+    "rust_version": "rustc 1.99.0-nightly (3d50c25bc 2026-07-16)",
+    "cargo_version": "cargo 1.99.0-nightly (59800466c 2026-07-07)",
+    "git_commit_sha": "d2ec37bf627df1d0351d68b6bfa0f394fd0ae97c",
+    "git_branch": null,
+    "git_head_unix_ts": 1784851727,
+    "git_dirty": true,
+    "benchmark_binary_modified_unix_ts": 1784856675,
+    "benchmark_binary_older_than_git_head": false,
+    "build_profile": "release-perf"
+  },
+  "summary": {
+    "total_scenarios": 6,
+    "franken_faster": 1,
+    "comparable": 1,
+    "csqlite_faster": 4,
+    "avg_ratio": 1.7456239023022009,
+    "average_ratio": 1.7456239023022009,
+    "geomean_ratio": 1.61063577401738,
+    "median_ratio": 1.9751359096464243,
+    "p90_ratio": 2.7505411255411256,
+    "p99_ratio": 2.7505411255411256,
+    "primary_metric": "per_category_weighted.score",
+    "per_category": {
+      "concurrent_writers": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "mixed": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_aggregate": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_single": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "write_bulk": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "write_single": {
+        "n": 6,
+        "avg_ratio": 1.7456239023022009,
+        "geomean_ratio": 1.61063577401738,
+        "median_ratio": 1.9751359096464243,
+        "p90_ratio": 2.7505411255411256,
+        "p99_ratio": 2.7505411255411256
+      }
+    },
+    "per_category_weighted": {
+      "primary": true,
+      "score": 1.61063577401738,
+      "weights": {
+        "concurrent_writers": 0.05,
+        "mixed": 0.05,
+        "read_aggregate": 0.15,
+        "read_single": 0.35,
+        "write_bulk": 0.1,
+        "write_single": 0.3
+      },
+      "observed_weight": 0.3,
+      "missing_categories": [
+        "concurrent_writers",
+        "mixed",
+        "read_aggregate",
+        "read_single",
+        "write_bulk"
+      ]
+    }
+  },
+  "ci_regression_gate": {
+    "schema_version": "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2",
+    "bead_id": "bd-m4tju",
+    "depends_on_bead_id": "bd-0winn",
+    "status": "rich_scorecard_schema_ready",
+    "thresholds": {
+      "avg_ratio_baseline": 2.74,
+      "avg_ratio_max": null,
+      "mt_p95_ratio_max": null,
+      "primary_score_max_regression_pct": 0.03,
+      "geomean_max_regression_pct": 0.05,
+      "per_category_geomean_max_regression_pct": 0.1,
+      "p90_max_regression_pct": 0.15,
+      "threshold_source": "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score"
+    },
+    "observed": {
+      "avg_ratio": 1.7456239023022009,
+      "primary_score": 1.61063577401738,
+      "geomean_ratio": 1.61063577401738,
+      "median_ratio": 1.9751359096464243,
+      "p90_ratio": 2.7505411255411256,
+      "max_mt_p95_ratio": null,
+      "max_mt_p95_scenario_id": null
+    }
+  },
+  "sections": [
+    {
+      "section_id": "update-delete-throughput",
+      "title": "UPDATE/DELETE Throughput",
+      "description": "Pre-populated table with N rows. Measures batch update (10% of rows) and batch delete (5% of rows).",
+      "rows": [
+        {
+          "scenario_id": "update-delete-throughput__100-rows-update-10-rows",
+          "scenario": "100 rows / update 10 rows",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.0063300000000000006,
+            "mean_ms": 0.017113,
+            "min_ms": 0.005808,
+            "p95_ms": 0.11453,
+            "p99_ms": 0.11453,
+            "stddev_ms": 0.032475000000000004,
+            "cv_pct": 189.76801262198327,
+            "rows_per_sec": 1579778.830963665,
+            "us_per_row": 0.633,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.010936,
+            "mean_ms": 0.011718000000000001,
+            "min_ms": 0.010406,
+            "p95_ms": 0.016714999999999997,
+            "p99_ms": 0.016714999999999997,
+            "stddev_ms": 0.0018080000000000001,
+            "cv_pct": 15.429254138931558,
+            "rows_per_sec": 914411.1192392099,
+            "us_per_row": 1.0936,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.7276461295418641
+        },
+        {
+          "scenario_id": "update-delete-throughput__100-rows-delete-5-rows",
+          "scenario": "100 rows / delete 5 rows",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.0036959999999999996,
+            "mean_ms": 0.003715,
+            "min_ms": 0.003275,
+            "p95_ms": 0.004537,
+            "p99_ms": 0.004537,
+            "stddev_ms": 0.000357,
+            "cv_pct": 9.609690444145356,
+            "rows_per_sec": 1352813.852813853,
+            "us_per_row": 0.7392,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.010166000000000001,
+            "mean_ms": 0.01045,
+            "min_ms": 0.009524000000000001,
+            "p95_ms": 0.013991,
+            "p99_ms": 0.013991,
+            "stddev_ms": 0.0012490000000000001,
+            "cv_pct": 11.952153110047847,
+            "rows_per_sec": 491835.53019870154,
+            "us_per_row": 2.0332,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 2.7505411255411256
+        },
+        {
+          "scenario_id": "update-delete-throughput__1000-rows-update-100-rows",
+          "scenario": "1000 rows / update 100 rows",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.042334,
+            "mean_ms": 0.047682,
+            "min_ms": 0.040601,
+            "p95_ms": 0.09304,
+            "p99_ms": 0.09304,
+            "stddev_ms": 0.015207,
+            "cv_pct": 31.892538064678494,
+            "rows_per_sec": 2362167.5249208673,
+            "us_per_row": 0.42333999999999994,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.041132,
+            "mean_ms": 0.042931,
+            "min_ms": 0.035563,
+            "p95_ms": 0.06991399999999999,
+            "p99_ms": 0.06991399999999999,
+            "stddev_ms": 0.009347000000000001,
+            "cv_pct": 21.772146001723698,
+            "rows_per_sec": 2431197.121462608,
+            "us_per_row": 0.41131999999999996,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9716067463504512
+        },
+        {
+          "scenario_id": "update-delete-throughput__1000-rows-delete-50-rows",
+          "scenario": "1000 rows / delete 50 rows",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.019319,
+            "mean_ms": 0.020958,
+            "min_ms": 0.018678,
+            "p95_ms": 0.034301000000000005,
+            "p99_ms": 0.034301000000000005,
+            "stddev_ms": 0.004482,
+            "cv_pct": 21.385628399656458,
+            "rows_per_sec": 2588125.679382991,
+            "us_per_row": 0.38638,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.041812,
+            "mean_ms": 0.043228,
+            "min_ms": 0.040231,
+            "p95_ms": 0.052499,
+            "p99_ms": 0.052499,
+            "stddev_ms": 0.0035099999999999997,
+            "cv_pct": 8.119737207365596,
+            "rows_per_sec": 1195828.9486271883,
+            "us_per_row": 0.83624,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 2.164294218127232
+        },
+        {
+          "scenario_id": "update-delete-throughput__10000-rows-update-1000-rows",
+          "scenario": "10000 rows / update 1000 rows",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.405427,
+            "mean_ms": 0.448172,
+            "min_ms": 0.354981,
+            "p95_ms": 0.631747,
+            "p99_ms": 0.631747,
+            "stddev_ms": 0.08730500000000001,
+            "cv_pct": 19.480244191962015,
+            "rows_per_sec": 2466535.2825539494,
+            "us_per_row": 0.405427,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.358608,
+            "mean_ms": 0.356537,
+            "min_ms": 0.296444,
+            "p95_ms": 0.461041,
+            "p99_ms": 0.461041,
+            "stddev_ms": 0.054113999999999995,
+            "cv_pct": 15.177667394968825,
+            "rows_per_sec": 2788560.210592067,
+            "us_per_row": 0.358608,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.8845192846061066
+        },
+        {
+          "scenario_id": "update-delete-throughput__10000-rows-delete-500-rows",
+          "scenario": "10000 rows / delete 500 rows",
+          "category": "write_single",
+          "csqlite": {
+            "median_ms": 0.213561,
+            "mean_ms": 0.223151,
+            "min_ms": 0.12651,
+            "p95_ms": 0.421321,
+            "p99_ms": 0.421321,
+            "stddev_ms": 0.076893,
+            "cv_pct": 34.45783348494965,
+            "rows_per_sec": 2341251.4457227676,
+            "us_per_row": 0.427122,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 0.42181199999999996,
+            "mean_ms": 0.45761599999999997,
+            "min_ms": 0.396043,
+            "p95_ms": 0.7449349999999999,
+            "p99_ms": 0.7449349999999999,
+            "stddev_ms": 0.100344,
+            "cv_pct": 21.927554980595083,
+            "rows_per_sec": 1185362.19927361,
+            "us_per_row": 0.8436239999999999,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 1.9751359096464243
+        }
+      ]
+    }
+  ]
+}

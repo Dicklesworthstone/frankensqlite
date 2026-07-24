@@ -821,109 +821,129 @@ impl VfsFile for MemoryFile {
         Ok(Some(FileIdentity::from_memory_parts(namespace, object)))
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        let storage = self.storage.lock().map_err(|_| lock_err())?;
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let storage = self.storage.lock().map_err(|_| lock_err())?;
 
-        let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
-        let file_len = storage.data.len();
+            let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
+            let file_len = storage.data.len();
 
-        if offset >= file_len {
+            if offset >= file_len {
+                drop(storage);
+                buf.fill(0);
+                return Ok(0);
+            }
+
+            let available = file_len - offset;
+            let to_read = buf.len().min(available);
+            buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
             drop(storage);
-            buf.fill(0);
-            return Ok(0);
-        }
 
-        let available = file_len - offset;
-        let to_read = buf.len().min(available);
-        buf[..to_read].copy_from_slice(&storage.data[offset..offset + to_read]);
-        drop(storage);
-
-        // Zero-fill the rest if short read.
-        if to_read < buf.len() {
-            buf[to_read..].fill(0);
-        }
-
-        Ok(to_read)
-    }
-
-    #[allow(clippy::significant_drop_tightening)]
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-        Self::write_into_storage(&mut inner, &mut storage, buf, offset)
-    }
-
-    #[allow(clippy::significant_drop_tightening)]
-    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        if writes.is_empty() {
-            return Ok(());
-        }
-        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-
-        if writes.len() == 1 {
-            let (offset, data) = writes[0];
-            return Self::write_into_storage(&mut inner, &mut storage, data, offset);
-        }
-
-        let mut normalized_writes = Vec::with_capacity(writes.len());
-        let mut required_len = storage.data.len();
-        for &(offset, data) in writes {
-            if data.is_empty() {
-                continue;
+            // Zero-fill the rest if short read.
+            if to_read < buf.len() {
+                buf[to_read..].fill(0);
             }
-            let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
-            required_len = required_len.max(end);
-            normalized_writes.push((offset, data));
-        }
 
-        if normalized_writes.is_empty() {
-            return Ok(());
+            Ok(to_read)
         }
+    }
 
-        let old_len = storage.data.len();
-        let old_reserved = storage.data.capacity();
-        if required_len > old_reserved {
-            let proposed_reserved = next_growth_target(
+    #[allow(clippy::significant_drop_tightening)]
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+            Self::write_into_storage(&mut inner, &mut storage, buf, offset)
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn write_page_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        writes: &'a [(u64, &'a [u8])],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            if writes.is_empty() {
+                return Ok(());
+            }
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+
+            if writes.len() == 1 {
+                let (offset, data) = writes[0];
+                return Self::write_into_storage(&mut inner, &mut storage, data, offset);
+            }
+
+            let mut normalized_writes = Vec::with_capacity(writes.len());
+            let mut required_len = storage.data.len();
+            for &(offset, data) in writes {
+                if data.is_empty() {
+                    continue;
+                }
+                let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
+                required_len = required_len.max(end);
+                normalized_writes.push((offset, data));
+            }
+
+            if normalized_writes.is_empty() {
+                return Ok(());
+            }
+
+            let old_len = storage.data.len();
+            let old_reserved = storage.data.capacity();
+            if required_len > old_reserved {
+                let proposed_reserved = next_growth_target(
+                    old_reserved,
+                    required_len,
+                    inner.config.initial_reserve_bytes,
+                    inner.config.growth_chunk_bytes,
+                );
+                ensure_total_reserved_within_limit(
+                    &inner.usage,
+                    old_reserved,
+                    proposed_reserved,
+                    inner.config.max_bytes,
+                )?;
+                storage
+                    .data
+                    .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                    .map_err(|_| FrankenError::OutOfMemory)?;
+            }
+
+            if required_len > storage.data.len() {
+                storage.data.resize(required_len, 0);
+            }
+
+            for (offset, data) in normalized_writes {
+                let end = offset + data.len();
+                if end == storage.data.len() && offset == storage.data.len() - data.len() {
+                    storage.data[offset..].copy_from_slice(data);
+                } else {
+                    storage.data[offset..end].copy_from_slice(data);
+                }
+            }
+            inner.usage.apply_file_change(
+                old_len,
                 old_reserved,
-                required_len,
-                inner.config.initial_reserve_bytes,
-                inner.config.growth_chunk_bytes,
+                storage.data.len(),
+                storage.data.capacity(),
             );
-            ensure_total_reserved_within_limit(
-                &inner.usage,
-                old_reserved,
-                proposed_reserved,
-                inner.config.max_bytes,
-            )?;
-            storage
-                .data
-                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
-                .map_err(|_| FrankenError::OutOfMemory)?;
+            Ok(())
         }
-
-        if required_len > storage.data.len() {
-            storage.data.resize(required_len, 0);
-        }
-
-        for (offset, data) in normalized_writes {
-            let end = offset + data.len();
-            if end == storage.data.len() && offset == storage.data.len() - data.len() {
-                storage.data[offset..].copy_from_slice(data);
-            } else {
-                storage.data[offset..end].copy_from_slice(data);
-            }
-        }
-        inner.usage.apply_file_change(
-            old_len,
-            old_reserved,
-            storage.data.len(),
-            storage.data.capacity(),
-        );
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -1107,7 +1127,20 @@ impl VfsFile for MemoryFile {
     }
 }
 
-impl crate::traits::AsyncVfsDataPath for MemoryFile {}
+#[cfg(test)]
+impl MemoryFile {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
+    }
+
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
+    }
+
+    fn write_page_batch(&self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write_page_batch(self, cx, writes))
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
@@ -1125,7 +1158,7 @@ mod tests {
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         file.write(&cx, b"hello", 0).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 5);
@@ -1147,7 +1180,7 @@ mod tests {
             .map(|idx| u8::try_from(idx % 251).expect("mod value must fit in u8"))
             .collect::<Vec<_>>();
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file.write(&cx, &payload, 0).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), payload.len() as u64);
 
@@ -1164,7 +1197,7 @@ mod tests {
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file.write(&cx, b"hi", 0).unwrap();
 
         let mut buf = [0xFFu8; 10];
@@ -1195,7 +1228,7 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
         file.write(&cx, b"world", 10).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 15);
@@ -1325,7 +1358,7 @@ mod tests {
         let path = Path::new("shared.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file1.write(&cx, b"shared data", 0).unwrap();
 
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
@@ -1380,7 +1413,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
         file.write(&cx, b"AAAAAAAAAA", 0).unwrap();
         file.write(&cx, b"BB", 3).unwrap();
@@ -1427,7 +1460,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("pages.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("pages.db")), flags).unwrap();
 
         let page1 = vec![0xAA_u8; 4096];
         let page2 = vec![0xBB_u8; 4096];
@@ -1451,7 +1484,7 @@ mod tests {
         let vfs2 = vfs1.clone();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs1.open(&cx, Some(Path::new("shared.db")), flags).unwrap();
+        let (file, _) = vfs1.open(&cx, Some(Path::new("shared.db")), flags).unwrap();
         file.write(&cx, b"from vfs1", 0).unwrap();
 
         // vfs2 should see the same file since they share inner state.
@@ -1470,7 +1503,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("zero.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("zero.db")), flags).unwrap();
 
         file.write(&cx, b"abc", 0).unwrap();
         file.write(&cx, b"", 0).unwrap(); // zero-length write
@@ -1486,7 +1519,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("overflow_offset.db")), flags)
             .unwrap();
 
@@ -1513,7 +1546,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("batch_overflow_offset.db")), flags)
             .unwrap();
 
@@ -1528,7 +1561,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("rz.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("rz.db")), flags).unwrap();
 
         file.write(&cx, b"data", 0).unwrap();
         let mut buf = [];
@@ -1541,7 +1574,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("end.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("end.db")), flags).unwrap();
 
         file.write(&cx, b"12345", 0).unwrap();
         let mut buf = [0xFFu8; 4];
@@ -1957,7 +1990,7 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("acc.db")), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(Path::new("acc.db")), flags).unwrap();
         file.write(&cx, b"test", 0).unwrap();
 
         // MemoryVfs always returns true for access if file exists.
@@ -1996,9 +2029,9 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut f1, _) = vfs.open(&cx, None, flags).unwrap();
-        let (mut f2, _) = vfs.open(&cx, None, flags).unwrap();
-        let (mut f3, _) = vfs.open(&cx, None, flags).unwrap();
+        let (f1, _) = vfs.open(&cx, None, flags).unwrap();
+        let (f2, _) = vfs.open(&cx, None, flags).unwrap();
+        let (f3, _) = vfs.open(&cx, None, flags).unwrap();
 
         f1.write(&cx, b"one", 0).unwrap();
         f2.write(&cx, b"two", 0).unwrap();
@@ -2036,12 +2069,12 @@ mod tests {
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut f1, _) = vfs.open(&cx, Some(Path::new("conc.db")), flags).unwrap();
+        let (f1, _) = vfs.open(&cx, Some(Path::new("conc.db")), flags).unwrap();
         f1.write(&cx, b"AAAA", 0).unwrap();
 
         // Open a second handle to the same file.
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut f2, _) = vfs
+        let (f2, _) = vfs
             .open(&cx, Some(Path::new("conc.db")), open_flags)
             .unwrap();
         f2.write(&cx, b"BB", 1).unwrap();
@@ -2115,7 +2148,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("batch_write.db")), flags)
             .unwrap();
 
@@ -2215,7 +2248,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("batch_write.db")), flags)
             .unwrap();
 
@@ -2349,7 +2382,7 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
+        let (file, _) = vfs
             .open(&cx, Some(Path::new("overwrite.db")), flags)
             .unwrap();
 
@@ -2473,7 +2506,7 @@ mod tests {
         let vfs = make_vfs();
         let path = Path::new("read_eof.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         file.write(&cx, &[0xCC; 10], 0).unwrap();
 
@@ -2501,7 +2534,7 @@ mod tests {
         let vfs = make_vfs();
         let path = Path::new("sparse.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         file.write(&cx, &[0xDD; 4], 100).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 104);
@@ -2523,7 +2556,7 @@ mod tests {
         let path = Path::new("shared.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
         f1.write(&cx, &[0x11; 16], 0).unwrap();
 
         let (f2, _) = vfs.open(&cx, Some(path), flags).unwrap();

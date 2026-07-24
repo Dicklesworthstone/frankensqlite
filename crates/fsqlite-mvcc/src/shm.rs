@@ -6,13 +6,17 @@
 //! - Atomic counters: next_txn_id, next_commit_seq, snapshot_seq (seqlock), commit_seq,
 //!   schema_epoch, ecs_epoch, gc_horizon.
 //! - Serialized writer indicator: writer_txn_id, pid, pid_birth, lease_expiry.
+//! - Snapshot publisher identity: owner token and PID birth marker.
 //! - An xxh3_64 checksum over the immutable fields.
 //!
 //! The in-process fast path uses native Rust atomics. Serialization to/from
 //! the on-disk byte-level wire format uses explicit `to_le_bytes`/`from_le_bytes`
 //! at computed offsets. No `unsafe`, no `repr(C)` reinterpret casts.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use fsqlite_types::{CommitSeq, PageSize, SchemaEpoch, TxnId};
 use fsqlite_vfs::ShmRegion;
@@ -93,9 +97,18 @@ mod offsets {
     /// `u64` — xxh3_64 checksum over immutable fields.
     pub const LAYOUT_CHECKSUM: usize = 144;
 
-    /// `[u8;56]` — reserved padding to 216 bytes.
-    pub const _PADDING: usize = 160;
-    pub const _PADDING_LEN: usize = 56;
+    /// `u64` — snapshot publisher owner token.
+    ///
+    /// Bit 63 marks owner initialization; bits 32..62 hold a process-local
+    /// generation and bits 0..31 hold the publisher PID.
+    pub const SNAPSHOT_PUBLISHER_OWNER: usize = 160;
+
+    /// `u64` — snapshot publisher PID birth marker.
+    pub const SNAPSHOT_PUBLISHER_PID_BIRTH: usize = 168;
+
+    /// `[u8;40]` — reserved padding to 216 bytes.
+    pub const _PADDING: usize = 176;
+    pub const _PADDING_LEN: usize = 40;
 
     /// Total header size in bytes.
     pub const HEADER_SIZE: usize = 216;
@@ -114,6 +127,90 @@ const LAYOUT_VERSION: u32 = 1;
 /// Default max transaction slots when not specified.
 const DEFAULT_MAX_TXN_SLOTS: u32 = 128;
 
+/// High bit identifying a `/proc/<pid>/stat` start-time birth marker.
+const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
+
+/// High bit identifying an owner token whose birth marker is not published yet.
+const SNAPSHOT_PUBLISHER_INITIALIZING: u64 = 1_u64 << 63;
+
+/// Process-local generation used to make consecutive ownership tokens distinct.
+///
+/// Seeded from per-process entropy rather than a fixed constant: with a fixed
+/// seed, a new process that reuses a dead publisher's PID would mint the exact
+/// token the dead owner left stamped, and a concurrent waiter that already
+/// proved the old owner dead could CAS the *live* new owner out (token ABA).
+/// Entropy makes cross-process token collision negligible, so the claim CAS
+/// remains a sound guard.
+static NEXT_SNAPSHOT_PUBLISHER_GENERATION: OnceLock<AtomicU64> = OnceLock::new();
+
+fn next_snapshot_publisher_generation_counter() -> &'static AtomicU64 {
+    NEXT_SNAPSHOT_PUBLISHER_GENERATION.get_or_init(|| {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        // RandomState carries per-process random SipHash keys; hashing the
+        // pid and birth marker through it yields a process-unique seed
+        // without pulling in an RNG dependency.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.write_u64(current_process_birth_marker());
+        AtomicU64::new(hasher.finish())
+    })
+}
+
+#[cfg(unix)]
+fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
+    let stat_path = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("stat");
+    let stat = std::fs::read_to_string(stat_path).ok()?;
+    let comm_end = stat.rfind(')')?;
+    let tail = stat.get(comm_end + 1..)?.trim_start();
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn current_process_birth_marker() -> u64 {
+    static FALLBACK_BIRTH: OnceLock<u64> = OnceLock::new();
+
+    #[cfg(unix)]
+    if std::path::Path::new("/proc").exists()
+        && let Some(start_ticks) = read_proc_start_time_ticks(std::process::id())
+    {
+        return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
+    }
+
+    *FALLBACK_BIRTH.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |duration| duration.as_nanos() as u64);
+        now.max(1)
+    })
+}
+
+fn snapshot_publisher_alive_os(pid: u32, pid_birth: u64) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        if !std::path::Path::new("/proc").exists() {
+            return true;
+        }
+        let proc_dir = std::path::Path::new("/proc").join(pid.to_string());
+        if !proc_dir.exists() {
+            return false;
+        }
+        if pid_birth == 0 || pid_birth & PID_BIRTH_PROCFS_TAG == 0 {
+            return true;
+        }
+        let expected_ticks = pid_birth & !PID_BIRTH_PROCFS_TAG;
+        read_proc_start_time_ticks(pid).is_none_or(|start_ticks| start_ticks == expected_ticks)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, pid_birth);
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ShmSnapshot
 // ---------------------------------------------------------------------------
@@ -127,6 +224,51 @@ pub struct ShmSnapshot {
     pub schema_epoch: SchemaEpoch,
     /// The current ECS epoch.
     pub ecs_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotPublisherIdentity {
+    active_token: u64,
+    initializing_token: u64,
+    pid: u32,
+    pid_birth: u64,
+}
+
+impl SnapshotPublisherIdentity {
+    fn current() -> Self {
+        let pid = std::process::id();
+        let generation = loop {
+            let raw = next_snapshot_publisher_generation_counter().fetch_add(1, Ordering::Relaxed);
+            let generation = (raw as u32) & 0x7fff_ffff;
+            if generation != 0 {
+                break generation;
+            }
+        };
+        let active_token = (u64::from(generation) << 32) | u64::from(pid);
+        Self {
+            active_token,
+            initializing_token: active_token | SNAPSHOT_PUBLISHER_INITIALIZING,
+            pid,
+            pid_birth: current_process_birth_marker(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn for_test(pid: u32, generation: u32, pid_birth: u64) -> Self {
+        let active_token = ((generation as u64 & 0x7fff_ffff) << 32) | pid as u64;
+        Self {
+            active_token,
+            initializing_token: active_token | SNAPSHOT_PUBLISHER_INITIALIZING,
+            pid,
+            pid_birth,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotPublishPermit {
+    identity: SnapshotPublisherIdentity,
+    odd_sequence: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +305,8 @@ pub struct SharedMemoryLayout {
     serialized_writer_pid_and_gen: AtomicU64,
     serialized_writer_pid_birth: AtomicU64,
     serialized_writer_lease_expiry: AtomicU64,
+    snapshot_publisher_owner: AtomicU64,
+    snapshot_publisher_pid_birth: AtomicU64,
     mapped_region: Option<ShmRegion>,
 }
 
@@ -232,6 +376,8 @@ impl SharedMemoryLayout {
             serialized_writer_pid_and_gen: AtomicU64::new(0),
             serialized_writer_pid_birth: AtomicU64::new(0),
             serialized_writer_lease_expiry: AtomicU64::new(0),
+            snapshot_publisher_owner: AtomicU64::new(0),
+            snapshot_publisher_pid_birth: AtomicU64::new(0),
             mapped_region: None,
         }
     }
@@ -303,6 +449,8 @@ impl SharedMemoryLayout {
         let sw_pid_and_gen = read_u64(buf, offsets::SERIALIZED_WRITER_PID_AND_GEN);
         let sw_pid_birth = read_u64(buf, offsets::SERIALIZED_WRITER_PID_BIRTH);
         let sw_lease = read_u64(buf, offsets::SERIALIZED_WRITER_LEASE_EXPIRY);
+        let snapshot_publisher_owner = read_u64(buf, offsets::SNAPSHOT_PUBLISHER_OWNER);
+        let snapshot_publisher_pid_birth = read_u64(buf, offsets::SNAPSHOT_PUBLISHER_PID_BIRTH);
 
         Ok(Self {
             page_size,
@@ -324,6 +472,8 @@ impl SharedMemoryLayout {
             serialized_writer_pid_and_gen: AtomicU64::new(sw_pid_and_gen),
             serialized_writer_pid_birth: AtomicU64::new(sw_pid_birth),
             serialized_writer_lease_expiry: AtomicU64::new(sw_lease),
+            snapshot_publisher_owner: AtomicU64::new(snapshot_publisher_owner),
+            snapshot_publisher_pid_birth: AtomicU64::new(snapshot_publisher_pid_birth),
             mapped_region: None,
         })
     }
@@ -465,6 +615,26 @@ impl SharedMemoryLayout {
             ),
         );
 
+        // Snapshot publisher owner stamp (dynamic crash-recovery metadata).
+        write_u64(
+            &mut buf,
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            self.load_u64_field(
+                offsets::SNAPSHOT_PUBLISHER_OWNER,
+                &self.snapshot_publisher_owner,
+                Ordering::Acquire,
+            ),
+        );
+        write_u64(
+            &mut buf,
+            offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
+            self.load_u64_field(
+                offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
+                &self.snapshot_publisher_pid_birth,
+                Ordering::Acquire,
+            ),
+        );
+
         // Region offsets (immutable).
         write_u64(&mut buf, offsets::LOCK_TABLE_OFFSET, self.lock_table_offset);
         write_u64(&mut buf, offsets::WITNESS_OFFSET, self.witness_offset);
@@ -508,23 +678,6 @@ impl SharedMemoryLayout {
         }
     }
 
-    fn fetch_add_u64_field(
-        &self,
-        offset: usize,
-        fallback: &AtomicU64,
-        delta: u64,
-        ordering: Ordering,
-    ) -> u64 {
-        self.mapped_region.as_ref().map_or_else(
-            || fallback.fetch_add(delta, ordering),
-            |region| {
-                region
-                    .atomic_fetch_add_u64_le(offset, delta, ordering)
-                    .expect("mapped MVCC SHM layout offset is valid")
-            },
-        )
-    }
-
     fn compare_exchange_u64_field(
         &self,
         offset: usize,
@@ -548,49 +701,251 @@ impl SharedMemoryLayout {
     // Seqlock protocol
     // -----------------------------------------------------------------------
 
-    /// Begin a snapshot publish cycle (increment seqlock from even to odd).
+    /// Busy-spin iterations before a publisher or reader starts yielding.
+    const PUBLISH_WAIT_SPIN_PHASE: u32 = 1 << 10;
+
+    fn wait_for_snapshot_publisher(spins: &mut u32) {
+        *spins = spins.saturating_add(1);
+        if *spins > Self::PUBLISH_WAIT_SPIN_PHASE {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn snapshot_publisher_is_alive(
+        &self,
+        owner: u64,
+        owner_alive: &impl Fn(u32, u64) -> bool,
+    ) -> bool {
+        let pid = owner as u32;
+        if owner & SNAPSHOT_PUBLISHER_INITIALIZING != 0 {
+            // During the short initialization window the birth marker is not
+            // published yet. PID existence is sufficient to avoid stealing
+            // from a live initializer; a dead initializer can still be
+            // recovered because the callback returns false for a missing PID.
+            return owner_alive(pid, 0);
+        }
+        let pid_birth = self.load_u64_field(
+            offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
+            &self.snapshot_publisher_pid_birth,
+            Ordering::Acquire,
+        );
+        owner_alive(pid, pid_birth)
+    }
+
+    /// Atomically replace `current_owner` with a fully initialized owner stamp.
     ///
-    /// Uses CAS to go even→odd. If already odd (crash-stale), this is a no-op
-    /// — the caller should proceed with the publish and `end_snapshot_publish`
-    /// will advance past the stale odd value.
-    pub fn begin_snapshot_publish(&self) {
+    /// The initializing bit closes the otherwise unsafe window between the
+    /// owner CAS and publication of the PID birth marker. Waiters never use a
+    /// previous owner's birth marker to decide that a newly initialized owner
+    /// is dead.
+    fn try_claim_snapshot_publisher(
+        &self,
+        current_owner: u64,
+        identity: SnapshotPublisherIdentity,
+    ) -> bool {
+        if self
+            .compare_exchange_u64_field(
+                offsets::SNAPSHOT_PUBLISHER_OWNER,
+                &self.snapshot_publisher_owner,
+                current_owner,
+                identity.initializing_token,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        self.store_u64_field(
+            offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
+            &self.snapshot_publisher_pid_birth,
+            identity.pid_birth,
+            Ordering::Release,
+        );
+
+        self.compare_exchange_u64_field(
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            &self.snapshot_publisher_owner,
+            identity.initializing_token,
+            identity.active_token,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    }
+
+    fn release_snapshot_publisher_without_publish(&self, identity: SnapshotPublisherIdentity) {
+        if self.load_u64_field(
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            &self.snapshot_publisher_owner,
+            Ordering::Acquire,
+        ) != identity.active_token
+        {
+            return;
+        }
+
+        // Leave the birth marker in place while releasing ownership. It is
+        // ignored whenever the owner token is zero and overwritten by the
+        // next claimant. Clearing it first would create a crash window where
+        // a rapidly reused PID could make a dead owner appear live.
+        let _ = self.compare_exchange_u64_field(
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            &self.snapshot_publisher_owner,
+            identity.active_token,
+            0,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+    }
+
+    fn begin_snapshot_publish_with(
+        &self,
+        identity: SnapshotPublisherIdentity,
+        owner_alive: &impl Fn(u32, u64) -> bool,
+        force_recovery: bool,
+    ) -> SnapshotPublishPermit {
+        let mut spins = 0_u32;
         loop {
-            let seq =
+            let sequence =
                 self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire);
-            if seq % 2 == 1 {
-                // Already odd (crash-stale or concurrent publisher).
-                return;
+            let owner = self.load_u64_field(
+                offsets::SNAPSHOT_PUBLISHER_OWNER,
+                &self.snapshot_publisher_owner,
+                Ordering::Acquire,
+            );
+
+            let sequence_is_odd = sequence % 2 == 1;
+            let may_claim = if owner == 0 {
+                !sequence_is_odd || force_recovery
+            } else {
+                !self.snapshot_publisher_is_alive(owner, owner_alive)
+            };
+
+            if !may_claim || !self.try_claim_snapshot_publisher(owner, identity) {
+                Self::wait_for_snapshot_publisher(&mut spins);
+                continue;
             }
+
+            let claimed_sequence =
+                self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire);
+            if claimed_sequence % 2 == 1 {
+                // A dead owner was taken over without opening an even window:
+                // readers remain excluded until this publisher overwrites the
+                // complete triple. An unowned odd sequence is accepted only by
+                // explicit recovery, where no live publisher may exist.
+                if owner != 0 || force_recovery {
+                    return SnapshotPublishPermit {
+                        identity,
+                        odd_sequence: claimed_sequence,
+                    };
+                }
+                self.release_snapshot_publisher_without_publish(identity);
+                Self::wait_for_snapshot_publisher(&mut spins);
+                continue;
+            }
+
             if self
                 .compare_exchange_u64_field(
                     offsets::SNAPSHOT_SEQ,
                     &self.snapshot_seq,
-                    seq,
-                    seq + 1,
+                    claimed_sequence,
+                    claimed_sequence.wrapping_add(1),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
                 .is_ok()
             {
-                return;
+                return SnapshotPublishPermit {
+                    identity,
+                    odd_sequence: claimed_sequence.wrapping_add(1),
+                };
             }
+
+            self.release_snapshot_publisher_without_publish(identity);
+            Self::wait_for_snapshot_publisher(&mut spins);
         }
+    }
+
+    /// Begin a snapshot publish cycle (increment seqlock from even to odd).
+    ///
+    /// GH #199: entry requires **exclusive ownership** of the even→odd
+    /// transition. An odd sequence means another publisher is inside the
+    /// critical section, so this spins until that publisher completes rather
+    /// than barging in — two concurrent publishers would otherwise interleave
+    /// their field stores and leave the sequence odd forever (readers spin).
+    ///
+    /// Crash-staleness is recovered only after proving the stamped owner dead.
+    /// There is no elapsed-time takeover: a descheduled live publisher retains
+    /// ownership indefinitely, preserving the seqlock safety contract.
+    ///
+    /// Protocol constraints (deliberate, documented trade-offs):
+    ///
+    /// - **Dead-owner detection is procfs-based.** All publishers sharing a
+    ///   region must live in one PID namespace; a peer in a different
+    ///   namespace could judge a live publisher dead (its PID is not visible
+    ///   in `/proc`) and steal the critical section. On platforms without
+    ///   `/proc` (and on non-unix), a stamped owner is presumed alive
+    ///   forever, so crash recovery of an owner-stamped odd sequence is
+    ///   unavailable there — publishers wait until `reconcile` semantics or
+    ///   process restart clear the region.
+    /// - **Legacy unowned-odd sequences** (left by a pre-ownership binary
+    ///   crashing mid-publish) are recovered only by the explicit
+    ///   `force_recovery` reconcile path; ordinary publishers wait. Callers
+    ///   that open a shared region with possibly-stale contents must run
+    ///   reconciliation before the first publish/read on that region.
+    /// - **Mixed-version sharing is unsupported.** A pre-ownership binary
+    ///   attached to the same region still barges on odd sequences
+    ///   (reintroducing GH #199); `LAYOUT_VERSION` was not bumped because the
+    ///   byte layout is unchanged, so version negotiation cannot catch this —
+    ///   deployments must not mix binaries across this protocol change.
+    fn begin_snapshot_publish(&self) -> SnapshotPublishPermit {
+        self.begin_snapshot_publish_with(
+            SnapshotPublisherIdentity::current(),
+            &snapshot_publisher_alive_os,
+            false,
+        )
     }
 
     /// End a snapshot publish cycle (increment seqlock from odd to even).
     ///
-    /// Uses `fetch_add(1, Release)` so readers observe the new even value
-    /// and all preceding stores.
-    pub fn end_snapshot_publish(&self) {
-        let new_seq = self
-            .fetch_add_u64_field(
-                offsets::SNAPSHOT_SEQ,
-                &self.snapshot_seq,
-                1,
-                Ordering::Release,
-            )
-            .wrapping_add(1);
-        debug_assert!(new_seq != 0, "seqlock counter wrapped to zero");
+    /// Uses owner- and generation-checked CAS operations so a stale publisher
+    /// can never end a replacement publisher's cycle.
+    fn end_snapshot_publish(&self, permit: SnapshotPublishPermit) {
+        assert_eq!(
+            self.load_u64_field(
+                offsets::SNAPSHOT_PUBLISHER_OWNER,
+                &self.snapshot_publisher_owner,
+                Ordering::Acquire,
+            ),
+            permit.identity.active_token,
+            "snapshot publication ended by a non-owner"
+        );
+        self.compare_exchange_u64_field(
+            offsets::SNAPSHOT_SEQ,
+            &self.snapshot_seq,
+            permit.odd_sequence,
+            permit.odd_sequence.wrapping_add(1),
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .expect("snapshot publisher must end its owned odd sequence");
+
+        // The birth marker deliberately remains after ownership is released.
+        // It is irrelevant while owner == 0 and the next initializer replaces
+        // it before publishing its active token. Keeping it avoids a crash
+        // window in which a reused PID could be mistaken for this owner.
+        self.compare_exchange_u64_field(
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            &self.snapshot_publisher_owner,
+            permit.identity.active_token,
+            0,
+            Ordering::Release,
+            Ordering::Acquire,
+        )
+        .expect("snapshot publisher owner token changed before release");
     }
 
     /// Load a consistent `(commit_seq, schema_epoch, ecs_epoch)` triple
@@ -600,11 +955,12 @@ impl SharedMemoryLayout {
     /// between the pre-read and post-read.
     #[must_use]
     pub fn load_consistent_snapshot(&self) -> ShmSnapshot {
+        let mut spins = 0_u32;
         loop {
             let seq1 =
                 self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire);
             if seq1 % 2 == 1 {
-                std::hint::spin_loop();
+                Self::wait_for_snapshot_publisher(&mut spins);
                 continue;
             }
 
@@ -622,7 +978,7 @@ impl SharedMemoryLayout {
                     ecs_epoch: ee,
                 };
             }
-            std::hint::spin_loop();
+            Self::wait_for_snapshot_publisher(&mut spins);
         }
     }
 
@@ -637,27 +993,45 @@ impl SharedMemoryLayout {
         schema_epoch: SchemaEpoch,
         ecs_epoch: u64,
     ) {
-        self.begin_snapshot_publish();
-        // DDL ordering: schema_epoch (Release) before commit_seq (Release).
-        self.store_u64_field(
-            offsets::SCHEMA_EPOCH,
-            &self.schema_epoch,
-            schema_epoch.get(),
-            Ordering::Release,
-        );
-        self.store_u64_field(
-            offsets::ECS_EPOCH,
-            &self.ecs_epoch,
-            ecs_epoch,
-            Ordering::Release,
-        );
-        self.store_u64_field(
-            offsets::COMMIT_SEQ,
-            &self.commit_seq,
-            commit_seq.get(),
-            Ordering::Release,
-        );
-        self.end_snapshot_publish();
+        let permit = self.begin_snapshot_publish();
+        let current_commit_seq =
+            self.load_u64_field(offsets::COMMIT_SEQ, &self.commit_seq, Ordering::Acquire);
+
+        // Concurrent commits can finish publication out of allocation order.
+        // Never let a late lower sequence overwrite a newer complete triple.
+        let published = commit_seq.get() >= current_commit_seq;
+        if published {
+            // DDL ordering: schema_epoch (Release) before commit_seq (Release).
+            self.store_u64_field(
+                offsets::SCHEMA_EPOCH,
+                &self.schema_epoch,
+                schema_epoch.get(),
+                Ordering::Release,
+            );
+            self.store_u64_field(
+                offsets::ECS_EPOCH,
+                &self.ecs_epoch,
+                ecs_epoch,
+                Ordering::Release,
+            );
+            self.store_u64_field(
+                offsets::COMMIT_SEQ,
+                &self.commit_seq,
+                commit_seq.get(),
+                Ordering::Release,
+            );
+        }
+        self.end_snapshot_publish(permit);
+        // Logged outside the seqlock critical section: while the sequence is
+        // odd every reader spins, so nothing that can allocate, format, or
+        // panic belongs between begin and end.
+        if !published {
+            tracing::debug!(
+                attempted_commit_seq = commit_seq.get(),
+                current_commit_seq,
+                "skipped stale out-of-order shared snapshot publication"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -674,7 +1048,16 @@ impl SharedMemoryLayout {
         durable_schema_epoch: SchemaEpoch,
         durable_ecs_epoch: u64,
     ) {
-        self.begin_snapshot_publish();
+        // Recovery may claim an abandoned owner (or a legacy unowned odd
+        // sequence) while keeping the sequence odd, then overwrite the
+        // complete triple. It still waits for a proven-live owner rather than
+        // stealing its critical section. Readers never observe the partial
+        // state that a crashed publisher may have left behind.
+        let permit = self.begin_snapshot_publish_with(
+            SnapshotPublisherIdentity::current(),
+            &snapshot_publisher_alive_os,
+            true,
+        );
 
         // DDL ordering: schema_epoch before commit_seq (§5.6.1).
         self.store_u64_field(
@@ -696,9 +1079,7 @@ impl SharedMemoryLayout {
             Ordering::Release,
         );
 
-        // Repair: if snapshot_seq was odd from a crash, end_snapshot_publish
-        // will advance it to even.
-        self.end_snapshot_publish();
+        self.end_snapshot_publish(permit);
     }
 
     // -----------------------------------------------------------------------
@@ -1238,7 +1619,7 @@ fn write_u64(buf: &mut [u8], offset: usize, val: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicBool};
     use std::thread;
 
     // -- Construction / serialization --
@@ -1356,7 +1737,10 @@ mod tests {
             offsets::TXN_SLOT_OFFSET,
             offsets::COMMITTED_READERS_OFFSET,
             offsets::COMMITTED_READERS_BYTES,
+            offsets::NEXT_COMMIT_SEQ,
             offsets::LAYOUT_CHECKSUM,
+            offsets::SNAPSHOT_PUBLISHER_OWNER,
+            offsets::SNAPSHOT_PUBLISHER_PID_BIRTH,
         ];
         for &off in &u64_offsets {
             assert_eq!(off % 8, 0, "offset {off} not 8-byte aligned");
@@ -1434,14 +1818,14 @@ mod tests {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
         assert_eq!(layout.snapshot_seq.load(Ordering::Relaxed), 0);
 
-        layout.begin_snapshot_publish();
+        let permit = layout.begin_snapshot_publish();
         assert_eq!(
             layout.snapshot_seq.load(Ordering::Relaxed) % 2,
             1,
             "after begin, seq must be odd"
         );
 
-        layout.end_snapshot_publish();
+        layout.end_snapshot_publish(permit);
         assert_eq!(
             layout.snapshot_seq.load(Ordering::Relaxed) % 2,
             0,
@@ -1505,8 +1889,9 @@ mod tests {
     fn test_seqlock_crash_repair() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
 
-        // Simulate crash: begin publish but never end (seq left odd).
-        layout.begin_snapshot_publish();
+        // Simulate a legacy crash: sequence left odd without an owner stamp.
+        layout.snapshot_seq.store(1, Ordering::Release);
+        layout.schema_epoch.store(999, Ordering::Release);
         assert_eq!(layout.snapshot_seq.load(Ordering::Relaxed) % 2, 1);
 
         // Reconciliation repairs the odd seqlock.
@@ -1526,7 +1911,7 @@ mod tests {
 
     #[test]
     fn test_seqlock_ddl_ordering() {
-        // Verify that publish_snapshot stores commit_seq before schema_epoch
+        // Verify that publish_snapshot stores schema_epoch before commit_seq
         // (DDL ordering). We can't directly test ordering, but we verify
         // the end result is consistent.
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
@@ -1536,6 +1921,26 @@ mod tests {
         assert_eq!(snap.commit_seq, CommitSeq::new(100));
         assert_eq!(snap.schema_epoch, SchemaEpoch::new(50));
         assert_eq!(snap.ecs_epoch, 25);
+    }
+
+    #[test]
+    fn test_stale_out_of_order_publication_cannot_rewind_snapshot() {
+        let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
+        layout.publish_snapshot(CommitSeq::new(100), SchemaEpoch::new(50), 25);
+
+        // Concurrent commits can finish in the opposite order from sequence
+        // allocation. The late, older commit must not rewind any member of the
+        // already-published triple.
+        layout.publish_snapshot(CommitSeq::new(99), SchemaEpoch::new(49), 24);
+
+        assert_eq!(
+            layout.load_consistent_snapshot(),
+            ShmSnapshot {
+                commit_seq: CommitSeq::new(100),
+                schema_epoch: SchemaEpoch::new(50),
+                ecs_epoch: 25,
+            }
+        );
     }
 
     #[test]
@@ -1584,8 +1989,9 @@ mod tests {
     fn test_reconcile_repair_odd_seq() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
 
-        // Leave seqlock in odd state (simulating crash mid-publish).
-        layout.begin_snapshot_publish();
+        // Leave an unowned legacy seqlock in an odd, partially written state.
+        layout.snapshot_seq.store(1, Ordering::Release);
+        layout.commit_seq.store(99, Ordering::Release);
         let seq_before = layout.snapshot_seq.load(Ordering::Relaxed);
         assert_eq!(seq_before % 2, 1);
 
@@ -1818,21 +2224,123 @@ mod tests {
     }
 
     #[test]
-    fn test_begin_snapshot_publish_stale_odd_handled() {
+    fn test_dead_snapshot_publisher_takeover_keeps_readers_excluded() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
+        let dead = SnapshotPublisherIdentity::for_test(111, 1, 1_001);
+        let abandoned = layout.begin_snapshot_publish_with(dead, &|_, _| true, false);
+        layout.schema_epoch.store(999, Ordering::Release);
+        assert_eq!(abandoned.odd_sequence % 2, 1);
 
-        // Force to odd (simulating crash-stale).
-        layout.begin_snapshot_publish();
-        let seq_odd = layout.snapshot_seq.load(Ordering::Relaxed);
-        assert_eq!(seq_odd % 2, 1);
-
-        // Calling begin again when already odd is a no-op (returns immediately).
-        layout.begin_snapshot_publish();
-        let seq_still_odd = layout.snapshot_seq.load(Ordering::Relaxed);
-        assert_eq!(
-            seq_still_odd, seq_odd,
-            "begin on stale odd must not increment further"
+        let replacement = SnapshotPublisherIdentity::for_test(222, 1, 2_002);
+        let permit = layout.begin_snapshot_publish_with(
+            replacement,
+            &|pid, birth| !(pid == dead.pid && birth == dead.pid_birth),
+            false,
         );
+
+        assert_eq!(
+            permit.odd_sequence, abandoned.odd_sequence,
+            "dead-owner takeover must not open an even reader window"
+        );
+        layout.schema_epoch.store(20, Ordering::Release);
+        layout.ecs_epoch.store(30, Ordering::Release);
+        layout.commit_seq.store(10, Ordering::Release);
+        layout.end_snapshot_publish(permit);
+
+        assert_eq!(
+            layout.load_consistent_snapshot(),
+            ShmSnapshot {
+                commit_seq: CommitSeq::new(10),
+                schema_epoch: SchemaEpoch::new(20),
+                ecs_epoch: 30,
+            }
+        );
+        assert_eq!(layout.snapshot_publisher_owner.load(Ordering::Acquire), 0);
+        assert_eq!(
+            layout.snapshot_publisher_pid_birth.load(Ordering::Acquire),
+            replacement.pid_birth,
+            "released owner birth remains as inert PID-reuse evidence"
+        );
+    }
+
+    #[test]
+    fn test_recovery_waits_for_live_snapshot_publisher() {
+        let layout = Arc::new(SharedMemoryLayout::new(PageSize::DEFAULT, 64));
+        let first_permit = layout.begin_snapshot_publish();
+        let recovery_acquired = Arc::new(AtomicBool::new(false));
+
+        let recovery = {
+            let layout = Arc::clone(&layout);
+            let recovery_acquired = Arc::clone(&recovery_acquired);
+            thread::spawn(move || {
+                let identity = SnapshotPublisherIdentity::for_test(222, 2, 2_002);
+                let permit = layout.begin_snapshot_publish_with(identity, &|_, _| true, true);
+                recovery_acquired.store(true, Ordering::Release);
+                layout.end_snapshot_publish(permit);
+            })
+        };
+
+        thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !recovery_acquired.load(Ordering::Acquire),
+            "recovery must not steal a proven-live publisher's critical section"
+        );
+
+        layout.end_snapshot_publish(first_permit);
+        recovery.join().unwrap();
+        assert!(recovery_acquired.load(Ordering::Acquire));
+        assert_eq!(layout.snapshot_seq.load(Ordering::Acquire) % 2, 0);
+    }
+
+    /// GH #199: a second live publisher must not enter the critical section
+    /// while the first is inside. Pre-fix, `begin_snapshot_publish` treated
+    /// any odd sequence as crash-stale and returned immediately, so two
+    /// begin/end pairs left the sequence odd and readers spun forever.
+    #[test]
+    fn test_concurrent_publishers_serialize_and_leave_even_sequence() {
+        let layout = Arc::new(SharedMemoryLayout::new(PageSize::DEFAULT, 64));
+
+        // First publisher enters.
+        let first_permit = layout.begin_snapshot_publish();
+        assert_eq!(layout.snapshot_seq.load(Ordering::Relaxed) % 2, 1);
+
+        // Second publisher must block until the first completes.
+        let second_acquired = Arc::new(AtomicBool::new(false));
+        let second = {
+            let layout = Arc::clone(&layout);
+            let second_acquired = Arc::clone(&second_acquired);
+            thread::spawn(move || {
+                let permit = layout.begin_snapshot_publish();
+                second_acquired.store(true, Ordering::Release);
+                layout.end_snapshot_publish(permit);
+            })
+        };
+
+        // Give the second publisher time to reach the spin-wait; it cannot
+        // have advanced the sequence while the first cycle is open.
+        thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !second_acquired.load(Ordering::Acquire),
+            "second live publisher must remain blocked behind the owner"
+        );
+        assert_eq!(
+            layout.snapshot_seq.load(Ordering::Relaxed) % 2,
+            1,
+            "second publisher must not enter while the first cycle is open"
+        );
+
+        // First publisher completes; the second can now run its full cycle.
+        layout.end_snapshot_publish(first_permit);
+        second.join().unwrap();
+        assert!(second_acquired.load(Ordering::Acquire));
+
+        let final_seq = layout.snapshot_seq.load(Ordering::Relaxed);
+        assert_eq!(
+            final_seq % 2,
+            0,
+            "completed publications must leave an even sequence"
+        );
+        assert_eq!(final_seq, 4, "two full publish cycles = four increments");
     }
 
     #[test]
@@ -1845,7 +2353,7 @@ mod tests {
         layout.publish_snapshot(CommitSeq::new(10), SchemaEpoch::new(20), 30);
 
         // Begin a new publish (seq goes odd).
-        layout.begin_snapshot_publish();
+        let permit = layout.begin_snapshot_publish();
         // Write new values while in odd state.
         layout.schema_epoch.store(200, Ordering::Release);
         layout.ecs_epoch.store(300, Ordering::Release);
@@ -1858,7 +2366,7 @@ mod tests {
         thread::sleep(std::time::Duration::from_millis(5));
 
         // Complete the publish (seq goes even).
-        layout.end_snapshot_publish();
+        layout.end_snapshot_publish(permit);
 
         let snap = reader.join().unwrap();
         // Reader must see the final published values, not partial.
@@ -2021,6 +2529,49 @@ mod tests {
         assert_eq!(layout_b.check_serialized_writer().unwrap().get(), 77);
         assert!(layout_b.release_serialized_writer(77));
         assert!(layout_a.check_serialized_writer().is_none());
+    }
+
+    #[test]
+    fn test_mapped_region_publishers_serialize_across_handles() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        let layout_a = Arc::new(
+            SharedMemoryLayout::open_or_initialize_region(region.share(), PageSize::DEFAULT, 64)
+                .unwrap(),
+        );
+        let layout_b = Arc::new(
+            SharedMemoryLayout::open_or_initialize_region(region, PageSize::DEFAULT, 64).unwrap(),
+        );
+
+        let first_permit = layout_a.begin_snapshot_publish();
+        let second_acquired = Arc::new(AtomicBool::new(false));
+        let second = {
+            let layout = Arc::clone(&layout_b);
+            let second_acquired = Arc::clone(&second_acquired);
+            thread::spawn(move || {
+                let permit = layout.begin_snapshot_publish();
+                second_acquired.store(true, Ordering::Release);
+                layout.end_snapshot_publish(permit);
+            })
+        };
+
+        thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !second_acquired.load(Ordering::Acquire),
+            "mapped handle must observe and honor the first owner's stamp"
+        );
+
+        layout_a.end_snapshot_publish(first_permit);
+        second.join().unwrap();
+        assert!(second_acquired.load(Ordering::Acquire));
+        assert_eq!(
+            layout_a.load_u64_field(
+                offsets::SNAPSHOT_SEQ,
+                &layout_a.snapshot_seq,
+                Ordering::Acquire,
+            ),
+            4,
+            "two mapped publish cycles must each complete odd to even"
+        );
     }
 
     #[test]

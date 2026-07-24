@@ -338,6 +338,9 @@ pub struct SelectPlannerDirective {
 pub struct FkDef {
     /// Column indices in the child table that form the FK.
     pub child_columns: Vec<usize>,
+    /// Owning column for a column-level `REFERENCES` clause; `None` for a
+    /// table-level `FOREIGN KEY` constraint.
+    pub owner_column: Option<String>,
     /// Referenced (parent) table name.
     pub parent_table: String,
     /// Referenced column names in the parent table.
@@ -351,6 +354,19 @@ pub struct FkDef {
     /// parent-existence check is deferred to COMMIT rather than checked at the
     /// statement (bd-do0d6).
     pub deferred: bool,
+}
+
+/// A CHECK constraint together with its schema-level ownership.
+///
+/// SQLite drops a column-level CHECK with its owning column, while a
+/// table-level CHECK or a CHECK owned by another column remains a dependency
+/// that can prevent `ALTER TABLE ... DROP COLUMN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    /// Constraint expression as SQL text.
+    pub expr: String,
+    /// Owning column for a column-level CHECK; `None` for table-level CHECKs.
+    pub owner_column: Option<String>,
 }
 
 /// Foreign key action type (mirrors `fsqlite_ast::ForeignKeyActionType`).
@@ -392,9 +408,8 @@ pub struct TableSchema {
     pub primary_key_constraints: Vec<Vec<String>>,
     /// Foreign key constraints declared on this table (child side).
     pub foreign_keys: Vec<FkDef>,
-    /// CHECK constraint expressions as SQL text, collected from both
-    /// column-level and table-level constraints.
-    pub check_constraints: Vec<String>,
+    /// CHECK constraints with durable column-vs-table ownership.
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 impl TableSchema {
@@ -1856,6 +1871,7 @@ pub fn codegen_select(
                     table,
                     table_alias,
                     schema,
+                    None,
                 )
                 .is_some()
                 || aggregate_index_prefix_literal_residual_target(
@@ -2144,21 +2160,80 @@ pub fn codegen_select(
         );
     }
 
+    // A rowid-backed IN subquery over an indexed outer column can be lowered to
+    // a streaming semijoin that counts each equal first-key run in the outer
+    // index.  Route that proven shape before the planner directive: the planner
+    // currently models IN as a scan and an explicit INDEXED BY hint therefore
+    // otherwise commits us to the generic per-row membership program.  The
+    // extractor honors INDEXED BY/NOT INDEXED and admits a composite index only
+    // when the unique, ordered RHS rowid stream makes the merge path mandatory;
+    // list/materialized probes retain their single-key seek contract.
+    if simple_count_star {
+        let scan_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+            register_base: None,
+            secondaries: &[],
+        };
+        if let Some((idx_schema, in_target)) = extract_count_indexed_in_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            &scan_ctx,
+            from_index_hint,
+        ) {
+            return codegen_select_count_star_indexed_in_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                out_regs,
+                done_label,
+                end_label,
+                idx_schema,
+                in_target,
+            );
+        }
+    }
+
     // bd-zqkrp: route a composite equality-prefix + trailing-range seek (`WHERE a = v AND b <range>`
     // on `index(a, b)`) BEFORE the planner directive. The planner reports this as an IndexRange
     // directive, but the single-column `index_range` local below is None for this shape, so the
     // directive bypasses to a full scan. The seek is affinity-coerced and differential-proven
     // bit-identical, so preferring it is always correct and strictly faster. First cut declines
-    // ORDER BY / LIMIT / DISTINCT / aggregate / GROUP BY / hints / WITHOUT ROWID.
+    // ORDER BY / LIMIT / DISTINCT / aggregate / GROUP BY / WITHOUT ROWID.
+    //
+    // GH #291: an `INDEXED BY` hint naming a composite index MUST take this
+    // seek — previously any hint declined it, and because the IndexRange
+    // directive arm also rejects composite shapes, the hinted query fell all
+    // the way back to a full table scan (observed as multi-GB RSS for a
+    // 593-row range lookup on a 9 GB database). The hint now restricts the
+    // candidate set to the named index; `NOT INDEXED` still declines by
+    // definition.
+    let composite_required_index = match from_index_hint {
+        None => Some(None),
+        Some(fsqlite_ast::IndexHint::IndexedBy(name)) => Some(Some(name.as_str())),
+        Some(fsqlite_ast::IndexHint::NotIndexed) => None,
+    };
     let composite_prefix_range = if !is_aggregate
         && time_travel.is_none()
-        && from_index_hint.is_none()
+        && let Some(required_index) = composite_required_index
         && distinct == Distinctness::All
         && group_by.is_empty()
         && having.is_none()
         && !table.without_rowid
     {
-        composite_index_prefix_range_target(where_clause.as_deref(), table, table_alias, schema)
+        composite_index_prefix_range_target(
+            where_clause.as_deref(),
+            table,
+            table_alias,
+            schema,
+            required_index,
+        )
     } else {
         None
     };
@@ -2652,6 +2727,7 @@ pub fn codegen_select(
             done_label,
             end_label,
             rowid_range,
+            from_index_hint,
         )
     } else if let Some(target_expr) = rowid_target {
         codegen_select_rowid_lookup(
@@ -2907,6 +2983,25 @@ pub fn codegen_select(
             end_label,
         )
     } else if distinct == Distinctness::Distinct {
+        // bd-distinct-loose-scan: `SELECT DISTINCT <indexed col>` (no WHERE/GROUP BY/HAVING/LIMIT) is a
+        // loose/skip index scan — emit each distinct value once and `SeekGT` past its whole run — instead
+        // of scanning every row into a dedup sorter. Work scales with #distinct values, not rows.
+        if where_clause.is_none()
+            && stmt.limit.is_none()
+            && group_by.is_empty()
+            && having.is_none()
+            && let Some(scan) = distinct_loose_scan_plan(columns, table, table_alias)
+        {
+            return codegen_select_distinct_loose_scan(
+                b,
+                cursor,
+                &scan,
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+            );
+        }
         // --- Full table scan with DISTINCT ---
         codegen_select_distinct_scan(
             b,
@@ -4629,15 +4724,21 @@ fn codegen_select_composite_index_prefix_range_scan(
     let skip_label = b.emit_label();
 
     // Stop once the equality prefix changes (`IdxGT` compares only the first `prefix_len` columns).
-    #[allow(clippy::cast_possible_truncation)]
-    b.emit_jump_to_label(
-        Opcode::IdxGT,
-        idx_cursor,
-        probe_rec,
-        done_label,
-        P4::None,
-        prefix_len as u16,
-    );
+    // With an EMPTY prefix (pure leading-term range, bd-bn45n) there is nothing to compare, so skip
+    // the IdxGT entirely and let the range bounds alone terminate the walk: the SeekGE anchors the
+    // lower end and the range-upper check below (`Gt`/`Ge` on `range_key_reg`) stops it — a
+    // zero-column IdxGT would be a degenerate no-op we do not want to rely on.
+    if prefix_len > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            idx_cursor,
+            probe_rec,
+            done_label,
+            P4::None,
+            prefix_len as u16,
+        );
+    }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let range_key_reg = b.alloc_reg();
@@ -5342,6 +5443,7 @@ fn codegen_select_count_star(
     done_label: crate::Label,
     end_label: crate::Label,
     rowid_range: Option<RowidRangeTarget<'_>>,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Result<(), CodegenError> {
     let scan_ctx = ScanCtx {
         cursor,
@@ -5367,9 +5469,14 @@ fn codegen_select_count_star(
             probe_target,
         );
     }
-    if let Some((idx_schema, in_target)) =
-        extract_count_indexed_in_target(where_clause, table, table_alias, schema, &scan_ctx)
-    {
+    if let Some((idx_schema, in_target)) = extract_count_indexed_in_target(
+        where_clause,
+        table,
+        table_alias,
+        schema,
+        &scan_ctx,
+        index_hint,
+    ) {
         return codegen_select_count_star_indexed_in_scan(
             b,
             cursor,
@@ -5407,10 +5514,10 @@ fn codegen_select_count_star(
     }
     // bd-count-rowid-eq: `COUNT(*) WHERE <rowid> = <int literal>` counts the single row (0 or 1) with one
     // SeekRowid instead of a full scan — the rowid (IPK) has no secondary index, so this shape is NOT
-    // diverted to the aggregate index-eq seek (bd-2dgf5) and would otherwise Rewind here. Integer literal
-    // ONLY (`SeekRowid` truncates reals via `to_integer()`, so `rowid = 2.5` would wrongly match rowid 2;
-    // a placeholder needs affinity handling): real/placeholder declines to the scan. Reuses the rowid-IN
-    // emitter with a one-element slice.
+    // diverted to the aggregate index-eq seek (bd-2dgf5) and would otherwise Rewind here. This first arm
+    // handles integer literals directly and reuses the rowid-IN emitter with a one-element slice. Other
+    // constant forms continue to the MustBeInt-coerced seek below so reals cannot be truncated and
+    // placeholders receive affinity handling.
     if !table.without_rowid
         && let Some(target) = extract_rowid_target_expr(where_clause, Some(table), table_alias)
         && let Expr::Literal(Literal::Integer(value), _) = target
@@ -6130,6 +6237,11 @@ fn codegen_select_count_star_indexed_in_scan(
 
             b.resolve_label(align_outer);
             b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+            // NULL is never equal to a rowid probe.  Skip nullable leading
+            // index keys explicitly: comparison opcodes intentionally do not
+            // order NULL against an integer for SQL predicate purposes, so
+            // omitting this edge would strand the outer cursor on its NULL run.
+            b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::Lt,
                 r_current_key,
@@ -6401,6 +6513,7 @@ fn codegen_select_count_star_indexed_in_scan(
 
         b.resolve_label(align_outer);
         b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IsNull, r_current_key, 0, advance_outer, P4::None, 0);
         b.emit_jump_to_label(
             Opcode::Lt,
             r_current_key,
@@ -10419,18 +10532,27 @@ fn count_distinct_index_walk_plan(
     }
     let col_idx = agg.arg_col_index?;
     let column = table.columns.get(col_idx)?;
-    let idx = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
-            && idx.key_term_count() == 1
-            && !idx.key_term_descending(0)
-            && idx
-                .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
-            && idx
-                .key_term_collation(0)
-                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-    })?;
+    // A COMPOSITE index whose LEADING key term is this column (ASC BINARY)
+    // qualifies: the walk reads only index column 0 and counts leading-value
+    // changes, so trailing terms are irrelevant. `supports_direct_column_lookup`
+    // still excludes partial (WHERE) and expression indexes (full plain-column
+    // coverage). Prefer the narrowest qualifying index (fewest entries to walk).
+    let idx = table
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx.key_term_count() >= 1
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
+                && idx
+                    .key_term_collation(0)
+                    .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+        })
+        .min_by_key(|idx| idx.key_term_count())?;
     Some(CountDistinctIndexWalk {
         index_name: idx.name.clone(),
         index_root: idx.root_page,
@@ -11125,6 +11247,198 @@ fn codegen_select_count_distinct_index_walk(
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
+}
+
+/// A `SELECT DISTINCT <col> FROM t` (no WHERE/GROUP BY/HAVING/LIMIT/ORDER BY) served by a loose/skip
+/// index scan: emit each distinct value once, then `SeekGT [value, i64::MAX]` past the value's whole
+/// duplicate run to the next distinct value. Work scales with the number of DISTINCT values, not rows.
+/// bd-distinct-loose-scan.
+struct DistinctLooseScan {
+    index_name: String,
+    index_root: i32,
+    /// Number of leading index key terms that equal the DISTINCT output columns
+    /// (in SELECT order). 1 for `SELECT DISTINCT a`; N for `SELECT DISTINCT a, b, …`
+    /// served by an index whose leading N terms are exactly those columns.
+    key_col_count: usize,
+}
+
+/// Cheap `Next` attempts per emitted value before the loose scan pays for a
+/// root-to-leaf `SeekGT` past the run. Keeps all-distinct indexes at
+/// emit-on-change-walk cost instead of one seek per row.
+const DISTINCT_LOOSE_SCAN_NEXT_PROBES: usize = 3;
+
+/// Detect `SELECT DISTINCT <col>` resolvable by a loose index scan. Gated tight so the loose scan is
+/// provably byte-identical to the sorter path: exactly one plain-column output (not `*`/rowid/expr), a
+/// BINARY column with a single-column ASC BINARY index (so index key order == the DISTINCT comparison),
+/// not a generated column, and not WITHOUT ROWID. WHERE/GROUP BY/HAVING/LIMIT are excluded by the caller.
+/// Searches all indexes so a composite `(col, …)` declared first does not shadow a usable single-column
+/// one (bd-agg-range-shadowed-index).
+fn distinct_loose_scan_plan(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<DistinctLooseScan> {
+    if table.without_rowid || columns.is_empty() {
+        return None;
+    }
+    // Every output must be a plain, non-generated, BINARY column reference. Collect their names in
+    // SELECT order — they must equal the chosen index's leading key terms in the SAME order, so the
+    // emitted tuples are exactly the index's leading-prefix groups in index order (byte-identical to
+    // C SQLite, which walks the same covering index for `SELECT DISTINCT <prefix cols>`).
+    let mut col_names: Vec<String> = Vec::with_capacity(columns.len());
+    for rc in columns {
+        let ResultColumn::Expr { expr, .. } = rc else {
+            return None;
+        };
+        let SortKeySource::Column(col_idx) = resolve_column_ref(expr, table, table_alias)? else {
+            return None;
+        };
+        let column = table.columns.get(col_idx)?;
+        // BINARY only: the index's BINARY key order must equal the DISTINCT comparison so adjacent-run
+        // skipping matches C SQLite's grouping. Generated columns decline (first cut).
+        if column.generated_expr.is_some()
+            || column
+                .collation
+                .as_deref()
+                .is_some_and(|c| !c.eq_ignore_ascii_case("BINARY"))
+        {
+            return None;
+        }
+        col_names.push(column.name.clone());
+    }
+    let n = col_names.len();
+    // The loose scan reads index columns 0..N-1 and probes with an N-field prefix `[v0..vN-1]`, so
+    // any index whose LEADING N key terms are exactly these columns (same order, each ASC BINARY)
+    // qualifies — entries sharing that leading tuple (regardless of trailing terms) are all cleared
+    // by one `SeekGT [v0..vN-1]`. `supports_direct_column_lookup` still excludes partial (WHERE) and
+    // expression indexes, so the chosen index is a full-coverage plain-column index. Prefer the
+    // narrowest qualifying index (fewest key terms => smallest entries to scan); this keeps the
+    // historical single-column choice when one exists and never uses a wider composite unnecessarily.
+    let idx = table
+        .indexes
+        .iter()
+        .filter(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx.key_term_count() >= n
+                && (0..n).all(|i| {
+                    !idx.key_term_descending(i)
+                        && idx
+                            .columns
+                            .get(i)
+                            .is_some_and(|c| c.eq_ignore_ascii_case(&col_names[i]))
+                        && idx
+                            .key_term_collation(i)
+                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                })
+        })
+        .min_by_key(|idx| idx.key_term_count())?;
+    Some(DistinctLooseScan {
+        index_name: idx.name.clone(),
+        index_root: idx.root_page,
+        key_col_count: n,
+    })
+}
+
+/// Emit `SELECT DISTINCT <col> FROM t` as a loose/skip index scan: open the single-column index, emit
+/// the first entry's value, then repeatedly `SeekGT [value]` past the current value's entire duplicate
+/// run to the next distinct value. NULL (if present) sorts first and is emitted once like any value.
+/// Terminates in ≤ #distinct seeks. The probe is a 1-FIELD prefix `[value]`: `SeekGT`'s index upper-bound
+/// (`index_seek_with_bias(UpperBound)`) treats a shorter prefix probe as sorting AFTER every equal-prefix
+/// entry (`compare_index_key_values`: `rhs.len() <= lhs.len() => Less`), so one seek clears the whole run.
+/// bd-distinct-loose-scan.
+#[allow(clippy::unnecessary_wraps)]
+fn codegen_select_distinct_loose_scan(
+    b: &mut ProgramBuilder,
+    idx_cursor: i32,
+    scan: &DistinctLooseScan,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        scan.index_root,
+        0,
+        P4::Index(scan.index_name.clone()),
+        0,
+    );
+    let finalize_label = b.emit_label();
+    // Empty index → nothing to emit.
+    b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, finalize_label, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_top = b.current_addr() as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let n = scan.key_col_count as i32;
+    // Emit the current distinct tuple (index columns 0..N-1), then skip its whole duplicate run.
+    // The probe copy MUST precede ResultRow: the engine's ResultRow drains its source
+    // registers (`take_reg_range`), so a Copy placed after it reads NULL and the SeekGT
+    // probe becomes a constant `[NULL, …]` — the loop then re-emits one row forever (the
+    // "skip-scan hang" this bead was blocked on).
+    for i in 0..n {
+        b.emit_op(Opcode::Column, idx_cursor, i, out_regs + i, P4::None, 0);
+    }
+    let probe_base = b.alloc_regs(n);
+    for i in 0..n {
+        b.emit_op(Opcode::Copy, out_regs + i, probe_base + i, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    // Adaptive skip (MySQL-style loose scan): try a few cheap Next steps before paying
+    // for a root-to-leaf SeekGT. Long duplicate runs fall through to the seek (one seek
+    // clears the whole run); short/unique runs leave via the Ne and never seek, so an
+    // all-distinct index degrades to an emit-on-change walk instead of one full-height
+    // seek per row (~11x worse than the sorter when measured). Each Ne carries NULLEQ
+    // (0x80) + BINARY collation so a NULL run is one distinct value, matching index key
+    // order; a tuple change on ANY column jumps back to emit the new distinct tuple.
+    let cur_base = b.alloc_regs(n);
+    for _ in 0..DISTINCT_LOOSE_SCAN_NEXT_PROBES {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let next_addr = b.current_addr() as i32;
+        // Next jumps to p2 when a next entry exists; falls through at EOF.
+        b.emit_op(Opcode::Next, idx_cursor, next_addr + 2, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
+        for i in 0..n {
+            b.emit_op(Opcode::Column, idx_cursor, i, cur_base + i, P4::None, 0);
+        }
+        for i in 0..n {
+            b.emit_op(
+                Opcode::Ne,
+                probe_base + i,
+                loop_top,
+                cur_base + i,
+                P4::Collation("BINARY".to_owned()),
+                0x80,
+            );
+        }
+    }
+    let probe_record_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        probe_base,
+        n,
+        probe_record_reg,
+        P4::None,
+        0,
+    );
+    // No entry beyond the [v0..vN-1] prefix run → the run was the last one → done.
+    b.emit_jump_to_label(
+        Opcode::SeekGT,
+        idx_cursor,
+        probe_record_reg,
+        finalize_label,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Goto, 0, loop_top, 0, P4::None, 0);
+
+    b.resolve_label(finalize_label);
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
 }
 
 /// Emit `SELECT MIN(col), MAX(col)` over one indexed column as TWO seeks to the two index ends — the
@@ -11899,16 +12213,30 @@ fn index_integer_in_list_target<'t>(
     {
         return None;
     }
-    // Find a single-column ascending index on the column. `index_for_column` returns the FIRST index
-    // whose LEADING column matches, which may be a *composite* `(col, …)` index that shadows a usable
-    // single-column one listed after it — filtering that result would then decline even though a
-    // single-column index exists. Search all indexes instead. (A composite index is not usable here: the
-    // `[value, i64::MIN]` probe's floor is the rowid for a single-column index but the *second key
-    // column* for a composite one, so a NULL second column — which sorts before `i64::MIN` — would be
-    // skipped. That needs a prefix probe; tracked as bd-in-list-composite-prefix-probe.)
-    let idx = table.indexes.iter().find(|idx| {
+    // Prefer a single-column ascending index on the column (its `[value, i64::MIN]` probe is exact).
+    // `index_for_column` returns the FIRST index whose LEADING column matches, which may be a
+    // *composite* `(col, …)` index that shadows a usable single-column one listed after it — filtering
+    // that result would then decline even though a single-column index exists. Search all indexes.
+    if let Some(idx) = table.indexes.iter().find(|idx| {
         idx.supports_direct_column_lookup()
             && idx.key_term_count() == 1
+            && !idx.key_term_descending(0)
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    }) {
+        return Some((idx, ints));
+    }
+    // bd-in-list-composite-prefix-probe: fall back to a composite index whose ASCENDING leading column
+    // is the target. The `[value, i64::MIN]` probe is WRONG here — its second field aligns with the
+    // trailing key column, and a NULL trailing column (sorts before `i64::MIN`) would be skipped by
+    // SeekGE. `emit_aggregate_index_value_seek` detects the composite case (`key_term_count() > 1`) and
+    // probes with a 1-field PREFIX `[value]`: SeekGE anchors at the first `a=value` entry regardless of
+    // the trailing column (including NULL), and the Column-0 run stop is unchanged.
+    let idx = table.indexes.iter().find(|idx| {
+        idx.supports_direct_column_lookup()
+            && idx.key_term_count() > 1
             && !idx.key_term_descending(0)
             && idx
                 .columns
@@ -12124,21 +12452,29 @@ fn emit_aggregate_index_value_seek(
     covering: bool,
     residual_where: Option<&Expr>,
 ) {
-    let probe_key_regs = b.alloc_regs(2);
+    // bd-in-list-composite-prefix-probe: a composite `(a, …)` index is probed with a 1-field PREFIX
+    // `[value]` so SeekGE anchors at the first `a=value` entry regardless of the trailing key column
+    // (including a NULL trailing column, which sorts before `i64::MIN`). A single-column index keeps
+    // the exact 2-field `[value, i64::MIN]` probe (the second field is the rowid floor) — byte-identical.
+    let prefix_probe = idx_schema.key_term_count() > 1;
+    let n_probe: i32 = if prefix_probe { 1 } else { 2 };
+    let probe_key_regs = b.alloc_regs(n_probe);
     b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
-    b.emit_op(
-        Opcode::Int64,
-        0,
-        probe_key_regs + 1,
-        0,
-        P4::Int64(i64::MIN),
-        0,
-    );
+    if !prefix_probe {
+        b.emit_op(
+            Opcode::Int64,
+            0,
+            probe_key_regs + 1,
+            0,
+            P4::Int64(i64::MIN),
+            0,
+        );
+    }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        2,
+        n_probe,
         probe_record_reg,
         P4::None,
         0,
@@ -12559,7 +12895,7 @@ fn codegen_select_aggregate(
         && index_range_seek.is_none()
         && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
-        composite_index_prefix_range_target(where_clause, table, table_alias, schema)
+        composite_index_prefix_range_target(where_clause, table, table_alias, schema, None)
     } else {
         None
     };
@@ -13310,15 +13646,20 @@ fn codegen_select_aggregate(
         let loop_top = b.current_addr();
         let skip_label = b.emit_label();
         // Stop once the equality prefix changes (`IdxGT` compares only the first `prefix_len` columns).
-        #[allow(clippy::cast_possible_truncation)]
-        b.emit_jump_to_label(
-            Opcode::IdxGT,
-            idx_cursor,
-            probe_rec,
-            finalize_label,
-            P4::None,
-            prefix_len as u16,
-        );
+        // With an EMPTY prefix (pure leading-term range, bd-bn45n) there is nothing to compare, so skip
+        // the IdxGT and let the range bounds alone terminate the walk (mirrors the non-aggregate
+        // `codegen_select_composite_index_prefix_range_scan`): a zero-column IdxGT is a degenerate no-op.
+        if prefix_len > 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            b.emit_jump_to_label(
+                Opcode::IdxGT,
+                idx_cursor,
+                probe_rec,
+                finalize_label,
+                P4::None,
+                prefix_len as u16,
+            );
+        }
 
         let range_key_reg = b.alloc_reg();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -17924,7 +18265,14 @@ pub fn codegen_update(
         // raw `SeekRowid` TRUNCATING it to a wrong rowid (`WHERE id = 2.5` must not update row 2).
         // Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the DELETE / SELECT paths.
         if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
-            b.emit_jump_to_label(Opcode::MustBeInt, matched_rowid_reg, 0, apply_done_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::MustBeInt,
+                matched_rowid_reg,
+                0,
+                apply_done_label,
+                P4::None,
+                0,
+            );
         }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
@@ -19415,7 +19763,14 @@ pub fn codegen_delete(
         // delete row 2). Integer literal is exact -> no MustBeInt (byte-identical). Mirrors the SELECT
         // rowid lookup + count/aggregate coerced seeks.
         if !matches!(target_expr, Expr::Literal(Literal::Integer(_), _)) {
-            b.emit_jump_to_label(Opcode::MustBeInt, rowid_reg, 0, collect_done_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::MustBeInt,
+                rowid_reg,
+                0,
+                collect_done_label,
+                P4::None,
+                0,
+            );
         }
         b.emit_jump_to_label(
             Opcode::SeekRowid,
@@ -19652,11 +20007,6 @@ pub fn codegen_delete(
 // leading declared columns in declared order; other shapes are rejected with a
 // clear "not yet supported" error rather than silently mis-ordering.
 
-/// Resolve the WITHOUT ROWID primary-key column indices, in PRIMARY KEY order.
-///
-/// Returns the declared table-column index of each PK column. Errors if the
-/// table has no PRIMARY KEY, or if the PK is not the leading declared columns
-/// (a shape the declared-order storage model cannot represent today).
 /// Position a WITHOUT ROWID table cursor on the row referenced by the current
 /// entry of a secondary-index cursor (bd-rjaff).
 ///
@@ -19707,7 +20057,12 @@ fn emit_without_rowid_index_to_table_seek(
     );
 }
 
-fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
+/// Resolve the WITHOUT ROWID primary-key column indices, in PRIMARY KEY order.
+///
+/// Returns the declared table-column index of each PK column. Errors if the
+/// table has no PRIMARY KEY, or if the PK is not the leading declared columns
+/// (a shape the declared-order storage model cannot represent today).
+pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
     let pk_group = table.primary_key_constraints.first().ok_or_else(|| {
         CodegenError::Unsupported(format!(
             "WITHOUT ROWID table {} has no PRIMARY KEY",
@@ -21880,8 +22235,8 @@ fn emit_check_constraints(
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
 
-    for check_sql in &table.check_constraints {
-        let Some(expr) = parse_default_expr(check_sql) else {
+    for check in &table.check_constraints {
+        let Some(expr) = parse_default_expr(&check.expr) else {
             continue;
         };
 
@@ -21916,7 +22271,7 @@ fn emit_check_constraints(
                 SQLITE_CONSTRAINT,
                 0,
                 0,
-                P4::Str(format!("CHECK constraint failed: {check_sql}")),
+                P4::Str(format!("CHECK constraint failed: {}", check.expr)),
                 0,
             );
         }
@@ -22202,14 +22557,21 @@ fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_
         .indexes
         .iter()
         .enumerate()
-        .filter(|(_, index)| index.supports_replace_cleanup_meta())
         .map(|(idx_offset, index)| {
             let cursor_id = table_cursor + 1 + idx_offset as i32;
-            let column_indices: Vec<usize> = index
-                .columns
-                .iter()
-                .filter_map(|col_name| table.column_index(col_name))
-                .collect();
+            // Direct, non-partial column indexes can reconstruct their exact
+            // key from the victim table payload. Partial and expression
+            // indexes cannot: an empty list tells the engine to locate the
+            // victim entry by its trailing rowid instead.
+            let column_indices = if index.supports_replace_cleanup_meta() {
+                index
+                    .columns
+                    .iter()
+                    .filter_map(|col_name| table.column_index(col_name))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             IndexCursorMeta {
                 cursor_id,
                 column_indices,
@@ -24511,6 +24873,7 @@ fn extract_count_indexed_in_target<'a>(
     table_alias: Option<&'a str>,
     schema: &'a [TableSchema],
     scan_ctx: &ScanCtx<'a>,
+    index_hint: Option<&fsqlite_ast::IndexHint>,
 ) -> Option<(&'a IndexSchema, CountIndexedInTarget<'a>)> {
     let expr = where_clause?;
     let Expr::In {
@@ -24524,44 +24887,56 @@ fn extract_count_indexed_in_target<'a>(
     };
 
     let column_name = column_name(operand, table, table_alias)?;
-    // All-index search for a single-column ascending index: `index_for_column` returns the first
-    // leading-column match, which may be a COMPOSITE `(col, …)` index declared before the single-column
-    // one; the `key_term_count() != 1` decline would then full-scan `COUNT(*) WHERE col IN (…)` whenever
-    // a composite `(col, …)` index shadows `idx_col` (bd-agg-range-shadowed-index, COUNT-IN mirror —
-    // reachable once the list reaches the once-materialized threshold and the per-value seek engages).
-    let idx_schema = table.indexes.iter().find(|idx| {
-        idx.supports_direct_column_lookup()
-            && idx.key_term_count() == 1
-            && !idx.key_term_descending(0)
-            && idx
-                .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(&column_name))
-    })?;
-    if !collation_names_equivalent(
-        effective_collation_ctx(operand, Some(scan_ctx)),
-        idx_schema.key_term_collation(0),
-    ) {
-        return None;
-    }
+    // Search all indexes so a composite leading-column match cannot shadow a
+    // later usable single-column index.  Composite indexes are safe only for
+    // the ordered semijoin below: the materialized/list fallback seeks with a
+    // two-field `(key, min-rowid)` record, whose physical contract is exactly a
+    // single-key index followed by rowid.
+    let find_index = |allow_composite: bool| {
+        table.indexes.iter().find(|idx| {
+            let matches_hint = match index_hint {
+                None => true,
+                Some(fsqlite_ast::IndexHint::IndexedBy(name)) => {
+                    idx.name.eq_ignore_ascii_case(name)
+                }
+                Some(fsqlite_ast::IndexHint::NotIndexed) => false,
+            };
+            matches_hint
+                && idx.supports_direct_column_lookup()
+                && (allow_composite || idx.key_term_count() == 1)
+                && !idx.key_term_descending(0)
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&column_name))
+                && collation_names_equivalent(
+                    effective_collation_ctx(operand, Some(scan_ctx)),
+                    idx.key_term_collation(0),
+                )
+        })
+    };
 
     match set {
         InSet::List(values)
             if can_use_once_materialized_in_list(values, operand, Some(scan_ctx)) =>
         {
+            let idx_schema = find_index(false)?;
             Some((idx_schema, CountIndexedInTarget::List(values)))
         }
         InSet::Subquery(_) => {
             let probe_source = resolve_in_probe_source(set, schema)?;
-            if can_use_direct_count_indexed_in_subquery_probe_source(
-                table,
-                idx_schema,
-                &probe_source,
-                operand,
-                scan_ctx,
-            ) {
+            if let Some(idx_schema) = find_index(true).filter(|idx_schema| {
+                can_use_direct_count_indexed_in_subquery_probe_source(
+                    table,
+                    idx_schema,
+                    &probe_source,
+                    operand,
+                    scan_ctx,
+                )
+            }) {
                 Some((idx_schema, CountIndexedInTarget::ProbeSource(probe_source)))
             } else {
+                let idx_schema = find_index(false)?;
                 can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx)
                     .then_some((
                         idx_schema,
@@ -24571,6 +24946,7 @@ fn extract_count_indexed_in_target<'a>(
         }
         InSet::Table(_) => {
             let probe_source = resolve_in_probe_source(set, schema)?;
+            let idx_schema = find_index(false)?;
             can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx).then_some((
                 idx_schema,
                 CountIndexedInTarget::MaterializedProbeSource(probe_source),
@@ -24808,12 +25184,18 @@ fn composite_index_prefix_range_target<'a>(
     table: &'a TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
+    required_index: Option<&str>,
 ) -> Option<CompositePrefixRange<'a>> {
     if table.without_rowid {
         return None;
     }
     let where_expr = where_clause?;
     for index in &table.indexes {
+        // GH #291: an `INDEXED BY` hint pins the candidate set to the named
+        // index (SQLite name resolution is case-insensitive).
+        if required_index.is_some_and(|name| !index.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
         let key_terms = index.key_term_count();
         if key_terms < 2
             || index.columns.len() != key_terms
@@ -24823,9 +25205,18 @@ fn composite_index_prefix_range_target<'a>(
         }
         let prefix_exprs =
             extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
-        if prefix_exprs.is_empty() {
-            continue;
-        }
+        // An EMPTY equality prefix is a PURE range on the LEADING key term
+        // (`WHERE a <range>` on `index(a, …)`) — no equality pins. The `else`
+        // branch below then extracts the range on `columns[0]` (declining if the
+        // WHERE has no range on the leading term), and the residual guard rejects
+        // any unpinnable conjunct. This is the composite-index analogue of the
+        // single-column range fast path (bd-bn45n): without it a pure leading
+        // range over a composite-only index falls all the way back to a full
+        // table scan. ORDER BY is auto-declined for this shape
+        // (`composite_order_by_satisfied` requires the range on the LAST key
+        // term, so a leading-term range on a >=2-term index never elides the
+        // sorter), so the empty-prefix seek only serves the no-ORDER-BY case and
+        // any ORDER BY correctly falls to the sorter.
         // When the prefix pins EVERY key column (`WHERE a=? AND b=?` on `(a,b)` — a full composite
         // equality / point lookup), demote the last pinned column to a degenerate range `[c, c]` so the
         // same prefix+range seek resolves it as one seek instead of a full scan.
@@ -25587,7 +25978,6 @@ fn can_use_direct_count_indexed_in_subquery_probe_source(
     matches!(probe_source.value, InProbeValue::Rowid)
         && can_use_once_materialized_in_probe_source(probe_source, operand, scan_ctx)
         && count_probe_source_can_skip_materialization(probe_source)
-        && extract_safe_probe_source_rowid_range(probe_source).is_some()
         && count_exists_semijoin_merge_is_safe(table, idx_schema, probe_source)
 }
 
@@ -30247,17 +30637,50 @@ mod tests {
             "indexed residual path must not full-scan the table"
         );
 
-        // Shapes the direct rowid seek MUST decline — each must fall back to a
-        // Rewind/Next scan so the scan's correct semantics apply. `id = -5` parses as
-        // unary-negate over an integer literal (not `Literal::Integer`), so it declines
-        // too; optimizing negative rowids is a clean follow-up, and the differential
-        // oracle confirms the scan is correct.  The residual case uses unindexed `v`
-        // so no independent index path can legitimately claim it.
+        // Non-integer literal constants use the newer exact-or-reject rowid
+        // probe: MustBeInt converts values such as '2' losslessly and jumps to
+        // aggregate finalization for a non-integral real such as 2.5.  Both
+        // shapes avoid a table scan, as covered by agg_rowid_eq_coerced_oracle.
         for sql in [
             "SELECT SUM(v) FROM t WHERE id = 2.5",
             "SELECT SUM(v) FROM t WHERE id = '2'",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::MustBeInt),
+                "`{sql}` must coerce the rowid probe exactly"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+                "`{sql}` must use the exact-or-reject rowid probe"
+            );
+            assert!(
+                !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+                "`{sql}` must not scan after exact-or-reject coercion"
+            );
+        }
+
+        // A rowid equality with an unindexed residual still probes the unique
+        // row directly and re-applies the full predicate before AggStep.
+        let residual_ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE id = 2 AND v = '3'");
+        assert!(
+            residual_ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "rowid equality plus residual must still use the unique rowid probe"
+        );
+        assert!(
+            residual_ops.iter().any(|op| op.opcode == Opcode::AggStep),
+            "rowid equality plus residual must retain aggregate accumulation"
+        );
+        assert!(
+            !residual_ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "rowid equality plus residual must not scan the table"
+        );
+
+        // Shapes the direct rowid seek still MUST decline. `id = -5` parses as
+        // unary-negate over an integer literal (not a simple constant), while
+        // NOT INDEXED explicitly retains the scan contract.
+        for sql in [
             "SELECT SUM(v) FROM t WHERE id = -5",
-            "SELECT SUM(v) FROM t WHERE id = 2 AND v = '3'",
             "SELECT SUM(v) FROM t NOT INDEXED WHERE id = 2",
         ] {
             let ops = bd_2dgf5_program(sql);
@@ -37488,9 +37911,15 @@ mod tests {
             unreachable!("fixture should include a WHERE clause");
         };
 
-        let extracted =
-            extract_count_indexed_in_target(Some(where_clause), table, None, &schema, &scan_ctx)
-                .expect("indexed IN target should match");
+        let extracted = extract_count_indexed_in_target(
+            Some(where_clause),
+            table,
+            None,
+            &schema,
+            &scan_ctx,
+            None,
+        )
+        .expect("indexed IN target should match");
 
         assert_eq!(extracted.0.name, "idx_t_b");
         match extracted.1 {
@@ -37540,8 +37969,15 @@ mod tests {
         };
 
         assert!(
-            extract_count_indexed_in_target(Some(&where_expr), table, None, &schema, &scan_ctx)
-                .is_none(),
+            extract_count_indexed_in_target(
+                Some(&where_expr),
+                table,
+                None,
+                &schema,
+                &scan_ctx,
+                None,
+            )
+            .is_none(),
             "count(*) indexed-IN fast path must reject indexes whose collation does not match the probe semantics"
         );
     }

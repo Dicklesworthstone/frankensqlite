@@ -205,9 +205,9 @@ impl VersionArena {
 
     /// Extract a version for deferred retirement (EBR phase 1).
     ///
-    /// Unlike [`take`], this does NOT add the slot to the free list. The slot
+    /// Unlike [`Self::take`], this does NOT add the slot to the free list. The slot
     /// is marked empty (version extracted, generation bumped) but remains
-    /// unavailable for allocation until [`recycle_slots`] is called.
+    /// unavailable for allocation until [`Self::recycle_slots`] is called.
     ///
     /// Use this when retiring versions via EBR: call `take_for_retirement`,
     /// defer the version drop via `crossbeam_epoch::Guard::defer()`, collect
@@ -1773,7 +1773,7 @@ pub struct Transaction {
     /// Monotonic start time (logical milliseconds) used for max-duration enforcement.
     pub started_at_ms: u64,
     /// Epoch-based reclamation ticket registered at transaction begin, dropped on
-    /// commit/abort.  Tracks this transaction in the [`VersionGuardRegistry`] for
+    /// commit/abort.  Tracks this transaction in the [`crate::VersionGuardRegistry`] for
     /// stale-reader detection and provides `defer_retire` for safe deferred
     /// reclamation of superseded page versions (§14.10, bd-2y306.1).
     pub version_guard: Option<VersionGuardTicket>,
@@ -2550,7 +2550,7 @@ pub fn raise_gc_horizon(
 /// Snapshot of a pinned reader consulted during GC horizon advance (bd-wt4uu).
 ///
 /// This is a slot-free view that matches
-/// [`crate::ebr::ReaderPinSnapshot`] but keeps [`core_types`] decoupled from
+/// [`crate::ebr::ReaderPinSnapshot`] but keeps [`crate::core_types`] decoupled from
 /// the EBR registry type so callers (e.g. the pager) can supply synthetic
 /// reader lists in tests without constructing a full registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

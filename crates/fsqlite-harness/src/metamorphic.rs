@@ -31,7 +31,7 @@
 //! # Determinism
 //!
 //! All transforms are deterministic given the same input and seed. Seeds
-//! are derived from [`derive_entry_seed`](crate::corpus_ingest::derive_entry_seed)
+//! are derived from [`derive_entry_seed`]
 //! to ensure reproducibility. The [`SeedContract`] formalizes this guarantee.
 
 use std::collections::BTreeSet;

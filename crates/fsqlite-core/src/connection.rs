@@ -147,10 +147,10 @@ use fsqlite_types::{
     StrictColumnType, TextEncoding, TypeAffinity,
 };
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
+    CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert, codegen_select,
-    codegen_update, emit_backfill_key_expr, emit_scan_filter,
+    codegen_update, emit_backfill_key_expr, emit_scan_filter, without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -371,9 +371,11 @@ fn retry_busy_connection_bootstrap<T>(mut operation: impl FnMut() -> Result<T>) 
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
 /// level consumes significantly more stack space than C (~20-40 KiB per level
-/// including VDBE dispatch + expression evaluation).  A practical limit of 32
-/// prevents stack overflow while still allowing reasonable trigger chains.
-const MAX_TRIGGER_DEPTH: usize = 32;
+/// including VDBE dispatch + expression evaluation). Keep at least a 2x margin
+/// below the observed 2 MiB test-thread stack boundary: compiler changes can
+/// grow these frames, and the limit must fire before the process aborts. The
+/// regression test exercises this boundary on an explicit 1 MiB stack.
+const MAX_TRIGGER_DEPTH: usize = 8;
 
 /// Maximum depth for FK CASCADE propagation.
 ///
@@ -583,6 +585,9 @@ static FSQLITE_JOIN_PAGER_SCAN_FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static FSQLITE_JOIN_HASH_RESIDUAL_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
     static FSQLITE_JOIN_HASH_RESIDUAL_CANDIDATE_EVALS: Cell<u64> = const { Cell::new(0) };
+    // Counts every successful prebound lookup across join planning and row
+    // evaluation. Tests must use per-query lower bounds rather than exact
+    // totals because additional optimized phases may legitimately consult it.
     static FSQLITE_JOIN_EXPR_BINDING_HITS: Cell<u64> = const { Cell::new(0) };
     static FSQLITE_JOIN_EXPR_FALLBACK_SCANS: Cell<u64> = const { Cell::new(0) };
 }
@@ -2337,34 +2342,31 @@ impl PagerBackend {
             return Ok(path.to_owned());
         }
 
-        let requested = Path::new(path);
-        let resolved = {
-            #[cfg(all(feature = "native", target_os = "linux"))]
-            {
-                IoUringVfs::new().full_pathname(cx, requested)?
-            }
-            #[cfg(all(feature = "native", unix, not(target_os = "linux")))]
-            {
-                UnixVfs::new().full_pathname(cx, requested)?
-            }
-            #[cfg(all(feature = "native", target_os = "windows"))]
-            {
-                fsqlite_vfs::WindowsVfs::new().full_pathname(cx, requested)?
-            }
-            #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
-            {
-                return Err(FrankenError::NotImplemented(
-                    "file-backed pager not available on this platform".to_owned(),
-                ));
-            }
-        };
+        #[cfg(all(feature = "native", any(unix, target_os = "windows")))]
+        {
+            let requested = Path::new(path);
+            #[cfg(target_os = "linux")]
+            let resolved = IoUringVfs::new().full_pathname(cx, requested)?;
+            #[cfg(all(unix, not(target_os = "linux")))]
+            let resolved = UnixVfs::new().full_pathname(cx, requested)?;
+            #[cfg(target_os = "windows")]
+            let resolved = fsqlite_vfs::WindowsVfs::new().full_pathname(cx, requested)?;
 
-        resolved
-            .into_os_string()
-            .into_string()
-            .map_err(|path| FrankenError::CannotOpen {
-                path: PathBuf::from(path),
-            })
+            resolved
+                .into_os_string()
+                .into_string()
+                .map_err(|path| FrankenError::CannotOpen {
+                    path: PathBuf::from(path),
+                })
+        }
+
+        #[cfg(any(not(feature = "native"), not(any(unix, target_os = "windows"))))]
+        {
+            let _ = cx;
+            Err(FrankenError::NotImplemented(
+                "file-backed pager not available on this platform".to_owned(),
+            ))
+        }
     }
 
     /// Returns `true` if this backend uses the in-memory VFS (`:memory:`).
@@ -2445,6 +2447,22 @@ impl PagerBackend {
             Self::Unix(p) => p.inspect_database_image(cx, path),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(p) => p.inspect_database_image(cx, path),
+        }
+    }
+
+    fn inspect_self_contained_database_image(
+        &self,
+        cx: &Cx,
+        path: &Path,
+    ) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.inspect_self_contained_database_image(cx, path),
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.inspect_self_contained_database_image(cx, path),
         }
     }
 
@@ -3227,6 +3245,7 @@ where
     }
     let adapter = PathRefreshingWalBackend::new(
         vfs,
+        pager.db_path(),
         wal_path,
         expected_page_size,
         wal,
@@ -3275,6 +3294,20 @@ where
     }
 }
 
+/// GH #292: decide whether an existing (>= 32 byte) WAL sidecar must be
+/// treated as empty per stock SQLite `walIndexRecover` semantics — bad magic,
+/// invalid page size, or header-checksum mismatch. A short header read also
+/// classifies as empty. An unsupported format version on a checksum-valid
+/// header stays a hard error and is left to [`WalFile::open`].
+fn wal_sidecar_treated_as_empty<F: VfsFile>(cx: &Cx, file: &F) -> Result<bool> {
+    let mut header_buf = [0_u8; fsqlite_wal::WAL_HEADER_SIZE];
+    let bytes_read = file.read(cx, &mut header_buf, 0)?;
+    if bytes_read < header_buf.len() {
+        return Ok(true);
+    }
+    Ok(fsqlite_wal::wal_header_treated_as_empty(&header_buf))
+}
+
 fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: V,
@@ -3289,17 +3322,38 @@ where
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
         let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
-            match WalFile::open(cx, file) {
-                Ok(wal) => return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true),
-                Err(err) => return Err(err),
+            if wal_sidecar_treated_as_empty(cx, &file)? {
+                // GH #292: stock SQLite (`walIndexRecover`) treats a WAL whose
+                // header fails magic/page-size/checksum validation as EMPTY —
+                // e.g. a torn or garbage sidecar left by a killed process —
+                // and proceeds against the main database. Hard-failing here
+                // made FrankenSQLite refuse databases that native SQLite
+                // reports as fully consistent. Discard the unusable sidecar
+                // and fall through to a fresh WAL generation; fresh random
+                // salts guarantee no stale tail frame can ever validate.
+                tracing::warn!(
+                    wal_path = %wal_path.display(),
+                    "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
+                );
+                let _ = file.close(cx);
+            } else {
+                match WalFile::open(cx, file) {
+                    Ok(wal) => {
+                        return install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
+        } else {
+            let _ = file.close(cx);
         }
-        let _ = file.close(cx);
     }
 
     let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
-    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::default())?;
+    // Random salts (GH #201): a fresh WAL generation must not validate
+    // frames from any stale or copied WAL of a previous generation.
+    let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::generate())?;
     install_opened_wal_backend(pager, cx, vfs, wal_path, wal, true)
 }
 
@@ -3339,6 +3393,18 @@ where
         Err(err) => return Err(err),
     };
     if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+        let _ = file.close(cx);
+        return Ok(false);
+    }
+
+    // GH #292: mirror stock SQLite — an invalid WAL header means "no WAL",
+    // not a corrupt database. Read-only/existing installs proceed against
+    // the main database exactly like the missing/short-sidecar cases above.
+    if wal_sidecar_treated_as_empty(cx, &file)? {
+        tracing::warn!(
+            wal_path = %wal_path.display(),
+            "WAL header failed validation; treating WAL as empty per stock SQLite semantics (GH #292)"
+        );
         let _ = file.close(cx);
         return Ok(false);
     }
@@ -7797,6 +7863,8 @@ fn select_indexed_numeric_probe_spec_for_column(
 struct DbSnapshot {
     db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
+    temp_table_names: HashSet<String>,
+    shadowed_main_tables: HashMap<String, TableSchema>,
     views: Vec<ViewDef>,
     triggers: Vec<TriggerDef>,
     rowid_alias_columns: HashMap<String, usize>,
@@ -8543,6 +8611,9 @@ pub(crate) mod fast_path_gate {
 /// (SAVEPOINT/RELEASE/ROLLBACK TO). The default runtime path uses pager/WAL/B-tree
 /// storage, while `MemDatabase` is retained as an execution image and limited
 /// compatibility fallback.
+#[cfg(test)]
+type VacuumRaceHook = Box<dyn FnOnce() + Send>;
+
 pub struct Connection {
     path: String,
     /// In-memory execution image shared with the VDBE engine.
@@ -8714,7 +8785,7 @@ pub struct Connection {
     /// Exposed for tests / observability.
     quotient_filter_short_circuits: Cell<u64>,
     /// bd-wwqen.2 B2.3: Cached pre-computed HashSets for materialized IN lists.
-    /// Keyed by Vec<Expr> pointer identity (the list's heap address).
+    /// Keyed by `Vec<Expr>` pointer identity (the list's heap address).
     /// Built once during first probe, reused on subsequent rows.
     precomputed_in_sets: RefCell<std::collections::HashMap<usize, PrecomputedInSetCache>>,
     /// GH#117: query-scoped memo of a child table column's value-set for the
@@ -9047,6 +9118,14 @@ pub struct Connection {
     /// published over the source database.
     #[cfg(test)]
     fail_vacuum_rebuild_validation_once: Cell<bool>,
+    /// One-shot race hook after a file-backed VACUUM source receipt is
+    /// captured but before the source is hydrated.
+    #[cfg(test)]
+    vacuum_after_source_receipt_once: RefCell<Option<VacuumRaceHook>>,
+    /// One-shot race hook after a VACUUM INTO image passes semantic validation
+    /// but before its receipt is revalidated and made durable.
+    #[cfg(test)]
+    vacuum_after_target_validation_once: RefCell<Option<VacuumRaceHook>>,
     /// One-shot injection after durable VACUUM publication but before the
     /// masked connection rebind begins.
     #[cfg(test)]
@@ -9055,6 +9134,10 @@ pub struct Connection {
     /// the old connection while leaving the committed image reopenable.
     #[cfg(test)]
     fail_vacuum_rebind_once: Cell<bool>,
+    /// One-shot failure after DROP COLUMN rewrites row storage but before it
+    /// updates the catalog. Proves statement-level rollback spans both sides.
+    #[cfg(test)]
+    fail_alter_drop_after_storage_once: Cell<bool>,
     // ── Cx capability context (bd-2g5.6) ──────────────────────────────────────
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
@@ -9077,6 +9160,14 @@ pub struct Connection {
     /// fallback and require all cursor operations to route through the real
     /// Pager+BtreeCursor stack. Used for parity-certification testing.
     reject_mem_fallback: RefCell<bool>,
+    /// Whether schema reload may keep a contentless FTS5 table in the
+    /// bounded, on-disk lazy representation.
+    ///
+    /// This is deliberately enabled only by the explicit schema-only open
+    /// family. Ordinary opens retain the historical hydrated representation,
+    /// whose mutation and auxiliary-command semantics are broader than the
+    /// repair-oriented lazy contract.
+    allow_lazy_contentless_fts5: bool,
     /// Internal execution guard for statements that temporarily install
     /// mirrored temp tables into the MemDatabase. The ordinary read-path
     /// refresh would rebuild MemDB from pager state and discard those tables
@@ -9420,6 +9511,16 @@ impl Connection {
         Self::open_schema_only_with_env(path, ConnectionEnv::default())
     }
 
+    /// Open an existing file-backed database for reading and writing while
+    /// loading only its schema into the compatibility [`MemDatabase`].
+    ///
+    /// This combines the bounded-memory behavior of [`Self::open_schema_only`]
+    /// with the existing-only, writable contract of [`Self::open_existing`].
+    /// The main database file is never created or initialized by this method.
+    pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self> {
+        Self::open_existing_schema_only_with_env(path, ConnectionEnv::default())
+    }
+
     /// Open a schema-only connection only if the read-only VFS handle has
     /// `expected_identity`.
     ///
@@ -9442,12 +9543,37 @@ impl Connection {
         )
     }
 
+    /// Open a writable, existing-only schema connection if the main database
+    /// handle has `expected_identity`.
+    ///
+    /// The cooperative-path and no-alias requirements documented on
+    /// [`Self::open_existing_with_expected_identity`] apply unchanged.
+    pub fn open_existing_schema_only_with_expected_identity(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+    ) -> Result<Self> {
+        Self::open_existing_schema_only_with_expected_identity_and_env(
+            path,
+            expected_identity,
+            ConnectionEnv::default(),
+        )
+    }
+
     /// Open a schema-only connection with an explicit runtime environment.
     ///
     /// Behaves like [`open_schema_only`](Self::open_schema_only) but allows
     /// specifying a custom [`ConnectionEnv`].
     pub fn open_schema_only_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env)
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, false)
+    }
+
+    /// Open a writable, existing-only schema connection with an explicit
+    /// runtime environment.
+    pub fn open_existing_schema_only_with_env(
+        path: impl Into<String>,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(path, None, env, true)
     }
 
     /// Open an identity-bound schema-only connection with an explicit runtime
@@ -9464,6 +9590,22 @@ impl Connection {
             path,
             Some(expected_identity),
             env,
+            false,
+        )
+    }
+
+    /// Open an identity-bound, writable, existing-only schema connection with
+    /// an explicit runtime environment.
+    pub fn open_existing_schema_only_with_expected_identity_and_env(
+        path: impl Into<String>,
+        expected_identity: FileIdentity,
+        env: ConnectionEnv,
+    ) -> Result<Self> {
+        Self::open_schema_only_with_optional_expected_identity_and_env(
+            path,
+            Some(expected_identity),
+            env,
+            true,
         )
     }
 
@@ -9471,9 +9613,13 @@ impl Connection {
         path: impl Into<String>,
         expected_identity: Option<FileIdentity>,
         env: ConnectionEnv,
+        writable: bool,
     ) -> Result<Self> {
         let path = path.into();
-        if path.is_empty() || (expected_identity.is_some() && path == ":memory:") {
+        if path.is_empty()
+            || (writable && path == ":memory:")
+            || (expected_identity.is_some() && path == ":memory:")
+        {
             return Err(FrankenError::CannotOpen {
                 path: std::path::PathBuf::from(path),
             });
@@ -9487,13 +9633,22 @@ impl Connection {
                 .with_trace_context(next_trace_id(), 0, 0);
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = retry_busy_connection_bootstrap(|| {
-            PagerBackend::open_readonly_with_page_buffer_max(
-                &path,
-                &bootstrap_cx,
-                expected_identity,
-                env.page_buffer_max(),
-                env.memory_vfs_config(),
-            )
+            if writable {
+                PagerBackend::open_existing_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    expected_identity,
+                    env.page_buffer_max(),
+                )
+            } else {
+                PagerBackend::open_readonly_with_page_buffer_max(
+                    &path,
+                    &bootstrap_cx,
+                    expected_identity,
+                    env.page_buffer_max(),
+                    env.memory_vfs_config(),
+                )
+            }
         })?;
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
@@ -9630,9 +9785,15 @@ impl Connection {
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
+            vacuum_after_source_receipt_once: RefCell::new(None),
+            #[cfg(test)]
+            vacuum_after_target_validation_once: RefCell::new(None),
+            #[cfg(test)]
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
+            #[cfg(test)]
+            fail_alter_drop_after_storage_once: Cell::new(false),
             root_cx,
             eprocess_oracle,
             statement_count_since_oracle_refresh: Cell::new(0),
@@ -9643,6 +9804,7 @@ impl Connection {
             // Schema-only connections always use parity-cert mode (pager-backed
             // cursors); the MemDatabase is deliberately left empty.
             reject_mem_fallback: RefCell::new(true),
+            allow_lazy_contentless_fts5: true,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
             vtab_modules: RefCell::new(default_vtab_module_registry()),
@@ -9693,7 +9855,11 @@ impl Connection {
         conn.register_cache_pages_module();
         conn.bootstrap_journal_mode_from_storage(false)?;
         conn.bootstrap_pragma_state_from_storage();
-        conn.apply_current_journal_mode_to_pager_readonly()?;
+        if writable {
+            conn.apply_current_journal_mode_to_pager()?;
+        } else {
+            conn.apply_current_journal_mode_to_pager_readonly()?;
+        }
         conn.apply_current_synchronous_to_pager()?;
         let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
@@ -10039,9 +10205,15 @@ impl Connection {
             #[cfg(test)]
             fail_vacuum_rebuild_validation_once: Cell::new(false),
             #[cfg(test)]
+            vacuum_after_source_receipt_once: RefCell::new(None),
+            #[cfg(test)]
+            vacuum_after_target_validation_once: RefCell::new(None),
+            #[cfg(test)]
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
+            #[cfg(test)]
+            fail_alter_drop_after_storage_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
             eprocess_oracle,
@@ -10057,6 +10229,7 @@ impl Connection {
             // via `set_reject_mem_fallback(false)` or
             // `PRAGMA fsqlite.parity_cert = OFF`.
             reject_mem_fallback: RefCell::new(true),
+            allow_lazy_contentless_fts5: false,
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
@@ -11636,6 +11809,9 @@ impl Connection {
                     if plan.idx_num == 1 {
                         return self.scan_lazy_fts5_match(src, plan);
                     }
+                    if !self.rootpage_zero_fts5_has_internal_content_shadow(&src.table_name) {
+                        return self.scan_lazy_contentless_fts5_rows(src);
+                    }
                     self.promote_lazy_fts5_table(&src.table_name)?;
                 }
                 let instances = self.vtab_instances.borrow();
@@ -12007,15 +12183,17 @@ impl Connection {
 
     /// Whether `<table_name>` has the catalog shape needed for lazy on-disk FTS5.
     ///
-    /// Only regular stored-content FTS5 tables are lazy-capable: the lazy reader
-    /// needs `_data` for MATCH and `_content` for result projection. The caller
-    /// must also verify that `_data` has a non-empty structure row; metadata-only
-    /// FrankenSQLite-created indexes should rebuild from `_content` instead.
+    /// Regular stored-content tables need `_content` for result projection.
+    /// Schema-only contentless opens can also remain lazy when `_docsize` can
+    /// enumerate rowids; their projected user columns are NULL by definition.
+    /// The caller must additionally verify that `_data` has a non-empty
+    /// structure row.
     #[cfg(feature = "ext-fts5")]
     fn fts5_table_is_lazy_capable(
         schema: &[TableSchema],
         table_name: &str,
         args: &[String],
+        allow_contentless: bool,
     ) -> bool {
         let has_shadow = |suffix: &str| {
             let name = format!("{table_name}{suffix}");
@@ -12023,8 +12201,17 @@ impl Connection {
                 .iter()
                 .any(|table| table.name.eq_ignore_ascii_case(&name) && table.root_page > 0)
         };
-        let regular_content = virtual_table_option_value(args, "content").is_none();
-        has_shadow("_data") && regular_content && has_shadow("_content")
+        let content = virtual_table_option_value(args, "content");
+        let projection_is_lazy_capable = match content.as_deref() {
+            None => has_shadow("_content"),
+            // Contentless tables project NULLs and use `_docsize` to enumerate
+            // rowids. Keep normal fully-hydrated opens unchanged; this bounded
+            // path is specifically for schema-only callers handling huge
+            // indexes that cannot fit in memory.
+            Some("") => allow_contentless && has_shadow("_docsize"),
+            Some(_) => false,
+        };
+        has_shadow("_data") && projection_is_lazy_capable
     }
 
     /// Read the persisted live document count for a lazy FTS5 table.
@@ -12234,6 +12421,48 @@ impl Connection {
                 row
             })
             .collect())
+    }
+
+    /// Enumerate a lazy contentless FTS5 table without hydrating its posting
+    /// lists. `_docsize` contains one row per live document; projected user
+    /// columns are NULL by definition, so the scan only needs those rowids.
+    #[cfg(feature = "ext-fts5")]
+    fn scan_lazy_contentless_fts5_rows(
+        &self,
+        src: &JoinTableSource,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let docsize_name = format!("{}_docsize", src.table_name);
+        let root_page = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&docsize_name))
+            .map(|table| table.root_page)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "lazy contentless FTS5 table `{}` is missing `{docsize_name}`",
+                    src.table_name
+                ),
+            })?;
+        let root = page_number_from_schema_root(root_page, &docsize_name, "fts5 docsize shadow")?;
+        self.with_integrity_txn(|cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            let mut rows = Vec::new();
+            if cursor.first(cx)? {
+                loop {
+                    let rowid = cursor.rowid(cx)?;
+                    let mut row = vec![SqliteValue::Null; src.col_names.len()];
+                    if src.hidden_rowid_projection.is_some() {
+                        row.push(SqliteValue::Integer(rowid));
+                    }
+                    rows.push(row);
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+            }
+            Ok(rows)
+        })
     }
 
     /// Promote a lazy on-disk FTS5 table into the in-memory representation for
@@ -24025,6 +24254,10 @@ impl Connection {
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::CreateIndex(_)
+                | Statement::AlterTable(fsqlite_ast::AlterTableStatement {
+                    action: AlterTableAction::DropColumn(_),
+                    ..
+                })
                 | Statement::Reindex(_)
         );
         let rollback_on_constraint_violation =
@@ -27806,6 +28039,20 @@ impl Connection {
         };
 
         let table_name = resolved_insert.table.name.as_str();
+        // The direct-simple lane opens `root_page` against the main pager.
+        // Connection-local TEMP roots deliberately share the integer root
+        // namespace but live only in `MemDatabase`; their compiled VDBE
+        // programs carry database number 1 to preserve that distinction.
+        // Keep TEMP inserts on that routed reusable-program lane. Otherwise a
+        // single-row prepared INSERT can mistake the first clean TEMP root for
+        // a page just beyond the main snapshot (CASS restart repair / GH#290).
+        if self
+            .temp_table_names
+            .borrow()
+            .contains(&table_name.to_ascii_lowercase())
+        {
+            return Ok(None);
+        }
         let schema = self.schema.borrow();
         let Some(table) = schema
             .iter()
@@ -32613,18 +32860,47 @@ impl Connection {
         let cx = self.op_cx()?;
         let key = table_name.to_ascii_uppercase();
         #[cfg(feature = "ext-fts5")]
-        {
-            let is_lazy = {
+        let lazy_contentless = {
+            let (is_lazy, column_count) = {
                 let instances = self.vtab_instances.borrow();
-                instances
+                let fts5 = instances
                     .get(&key)
-                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                    .is_some_and(Fts5Table::is_lazy_on_disk)
+                    .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>());
+                (
+                    fts5.is_some_and(Fts5Table::is_lazy_on_disk),
+                    fts5.map_or(0, |table| table.columns().len()),
+                )
             };
-            if is_lazy {
+            let contentless =
+                is_lazy && !self.rootpage_zero_fts5_has_internal_content_shadow(table_name);
+            if is_lazy && !contentless {
                 self.promote_lazy_fts5_table(table_name)?;
             }
-        }
+            if contentless {
+                let mut rowids = HashSet::with_capacity(rows.len());
+                for row in rows {
+                    let rowid = row
+                        .explicit_rowid
+                        .as_ref()
+                        .ok_or_else(|| {
+                            FrankenError::function_error(format!(
+                                "lazy contentless FTS5 INSERT into `{table_name}` requires an explicit rowid"
+                            ))
+                        })?
+                        .to_integer();
+                    if !rowids.insert(rowid) {
+                        return Err(FrankenError::PrimaryKeyViolation);
+                    }
+                    let exists = self.with_lazy_fts5_reader(table_name, |reader| {
+                        Ok(reader.read_docsize(rowid, column_count)?.is_some())
+                    })?;
+                    if exists {
+                        return Err(FrankenError::PrimaryKeyViolation);
+                    }
+                }
+            }
+            contentless
+        };
         let mut instances = self.vtab_instances.borrow_mut();
         let instance = instances.get_mut(&key).ok_or_else(|| {
             FrankenError::Internal(format!("virtual table not found: {table_name}"))
@@ -32658,6 +32934,18 @@ impl Connection {
 
         #[cfg(feature = "ext-fts5")]
         if self.persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids)? {
+            if lazy_contentless {
+                let mut instances = self.vtab_instances.borrow_mut();
+                let fts5 = instances
+                    .get_mut(&key)
+                    .and_then(|instance| instance.as_any_mut().downcast_mut::<Fts5Table>())
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "virtual table changed type during lazy insert: {table_name}"
+                        ))
+                    })?;
+                fts5.note_lazy_inserted_rows(&inserted_rowids);
+            }
             return Ok(inserted_rowids);
         }
 
@@ -33551,20 +33839,70 @@ impl Connection {
         table_name: &str,
         removed_slot: usize,
     ) -> Result<()> {
-        let root_page = {
+        let (root_page, without_rowid, temporary) = {
             let schema = self.schema.borrow();
-            schema
+            let table = schema
                 .iter()
                 .find(|table| table.name.eq_ignore_ascii_case(table_name))
-                .map(|table| table.root_page)
-                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+            (
+                table.root_page,
+                table.without_rowid,
+                self.temp_table_names
+                    .borrow()
+                    .contains(&table.name.to_ascii_lowercase()),
+            )
         };
         if root_page <= 0 {
             return Ok(());
         }
+        if temporary {
+            if self
+                .db
+                .borrow_mut()
+                .remove_column_from_rows(root_page, removed_slot)
+            {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "TEMP table storage could not remove column slot {removed_slot}: {table_name}"
+            )));
+        }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
         self.with_pager_write_txn(|cx, txn| {
-            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true)?;
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, !without_rowid)?;
+            if without_rowid {
+                // WITHOUT ROWID tables are index b-trees whose full records are
+                // keys. Collect the rewritten keys, clear the old keys, then
+                // insert the new records through the index-cursor API.
+                let mut rewritten = Vec::new();
+                if cursor.first(cx)? {
+                    loop {
+                        let payload = cursor.payload(cx)?;
+                        let mut values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "WITHOUT ROWID table `{table_name}` key is not a valid SQLite record"
+                                ),
+                            }
+                        })?;
+                        if removed_slot < values.len() {
+                            values.remove(removed_slot);
+                        }
+                        rewritten.push(serialize_record(&values));
+                        if !cursor.next(cx)? {
+                            break;
+                        }
+                    }
+                }
+                while cursor.first(cx)? {
+                    cursor.delete(cx)?;
+                }
+                for record in rewritten {
+                    cursor.index_insert(cx, &record)?;
+                }
+                return Ok(());
+            }
             // Collect (rowid, rewritten record) first, then delete+reinsert so we
             // never mutate the tree while iterating it.
             let mut rewritten: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -33721,34 +34059,27 @@ impl Connection {
 
     #[cfg(feature = "ext-fts5")]
     fn create_fts5_shadow_table(&self, table: Fts5ShadowTableDef) -> Result<()> {
-        let root_page = self.allocate_root_page()?;
-        self.db
-            .borrow_mut()
-            .create_table_at(root_page, table.columns.len());
-        if let Some(rowid_alias_idx) = table.columns.iter().position(|column| column.is_ipk) {
-            self.rowid_alias_columns
-                .borrow_mut()
-                .insert(table.name.to_ascii_lowercase(), rowid_alias_idx);
+        let create = match parse_single_statement(&table.create_sql)? {
+            Statement::CreateTable(create) => create,
+            _ => {
+                return Err(FrankenError::Internal(format!(
+                    "FTS5 shadow definition for {} did not parse as CREATE TABLE",
+                    table.name
+                )));
+            }
+        };
+        if !create.name.name.eq_ignore_ascii_case(&table.name) {
+            return Err(FrankenError::Internal(format!(
+                "FTS5 shadow definition name mismatch: expected {}, parsed {}",
+                table.name, create.name.name
+            )));
         }
-        self.schema.borrow_mut().push(TableSchema {
-            name: table.name.clone(),
-            root_page,
-            columns: table.columns,
-            indexes: Vec::new(),
-            strict: false,
-            without_rowid: false,
-            primary_key_constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-            check_constraints: Vec::new(),
-        });
-        self.rebuild_schema_indices();
-        self.insert_sqlite_master_row(
-            "table",
-            &table.name,
-            &table.name,
-            root_page,
-            &table.create_sql,
-        )
+
+        // Route shadow DDL through the ordinary CREATE TABLE implementation.
+        // Besides keeping the parser/schema/catalog representations identical,
+        // this is what makes `%_idx` and `%_config` real WITHOUT ROWID b-trees
+        // with owned roots and primary-key metadata, exactly like stock SQLite.
+        self.execute_create_table(&create)
     }
 
     #[allow(clippy::unused_self)]
@@ -39993,6 +40324,48 @@ impl Connection {
                     )));
                 }
 
+                // Generated columns may not be part of the PRIMARY KEY. SQLite
+                // rejects this at CREATE time, for both a column-level generated
+                // PRIMARY KEY and a table-level PRIMARY KEY listing a generated
+                // column. (GH #181)
+                let col_is_generated = |col: &fsqlite_ast::ColumnDef| {
+                    col.constraints
+                        .iter()
+                        .any(|c| matches!(c.kind, ColumnConstraintKind::Generated { .. }))
+                };
+                for col in columns {
+                    let is_col_level_pk = col
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                    if is_col_level_pk && col_is_generated(col) {
+                        return Err(FrankenError::FunctionError(
+                            "generated columns cannot be part of the PRIMARY KEY".to_owned(),
+                        ));
+                    }
+                }
+                for tc in constraints {
+                    if let TableConstraintKind::PrimaryKey {
+                        columns: pk_columns,
+                        ..
+                    } = &tc.kind
+                    {
+                        for pk_col in pk_columns {
+                            if let Some(normalized) = normalize_indexed_column_term(pk_col)
+                                && let Some(col) = columns
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(&normalized.column_name))
+                                && col_is_generated(col)
+                            {
+                                return Err(FrankenError::FunctionError(
+                                    "generated columns cannot be part of the PRIMARY KEY"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 // CHECK constraints may not contain a subquery — SQLite rejects
                 // them at CREATE time ("subqueries prohibited in CHECK
                 // constraints"). Validate before allocating any pages so a
@@ -40032,8 +40405,7 @@ impl Connection {
                         .iter()
                         .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
                     if col.unique && !col.is_ipk && !(create.without_rowid && column_primary_key) {
-                        let idx_root = self.allocate_index_root_page()?;
-                        self.db.borrow_mut().create_table_at(idx_root, 0);
+                        let idx_root = self.allocate_schema_table_root(target_is_temp, 0, true)?;
                         // Per-constraint ON CONFLICT declared on the column's
                         // UNIQUE / (non-IPK) PRIMARY KEY clause.
                         let conflict_action =
@@ -40091,8 +40463,8 @@ impl Connection {
                             if all_ipk {
                                 continue;
                             }
-                            let idx_root = self.allocate_index_root_page()?;
-                            self.db.borrow_mut().create_table_at(idx_root, 0);
+                            let idx_root =
+                                self.allocate_schema_table_root(target_is_temp, 0, true)?;
                             // Per-constraint ON CONFLICT declared on the
                             // table-level UNIQUE / PRIMARY KEY constraint.
                             let conflict_action = match &tc.kind {
@@ -40126,12 +40498,11 @@ impl Connection {
                 }
 
                 let num_columns = col_infos.len();
-                let root_page = if create.without_rowid {
-                    self.allocate_index_root_page()?
-                } else {
-                    self.allocate_root_page()?
-                };
-                self.db.borrow_mut().create_table_at(root_page, num_columns);
+                let root_page = self.allocate_schema_table_root(
+                    target_is_temp,
+                    num_columns,
+                    create.without_rowid,
+                )?;
 
                 // Register UNIQUE column groups with MemTable for in-memory
                 // constraint enforcement. This is needed because MemDatabase
@@ -40207,7 +40578,7 @@ impl Connection {
                 for (i, col) in columns.iter().enumerate() {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
-                            fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                            fk_defs.push(fk_clause_to_def(&[i], Some(col.name.clone()), fk_clause));
                         }
                     }
                 }
@@ -40226,7 +40597,7 @@ impl Connection {
                             })
                             .collect();
                         if !child_indices.is_empty() {
-                            fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                            fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                         }
                     }
                 }
@@ -40237,13 +40608,19 @@ impl Connection {
                 for col in columns {
                     for c in &col.constraints {
                         if let ColumnConstraintKind::Check(ref expr) = c.kind {
-                            check_defs.push(format!("{expr}"));
+                            check_defs.push(CheckConstraint {
+                                expr: expr.to_string(),
+                                owner_column: Some(col.name.clone()),
+                            });
                         }
                     }
                 }
                 for tc in constraints {
                     if let TableConstraintKind::Check(ref expr) = tc.kind {
-                        check_defs.push(format!("{expr}"));
+                        check_defs.push(CheckConstraint {
+                            expr: expr.to_string(),
+                            owner_column: None,
+                        });
                     }
                 }
 
@@ -40579,10 +40956,12 @@ impl Connection {
                         .map(|idx| schema.remove(idx))
                 };
                 if let Some(table) = removed {
-                    // TEMP table pages live in the same MemDatabase; release the
-                    // backing memtable. (Indexes on TEMP tables are not yet
-                    // separately tracked here.)
+                    // TEMP table and index roots are MemDatabase-only. Release
+                    // every one without touching the main pager freelist.
                     self.db.borrow_mut().destroy_table(table.root_page);
+                    for index in &table.indexes {
+                        self.db.borrow_mut().destroy_table(index.root_page);
+                    }
                 }
                 self.temp_table_names.borrow_mut().remove(&drop_name_lc);
                 self.rowid_alias_columns.borrow_mut().remove(&drop_name_lc);
@@ -40686,9 +41065,12 @@ impl Connection {
                 }
             }
             DropObjectType::Index => {
+                let temp_names = self.temp_table_names.borrow();
                 let mut schema = self.schema.borrow_mut();
                 let mut found = false;
                 let mut dropped_root_page = None;
+                let mut dropped_temp = false;
+                let mut dropped_temp_unique = None;
                 for table in schema.iter_mut() {
                     if let Some(pos) = table
                         .indexes
@@ -40697,11 +41079,28 @@ impl Connection {
                     {
                         let removed = table.indexes.remove(pos);
                         dropped_root_page = Some(removed.root_page);
+                        dropped_temp = temp_names.contains(&table.name.to_ascii_lowercase());
+                        if dropped_temp && removed.is_unique {
+                            let columns = removed
+                                .columns
+                                .iter()
+                                .map(|column| {
+                                    table.columns.iter().position(|candidate| {
+                                        candidate.name.eq_ignore_ascii_case(column)
+                                    })
+                                })
+                                .collect::<Option<Vec<_>>>();
+                            if let Some(columns) = columns {
+                                dropped_temp_unique =
+                                    Some((table.root_page, columns, removed.key_collations));
+                            }
+                        }
                         found = true;
                         break;
                     }
                 }
                 drop(schema);
+                drop(temp_names);
                 if !found {
                     if drop_stmt.if_exists {
                         return Ok(());
@@ -40709,13 +41108,23 @@ impl Connection {
                     return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
                 }
                 if let Some(root_page) = dropped_root_page {
-                    // Free all B-tree pages for the index back to the pager
-                    // freelist before removing the in-memory MemDatabase entry.
-                    self.free_btree_pages(root_page, false)?;
+                    // TEMP indexes are MemDatabase-only and must never be
+                    // interpreted as main-pager roots. Persistent indexes are
+                    // returned to the pager freelist as usual.
+                    if !dropped_temp {
+                        self.free_btree_pages(root_page, false)?;
+                    }
                     self.db.borrow_mut().destroy_table(root_page);
                 }
-                if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name) {
-                    swallow_missing_master(err)?;
+                if let Some((table_root, columns, collations)) = dropped_temp_unique {
+                    if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
+                        table.remove_unique_column_group_with_collations(&columns, &collations);
+                    }
+                }
+                if !dropped_temp {
+                    if let Err(err) = self.delete_sqlite_master_typed_row("index", obj_name) {
+                        swallow_missing_master(err)?;
+                    }
                 }
                 true
             }
@@ -40827,6 +41236,124 @@ impl Connection {
 
     /// Execute an ALTER TABLE statement.
     fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
+        if !matches!(alter.action, AlterTableAction::DropColumn(_)) {
+            return self.execute_alter_table_impl(alter);
+        }
+
+        let table_name_lc = alter.table.name.to_ascii_lowercase();
+        let targets_main_explicit = alter
+            .table
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        if targets_main_explicit
+            && self
+                .shadowed_main_tables
+                .borrow()
+                .contains_key(&table_name_lc)
+        {
+            return self.execute_alter_drop_on_shadowed_main(alter);
+        }
+
+        // DROP COLUMN rewrites physical rows before the catalog update. Keep a
+        // connection-local snapshot as a second line of defence around the
+        // pager statement savepoint: schema metadata is mutated eagerly by the
+        // implementation, and TEMP rows live only in MemDatabase (not in the
+        // pager transaction that an autocommit failure rolls back).
+        let snapshot = self.snapshot();
+        let temp_table_snapshot = (!targets_main_explicit
+            && self.temp_table_names.borrow().contains(&table_name_lc))
+        .then(|| {
+            let root_page = self
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&alter.table.name))
+                .map(|table| table.root_page)?;
+            self.db
+                .borrow()
+                .get_table(root_page)
+                .cloned()
+                .map(|table| (root_page, table))
+        })
+        .flatten();
+
+        let result = self.execute_alter_table_impl(alter);
+        if let Err(statement_error) = result {
+            let cx = self.op_cx()?;
+            self.restore_snapshot(&cx, &snapshot)?;
+            if let Some((root_page, table)) = temp_table_snapshot {
+                self.db.borrow_mut().tables.insert(root_page, table);
+            }
+            return Err(statement_error);
+        }
+        Ok(())
+    }
+
+    /// Temporarily make a shadowed `main.<table>` the visible schema entry so
+    /// the ordinary ALTER machinery can rewrite its pager root and catalog
+    /// row. The connection-local TEMP table is restored as the unqualified
+    /// binding before this function returns, on both success and failure.
+    fn execute_alter_drop_on_shadowed_main(
+        &self,
+        alter: &fsqlite_ast::AlterTableStatement,
+    ) -> Result<()> {
+        let table_name_lc = alter.table.name.to_ascii_lowercase();
+        let visible_slot = self
+            .schema
+            .borrow()
+            .iter()
+            .position(|table| table.name.eq_ignore_ascii_case(&alter.table.name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: alter.table.name.clone(),
+            })?;
+        let main_table = self
+            .shadowed_main_tables
+            .borrow_mut()
+            .remove(&table_name_lc)
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: alter.table.name.clone(),
+            })?;
+        let temp_table = {
+            let mut schema = self.schema.borrow_mut();
+            std::mem::replace(&mut schema[visible_slot], main_table)
+        };
+        let temp_rowid_alias = self.rowid_alias_columns.borrow_mut().remove(&table_name_lc);
+        if let Some(main_alias) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&alter.table.name))
+            .and_then(|table| table.columns.iter().position(|column| column.is_ipk))
+        {
+            self.rowid_alias_columns
+                .borrow_mut()
+                .insert(table_name_lc.clone(), main_alias);
+        }
+        self.temp_table_names.borrow_mut().remove(&table_name_lc);
+        self.rebuild_schema_indices();
+
+        let result = self.execute_alter_table(alter);
+
+        let updated_main = {
+            let mut schema = self.schema.borrow_mut();
+            std::mem::replace(&mut schema[visible_slot], temp_table)
+        };
+        self.shadowed_main_tables
+            .borrow_mut()
+            .insert(table_name_lc.clone(), updated_main);
+        self.rowid_alias_columns.borrow_mut().remove(&table_name_lc);
+        if let Some(temp_alias) = temp_rowid_alias {
+            self.rowid_alias_columns
+                .borrow_mut()
+                .insert(table_name_lc.clone(), temp_alias);
+        }
+        self.temp_table_names.borrow_mut().insert(table_name_lc);
+        self.rebuild_schema_indices();
+        result
+    }
+
+    fn execute_alter_table_impl(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
         let table_name = &alter.table.name;
         if matches!(alter.action, AlterTableAction::RenameTo(_))
             && self.has_live_vtab_instance(table_name)
@@ -40933,8 +41460,15 @@ impl Connection {
                         rename_column_refs_in_stored_expr_sql(generated_expr, old, new)?;
                     }
                 }
-                for check_expr in &mut renamed_table.check_constraints {
-                    rename_column_refs_in_stored_expr_sql(check_expr, old, new)?;
+                for check in &mut renamed_table.check_constraints {
+                    rename_column_refs_in_stored_expr_sql(&mut check.expr, old, new)?;
+                    if check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(old))
+                    {
+                        check.owner_column = Some(new.clone());
+                    }
                 }
                 for pk in &mut renamed_table.primary_key_constraints {
                     for pk_col in pk {
@@ -40962,6 +41496,13 @@ impl Connection {
                 }
                 for fk in &mut renamed_table.foreign_keys {
                     rename_fk_parent_columns(fk, &renamed_table.name, old, new);
+                    if fk
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(old))
+                    {
+                        fk.owner_column = Some(new.clone());
+                    }
                 }
                 for (idx, dependent_table) in schema.iter().enumerate() {
                     if idx == table_idx {
@@ -41014,6 +41555,22 @@ impl Connection {
                         col_def.name
                     )));
                 }
+                // CHECK constraints may not contain a subquery. CREATE TABLE
+                // already rejects these (bd-bkbe6); ALTER TABLE ADD COLUMN
+                // must too, with C SQLite's alter-scoped message. Persisting
+                // such a CHECK poisons the on-disk schema: stock SQLite
+                // refuses to parse it and the whole file becomes unreadable
+                // ("malformed database schema").
+                for constraint in &col_def.constraints {
+                    if let ColumnConstraintKind::Check(ref expr) = constraint.kind
+                        && expr_contains_subquery_match(expr, &mut |_| true)
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {table_name} after add column: \
+                             subqueries prohibited in CHECK constraints"
+                        )));
+                    }
+                }
                 let affinity = col_def
                     .type_name
                     .as_ref()
@@ -41064,7 +41621,10 @@ impl Connection {
                     .constraints
                     .iter()
                     .filter_map(|constraint| match &constraint.kind {
-                        ColumnConstraintKind::Check(expr) => Some(expr.to_string()),
+                        ColumnConstraintKind::Check(expr) => Some(CheckConstraint {
+                            expr: expr.to_string(),
+                            owner_column: Some(col_def.name.clone()),
+                        }),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -41178,6 +41738,7 @@ impl Connection {
                     }
                     table.foreign_keys.push(FkDef {
                         child_columns: vec![new_column_index],
+                        owner_column: Some(col_def.name.clone()),
                         parent_table: clause.table.clone(),
                         parent_columns: clause.columns.clone(),
                         on_delete,
@@ -41215,21 +41776,177 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
-                // SQLite rule: cannot drop the last remaining column.
-                if table.columns.len() == 1 {
-                    return Err(FrankenError::Internal(format!(
-                        "cannot drop column {col_name}: only one column remains"
-                    )));
-                }
                 if table.primary_key_constraints.iter().any(|pk| {
                     pk.iter()
                         .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
                 }) {
-                    return Err(FrankenError::Internal(format!(
-                        "cannot drop PRIMARY KEY column {col_name}"
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop PRIMARY KEY column: \"{col_name}\""
                     )));
                 }
+
+                // A column-level UNIQUE constraint is part of the table
+                // definition, not a disposable user index. Silently deleting
+                // its autoindex would weaken the table's data contract.
+                if table.columns[col_idx].unique {
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop UNIQUE column: \"{col_name}\""
+                    )));
+                }
+
+                // SQLite rule: cannot drop the last remaining column.
+                if table.columns.len() == 1 {
+                    return Err(FrankenError::FunctionError(format!(
+                        "cannot drop column \"{col_name}\": no other columns exist"
+                    )));
+                }
+
+                let index_references_dropped_column = |index: &IndexSchema| -> Result<bool> {
+                    let key_expression_references_column =
+                        index
+                            .key_expressions
+                            .iter()
+                            .try_fold(false, |found, expr_sql| {
+                                Ok::<bool, FrankenError>(
+                                    found || stored_expr_references_column(expr_sql, col_name)?,
+                                )
+                            })?;
+                    let predicate_references_column = index
+                        .where_clause
+                        .as_deref()
+                        .map(|where_sql| stored_expr_references_column(where_sql, col_name))
+                        .transpose()?
+                        .unwrap_or(false);
+                    Ok(index
+                        .columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(col_name))
+                        || key_expression_references_column
+                        || predicate_references_column)
+                };
+
+                // Table-level UNIQUE constraints keep SQLite's schema-error
+                // precedence ahead of table-level foreign keys.
+                for index in &table.indexes {
+                    if self.index_is_implicit_autoindex(&index.name, &table.name)
+                        && index_references_dropped_column(index)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+
+                // A table-level FOREIGN KEY survives independently of its
+                // child columns. SQLite diagnoses this before generated,
+                // CHECK, or explicit-index dependencies. A column-level
+                // REFERENCES clause, by contrast, is owned by and removed
+                // with the dropped column.
+                for fk in &table.foreign_keys {
+                    if !fk.child_columns.contains(&col_idx) {
+                        continue;
+                    }
+                    let is_owned_by_dropped_column = fk
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name));
+                    if !is_owned_by_dropped_column {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: unknown column \"{col_name}\" in foreign key definition",
+                            table.name
+                        )));
+                    }
+                }
+
+                // SQLite requires every table to retain at least one ordinary
+                // (non-generated) column. Check this before dependency errors so
+                // `DROP COLUMN` reports the same primary schema defect as stock
+                // SQLite when the sole base column feeds a generated column.
+                if !table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(idx, column)| idx != col_idx && column.generated_expr.is_none())
+                {
+                    return Err(FrankenError::FunctionError(format!(
+                        "error in table {} after drop column: must have at least one non-generated column",
+                        table.name
+                    )));
+                }
+
+                // Validate every stored table expression before mutating the
+                // schema. Leaving a generated column or CHECK constraint that
+                // names the removed column poisons sqlite_master for stock
+                // SQLite and silently disables constraints in this runtime.
+                for (idx, column) in table.columns.iter().enumerate() {
+                    if idx == col_idx {
+                        continue;
+                    }
+                    if let Some(expr_sql) = column.generated_expr.as_deref()
+                        && stored_expr_references_column(expr_sql, col_name)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+                for check in &table.check_constraints {
+                    if check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                    {
+                        continue;
+                    }
+                    if stored_expr_references_column(&check.expr, col_name)? {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in table {} after drop column: no such column: {col_name}",
+                            table.name
+                        )));
+                    }
+                }
+
+                // Explicit indexes make the column non-droppable. This includes
+                // expression-index terms and partial-index predicates, whose
+                // dependencies are not represented in `IndexSchema::columns`.
+                for index in &table.indexes {
+                    if !self.index_is_implicit_autoindex(&index.name, &table.name)
+                        && index_references_dropped_column(index)?
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "error in index {} after drop column: no such column: {col_name}",
+                            index.name
+                        )));
+                    }
+                }
+                let dependency_table_name = table.name.clone();
+                drop(schema);
+                self.validate_drop_column_view_and_trigger_dependencies(
+                    &dependency_table_name,
+                    col_name,
+                )?;
+
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
                 table.columns.remove(col_idx);
+                table.check_constraints.retain(|check| {
+                    !check
+                        .owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                });
                 // Remove indexes that reference the dropped column.
                 let dropped_indexes: Vec<String> = table
                     .indexes
@@ -41244,9 +41961,11 @@ impl Connection {
                 // Remove FKs that reference the dropped column, and adjust
                 // column indices for remaining FKs whose child_columns point
                 // past the removed position.
-                table
-                    .foreign_keys
-                    .retain(|fk| !fk.child_columns.contains(&col_idx));
+                table.foreign_keys.retain(|fk| {
+                    !fk.owner_column
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(col_name))
+                });
                 for fk in &mut table.foreign_keys {
                     for ci in &mut fk.child_columns {
                         if *ci > col_idx {
@@ -41272,7 +41991,7 @@ impl Connection {
                     }
                 }
                 for idx_name in &dropped_indexes {
-                    let _ = self.delete_sqlite_master_typed_row("index", idx_name);
+                    self.delete_sqlite_master_typed_row("index", idx_name)?;
                 }
                 // Physically rewrite stored rows to drop the column's record slot
                 // so trailing columns realign on read (the read path decodes by
@@ -41283,6 +42002,35 @@ impl Connection {
                 table_clone
             }
         };
+
+        #[cfg(test)]
+        if matches!(alter.action, AlterTableAction::DropColumn(_))
+            && self.fail_alter_drop_after_storage_once.replace(false)
+        {
+            return Err(FrankenError::Internal(
+                "injected ALTER DROP COLUMN failure after storage rewrite".to_owned(),
+            ));
+        }
+
+        let targets_main_explicit = alter
+            .table
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"));
+        let alters_temp_table = !targets_main_explicit
+            && self
+                .temp_table_names
+                .borrow()
+                .contains(&old_name.to_ascii_lowercase());
+        if alters_temp_table && matches!(alter.action, AlterTableAction::DropColumn(_)) {
+            // TEMP schema and rows are connection-local. There is deliberately
+            // no sqlite_master row to update; trying the main-catalog path is
+            // what previously turned every TEMP DROP COLUMN into a late error.
+            self.rebuild_schema_indices();
+            self.validate_schema_index();
+            self.note_temp_schema_change();
+            return Ok(());
+        }
 
         if let AlterTableAction::RenameTo(new_name) = &alter.action {
             let old_key = old_name.to_ascii_lowercase();
@@ -41451,6 +42199,116 @@ impl Connection {
             }
         }
         updates
+    }
+
+    fn validate_drop_column_view_and_trigger_dependencies(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<()> {
+        const PROBE_COLUMN: &str = "__fsqlite_drop_column_dependency_probe__";
+
+        // Column rename and column removal share the same name-binding question:
+        // would this AST reference follow the target table's column? Run the
+        // mature rename resolver against clones so CTEs, aliases, derived
+        // sources, and chained views are handled semantically. Star projections
+        // never rewrite and therefore remain legal, matching SQLite.
+        let mut source_catalog = self.column_rename_source_catalog(table_name, column_name);
+        let mut views = self.views.borrow().clone();
+        for view in &views {
+            source_catalog.set_view_output_status(
+                &view.name,
+                view_column_rename_initial_output_status(view, column_name),
+            );
+        }
+
+        let mut dependent_view = None;
+        for _ in 0..=views.len() {
+            let mut pass_changed = false;
+            for view in &mut views {
+                let view_changed = rename_column_refs_in_select_for_table(
+                    &mut view.query,
+                    table_name,
+                    column_name,
+                    PROBE_COLUMN,
+                    &source_catalog,
+                );
+                if view_changed && dependent_view.is_none() {
+                    dependent_view = Some(view.name.clone());
+                }
+                pass_changed |= view_changed;
+                let output_status = view_column_rename_output_status(
+                    view,
+                    column_name,
+                    PROBE_COLUMN,
+                    &source_catalog,
+                );
+                pass_changed |= source_catalog.set_view_output_status(&view.name, output_status);
+            }
+            if !pass_changed {
+                break;
+            }
+        }
+        if let Some(view_name) = dependent_view {
+            return Err(FrankenError::FunctionError(format!(
+                "error in view {view_name} after drop column: no such column: {column_name}"
+            )));
+        }
+
+        for trigger in self.triggers.borrow().iter() {
+            let mut trigger_probe = trigger.clone();
+            let target_matches = trigger_probe.table_name.eq_ignore_ascii_case(table_name);
+            let mut dependency_found = false;
+            if let Some(when_clause) = &mut trigger_probe.when_clause {
+                let mut target_bindings = ColumnRenameBindings::default();
+                if target_matches {
+                    target_bindings.add_matching_binding(table_name);
+                }
+                dependency_found |= rename_column_refs_in_expr_for_table(
+                    when_clause,
+                    table_name,
+                    column_name,
+                    PROBE_COLUMN,
+                    &target_bindings,
+                    target_matches,
+                    &source_catalog,
+                );
+                if target_matches {
+                    dependency_found |= rename_trigger_row_column_refs_in_expr(
+                        when_clause,
+                        column_name,
+                        PROBE_COLUMN,
+                        &source_catalog,
+                    );
+                }
+            }
+            for statement in &mut trigger_probe.body {
+                dependency_found |= rename_column_refs_in_statement_for_table(
+                    statement,
+                    table_name,
+                    column_name,
+                    PROBE_COLUMN,
+                    &source_catalog,
+                );
+                if target_matches {
+                    dependency_found |= rename_trigger_row_column_refs_in_statement(
+                        statement,
+                        column_name,
+                        PROBE_COLUMN,
+                        &source_catalog,
+                    );
+                }
+            }
+            // UPDATE OF is intentionally excluded: SQLite keeps event-only
+            // references to removed columns as inert trigger metadata.
+            if dependency_found {
+                return Err(FrankenError::FunctionError(format!(
+                    "error in trigger {} after drop column: no such column: {column_name}",
+                    trigger.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn rename_dependent_views_for_column_rename(
@@ -41981,7 +42839,7 @@ impl Connection {
             None
         };
 
-        let source_receipt = if target_value.is_none() && self.path != ":memory:" {
+        let source_receipt = if self.path != ":memory:" {
             Some(self.pager.capture_vacuum_source_image(&cx)?)
         } else {
             None
@@ -41991,7 +42849,21 @@ impl Connection {
             Some(receipt) => receipt.header().clone(),
             None => self.current_database_header(&cx)?,
         };
+        #[cfg(test)]
+        if let Some(hook) = self.vacuum_after_source_receipt_once.borrow_mut().take() {
+            hook();
+        }
         self.reload_memdb_from_pager_with_mode(&cx, true)?;
+        if let Some(source_receipt) = source_receipt.as_ref() {
+            let hydrated_source_receipt = self.pager.capture_vacuum_source_image(&cx)?;
+            if hydrated_source_receipt != *source_receipt {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages:
+                        "VACUUM source image changed while hydrating its receipt-bound snapshot"
+                            .to_owned(),
+                });
+            }
+        }
         let extra_master_entries = self.vacuum_extra_sqlite_master_entries();
         let target_reservation = target_value
             .as_ref()
@@ -42056,29 +42928,67 @@ impl Connection {
             return Err(error);
         }
 
+        let mut finalized_output_receipt = None;
         if let Some(target) = target_reservation.as_ref() {
             match target.kind() {
                 crate::vacuum::VacuumTargetKind::UserOutput => {
-                    if let Err(error) = self.validate_vacuum_rebuild(target) {
-                        if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                            tracing::warn!(
-                                error = %cleanup_error,
-                                path = %target.path().display(),
-                                "VACUUM INTO validation failed and exact-reservation cleanup also failed"
-                            );
+                    let finalization_result = (|| -> Result<DatabaseImageReceipt> {
+                        let persisted_candidate = self
+                            .pager
+                            .inspect_self_contained_database_image(&cx, target.path())?;
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+                        if persisted_candidate.identity() != target.identity() {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "VACUUM INTO candidate no longer has its reserved identity"
+                                    .to_owned(),
+                            });
                         }
-                        return Err(error);
-                    }
-                    if let Err(error) = target.finish_user_output(&cx) {
-                        if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
-                            tracing::warn!(
-                                error = %cleanup_error,
-                                path = %target.path().display(),
-                                "VACUUM INTO finalization failed and exact-reservation cleanup also failed"
-                            );
+
+                        self.validate_vacuum_rebuild(target)?;
+                        #[cfg(test)]
+                        if let Some(hook) =
+                            self.vacuum_after_target_validation_once.borrow_mut().take()
+                        {
+                            hook();
                         }
-                        return Err(error);
-                    }
+
+                        let validated_candidate = self
+                            .pager
+                            .inspect_self_contained_database_image(&cx, target.path())?;
+                        if validated_candidate != persisted_candidate {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "VACUUM INTO candidate identity or content changed during semantic validation"
+                                    .to_owned(),
+                            });
+                        }
+
+                        target.finish_user_output(&cx)?;
+                        let durable_candidate = self
+                            .pager
+                            .inspect_self_contained_database_image(&cx, target.path())?;
+                        if durable_candidate != validated_candidate {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: "VACUUM INTO candidate identity or content changed across its durability barrier"
+                                    .to_owned(),
+                            });
+                        }
+                        Ok(durable_candidate)
+                    })();
+
+                    let candidate_receipt = match finalization_result {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                                tracing::warn!(
+                                    error = %cleanup_error,
+                                    path = %target.path().display(),
+                                    "VACUUM INTO finalization failed and exact-reservation cleanup also failed"
+                                );
+                            }
+                            return Err(error);
+                        }
+                    };
+                    finalized_output_receipt = Some(candidate_receipt);
                 }
                 crate::vacuum::VacuumTargetKind::Discard => {
                     if !target.cleanup_if_owned(&cx)? {
@@ -42172,7 +43082,53 @@ impl Connection {
 
         self.invalidate_cached_read_snapshot(&cx);
         self.invalidate_cached_write_txn(&cx);
-        self.reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows)?;
+        if let Err(error) = self.reload_memdb_from_pager_with_mode(&cx, restore_hydrated_rows) {
+            if let Some(target) = target_reservation.as_ref()
+                && let Err(cleanup_error) = target.cleanup_if_owned(&cx)
+            {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    path = %target.path().display(),
+                    "VACUUM INTO source-state restoration failed and exact-reservation cleanup also failed"
+                );
+            }
+            return Err(error);
+        }
+
+        if let Some(expected_receipt) = finalized_output_receipt.as_ref() {
+            let target = target_reservation.as_ref().ok_or_else(|| {
+                FrankenError::internal("VACUUM INTO finalized without an output reservation")
+            })?;
+            let final_receipt = self
+                .pager
+                .inspect_self_contained_database_image(&cx, target.path());
+            match final_receipt {
+                Ok(receipt) if receipt == *expected_receipt => {}
+                Ok(_) => {
+                    if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                        tracing::warn!(
+                            error = %cleanup_error,
+                            path = %target.path().display(),
+                            "VACUUM INTO final receipt changed and exact-reservation cleanup also failed"
+                        );
+                    }
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "VACUUM INTO candidate identity or content changed before success"
+                            .to_owned(),
+                    });
+                }
+                Err(error) => {
+                    if let Err(cleanup_error) = target.cleanup_if_owned(&cx) {
+                        tracing::warn!(
+                            error = %cleanup_error,
+                            path = %target.path().display(),
+                            "VACUUM INTO final receipt failed and exact-reservation cleanup also failed"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -42235,6 +43191,19 @@ impl Connection {
     fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
         let table_name = &stmt.table;
         let index_name = stmt.name.name.clone();
+        let target_is_temp = self
+            .temp_table_names
+            .borrow()
+            .contains(&table_name.to_ascii_lowercase());
+        if let Some(index_schema) = stmt.name.schema.as_deref() {
+            let names_temp = index_schema.eq_ignore_ascii_case("temp");
+            let names_main = index_schema.eq_ignore_ascii_case("main");
+            if (names_temp && !target_is_temp) || (names_main && target_is_temp) {
+                return Err(FrankenError::FunctionError(format!(
+                    "cannot create index `{index_name}` in schema `{index_schema}` on table `{table_name}`"
+                )));
+            }
+        }
 
         // Phase 1: Validate schema (with borrow)
         {
@@ -42245,6 +43214,22 @@ impl Connection {
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
                 })?;
+            // An index cannot reuse the name of an existing table or view. C
+            // SQLite rejects this unconditionally — IF NOT EXISTS only suppresses
+            // a collision with another *index* of the same name. (GH #232)
+            let name_taken_by_table = schema
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(&index_name));
+            let name_taken_by_view = self
+                .views
+                .borrow()
+                .iter()
+                .any(|v| v.name.eq_ignore_ascii_case(&index_name));
+            if name_taken_by_table || name_taken_by_view {
+                return Err(FrankenError::Internal(format!(
+                    "there is already a table named {index_name}"
+                )));
+            }
             let index_name_exists = schema.iter().any(|candidate| {
                 candidate
                     .indexes
@@ -42336,12 +43321,50 @@ impl Connection {
             Vec::new()
         };
 
-        // Phase 3: Allocate index B-tree root page (no borrow held)
-        let root_page = self.allocate_index_root_page()?;
+        if target_is_temp && stmt.unique && has_expression_term {
+            return Err(FrankenError::NotImplemented(
+                "UNIQUE expression indexes on TEMP tables are not yet supported".to_owned(),
+            ));
+        }
 
-        // Phase 4: Create B-tree in db layer (for in-memory engine compatibility)
-        // Index B-trees have key = (indexed columns..., rowid), no payload columns
-        self.db.borrow_mut().create_table_at(root_page, 0);
+        let temp_unique_columns = if target_is_temp && stmt.unique {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            let columns = col_names
+                .iter()
+                .map(|column| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.name.eq_ignore_ascii_case(column))
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "failed to resolve TEMP index columns for `{index_name}`"
+                    ))
+                })?;
+            let db = self.db.borrow();
+            let table = db.get_table(table.root_page).ok_or_else(|| {
+                FrankenError::Internal(format!("TEMP table `{table_name}` has no attached storage"))
+            })?;
+            if !table.unique_column_group_is_valid(&columns, &key_collations) {
+                return Err(FrankenError::UniqueViolation {
+                    columns: col_names.join(", "),
+                });
+            }
+            Some(columns)
+        } else {
+            None
+        };
+
+        // Phase 3: Allocate index B-tree root page (no borrow held)
+        let root_page = self.allocate_schema_table_root(target_is_temp, 0, true)?;
 
         // Phase 5: Record index in schema (with mut borrow)
         {
@@ -42360,14 +43383,37 @@ impl Connection {
                 where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
                 root_page,
                 is_unique: stmt.unique,
-                key_collations,
+                key_collations: key_collations.clone(),
                 conflict_action: None,
             });
         }
 
+        if let Some(columns) = temp_unique_columns {
+            let table_root = self
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
+                table.add_unique_column_group_with_collations(columns, key_collations.clone());
+            }
+        }
+
         // Phase 6: Persist to sqlite_master
         let create_sql = stmt.to_string();
-        self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
+        if !target_is_temp {
+            self.insert_sqlite_master_row(
+                "index",
+                &index_name,
+                table_name,
+                root_page,
+                &create_sql,
+            )?;
+        }
 
         self.increment_schema_cookie()?;
 
@@ -42375,6 +43421,9 @@ impl Connection {
         // SQLite populates a new index with all current table data during
         // CREATE INDEX.  For UNIQUE indexes this also validates that no
         // duplicate values exist.
+        if target_is_temp {
+            return Ok(());
+        }
         let (table, index) = {
             let schema = self.schema.borrow();
             let table = schema
@@ -42422,6 +43471,12 @@ impl Connection {
         } else {
             idx_col_positions.len()
         };
+        let without_rowid_pk = table
+            .without_rowid
+            .then(|| without_rowid_pk_indices(table).map_err(codegen_error_to_franken))
+            .transpose()?;
+        let n_row_locator_cols = without_rowid_pk.as_ref().map_or(1, Vec::len);
+        let n_record_cols = n_idx_cols + n_row_locator_cols;
         let mut b = ProgramBuilder::new();
         let halt_label = b.emit_label();
         let loop_label = b.emit_label();
@@ -42452,8 +43507,9 @@ impl Connection {
             emit_scan_filter(&mut b, predicate, 0, table, next_label);
         }
 
-        // Allocate registers for index key: (indexed_cols..., rowid).
-        let key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
+        // Rowid tables append the rowid. WITHOUT ROWID tables append every
+        // PRIMARY KEY column in declared PK order, matching ordinary DML.
+        let key_regs = b.alloc_regs(n_record_cols as i32);
 
         if is_expression_index {
             // Expression index: evaluate each key expression against cursor 0.
@@ -42474,16 +43530,29 @@ impl Connection {
             }
         }
 
-        // Read rowid.
-        let rowid_reg = key_regs + n_idx_cols as i32;
-        b.emit_op(Opcode::Rowid, 0, rowid_reg, 0, P4::None, 0);
+        if let Some(pk_indices) = without_rowid_pk.as_deref() {
+            for (pk_pos, &col_idx) in pk_indices.iter().enumerate() {
+                b.emit_op(
+                    Opcode::Column,
+                    0,
+                    col_idx as i32,
+                    key_regs + (n_idx_cols + pk_pos) as i32,
+                    P4::None,
+                    0,
+                );
+            }
+        } else {
+            let rowid_reg = key_regs + n_idx_cols as i32;
+            b.emit_op(Opcode::Rowid, 0, rowid_reg, 0, P4::None, 0);
+        }
 
-        // MakeRecord from (cols..., rowid).
+        // Pack (index terms..., row locator). Unique checks intentionally use
+        // only `n_idx_cols` below, never the PK suffix.
         let rec_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             key_regs,
-            (n_idx_cols + 1) as i32,
+            n_record_cols as i32,
             rec_reg,
             P4::None,
             0,
@@ -43635,8 +44704,8 @@ impl Connection {
     ) -> Result<bool> {
         // F-PGM.11: Enforce trigger recursion depth limit.
         // SQLite uses SQLITE_MAX_TRIGGER_DEPTH=1000, but each Rust recursion
-        // level is heavier on the call stack than C. Use 100 as a practical
-        // limit that prevents stack overflow while still allowing deep nesting.
+        // level is heavier on the call stack than C. MAX_TRIGGER_DEPTH keeps a
+        // conservative safety margin below the regression-tested thread stack.
         if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
@@ -44581,6 +45650,34 @@ impl Connection {
         rollback_result
     }
 
+    /// Allocate a root for schema-visible table storage and create its
+    /// `MemDatabase` representation.
+    ///
+    /// Persistent objects own a pager B-tree root. TEMP objects are strictly
+    /// connection-local and must never allocate or initialize a main-database
+    /// page: doing so without a matching `sqlite_master` owner leaves an
+    /// orphan that stock SQLite reports as "Page N: never used". Their roots
+    /// therefore come only from the collision-safe MemDatabase namespace.
+    fn allocate_schema_table_root(
+        &self,
+        temporary: bool,
+        num_columns: usize,
+        index_btree: bool,
+    ) -> Result<i32> {
+        if temporary {
+            self.reserve_clean_memdb_root_pages(1)?;
+            return Ok(self.db.borrow_mut().create_table(num_columns));
+        }
+
+        let root_page = if index_btree {
+            self.allocate_index_root_page()?
+        } else {
+            self.allocate_root_page()?
+        };
+        self.db.borrow_mut().create_table_at(root_page, num_columns);
+        Ok(root_page)
+    }
+
     fn reserve_clean_memdb_root_pages_with_txn(
         &self,
         txn: &dyn TransactionHandle,
@@ -44799,6 +45896,8 @@ impl Connection {
         DbSnapshot {
             db_version,
             schema: self.schema.borrow().clone(),
+            temp_table_names: self.temp_table_names.borrow().clone(),
+            shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
             views: self.views.borrow().clone(),
             triggers: self.triggers.borrow().clone(),
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
@@ -44814,6 +45913,17 @@ impl Connection {
 
     /// Restore a snapshot, replacing the current database + schema state.
     fn restore_snapshot(&self, cx: &Cx, snap: &DbSnapshot) -> Result<()> {
+        self.restore_snapshot_state(snap);
+        self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
+    }
+
+    /// Restore the MemDatabase and connection-local schema state in a snapshot.
+    ///
+    /// Full transaction rollback uses this before reloading persistent pager
+    /// state so that TEMP tables captured by the reload are the pre-transaction
+    /// versions, not the just-rolled-back ALTER image. Virtual-table registry
+    /// cleanup remains owned by the caller on that path.
+    fn restore_snapshot_state(&self, snap: &DbSnapshot) {
         self.db.borrow_mut().rollback_to(snap.db_version);
         // bd-e6zfc: rebuild the case-insensitive side indices from the snapshot
         // (positions match the about-to-be-cloned Vecs) and publish each data
@@ -44841,6 +45951,8 @@ impl Connection {
             .collect();
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
+        (*self.temp_table_names.borrow_mut()).clone_from(&snap.temp_table_names);
+        (*self.shadowed_main_tables.borrow_mut()).clone_from(&snap.shadowed_main_tables);
         (*self.views.borrow_mut()).clone_from(&snap.views);
         *self.views_by_name.borrow_mut() = new_views_by_name;
         (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
@@ -44853,7 +45965,6 @@ impl Connection {
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
         self.schema_generation.set(snap.schema_generation);
-        self.restore_live_vtab_registry_to(cx, snap.live_vtab_registry_undo_len)
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -45734,6 +46845,11 @@ impl Connection {
                 let vtab_rollback_result = self.live_vtab_rollback_all(cx);
                 let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                 self.clear_pending_memdb_direct_upserts();
+                if rollback_succeeded
+                    && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
+                {
+                    self.restore_snapshot_state(&snapshot);
+                }
                 let reload_result = if txn_has_pending_writes && rollback_succeeded {
                     self.reload_memdb_from_pager(cx)
                 } else {
@@ -46308,6 +47424,15 @@ impl Connection {
             let live_vtab_result = self.live_vtab_rollback_all(cx);
             let live_vtab_registry_result = self.restore_live_vtab_registry_to(cx, 0);
             self.clear_pending_memdb_direct_upserts();
+
+            // Restore the BEGIN-time connection-local image before the pager
+            // reload snapshots TEMP tables. Pager rollback cannot restore
+            // TEMP roots because they never live in the main database.
+            if rollback_result.is_ok()
+                && let Some(snapshot) = self.txn_snapshot.borrow().as_ref().cloned()
+            {
+                self.restore_snapshot_state(&snapshot);
+            }
 
             // Reload MemDatabase from pager's committed state.
             // This replaces the snapshot-restore approach with reading the
@@ -49560,11 +50685,26 @@ impl Connection {
                         // generated (bd-ewj3w).
                         let is_xinfo = full_name == "table_xinfo";
                         let pk_positions = self.compute_pk_positions(t);
+                        // table_info omits generated columns (they surface only in
+                        // table_xinfo) and renumbers cid over the remaining
+                        // columns; table_xinfo lists every column at its real cid.
+                        // (GH #240)
+                        let mut next_cid: i64 = 0;
                         let rows = t
                             .columns
                             .iter()
                             .enumerate()
-                            .map(|(i, col)| {
+                            .filter_map(|(i, col)| {
+                                if !is_xinfo && col.generated_expr.is_some() {
+                                    return None;
+                                }
+                                let cid = if is_xinfo {
+                                    i64::try_from(i).unwrap_or(0)
+                                } else {
+                                    let c = next_cid;
+                                    next_cid += 1;
+                                    c
+                                };
                                 let type_str =
                                     col.type_name.as_deref().unwrap_or(match col.affinity {
                                         'D' | 'd' => "INTEGER",
@@ -49580,7 +50720,7 @@ impl Connection {
                                     });
                                 let pk = pk_positions.get(i).copied().unwrap_or(0);
                                 let mut values = vec![
-                                    SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
+                                    SqliteValue::Integer(cid),
                                     SqliteValue::Text(col.name.clone().into()),
                                     SqliteValue::Text(type_str.into()),
                                     SqliteValue::Integer(notnull),
@@ -49597,7 +50737,7 @@ impl Connection {
                                     };
                                     values.push(SqliteValue::Integer(hidden));
                                 }
-                                Row { values }
+                                Some(Row { values })
                             })
                             .collect();
                         Ok(rows)
@@ -49756,6 +50896,17 @@ impl Connection {
                     },
                     None => None,
                 };
+                // A named table must exist; C SQLite errors "no such table: X"
+                // rather than silently returning zero rows. (GH #261)
+                if let Some(name) = &only_table
+                    && !self
+                        .schema
+                        .borrow()
+                        .iter()
+                        .any(|t| t.name.eq_ignore_ascii_case(name))
+                {
+                    return Err(FrankenError::NoSuchTable { name: name.clone() });
+                }
                 // Resolve every FK to check (column NAMES + fkid) up front so no
                 // schema borrow is held across the queries below.
                 struct FkCheck {
@@ -51033,6 +52184,32 @@ impl Connection {
             }
             // Recreate the TEMP table and its rows in the rebuilt memdb.
             new_db.create_table_at(temp_schema.root_page, temp_schema.columns.len());
+            for index in &temp_schema.indexes {
+                new_db.create_table_at(index.root_page, 0);
+            }
+            if let Some(mem_table) = new_db.get_table_mut(temp_schema.root_page) {
+                for index in temp_schema.indexes.iter().filter(|index| index.is_unique) {
+                    let Some(columns) = index
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            temp_schema
+                                .columns
+                                .iter()
+                                .position(|candidate| candidate.name.eq_ignore_ascii_case(column))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    if !columns.is_empty() {
+                        mem_table.add_unique_column_group_with_collations(
+                            columns,
+                            index.key_collations.clone(),
+                        );
+                    }
+                }
+            }
             for (rowid, vals) in rows {
                 new_db.upsert_row(temp_schema.root_page, rowid, vals);
             }
@@ -51074,6 +52251,52 @@ impl Connection {
         }
     }
 
+    /// Return every schema root owned by connection-local TEMP tables.
+    ///
+    /// TEMP objects use the ordinary schema metadata shape, but their storage
+    /// lives exclusively in `MemDatabase`. Finalized VDBE programs use this
+    /// set to annotate those roots with SQLite database number 1 so execution
+    /// never consults or mutates the main pager for them.
+    fn temp_storage_roots(&self) -> HashSet<i32> {
+        let temp_names = self.temp_table_names.borrow();
+        if temp_names.is_empty() {
+            return HashSet::new();
+        }
+        let schema = self.schema.borrow();
+        let mut roots = HashSet::new();
+        for table in schema
+            .iter()
+            .filter(|table| temp_names.contains(&table.name.to_ascii_lowercase()))
+        {
+            roots.insert(table.root_page);
+            roots.extend(table.indexes.iter().map(|index| index.root_page));
+        }
+        roots
+    }
+
+    /// Remove TEMP indexes from a statement-local codegen snapshot.
+    ///
+    /// `MemTable` enforces declared uniqueness directly, while its cursor
+    /// backend intentionally has no separate index B-trees. Emitting an index
+    /// access plan would therefore create an empty, misleading access path.
+    /// The connection's schema remains unchanged; only this disposable clone
+    /// is simplified to table scans.
+    fn suppress_temp_indexes_for_codegen(schema: &mut [TableSchema], temp_roots: &HashSet<i32>) {
+        for table in schema {
+            if temp_roots.contains(&table.root_page) {
+                table.indexes.clear();
+            }
+        }
+    }
+
+    fn route_temp_roots_in_program(
+        mut program: VdbeProgram,
+        temp_roots: &HashSet<i32>,
+    ) -> VdbeProgram {
+        program.route_storage_roots_to_temp_database(temp_roots.iter().copied());
+        program
+    }
+
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
         let prof = hot_path_profile_enabled();
@@ -51093,16 +52316,19 @@ impl Connection {
         // TEMP shadowing) — borrow `self.schema` directly and skip the O(total-schema) deep clone.
         // The schema data fed to the planner + codegen is identical either way, so the emitted
         // program is byte-for-byte unchanged.
+        let temp_roots = self.temp_storage_roots();
         let needs_owned_schema = FSQLITE_FORCE_SCHEMA_CLONE_BENCH.with(std::cell::Cell::get)
             || self.sqlite_stat1_root_page().is_some()
-            || !self.shadowed_main_tables.borrow().is_empty();
-        if needs_owned_schema {
+            || !self.shadowed_main_tables.borrow().is_empty()
+            || !temp_roots.is_empty();
+        let program = if needs_owned_schema {
             let t = prof.then(Instant::now);
             let mut schema = self.schema.borrow().clone();
             // bd-wjrs0: when a TEMP table shadows a same-named main table, the visible `schema`
             // entry is the TEMP one. An explicit `main.<name>` reference must still reach the
             // shadowed main table, so swap it back into this per-statement snapshot.
             self.apply_shadowed_main_substitution(&mut schema, &canonical_select);
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
         } else {
@@ -51110,7 +52336,8 @@ impl Connection {
             let schema = self.schema.borrow();
             record_hot_path_duration(&FSQLITE_COMPILE_SCHEMA_CLONE_NS, t);
             self.compile_canonical_select_with_schema(&canonical_select, &schema)
-        }
+        }?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// Shared tail of `compile_table_select`: plan the directive and emit the program.
@@ -59088,7 +60315,11 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<SelectStatement> {
-        let mut result = select.clone();
+        // Preserve SQLite's statement-global bind numbering before any
+        // subquery is executed independently.  Canonicalizing only the
+        // extracted subquery would restart anonymous `?` slots at one and
+        // make the remaining outer expression read the wrong parameter.
+        let mut result = canonicalize_select_placeholders(select)?;
         rewrite_in_select_core(&mut result.body.select, self, false, params)?;
         // Also rewrite any compound arms.
         for (_op, core) in &mut result.body.compounds {
@@ -59119,7 +60350,10 @@ impl Connection {
         {
             return Ok(Cow::Borrowed(select));
         }
-        let mut result = select.clone();
+        // Fallback execution may also materialize an IN subquery separately,
+        // so it needs the same statement-wide bind-slot preservation as the
+        // primary rewrite path.
+        let mut result = canonicalize_select_placeholders(select)?;
         rewrite_in_select_core(&mut result.body.select, self, true, params)?;
         for (_op, core) in &mut result.body.compounds {
             rewrite_in_select_core(core, self, true, params)?;
@@ -60687,14 +61921,20 @@ impl Connection {
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
         let insert = self.resolve_insert_values_subqueries(insert)?;
-        let schema = self.schema.borrow();
-        let table_schema = schema
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
-            .ok_or_else(|| {
-                FrankenError::Internal(format!("no such table: {}", insert.table.name))
-            })?;
-        Self::validate_insert_target_columns(table_schema, &insert.table.name, &insert.columns)?;
+        {
+            let schema = self.schema.borrow();
+            let table_schema = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("no such table: {}", insert.table.name))
+                })?;
+            Self::validate_insert_target_columns(
+                table_schema,
+                &insert.table.name,
+                &insert.columns,
+            )?;
+        }
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
             .rowid_alias_columns
@@ -60706,9 +61946,19 @@ impl Connection {
             rowid_alias_col_idx,
             ..CodegenContext::default()
         };
-        codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
-            .map_err(codegen_error_to_franken)?;
-        builder.finish()
+        let temp_roots = self.temp_storage_roots();
+        if temp_roots.is_empty() {
+            let schema = self.schema.borrow();
+            codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        }
+        let program = builder.finish()?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// If the INSERT source contains VALUES rows with subquery expressions,
@@ -60768,7 +62018,6 @@ impl Connection {
 
     /// Compile an UPDATE through the VDBE codegen.
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
-        let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
             .rowid_alias_columns
@@ -60780,21 +62029,42 @@ impl Connection {
             rowid_alias_col_idx,
             ..CodegenContext::default()
         };
-        codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
-        builder.finish()
+        let temp_roots = self.temp_storage_roots();
+        if temp_roots.is_empty() {
+            let schema = self.schema.borrow();
+            codegen_update(&mut builder, update, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            codegen_update(&mut builder, update, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        }
+        let program = builder.finish()?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// Compile a DELETE through the VDBE codegen.
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
-        let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
             ..CodegenContext::default()
         };
-        codegen_delete(&mut builder, delete, &schema, &ctx).map_err(codegen_error_to_franken)?;
-        builder.finish()
+        let temp_roots = self.temp_storage_roots();
+        if temp_roots.is_empty() {
+            let schema = self.schema.borrow();
+            codegen_delete(&mut builder, delete, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            codegen_delete(&mut builder, delete, &schema, &ctx)
+                .map_err(codegen_error_to_franken)?;
+        }
+        let program = builder.finish()?;
+        Ok(Self::route_temp_roots_in_program(program, &temp_roots))
     }
 
     /// Attempt to compile any statement into a `VdbeProgram` for EXPLAIN.
@@ -61280,6 +62550,23 @@ impl Connection {
         // SCHEMA_STABLE so fast-lane consumers can re-enter once migrated.
         self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, true);
         Ok(())
+    }
+
+    /// Invalidate connection-local compilation state after a TEMP schema
+    /// change without writing the main database header.
+    ///
+    /// TEMP objects have no main `sqlite_master` entry and their roots exist
+    /// only in `MemDatabase`, so advancing the main schema cookie would create
+    /// an unrelated pager write (and can conflict with a concurrent main-db
+    /// snapshot). `schema_generation` is the local prepared-statement guard.
+    fn note_temp_schema_change(&self) {
+        self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, false);
+        self.schema_generation
+            .set(self.schema_generation.get().wrapping_add(1));
+        self.parse_cache.borrow_mut().clear();
+        self.clear_compilation_reuse_caches();
+        self.table_execution_metadata_cache.borrow_mut().take();
+        self.set_fast_path_bit(fast_path_gate::SCHEMA_STABLE, true);
     }
 
     /// Increment the file change counter.  Must be called for every
@@ -61936,7 +63223,36 @@ impl Connection {
     ) -> Result<HashMap<String, Box<dyn ErasedVtabInstance>>> {
         let mut reloaded = HashMap::new();
 
-        for (table_name, create_sql, _) in specs {
+        for (spec_index, (table_name, create_sql, _)) in specs.iter().enumerate() {
+            let has_reloadable_duplicate_fts5_schema_row = specs.iter().enumerate().any(
+                |(candidate_index, (candidate_name, candidate_sql, _))| {
+                    if candidate_index == spec_index
+                        || !candidate_name.eq_ignore_ascii_case(table_name)
+                    {
+                        return false;
+                    }
+                    let Ok(Statement::CreateVirtualTable(candidate_stmt)) =
+                        parse_single_statement(candidate_sql)
+                    else {
+                        return false;
+                    };
+                    if !candidate_stmt.module.eq_ignore_ascii_case("fts5") {
+                        return false;
+                    }
+                    match virtual_table_option_value(&candidate_stmt.args, "content") {
+                        Some(content_table) if content_table.is_empty() => true,
+                        Some(content_table) => schema
+                            .iter()
+                            .any(|candidate| candidate.name.eq_ignore_ascii_case(&content_table)),
+                        None => {
+                            let content_table_name = format!("{candidate_name}_content");
+                            schema.iter().any(|candidate| {
+                                candidate.name.eq_ignore_ascii_case(&content_table_name)
+                            })
+                        }
+                    }
+                },
+            );
             let table_key = table_name.to_ascii_uppercase();
             if preserve_existing_live_vtabs {
                 if let Some(instance) = self.vtab_instances.borrow_mut().remove(&table_key) {
@@ -61957,6 +63273,23 @@ impl Connection {
                 }
             };
             let module_key = create_stmt.module.to_ascii_uppercase();
+            if create_stmt.module.eq_ignore_ascii_case("fts5")
+                && has_reloadable_duplicate_fts5_schema_row
+                && virtual_table_option_value(&create_stmt.args, "content").is_none()
+            {
+                let content_table_name = format!("{table_name}_content");
+                if !schema
+                    .iter()
+                    .any(|candidate| candidate.name.eq_ignore_ascii_case(&content_table_name))
+                {
+                    tracing::debug!(
+                        table = %table_name,
+                        missing_shadow = %content_table_name,
+                        "skipping stale duplicate rootpage=0 FTS5 schema row during reload"
+                    );
+                    continue;
+                }
+            }
             let mut instance = {
                 let modules = self.vtab_modules.borrow();
                 let Some(factory) = modules.get(&module_key) else {
@@ -61979,16 +63312,19 @@ impl Connection {
 
             #[cfg(feature = "ext-fts5")]
             if let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>() {
-                if Self::fts5_table_is_lazy_capable(schema, table_name, &create_stmt.args)
-                    && self.read_fts5_lazy_has_segments(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        schema,
-                        table_name,
-                    )?
-                {
+                if Self::fts5_table_is_lazy_capable(
+                    schema,
+                    table_name,
+                    &create_stmt.args,
+                    self.allow_lazy_contentless_fts5,
+                ) && self.read_fts5_lazy_has_segments(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    schema,
+                    table_name,
+                )? {
                     let column_count = parse_virtual_table_column_infos(&create_stmt.args).len();
                     let doc_count = self.read_fts5_lazy_doc_count(
                         cx,
@@ -62593,9 +63929,40 @@ impl Connection {
                 SqliteValue::Text(s) => s.clone(),
                 _ => continue,
             };
-            new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
-
             let is_virtual_sql = is_virtual_table_sql(&create_sql);
+            let ddl_key = name.to_ascii_lowercase();
+            let implicit_content_shadow = format!("{name}_content");
+            let replacement_is_stale_implicit_fts5 = root_page_num == 0
+                && is_virtual_sql
+                && matches!(
+                    parse_single_statement(&create_sql),
+                    Ok(Statement::CreateVirtualTable(ref stmt))
+                        if stmt.module.eq_ignore_ascii_case("fts5")
+                            && virtual_table_option_value(&stmt.args, "content").is_none()
+                )
+                && !master_entries.iter().any(|candidate| {
+                    candidate.len() >= 2
+                        && matches!(
+                            &candidate[1],
+                            SqliteValue::Text(candidate_name)
+                                if candidate_name.eq_ignore_ascii_case(&implicit_content_shadow)
+                        )
+                });
+            let existing_is_reloadable_contentless_fts5 = new_original_ddl_sql
+                .get(&ddl_key)
+                .is_some_and(|existing_sql| {
+                    matches!(
+                        parse_single_statement(existing_sql),
+                        Ok(Statement::CreateVirtualTable(ref stmt))
+                            if stmt.module.eq_ignore_ascii_case("fts5")
+                                && virtual_table_option_value(&stmt.args, "content")
+                                    .is_some_and(|content| content.is_empty())
+                    )
+                });
+            if !(replacement_is_stale_implicit_fts5 && existing_is_reloadable_contentless_fts5) {
+                new_original_ddl_sql.insert(ddl_key, create_sql.to_string());
+            }
+
             if root_page_num == 0 && is_virtual_sql {
                 let shadowed_by_materialized =
                     materialized_virtual_tables.contains(&name.to_ascii_lowercase());
@@ -62679,7 +64046,11 @@ impl Connection {
                     for (i, col) in col_defs.iter().enumerate() {
                         for c in &col.constraints {
                             if let ColumnConstraintKind::ForeignKey(fk_clause) = &c.kind {
-                                fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                                fk_defs.push(fk_clause_to_def(
+                                    &[i],
+                                    Some(col.name.clone()),
+                                    fk_clause,
+                                ));
                             }
                         }
                     }
@@ -62699,7 +64070,7 @@ impl Connection {
                                 })
                                 .collect();
                             if !child_indices.is_empty() {
-                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                                fk_defs.push(fk_clause_to_def(&child_indices, None, clause));
                             }
                         }
                     }
@@ -62760,9 +64131,17 @@ impl Connection {
                     }
                 }
             }
+            if parsed_create_table.is_none() {
+                fk_defs =
+                    crate::compat_persist::extract_foreign_keys_from_sql(&create_sql, &columns);
+            }
 
             let check_defs = parsed_create_table.as_ref().map_or_else(
-                || crate::compat_persist::extract_check_constraints_from_sql(&create_sql),
+                || {
+                    crate::compat_persist::extract_check_constraints_with_owners_from_sql(
+                        &create_sql,
+                    )
+                },
                 crate::compat_persist::check_constraints_from_create_table_statement,
             );
 
@@ -67006,6 +68385,23 @@ where
                     part.push_str(" VIRTUAL");
                 }
             }
+            for check in table.check_constraints.iter().filter(|check| {
+                check
+                    .owner_column
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+            }) {
+                part.push_str(" CHECK(");
+                part.push_str(&check.expr);
+                part.push(')');
+            }
+            for fk in table.foreign_keys.iter().filter(|fk| {
+                fk.owner_column
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+            }) {
+                append_fk_reference_clause_sql(&mut part, fk);
+            }
             part
         })
         .collect();
@@ -67061,7 +68457,11 @@ where
     // Append table-level FOREIGN KEY constraints so they survive
     // round-tripping through sqlite_master.
     let mut fk_clauses = String::new();
-    for fk in &table.foreign_keys {
+    for fk in table
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.owner_column.is_none())
+    {
         use std::fmt::Write;
         let child_cols: Vec<&str> = fk
             .child_columns
@@ -67073,39 +68473,25 @@ where
         }
         write!(
             fk_clauses,
-            ", FOREIGN KEY({}) REFERENCES {}",
+            ", FOREIGN KEY({})",
             child_cols
                 .iter()
                 .map(|c| maybe_quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            maybe_quote_ident(&fk.parent_table),
         )
         .ok();
-        if !fk.parent_columns.is_empty() {
-            write!(
-                fk_clauses,
-                "({})",
-                fk.parent_columns
-                    .iter()
-                    .map(|c| maybe_quote_ident(c))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-            .ok();
-        }
-        if fk.on_delete != FkActionType::NoAction {
-            write!(fk_clauses, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
-        }
-        if fk.on_update != FkActionType::NoAction {
-            write!(fk_clauses, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
-        }
+        append_fk_reference_clause_sql(&mut fk_clauses, fk);
     }
     // Append table-level CHECK constraints.
     let mut check_clauses = String::new();
-    for check_expr in &table.check_constraints {
+    for check in table
+        .check_constraints
+        .iter()
+        .filter(|check| check.owner_column.is_none())
+    {
         use std::fmt::Write;
-        write!(check_clauses, ", CHECK({check_expr})").ok();
+        write!(check_clauses, ", CHECK({})", check.expr).ok();
     }
     let mut table_options = Vec::new();
     if table.without_rowid {
@@ -67132,6 +68518,33 @@ fn fk_action_sql(action: FkActionType) -> &'static str {
         FkActionType::SetNull => "SET NULL",
         FkActionType::SetDefault => "SET DEFAULT",
         FkActionType::Cascade => "CASCADE",
+    }
+}
+
+fn append_fk_reference_clause_sql(sql: &mut String, fk: &FkDef) {
+    use std::fmt::Write;
+
+    write!(sql, " REFERENCES {}", maybe_quote_ident(&fk.parent_table)).ok();
+    if !fk.parent_columns.is_empty() {
+        write!(
+            sql,
+            "({})",
+            fk.parent_columns
+                .iter()
+                .map(|column| maybe_quote_ident(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .ok();
+    }
+    if fk.on_delete != FkActionType::NoAction {
+        write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
+    }
+    if fk.on_update != FkActionType::NoAction {
+        write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
     }
 }
 
@@ -72160,6 +73573,20 @@ fn expand_row_value_comparison(a: &[Expr], b: &[Expr], op: BinaryOp, span: Span)
             .zip(b)
             .map(|(l, r)| cmp(l, r, BinaryOp::Ne))
             .reduce(join(BinaryOp::Or)),
+        // (a,b) IS (c,d)  ->  a IS c AND b IS d  (NULL-safe, componentwise).
+        // Also covers `IS NOT DISTINCT FROM`, which parses to IS. (GH #170, #243)
+        BinaryOp::Is => a
+            .iter()
+            .zip(b)
+            .map(|(l, r)| cmp(l, r, BinaryOp::Is))
+            .reduce(join(BinaryOp::And)),
+        // (a,b) IS NOT (c,d)  ->  a IS NOT c OR b IS NOT d. Also covers
+        // `IS DISTINCT FROM`, which parses to IS NOT. (GH #170, #243)
+        BinaryOp::IsNot => a
+            .iter()
+            .zip(b)
+            .map(|(l, r)| cmp(l, r, BinaryOp::IsNot))
+            .reduce(join(BinaryOp::Or)),
         // Lexicographic: a0 STRICT b0 OR (a0 = b0 AND <rest>), last element uses
         // the original (possibly non-strict) operator.
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
@@ -72249,13 +73676,43 @@ fn rewrite_row_value_comparisons(expr: &Expr) -> Expr {
             high,
             not,
             span,
-        } => Expr::Between {
-            expr: Box::new(rewrite_row_value_comparisons(e)),
-            low: Box::new(rewrite_row_value_comparisons(low)),
-            high: Box::new(rewrite_row_value_comparisons(high)),
-            not: *not,
-            span: *span,
-        },
+        } => {
+            let e2 = rewrite_row_value_comparisons(e);
+            let low2 = rewrite_row_value_comparisons(low);
+            let high2 = rewrite_row_value_comparisons(high);
+            // Row-value BETWEEN expands to (e >= low) AND (e <= high); row-value
+            // NOT BETWEEN to (e < low) OR (e > high) — each side compared
+            // lexicographically via the row-value comparison expansion. (GH #171)
+            if let (Expr::RowValue(ea, _), Expr::RowValue(la, _), Expr::RowValue(ha, _)) =
+                (&e2, &low2, &high2)
+            {
+                if !ea.is_empty() && ea.len() == la.len() && ea.len() == ha.len() {
+                    let (lo_op, hi_op, combine) = if *not {
+                        (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
+                    } else {
+                        (BinaryOp::Ge, BinaryOp::Le, BinaryOp::And)
+                    };
+                    if let (Some(lo_cmp), Some(hi_cmp)) = (
+                        expand_row_value_comparison(ea, la, lo_op, *span),
+                        expand_row_value_comparison(ea, ha, hi_op, *span),
+                    ) {
+                        return Expr::BinaryOp {
+                            left: Box::new(lo_cmp),
+                            op: combine,
+                            right: Box::new(hi_cmp),
+                            span: *span,
+                        };
+                    }
+                }
+            }
+            Expr::Between {
+                expr: Box::new(e2),
+                low: Box::new(low2),
+                high: Box::new(high2),
+                not: *not,
+                span: *span,
+            }
+        }
         Expr::In {
             expr: e,
             set,
@@ -73308,6 +74765,48 @@ fn expr_may_observe_change_tracking(expr: &Expr) -> bool {
     }
 }
 
+/// Compare two evaluated in-aggregate `ORDER BY` key tuples, honoring each
+/// term's direction (`ASC`/`DESC`) and NULLS placement. Used by the interpreted
+/// `json_group_array`/`json_group_object` aggregates. (GH #266, #267)
+#[cfg(feature = "ext-json")]
+fn cmp_in_aggregate_order_keys(
+    order_by: &[OrderingTerm],
+    a: &[SqliteValue],
+    b: &[SqliteValue],
+) -> std::cmp::Ordering {
+    for (i, term) in order_by.iter().enumerate() {
+        let av = &a[i];
+        let bv = &b[i];
+        let ord = if av.is_null() || bv.is_null() {
+            if av.is_null() && bv.is_null() {
+                std::cmp::Ordering::Equal
+            } else {
+                let nulls = term
+                    .nulls
+                    .unwrap_or_else(|| default_nulls_order(term.direction));
+                match (av.is_null(), nulls) {
+                    (true, NullsOrder::First) | (false, NullsOrder::Last) => {
+                        std::cmp::Ordering::Less
+                    }
+                    (true, NullsOrder::Last) | (false, NullsOrder::First) => {
+                        std::cmp::Ordering::Greater
+                    }
+                }
+            }
+        } else {
+            let mut o = cmp_sqlite_values(av, bv);
+            if term.direction == Some(SortDirection::Desc) {
+                o = o.reverse();
+            }
+            o
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// Evaluate an expression that may contain aggregate function calls against
 /// a group of rows. Aggregate sub-expressions are computed over the full
 /// group; the remaining scalar parts are evaluated against the first row.
@@ -73321,7 +74820,12 @@ fn eval_group_agg_join_expr(
         // json_group_array; two-argument key/value pairs for json_group_object).
         #[cfg(feature = "ext-json")]
         Expr::FunctionCall {
-            name, args, filter, ..
+            name,
+            args,
+            filter,
+            order_by,
+            distinct,
+            ..
         } if is_builtin_json_aggregate(name) => {
             let exprs = match args {
                 FunctionArgs::List(e) => e.as_slice(),
@@ -73338,13 +74842,39 @@ fn eval_group_agg_join_expr(
                 let arg = exprs.first().ok_or_else(|| {
                     FrankenError::function_error("json_group_array() requires 1 argument")
                 })?;
-                let mut vals = Vec::new();
+                // Collect (value, ORDER BY keys) for each row that passes FILTER.
+                let mut items: Vec<(SqliteValue, Vec<SqliteValue>)> = Vec::new();
                 for row in group_rows {
                     if passes_filter(row) {
                         // NULLs are preserved (rendered as JSON null).
-                        vals.push(eval_join_expr(arg, row, col_map)?);
+                        let value = eval_join_expr(arg, row, col_map)?;
+                        let mut keys = Vec::with_capacity(order_by.len());
+                        for term in order_by {
+                            keys.push(eval_join_expr(&term.expr, row, col_map)?);
+                        }
+                        items.push((value, keys));
                     }
                 }
+                // DISTINCT removes duplicate values (first occurrence wins). (GH #268)
+                if *distinct {
+                    let mut seen: Vec<SqliteValue> = Vec::new();
+                    items.retain(|(v, _)| {
+                        if seen
+                            .iter()
+                            .any(|s| cmp_sqlite_values(s, v) == std::cmp::Ordering::Equal)
+                        {
+                            false
+                        } else {
+                            seen.push(v.clone());
+                            true
+                        }
+                    });
+                }
+                // In-aggregate ORDER BY sorts the collected values. (GH #266)
+                if !order_by.is_empty() {
+                    items.sort_by(|(_, ak), (_, bk)| cmp_in_aggregate_order_keys(order_by, ak, bk));
+                }
+                let vals: Vec<SqliteValue> = items.into_iter().map(|(v, _)| v).collect();
                 Ok(SqliteValue::Text(
                     fsqlite_ext_json::json_group_array(&vals)?.into(),
                 ))
@@ -73355,14 +74885,24 @@ fn eval_group_agg_join_expr(
                         "json_group_object() requires 2 arguments",
                     ));
                 }
-                let mut pairs = Vec::new();
+                let mut items: Vec<((SqliteValue, SqliteValue), Vec<SqliteValue>)> = Vec::new();
                 for row in group_rows {
                     if passes_filter(row) {
                         let key = eval_join_expr(&exprs[0], row, col_map)?;
                         let value = eval_join_expr(&exprs[1], row, col_map)?;
-                        pairs.push((key, value));
+                        let mut keys = Vec::with_capacity(order_by.len());
+                        for term in order_by {
+                            keys.push(eval_join_expr(&term.expr, row, col_map)?);
+                        }
+                        items.push(((key, value), keys));
                     }
                 }
+                // In-aggregate ORDER BY sorts the key/value pairs. (GH #267)
+                if !order_by.is_empty() {
+                    items.sort_by(|(_, ak), (_, bk)| cmp_in_aggregate_order_keys(order_by, ak, bk));
+                }
+                let pairs: Vec<(SqliteValue, SqliteValue)> =
+                    items.into_iter().map(|(kv, _)| kv).collect();
                 Ok(SqliteValue::Text(
                     fsqlite_ext_json::json_group_object(&pairs)?.into(),
                 ))
@@ -75495,6 +77035,19 @@ fn rename_column_refs_in_stored_expr_sql(
         *expr_sql = renamed;
     }
     Ok(())
+}
+
+fn stored_expr_references_column(expr_sql: &str, column_name: &str) -> Result<bool> {
+    let expr = fsqlite_parser::expr::parse_expr(expr_sql).map_err(|err| {
+        FrankenError::Internal(format!(
+            "failed to parse schema expression `{expr_sql}` during column drop: {err}"
+        ))
+    })?;
+    let mut column_refs = Vec::new();
+    collect_expr_column_refs(&expr, &mut column_refs);
+    Ok(column_refs
+        .iter()
+        .any(|referenced| referenced.eq_ignore_ascii_case(column_name)))
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -79193,10 +80746,36 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 }
             }
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
             if let FunctionArgs::List(items) = args {
                 for e in items {
                     collect_expr_column_refs(e, out);
+                }
+            }
+            for term in order_by {
+                collect_expr_column_refs(&term.expr, out);
+            }
+            if let Some(filter_expr) = filter {
+                collect_expr_column_refs(filter_expr, out);
+            }
+            if let Some(window) = over {
+                for partition_expr in &window.partition_by {
+                    collect_expr_column_refs(partition_expr, out);
+                }
+                for term in &window.order_by {
+                    collect_expr_column_refs(&term.expr, out);
+                }
+                if let Some(frame) = &window.frame {
+                    collect_frame_bound_column_refs(&frame.start, out);
+                    if let Some(end) = &frame.end {
+                        collect_frame_bound_column_refs(end, out);
+                    }
                 }
             }
         }
@@ -79229,8 +80808,28 @@ fn collect_expr_column_refs<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
                 collect_expr_column_refs(esc, out);
             }
         }
+        Expr::JsonAccess { expr, path, .. } => {
+            collect_expr_column_refs(expr, out);
+            collect_expr_column_refs(path, out);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                collect_expr_column_refs(value, out);
+            }
+        }
         // Literals, placeholders, subqueries, etc. have no column refs.
         _ => {}
+    }
+}
+
+fn collect_frame_bound_column_refs<'a>(bound: &'a FrameBound, out: &mut Vec<&'a str>) {
+    match bound {
+        FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
+            collect_expr_column_refs(expr, out);
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => {}
     }
 }
 
@@ -82220,19 +83819,31 @@ fn resolve_named_order_term_idx(
     order_table: Option<&str>,
     columns: &[ResultColumn],
 ) -> Option<usize> {
+    // SQLite resolves an unqualified output alias before consulting source
+    // column names, even when the alias appears later in the result list.
+    if order_table.is_none() {
+        if let Some(index) = columns.iter().position(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr {
+                    alias: Some(alias),
+                    ..
+                } if alias.eq_ignore_ascii_case(col_name)
+            )
+        }) {
+            return Some(index);
+        }
+    }
+
     columns.iter().position(|column| match column {
-        ResultColumn::Expr {
-            expr: Expr::Column(result_col_ref, _),
-            alias,
-            ..
-        } => {
-            if order_table.is_none()
-                && alias
-                    .as_deref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(col_name))
-            {
-                return true;
-            }
+        ResultColumn::Expr { expr, .. } => {
+            let result_expr = match expr {
+                Expr::Collate { expr, .. } => expr.as_ref(),
+                _ => expr,
+            };
+            let Expr::Column(result_col_ref, _) = result_expr else {
+                return false;
+            };
             if !result_col_ref.column.eq_ignore_ascii_case(col_name) {
                 return false;
             }
@@ -82243,24 +83854,28 @@ fn resolve_named_order_term_idx(
                     .is_some_and(|result_table| result_table.eq_ignore_ascii_case(table))
             })
         }
-        ResultColumn::Expr {
-            alias: Some(alias), ..
-        } => order_table.is_none() && alias.eq_ignore_ascii_case(col_name),
-        _ => false,
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
     })
 }
 
 /// Try to resolve an ORDER BY expression to a column index in `columns`.
 /// Returns `None` if the expression doesn't match any column.
 fn resolve_order_term_idx(expr: &Expr, columns: &[ResultColumn]) -> Option<usize> {
-    if let Expr::Literal(Literal::Integer(n), _) = expr {
+    // A compound ORDER BY may wrap an output name, alias, or 1-based position
+    // in COLLATE. Resolve those SQLite-defined output references against the
+    // inner expression first; the caller still applies the outer collation
+    // while sorting.
+    let base_expr = match expr {
+        Expr::Collate { expr, .. } => expr.as_ref(),
+        _ => expr,
+    };
+
+    if let Expr::Literal(Literal::Integer(n), _) = base_expr {
         let pos = usize::try_from(*n).unwrap_or(0);
-        if pos >= 1 && pos <= columns.len() {
-            return Some(pos - 1);
-        }
+        return (pos >= 1 && pos <= columns.len()).then_some(pos - 1);
     }
-    if let Some(col_name) = expr_col_name(expr) {
-        let order_table = if let Expr::Column(col_ref, _) = expr {
+    if let Some(col_name) = expr_col_name(base_expr) {
+        let order_table = if let Expr::Column(col_ref, _) = base_expr {
             col_ref.table.as_deref()
         } else {
             None
@@ -82269,8 +83884,22 @@ fn resolve_order_term_idx(expr: &Expr, columns: &[ResultColumn]) -> Option<usize
             return Some(found);
         }
     }
+
+    // After ordinal and output-name/alias precedence, preserve an exact
+    // selected expression before falling back to the unwrapped expression.
+    // This matters for non-column COLLATE expressions while preventing a
+    // selected integer literal from stealing `ORDER BY 1`.
+    if let Some(index) = columns.iter().position(|column| match column {
+        ResultColumn::Expr {
+            expr: output_expr, ..
+        } => exprs_match(expr, output_expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }) {
+        return Some(index);
+    }
+
     columns.iter().position(|c| match c {
-        ResultColumn::Expr { expr: e, .. } => exprs_match(expr, e),
+        ResultColumn::Expr { expr: e, .. } => exprs_match(base_expr, e),
         _ => false,
     })
 }
@@ -82288,29 +83917,7 @@ fn sort_rows_by_order_terms(
     let resolved: Vec<(usize, bool, NullsOrder, Option<String>)> = order_by
         .iter()
         .map(|term| {
-            // Try integer position reference first (ORDER BY 1, 2).
-            let idx = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
-                let pos = usize::try_from(*n).unwrap_or(0);
-                if pos >= 1 && pos <= columns.len() {
-                    Some(pos - 1)
-                } else {
-                    None
-                }
-            } else if let Some(col_name) = expr_col_name(&term.expr) {
-                let order_table = if let Expr::Column(col_ref, _) = &term.expr {
-                    col_ref.table.as_deref()
-                } else {
-                    None
-                };
-                resolve_named_order_term_idx(col_name, order_table, columns)
-            } else {
-                // Expression ORDER BY: match structurally against result columns.
-                columns.iter().position(|c| match c {
-                    ResultColumn::Expr { expr, .. } => exprs_match(&term.expr, expr),
-                    _ => false,
-                })
-            };
-            let idx = idx.ok_or_else(|| {
+            let idx = resolve_order_term_idx(&term.expr, columns).ok_or_else(|| {
                 FrankenError::Internal("ORDER BY expression not found in SELECT list".to_owned())
             })?;
             let desc = matches!(term.direction, Some(SortDirection::Desc));
@@ -82363,7 +83970,11 @@ fn sort_rows_by_order_terms(
 }
 
 /// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
-fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
+fn fk_clause_to_def(
+    child_indices: &[usize],
+    owner_column: Option<String>,
+    clause: &fsqlite_ast::ForeignKeyClause,
+) -> FkDef {
     let mut on_delete = FkActionType::NoAction;
     let mut on_update = FkActionType::NoAction;
     for action in &clause.actions {
@@ -82381,6 +83992,7 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
     }
     FkDef {
         child_columns: child_indices.to_vec(),
+        owner_column,
         parent_table: clause.table.clone(),
         parent_columns: clause.columns.clone(),
         on_delete,
@@ -85092,46 +86704,25 @@ fn fts5_shadow_table_defs(
                 quote_identifier(&data_name)
             ),
             name: data_name,
-            columns: vec![
-                ColumnInfo::basic("id", 'D', true),
-                ColumnInfo::basic("block", 'A', false),
-            ],
         },
         Fts5ShadowTableDef {
             create_sql: format!(
-                "CREATE TABLE {}(segid INTEGER, term BLOB, pgno INTEGER)",
+                "CREATE TABLE {}(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
                 quote_identifier(&idx_name)
             ),
             name: idx_name,
-            columns: vec![
-                ColumnInfo::basic("segid", 'D', false),
-                ColumnInfo::basic("term", 'A', false),
-                ColumnInfo::basic("pgno", 'D', false),
-            ],
         },
         Fts5ShadowTableDef {
             create_sql: format!(
-                "CREATE TABLE {}(k TEXT PRIMARY KEY, v)",
+                "CREATE TABLE {}(k PRIMARY KEY, v) WITHOUT ROWID",
                 quote_identifier(&config_name)
             ),
             name: config_name,
-            columns: vec![
-                ColumnInfo::basic("k", 'B', false),
-                ColumnInfo::basic("v", 'C', false),
-            ],
         },
     ];
 
     if virtual_table_option_value(args, "content").is_none() {
         let content_name = format!("{table_name}_content");
-        let mut columns = Vec::with_capacity(fts_columns.len() + 1);
-        columns.push(ColumnInfo::basic("id", 'D', true));
-        columns.extend(
-            fts_columns
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| ColumnInfo::basic(format!("c{idx}"), 'B', false)),
-        );
         let content_columns = (0..fts_columns.len())
             .map(|idx| format!("c{idx}"))
             .collect::<Vec<_>>()
@@ -85150,7 +86741,6 @@ fn fts5_shadow_table_defs(
         defs.push(Fts5ShadowTableDef {
             create_sql,
             name: content_name,
-            columns,
         });
     }
 
@@ -85159,16 +86749,21 @@ fn fts5_shadow_table_defs(
         Some("0")
     ) {
         let docsize_name = format!("{table_name}_docsize");
+        let contentless_delete = matches!(
+            virtual_table_option_value(args, "contentless_delete").as_deref(),
+            Some("1")
+        );
+        let columns = if contentless_delete {
+            "id INTEGER PRIMARY KEY, sz BLOB, origin INTEGER"
+        } else {
+            "id INTEGER PRIMARY KEY, sz BLOB"
+        };
         defs.push(Fts5ShadowTableDef {
             create_sql: format!(
-                "CREATE TABLE {}(id INTEGER PRIMARY KEY, sz BLOB)",
+                "CREATE TABLE {}({columns})",
                 quote_identifier(&docsize_name)
             ),
             name: docsize_name,
-            columns: vec![
-                ColumnInfo::basic("id", 'D', true),
-                ColumnInfo::basic("sz", 'A', false),
-            ],
         });
     }
 
@@ -88196,7 +89791,6 @@ struct LiveVtabInsertRow {
 #[derive(Debug, Clone)]
 struct Fts5ShadowTableDef {
     name: String,
-    columns: Vec<ColumnInfo>,
     create_sql: String,
 }
 
@@ -96597,18 +98191,23 @@ mod tests {
             )
             .unwrap();
 
-        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+        let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
+        let fallback_scans_before = FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(std::cell::Cell::get);
         let rows = statement.query().unwrap();
 
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(4)]);
-        assert_eq!(
-            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get()),
-            8,
-            "two WHERE column references across four joined rows must use direct bindings"
+        let binding_hits = FSQLITE_JOIN_EXPR_BINDING_HITS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(binding_hits_before);
+        assert!(
+            binding_hits >= 8,
+            "two WHERE column references across four joined rows must use direct bindings \
+             (observed {binding_hits})"
         );
         assert_eq!(
-            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS
+                .with(std::cell::Cell::get)
+                .wrapping_sub(fallback_scans_before),
             0,
             "WHERE evaluation must not linearly rescan the column map"
         );
@@ -96629,18 +98228,23 @@ mod tests {
             .prepare("SELECT l.payload, r.payload FROM l JOIN r ON r.id = l.id")
             .unwrap();
 
-        FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.set(0));
-        FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.set(0));
+        let binding_hits_before = FSQLITE_JOIN_EXPR_BINDING_HITS.with(std::cell::Cell::get);
+        let fallback_scans_before = FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(std::cell::Cell::get);
         let rows = statement.query().unwrap();
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            FSQLITE_JOIN_EXPR_BINDING_HITS.with(|counter| counter.get()),
-            6,
-            "two projected columns across three result rows must use direct bindings"
+        let binding_hits = FSQLITE_JOIN_EXPR_BINDING_HITS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(binding_hits_before);
+        assert!(
+            binding_hits >= 6,
+            "two projected columns across three result rows must use direct bindings \
+             (observed {binding_hits})"
         );
         assert_eq!(
-            FSQLITE_JOIN_EXPR_FALLBACK_SCANS.with(|counter| counter.get()),
+            FSQLITE_JOIN_EXPR_FALLBACK_SCANS
+                .with(std::cell::Cell::get)
+                .wrapping_sub(fallback_scans_before),
             0,
             "projection evaluation must not linearly rescan the column map"
         );
@@ -101224,31 +102828,42 @@ mod tests {
             stmt.prepared_query_fast_path
         );
 
-        super::reset_hot_path_profile();
-        let row = stmt.query_row().unwrap();
-        assert_eq!(row.get(0), Some(&SqliteValue::Integer(3)));
+        let assert_fast_count = |expected: i64, state: &str| {
+            super::reset_hot_path_profile();
+            let row = stmt.query_row().unwrap();
+            let profile = super::hot_path_profile_snapshot();
+
+            assert_eq!(
+                row.get(0),
+                Some(&SqliteValue::Integer(expected)),
+                "unexpected count for {state}"
+            );
+            assert_eq!(
+                profile.direct_count_indexed_rowid_probe_query_row_hits, 1,
+                "indexed rowid-probe fast path must serve exactly one query for {state}: {profile:?}"
+            );
+            assert_eq!(
+                profile.parser.fast_path_executions, 1,
+                "exactly one fast-path execution is expected for {state}: {profile:?}"
+            );
+            assert_eq!(
+                profile.parser.slow_path_executions, 0,
+                "query unexpectedly fell back to the slow path for {state}: {profile:?}"
+            );
+            assert_eq!(profile.direct_count_star_query_row_hits, 0);
+            assert_eq!(profile.direct_rowid_lookup_query_row_hits, 0);
+            assert_eq!(profile.direct_count_star_rowid_range_query_row_hits, 0);
+        };
+
+        assert_fast_count(3, "the initial fixture");
 
         conn.execute("INSERT INTO products VALUES (7, 2, 'p7');")
             .unwrap();
-        let row = stmt.query_row().unwrap();
-        assert_eq!(row.get(0), Some(&SqliteValue::Integer(4)));
+        assert_fast_count(4, "the product mutation");
 
         conn.execute("INSERT INTO categories VALUES (6, 'zeta');")
             .unwrap();
-        let row = stmt.query_row().unwrap();
-        assert_eq!(row.get(0), Some(&SqliteValue::Integer(4)));
-
-        let profile = super::hot_path_profile_snapshot();
-        assert_eq!(profile.direct_count_indexed_rowid_probe_query_row_hits, 3);
-        assert!(
-            profile.parser.fast_path_executions
-                >= profile.direct_count_indexed_rowid_probe_query_row_hits,
-            "aggregate fast-path counter also includes DML fast paths in this test: {profile:?}"
-        );
-        assert_eq!(profile.parser.slow_path_executions, 0);
-        assert_eq!(profile.direct_count_star_query_row_hits, 0);
-        assert_eq!(profile.direct_rowid_lookup_query_row_hits, 0);
-        assert_eq!(profile.direct_count_star_rowid_range_query_row_hits, 0);
+        assert_fast_count(4, "the non-matching category mutation");
     }
 
     fn populate_benchmark_subquery_fixture(conn: &Connection, count: usize) {
@@ -105985,6 +107600,1073 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_drop_column_file_backed_rowid_and_without_rowid_match_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-storage-layouts.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "
+            CREATE TABLE rowid_table (id INTEGER PRIMARY KEY, removed TEXT, kept INTEGER);
+            INSERT INTO rowid_table VALUES (1, 'discard', 11), (2, 'gone', 22);
+            CREATE TABLE wr_table (key INTEGER, removed TEXT, kept INTEGER,
+                                   PRIMARY KEY(key)) WITHOUT ROWID;
+            CREATE INDEX wr_kept ON wr_table(kept);
+            INSERT INTO wr_table VALUES (1, 'discard', 101), (2, 'gone', 202);
+        ";
+        conn.execute_batch(setup).unwrap();
+        oracle.execute_batch(setup).unwrap();
+
+        drop(conn);
+        let sqlite_pre_alter = rusqlite::Connection::open(&db_path).unwrap();
+        let pre_alter_integrity: String = sqlite_pre_alter
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pre_alter_integrity, "ok");
+        drop(sqlite_pre_alter);
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        for alter in [
+            "ALTER TABLE rowid_table DROP COLUMN removed;",
+            "ALTER TABLE wr_table DROP COLUMN removed;",
+        ] {
+            conn.execute(alter).unwrap();
+            oracle.execute_batch(alter).unwrap();
+        }
+
+        let expected_rowid = oracle
+            .prepare("SELECT id, kept FROM rowid_table ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let expected_wr = oracle
+            .prepare("SELECT key, kept FROM wr_table ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let actual_rowid = conn
+            .query("SELECT id, kept FROM rowid_table ORDER BY id;")
+            .unwrap()
+            .iter()
+            .map(|row| (row.values()[0].to_integer(), row.values()[1].to_integer()))
+            .collect::<Vec<_>>();
+        let actual_wr = conn
+            .query("SELECT key, kept FROM wr_table ORDER BY key;")
+            .unwrap()
+            .iter()
+            .map(|row| (row.values()[0].to_integer(), row.values()[1].to_integer()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_rowid, expected_rowid);
+        assert_eq!(actual_wr, expected_wr);
+        drop(conn);
+
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = reopened
+            .query("SELECT key, kept FROM wr_table ORDER BY key;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[SqliteValue::Integer(2), SqliteValue::Integer(202)]
+        );
+        drop(reopened);
+
+        let sqlite_reopen = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite_reopen
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            sqlite_reopen
+                .query_row("SELECT id, kept FROM rowid_table WHERE id = 2", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (2, 22)
+        );
+        assert_eq!(
+            sqlite_reopen
+                .query_row("SELECT key, kept FROM wr_table WHERE key = 2", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (2, 202)
+        );
+    }
+
+    #[test]
+    fn test_alter_drop_column_rejects_semantic_view_and_trigger_dependencies_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-view-trigger-dependencies.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (kept TEXT, removed TEXT);
+                 INSERT INTO t VALUES ('still-here', 'dependency');
+                 CREATE TABLE audit (value TEXT);
+                 CREATE VIEW t_star AS SELECT * FROM t;
+                 CREATE VIEW dependent_view AS SELECT removed FROM t_star;",
+            )
+            .unwrap();
+
+            let view_error = conn
+                .execute("ALTER TABLE t DROP COLUMN removed;")
+                .unwrap_err();
+            assert_eq!(
+                view_error.to_string(),
+                "error in view dependent_view after drop column: no such column: removed"
+            );
+            assert_eq!(
+                row_values(&conn.query("SELECT kept, removed FROM t;").unwrap()[0]),
+                &[
+                    SqliteValue::Text("still-here".into()),
+                    SqliteValue::Text("dependency".into()),
+                ],
+                "view dependency rejection must precede schema and row mutation"
+            );
+
+            conn.execute("DROP VIEW dependent_view;").unwrap();
+            conn.execute(
+                "CREATE TRIGGER dependent_body AFTER UPDATE ON t BEGIN
+                     INSERT INTO audit SELECT removed FROM t_star;
+                 END;",
+            )
+            .unwrap();
+            let body_error = conn
+                .execute("ALTER TABLE t DROP COLUMN removed;")
+                .unwrap_err();
+            assert_eq!(
+                body_error.to_string(),
+                "error in trigger dependent_body after drop column: no such column: removed"
+            );
+
+            conn.execute("DROP TRIGGER dependent_body;").unwrap();
+            conn.execute(
+                "CREATE TRIGGER dependent_when AFTER UPDATE ON t
+                 WHEN NEW.removed IS NOT NULL BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+            let when_error = conn
+                .execute("ALTER TABLE t DROP COLUMN removed;")
+                .unwrap_err();
+            assert_eq!(
+                when_error.to_string(),
+                "error in trigger dependent_when after drop column: no such column: removed"
+            );
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let columns = sqlite
+            .prepare("SELECT name FROM pragma_table_info('t') ORDER BY cid;")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(columns, vec!["kept".to_owned(), "removed".to_owned()]);
+    }
+
+    #[test]
+    fn test_alter_drop_column_preserves_star_view_event_only_trigger_and_literals_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-legal-view-trigger.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (kept TEXT, removed TEXT);
+                 INSERT INTO t VALUES ('survivor', 'discard');
+                 CREATE TABLE audit (value TEXT);
+                 CREATE VIEW t_star AS SELECT * FROM t;
+                 CREATE VIEW literal_view AS SELECT 'removed' AS text FROM t;
+                 CREATE TRIGGER event_only AFTER UPDATE OF removed ON t BEGIN
+                     INSERT INTO audit VALUES (NEW.kept);
+                     SELECT 'removed';
+                 END;
+                 ALTER TABLE t DROP COLUMN removed;",
+            )
+            .unwrap();
+        }
+
+        let reopened = Connection::open(&db_str).unwrap();
+        let rows = reopened.query("SELECT kept FROM t_star;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[SqliteValue::Text("survivor".into())]
+        );
+        let literal_rows = reopened.query("SELECT text FROM literal_view;").unwrap();
+        assert_eq!(
+            row_values(&literal_rows[0]),
+            &[SqliteValue::Text("removed".into())]
+        );
+        drop(reopened);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let columns = sqlite
+            .prepare("SELECT name FROM pragma_table_info('t') ORDER BY cid;")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(columns, vec!["kept".to_owned()]);
+        let trigger_sql: String = sqlite
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='event_only';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains("UPDATE OF removed"), "{trigger_sql}");
+        let view_row: String = sqlite
+            .query_row("SELECT kept FROM t_star;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(view_row, "survivor");
+    }
+
+    #[test]
+    fn test_alter_drop_column_temp_success_and_validation_rollback_match_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-temp-routing.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "
+            CREATE TABLE sentinel (id INTEGER PRIMARY KEY, payload TEXT);
+            INSERT INTO sentinel VALUES (1, 'main-unchanged');
+            CREATE TEMP TABLE temp_ok (id INTEGER, removed TEXT, kept INTEGER UNIQUE);
+            INSERT INTO temp_ok VALUES (1, 'discard', 10), (2, 'gone', 20);
+            CREATE TEMP TABLE temp_rollback (
+                id INTEGER, guarded INTEGER, kept INTEGER, CHECK(guarded > 0)
+            );
+            INSERT INTO temp_rollback VALUES (3, 7, 30);
+        ";
+        conn.execute_batch(setup).unwrap();
+        oracle.execute_batch(setup).unwrap();
+
+        let main_schema_cookie_before_temp_alter = conn.schema_cookie();
+        conn.execute("ALTER TABLE temp_ok DROP COLUMN removed;")
+            .unwrap();
+        oracle
+            .execute_batch("ALTER TABLE temp_ok DROP COLUMN removed;")
+            .unwrap();
+        assert_eq!(
+            conn.query("SELECT id, kept FROM temp_ok ORDER BY id;")
+                .unwrap()
+                .iter()
+                .map(|row| (row.values()[0].to_integer(), row.values()[1].to_integer()))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (2, 20)]
+        );
+        assert_eq!(
+            conn.schema_cookie(),
+            main_schema_cookie_before_temp_alter,
+            "TEMP ALTER must not write the main database schema cookie"
+        );
+        assert!(
+            conn.execute("INSERT INTO temp_ok VALUES (3, 20);").is_err(),
+            "TEMP UNIQUE metadata after the dropped slot must stay aligned"
+        );
+        assert!(
+            oracle
+                .execute_batch("INSERT INTO temp_ok VALUES (3, 20);")
+                .is_err()
+        );
+
+        assert!(
+            conn.execute("ALTER TABLE temp_rollback DROP COLUMN guarded;")
+                .is_err()
+        );
+        assert!(
+            oracle
+                .execute_batch("ALTER TABLE temp_rollback DROP COLUMN guarded;")
+                .is_err()
+        );
+        let rows = conn
+            .query("SELECT id, guarded, kept FROM temp_rollback;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(30),
+            ]
+        );
+        let oracle_row = oracle
+            .query_row("SELECT id, guarded, kept FROM temp_rollback", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(oracle_row, (3, 7, 30));
+        drop(conn);
+
+        let sqlite_reopen = rusqlite::Connection::open(&db_path).unwrap();
+        let sentinel: String = sqlite_reopen
+            .query_row("SELECT payload FROM sentinel WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sentinel, "main-unchanged");
+        let integrity: String = sqlite_reopen
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_alter_drop_column_qualified_main_preserves_temp_shadow() {
+        let conn = Connection::open(":memory:").unwrap();
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        let setup = "
+            CREATE TABLE shadowed (id INTEGER PRIMARY KEY, removed TEXT, kept INTEGER);
+            INSERT INTO shadowed VALUES (1, 'main-removed', 10);
+            CREATE TEMP TABLE shadowed (id INTEGER PRIMARY KEY, removed TEXT, kept INTEGER);
+            INSERT INTO temp.shadowed VALUES (2, 'temp-kept', 20);
+        ";
+        conn.execute_batch(setup).unwrap();
+        oracle.execute_batch(setup).unwrap();
+
+        conn.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            conn.execute("ALTER TABLE main.shadowed DROP COLUMN removed;")
+                .is_err()
+        );
+        assert_eq!(
+            row_values(
+                &conn
+                    .query("SELECT id, removed, kept FROM main.shadowed;")
+                    .unwrap()[0]
+            ),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("main-removed".into()),
+                SqliteValue::Integer(10),
+            ]
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("ALTER TABLE main.shadowed DROP COLUMN removed;")
+            .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+        assert_eq!(
+            row_values(
+                &conn
+                    .query("SELECT id, removed, kept FROM main.shadowed;")
+                    .unwrap()[0]
+            ),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("main-removed".into()),
+                SqliteValue::Integer(10),
+            ],
+            "transaction rollback must restore the parked main schema"
+        );
+        assert_eq!(
+            row_values(
+                &conn
+                    .query("SELECT id, removed, kept FROM temp.shadowed;")
+                    .unwrap()[0]
+            ),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("temp-kept".into()),
+                SqliteValue::Integer(20),
+            ]
+        );
+
+        conn.execute("ALTER TABLE main.shadowed DROP COLUMN removed;")
+            .unwrap();
+        oracle
+            .execute_batch("ALTER TABLE main.shadowed DROP COLUMN removed;")
+            .unwrap();
+
+        let temp_rows = conn
+            .query("SELECT id, removed, kept FROM temp.shadowed;")
+            .unwrap();
+        assert_eq!(
+            row_values(&temp_rows[0]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("temp-kept".into()),
+                SqliteValue::Integer(20),
+            ]
+        );
+        let main_rows = conn.query("SELECT id, kept FROM main.shadowed;").unwrap();
+        assert_eq!(
+            row_values(&main_rows[0]),
+            &[SqliteValue::Integer(1), SqliteValue::Integer(10)]
+        );
+        assert_eq!(
+            oracle
+                .query_row("SELECT id, kept FROM main.shadowed", [], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap(),
+            (1, 10)
+        );
+    }
+
+    #[test]
+    fn test_alter_drop_column_post_storage_failure_rolls_back_schema_and_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop-column-post-storage-rollback.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE TABLE persisted (id INTEGER, removed TEXT, kept INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO persisted VALUES (1, 'still-here', 9);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE persisted_wr (
+                key INTEGER, removed TEXT, kept INTEGER, PRIMARY KEY(key)
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO persisted_wr VALUES (1, 'wr-still-here', 19);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.fail_alter_drop_after_storage_once.set(true);
+        let error = conn
+            .execute("ALTER TABLE persisted DROP COLUMN removed;")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("after storage rewrite"),
+            "{error}"
+        );
+        let rows = conn
+            .query("SELECT id, removed, kept FROM persisted;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("still-here".into()),
+                SqliteValue::Integer(9),
+            ]
+        );
+        conn.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            conn.execute("ALTER TABLE persisted_wr DROP COLUMN removed;")
+                .is_err()
+        );
+        let wr_rows = conn
+            .query("SELECT key, removed, kept FROM persisted_wr;")
+            .unwrap();
+        assert_eq!(
+            row_values(&wr_rows[0]),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("wr-still-here".into()),
+                SqliteValue::Integer(19),
+            ]
+        );
+        conn.execute("INSERT INTO persisted VALUES (2, 'new-write', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO persisted_wr VALUES (2, 'wr-new-write', 20);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        drop(conn);
+
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let rows = reopened
+            .query("SELECT id, removed, kept FROM persisted ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("new-write".into()),
+                SqliteValue::Integer(10),
+            ]
+        );
+        let wr_rows = reopened
+            .query("SELECT key, removed, kept FROM persisted_wr ORDER BY key;")
+            .unwrap();
+        assert_eq!(wr_rows.len(), 2);
+        assert_eq!(
+            row_values(&wr_rows[1]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("wr-new-write".into()),
+                SqliteValue::Integer(20),
+            ]
+        );
+        drop(reopened);
+        let sqlite_reopen = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite_reopen
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let temp = Connection::open(":memory:").unwrap();
+        temp.execute("CREATE TEMP TABLE local (id INTEGER, removed TEXT, kept INTEGER);")
+            .unwrap();
+        temp.execute("INSERT INTO local VALUES (4, 'temp-still-here', 12);")
+            .unwrap();
+        temp.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            temp.execute("ALTER TABLE local DROP COLUMN removed;")
+                .is_err()
+        );
+        let rows = temp.query("SELECT id, removed, kept FROM local;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(4),
+                SqliteValue::Text("temp-still-here".into()),
+                SqliteValue::Integer(12),
+            ]
+        );
+        temp.execute("BEGIN;").unwrap();
+        temp.fail_alter_drop_after_storage_once.set(true);
+        assert!(
+            temp.execute("ALTER TABLE local DROP COLUMN removed;")
+                .is_err()
+        );
+        temp.execute("INSERT INTO local VALUES (5, 'after-error', 13);")
+            .unwrap();
+        temp.execute("COMMIT;").unwrap();
+        let rows = temp
+            .query("SELECT id, removed, kept FROM local ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[
+                SqliteValue::Integer(5),
+                SqliteValue::Text("after-error".into()),
+                SqliteValue::Integer(13),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alter_drop_column_temp_full_and_savepoint_rollback_restore_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TEMP TABLE local (a INTEGER, b TEXT, c INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO local VALUES (1, 'original', 3);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("ALTER TABLE local DROP COLUMN b;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+        let rows = conn.query("SELECT a, b, c FROM local;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("original".into()),
+                SqliteValue::Integer(3),
+            ]
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT before_drop;").unwrap();
+        conn.execute("ALTER TABLE local DROP COLUMN b;").unwrap();
+        conn.execute("ROLLBACK TO before_drop;").unwrap();
+        conn.execute("RELEASE before_drop;").unwrap();
+        conn.execute("INSERT INTO local VALUES (2, 'after-savepoint', 4);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        let rows = conn.query("SELECT a, b, c FROM local ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[1]),
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("after-savepoint".into()),
+                SqliteValue::Integer(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_last_non_generated_column() {
+        let single = Connection::open(":memory:").unwrap();
+        single.execute("CREATE TABLE single (a INTEGER);").unwrap();
+        let err = single
+            .execute("ALTER TABLE single DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop column \"a\": no other columns exist"
+            ),
+            "{err}"
+        );
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (1) STORED);")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN a;").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must have at least one non-generated column"),
+            "{err}"
+        );
+        conn.execute("INSERT INTO t(a) VALUES (7);").unwrap();
+        let rows = conn.query("SELECT a, b FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[SqliteValue::Integer(7), SqliteValue::Integer(1)]
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_generated_column_dependency() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, c INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+        )
+        .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN a;").unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+        conn.execute("INSERT INTO t(a, c) VALUES (5, 9);").unwrap();
+        let rows = conn.query("SELECT a, c, b FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            &[
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(9),
+                SqliteValue::Integer(10),
+            ]
+        );
+
+        let json_conn = Connection::open(":memory:").unwrap();
+        json_conn
+            .execute(
+                "CREATE TABLE json_generated (payload TEXT, keep INTEGER, extracted TEXT GENERATED ALWAYS AS (payload ->> '$.name') STORED);",
+            )
+            .unwrap();
+        let err = json_conn
+            .execute("ALTER TABLE json_generated DROP COLUMN payload;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: payload"), "{err}");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-generated-fallback.db");
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE fallback_generated(
+                        a INTEGER,
+                        c INTEGER,
+                        b INTEGER GENERATED ALWAYS AS(a * 2) STORED,
+                        CHECK(c > 0) ON CONFLICT FAIL
+                    );",
+                )
+                .unwrap();
+        }
+        let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let err = reopened
+            .execute("ALTER TABLE fallback_generated DROP COLUMN a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+        let rows = reopened
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_generated';")
+            .unwrap();
+        assert!(row_values(&rows[0])[0].to_text().contains("GENERATED"));
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_check_dependency() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, CHECK(a + b > 0));")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap_err();
+        assert!(err.to_string().contains("no such column: b"), "{err}");
+        assert!(
+            conn.execute("INSERT INTO t VALUES (-2, 1);").is_err(),
+            "the rejected ALTER must leave the CHECK constraint active"
+        );
+
+        let row_value_conn = Connection::open(":memory:").unwrap();
+        row_value_conn
+            .execute(
+                "CREATE TABLE row_value_check (a INTEGER, b INTEGER, CHECK((a, b) != (1, 2)));",
+            )
+            .unwrap();
+        let err = row_value_conn
+            .execute("ALTER TABLE row_value_check DROP COLUMN b;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: b"), "{err}");
+
+        let surviving_column_check = Connection::open(":memory:").unwrap();
+        surviving_column_check
+            .execute("CREATE TABLE surviving_column_check (a INTEGER, b INTEGER CHECK(a + b > 0));")
+            .unwrap();
+        let err = surviving_column_check
+            .execute("ALTER TABLE surviving_column_check DROP COLUMN a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("no such column: a"), "{err}");
+
+        let dropped_column_check = Connection::open(":memory:").unwrap();
+        dropped_column_check
+            .execute("CREATE TABLE dropped_column_check (a INTEGER CHECK(a > 0), b INTEGER);")
+            .unwrap();
+        dropped_column_check
+            .execute("ALTER TABLE dropped_column_check DROP COLUMN a;")
+            .unwrap();
+        dropped_column_check
+            .execute("INSERT INTO dropped_column_check(b) VALUES (-1);")
+            .unwrap();
+        let rows = dropped_column_check
+            .query("SELECT b FROM dropped_column_check;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0]), &[SqliteValue::Integer(-1)]);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-check-owner.db");
+        {
+            let persisted = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            persisted
+                .execute("CREATE TABLE persisted (a INTEGER CHECK(a > 0), b INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE persisted RENAME COLUMN a TO renamed_a;")
+                .unwrap();
+        }
+        {
+            let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            reopened
+                .execute("ALTER TABLE persisted DROP COLUMN renamed_a;")
+                .unwrap();
+            reopened
+                .execute("INSERT INTO persisted(b) VALUES (-2);")
+                .unwrap();
+            let rows = reopened.query("SELECT b FROM persisted;").unwrap();
+            assert_eq!(row_values(&rows[0]), &[SqliteValue::Integer(-2)]);
+        }
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_index_dependencies() {
+        for create_index in [
+            "CREATE INDEX idx ON t(a, b);",
+            "CREATE INDEX idx ON t(lower(b));",
+            "CREATE INDEX idx ON t(b ->> '$.name');",
+            "CREATE INDEX idx ON t(a) WHERE b > 0;",
+        ] {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+                .unwrap();
+            conn.execute(create_index).unwrap();
+
+            let err = conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("error in index idx after drop column"),
+                "index SQL `{create_index}` produced unexpected error: {err}"
+            );
+            let rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx';")
+                .unwrap();
+            assert_eq!(rows.len(), 1, "index SQL `{create_index}` was removed");
+        }
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_rejects_unique_constraints() {
+        let primary_key_conn = Connection::open(":memory:").unwrap();
+        primary_key_conn
+            .execute("CREATE TABLE one_pk (a INTEGER PRIMARY KEY);")
+            .unwrap();
+        let err = primary_key_conn
+            .execute("ALTER TABLE one_pk DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop PRIMARY KEY column: \"a\""
+            ),
+            "{err}"
+        );
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE single_unique (a INTEGER UNIQUE, b INTEGER);")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE single_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot drop UNIQUE column: \"a\""),
+            "{err}"
+        );
+
+        let table_level_unique = Connection::open(":memory:").unwrap();
+        table_level_unique
+            .execute("CREATE TABLE table_unique (a INTEGER, b INTEGER, UNIQUE(a));")
+            .unwrap();
+        let err = table_level_unique
+            .execute("ALTER TABLE table_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table table_unique after drop column: no such column: a"
+            ),
+            "{err}"
+        );
+
+        conn.execute(
+            "CREATE TABLE unique_generated (a INTEGER UNIQUE, b INTEGER GENERATED ALWAYS AS (a + 1) STORED);",
+        )
+        .unwrap();
+        let err = conn
+            .execute("ALTER TABLE unique_generated DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "cannot drop UNIQUE column: \"a\""
+            ),
+            "{err}"
+        );
+
+        conn.execute(
+            "CREATE TABLE composite_unique (a INTEGER, b INTEGER, c INTEGER, UNIQUE(a, b));",
+        )
+        .unwrap();
+        let err = conn
+            .execute("ALTER TABLE composite_unique DROP COLUMN a;")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("error in table composite_unique after drop column"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_alter_table_drop_column_preserves_foreign_key_ownership() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE column_owned (
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+                    DEFERRABLE INITIALLY DEFERRED,
+                keep INTEGER
+            );",
+        )
+        .unwrap();
+        conn.execute("ALTER TABLE column_owned RENAME COLUMN parent_id TO renamed_parent_id;")
+            .unwrap();
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'column_owned';")
+            .unwrap();
+        let renamed_sql = row_values(&rows[0])[0].to_text();
+        assert!(
+            renamed_sql.contains(
+                "renamed_parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
+            ),
+            "{renamed_sql}"
+        );
+        conn.execute("ALTER TABLE column_owned DROP COLUMN renamed_parent_id;")
+            .unwrap();
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'column_owned';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        assert!(!sql.contains("REFERENCES"), "{sql}");
+
+        conn.execute("CREATE TABLE table_owned (parent_id INTEGER, keep INTEGER, FOREIGN KEY(parent_id) REFERENCES parent(id));")
+            .unwrap();
+        conn.execute("ALTER TABLE table_owned RENAME COLUMN parent_id TO renamed_parent_id;")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE table_owned DROP COLUMN renamed_parent_id;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table table_owned after drop column: unknown column \"renamed_parent_id\" in foreign key definition"
+            ),
+            "{err}"
+        );
+
+        conn.execute("CREATE TABLE add_owned (keep INTEGER);")
+            .unwrap();
+        conn.execute("ALTER TABLE add_owned ADD COLUMN parent_id INTEGER REFERENCES parent(id);")
+            .unwrap();
+        conn.execute("ALTER TABLE add_owned DROP COLUMN parent_id;")
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("drop-column-fk-owner.db");
+        {
+            let persisted = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            persisted
+                .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_column (parent_id INTEGER REFERENCES parent(id) ON UPDATE RESTRICT, keep INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE reopen_column RENAME COLUMN parent_id TO renamed_parent_id;")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_table (parent_id INTEGER, keep INTEGER, FOREIGN KEY(parent_id) REFERENCES parent(id));")
+                .unwrap();
+            persisted
+                .execute("CREATE TABLE reopen_add (keep INTEGER);")
+                .unwrap();
+            persisted
+                .execute("ALTER TABLE reopen_add ADD COLUMN parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL;")
+                .unwrap();
+        }
+        {
+            let reopened = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            reopened
+                .execute("ALTER TABLE reopen_column DROP COLUMN renamed_parent_id;")
+                .unwrap();
+            let err = reopened
+                .execute("ALTER TABLE reopen_table DROP COLUMN parent_id;")
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FrankenError::FunctionError(ref message)
+                        if message == "error in table reopen_table after drop column: unknown column \"parent_id\" in foreign key definition"
+                ),
+                "{err}"
+            );
+            reopened
+                .execute("ALTER TABLE reopen_add DROP COLUMN parent_id;")
+                .unwrap();
+        }
+
+        let fallback_path = temp_dir.path().join("drop-column-fk-fallback.db");
+        {
+            let sqlite = rusqlite::Connection::open(&fallback_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE fallback_column (
+                         parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                         keep INTEGER,
+                         CHECK(keep > 0) ON CONFLICT FAIL
+                     );
+                     CREATE TABLE fallback_table (
+                         parent_id INTEGER,
+                         keep INTEGER,
+                         FOREIGN KEY(parent_id) REFERENCES parent(id),
+                         CHECK(keep > 0) ON CONFLICT FAIL
+                     );
+                     CREATE INDEX fallback_index ON fallback_table(parent_id);",
+                )
+                .unwrap();
+        }
+        let fallback = Connection::open(fallback_path.to_string_lossy().into_owned()).unwrap();
+        fallback.execute("PRAGMA foreign_keys = ON;").unwrap();
+        {
+            let schema = fallback.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|table| table.name == "fallback_column")
+                .unwrap();
+            let foreign_key = &table.foreign_keys[0];
+            assert_eq!(foreign_key.parent_table, "parent");
+            assert_eq!(foreign_key.parent_columns, vec!["id"]);
+            assert_eq!(
+                foreign_key.on_delete,
+                fsqlite_vdbe::codegen::FkActionType::Cascade
+            );
+            assert_eq!(foreign_key.owner_column.as_deref(), Some("parent_id"));
+        }
+        let err = fallback
+            .execute("INSERT INTO fallback_column(parent_id, keep) VALUES(999, 1);")
+            .expect_err("fallback FK metadata must still enforce the parent lookup");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        fallback
+            .execute("ALTER TABLE fallback_column DROP COLUMN parent_id;")
+            .unwrap();
+        let err = fallback
+            .execute("ALTER TABLE fallback_table DROP COLUMN parent_id;")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FrankenError::FunctionError(ref message)
+                    if message == "error in table fallback_table after drop column: unknown column \"parent_id\" in foreign key definition"
+            ),
+            "{err}"
+        );
+
+        let oracle = rusqlite::Connection::open_in_memory().unwrap();
+        oracle
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE fallback_table (
+                     parent_id INTEGER,
+                     keep INTEGER,
+                     FOREIGN KEY(parent_id) REFERENCES parent(id),
+                     CHECK(keep > 0) ON CONFLICT FAIL
+                 );
+                 CREATE INDEX fallback_index ON fallback_table(parent_id);",
+            )
+            .unwrap();
+        let oracle_err = oracle
+            .execute("ALTER TABLE fallback_table DROP COLUMN parent_id;", [])
+            .unwrap_err();
+        assert!(
+            oracle_err.to_string().contains(
+                "error in table fallback_table after drop column: unknown column \"parent_id\" in foreign key definition"
+            ),
+            "{oracle_err}"
+        );
+
+        let rows = fallback
+            .query("SELECT name FROM sqlite_master WHERE name = 'fallback_index';")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "rejected ALTER removed its explicit index");
+        let rows = fallback
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_table';")
+            .unwrap();
+        assert!(
+            row_values(&rows[0])[0]
+                .to_text()
+                .contains("FOREIGN KEY(parent_id)"),
+            "rejected ALTER rewrote the table schema"
+        );
+        let rows = fallback
+            .query("SELECT sql FROM sqlite_master WHERE name = 'fallback_column';")
+            .unwrap();
+        assert!(
+            !row_values(&rows[0])[0].to_text().contains("REFERENCES"),
+            "column-owned fallback FK survived its dropped column"
+        );
+    }
+
+    #[test]
     fn test_alter_table_nonexistent_table_errors() {
         let conn = Connection::open(":memory:").unwrap();
         let err = conn.execute("ALTER TABLE nosuch ADD COLUMN x INTEGER;");
@@ -109641,33 +112323,44 @@ mod tests {
     #[test]
     fn test_recursive_trigger_depth_limit() {
         // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
-        // Without recursive_triggers=ON, the default behavior suppresses
-        // same-table re-entry, so we test with two tables that ping-pong
-        // triggers between each other (which is NOT suppressed by the
-        // default recursive_triggers=OFF — that only suppresses self-table).
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("PRAGMA recursive_triggers = ON;").unwrap();
-        conn.execute("CREATE TABLE a (n INTEGER);").unwrap();
-        conn.execute("CREATE TABLE b (n INTEGER);").unwrap();
-        conn.execute("INSERT INTO a VALUES (0);").unwrap();
-        conn.execute("INSERT INTO b VALUES (0);").unwrap();
-        // Trigger chain: UPDATE a → fire trg_a → UPDATE b → fire trg_b → UPDATE a → ...
-        conn.execute(
-            "CREATE TRIGGER trg_a AFTER UPDATE ON a BEGIN UPDATE b SET n = NEW.n + 1; END;",
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TRIGGER trg_b AFTER UPDATE ON b BEGIN UPDATE a SET n = NEW.n + 1; END;",
-        )
-        .unwrap();
-        let err = conn
-            .execute("UPDATE a SET n = 1;")
-            .expect_err("should hit trigger depth limit");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("too many levels of trigger recursion"),
-            "unexpected error: {msg}",
-        );
+        // Pin the regression to a 1 MiB stack so ordinary compiler frame
+        // growth cannot silently move the process-abort boundary below the
+        // configured error boundary again.
+        std::thread::Builder::new()
+            .name("recursive-trigger-depth-limit".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                // Without recursive_triggers=ON, the default behavior suppresses
+                // same-table re-entry, so we test with two tables that ping-pong
+                // triggers between each other.
+                let conn = Connection::open(":memory:").unwrap();
+                conn.execute("PRAGMA recursive_triggers = ON;").unwrap();
+                conn.execute("CREATE TABLE a (n INTEGER);").unwrap();
+                conn.execute("CREATE TABLE b (n INTEGER);").unwrap();
+                conn.execute("INSERT INTO a VALUES (0);").unwrap();
+                conn.execute("INSERT INTO b VALUES (0);").unwrap();
+                // Trigger chain: UPDATE a → trg_a → UPDATE b → trg_b → UPDATE a → ...
+                conn.execute(
+                    "CREATE TRIGGER trg_a AFTER UPDATE ON a BEGIN UPDATE b SET n = NEW.n + 1; END;",
+                )
+                .unwrap();
+                conn.execute(
+                    "CREATE TRIGGER trg_b AFTER UPDATE ON b BEGIN UPDATE a SET n = NEW.n + 1; END;",
+                )
+                .unwrap();
+                let err = conn
+                    .execute("UPDATE a SET n = 1;")
+                    .expect_err("should hit trigger depth limit");
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("too many levels of trigger recursion"),
+                    "unexpected error: {msg}",
+                );
+                assert!(conn.trigger_frame_stack.borrow().is_empty());
+            })
+            .expect("spawn 1 MiB trigger-depth regression thread")
+            .join()
+            .expect("trigger-depth regression thread panicked");
     }
 
     #[test]
@@ -110151,6 +112844,154 @@ mod tests {
             .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_vacuum_into_rejects_source_commit_between_receipt_and_hydration() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-source-race.db");
+        let target_path = dir.path().join("vacuum-into-source-race-output.db");
+        let source = source_path.to_string_lossy().into_owned();
+        let target = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+
+        let writer_path = source.clone();
+        *conn.vacuum_after_source_receipt_once.borrow_mut() = Some(Box::new(move || {
+            let writer = Connection::open(writer_path).unwrap();
+            writer
+                .execute("INSERT INTO items VALUES (3,'gamma');")
+                .unwrap();
+            writer.close().unwrap();
+        }));
+
+        let error = conn
+            .execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target.clone().into())],
+            )
+            .expect_err("a source generation change must reject VACUUM INTO");
+        assert!(
+            matches!(
+                error,
+                FrankenError::Busy | FrankenError::BusySnapshot { .. }
+            ),
+            "unexpected source receipt race error: {error}"
+        );
+        assert!(
+            !target_path.exists(),
+            "source receipt rejection must happen before output reservation"
+        );
+        conn.close().unwrap();
+
+        let source_oracle = rusqlite::Connection::open(&source_path).unwrap();
+        let values: Vec<String> = source_oracle
+            .prepare("SELECT value FROM items ORDER BY id;")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let integrity: String = source_oracle
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(values, ["alpha", "beta", "gamma"]);
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn test_vacuum_into_rejects_same_inode_write_after_validation() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-target-race.db");
+        let target_path = dir.path().join("vacuum-into-target-race-output.db");
+        let source = source_path.to_string_lossy().into_owned();
+        let target = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+
+        let raced_target = target_path.clone();
+        *conn.vacuum_after_target_validation_once.borrow_mut() = Some(Box::new(move || {
+            let writer = rusqlite::Connection::open(raced_target).unwrap();
+            writer
+                .execute("INSERT INTO items VALUES (3,'intruder');", [])
+                .unwrap();
+        }));
+
+        let error = conn
+            .execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target.clone().into())],
+            )
+            .expect_err("a same-inode target write must reject VACUUM INTO");
+        assert!(
+            matches!(error, FrankenError::DatabaseCorrupt { .. }),
+            "unexpected target receipt race error: {error}"
+        );
+        assert!(
+            !target_path.exists(),
+            "a modified exact reservation must be removed after rejection"
+        );
+
+        let rows = conn.query("SELECT value FROM items ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn test_vacuum_into_preserves_post_validation_path_replacement() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-path-race.db");
+        let target_path = dir.path().join("vacuum-into-path-race-output.db");
+        let displaced_path = dir.path().join("vacuum-into-path-race-displaced.db");
+        let source = source_path.to_string_lossy().into_owned();
+        let target = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1,'alpha'),(2,'beta');")
+            .unwrap();
+
+        let raced_target = target_path.clone();
+        let raced_displaced = displaced_path.clone();
+        *conn.vacuum_after_target_validation_once.borrow_mut() = Some(Box::new(move || {
+            fsqlite_vfs::host_fs::rename(&raced_target, &raced_displaced).unwrap();
+            fsqlite_vfs::host_fs::write(&raced_target, b"replacement-sentinel").unwrap();
+        }));
+
+        conn.execute_with_params(
+            "VACUUM INTO ?1;",
+            &[SqliteValue::Text(target.clone().into())],
+        )
+        .expect_err("a post-validation path replacement must reject VACUUM INTO");
+        assert_eq!(
+            fsqlite_vfs::host_fs::read(&target_path).unwrap(),
+            b"replacement-sentinel",
+            "identity-bound cleanup must preserve the replacement path entry"
+        );
+        assert!(
+            displaced_path.exists(),
+            "identity drift must preserve the displaced reserved image"
+        );
+
+        let rows = conn.query("SELECT value FROM items ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
+        conn.close().unwrap();
     }
 
     #[test]
@@ -115994,6 +118835,153 @@ mod tests {
 
         let rewritten = conn.rewrite_in_subqueries_select(&select, None).unwrap();
         assert!(matches!(rewritten, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_rewrite_subqueries_preserves_statement_global_bind_slots() {
+        fn assert_in_list_placeholder(expr: &fsqlite_ast::Expr, expected: u32) {
+            let fsqlite_ast::Expr::In {
+                set: fsqlite_ast::InSet::List(items),
+                ..
+            } = expr
+            else {
+                panic!("expected rewritten IN-list expression");
+            };
+            assert!(
+                matches!(
+                    items.as_slice(),
+                    [fsqlite_ast::Expr::Placeholder(
+                        fsqlite_ast::PlaceholderType::Numbered(index),
+                        _
+                    )] if *index == expected
+                ),
+                "expected anonymous placeholder to retain statement-global slot {expected}"
+            );
+        }
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, issue_type TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE labels (issue_id TEXT, label TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO issues VALUES ('a', 'task'), ('b', 'feature');")
+            .unwrap();
+        conn.execute("INSERT INTO labels VALUES ('a', 'core'), ('b', 'core');")
+            .unwrap();
+
+        let params = [
+            SqliteValue::Text("core".into()),
+            SqliteValue::Text("task".into()),
+        ];
+        let statement = super::parse_single_statement(
+            "SELECT id FROM issues
+             WHERE id IN (SELECT issue_id FROM labels WHERE label = ?)
+               AND issue_type IN (?);",
+        )
+        .unwrap();
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+        let rewritten = conn.rewrite_subqueries(&select, Some(&params)).unwrap();
+        let fsqlite_ast::SelectCore::Select {
+            where_clause: Some(where_clause),
+            ..
+        } = &rewritten.body.select
+        else {
+            panic!("expected WHERE clause");
+        };
+        let fsqlite_ast::Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } = where_clause.as_ref()
+        else {
+            panic!("expected conjunctive WHERE clause");
+        };
+        assert!(
+            matches!(
+                left.as_ref(),
+                fsqlite_ast::Expr::In {
+                    set: fsqlite_ast::InSet::List(_),
+                    ..
+                }
+            ),
+            "parameterized subquery should be materialized at execution time"
+        );
+        assert_in_list_placeholder(right, 2);
+
+        let swapped_params = [
+            SqliteValue::Text("task".into()),
+            SqliteValue::Text("core".into()),
+        ];
+        let swapped_statement = super::parse_single_statement(
+            "SELECT id FROM issues
+             WHERE issue_type IN (?)
+               AND id IN (SELECT issue_id FROM labels WHERE label = ?);",
+        )
+        .unwrap();
+        let Statement::Select(swapped_select) = swapped_statement else {
+            panic!("expected SELECT statement");
+        };
+        let swapped = conn
+            .rewrite_subqueries(&swapped_select, Some(&swapped_params))
+            .unwrap();
+        let fsqlite_ast::SelectCore::Select {
+            where_clause: Some(swapped_where),
+            ..
+        } = &swapped.body.select
+        else {
+            panic!("expected WHERE clause");
+        };
+        let fsqlite_ast::Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } = swapped_where.as_ref()
+        else {
+            panic!("expected conjunctive WHERE clause");
+        };
+        assert_in_list_placeholder(left, 1);
+        assert!(
+            matches!(
+                right.as_ref(),
+                fsqlite_ast::Expr::In {
+                    set: fsqlite_ast::InSet::List(_),
+                    ..
+                }
+            ),
+            "subquery should retain slot two before materialization"
+        );
+
+        let numbered = conn
+            .query_with_params(
+                "SELECT id FROM issues
+                 WHERE id IN (SELECT issue_id FROM labels WHERE label = ?2)
+                   AND issue_type IN (?1);",
+                &[
+                    SqliteValue::Text("task".into()),
+                    SqliteValue::Text("core".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(numbered.len(), 1);
+        assert_eq!(numbered[0].values()[0], SqliteValue::Text("a".into()));
+
+        let named = conn
+            .query_with_params(
+                "SELECT id FROM issues
+                 WHERE id IN (SELECT issue_id FROM labels WHERE label = :label)
+                   AND issue_type IN (:kind);",
+                &[
+                    SqliteValue::Text("core".into()),
+                    SqliteValue::Text("task".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].values()[0], SqliteValue::Text("a".into()));
     }
 
     #[test]
@@ -124633,8 +127621,13 @@ mod tests {
         );
     }
 
+    /// GH #292: a header-sized sidecar whose header fails validation (here:
+    /// zeroed bytes = invalid magic) must be treated as an EMPTY WAL — stock
+    /// SQLite `walIndexRecover` semantics — and replaced by a fresh
+    /// generation, not surfaced as `WalCorrupt`. Hard-failing here made
+    /// FrankenSQLite refuse databases native SQLite reports as consistent.
     #[test]
-    fn test_install_wal_backend_rejects_corrupt_existing_wal() {
+    fn test_install_wal_backend_treats_corrupt_existing_wal_as_empty() {
         let cx = Cx::new();
         let vfs = MemoryVfs::new();
         let db_path = Path::new("/wal_corrupt_existing.db");
@@ -124647,8 +127640,48 @@ mod tests {
         file.write(&cx, &[0_u8; 32], 0).unwrap();
         file.close(&cx).unwrap();
 
+        super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
+            .expect("corrupt-header WAL must be treated as empty (GH #292)");
+
+        // The unusable sidecar was replaced by a fresh, valid generation.
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        let wal = fsqlite_wal::WalFile::open(&cx, file).expect("fresh WAL generation is valid");
+        assert_eq!(wal.frame_count(), 0, "fresh generation starts empty");
+    }
+
+    /// GH #292 boundary: an unsupported WAL format version on an
+    /// otherwise-valid, checksum-correct header is the one case stock SQLite
+    /// keeps as a hard error (`SQLITE_CANTOPEN`) — it must NOT be silently
+    /// treated as empty, or a future-format WAL's committed data would be
+    /// discarded.
+    #[test]
+    fn test_install_wal_backend_still_rejects_unsupported_format_version() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = Path::new("/wal_future_version.db");
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT).unwrap(),
+        );
+        let wal_path = wal_path_for_db_path("/wal_future_version.db");
+
+        // Build a header with valid magic/page size, a future format version,
+        // and a CORRECT checksum over bytes 0..24.
+        let mut header = [0_u8; 32];
+        header[..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
+        header[4..8].copy_from_slice(&3_007_001_u32.to_be_bytes());
+        header[8..12].copy_from_slice(&4096_u32.to_be_bytes());
+        let checksum = fsqlite_wal::wal_header_checksum(&header, false).expect("checksum");
+        header[24..28].copy_from_slice(&checksum.s1.to_be_bytes());
+        header[28..32].copy_from_slice(&checksum.s2.to_be_bytes());
+
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        file.write(&cx, &header, 0).unwrap();
+        file.close(&cx).unwrap();
+
         let err = super::install_wal_backend_with_vfs(&pager, vfs.clone(), &cx, &wal_path)
-            .expect_err("header-sized corrupt WAL should be surfaced");
+            .expect_err("checksum-valid future-version WAL must stay a hard error");
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
             "unexpected error: {err:?}"
@@ -128304,6 +131337,126 @@ mod without_rowid_runtime_tests {
     }
 
     #[test]
+    fn test_without_rowid_create_index_backfill_uses_primary_key_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_index_backfill.db");
+
+        {
+            let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+            conn.execute(
+                "CREATE TABLE wr (key TEXT PRIMARY KEY, payload TEXT) WITHOUT ROWID;
+                 INSERT INTO wr VALUES ('key-c', 'kept'), ('key-a', 'alpha'), ('key-b', 'kept');
+                 CREATE INDEX wr_payload_idx ON wr(payload);",
+            )
+            .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let rows = sqlite
+            .prepare(
+                "SELECT payload, key
+                 FROM wr INDEXED BY wr_payload_idx
+                 ORDER BY payload, key;",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("alpha".to_owned(), "key-a".to_owned()),
+                ("kept".to_owned(), "key-b".to_owned()),
+                ("kept".to_owned(), "key-c".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_without_rowid_create_index_backfill_preserves_composite_pk_order_and_unique_arity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_composite_index_backfill.db");
+
+        {
+            let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+            conn.execute(
+                "CREATE TABLE wr (
+                     tenant TEXT,
+                     item TEXT,
+                     payload TEXT,
+                     PRIMARY KEY(tenant, item)
+                 ) WITHOUT ROWID;
+                 INSERT INTO wr VALUES
+                     ('tenant-b', 'item-1', 'same'),
+                     ('tenant-a', 'item-2', 'same'),
+                     ('tenant-a', 'item-1', 'other');
+                 CREATE INDEX wr_payload_idx ON wr(payload);",
+            )
+            .unwrap();
+
+            let err = conn
+                .execute("CREATE UNIQUE INDEX wr_payload_unique ON wr(payload);")
+                .unwrap_err();
+            assert!(
+                matches!(err, FrankenError::UniqueViolation { .. }),
+                "the PK suffix must not make duplicate index terms unique: {err:?}"
+            );
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        let rows = sqlite
+            .prepare(
+                "SELECT payload, tenant, item
+                 FROM wr INDEXED BY wr_payload_idx
+                 ORDER BY payload, tenant, item;",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "other".to_owned(),
+                    "tenant-a".to_owned(),
+                    "item-1".to_owned(),
+                ),
+                (
+                    "same".to_owned(),
+                    "tenant-a".to_owned(),
+                    "item-2".to_owned(),
+                ),
+                (
+                    "same".to_owned(),
+                    "tenant-b".to_owned(),
+                    "item-1".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn test_without_rowid_dup_primary_key_conflicts_and_replace() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE wr (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;")
@@ -128435,26 +131588,29 @@ mod autocommit_txn_tests {
     where
         B: fsqlite_pager::traits::WalBackend,
     {
-        fn begin_transaction(&mut self, cx: &Cx) -> Result<()> {
-            self.inner.begin_transaction(cx)
+        fn begin_transaction<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { self.inner.begin_transaction(cx).await })
         }
 
-        fn append_frame(
-            &mut self,
-            _cx: &Cx,
+        fn append_frame<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
             _page_number: u32,
-            _page_data: &[u8],
+            _page_data: &'a [u8],
             _db_size_if_commit: u32,
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
-        fn append_frames(
-            &mut self,
-            _cx: &Cx,
-            _frames: &[fsqlite_pager::traits::WalFrameRef<'_>],
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        fn append_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _frames: &'a [fsqlite_pager::traits::WalFrameRef<'a>],
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
         fn prepare_append_frames(
@@ -128472,32 +131628,47 @@ mod autocommit_txn_tests {
             self.inner.finalize_prepared_frames(cx, prepared)
         }
 
-        fn append_prepared_frames(
-            &mut self,
-            _cx: &Cx,
-            _prepared: &mut fsqlite_pager::traits::PreparedWalFrameBatch,
-        ) -> Result<()> {
-            Err(forced_retained_flush_failure())
+        fn append_prepared_frames<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _prepared: &'a mut fsqlite_pager::traits::PreparedWalFrameBatch,
+        ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
+            Box::pin(async move { Err(forced_retained_flush_failure()) })
         }
 
-        fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-            self.inner.read_page(cx, page_number)
+        fn read_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page(cx, page_number).await })
         }
 
-        fn read_page_pinned(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-            self.inner.read_page_pinned(cx, page_number)
+        fn read_page_pinned<'a>(
+            &'a self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, Option<Vec<u8>>> {
+            Box::pin(async move { self.inner.read_page_pinned(cx, page_number).await })
         }
 
         fn supports_pinned_reads(&self) -> bool {
             self.inner.supports_pinned_reads()
         }
 
-        fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
-            self.inner.committed_txns_since_page(cx, page_number)
+        fn committed_txns_since_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_number: u32,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txns_since_page(cx, page_number).await })
         }
 
-        fn committed_txn_count(&mut self, cx: &Cx) -> Result<u64> {
-            self.inner.committed_txn_count(cx)
+        fn committed_txn_count<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+        ) -> fsqlite_pager::traits::WalFuture<'a, u64> {
+            Box::pin(async move { self.inner.committed_txn_count(cx).await })
         }
 
         fn sync(&mut self, cx: &Cx) -> Result<()> {
@@ -128508,16 +131679,19 @@ mod autocommit_txn_tests {
             self.inner.frame_count()
         }
 
-        fn checkpoint(
-            &mut self,
-            cx: &Cx,
+        fn checkpoint<'a>(
+            &'a mut self,
+            cx: &'a Cx,
             mode: fsqlite_pager::traits::CheckpointMode,
-            writer: &mut dyn fsqlite_pager::traits::CheckpointPageWriter,
+            writer: &'a mut dyn fsqlite_pager::traits::CheckpointPageWriter,
             backfilled_frames: u32,
             oldest_reader_frame: Option<u32>,
-        ) -> Result<fsqlite_pager::traits::CheckpointResult> {
-            self.inner
-                .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+        ) -> fsqlite_pager::traits::WalFuture<'a, fsqlite_pager::traits::CheckpointResult> {
+            Box::pin(async move {
+                self.inner
+                    .checkpoint(cx, mode, writer, backfilled_frames, oldest_reader_frame)
+                    .await
+            })
         }
     }
 
@@ -131475,6 +134649,18 @@ SELECT x FROM t;
         }
 
         let conn = Connection::open(&db_str).unwrap();
+        #[cfg(feature = "ext-fts5")]
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs_fts should reconnect as FTS5");
+            assert!(
+                !fts5.is_lazy_on_disk(),
+                "ordinary opens must retain hydrated contentless FTS5 semantics"
+            );
+        }
         let rows = conn
             .query(
                 "SELECT rowid FROM docs_fts \
@@ -131510,6 +134696,213 @@ SELECT x FROM t;
             ],
             "reopened contentless FTS5 full scans must preserve rowids and return NULL content"
         );
+    }
+
+    #[cfg(all(unix, feature = "ext-fts5"))]
+    #[test]
+    fn test_existing_schema_only_contentless_fts5_stays_lazy_across_incremental_appends() {
+        let _serial = super::fsqlite_core_test_serializer();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_only_contentless_append.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE messages_fts USING fts5(body, content='');
+                    INSERT INTO messages_fts(rowid, body) VALUES
+                        (1, 'alpha rust'),
+                        (2, 'beta search'),
+                        (3, 'gamma rust search');
+                    INSERT INTO messages_fts(messages_fts) VALUES('optimize');
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open_existing_schema_only(&db_str).unwrap();
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("MESSAGES_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("contentless table should reconnect as FTS5");
+            assert!(fts5.is_lazy_on_disk());
+            assert_eq!(fts5.row_count(), 3);
+        }
+
+        // Model the bounded CASS repair driver: its TEMP table is created
+        // before the main FTS shadow grows. The connection must keep that
+        // connection-local root isolated even when later shadow B-tree splits
+        // allocate the same numeric page in the main database.
+        conn.execute("CREATE TEMP TABLE repair_probe_ids(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO repair_probe_ids(id) VALUES(?1),(?2);",
+            &[SqliteValue::Integer(1), SqliteValue::Integer(2)],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repair_probe_ids;").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO repair_probe_ids(id) VALUES(?1);",
+            &[SqliteValue::Integer(1)],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO messages_fts(rowid, body) VALUES
+                (4, 'delta rust'),
+                (5, 'epsilon search');",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repair_probe_ids;").unwrap();
+        conn.execute_with_params(
+            "INSERT INTO repair_probe_ids(id) VALUES(?1),(?2);",
+            &[SqliteValue::Integer(4), SqliteValue::Integer(5)],
+        )
+        .unwrap();
+        let probe_rows = conn
+            .query("SELECT id FROM repair_probe_ids ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            probe_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(4), SqliteValue::Integer(5)]
+        );
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("MESSAGES_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("contentless table should remain FTS5");
+            assert!(
+                fts5.is_lazy_on_disk(),
+                "incremental append must not hydrate the historical corpus"
+            );
+            assert_eq!(fts5.row_count(), 5);
+        }
+
+        let rust_rows = conn
+            .query(
+                "SELECT rowid FROM messages_fts
+                 WHERE messages_fts MATCH 'rust' ORDER BY rowid;",
+            )
+            .unwrap();
+        assert_eq!(
+            rust_rows
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(4),
+            ]
+        );
+        let full_scan = conn
+            .query("SELECT rowid, body FROM messages_fts ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(full_scan.len(), 5);
+        assert!(
+            full_scan
+                .iter()
+                .all(|row| matches!(row.values(), [SqliteValue::Integer(_), SqliteValue::Null]))
+        );
+
+        let duplicate = conn
+            .execute("INSERT INTO messages_fts(rowid, body) VALUES (4, 'duplicate');")
+            .expect_err("lazy append must reject an existing persisted rowid");
+        assert!(matches!(duplicate, FrankenError::PrimaryKeyViolation));
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick: String = sqlite
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick, "ok");
+        assert_eq!(integrity, "ok");
+        let matched: Vec<i64> = sqlite
+            .prepare(
+                "SELECT rowid FROM messages_fts
+                 WHERE messages_fts MATCH 'rust' ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(matched, vec![1, 3, 4]);
+    }
+
+    #[cfg(feature = "ext-fts5")]
+    #[test]
+    fn test_fsqlite_created_fts5_uses_stock_shadow_schema_and_passes_stock_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("canonical_fts5_shadows.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute(
+                "CREATE VIRTUAL TABLE messages_fts USING
+                 fts5(body, content='', contentless_delete=1);",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO messages_fts(rowid, body) VALUES (1, 'canonical shadow');")
+                .unwrap();
+        }
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let shadow_sql = |name: &str| -> String {
+            sqlite
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let normalize_sql = |sql: String| {
+            sql.chars()
+                .filter(|ch| !ch.is_ascii_whitespace() && *ch != '"')
+                .flat_map(char::to_uppercase)
+                .collect::<String>()
+        };
+        let idx_sql = normalize_sql(shadow_sql("messages_fts_idx"));
+        let config_sql = normalize_sql(shadow_sql("messages_fts_config"));
+        let docsize_sql = normalize_sql(shadow_sql("messages_fts_docsize"));
+        assert!(
+            idx_sql.ends_with("PRIMARYKEY(SEGID,TERM))WITHOUTROWID"),
+            "unexpected FTS5 idx shadow DDL: {idx_sql}"
+        );
+        assert!(
+            config_sql.ends_with("(KPRIMARYKEY,V)WITHOUTROWID"),
+            "unexpected FTS5 config shadow DDL: {config_sql}"
+        );
+        assert!(
+            docsize_sql.contains("ORIGININTEGER"),
+            "contentless-delete docsize shadow must store origin: {docsize_sql}"
+        );
+        for name in ["messages_fts_idx", "messages_fts_config"] {
+            let without_rowid: i64 = sqlite
+                .query_row(
+                    "SELECT wr FROM pragma_table_list WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(without_rowid, 1, "{name} must be a WITHOUT ROWID table");
+        }
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
     }
 
     #[test]
@@ -131683,6 +135076,18 @@ SELECT x FROM t;
         }
 
         let conn = Connection::open(&db_str).unwrap();
+        #[cfg(feature = "ext-fts5")]
+        {
+            let instances = conn.vtab_instances.borrow();
+            let fts5 = instances
+                .get("DOCS_FTS")
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .expect("docs_fts should reconnect as FTS5");
+            assert!(
+                !fts5.is_lazy_on_disk(),
+                "ordinary opens must retain hydrated stock contentless FTS5 semantics"
+            );
+        }
         let rows = conn
             .query(
                 "SELECT rowid FROM docs_fts \
@@ -131853,6 +135258,77 @@ SELECT x FROM t;
                 || message.contains("docs_fts_content"),
             "unexpected reconnect error: {message}"
         );
+    }
+
+    #[test]
+    fn test_reopen_duplicate_fts5_rootpage_zero_allows_authoritative_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("duplicate_fts5_schema.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(
+                        title,
+                        body,
+                        content=''
+                    );
+                    INSERT INTO docs_fts(rowid, title, body)
+                    VALUES(1, 'rust', 'persisted repair');
+                    PRAGMA writable_schema = ON;
+                    INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                    VALUES(
+                        'table',
+                        'docs_fts',
+                        'docs_fts',
+                        0,
+                        'CREATE VIRTUAL TABLE docs_fts USING fts5(title, body)'
+                    );
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str)
+                .expect("duplicate legacy FTS5 schema row should remain available for repair");
+            let schema_rows = conn
+                .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'docs_fts';")
+                .unwrap();
+            assert_eq!(schema_rows.len(), 1);
+            assert_eq!(schema_rows[0].values()[0], SqliteValue::Integer(1));
+            let persisted = conn
+                .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'persisted';")
+                .unwrap();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].values()[0], SqliteValue::Integer(1));
+            conn.execute("INSERT INTO docs_fts(rowid, title, body) VALUES(2, 'rust', 'catchup');")
+                .unwrap();
+            let rows = conn
+                .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'rust' ORDER BY rowid;")
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        }
+
+        let reopened = Connection::open(&db_str)
+            .expect("repaired duplicate FTS5 schema should remain reloadable");
+        let schema_rows = reopened
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'docs_fts';")
+            .unwrap();
+        assert_eq!(schema_rows.len(), 1);
+        assert_eq!(schema_rows[0].values()[0], SqliteValue::Integer(1));
+        let rows = reopened
+            .query("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'rust' ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
     }
 
     #[test]
@@ -133496,6 +136972,50 @@ fts5(title, body, content=docs, content_rowid=id)'
             .unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS mixed (id INTEGER PRIMARY KEY, val TEXT);")
             .expect("strict parity-cert create table must honor non-default page sizes");
+    }
+
+    #[test]
+    fn test_open_existing_schema_only_is_writable_but_never_creates_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing.db");
+        let missing_str = missing_path.to_string_lossy().into_owned();
+        let err = Connection::open_existing_schema_only(&missing_str)
+            .expect_err("existing-only schema open must reject a missing path");
+        assert!(matches!(err, FrankenError::CannotOpen { .. }));
+        assert!(!missing_path.exists());
+
+        let db_path = dir.path().join("existing.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+        {
+            let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+            sqlite
+                .execute_batch(
+                    "CREATE TABLE events(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+                     INSERT INTO events VALUES (1, 'seed');",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open_existing_schema_only(&db_str).unwrap();
+        assert!(!conn.memdb_rows_loaded.get());
+        conn.execute("INSERT INTO events VALUES (2, 'appended');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, body FROM events ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("appended".into()));
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let appended: String = sqlite
+            .query_row("SELECT body FROM events WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(appended, "appended");
+        assert_eq!(integrity, "ok");
     }
 
     #[test]
@@ -136515,7 +140035,7 @@ fts5(title, body, content=docs, content_rowid=id)'
     }
 
     #[test]
-    fn test_compat_trace_callback_works_without_debug_span_bookkeeping() {
+    fn test_compat_trace_callback_works_with_tracing_disabled() {
         let _serial = super::fsqlite_core_test_serializer();
         let sink = Arc::new(std::sync::Mutex::new(Vec::<TraceEvent>::new()));
         let sink_clone = Arc::clone(&sink);
@@ -136529,9 +140049,17 @@ fts5(title, body, content=docs, content_rowid=id)'
             }),
         };
 
-        reset_trace_metrics();
         let baseline = trace_metrics_snapshot();
-        emit_compat_trace_event(Some(&trace), TraceEvent::Close);
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            assert!(
+                !tracing::enabled!(
+                    target: "fsqlite.compat_trace",
+                    tracing::Level::DEBUG
+                ),
+                "the test subscriber must keep compat-trace debug spans disabled"
+            );
+            emit_compat_trace_event(Some(&trace), TraceEvent::Close);
+        });
 
         let snapshot = trace_metrics_snapshot();
         let captured = sink.lock().expect("trace sink mutex poisoned");
@@ -136540,14 +140068,10 @@ fts5(title, body, content=docs, content_rowid=id)'
             matches!(captured[0], TraceEvent::Close),
             "expected close event to reach callback"
         );
-        assert_eq!(
-            snapshot.fsqlite_compat_trace_callbacks_total,
-            baseline.fsqlite_compat_trace_callbacks_total + 1,
+        assert!(
+            snapshot.fsqlite_compat_trace_callbacks_total
+                > baseline.fsqlite_compat_trace_callbacks_total,
             "compat callback counter should still advance"
-        );
-        assert_eq!(
-            snapshot.fsqlite_trace_spans_total, baseline.fsqlite_trace_spans_total,
-            "without a compat-trace subscriber, no extra compat trace span should be counted"
         );
     }
 
@@ -136735,6 +140259,27 @@ mod pager_routing_tests {
     fn flush_retained_autocommit_for_cached_read_test(conn: &Connection) {
         let cx = conn.op_cx().unwrap();
         conn.flush_retained_autocommit_txn(&cx).unwrap();
+    }
+
+    fn open_connection_with_transient_retry(path: &str) -> Connection {
+        let started = std::time::Instant::now();
+        let mut attempt = 0_u32;
+        loop {
+            match Connection::open(path) {
+                Ok(conn) => return conn,
+                Err(err)
+                    if err.is_transient()
+                        && started.elapsed() < std::time::Duration::from_secs(10) =>
+                {
+                    attempt = attempt.saturating_add(1);
+                    std::thread::sleep(std::time::Duration::from_millis(1_u64 << attempt.min(6)));
+                }
+                Err(err) => panic!(
+                    "open {path} failed after {:?} and {attempt} retries: {err}",
+                    started.elapsed()
+                ),
+            }
+        }
     }
 
     #[test]
@@ -139284,6 +142829,7 @@ mod pager_routing_tests {
     #[test]
     fn test_same_table_concurrent_prepared_insert_reuse_across_rounds_preserves_all_rows_after_reopen()
      {
+        let _serial = super::fsqlite_core_test_serializer();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir
             .path()
@@ -139303,6 +142849,7 @@ mod pager_routing_tests {
                 FrankenError::Busy
                     | FrankenError::BusyRecovery
                     | FrankenError::BusySnapshot { .. }
+                    | FrankenError::DatabaseLocked { .. }
                     | FrankenError::WriteConflict { .. }
                     | FrankenError::SerializationFailure { .. }
             )
@@ -139313,7 +142860,7 @@ mod pager_routing_tests {
             for worker_idx in 0_i64..4 {
                 let db = db.clone();
                 handles.push(scope.spawn(move || {
-                    let conn = Connection::open(&db).unwrap();
+                    let conn = open_connection_with_transient_retry(&db);
                     conn.execute("PRAGMA busy_timeout=5000;").unwrap();
                     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
                     let insert = conn
@@ -139329,17 +142876,16 @@ mod pager_routing_tests {
                         let mut attempt = 0_u32;
                         loop {
                             attempt += 1;
-                            conn.execute("BEGIN CONCURRENT;").unwrap();
-
-                            let op_result = conn
-                                .execute_prepared_with_params(
+                            let op_result = conn.execute("BEGIN CONCURRENT;").and_then(|_| {
+                                conn.execute_prepared_with_params(
                                     &insert,
                                     &[
                                         SqliteValue::Integer(id),
                                         SqliteValue::Text(payload.clone().into()),
                                     ],
                                 )
-                                .and_then(|_| conn.execute("COMMIT;"));
+                                .and_then(|_| conn.execute("COMMIT;"))
+                            });
 
                             match op_result {
                                 Ok(_) => {
@@ -140049,6 +143595,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6741_simple_inner_join_uses_vdbe_storage_cursors() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_inner_join_vdbe_storage.db")?;
         conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")?;
         conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);")?;
@@ -140167,6 +143714,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6741_simple_derived_from_source_flattens_to_vdbe_storage_cursors() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) =
             open_t6751_file_backed_connection("strict_derived_from_vdbe_storage.db")?;
         conn.execute("CREATE TABLE orders (id INTEGER, customer TEXT, amount INTEGER);")?;
@@ -140289,6 +143837,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6741_left_join_uses_vdbe_storage_cursors() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) = open_t6751_file_backed_connection("strict_left_join_vdbe_storage.db")?;
         conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")?;
         conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, label TEXT);")?;
@@ -141082,6 +144631,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_t6751_named_window_partition_aggregate_logs_stage_lifecycle() -> Result<()> {
+        let _serial = super::fsqlite_core_test_serializer();
         let (_dir, conn) =
             open_t6751_file_backed_connection("strict_named_window_partition_aggregate_log.db")?;
         conn.execute("CREATE TABLE sales (region TEXT, day INTEGER, amount INTEGER);")?;
@@ -149895,9 +153445,9 @@ mod pager_routing_tests {
         );
 
         let profile = hot_path_profile_snapshot();
-        assert_eq!(
-            profile.direct_rowid_lookup_query_row_hits, 3,
-            "test must exercise the direct rowid query_row fast path: {profile:?}"
+        assert!(
+            profile.direct_rowid_lookup_query_row_hits >= 3,
+            "test must exercise the direct rowid query_row fast path at least three times: {profile:?}"
         );
     }
 
@@ -155798,6 +159348,74 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_replace_cleans_partial_and_expression_index_victims_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replace-index-victim-cleanup.db");
+        let db_str = db_path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE partial_t (a TEXT, b INTEGER UNIQUE, c INTEGER);
+                 CREATE INDEX partial_idx ON partial_t(a) WHERE c > 0;
+                 INSERT INTO partial_t VALUES ('victim', 1, 5);
+                 INSERT OR REPLACE INTO partial_t VALUES ('newrow', 1, 0);
+
+                 CREATE TABLE expression_t (a TEXT, b INTEGER UNIQUE);
+                 CREATE INDEX expression_idx ON expression_t(lower(a));
+                 INSERT INTO expression_t VALUES ('VICTIM', 1);
+                 INSERT OR REPLACE INTO expression_t VALUES ('other', 1);",
+            )
+            .unwrap();
+
+            assert_eq!(
+                conn.query("SELECT a, b, c FROM partial_t;").unwrap()[0].values(),
+                &[
+                    SqliteValue::Text("newrow".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(0),
+                ]
+            );
+            assert_eq!(
+                conn.query("SELECT a, b FROM expression_t;").unwrap()[0].values(),
+                &[SqliteValue::Text("other".into()), SqliteValue::Integer(1),]
+            );
+        }
+
+        let reopened = Connection::open(&db_str).unwrap();
+        assert_eq!(reopened.query("SELECT * FROM partial_t;").unwrap().len(), 1);
+        assert_eq!(
+            reopened.query("SELECT * FROM expression_t;").unwrap().len(),
+            1
+        );
+        drop(reopened);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let stale_partial: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM partial_t INDEXED BY partial_idx
+                 WHERE a = 'victim' AND c > 0;",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_partial, 0);
+        let stale_expression: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM expression_t INDEXED BY expression_idx
+                 WHERE lower(a) = 'victim';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_expression, 0);
+    }
+
+    #[test]
     fn test_replace_on_unique_multiple_columns() {
         // REPLACE should handle multiple UNIQUE columns — each conflicting row
         // gets deleted before insertion.
@@ -159032,6 +162650,268 @@ mod pager_routing_tests {
                 "idx_pragma_items_name".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn test_compound_order_by_collate_resolves() {
+        // GH #217-#221: a COLLATE-wrapped ORDER BY term in a compound SELECT must
+        // resolve (by output name, alias, or 1-based position) and sort with the
+        // collation instead of erroring "not found in SELECT list".
+        let conn = Connection::open(":memory:").unwrap();
+        for sql in [
+            "SELECT 'b' AS x UNION SELECT 'A' ORDER BY x COLLATE NOCASE",
+            "SELECT 'b' AS x UNION ALL SELECT 'A' ORDER BY x COLLATE NOCASE",
+            "SELECT 'b' UNION SELECT 'A' ORDER BY 1 COLLATE NOCASE",
+        ] {
+            let rows = conn.query(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(rows.len(), 2, "sql={sql}");
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Text("A".into()),
+                "sql={sql}"
+            );
+            assert_eq!(
+                rows[1].values()[0],
+                SqliteValue::Text("b".into()),
+                "sql={sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_order_by_collate_preserves_selected_expression_resolution() {
+        // A COLLATE-wrapped selected expression must remain resolvable through
+        // its inner output name. This guards the non-compound regression
+        // exposed while fixing GH #217-#221.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tags(tag TEXT COLLATE NOCASE);")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES ('beta'), ('Alpha'), ('alpha');")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT tag COLLATE BINARY, COUNT(*)
+                 FROM tags
+                 GROUP BY tag COLLATE BINARY
+                 ORDER BY tag COLLATE BINARY",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Text("Alpha".into()), SqliteValue::Integer(1),],
+                vec![SqliteValue::Text("alpha".into()), SqliteValue::Integer(1),],
+                vec![SqliteValue::Text("beta".into()), SqliteValue::Integer(1),],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_order_by_output_reference_precedence() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        // A 1-based ordinal must win over structural equality with a later
+        // selected integer literal, including when COLLATE wraps the ordinal.
+        for sql in [
+            "SELECT 2 AS sort_key, 1 AS literal_value
+             UNION ALL
+             SELECT 1, 1
+             ORDER BY 1",
+            "SELECT 2 AS sort_key, 1 AS literal_value
+             UNION ALL
+             SELECT 1, 1
+             ORDER BY 1 COLLATE BINARY",
+        ] {
+            let rows = conn
+                .query(sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>(),
+                vec![
+                    vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
+                    vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                ],
+                "sql={sql}"
+            );
+        }
+
+        // An output alias must likewise win over an earlier result expression
+        // that structurally matches the underlying source column.
+        conn.execute("CREATE TABLE order_aliases(source_value INTEGER, alias_value INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO order_aliases VALUES (2, 1), (1, 2);")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT source_value, alias_value AS source_value
+                 FROM order_aliases
+                 ORDER BY source_value",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pragma_table_info_excludes_generated_columns() {
+        // GH #240: table_info omits generated columns and renumbers cid over the
+        // remaining columns; table_xinfo still lists them at their real cid.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED, d INTEGER);",
+        )
+        .unwrap();
+        let info = conn.query("PRAGMA table_info(t);").unwrap();
+        let names: Vec<_> = info
+            .iter()
+            .map(|r| (r.values()[0].clone(), r.values()[1].clone()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (SqliteValue::Integer(0), SqliteValue::Text("a".into())),
+                (SqliteValue::Integer(1), SqliteValue::Text("d".into())),
+            ]
+        );
+        // xinfo still contains all three columns.
+        let xinfo = conn.query("PRAGMA table_xinfo(t);").unwrap();
+        assert_eq!(xinfo.len(), 3);
+    }
+
+    #[test]
+    fn test_create_index_name_collides_with_table_or_view() {
+        // GH #232: an index cannot reuse a table/view name, even with
+        // IF NOT EXISTS.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a);").unwrap();
+        conn.execute("CREATE TABLE x(b);").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM x;").unwrap();
+        assert!(
+            conn.execute("CREATE INDEX IF NOT EXISTS t ON x(b);")
+                .is_err()
+        );
+        assert!(conn.execute("CREATE INDEX v ON x(b);").is_err());
+        // A genuinely new index name still works.
+        conn.execute("CREATE INDEX ix ON x(b);").unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "ext-json")]
+    fn test_json_group_aggregate_order_by_and_distinct() {
+        // GH #266/#267/#268: json_group_array/object honor in-aggregate ORDER BY
+        // and DISTINCT.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3),(1),(1),(2);")
+            .unwrap();
+
+        let one = |sql: &str| -> String {
+            let rows = conn.query(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            match &rows[0].values()[0] {
+                SqliteValue::Text(s) => s.to_string(),
+                other => panic!("{sql}: expected text, got {other:?}"),
+            }
+        };
+
+        // #266: ORDER BY sorts the values (no dedup).
+        assert_eq!(
+            one("SELECT json_group_array(x ORDER BY x) FROM t"),
+            "[1,1,2,3]"
+        );
+        assert_eq!(
+            one("SELECT json_group_array(x ORDER BY x DESC) FROM t"),
+            "[3,2,1,1]"
+        );
+        // #268: DISTINCT dedups, preserving first-seen order.
+        assert_eq!(one("SELECT json_group_array(DISTINCT x) FROM t"), "[3,1,2]");
+        // DISTINCT + ORDER BY: dedup then sort.
+        assert_eq!(
+            one("SELECT json_group_array(DISTINCT x ORDER BY x) FROM t"),
+            "[1,2,3]"
+        );
+
+        // #267: json_group_object ORDER BY.
+        conn.execute("CREATE TABLE kv(k TEXT, v INTEGER);").unwrap();
+        conn.execute("INSERT INTO kv VALUES ('b',2),('a',1),('c',3);")
+            .unwrap();
+        assert_eq!(
+            one("SELECT json_group_object(k, v ORDER BY k) FROM kv"),
+            r#"{"a":1,"b":2,"c":3}"#
+        );
+    }
+
+    #[test]
+    fn test_row_value_is_between_distinct() {
+        // GH #170/#171/#243: NULL-safe row-value IS/IS NOT, lexicographic
+        // row-value BETWEEN, and row-value IS DISTINCT FROM.
+        let conn = Connection::open(":memory:").unwrap();
+        let b = |sql: &str| -> i64 {
+            let rows = conn.query(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            match &rows[0].values()[0] {
+                SqliteValue::Integer(n) => *n,
+                other => panic!("{sql}: expected int, got {other:?}"),
+            }
+        };
+        // #170: row-value IS / IS NOT are NULL-safe and componentwise.
+        assert_eq!(b("SELECT (1,NULL) IS (1,NULL)"), 1);
+        assert_eq!(b("SELECT (1,NULL) IS (1,2)"), 0);
+        assert_eq!(b("SELECT (1,2) IS NOT (1,3)"), 1);
+        // #171: row-value BETWEEN / NOT BETWEEN (lexicographic).
+        assert_eq!(b("SELECT (1,2) BETWEEN (1,1) AND (1,3)"), 1);
+        assert_eq!(b("SELECT (2,0) BETWEEN (1,1) AND (1,3)"), 0);
+        assert_eq!(b("SELECT (2,0) NOT BETWEEN (1,1) AND (1,3)"), 1);
+        // #243: row-value IS DISTINCT FROM (NULL-safe negation of IS).
+        assert_eq!(b("SELECT (1,NULL) IS DISTINCT FROM (1,NULL)"), 0);
+        assert_eq!(b("SELECT (1,NULL) IS DISTINCT FROM (1,2)"), 1);
+    }
+
+    #[test]
+    fn test_generated_column_cannot_be_primary_key() {
+        // GH #181: a generated column may not be part of the PRIMARY KEY.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(
+            conn.execute(
+                "CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED PRIMARY KEY);"
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "CREATE TABLE t2(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED, PRIMARY KEY(b));"
+            )
+            .is_err()
+        );
+        // A non-generated PK alongside a generated column is fine.
+        conn.execute(
+            "CREATE TABLE t3(a INTEGER PRIMARY KEY, b INTEGER GENERATED ALWAYS AS (a*2) STORED);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_foreign_key_check_unknown_table_errors() {
+        // GH #261: foreign_key_check on a nonexistent table errors instead of
+        // silently returning zero rows.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a);").unwrap();
+        assert!(
+            conn.query("PRAGMA foreign_key_check(nonexistent);")
+                .is_err()
+        );
+        // A valid table is accepted (no FKs -> empty result).
+        assert!(conn.query("PRAGMA foreign_key_check(t);").is_ok());
     }
 
     #[test]
@@ -163623,6 +167503,416 @@ mod pager_routing_tests {
             !opcodes.iter().any(|op| op == "AggStep" || op == "AggFinal"),
             "NOCASE COUNT(*) IN query should stay on the direct counter path: {opcodes:?}"
         );
+    }
+
+    #[test]
+    fn test_count_composite_index_rowid_subquery_streams_first_key_runs() {
+        fn scalar_count(conn: &Connection, sql: &str) -> i64 {
+            let rows = conn.query(sql).unwrap();
+            match rows.as_slice() {
+                [row] => match row.values() {
+                    [SqliteValue::Integer(value)] => *value,
+                    values => panic!("expected one integer count, got {values:?}"),
+                },
+                rows => panic!("expected one count row, got {rows:?}"),
+            }
+        }
+
+        // Exact CASS schema/query shape: the only messages index is the
+        // UNIQUE(conversation_id, idx) autoindex, while the RHS is the complete,
+        // naturally ordered conversations rowid stream.  Deliberate orphans
+        // must be excluded exactly like the reference inner join.
+        let conn = Connection::open(":memory:").unwrap();
+        for sql in [
+            "PRAGMA foreign_keys = OFF;",
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL
+            );",
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                body TEXT,
+                UNIQUE(conversation_id, idx)
+            );",
+            "INSERT INTO conversations VALUES (1, 'one'), (2, 'two'), (4, 'four');",
+            "INSERT INTO messages VALUES
+                (1, 1, 0, 'a'),
+                (2, 1, 1, 'b'),
+                (3, 2, 0, 'c'),
+                (4, 3, 0, 'orphan'),
+                (5, 5, 0, 'orphan too');",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        let cass_sql = "SELECT COUNT(*)
+            FROM messages INDEXED BY sqlite_autoindex_messages_1
+            WHERE conversation_id IN (SELECT rowid FROM conversations)";
+        let reference_sql = "SELECT COUNT(*)
+            FROM messages AS m
+            INNER JOIN conversations AS c ON c.rowid = m.conversation_id";
+        assert_eq!(scalar_count(&conn, cass_sql), 3);
+        assert_eq!(
+            scalar_count(&conn, cass_sql),
+            scalar_count(&conn, reference_sql)
+        );
+
+        let prepared = conn.prepare(cass_sql).unwrap();
+        let ops = prepared.program.ops();
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::CountIndexEqRun),
+            "composite first-key semijoin should count duplicate runs: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "sqlite_autoindex_messages_1")
+            }),
+            "the exact forced composite autoindex should drive the outer stream: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name == "conversations")
+            }),
+            "the RHS conversations rowid source should be scanned directly: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Table(name) if name == "messages")
+            }),
+            "the covering composite-index counter must never open the messages table: {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::OpenRead)
+                .count(),
+            2,
+            "only the outer index and RHS table should be opened: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op.opcode,
+                Opcode::OpenAutoindex | Opcode::Count | Opcode::AggStep | Opcode::AggFinal
+            )),
+            "the streaming counter must not materialize or enter generic aggregation: {ops:?}"
+        );
+
+        // Non-unique composite index, duplicate complete keys, nullable first
+        // keys, matching non-BINARY collation, and a descending trailing term.
+        // Only the first key controls the merge, so all of these are legitimate
+        // and NULL rows must be skipped before the integer comparison loop.
+        let nonunique = Connection::open(":memory:").unwrap();
+        for sql in [
+            "CREATE TABLE allowed_buckets (id INTEGER PRIMARY KEY);",
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                bucket_id INTEGER COLLATE NOCASE,
+                position INTEGER NOT NULL,
+                payload TEXT
+            );",
+            "CREATE INDEX idx_events_bucket_position
+                ON events(bucket_id COLLATE NOCASE, position DESC);",
+            "INSERT INTO allowed_buckets VALUES (1), (3);",
+            "INSERT INTO events VALUES
+                (1, NULL, 9, 'null'),
+                (2, 1, 5, 'a'),
+                (3, 1, 5, 'duplicate full key'),
+                (4, 2, 8, 'excluded'),
+                (5, 3, 7, 'b'),
+                (6, 3, 6, 'c');",
+        ] {
+            nonunique.execute(sql).unwrap();
+        }
+        let nonunique_sql = "SELECT COUNT(*)
+            FROM events INDEXED BY idx_events_bucket_position
+            WHERE bucket_id IN (SELECT rowid FROM allowed_buckets)";
+        let nonunique_reference = "SELECT COUNT(*)
+            FROM events AS e
+            INNER JOIN allowed_buckets AS b ON b.rowid = e.bucket_id";
+        assert_eq!(scalar_count(&nonunique, nonunique_sql), 4);
+        assert_eq!(
+            scalar_count(&nonunique, nonunique_sql),
+            scalar_count(&nonunique, nonunique_reference)
+        );
+        let nonunique_ops = nonunique.prepare(nonunique_sql).unwrap();
+        let nonunique_ops = nonunique_ops.program.ops();
+        assert!(
+            nonunique_ops
+                .iter()
+                .any(|op| op.opcode == Opcode::CountIndexEqRun),
+            "non-unique composite first-key runs should use the fused counter: {nonunique_ops:?}"
+        );
+        assert!(
+            nonunique_ops.iter().any(|op| op.opcode == Opcode::IsNull),
+            "nullable first keys need an explicit NULL skip: {nonunique_ops:?}"
+        );
+        assert!(
+            !nonunique_ops
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "matching NOCASE semantics must remain on the direct merge: {nonunique_ops:?}"
+        );
+
+        // The list/materialized-probe path deliberately remains single-key.
+        // Its `(key, min-rowid)` seek record is not a valid lower bound for a
+        // `(key, trailing-key, rowid)` composite index.
+        let list_sql = "SELECT COUNT(*)
+            FROM messages INDEXED BY sqlite_autoindex_messages_1
+            WHERE conversation_id IN (1, 2, 4, 6, 7, 8, 9, 10)";
+        assert_eq!(scalar_count(&conn, list_sql), 3);
+        let list_ops = explain_opcodes(&conn, list_sql);
+        assert!(
+            !list_ops
+                .iter()
+                .any(|op| op == "CountIndexEqRun" || op == "SeekGE"),
+            "composite IN-list must not enter the single-key probe-record path: {list_ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_count_composite_index_rowid_subquery_counts_each_run_once_file_backed() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        let conn = Connection::open(path).unwrap();
+        for sql in [
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                body TEXT,
+                UNIQUE(conversation_id, idx)
+            );",
+            "INSERT INTO conversations VALUES (1, 'one');",
+            "INSERT INTO messages VALUES
+                (1, 1, 0, 'zero'),
+                (2, 1, 1, 'one'),
+                (3, 1, 2, 'two'),
+                (4, 1, 3, 'three'),
+                (5, 1, 4, 'four');",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        let sql = "SELECT COUNT(*)
+            FROM messages INDEXED BY sqlite_autoindex_messages_1
+            WHERE conversation_id IN (SELECT rowid FROM conversations)";
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(
+            rows[0].values,
+            vec![SqliteValue::Integer(5)],
+            "a five-row equality run must contribute five, not the triangular sum fifteen"
+        );
+
+        let opcodes = explain_opcodes(&conn, sql);
+        assert_eq!(
+            opcodes
+                .iter()
+                .filter(|opcode| opcode.as_str() == "CountIndexEqRun")
+                .count(),
+            1,
+            "the merge program should contain one fused run counter: {opcodes:?}"
+        );
+        let count_pos = first_opcode_position(&opcodes, "CountIndexEqRun").unwrap();
+        assert_eq!(
+            opcodes.get(count_pos + 1).map(String::as_str),
+            Some("IfNullRow"),
+            "the run counter must test its advanced outer cursor before moving the probe source: {opcodes:?}"
+        );
+    }
+
+    #[test]
+    fn test_temp_sparse_ipk_driver_join_preserves_all_parameterized_values() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE VIRTUAL TABLE fts_messages
+             USING fts5(body, content='');",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO fts_messages(rowid, body) VALUES (1, 'seed');")
+            .unwrap();
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS cass_fts_repair_probe_ids(
+                id INTEGER PRIMARY KEY
+            );",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM cass_fts_repair_probe_ids;")
+            .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO cass_fts_repair_probe_ids(id) VALUES(?1),(?2);",
+            &[SqliteValue::Integer(1_000_000), SqliteValue::Integer(1)],
+        )
+        .unwrap();
+        for rowid in [500_000_i64, 1_000_000] {
+            conn.execute_with_params(
+                "INSERT INTO fts_messages_docsize(id, sz)
+                 SELECT ?1, sz FROM fts_messages_docsize WHERE id = ?2;",
+                &[SqliteValue::Integer(rowid), SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        }
+
+        let requested = conn
+            .query("SELECT id FROM cass_fts_repair_probe_ids ORDER BY id;")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested,
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1_000_000)],
+            "the parameterized multi-row VALUES insert must preserve both sparse IPKs"
+        );
+
+        let mut joined = conn
+            .query(
+                "SELECT f.id
+                 FROM cass_fts_repair_probe_ids AS requested
+                 INNER JOIN fts_messages_docsize AS f ON f.id = requested.id;",
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| match row.values[0] {
+                SqliteValue::Integer(value) => value,
+                ref other => panic!("expected integer FTS shadow rowid, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        joined.sort_unstable();
+        assert_eq!(
+            joined,
+            vec![1, 1_000_000],
+            "the sparse TEMP-IPK repair driver must find every requested FTS shadow row"
+        );
+    }
+
+    #[test]
+    fn test_temp_table_ddl_never_allocates_unowned_main_database_pages() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_string_lossy().into_owned();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE durable(
+                id INTEGER PRIMARY KEY,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO durable VALUES (1, 'seed', 'main');")
+            .unwrap();
+        let before = conn.query("PRAGMA page_count;").unwrap()[0].values()[0].to_integer();
+
+        conn.execute(
+            "CREATE TEMP TABLE repair_probe(
+                id INTEGER PRIMARY KEY,
+                external_id TEXT UNIQUE,
+                ordinal INTEGER,
+                tag TEXT,
+                UNIQUE(ordinal, external_id)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repair_probe VALUES
+                (1000000, 'high', 2, 'alpha'),
+                (1, 'low', 1, 'beta');",
+        )
+        .unwrap();
+        let rows = conn
+            .query("SELECT id FROM repair_probe ORDER BY ordinal;")
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1_000_000)]
+        );
+        conn.execute("CREATE INDEX temp.idx_repair_ordinal ON repair_probe(ordinal);")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX temp.idx_repair_tag ON repair_probe(tag);")
+            .unwrap();
+        assert!(
+            conn.execute("INSERT INTO repair_probe VALUES (2, 'other', 3, 'alpha');")
+                .is_err(),
+            "TEMP UNIQUE indexes must reject duplicate keys without a pager B-tree"
+        );
+        conn.execute("DROP INDEX temp.idx_repair_tag;").unwrap();
+        conn.execute("INSERT INTO repair_probe VALUES (2, 'other', 3, 'alpha');")
+            .unwrap();
+        conn.execute("DROP INDEX temp.idx_repair_ordinal;").unwrap();
+        let after = conn.query("PRAGMA page_count;").unwrap()[0].values()[0].to_integer();
+        assert_eq!(
+            after, before,
+            "TEMP table roots and implicit indexes must not consume main-database pages"
+        );
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(temp.path()).unwrap();
+        let quick: String = sqlite
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = sqlite
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick, "ok");
+        assert_eq!(integrity, "ok");
+        let leaked: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='repair_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "TEMP catalog entries must remain connection-local"
+        );
+    }
+
+    #[test]
+    fn test_count_composite_index_rowid_subquery_rejects_unsafe_index_shapes() {
+        let conn = Connection::open(":memory:").unwrap();
+        for sql in [
+            "CREATE TABLE probe_ids (id INTEGER PRIMARY KEY);",
+            "INSERT INTO probe_ids VALUES (1), (3);",
+            "CREATE TABLE desc_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_desc_items ON desc_items(k DESC, seq);",
+            "CREATE TABLE partial_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_partial_items ON partial_items(k, seq) WHERE seq >= 0;",
+            "CREATE TABLE expression_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_expression_items ON expression_items((k + 0), seq);",
+            "CREATE TABLE collated_items (id INTEGER PRIMARY KEY, k INTEGER, seq INTEGER);",
+            "CREATE INDEX idx_collated_items ON collated_items(k, seq);",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        let rejected = [
+            "SELECT COUNT(*) FROM desc_items
+                WHERE k IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM partial_items
+                WHERE k IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM expression_items
+                WHERE (k + 0) IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM collated_items
+                WHERE k COLLATE NOCASE IN (SELECT rowid FROM probe_ids)",
+            "SELECT COUNT(*) FROM collated_items NOT INDEXED
+                WHERE k IN (SELECT rowid FROM probe_ids)",
+        ];
+        for sql in rejected {
+            let opcodes = explain_opcodes(&conn, sql);
+            assert!(
+                !opcodes.iter().any(|op| op == "CountIndexEqRun"),
+                "unsafe DESC/expression/partial/collation/NOT INDEXED shape must decline the composite-run counter for `{sql}`: {opcodes:?}"
+            );
+        }
     }
 
     #[test]
@@ -189565,7 +193855,14 @@ mod pager_routing_tests {
                     )?;
                 }
                 conn_a.execute("COMMIT;")?;
-                conn_a.close()?;
+                // The regression boundary is the concurrent COMMIT above.
+                // Avoid a close-time passive checkpoint while B is still
+                // racing: a transient checkpoint Busy is unrelated to the
+                // validate→publish invariant and must not masquerade as a
+                // commit failure. The canonical SQLite oracle below opens the
+                // database with its WAL still present and validates the full
+                // durable image.
+                conn_a.close_without_checkpoint()?;
                 Ok(())
             })();
             let _ = a_done_tx.send(res);
@@ -189609,12 +193906,12 @@ mod pager_routing_tests {
             // Best-effort close on success; on a snapshot/busy conflict the
             // transaction is already torn down by the engine.
             if res.is_ok() {
-                conn_b.close().unwrap();
+                conn_b.close_without_checkpoint().unwrap();
             } else {
                 // Roll back any partial uncommitted state so the file is clean
                 // for the canonical-SQLite oracle read.
                 let _ = conn_b.execute("ROLLBACK;");
-                conn_b.close().unwrap();
+                conn_b.close_without_checkpoint().unwrap();
             }
             let _ = b_done_tx.send(res);
         });
@@ -189732,7 +194029,7 @@ mod pager_routing_tests {
                 let db = db_path.clone();
                 let barrier = Arc::clone(&start_barrier);
                 handles.push(std::thread::spawn(move || {
-                    let conn = Connection::open(&db).unwrap();
+                    let conn = open_connection_with_transient_retry(&db);
                     conn.execute("PRAGMA busy_timeout=2000;").unwrap();
                     barrier.wait();
                     for txn_idx in 0..TXNS_PER_WORKER {
@@ -189780,7 +194077,7 @@ mod pager_routing_tests {
                             }
                         }
                     }
-                    conn.close().unwrap();
+                    conn.close_without_checkpoint().unwrap();
                 }));
             }
             for handle in handles {

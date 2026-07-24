@@ -14,7 +14,7 @@
 //!    can use cell-delta frames (~100-200 bytes each) instead of full pages.
 //!
 //! This module provides the integration layer to:
-//! - Extract cell deltas from [`CellVisibilityLog`] at commit time
+//! - Extract cell deltas from `CellVisibilityLog` at commit time
 //! - Serialize them to [`CellDeltaWalFrame`] format
 //! - Append them to WAL alongside (or instead of) full-page frames
 //! - Support mixed commits with both frame types
@@ -42,7 +42,7 @@
 //! During WAL recovery:
 //! 1. Read the first 4-byte marker word
 //! 2. Full-page frames: Apply to page cache (existing path)
-//! 3. Cell-delta frames: Insert into [`CellVisibilityLog`], then materialize
+//! 3. Cell-delta frames: Insert into `CellVisibilityLog`, then materialize
 //!
 //! # Atomicity Guarantee
 //!

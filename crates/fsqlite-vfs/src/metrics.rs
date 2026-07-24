@@ -260,35 +260,52 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.file_identity()
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        GLOBAL_VFS_METRICS.read_ops.fetch_add(1, Ordering::Relaxed);
-        let bytes_requested = buf.len() as u64;
-        let result = vfs_trace_op!(
-            "read",
-            &*self.path,
-            bytes_requested,
-            self.inner.read(cx, buf, offset)
-        );
-        if let Ok(n) = &result {
-            GLOBAL_VFS_METRICS
-                .read_bytes_total
-                .fetch_add(*n as u64, Ordering::Relaxed);
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            GLOBAL_VFS_METRICS.read_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes_requested = buf.len() as u64;
+            let result = vfs_trace_op!(
+                "read_async",
+                &*self.path,
+                bytes_requested,
+                self.inner.read(cx, buf, offset).await
+            );
+            if let Ok(read) = &result {
+                GLOBAL_VFS_METRICS
+                    .read_bytes_total
+                    .fetch_add(*read as u64, Ordering::Relaxed);
+            }
+            result
         }
-        result
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
-        let bytes = buf.len() as u64;
-        GLOBAL_VFS_METRICS
-            .write_bytes_total
-            .fetch_add(bytes, Ordering::Relaxed);
-        vfs_trace_op!(
-            "write",
-            &*self.path,
-            bytes,
-            self.inner.write(cx, buf, offset)
-        )
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+            let bytes = buf.len() as u64;
+            let result = vfs_trace_op!(
+                "write_async",
+                &*self.path,
+                bytes,
+                self.inner.write(cx, buf, offset).await
+            );
+            if result.is_ok() {
+                GLOBAL_VFS_METRICS
+                    .write_bytes_total
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -365,9 +382,15 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
     }
 }
 
-impl<F: VfsFile + crate::traits::AsyncVfsDataPath> crate::traits::AsyncVfsDataPath
-    for TracingFile<F>
-{
+#[cfg(test)]
+impl<F: VfsFile> TracingFile<F> {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
+    }
+
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
+    }
 }
 
 // TracingFile is Send+Sync automatically because F: VfsFile requires Send+Sync
@@ -621,7 +644,11 @@ mod tests {
 
         // Read through inner.
         let mut buf = [0u8; 4];
-        let n = traced.inner_mut().read(&cx, &mut buf, 0).unwrap();
+        let n = crate::block_on_test_io(
+            &cx,
+            <crate::memory::MemoryFile as VfsFile>::read(traced.inner_mut(), &cx, &mut buf, 0),
+        )
+        .unwrap();
         assert_eq!(n, 4);
         assert_eq!(&buf, b"test");
     }

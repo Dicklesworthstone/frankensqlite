@@ -79,7 +79,7 @@ fn run_backpressure_scenario(
     mgr.commit(&mut seed).expect("seed commit");
 
     let mut pinned_reader = mgr.begin(BeginKind::Concurrent).expect("reader begin");
-    let _ = mgr.read_page(&mut pinned_reader, pgno);
+    let _ = mgr.read_page(&mut pinned_reader, pgno).unwrap();
 
     let before = GLOBAL_EBR_METRICS.snapshot();
     let mut saw_busy = false;

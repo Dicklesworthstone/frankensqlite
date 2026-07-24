@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_e2e::logging::init_logging;
 use fsqlite_types::SqliteValue;
@@ -23,6 +23,7 @@ const CHILD_MODE_ENV: &str = "FSQLITE_BD_3WOP3_1_2_MODE";
 const CHILD_RUN_DIR_ENV: &str = "FSQLITE_BD_3WOP3_1_2_RUN_DIR";
 const REPORT_ARTIFACT_ENV: &str = "FSQLITE_BD_3WOP3_1_2_ARTIFACT";
 const RUN_ROOT_ENV: &str = "FSQLITE_BD_3WOP3_1_2_RUN_ROOT";
+const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(10);
 
 static E2E_LOCK: Mutex<()> = Mutex::new(());
 
@@ -53,21 +54,64 @@ struct LaneRunSummary {
     required_fields: BTreeMap<String, bool>,
 }
 
+fn is_lock_contention(error: &fsqlite::FrankenError) -> bool {
+    matches!(
+        error,
+        fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::DatabaseLocked { .. }
+    )
+}
+
+fn retry_lock_contention<T>(
+    context: &str,
+    mut operation: impl FnMut() -> Result<T, fsqlite::FrankenError>,
+) -> Result<T, String> {
+    let started = Instant::now();
+    let mut attempt = 0_u32;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_lock_contention(&error) && started.elapsed() < OPEN_RETRY_BUDGET => {
+                attempt = attempt.saturating_add(1);
+                thread::sleep(Duration::from_millis(1_u64 << attempt.min(5)));
+            }
+            Err(error) => {
+                return Err(format!("{context} after {:?}: {error}", started.elapsed()));
+            }
+        }
+    }
+}
+
+fn try_open_connection(path: &Path) -> Result<fsqlite::Connection, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("database path is not UTF-8: {}", path.display()))?;
+    let conn = retry_lock_contention("open FrankenSQLite connection", || {
+        fsqlite::Connection::open(path)
+    })?;
+    retry_lock_contention("enable WAL mode", || {
+        conn.execute("PRAGMA journal_mode=WAL;").map(|_| ())
+    })?;
+    if !conn.is_concurrent_mode_default() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=concurrent_mode_default_guard"
+        ));
+    }
+    Ok(conn)
+}
+
 fn open_connection(path: &Path) -> fsqlite::Connection {
-    let conn = fsqlite::Connection::open(path.to_str().expect("utf-8 db path"))
-        .expect("open FrankenSQLite connection");
-    conn.execute("PRAGMA journal_mode=WAL;")
-        .expect("enable WAL mode");
-    assert!(
-        conn.is_concurrent_mode_default(),
-        "bead_id={BEAD_ID} case=concurrent_mode_default_guard"
-    );
-    conn
+    try_open_connection(path).unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barrier>) {
-    let conn = open_connection(path);
+    // Always rendezvous, even when connection setup fails.  Otherwise the
+    // healthy peer can block forever at the barrier and hide the real error.
+    let conn = try_open_connection(path);
     barrier.wait();
+    let conn = conn.unwrap_or_else(|error| panic!("{error}"));
     conn.execute("BEGIN CONCURRENT;")
         .expect("begin concurrent transaction");
     conn.execute(&format!(
@@ -75,7 +119,13 @@ fn insert_row(path: &Path, table_name: &'static str, id: i64, barrier: Arc<Barri
     ))
     .expect("insert row");
     conn.execute("COMMIT;").expect("commit transaction");
-    conn.close().expect("close writer connection");
+    // The peer writer can still own the WAL checkpoint lock here.  The
+    // durability boundary under test is the successful COMMIT above; making
+    // this helper run a passive close-time checkpoint introduces an unrelated
+    // transient SQLITE_BUSY race.  Preserve the committed WAL frames and let
+    // `fetch_final_rows` exercise recovery plus the final uncontended close.
+    conn.close_without_checkpoint()
+        .expect("close writer connection without checkpoint");
 }
 
 fn fetch_final_rows(path: &Path) -> Vec<FinalRow> {

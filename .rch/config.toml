@@ -1,0 +1,51 @@
+# FrankenSQLite's E2E library tests load small, tracked campaign manifests and
+# fixture metadata from sample_sqlite_db_files/.  The fleet-wide RCH config
+# excludes that whole tree because local golden/working databases can be huge,
+# so this project override narrows the exclusion to generated artifacts while
+# keeping the tracked fixture contract available on remote workers.
+
+[transfer]
+exclude_patterns = [
+    "*.rlib",
+    "*.rmeta",
+    # Keep the tracked issue ledger available: several compliance tests read
+    # .beads/issues.jsonl.  Exclude only Beads' mutable runtime state.
+    ".beads/.br_recovery/",
+    ".beads/.write.lock",
+    ".beads/beads.db",
+    ".beads/beads.db-*",
+    ".bun/",
+    ".rch-target-*/",
+    ".rch-target*/",
+    ".cargo-target-*/",
+    ".cargo-target-rusticmill/",
+    ".cargo-target/",
+    ".core.*",
+    ".git/objects/",
+    ".next/",
+    ".npm/",
+    ".nuxt/",
+    ".nyc_output/",
+    ".parcel-cache/",
+    ".pnpm-store/",
+    ".turbo/",
+    "build/",
+    "core.[0-9]*",
+    "coverage/",
+    "dist/",
+    "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/",
+    "node_modules/",
+    "perf.data",
+    "perf.data.old",
+    "perf_hsmm.data",
+    "perf_hsmm.data.old",
+    "process_triage/",
+    "sample_sqlite_db_files/golden/",
+    "sample_sqlite_db_files/recordings/",
+    "sample_sqlite_db_files/runs/",
+    "sample_sqlite_db_files/working/",
+    "target-*/",
+    "target/",
+    "target_*/",
+    "tests/artifacts/",
+]

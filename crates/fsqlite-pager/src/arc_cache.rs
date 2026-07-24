@@ -1669,7 +1669,7 @@ impl std::fmt::Debug for ArcCache {
 /// Data-less ARC ordering core for victim selection.
 ///
 /// Mirrors [`ArcCacheInner`]'s REQUEST + REPLACE + adaptive-`p` logic over bare
-/// [`PageNumber`]s. It reuses the same [`IntrusiveList`]/[`Location`] machinery
+/// [`PageNumber`]s. It reuses the same `IntrusiveList`/`Location` machinery
 /// and the same algorithm, but carries **no** page data, pin counts, MVCC
 /// version chains, or byte accounting — only the recency/frequency ordering
 /// needed to decide *which* page ARC would evict next.
@@ -1833,7 +1833,7 @@ impl ArcEvictionModel {
 
     /// Return the page ARC's REPLACE rule would evict next, without mutating.
     ///
-    /// Faithful to [`ArcCacheInner::replace`]'s primary branch: prefer the T1
+    /// Faithful to `ArcCacheInner::replace`'s primary branch: prefer the T1
     /// LRU when `|T1| > p` (recency overflow), otherwise the T2 LRU, with the
     /// opposite list as fallback. Returns `None` only when both lists are empty.
     #[must_use]

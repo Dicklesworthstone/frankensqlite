@@ -55,11 +55,18 @@ fn has_op(c: &Connection, sql: &str, prefix: &str) -> bool {
 fn check(f: &Connection, r: &rusqlite::Connection, dml: &str, no_rewind: Option<bool>) {
     setup(f, r);
     match no_rewind {
-        Some(true) => assert!(!has_op(f, dml, "Rewind"), "rowid-eq DML must not full-scan Pass 1 (Rewind): `{dml}`"),
-        Some(false) => assert!(has_op(f, dml, "Rewind"), "control should full-scan (Rewind): `{dml}`"),
+        Some(true) => assert!(
+            !has_op(f, dml, "Rewind"),
+            "rowid-eq DML must not full-scan Pass 1 (Rewind): `{dml}`"
+        ),
+        Some(false) => assert!(
+            has_op(f, dml, "Rewind"),
+            "control should full-scan (Rewind): `{dml}`"
+        ),
         None => {}
     }
-    f.execute(dml).unwrap_or_else(|e| panic!("frank `{dml}`: {e}"));
+    f.execute(dml)
+        .unwrap_or_else(|e| panic!("frank `{dml}`: {e}"));
     r.execute_batch(dml).unwrap();
     assert_eq!(state_f(f), state_r(r), "table state diverged after `{dml}`");
 }
@@ -80,13 +87,43 @@ fn dml_rowid_eq_coerced_matches_sqlite() {
     check(&f, &r, "DELETE FROM t WHERE id = 3.5", Some(true)); // non-exact -> nothing
 
     // UPDATE: same coercion cases; the SET rewrites x so a wrong row would corrupt state.
-    check(&f, &r, "UPDATE t SET x = x + 1000 WHERE id = 20", Some(true)); // int literal
-    check(&f, &r, "UPDATE t SET x = x + 1000 WHERE id = 20.0", Some(true)); // exact real -> row 20
-    check(&f, &r, "UPDATE t SET x = x + 1000 WHERE id = 2.5", Some(true)); // non-exact -> nothing (was row 2)
-    check(&f, &r, "UPDATE t SET x = x + 1000 WHERE id = '30'", Some(true)); // numeric text -> row 30
-    check(&f, &r, "UPDATE t SET x = x + 1000 WHERE id = 'xyz'", Some(true)); // non-numeric -> nothing
+    check(
+        &f,
+        &r,
+        "UPDATE t SET x = x + 1000 WHERE id = 20",
+        Some(true),
+    ); // int literal
+    check(
+        &f,
+        &r,
+        "UPDATE t SET x = x + 1000 WHERE id = 20.0",
+        Some(true),
+    ); // exact real -> row 20
+    check(
+        &f,
+        &r,
+        "UPDATE t SET x = x + 1000 WHERE id = 2.5",
+        Some(true),
+    ); // non-exact -> nothing (was row 2)
+    check(
+        &f,
+        &r,
+        "UPDATE t SET x = x + 1000 WHERE id = '30'",
+        Some(true),
+    ); // numeric text -> row 30
+    check(
+        &f,
+        &r,
+        "UPDATE t SET x = x + 1000 WHERE id = 'xyz'",
+        Some(true),
+    ); // non-numeric -> nothing
     // Rowid-rewriting UPDATE (Halloween safety) with a coerced key.
-    check(&f, &r, "UPDATE t SET id = id + 10000 WHERE id = 7.0", Some(true)); // exact real -> rewrite row 7
+    check(
+        &f,
+        &r,
+        "UPDATE t SET id = id + 10000 WHERE id = 7.0",
+        Some(true),
+    ); // exact real -> rewrite row 7
 
     // Control: a non-rowid predicate still full-scans.
     check(&f, &r, "DELETE FROM t WHERE x = 100", Some(false)); // x[10]=100 -> deletes row 10

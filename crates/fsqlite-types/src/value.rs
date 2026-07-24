@@ -264,7 +264,7 @@ impl SmallText {
         }
     }
 
-    /// Create from an Arc<str>, avoiding re-allocation if already heap.
+    /// Create from an `Arc<str>`, avoiding re-allocation if already heap.
     #[inline]
     pub fn from_arc(arc: Arc<str>) -> Self {
         if arc.len() <= SMALL_TEXT_INLINE_CAP {
@@ -371,7 +371,7 @@ impl SmallText {
         matches!(&self.repr, SmallTextRepr::Inline { .. })
     }
 
-    /// Convert to Arc<str>, potentially allocating if currently inline.
+    /// Convert to `Arc<str>`, potentially allocating if currently inline.
     #[inline]
     pub fn into_arc(self) -> Arc<str> {
         match self.repr {

@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use asupersync::runtime::spawn_blocking_io;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -68,6 +69,108 @@ fn checked_io_offset(offset: u64, total: usize, op: &'static str) -> Result<u64>
     offset
         .checked_add(total)
         .ok_or_else(|| invalid_io_input(format!("offset overflow during unix vfs {op}")))
+}
+
+fn blocking_io_offset(offset: u64, total: usize, op: &'static str) -> io::Result<u64> {
+    let total = u64::try_from(total)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "I/O offset is too large"))?;
+    offset.checked_add(total).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("offset overflow during async unix vfs {op}"),
+        )
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn read_owned_at(file: Arc<File>, len: usize, offset: u64) -> io::Result<(Vec<u8>, usize)> {
+    let mut data = vec![0_u8; len];
+    let mut total = 0_usize;
+    while total < data.len() {
+        let current = blocking_io_offset(offset, total, "read")?;
+        match file.read_at(&mut data[total..], current) {
+            Ok(0) => break,
+            Ok(read) => total += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((data, total))
+}
+
+#[allow(clippy::needless_pass_by_value)] // owns closure inputs for spawn_blocking_io
+fn write_owned_at(file: Arc<File>, data: Vec<u8>, offset: u64) -> io::Result<()> {
+    let mut total = 0_usize;
+    while total < data.len() {
+        let current = blocking_io_offset(offset, total, "write")?;
+        match file.write_at(&data[total..], current) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "async unix vfs write_at returned 0",
+                ));
+            }
+            Ok(written) => total += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Write the whole buffer at `offset`, retrying short writes and `EINTR`.
+///
+/// GH #200: `pwrite(2)` can be interrupted by a signal at any iteration,
+/// including after earlier iterations already wrote a prefix of the buffer.
+/// Returning `Interrupted` at that point reports a retryable error while
+/// leaving a torn write behind, so interruption is retried in place with
+/// partial progress preserved.
+fn write_full_at<W>(mut write_at: W, buf: &[u8], offset: u64, what: &'static str) -> Result<()>
+where
+    W: FnMut(&[u8], u64) -> std::io::Result<usize>,
+{
+    let mut total = 0_usize;
+    while total < buf.len() {
+        let off = checked_io_offset(offset, total, what)?;
+        match write_at(&buf[total..], off) {
+            Ok(0) => {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!("unix vfs {what} write_at returned 0"),
+                )));
+            }
+            Ok(n) => {
+                total += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(FrankenError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Read into the whole buffer at `offset`, retrying short reads and `EINTR`.
+///
+/// Returns the number of bytes read before EOF (GH #200: interruption is
+/// retried in place instead of surfacing `Interrupted` mid-buffer).
+#[cfg(test)]
+fn read_full_at<R>(mut read_at: R, buf: &mut [u8], offset: u64, what: &'static str) -> Result<usize>
+where
+    R: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+{
+    let mut total = 0_usize;
+    while total < buf.len() {
+        let off = checked_io_offset(offset, total, what)?;
+        match read_at(&mut buf[total..], off) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                total += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(FrankenError::Io(e)),
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -1069,6 +1172,13 @@ impl UnixFile {
             .expect("open UnixFile must retain its canonical descriptor")
     }
 
+    pub(crate) fn canonical_file(&self) -> Result<Arc<File>> {
+        self.file
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| FrankenError::internal("unix file is closed"))
+    }
+
     fn inode_info_ref(&self) -> &Arc<Mutex<InodeInfo>> {
         self.inode_info
             .as_ref()
@@ -1779,21 +1889,12 @@ impl UnixFile {
         let n_page = u32::try_from(n_page_u64).unwrap_or(u32::MAX);
 
         let header = build_empty_sqlite_wal_shm_header(page_size, n_page)?;
-        let mut written = 0_usize;
-        while written < header.len() {
-            #[allow(clippy::cast_possible_truncation)]
-            let offset = u64::try_from(written).expect("header write offset fits u64");
-            let n = shm_file
-                .write_at(&header[written..], offset)
-                .map_err(FrankenError::Io)?;
-            if n == 0 {
-                return Err(FrankenError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "unix vfs shm header write_at returned 0",
-                )));
-            }
-            written += n;
-        }
+        write_full_at(
+            |src, off| shm_file.write_at(src, off),
+            &header,
+            0,
+            "shm header",
+        )?;
 
         let mut verify = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
         let verify_read = shm_file.read_at(&mut verify, 0).map_err(FrankenError::Io)?;
@@ -1849,50 +1950,50 @@ impl VfsFile for UnixFile {
         Ok(Some(self.inode_key))
     }
 
-    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "read")?;
-        let mut total = 0_usize;
-        while total < buf.len() {
-            let off = checked_io_offset(offset, total, "read")?;
-            let n = self
-                .file_ref()
-                .read_at(&mut buf[total..], off)
+    fn read<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "read")?;
+            let file = Arc::clone(
+                self.file
+                    .as_ref()
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+            );
+            let requested = buf.len();
+            let (data, total) = spawn_blocking_io(move || read_owned_at(file, requested, offset))
+                .await
                 .map_err(FrankenError::Io)?;
-            if n == 0 {
-                break; // EOF
-            }
-            total += n;
+            checkpoint_or_abort(cx)?;
+            buf.copy_from_slice(&data);
+            Ok(total)
         }
-
-        // Zero-fill short reads (SQLite requirement).
-        if total < buf.len() {
-            buf[total..].fill(0);
-        }
-
-        Ok(total)
     }
 
-    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
-        checkpoint_or_abort(cx)?;
-        checked_io_range(offset, buf.len(), "write")?;
-        let mut total = 0_usize;
-        while total < buf.len() {
-            let off = checked_io_offset(offset, total, "write")?;
-            match self.file_ref().write_at(&buf[total..], off) {
-                Ok(0) => {
-                    return Err(FrankenError::Io(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "unix vfs write_at returned 0",
-                    )));
-                }
-                Ok(n) => {
-                    total += n;
-                }
-                Err(e) => return Err(FrankenError::Io(e)),
-            }
+    fn write<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "write")?;
+            let file = Arc::clone(
+                self.file
+                    .as_ref()
+                    .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+            );
+            let data = buf.to_vec();
+            spawn_blocking_io(move || write_owned_at(file, data, offset))
+                .await
+                .map_err(FrankenError::Io)?;
+            checkpoint_or_abort(cx)
         }
-        Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
@@ -2322,7 +2423,16 @@ impl VfsFile for UnixFile {
     }
 }
 
-impl crate::traits::AsyncVfsDataPath for UnixFile {}
+#[cfg(test)]
+impl UnixFile {
+    fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::read(self, cx, buf, offset))
+    }
+
+    fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        crate::block_on_test_io(cx, <Self as VfsFile>::write(self, cx, buf, offset))
+    }
+}
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
@@ -3747,7 +3857,7 @@ mod tests {
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("write_overflow.db");
 
-        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         let err = file.write(&cx, &[1, 2], u64::MAX).unwrap_err();
         assert_invalid_input_error(err, "offset overflow during unix vfs write");
     }
@@ -4111,5 +4221,92 @@ mod tests {
         reader.shm_unmap(&cx, true).unwrap();
         writer.close(&cx).unwrap();
         reader.close(&cx).unwrap();
+    }
+
+    // -- GH #200: EINTR mid-buffer must be retried with progress preserved --
+
+    #[test]
+    fn test_write_full_at_retries_eintr_after_partial_progress() {
+        // Schedule from the issue: Ok(2048), Interrupted, Ok(2048) for a
+        // 4096-byte positional write. The interruption must be retried and
+        // the full buffer written.
+        let buf = vec![0xAB_u8; 4096];
+        let mut sink = vec![0_u8; 4096];
+        let mut calls = 0_usize;
+        {
+            let sink = std::cell::RefCell::new(&mut sink);
+            let result = write_full_at(
+                |src, off| {
+                    calls += 1;
+                    match calls {
+                        1 => {
+                            assert_eq!(off, 0);
+                            sink.borrow_mut()[..2048].copy_from_slice(&src[..2048]);
+                            Ok(2048)
+                        }
+                        2 => {
+                            assert_eq!(off, 2048, "retry must preserve partial progress");
+                            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                        }
+                        _ => {
+                            assert_eq!(off, 2048, "post-EINTR retry must resume at offset 2048");
+                            sink.borrow_mut()[2048..].copy_from_slice(&src[..2048]);
+                            Ok(2048)
+                        }
+                    }
+                },
+                &buf,
+                0,
+                "write",
+            );
+            result.expect("interrupted write must be retried to completion");
+        }
+        assert_eq!(calls, 3);
+        assert_eq!(sink, buf, "full buffer must be written after EINTR retry");
+    }
+
+    #[test]
+    fn test_write_full_at_propagates_non_eintr_errors() {
+        let buf = vec![0_u8; 128];
+        let result = write_full_at(
+            |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            &buf,
+            0,
+            "write",
+        );
+        assert!(result.is_err(), "non-EINTR errors must still propagate");
+    }
+
+    #[test]
+    fn test_read_full_at_retries_eintr_after_partial_progress() {
+        let src = (0..4096_usize).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let mut buf = vec![0_u8; 4096];
+        let mut calls = 0_usize;
+        let total = read_full_at(
+            |dst, off| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        assert_eq!(off, 0);
+                        dst[..1024].copy_from_slice(&src[..1024]);
+                        Ok(1024)
+                    }
+                    2 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                    _ => {
+                        let off = usize::try_from(off).unwrap();
+                        let n = dst.len();
+                        dst.copy_from_slice(&src[off..off + n]);
+                        Ok(n)
+                    }
+                }
+            },
+            &mut buf,
+            0,
+            "read",
+        )
+        .expect("interrupted read must be retried to completion");
+        assert_eq!(total, 4096);
+        assert_eq!(buf, src);
+        assert_eq!(calls, 3);
     }
 }

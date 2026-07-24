@@ -7,7 +7,7 @@ SEED="${SEED:-2026022002}"
 RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET_DIR="${CARGO_TARGET_DIR:-${WORKSPACE_ROOT}/target/bd-2v8x-build-matrix}"
+TARGET_DIR="${CARGO_TARGET_DIR:-${WORKSPACE_ROOT}/target}/bd-2v8x-build-matrix"
 LOG_DIR="${WORKSPACE_ROOT}/target/bd-2v8x-build-matrix/logs"
 SCHEMA_LOG_PATH="${LOG_DIR}/build_matrix_events.jsonl"
 

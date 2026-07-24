@@ -2328,7 +2328,10 @@ impl<P: PageReader> BtCursor<P> {
         probe_value: i64,
     ) -> Result<FirstIndexKeyIntegerLocalRunSegment> {
         enum LocalRunScanOutcome {
-            MatchedAll(i64),
+            MatchedAll {
+                matched: i64,
+                last_cell_idx: Option<u16>,
+            },
             MatchedCurrent(i64),
             Mismatch {
                 matched: i64,
@@ -2359,6 +2362,7 @@ impl<P: PageReader> BtCursor<P> {
                     let page = top.page_data.as_bytes();
                     let cell_pointers = &top.cell_pointers;
                     let mut matched = 0_i64;
+                    let mut last_matched_cell_idx = None;
                     let mut outcome = None;
 
                     for idx in start_idx..cell_count {
@@ -2380,6 +2384,7 @@ impl<P: PageReader> BtCursor<P> {
                         )? {
                             Some(value) if value == probe_value => {
                                 matched = matched.wrapping_add(1);
+                                last_matched_cell_idx = Some(idx);
                             }
                             Some(current_value) => {
                                 outcome = Some(LocalRunScanOutcome::Mismatch {
@@ -2399,7 +2404,10 @@ impl<P: PageReader> BtCursor<P> {
                         }
                     }
 
-                    outcome.unwrap_or(LocalRunScanOutcome::MatchedAll(matched))
+                    outcome.unwrap_or(LocalRunScanOutcome::MatchedAll {
+                        matched,
+                        last_cell_idx: last_matched_cell_idx,
+                    })
                 } else if page_type.is_table() {
                     LocalRunScanOutcome::NeedsFallback {
                         matched: 0,
@@ -2424,8 +2432,28 @@ impl<P: PageReader> BtCursor<P> {
             };
 
             match scan_outcome {
-                LocalRunScanOutcome::MatchedAll(matched)
-                | LocalRunScanOutcome::MatchedCurrent(matched) => {
+                LocalRunScanOutcome::MatchedAll {
+                    matched,
+                    last_cell_idx,
+                } => {
+                    // The local fast lane inspected every cell from the
+                    // cursor's starting slot through the end of this leaf.
+                    // Position the cursor on the final consumed cell before
+                    // advancing.  Leaving it on the starting slot makes the
+                    // next iteration rescan the suffix and turns a run of N
+                    // equal keys into the triangular sum N+(N-1)+...+1.
+                    if let Some(last_cell_idx) = last_cell_idx {
+                        self.stack
+                            .last_mut()
+                            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+                            .cell_idx = last_cell_idx;
+                    }
+                    matched_total = matched_total.wrapping_add(matched);
+                    if !self.advance_next(cx)? {
+                        return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
+                    }
+                }
+                LocalRunScanOutcome::MatchedCurrent(matched) => {
                     matched_total = matched_total.wrapping_add(matched);
                     if !self.advance_next(cx)? {
                         return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
@@ -12313,6 +12341,44 @@ mod tests {
         assert_eq!(cursor.count_all_rows(&cx).unwrap(), ROW_COUNT);
     }
 
+    /// The revalidation guard must fail loud — not corrupt — when a caller
+    /// violates the "prechecked absent" contract itself: reusing a stale
+    /// NotFound position for a rowid that is actually present, where the
+    /// stale position ALSO fails admissibility. The fallback re-seek finds
+    /// the row and reports `DatabaseCorrupt` instead of inserting a
+    /// duplicate or splicing the tree out of order.
+    #[test]
+    fn test_prechecked_absent_present_row_at_inadmissible_position_fails_loud() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        let payload = vec![0x3Cu8; 3600];
+        for rowid in 1..=200_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        // Position the cursor far from rowid 7's true slot (EOF context from
+        // seeking past the end), then violate the contract: rowid 7 exists.
+        assert_eq!(
+            cursor.table_move_to(&cx, 10_000).unwrap(),
+            SeekResult::NotFound
+        );
+        assert!(cursor.eof());
+        let err = cursor
+            .table_insert_prechecked_absent(&cx, 7, &payload)
+            .expect_err("present rowid at an inadmissible reused position must fail loud");
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { .. }),
+            "expected DatabaseCorrupt, got {err:?}"
+        );
+
+        // The tree must be unharmed: exactly one rowid 7, full count intact.
+        assert_eq!(cursor.table_move_to(&cx, 7).unwrap(), SeekResult::Found);
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 200);
+    }
+
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
     fn build_leaf_table(entries: &[(i64, &[u8])]) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
@@ -13942,6 +14008,86 @@ mod tests {
         assert_eq!(
             parse_record(&cursor.payload(&cx).unwrap()).unwrap(),
             vec![SqliteValue::Integer(42), SqliteValue::Integer(3)]
+        );
+    }
+
+    /// bd-distinct-loose-scan: the loose/skip scan (`first`, then repeated
+    /// prefix upper-bound seeks) must terminate in exactly one seek per
+    /// distinct value on a NATURALLY SPLIT multi-level tree whose duplicate
+    /// runs span several leaves. A seek that lands back inside the current
+    /// run turns the loop into an infinite re-emit of the same value; the
+    /// iteration cap converts that hang into a loud failure.
+    #[test]
+    fn test_cursor_index_prefix_upper_bound_loose_scan_over_multi_leaf_runs() {
+        const DISTINCT: i64 = 8;
+        const PER_VALUE: i64 = 1000;
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        // Interleaved insert order (value = i % DISTINCT) mirrors the failing
+        // `SELECT DISTINCT` workload and exercises natural page splits; each
+        // value's run of PER_VALUE entries spans multiple leaves. A leading
+        // NULL run (NULL sorts first in index order) pins the [NULL] prefix
+        // probe — the case the SELECT DISTINCT oracle hangs on.
+        for i in 0..DISTINCT * PER_VALUE {
+            let key = if i % 37 == 0 {
+                serialize_record(&[SqliteValue::Null, SqliteValue::Integer(i)])
+            } else {
+                serialize_record(&[SqliteValue::Integer(i % DISTINCT), SqliteValue::Integer(i)])
+            };
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        // --- 1-field prefix probe (the design-intended loose-scan shape). ---
+        assert!(
+            cursor.first(&cx).unwrap(),
+            "populated index has a first row"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..=DISTINCT + 1 {
+            let payload = cursor.payload(&cx).unwrap();
+            let fields = parse_record(&payload).unwrap();
+            let probe = serialize_record(&fields[..1]);
+            match fields[0] {
+                SqliteValue::Integer(v) => seen.push(v),
+                SqliteValue::Null => seen.push(i64::MIN),
+                ref other => panic!("unexpected index key {other:?}"),
+            }
+            cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
+            if cursor.eof() {
+                break;
+            }
+        }
+        let expected: Vec<i64> = std::iter::once(i64::MIN).chain(0..DISTINCT).collect();
+        assert_eq!(
+            seen, expected,
+            "prefix upper-bound loose scan must visit NULL then each distinct value exactly once"
+        );
+
+        // --- 2-field [value, i64::MAX] sentinel probe (the alternate shape). ---
+        assert!(cursor.first(&cx).unwrap());
+        let mut seen_sentinel = Vec::new();
+        for _ in 0..=DISTINCT + 1 {
+            let payload = cursor.payload(&cx).unwrap();
+            let fields = parse_record(&payload).unwrap();
+            let first = fields[0].clone();
+            match first {
+                SqliteValue::Integer(v) => seen_sentinel.push(v),
+                SqliteValue::Null => seen_sentinel.push(i64::MIN),
+                ref other => panic!("unexpected index key {other:?}"),
+            }
+            let probe = serialize_record(&[first, SqliteValue::Integer(i64::MAX)]);
+            cursor.index_move_to_upper_bound(&cx, &probe).unwrap();
+            if cursor.eof() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen_sentinel, expected,
+            "sentinel upper-bound loose scan must visit NULL then each distinct value exactly once"
         );
     }
 

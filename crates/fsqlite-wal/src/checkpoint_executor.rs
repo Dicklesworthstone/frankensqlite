@@ -12,6 +12,9 @@
 //! but is defined here to avoid a circular crate dependency.  Higher layers
 //! (`fsqlite-core`) provide an adapter bridging the two at runtime.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
@@ -22,7 +25,7 @@ use crate::checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
 };
-use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalSalts};
+use crate::checksum::WAL_FRAME_HEADER_SIZE;
 use crate::recovery_fence::{CheckpointChecksumVerdict, ExpectedPageChecksum};
 use crate::wal::WalFile;
 
@@ -30,20 +33,31 @@ use crate::wal::WalFile;
 // CheckpointTarget trait
 // ---------------------------------------------------------------------------
 
+/// Object-safe future returned by [`CheckpointTarget`] operations.
+///
+/// Keeping the future behind a box allows checkpoint targets to remain usable
+/// through `dyn CheckpointTarget` while each I/O step is awaited in sequence.
+pub type CheckpointTargetFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 /// Write-back interface for checkpoint page transfers.
 ///
 /// Implementors push WAL frame content into the main database file.
 /// This trait is intentionally **not** sealed so that `fsqlite-core` can
 /// provide the concrete adapter at runtime.
-pub trait CheckpointTarget {
+pub trait CheckpointTarget: Send {
     /// Write `data` for `page_no` directly to the database file.
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+    fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+        data: &'a [u8],
+    ) -> CheckpointTargetFuture<'a, ()>;
 
     /// Truncate the database file to exactly `n_pages` pages.
-    fn truncate_db(&mut self, cx: &Cx, n_pages: u32) -> Result<()>;
+    fn truncate_db<'a>(&'a mut self, cx: &'a Cx, n_pages: u32) -> CheckpointTargetFuture<'a, ()>;
 
     /// Sync the database file to stable storage.
-    fn sync_db(&mut self, cx: &Cx) -> Result<()>;
+    fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()>;
 
     /// Read back a page's current on-disk content, if the target supports
     /// it.  Used by the post-checkpoint checksum verification path
@@ -53,13 +67,13 @@ pub trait CheckpointTarget {
     /// The default implementation returns `None`, which skips verification.
     /// Concrete `CheckpointTarget`s that back a real VFS file should
     /// override this with the equivalent of `vfs.read(db_fd, buf, offset)`.
-    fn read_page_if_supported(
-        &self,
-        _cx: &Cx,
+    fn read_page_if_supported<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
         _page_no: PageNumber,
-        _buf: &mut [u8],
-    ) -> Result<Option<usize>> {
-        Ok(None)
+        _buf: &'a mut [u8],
+    ) -> CheckpointTargetFuture<'a, Option<usize>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -97,7 +111,7 @@ pub struct CheckpointExecutionResult {
 ///
 /// Propagates any I/O error from `WalFile`, `CheckpointTarget`, or VFS.
 #[allow(clippy::too_many_lines)]
-pub fn execute_checkpoint<F: VfsFile>(
+pub async fn execute_checkpoint<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     mode: CheckpointMode,
@@ -133,7 +147,7 @@ pub fn execute_checkpoint<F: VfsFile>(
 
         // Pass 1: Find the latest frame index for each page in the checkpoint range.
         for frame_idx in start..end {
-            let header = wal.read_frame_header(cx, frame_idx)?;
+            let header = wal.read_frame_header(cx, frame_idx).await?;
 
             let page_no =
                 PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
@@ -167,9 +181,9 @@ pub fn execute_checkpoint<F: VfsFile>(
                 }
             }
 
-            wal.read_frame_into(cx, *frame_idx, &mut frame_buf)?;
+            wal.read_frame_into(cx, *frame_idx, &mut frame_buf).await?;
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
-            target.write_page(cx, *page_no, page_data)?;
+            target.write_page(cx, *page_no, page_data).await?;
 
             // bd-yfdb6: capture the expected post-checkpoint checksum so the
             // truncate path can verify disk state before discarding WAL
@@ -194,14 +208,14 @@ pub fn execute_checkpoint<F: VfsFile>(
         }
 
         // Sync database after all frame writes.
-        target.sync_db(cx)?;
+        target.sync_db(cx).await?;
 
         // If the checkpoint completed fully, truncate the database to the last
         // committed size.
         if matches!(plan.progress, CheckpointProgress::Complete) {
             if let Some(db_size) = last_db_size {
-                target.truncate_db(cx, db_size)?;
-                target.sync_db(cx)?;
+                target.truncate_db(cx, db_size).await?;
+                target.sync_db(cx).await?;
             }
         }
     }
@@ -212,7 +226,8 @@ pub fn execute_checkpoint<F: VfsFile>(
     // path can verify on-disk DB state matches the post-checkpoint
     // state before truncating (both bd-yfdb6).
     let wal_was_reset =
-        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)?;
+        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)
+            .await?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -241,7 +256,7 @@ pub fn execute_checkpoint<F: VfsFile>(
     })
 }
 
-fn apply_checkpoint_post_action<F: VfsFile>(
+async fn apply_checkpoint_post_action<F: VfsFile>(
     cx: &Cx,
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
@@ -251,50 +266,59 @@ fn apply_checkpoint_post_action<F: VfsFile>(
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
             let new_seq = wal.header().checkpoint_seq.wrapping_add(1);
-            let new_salts = WalSalts {
-                salt1: wal.header().salts.salt1.wrapping_add(1),
-                salt2: wal.header().salts.salt2.wrapping_add(1),
-            };
+            // Salt-1 increments, salt-2 randomizes (C SQLite `walRestartHdr`
+            // semantics): stale frames from the pre-reset generation must
+            // fail salt validation rather than replay (GH #201).
+            let new_salts = wal.header().salts.next_generation();
             let truncate = matches!(post_action, CheckpointPostAction::TruncateWal);
-            if truncate {
-                // bd-yfdb6: enforce fsync(db, FULL) before any WAL
-                // truncate. The earlier backfill loop issues `sync_db`
-                // already, but we re-issue an explicit full sync here to
-                // make the ordering invariant visible at the truncate
-                // call-site and defensive against future changes to the
-                // backfill path. A failure here MUST prevent the truncate;
-                // `?` accomplishes that.
-                crate::recovery_fence::ensure_db_fsync_before_wal_truncate(cx, target)?;
+            // bd-yfdb6 / GH #193: enforce fsync(db, FULL) before ANY reset of
+            // the WAL generation. The earlier backfill loop issues `sync_db`
+            // already, but we re-issue an explicit full sync here to make the
+            // ordering invariant visible at the invalidation call-site and
+            // defensive against future changes to the backfill path. Both
+            // RESTART (`ResetWal`) and TRUNCATE (`TruncateWal`) rewrite the
+            // header with fresh salts, which invalidates every frame of the
+            // prior generation; recovery can no longer replay them, so the
+            // database file must be durably up to date first. A failure here
+            // MUST prevent the reset; `?` accomplishes that.
+            target.sync_db(cx).await.map_err(|err| {
+                tracing::error!(
+                    target: "fsqlite.wal.recovery_fence",
+                    error = %err,
+                    "fsync(db) before WAL truncate failed; refusing to truncate"
+                );
+                err
+            })?;
 
-                // bd-yfdb6: if the target supports read-back, verify that
-                // every page we just checkpointed still matches its
-                // expected post-checkpoint checksum on disk. On mismatch,
-                // refuse the truncate — the WAL must stay intact so a retry
-                // can complete the backfill.
-                if !expected_checksums.is_empty() {
-                    let verdict = verify_checkpoint_checksums_via_target(
-                        cx,
-                        target,
-                        wal.page_size(),
-                        expected_checksums,
-                    )?;
-                    if let CheckpointChecksumVerdict::Mismatch { first_bad_page } = verdict {
-                        tracing::error!(
-                            target: "fsqlite.wal.recovery_fence",
-                            first_bad_page = first_bad_page.get(),
-                            "UNRECOVERABLE: post-checkpoint DB/WAL disagreed; refusing truncate"
-                        );
-                        return Err(FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "post-checkpoint DB/WAL state disagreed at page {}; WAL truncate refused \
-                                 to preserve committed frames (bd-yfdb6)",
-                                first_bad_page.get()
-                            ),
-                        });
-                    }
+            // bd-yfdb6: if the target supports read-back, verify that
+            // every page we just checkpointed still matches its
+            // expected post-checkpoint checksum on disk. On mismatch,
+            // refuse the reset — the WAL must stay intact so a retry
+            // can complete the backfill.
+            if !expected_checksums.is_empty() {
+                let verdict = verify_checkpoint_checksums_via_target(
+                    cx,
+                    target,
+                    wal.page_size(),
+                    expected_checksums,
+                )
+                .await?;
+                if let CheckpointChecksumVerdict::Mismatch { first_bad_page } = verdict {
+                    tracing::error!(
+                        target: "fsqlite.wal.recovery_fence",
+                        first_bad_page = first_bad_page.get(),
+                        "UNRECOVERABLE: post-checkpoint DB/WAL disagreed; refusing WAL reset"
+                    );
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "post-checkpoint DB/WAL state disagreed at page {}; WAL reset refused \
+                             to preserve committed frames (bd-yfdb6)",
+                            first_bad_page.get()
+                        ),
+                    });
                 }
             }
-            wal.reset(cx, new_seq, new_salts, truncate)?;
+            wal.reset(cx, new_seq, new_salts, truncate).await?;
             info!(
                 new_checkpoint_seq = new_seq,
                 action = ?post_action,
@@ -312,15 +336,17 @@ fn apply_checkpoint_post_action<F: VfsFile>(
 /// (`read_page_if_supported` returns `None`), verification is silently
 /// skipped — which matches the audit-requested behaviour of "additive
 /// insurance, not a hard invariant" for targets without a read path.
-fn verify_checkpoint_checksums_via_target(
+async fn verify_checkpoint_checksums_via_target(
     cx: &Cx,
-    target: &impl CheckpointTarget,
+    target: &mut impl CheckpointTarget,
     page_size: usize,
     expected: &[ExpectedPageChecksum],
 ) -> Result<CheckpointChecksumVerdict> {
     let mut buf = vec![0u8; page_size];
     for exp in expected {
-        let maybe_read = target.read_page_if_supported(cx, exp.page, &mut buf)?;
+        let maybe_read = target
+            .read_page_if_supported(cx, exp.page, &mut buf)
+            .await?;
         let Some(n) = maybe_read else {
             // Target does not support read-back; abort further checks.
             return Ok(CheckpointChecksumVerdict::Match);
@@ -351,6 +377,8 @@ mod tests {
     use fsqlite_vfs::traits::Vfs;
 
     use super::*;
+    use crate::checksum::WalSalts;
+    use crate::test_support::FutureResultTestExt as _;
 
     const PAGE_SIZE: u32 = 4096;
 
@@ -401,19 +429,34 @@ mod tests {
     }
 
     impl CheckpointTarget for RecordingTarget {
-        fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.pages.push((page_no, data.to_vec()));
-            Ok(())
+        fn write_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.pages.push((page_no, data.to_vec()));
+                Ok(())
+            })
         }
 
-        fn truncate_db(&mut self, _cx: &Cx, n_pages: u32) -> Result<()> {
-            self.truncate_to = Some(n_pages);
-            Ok(())
+        fn truncate_db<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.truncate_to = Some(n_pages);
+                Ok(())
+            })
         }
 
-        fn sync_db(&mut self, _cx: &Cx) -> Result<()> {
-            self.sync_count += 1;
-            Ok(())
+        fn sync_db<'a>(&'a mut self, _cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.sync_count += 1;
+                Ok(())
+            })
         }
     }
 
@@ -864,7 +907,7 @@ mod tests {
     #[test]
     fn test_recording_target_read_page_default_returns_none() {
         let cx = test_cx();
-        let target = RecordingTarget::new();
+        let mut target = RecordingTarget::new();
         let mut buf = vec![0u8; 4096];
         let page = PageNumber::new(1).expect("valid page");
         let result = target
@@ -880,6 +923,9 @@ mod tests {
         let file = open_wal_file(&vfs, &cx);
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
+        // Salt-2 history across generations: every reset must randomize it
+        // (GH #201 — never the old deterministic +1 walk).
+        let mut salt2_history = vec![wal.header().salts.salt2];
         for round in 0..3u32 {
             populate_wal(&mut wal, &cx, 2);
             let state = CheckpointState {
@@ -891,11 +937,23 @@ mod tests {
             execute_checkpoint(&cx, &mut wal, CheckpointMode::Restart, state, &mut target)
                 .expect("checkpoint");
             assert_eq!(wal.header().checkpoint_seq, round + 1);
+            salt2_history.push(wal.header().salts.salt2);
         }
         assert_eq!(wal.header().checkpoint_seq, 3);
         let salts = wal.header().salts;
+        // Salt-1 increments once per reset (C SQLite walRestartHdr).
         assert_eq!(salts.salt1, test_salts().salt1.wrapping_add(3));
-        assert_eq!(salts.salt2, test_salts().salt2.wrapping_add(3));
+        // Salt-2 is randomized per reset: each generation must differ from
+        // its predecessor (a 2^-32 collision would be a red flag, and the
+        // old +1 walk always "passed" — assert the walk is gone explicitly).
+        for window in salt2_history.windows(2) {
+            assert_ne!(window[0], window[1], "salt2 must change on every WAL reset");
+            assert_ne!(
+                window[1],
+                window[0].wrapping_add(1),
+                "salt2 must be randomized, not the deterministic +1 walk (GH #201)"
+            );
+        }
     }
 
     #[test]
@@ -1075,7 +1133,7 @@ mod tests {
 
     #[test]
     fn checkpoint_target_default_read_page_returns_none() {
-        let target = RecordingTarget::new();
+        let mut target = RecordingTarget::new();
         let cx = test_cx();
         let page = PageNumber::new(1).expect("valid");
         let mut buf = [0u8; 4096];
@@ -1145,5 +1203,94 @@ mod tests {
             1,
             "only the first page was written before the crash fired on page_idx=1"
         );
+    }
+
+    // ── GH #193: RESTART must traverse the same full-durability fence as
+    //    TRUNCATE before invalidating the prior WAL generation ──
+
+    /// Target whose `sync_db` fails once a configured call count is reached.
+    struct FailingSyncTarget {
+        inner: RecordingTarget,
+        fail_from_call: u32,
+    }
+
+    impl CheckpointTarget for FailingSyncTarget {
+        fn write_page<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            page_no: PageNumber,
+            data: &'a [u8],
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move { self.inner.write_page(cx, page_no, data).await })
+        }
+
+        fn truncate_db<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            n_pages: u32,
+        ) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move { self.inner.truncate_db(cx, n_pages).await })
+        }
+
+        fn sync_db<'a>(&'a mut self, cx: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
+            Box::pin(async move {
+                self.inner.sync_db(cx).await?;
+                if self.inner.sync_count >= self.fail_from_call {
+                    return Err(FrankenError::Io(std::io::Error::other(
+                        "injected sync_db failure at durability fence",
+                    )));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn run_reset_mode_with_failing_fence(mode: CheckpointMode) {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        populate_wal(&mut wal, &cx, 3);
+        let generation_before = wal.header().checkpoint_seq;
+
+        let state = CheckpointState {
+            total_frames: 3,
+            backfilled_frames: 0,
+            oldest_reader_frame: None,
+        };
+        // Backfill issues sync 1 (post-writes) and sync 2 (post-truncate);
+        // the explicit pre-reset durability fence is sync 3 — fail there,
+        // exactly the schedule from GH #193.
+        let mut target = FailingSyncTarget {
+            inner: RecordingTarget::new(),
+            fail_from_call: 3,
+        };
+
+        let err = execute_checkpoint(&cx, &mut wal, mode, state, &mut target)
+            .expect_err("failed durability fence must refuse WAL generation reset");
+        assert!(
+            err.to_string().contains("injected sync_db failure"),
+            "error must be the injected fence failure: {err}"
+        );
+        assert_eq!(
+            wal.frame_count(),
+            3,
+            "WAL frames must survive a failed pre-reset fence"
+        );
+        assert_eq!(
+            wal.header().checkpoint_seq,
+            generation_before,
+            "checkpoint generation must not advance past a failed fence"
+        );
+    }
+
+    #[test]
+    fn test_restart_refuses_reset_when_durability_fence_fails() {
+        run_reset_mode_with_failing_fence(CheckpointMode::Restart);
+    }
+
+    #[test]
+    fn test_truncate_refuses_reset_when_durability_fence_fails() {
+        run_reset_mode_with_failing_fence(CheckpointMode::Truncate);
     }
 }

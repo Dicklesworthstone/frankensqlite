@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use asupersync::sync::Notify;
 #[cfg(target_arch = "x86_64")]
 use core::intrinsics::prefetch_read_data;
 
@@ -810,7 +811,7 @@ impl PageCache {
     /// Create a new, empty `PageCache` configured for the given `page_size`.
     ///
     /// The buffer-pool ceiling is determined by
-    /// [`resolve_page_buffer_max(None)`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
+    /// [`resolve_page_buffer_max`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
     /// environment variable if set, otherwise [`DEFAULT_PAGE_BUFFER_MAX`]
     /// (262 144 buffers ≈ 1 GiB at 4 KiB pages).
     pub fn new(page_size: PageSize) -> Self {
@@ -913,10 +914,10 @@ impl PageCache {
     ///
     /// **Zero-copy guarantee:** the buffer passed to `VfsFile::read` is the
     /// same memory that the returned `&[u8]` points into.
-    pub fn read_page(
+    pub async fn read_page(
         &mut self,
         cx: &Cx,
-        file: &mut impl VfsFile,
+        file: &impl VfsFile,
         page_no: PageNumber,
     ) -> Result<&[u8]> {
         if self.contains(page_no) {
@@ -924,7 +925,7 @@ impl PageCache {
         } else {
             let mut buf = self.pool.acquire()?;
             let offset = page_offset(page_no, self.page_size);
-            let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
+            let bytes_read = file.read(cx, buf.as_mut_slice(), offset).await?;
             if bytes_read < self.page_size.as_usize() {
                 return Err(fsqlite_error::FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -948,7 +949,12 @@ impl PageCache {
     /// no intermediate staging copy.
     ///
     /// Returns `Err` if the page is not in the cache.
-    pub fn write_page(&self, cx: &Cx, file: &mut impl VfsFile, page_no: PageNumber) -> Result<()> {
+    pub async fn write_page(
+        &self,
+        cx: &Cx,
+        file: &impl VfsFile,
+        page_no: PageNumber,
+    ) -> Result<()> {
         let Some(buf) = self.pages.get(&page_no) else {
             self.misses.set(self.misses.get().saturating_add(1));
             return Err(fsqlite_error::FrankenError::internal(format!(
@@ -959,7 +965,7 @@ impl PageCache {
         self.hits.set(self.hits.get().saturating_add(1));
         self.eviction_policy.borrow_mut().record_access(page_no);
         let offset = page_offset(page_no, self.page_size);
-        file.write(cx, buf.as_slice(), offset)?;
+        file.write(cx, buf.as_slice(), offset).await?;
         Ok(())
     }
 
@@ -1225,6 +1231,7 @@ struct CachedPageEntry {
     shared: Option<Arc<[u8]>>,
     access_count: AtomicU64,
     dirty: AtomicBool,
+    mutation_generation: AtomicU64,
 }
 
 impl CachedPageEntry {
@@ -1235,6 +1242,7 @@ impl CachedPageEntry {
             shared: None,
             access_count: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
+            mutation_generation: AtomicU64::new(0),
         }
     }
 
@@ -1245,6 +1253,7 @@ impl CachedPageEntry {
             shared: None,
             access_count: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
+            mutation_generation: AtomicU64::new(1),
         }
     }
 
@@ -1297,12 +1306,18 @@ impl CachedPageEntry {
 
     #[inline]
     fn mark_dirty(&self) {
+        self.mutation_generation.fetch_add(1, Ordering::AcqRel);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
     #[inline]
     fn mark_clean(&self) {
         self.dirty.store(false, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn mutation_generation(&self) -> u64 {
+        self.mutation_generation.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -2288,8 +2303,9 @@ impl std::fmt::Debug for PageCacheShard {
 /// # Single-Connection Fast Path (bd-fzr07)
 ///
 /// For single-connection `:memory:` workloads, the cache can use a flat
-/// [`FastPageArray`] that provides O(1) page access via direct Vec indexing.
-/// Enable with [`new_single_connection`] or [`enable_fast_path`].
+/// `FastPageArray` that provides O(1) page access via direct Vec indexing.
+/// Enable with [`ShardedPageCache::new_single_connection`] or
+/// [`ShardedPageCache::enable_fast_path`].
 ///
 /// # Thread Safety
 ///
@@ -2297,6 +2313,68 @@ impl std::fmt::Debug for PageCacheShard {
 /// (based on page number), so deadlock-free access is guaranteed as long as
 /// callers don't hold multiple shard locks simultaneously. The API is designed
 /// to make multi-shard locking unnecessary.
+#[derive(Debug)]
+struct InFlightPageRead {
+    completed: AtomicBool,
+    notify: Notify,
+}
+
+impl InFlightPageRead {
+    fn new() -> Self {
+        Self {
+            completed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        self.notify
+            .wait_until(|| self.completed.load(Ordering::Acquire))
+            .await;
+    }
+}
+
+enum InFlightReadRole<'a> {
+    Leader(InFlightReadLeader<'a>),
+    Follower(Arc<InFlightPageRead>),
+}
+
+struct InFlightReadLeader<'a> {
+    cache: &'a ShardedPageCache,
+    page_no: PageNumber,
+    flight: Arc<InFlightPageRead>,
+    finished: bool,
+}
+
+impl InFlightReadLeader<'_> {
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        let mut in_flight = self.cache.in_flight_reads.lock();
+        if in_flight
+            .get(&self.page_no)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.flight))
+        {
+            in_flight.remove(&self.page_no);
+        }
+        drop(in_flight);
+
+        self.flight.completed.store(true, Ordering::Release);
+        self.flight.notify.notify_waiters();
+        self.finished = true;
+    }
+}
+
+impl Drop for InFlightReadLeader<'_> {
+    fn drop(&mut self) {
+        // A cancelled leader must never strand followers. Removing the map
+        // entry lets the woken tasks elect a replacement read leader.
+        self.finish();
+    }
+}
+
 pub struct ShardedPageCache {
     /// CAS-based flat hash page cache (bd-eorms, pcache1 pattern).
     /// Tried first for all lookups; cache misses are lock-free.
@@ -2330,6 +2408,10 @@ pub struct ShardedPageCache {
     eviction_policy_enabled: AtomicBool,
     /// Shared eviction-policy tracker used by [`Self::evict_any`].
     eviction_policy: Mutex<PageCacheEvictionTracker>,
+    /// Per-page miss flights. The first task for a missing page owns the VFS
+    /// read; later tasks await the same completion notification and retry the
+    /// cache instead of amplifying disk I/O.
+    in_flight_reads: Mutex<HashMap<PageNumber, Arc<InFlightPageRead>>>,
     /// Bayesian-mixture e-value evictor (IMPL-19 / AAC-P5).
     ///
     /// Present only when the `evalue-eviction` cargo feature is enabled.
@@ -2350,11 +2432,11 @@ impl ShardedPageCache {
     /// Create a new sharded page cache with the given page size.
     ///
     /// The buffer-pool ceiling is determined by
-    /// [`resolve_page_buffer_max(None)`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
+    /// [`resolve_page_buffer_max`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
     /// environment variable if set, otherwise [`DEFAULT_PAGE_BUFFER_MAX`]
     /// (262 144 buffers ≈ 1 GiB at 4 KiB pages).
     ///
-    /// For single-connection `:memory:` workloads, prefer [`new_single_connection`]
+    /// For single-connection `:memory:` workloads, prefer [`Self::new_single_connection`]
     /// which enables the fast-path flat array (bd-fzr07).
     pub fn new(page_size: PageSize) -> Self {
         Self::with_max_buffers_and_shards(
@@ -2474,6 +2556,7 @@ impl ShardedPageCache {
             use_fast_path: AtomicBool::new(false),
             eviction_policy_enabled: AtomicBool::new(false),
             eviction_policy: Mutex::new(PageCacheEvictionTracker::default()),
+            in_flight_reads: Mutex::new(HashMap::new()),
             #[cfg(feature = "evalue-eviction")]
             evalue_evictor: crate::evalue_eviction::EValueEvictor::new(),
             #[cfg(feature = "evalue-eviction")]
@@ -2688,6 +2771,85 @@ impl ShardedPageCache {
         }
     }
 
+    fn mark_page_clean_if_generation(&self, page_no: PageNumber, generation: u64) {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = fast.lock().pages.get(idx)
+                && entry.mutation_generation() == generation
+            {
+                entry.mark_clean();
+            }
+            return;
+        }
+
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref entry) = *guard
+                && entry.mutation_generation() == generation
+            {
+                entry.mark_clean();
+                return;
+            }
+        }
+
+        let idx = self.shard_index(page_no);
+        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no)
+            && entry.mutation_generation() == generation
+        {
+            entry.mark_clean();
+        }
+    }
+
+    fn page_write_snapshot(&self, page_no: PageNumber) -> Option<(PageData, u64)> {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let mut fast = fast.lock();
+            let entry = fast
+                .pages
+                .get_mut(FastPageArray::pgno_to_idx(page_no))?
+                .as_mut()?;
+            entry.record_access();
+            return Some((entry.shared_page(), entry.mutation_generation()));
+        }
+
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            let mut guard = self.flat_slots.slots[slot_idx].data.lock();
+            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
+                && let Some(ref mut entry) = *guard
+            {
+                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
+                return Some((entry.shared_page(), entry.mutation_generation()));
+            }
+        }
+
+        let idx = self.shard_index(page_no);
+        let mut shard = self.shards[idx].lock();
+        shard.hits = shard.hits.saturating_add(1);
+        let entry = shard.pages.get_mut(&page_no)?;
+        Some((entry.shared_page(), entry.mutation_generation()))
+    }
+
+    fn claim_in_flight_read(&self, page_no: PageNumber) -> InFlightReadRole<'_> {
+        let mut in_flight = self.in_flight_reads.lock();
+        if let Some(flight) = in_flight.get(&page_no) {
+            return InFlightReadRole::Follower(Arc::clone(flight));
+        }
+
+        let flight = Arc::new(InFlightPageRead::new());
+        in_flight.insert(page_no, Arc::clone(&flight));
+        drop(in_flight);
+        InFlightReadRole::Leader(InFlightReadLeader {
+            cache: self,
+            page_no,
+            flight,
+            finished: false,
+        })
+    }
+
     /// Remove an obsolete overflow copy after the authoritative insertion was
     /// admitted into the flat tier. This preserves the one-resident-image
     /// invariant across tombstone reuse and probe-chain contraction.
@@ -2722,6 +2884,38 @@ impl ShardedPageCache {
             }
             Err(buf) => {
                 let admitted = shard.insert_with_dirty_state(page_no, buf, dirty);
+                self.shards_dirty.store(true, Ordering::Release);
+                admitted
+            }
+        }
+    }
+
+    /// Admit a clean miss-fill image only while the page is still absent
+    /// from both storage tiers (GH #197).
+    ///
+    /// The read-miss path drops every cache lock during its VFS read, so a
+    /// writer can install a **newer** image for the same page while the miss
+    /// I/O is in flight. Unconditionally inserting the miss result would
+    /// overwrite that newer resident image — including a dirty one, silently
+    /// losing the write. Under the same per-page shard serialization used by
+    /// [`Self::insert_tiered`], this checks residency first and discards the
+    /// stale miss-fill when the page reappeared.
+    ///
+    /// Returns `true` if the miss-fill was admitted.
+    fn insert_tiered_if_absent(&self, page_no: PageNumber, buf: PageBuf) -> bool {
+        let shard_idx = self.shard_index(page_no);
+        let mut shard = self.shards[shard_idx].lock();
+        if shard.pages.contains_key(&page_no) || self.flat_slots.contains_stable(page_no) {
+            // A newer resident image won the race; the stale miss-fill loses.
+            return false;
+        }
+        match self.flat_slots.try_insert(page_no, buf) {
+            Ok(is_new) => {
+                let duplicate_removed = shard.remove(page_no);
+                is_new && !duplicate_removed
+            }
+            Err(buf) => {
+                let admitted = shard.insert_with_dirty_state(page_no, buf, false);
                 self.shards_dirty.store(true, Ordering::Release);
                 admitted
             }
@@ -2933,160 +3127,79 @@ impl ShardedPageCache {
     /// If the page is already cached, returns the cached data via the callback.
     /// Otherwise, acquires a buffer from the pool, reads from VFS, caches it,
     /// and returns via the callback.
-    pub fn read_page<R>(
+    pub async fn read_page<R>(
         &self,
         cx: &Cx,
-        file: &mut impl VfsFile,
+        file: &impl VfsFile,
         page_no: PageNumber,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R> {
-        // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let mut arr = fast.lock();
-                // Check for cache hit first
-                if let Some(data) = arr.get(page_no) {
-                    let result = f(data);
-                    drop(arr);
-                    self.record_eviction_access(page_no);
+        let mut callback = Some(f);
+        loop {
+            if let Some(result) = self.with_page(page_no, |data| {
+                callback.take().expect("page callback used once")(data)
+            }) {
+                return Ok(result);
+            }
+
+            match self.claim_in_flight_read(page_no) {
+                InFlightReadRole::Follower(flight) => {
+                    tracing::debug!(page = page_no.get(), "page-cache read coalesced");
+                    flight.wait().await;
+                }
+                InFlightReadRole::Leader(mut leader) => {
+                    // A resident page can appear between the first cache probe
+                    // and flight election. Re-check before issuing disk I/O.
+                    if let Some(result) = self.with_page(page_no, |data| {
+                        callback.take().expect("page callback used once")(data)
+                    }) {
+                        leader.finish();
+                        return Ok(result);
+                    }
+
+                    self.flat_slots.misses.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(page = page_no.get(), "page-cache read dispatch");
+                    let mut buf = self.pool.acquire()?;
+                    let offset = page_offset(page_no, self.page_size);
+                    let bytes_read = file.read(cx, buf.as_mut_slice(), offset).await?;
+                    if bytes_read < self.page_size.as_usize() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short read fetching page {page}: got {bytes_read} of {page_size}",
+                                page = page_no.get(),
+                                page_size = self.page_size.as_usize()
+                            ),
+                        });
+                    }
+
+                    let result = callback.take().expect("page callback used once")(buf.as_slice());
+                    if self.insert_tiered_if_absent(page_no, buf) {
+                        self.note_page_access_without_metrics(page_no);
+                        self.record_eviction_admit(page_no);
+                    }
+                    leader.finish();
+                    tracing::debug!(page = page_no.get(), "page-cache read complete");
                     return Ok(result);
                 }
-                // Cache miss — read from VFS
-                let mut buf = self.pool.acquire()?;
-                let offset = page_offset(page_no, self.page_size);
-                let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
-                if bytes_read < self.page_size.as_usize() {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "short read fetching page {page}: got {bytes_read} of {page_size}",
-                            page = page_no.get(),
-                            page_size = self.page_size.as_usize()
-                        ),
-                    });
-                }
-                let result = f(buf.as_slice());
-                arr.insert(page_no, buf);
-                if let Some(Some(entry)) = arr.pages.get(FastPageArray::pgno_to_idx(page_no)) {
-                    entry.record_access();
-                }
-                drop(arr);
-                self.record_eviction_admit(page_no);
-                return Ok(result);
             }
         }
-
-        // Flat slots probe (bd-eorms) — lock-free miss path
-        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
-                && let Some(ref buf) = *guard
-            {
-                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
-                let result = f(buf.as_slice());
-                drop(guard);
-                self.record_eviction_access(page_no);
-                return Ok(result);
-            }
-            // Data cleared between probe and lock (rare). Fall through.
-        }
-
-        // Overflow shard hit check
-        let shard_idx = self.shard_index(page_no);
-        {
-            let mut shard = self.shards[shard_idx].lock();
-            if shard.pages.contains_key(&page_no) {
-                shard.hits = shard.hits.saturating_add(1);
-                let data = shard.pages.get(&page_no).expect("just checked");
-                let result = f(data.as_slice());
-                drop(shard);
-                self.record_eviction_access(page_no);
-                return Ok(result);
-            }
-            shard.misses = shard.misses.saturating_add(1);
-        }
-        // Shard lock released before VFS I/O — better concurrency (bd-eorms).
-
-        // Cache miss — read from VFS (no lock held)
-        self.flat_slots.misses.fetch_add(1, Ordering::Relaxed);
-        let mut buf = self.pool.acquire()?;
-        let offset = page_offset(page_no, self.page_size);
-        let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
-
-        if bytes_read < self.page_size.as_usize() {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "short read fetching page {page}: got {bytes_read} of {page_size}",
-                    page = page_no.get(),
-                    page_size = self.page_size.as_usize()
-                ),
-            });
-        }
-
-        let result = f(buf.as_slice());
-        // Insert into flat slots; overflow to shard on CAS failure.
-        self.insert_tiered(page_no, buf, false);
-        self.note_page_access_without_metrics(page_no);
-        self.record_eviction_admit(page_no);
-        Ok(result)
     }
 
     /// Write a cached page out to a VFS file.
-    pub fn write_page(&self, cx: &Cx, file: &mut impl VfsFile, page_no: PageNumber) -> Result<()> {
-        // Fast path (bd-fzr07)
-        if self.use_fast_path.load(Ordering::Relaxed) {
-            if let Some(ref fast) = self.fast_array {
-                let mut arr = fast.lock();
-                if let Some(data) = arr.get(page_no) {
-                    let offset = page_offset(page_no, self.page_size);
-                    file.write(cx, data, offset)?;
-                    if let Some(Some(entry)) = arr.pages.get(FastPageArray::pgno_to_idx(page_no)) {
-                        entry.mark_clean();
-                    }
-                    drop(arr);
-                    self.record_eviction_access(page_no);
-                    return Ok(());
-                }
-                return Err(FrankenError::internal(format!(
-                    "page {} not in cache",
-                    page_no
-                )));
-            }
-        }
-
-        // Flat slots (bd-eorms)
-        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
-            let guard = self.flat_slots.slots[slot_idx].data.lock();
-            if self.flat_slots.slots[slot_idx].pgno.load(Ordering::Acquire) == page_no.get()
-                && let Some(ref buf) = *guard
-            {
-                self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
-                let offset = page_offset(page_no, self.page_size);
-                file.write(cx, buf.as_slice(), offset)?;
-                buf.mark_clean();
-                drop(guard);
-                self.record_eviction_access(page_no);
-                return Ok(());
-            }
-        }
-
-        // Overflow shard
-        let idx = self.shard_index(page_no);
-        let mut shard = self.shards[idx].lock();
-
-        if !shard.pages.contains_key(&page_no) {
-            shard.misses = shard.misses.saturating_add(1);
+    pub async fn write_page(
+        &self,
+        cx: &Cx,
+        file: &impl VfsFile,
+        page_no: PageNumber,
+    ) -> Result<()> {
+        let Some((page, generation)) = self.page_write_snapshot(page_no) else {
             return Err(FrankenError::internal(format!(
-                "page {} not in cache",
-                page_no
+                "page {page_no} not in cache"
             )));
-        }
-
-        shard.hits = shard.hits.saturating_add(1);
-        let buf = shard.pages.get(&page_no).expect("just checked");
+        };
         let offset = page_offset(page_no, self.page_size);
-        file.write(cx, buf.as_slice(), offset)?;
-        buf.mark_clean();
-        drop(shard);
+        file.write(cx, page.as_bytes(), offset).await?;
+        self.mark_page_clean_if_generation(page_no, generation);
         self.record_eviction_access(page_no);
         Ok(())
     }
@@ -3274,7 +3387,7 @@ impl ShardedPageCache {
 
     /// Evict one clean pool-backed cache page and return its buffer to the
     /// free list. Callers that immediately need the allocation should prefer
-    /// [`Self::take_clean_buffer`] to avoid a free-list race.
+    /// `Self::take_clean_buffer` to avoid a free-list race.
     pub fn evict_clean_any(&self) -> bool {
         self.take_clean_buffer().is_some()
     }
@@ -3662,13 +3775,14 @@ impl ShardedPageCache {
     ///
     /// This is a convenience method that wraps `read_page` with a copy
     /// operation, matching the common usage pattern in pager code.
-    pub fn read_page_copy(
+    pub async fn read_page_copy(
         &self,
         cx: &Cx,
-        file: &mut impl VfsFile,
+        file: &impl VfsFile,
         page_no: PageNumber,
     ) -> Result<Vec<u8>> {
         self.read_page(cx, file, page_no, |data| data.to_vec())
+            .await
     }
 
     /// Get a cached page and return an owned copy.
@@ -3813,9 +3927,9 @@ fn page_offset(page_no: PageNumber, page_size: PageSize) -> u64 {
 /// "small stack buffers for fixed-size headers."
 ///
 /// Returns the raw header bytes.
-pub fn read_db_header(cx: &Cx, file: &mut impl VfsFile) -> Result<[u8; 100]> {
+pub async fn read_db_header(cx: &Cx, file: &impl VfsFile) -> Result<[u8; 100]> {
     let mut header = [0u8; 100];
-    let bytes_read = file.read(cx, &mut header, 0)?;
+    let bytes_read = file.read(cx, &mut header, 0).await?;
     if bytes_read < 100 {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!("database header short read: expected 100 bytes, got {bytes_read}"),
@@ -4902,6 +5016,60 @@ mod tests {
         assert!(
             snapshot.t2_size >= 1,
             "S3-FIFO metrics should expose a non-empty main queue for sharded cache"
+        );
+    }
+
+    /// GH #197: a cache-miss fill that raced with a concurrent writer must
+    /// not overwrite the newer resident image the writer installed while the
+    /// miss I/O was in flight.
+    ///
+    /// The interleaving is forced deterministically: the miss path reads the
+    /// stale bytes from the VFS, then — before it re-acquires the cache to
+    /// install them — the `f` callback plays the role of the racing writer
+    /// and installs fresh bytes for the same page. The resident entry must
+    /// keep the fresh bytes.
+    #[test]
+    fn gh_197_late_miss_fill_does_not_overwrite_newer_resident_page() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(Path::new("/gh-197.db")),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB,
+            )
+            .expect("open db file");
+
+        let page_size = PageSize::DEFAULT.as_usize();
+        let page_no = PageNumber::new(7).unwrap();
+        let offset = page_offset(page_no, PageSize::DEFAULT);
+
+        // Backing store holds the stale image 0x11.
+        file.write(&cx, &vec![0x11_u8; page_size], offset)
+            .expect("seed stale page");
+
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+
+        // Miss path: while the stale read result is still un-cached, a
+        // writer installs the fresh image 0x22 for the same page.
+        cache
+            .read_page(&cx, &mut file, page_no, |stale| {
+                assert!(
+                    stale.iter().all(|&b| b == 0x11),
+                    "miss I/O must observe the stale backing bytes"
+                );
+                let mut fresh = cache.pool().acquire().expect("acquire fresh buf");
+                fresh.as_mut_slice().fill(0x22);
+                cache.insert_buffer(page_no, fresh);
+            })
+            .expect("miss read");
+
+        let resident = cache
+            .get_copy(page_no)
+            .expect("page must be resident after the race");
+        assert!(
+            resident.iter().all(|&b| b == 0x22),
+            "newer resident image must win over the stale late miss-fill (GH #197)"
         );
     }
 

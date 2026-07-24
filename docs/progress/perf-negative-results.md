@@ -19417,3 +19417,905 @@ size). DISPROVES the earlier slow-balance hypothesis:
   locality-ramp. INFRA: enable btree counters (`set_btree_metrics_enabled`/`set_btree_copy_profile_enabled`)
   — they are gated OFF by default and silently read zero otherwise; debug build is fine (counters are
   opt-level-independent) and compiles faster than release-perf.
+
+## 2026-07-16 - ROOT CAUSE (bd-aoj0g CONFIRMED): the O(n²) INSERT is non-sequential-index CACHE LOCALITY
+
+Locality experiment (debug, `:memory:`, one txn, index on `k`, per-1000-insert ns by table size) —
+inserted the SAME rows but varied `k`, which controls the secondary-index key `(k, rowid)` order:
+- `k = i` (unique, sequential → MONOTONIC index key → append to the rightmost leaf): **FLAT**
+  ~125-153 ns/insert across 0→9k rows. NO growth.
+- `k = i%100` (low-cardinality, non-monotonic → scatters across 100 subtrees): **166 → 646 ns/insert**
+  (grows ~4× over 9k; extrapolates to the 295× gap at 100k).
+- `k = i%5000` (higher-cardinality, non-monotonic): flat ~130 ns until row 5000 (all 5000 distinct
+  k-values now exist), then STEP-jumps to ~330 ns and plateaus.
+CONCLUSION: the O(n²) secondary-index INSERT is **CPU-cache locality of NON-SEQUENTIAL index inserts** —
+each insert seeks a scattered leaf whose page is cache-cold as the index grows, and `MemPageStore::read_page`
+(cursor.rs:538) `.cloned()`s the full 4 KB page per read. A monotonic index key (sequential append, one hot
+leaf) is flat; a non-monotonic key scatters and ramps. This DEFINITIVELY rules out witnesses / btree cell
+ops / opcode overhead (those are constant, which the sequential case would also show).
+- Also note: even the FLAT sequential case is ~130 ns/insert (debug) with an index vs ~5 µs execute_body
+  without one — there is a high per-index-insert CONSTANT (re-descend + per-page 4 KB clone; stack-elision
+  is disabled because pages are dirty within the txn), separate from the locality ramp.
+- FIX = STRUCTURAL, not one-turn (recorded on bd-aoj0g, handed to open): the growth is inherent to
+  non-sequential inserts into a large in-memory B-tree; mitigations are chartered — LSM/B-epsilon-style
+  write buffering that batches+sorts index inserts, a larger effective page cache, or handing out
+  `Arc<[u8]>` pages instead of 4 KB clones (reduces the constant, not the ramp). The single biggest INSERT
+  perf item in the codebase is now fully root-caused.
+
+## 2026-07-16 - BLOCKED: bd-in-list-composite-prefix implemented + golden-verified, oracle blocked by a fsqlite-core BUILD BREAK
+
+Implemented the composite-leading IN-list aggregate seek (bd-in-list-composite-prefix-probe): relaxed
+`index_integer_in_list_target` to fall back to a composite `(a, …)` index whose ascending leading column
+matches (after the single-column preference), and made `emit_aggregate_index_value_seek` probe with a
+1-field PREFIX `[value]` when `idx_schema.key_term_count() > 1` (so SeekGE anchors at the first `a=value`
+entry INCLUDING `a=value, b=NULL` rows, which the 2-field `[value, i64::MIN]` probe skips). Single-column
+path keeps the exact 2-field probe. **GOLDEN 8/8 unchanged** (fsqlite-vdbe compiles, single-col
+byte-identical). Wrote `agg_in_list_composite_prefix_oracle.rs` (COUNT/SUM/MIN/MAX/AVG over a composite
+index with `a=3` being b=NULL-only, dup IN values, no-match, single-col control, non-indexed control).
+- BLOCKER: the oracle CANNOT RUN — **fsqlite-core does not compile on a fresh build in ANY feature config**:
+  (native) `remote_effects.rs:644` passes 2 args to `Bulkhead::try_acquire`, but Cargo.lock pins
+  `asupersync 0.3.5` whose `try_acquire` takes 1 arg (re-applied by `51a20be2` "merge regression" — the lock
+  bump to 0.3.5 and the 2-arg call are inconsistent); (no-default-features) a separate `into_os_string` on
+  `!` error. This blocks ALL fresh `fsqlite` oracle/e2e builds, not just mine. NOT my change (fsqlite-vdbe
+  golden compiled clean).
+- Result: my WIP is STASHED ("BlackThrush bd-in-list-composite-prefix WIP ... DO NOT DROP") and the bead is
+  handed back to open. RETRY: once fsqlite-core builds again (pin asupersync to a 2-arg version, or revert
+  remote_effects.rs:644 to 1-arg — a dependency/core call, not mine), `git stash pop` the WIP and run
+  `cargo test -p fsqlite --test agg_in_list_composite_prefix_oracle`; the logic is sound + golden-clean, so
+  it should pass. Per the oracle-first cadence I did NOT ship the unverified codegen.
+
+## 2026-07-16 - RESOLVED + SHIPPED: root-caused the asupersync build break (STALE PIN) and landed bd-in-list-composite (~657x)
+
+The "fsqlite-core does not compile" blocker above was a **stale dependency pin**, not a 2-arg-vs-1-arg
+code bug: `remote_effects.rs` correctly targets asupersync's 2-arg `try_acquire(weight, now)` API
+(edf9852f/51a20be2's deliberate time-API move), which is **asupersync 0.3.9** — published on crates.io —
+but the workspace `Cargo.toml` pin was never bumped from `0.3.5` (1-arg). Every fresh fsqlite-core build
+(rch workers, clean checkouts) failed `error[E0061]`; only machines with an uncommitted local asupersync
+patch built. The earlier "no-default-features into_os_string on !" was a red herring from a separate
+non-native stub. Fix (`fix(deps): bump asupersync pin 0.3.5 -> 0.3.9`): one-line pin bump + lockstep lock
+update (asupersync + franken-decision/evidence/kernel 0.3.5->0.3.9). Verified `cargo check -p fsqlite
+--tests` compiles clean fleet-wide. (A stray uncommitted 1-arg workaround someone had left in the working
+tree was preserved to a stash, not discarded, and reverted to HEAD's 2-arg — the forward-correct state.)
+
+With fsqlite building again, bd-in-list-composite-prefix's oracle RAN and PASSED (byte-exact vs rusqlite,
+all of COUNT/SUM/MIN/MAX/AVG incl the `a=3` b=NULL-only case). Perf A/B on a 200k-row composite-`(a,b)`
+table with no single-column index (release-perf, no LTO):
+- `COUNT(*) WHERE a IN (5 vals)` (composite SeekGE 1-field prefix): **51,416 ns/query**
+- `COUNT(*) WHERE c = 500` (full-scan control): **33,791,088 ns/query**
+- **A/B ratio ≈ 657x** (seek replaces full scan; EXPLAIN confirms no Rewind on the seek, Rewind on control).
+SHIPPED: codegen.rs + `agg_in_list_composite_prefix_oracle.rs`. Single-column IN path unchanged (golden 8/8).
+
+## 2026-07-16 - PROFILE + WIP: seek-gap map (easy levers mined) + bd-distinct-loose-scan hits the btree hang
+
+Profiled the codegen seek vein with an EXPLAIN-opcode battery (`zz_seekgap_probe`, ephemeral) across DISTINCT,
+GROUP BY, MIN/MAX, equality, range, IN over single-column and composite indexes. Key finding: a crude
+"Rewind = full scan" heuristic FALSE-POSITIVES — the real opcode dumps show the accessible levers are already
+mined:
+- `MIN(a)` "full-scans" only in the heuristic; `codegen_select_minmax_index_seek` already does `Rewind`
+  (go-to-first) + a NULL-skip loop that stops at the first non-NULL (O(1), not O(n)). Not a gap.
+- `COUNT(*) WHERE a=5` / `SELECT id WHERE a=5` are already index-seek-served (SeekGE idx + walk the run);
+  the `Rewind` the heuristic flagged is UNREACHABLE dead code after the seek loop's exit jump. Not gaps.
+- `GROUP BY a` index-walk and `SELECT DISTINCT a` emit-on-change index-walk are both already REJECTED
+  (`63cc5f87` perf-flat vs the vectorized sorter; `6e672d6f` ~32% slower). The sorter is competitive.
+- The ONLY remaining real gap is the DISTINCT loose/skip scan (100-400x) — filed as bd-distinct-loose-scan.
+
+Implemented bd-distinct-loose-scan (WIP stashed "BlackThrush bd-distinct-loose-scan WIP ... DO NOT DROP"):
+`distinct_loose_scan_plan` + `codegen_select_distinct_loose_scan` + routing at the DISTINCT branch, gated to
+`SELECT DISTINCT <single plain BINARY col>` with a single-column ASC BINARY index, no WHERE/GROUP BY/HAVING/
+LIMIT, not generated/WITHOUT ROWID. Emitter: OpenRead idx, Rewind, loop { Column→emit; SeekGT past the run }.
+GOLDEN-COMPILES. **BLOCKED: the oracle HANGS** — the same failure the bead flagged ("skip-scan hangs"). Root-
+caused past the codegen probe: BOTH a 2-field `[value, i64::MAX]` probe AND a 1-field prefix `[value]` probe
+(the design-intended form for `compare_index_key_values`' UpperBound bias `rhs.len() <= lhs.len() => Less`,
+cursor.rs:4623) hang. So the bug is in the **btree upper-bound skip layer, NOT the codegen** — most likely the
+interior-page descent uses `IndexSeekBias::LowerBound` unconditionally (cursor.rs:4578) while the leaf uses
+UpperBound, so `index_seek_upper_bound` mis-positions when a value's run spans multiple leaves (my 2000-row /
+~166-per-value test does), and the cursor fails to advance → infinite loop. NEXT: root-cause
+`index_seek_with_bias(UpperBound)` / `binary_search_index_interior_with_bias` on a fast LOCAL build (per the
+bead) — likely the interior descent must propagate the UpperBound bias, or the leaf-crossing successor logic
+(cursor.rs:4247) must re-seek. Codegen WIP is correct in shape; unblocking is a btree-cursor fix. Did NOT ship.
+
+## 2026-07-24 - BLOCKER: comprehensive frontier refresh cannot compile after the async `TransactionHandle` migration
+
+- Result type: build blocker before the timed path, not a performance REJECT.
+  The attempted refresh used clean merged HEAD
+  `e4be5aee34f4919fa73071f351f9018d094d9422` and strict remote execution:
+  `RCH_WORKER=vmi1227854 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+  -- cargo run -j2 --profile release-perf -p fsqlite-e2e --bin
+  comprehensive-bench -- --quick --json-out
+  tests/artifacts/perf/snowybrook-full-quick-20260724T0200Z.json --no-html`
+  (RCH job `j-29944835100115059`). Worker placement was honored and no local
+  Cargo fallback ran.
+- Failure: `fsqlite-btree` stopped compilation with eight type errors in
+  `crates/fsqlite-btree/src/cursor.rs:385-432`. `TransactionPageIo` implements
+  synchronous `PageReader`/`PageWriter`, but its calls to
+  `TransactionHandle::{get_page,write_page,write_page_data,
+  restore_staged_page_data,allocate_page,free_page}` now return Futures.
+  Representative diagnostics were E0277 (`?` cannot be applied to a Future)
+  and E0308 (expected `Result<...>`, found
+  `impl Future<Output = Result<...>>`).
+- Root cause is the incomplete contract migration in commit `213448b0`
+  (`fix(wal): db-fsync recovery fence before WAL truncate over an async
+  checkpoint target`). That commit changed the `TransactionHandle` methods in
+  `crates/fsqlite-pager/src/traits.rs` from synchronous Results to Futures but
+  did not touch `crates/fsqlite-btree/src/cursor.rs`; later commits through
+  merged HEAD did not bridge or migrate the synchronous B-tree adapter.
+- No artifact, benchmark result, new worst-ratio ranking, or candidate
+  performance claim exists for this attempt. The last admissible frontier
+  artifact remains
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/full-quick.json`
+  from pre-migration source `d2ec37bf`. The consecutive performance-REJECT
+  count therefore remains one; a build blocker is not counted as REJECT #2.
+- This measured-frontier lane did not patch the async architecture. An
+  ad-hoc blocking executor inside `TransactionPageIo` would make
+  cancellation/runtime semantics part of a benchmark-enabling workaround and
+  would cross the separately owned architectural lane. The owning fix must
+  make the B-tree page-I/O contract and async pager contract coherent, with
+  explicit asupersync/cancellation semantics, before performance work resumes.
+- `zz_*_bench.rs` triage refresh: all 29 benches are still present, still
+  declare `EPHEMERAL ... Not for commit`, and remain ignored single-shot
+  `Instant` probes without interleaved null controls, repeated-sample CV, or a
+  general SQLite differential oracle. None became a durable KEEP candidate;
+  the complete preserved filename list and promotion requirements remain in
+  the 2026-07-22 probe-triage entry. The separate
+  `zz_seekgap_probe.rs` is also still present. No probe was edited, committed,
+  archived, or deleted.
+- Retry predicate: first require exact current `origin/main` to pass
+  `RCH_REQUIRE_REMOTE=1 rch exec -- cargo check -p fsqlite-btree` on a remote
+  worker, then require the exact-SHA release-perf comprehensive command above
+  to reach and finish the timed `--quick` matrix. Only then refresh the
+  artifact, re-rank stable rows, and resume one-lever profile/A-B/conformance
+  cycles.
+
+## 2026-07-24 - REJECT/SURFACE: refreshed worst ratio still fails the small-N DELETE retry gate
+
+- Result type: profile-gated lever REJECT with no source mutation. The fresh
+  comprehensive quick artifact is
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/full-quick.json`
+  (SHA-256
+  `d8d6fa76bc0641879b3b97bbb67bfacb4ea43bdd4f50b883596356297e50c534`).
+  It was built and run remotely on `vmi1227854` from exact source commit
+  `d2ec37bf627df1d0351d68b6bfa0f394fd0ae97c` with
+  `RCH_REQUIRE_REMOTE=1 rch exec -- cargo run -j2 --profile release-perf -p
+  fsqlite-e2e --bin comprehensive-bench -- --quick --json-out
+  tests/artifacts/perf/darkbarn-full-quick-20260724T0030Z.json --no-html`.
+  The report's dirty flag is the RCH transfer scratch directory; its recorded
+  source SHA is exact and the release-perf binary is newer than that HEAD.
+- Refresh result: 93 scenarios in 13.382 seconds; 75 FrankenSQLite-faster, 6
+  comparable, 12 C-SQLite-faster; primary category-weighted score
+  `0.4271456883` and geomean ratio `0.3125652025`. The worst raw ratio is again
+  `UPDATE/DELETE Throughput / 100 rows / delete 5 rows`: C `2.354 us`
+  (CV `3.81%`) versus FrankenSQLite `7.902 us` (CV `6.96%`), ratio
+  `3.356839x`.
+- One lever screened: elide/coalesce the retained direct-DELETE run's
+  top-level direct-write flush or explicit-COMMIT boundary. A second
+  same-worker remote profile run used the same release-perf source and
+  `FSQLITE_BENCH_PROFILE_DML=1`, filtered to `update-delete`; its JSON is
+  `tests/artifacts/perf/cod-fullquick-refresh-20260724T0030Z/update-delete-profile.json`
+  (SHA-256
+  `b2bb4fde4541183f9bc41f885445de1622b5c10a6a0386b737ece2a0ac35b6e5`).
+  The target repeated at C `3.696 us` (CV `9.61%`) versus FrankenSQLite
+  `10.166 us` (CV `11.95%`), ratio `2.750541x`. Phase counters showed no
+  dominant removable component: `begin_ns=2163`, `commit_roundtrip_ns=2103`,
+  `delete_seek_ns=1192`, `delete_leaf_flush_ns=2283`, and the complete
+  top-level `direct_flush_ns=2774` (27.3% of the measured F median). This
+  reproduces the 2026-05-10 direct-write-flush-wrapper rejection rather than
+  admitting another wrapper or transaction-control edit.
+- Verdict: rejected before implementation. The row is only `10.166 us`
+  absolute, both focused comparator CVs exceed 5%, and no single removable
+  component clears 30%. Therefore source A/B, null-control, and conformance
+  gates were not entered; inventing a candidate here would violate the
+  profile-first eligibility rule and cross into the architectural MVCC
+  transaction lane.
+- `zz_*` triage refresh: all 30 preserved probe files are still present and
+  still carry their `EPHEMERAL ... Not for commit` marker. None is useful as a
+  durable test as-is; the complete preserved filename list and promotion
+  requirements remain in the 2026-07-22 untracked-probe entry below. No probe
+  was edited, committed, archived, or deleted.
+- Retry predicate: reopen this small-N DELETE family only when a same-worker
+  baseline is stable below 5% CV, exceeds `50 us` absolute, and attributes
+  more than 30% to one correctness-optional component not already rejected in
+  this ledger. Any candidate must then clear an interleaved same-worker A/B
+  with a null control, both variants below 5% CV, at least a 10% target
+  improvement, no 1K/10K DELETE regression, and SQLite differential
+  conformance.
+
+## 2026-07-22 - KEEP + BLOCKER ROOT-CAUSED: adaptive DISTINCT loose/skip scan lands at 23.5x; the "skip-scan hang" was ResultRow register drain, never the btree (bd-distinct-loose-scan-c8nay)
+
+- Result type: lever KEEP + blocker resolution. Prior state: 2026-07-11 (reverted, hang),
+  2026-07-16 (WIP stashed, hang re-observed, btree upper-bound layer suspected — see previous entry).
+- BLOCKER ROOT CAUSE (definitive, gdb-proven): the WIP emitted Column -> ResultRow -> Copy ->
+  MakeRecord -> SeekGT, but the engine's ResultRow (`execute_result_row_hot`) DRAINS its source
+  registers via `take_reg_range` — the probe Copy after ResultRow always read NULL, so every SeekGT
+  probe was the constant record `[2,0]`=`[NULL]` (gdb breakpoint on the SeekGT arm: probe identical
+  across 8 iterations) while the cursor sat CORRECTLY parked at the NULL-run upper bound (leaf page 6,
+  cell 54/500, at_eof=false, byte-identical stack each iteration). The loop re-emitted one row
+  forever; reproduced locally to 192 GB RSS before kill. Fix: the probe Copy precedes ResultRow.
+- BTREE EXONERATED: `test_cursor_index_prefix_upper_bound_loose_scan_over_multi_leaf_runs`
+  (46a4544b; extended with a leading NULL run + [NULL]-prefix probes in the lever commit) drives the
+  loose-scan loop over a NATURALLY SPLIT multi-leaf tree with both probe shapes (1-field prefix and
+  [value, i64::MAX] sentinel): one seek per distinct value, terminates. The 2026-07-16
+  interior-descent-LowerBound hypothesis is REFUTED — `binary_search_index_interior_with_bias` has
+  propagated the bias since a42d1020, which predates the hang. HAZARD (chartered follow-up
+  bd-resultrow-drain-sweep): ANY emitter reading a result register after ResultRow silently gets NULL
+  (take_reg_range drain diverges from stock SQLite register semantics); sweep existing emitters.
+- PREFLIGHT GATE: sql_pipeline_candidate_preflight --operation DistinctLooseScan --direction other
+  => verdict "allowed", zero matched no-retry records.
+- LEVER (commit eee0c07d): distinct_loose_scan_plan + codegen_select_distinct_loose_scan
+  (BlackThrush stash@{0} WIP, applied, stash preserved) + ADAPTIVE skip: up to 3 cheap Next probes
+  (Ne, NULLEQ 0x80, BINARY collation) exit short runs before paying a root-to-leaf SeekGT. Gates:
+  single plain BINARY column output, single-column ASC BINARY index (supports_direct_column_lookup
+  => not partial, no extra stored columns; name match => not expression), rowid table, not
+  generated, no WHERE/GROUP BY/HAVING/LIMIT; ORDER BY and aggregates consumed by earlier branches.
+- WORST CASE MEASURED AND FIXED: pure per-value SeekGT on an ALL-DISTINCT 20k-row index cost
+  109.8 ms/query vs 8.9-10.1 ms sorter (~11x REGRESSION) — the adaptive Next-probe form degrades to
+  an emit-on-change walk at 9.9 ms (sorter parity). Do NOT re-land a seek-only loose scan without
+  the adaptive fallback; this is the retry predicate for any future "simplify the inner loop" idea.
+- A/B (release-perf, isolated cc-target on csd, interleaved lever-vs-null-control x5 batches of 200,
+  in-binary EXPLAIN freshness gate printed "loose-scan/index"): DISTINCT k (50 distinct / 20k rows,
+  indexed, loose scan) 384,065 ns/query CV 5.2% vs DISTINCT u (same data, NOT indexed, sorter
+  control) 9,018,971 ns/query CV 3.2% => 23.48x; single-shot 321 us vs 8.9 ms => 27.7x. CV gate note:
+  k's 5.2% is a hair over the 5% target on the shared host; the 23.5x effect is ~450x beyond the
+  noise — decisive. Historical pre-lever baseline for the same shape: 14.8 ms (2026-07-11 entry).
+- CONFORMANCE: distinct_loose_scan_oracle 3/3 byte-exact vs rusqlite (int/text NULL-run tables,
+  empty/single/all-same/all-NULL, mixed storage classes 2 vs 2.0 typeless, REAL runs, i64::MIN/MAX,
+  all-distinct, short 2-3 runs, file-backed Txn-cursor variant; EXPLAIN no-SorterOpen gate). DECLINE
+  controls (NOCASE, non-indexed) assert SET-equality: bare-DISTINCT fallback ORDER already diverges
+  from C SQLite (pre-existing bd-distinct-scan-order-divergence-zv52i, not introduced here).
+  No-regression: fsqlite 654/0, fsqlite-btree 487/0, fsqlite-vdbe 1060/0 lib suites; clippy
+  -D warnings; fmt.
+- Environment incidents fixed en route (memory notes saved): csd's crates.io sparse-index cache had
+  regressed (serde capped at 1.0.224, franken-* 0.3.9 missing) — healed by rewriting 4 stale .cache
+  entries from the live index; asupersync 0.3.9 cannot compile under a bare `-p fsqlite` resolver-v2
+  feature subgraph (atp module needs optional deps only workspace-level unification activates) —
+  full-stack builds must be workspace-scoped (`--workspace --test ...`) or fleet-run.
+
+## 2026-07-22 - Adaptive micro-sampling for the 100-row DELETE comparator tail
+
+- Target: the refreshed worst raw ratio in
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`,
+  `UPDATE/DELETE Throughput / 100 rows / delete 5 rows` at `3.3188x`. The
+  refresh itself had high C/F CV (`14.03%/35.91%`), so this candidate changed
+  only `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`: extend sampling for
+  sub-20-us rows until a tighter elapsed-time floor, without changing either
+  engine or the measured SQL envelope. Source was manually restored after the
+  measurement rejected the lever.
+- Interleaved same-worker target evidence (`A1/B1/A2/B2`, where A is the
+  existing sampler and B is the adaptive candidate): A1 C/F
+  `2.174/6.743 us`, ratio `3.1017`, CV `5.83%/3.79%`; B1
+  `1.703/5.741 us`, ratio `3.3711`, CV `0.65%/1.14%`; A2
+  `2.275/7.624 us`, ratio `3.3512`, CV `4.28%/26.17%`; B2
+  `1.683/6.732 us`, ratio `4.0000`, CV `0.24%/9.97%`.
+- Result: rejected. The null-control alternation disproved a coherent engine
+  win, and the candidate still failed the mandatory under-5% FSQLite CV gate
+  in B2. More sampling stabilized the C comparator but did not stabilize the
+  full prepared-DELETE transaction envelope, so it cannot support a KEEP or a
+  new performance claim.
+- Do not retry adaptive micro-sampling as a performance lever for this row.
+  Reconsider benchmark-only sampling changes only if an external scheduler or
+  timer study identifies a concrete noise source and an interleaved same-worker
+  null control brings both engines below 5% CV without changing their SQL,
+  transaction, fixture, or teardown envelopes.
+
+## 2026-07-22 - Untracked `zz_*` probe triage: no durable test candidates as-is
+
+- Target: all 30 untracked `crates/fsqlite/tests/zz_*` probe files left in the
+  shared checkout after the rowid/index seek campaign.
+- Result: none should land as-is. Every file declares `EPHEMERAL ... Not for
+  commit`; the 29 benches are ignored single-shot `Instant` probes with no
+  interleaved null control, no repeated-sample CV, and generally no C-SQLite
+  oracle. `zz_seekgap_probe.rs` only dumps opcode lists and overlaps the owned
+  DISTINCT skip-scan lane. The useful rowid/index opcode shapes are already
+  covered by landed commits `91e42854`, `b41d02d5`, `66a62e57`, `dcd6f3c`,
+  `73ff169c`, `9c692992`, `a9a95427`, `1023043f`, `d32a263a`, `81a66d3f`, and
+  `8ba32e76` plus their durable tests.
+- Operator list; preserved untouched and not deleted:
+  `zz_aggincomposite_bench.rs`, `zz_aggrowideqcoerced_bench.rs`,
+  `zz_aggrowideqresidual_bench.rs`, `zz_aggrowidin_bench.rs`,
+  `zz_aggrowidinresidual_bench.rs`, `zz_countrowideq_bench.rs`,
+  `zz_countrowideqcoerced_bench.rs`, `zz_countrowidin_bench.rs`,
+  `zz_countrowidresidual_bench.rs`, `zz_deleterowidin_bench.rs`,
+  `zz_dmlindexeq_bench.rs`, `zz_dmlindexeqnum_bench.rs`,
+  `zz_dmlindexeqparam_bench.rs`, `zz_dmlindexeqresidual_bench.rs`,
+  `zz_dmlindexeqtext_bench.rs`, `zz_dmlrowideqresidual_bench.rs`,
+  `zz_dmlrowidinresidual_bench.rs`, `zz_dmlrowidrange_bench.rs`,
+  `zz_indexeqorderrowid_bench.rs`, `zz_indexeqorderrowiddesc_bench.rs`,
+  `zz_rowideqresidual_bench.rs`, `zz_rowidinorder_bench.rs`,
+  `zz_rowidinresidual_bench.rs`, `zz_rowidorderscan_bench.rs`,
+  `zz_rowidorderscandesc_bench.rs`, `zz_rowidorderscandescfilt_bench.rs`,
+  `zz_rowidorderscanfilt_bench.rs`, `zz_rowidrangeresidual_bench.rs`,
+  `zz_seekgap_probe.rs`, and `zz_updaterowidin_bench.rs`.
+- Retry condition: promote an individual probe only after it demonstrates a
+  still-uncovered semantic shape, is renamed out of the `zz_` namespace, gains
+  a C-SQLite differential oracle plus durable opcode/behavior assertions, and
+  any numeric claim uses interleaved same-worker sampling with a null control
+  and CV below 5%. The operator decides archival/removal; this agent deleted
+  nothing.
+
+## 2026-07-22 - REJECT: prepared DELETE vector batch publication deferral
+
+- Target: refreshed worst raw ratio, `UPDATE/DELETE Throughput / 100 rows /
+  delete 5 rows` (`3.3188x`) in
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+  This was the broader same-leaf operator admitted by the retry predicates on
+  the closed direct-publication and transaction-local rowid-batch attempts: it
+  added a prepared-parameter batch API without an O(table rows) proof set or
+  deferred physical-delete scan.
+- Candidate preflight: `sql_pipeline_candidate_preflight --workload DELETE
+  --operation prepared_delete_vector_batch --direction other --benchmark
+  comprehensive-bench-update-delete --source-surface
+  PreparedStatement::execute_batch_with_params --json` returned `allowed` with
+  zero matched records. Profile-first routing on the exact 100-row/5-delete
+  shape put `execute_body` at `4.659-5.620 us`, with commit roundtrip
+  `1.493-2.214 us`; the per-row direct DELETE tail included active probe
+  `1.011-1.303 us`, seek `0.742-1.133 us`, leaf flush `1.112-1.373 us`, and
+  five memory-sync calls totaling `0.331-0.551 us`.
+- Touched during the rejected candidate:
+  `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`, and
+  `crates/fsqlite-e2e/src/bin/perf_update_delete.rs`. The candidate fused only
+  eligible direct rowid DELETEs in an active explicit transaction, publishing
+  the conservative memory write-set once at the batch boundary; savepoints,
+  tracing, foreign-key work, and other DML shapes retained the sequential
+  executor. The benchmark kept the original loop as the same-binary null
+  control behind `FSQLITE_BENCH_DISABLE_DELETE_BATCH`. Source was manually
+  restored after rejection.
+- Behavior-isomorphism proof passed remotely through RCH: two focused tests
+  covered duplicate/missing rowids and exact affected counts, read-your-writes,
+  transaction rollback, savepoint fallback plus `ROLLBACK TO`, committed row
+  count, and an instrumentation assertion reducing eight direct DELETE memory
+  syncs to two (`2 passed; 0 failed`). The release-perf two-binary build also
+  passed. This proves the mechanism worked; it did not prove enough speed.
+- Final interleaved same-worker A/B used one release-perf binary on
+  `vmi1149989`, pinned to CPU 8, five alternating-order pairs of 500,000 exact
+  100-row/5-delete iterations. Candidate per-delete samples were
+  `1356/1185/1201/1314/1294 ns` (median `1294 ns`, mean `1270.0 ns`, CV
+  `5.210%`); null-control samples were `1317/1259/1225/1330/1309 ns` (median
+  `1309 ns`, mean `1288.0 ns`, CV `3.078%`). The median delta was only `1.146%`,
+  below control noise, and candidate CV failed the mandatory `<5%` gate. An
+  earlier 20,000-iteration alternation was discarded because two LTO links
+  were still active on the worker.
+- Result: rejected. Collapsing five memory-write-set publications to two is
+  real but too small relative to the full prepared-DELETE transaction envelope
+  to justify a new public batch API or a benchmark-only call-shape advantage.
+  Do not retry publication-only prepared DELETE batching. Reconsider only if a
+  different batch operator also removes a measured larger component (at least
+  one of commit roundtrip, leaf materialization/flush, or repeated seek), and a
+  quiescent same-worker null-controlled A/B improves the 100-row median by at
+  least 10% with both variants below 5% CV and no regression in the 1k/10k
+  DELETE rows.
+
+## 2026-07-23 - REJECT (misdirected charter): "leader-follower group commit for the compat pager WAL path" (bd-6hgad); the machinery already exists and cannot coalesce in the NORMAL-sync benchmark shape
+
+- Result type: lever REJECT + blocker/premise resolution for bd-6hgad
+  ("wal_group_commits=0 ... group commit machinery never fires; 8w parity row
+  pays 108 solo WAL commits"). The chartered lever was CopperCliff's
+  "leader-follower group commit for the compat pager WAL path" on the premise
+  that the compat path has NO cross-committer group commit.
+- PREMISE DISPROVEN (source read): the compat WAL commit path
+  (`commit_wal_group_commit_with_snapshot`, pager.rs:11019) already implements
+  full leader-follower group commit — a shared per-database `GroupCommitQueue`
+  consolidator (FILLING->FLUSHING->COMPLETE, epoch pipelining, Flusher/Waiter
+  roles via `submit_batch`, waiter takeover via `claim_flusher_vacancy`,
+  cross-batch overlap aborts, durable certificates). BOTH WAL commit call sites
+  (pager.rs:13004 plain, :13440 concurrent/retained) funnel through it. It is
+  not structurally absent.
+- WHY `wal_group_commits=0` (metric wiring, not behavior): the counter the
+  bench prints (`wal_group_commits`) is sourced from
+  `GLOBAL_GROUP_COMMIT_METRICS.record_group_commit`, whose ONLY call site is
+  Native-mode `native_commit.rs:578`. The compat flusher records a DIFFERENT
+  family (`GLOBAL_CONSOLIDATION_METRICS`: groups_flushed, transactions_batched,
+  flusher_commits, waiter_commits). So zero is a native-only counter never
+  incremented on the compat path — not evidence the path never groups.
+- EMPIRICAL (debug binary; FSQLITE_TRACE_GROUP_COMMIT=1 +
+  FSQLITE_WAL_DETAILED_COMMIT_METRICS=1 + FSQLITE_BENCH_PROFILE_CONCURRENT=1,
+  `--filter concurrent`, 2w/4w/8w): 204 group-commit epochs traced; EVERY epoch
+  `batch_size=1`, `members=[single]`, `fsync_seq=0`, `control_mode=conservative`,
+  `fallback_reason=operator_forced`. The machinery FIRES but never COALESCES.
+- ROOT CAUSE of no-coalescing (two independent reasons, either sufficient):
+  (1) `synchronous=NORMAL` => `WalCommitSyncPolicy::Deferred` =>
+  `should_sync_on_commit()` false => NO fsync on commit (fsync_seq=0 confirms).
+  Group commit's entire value is amortizing the expensive fsync across N
+  committers; with no fsync there is nothing to amortize. (2) The benchmark
+  workload is a FEW LARGE transactions (per writer: 1 `BEGIN CONCURRENT` + 1000
+  INSERT + 1 COMMIT), so only ~N commits occur near-simultaneously and the
+  cheap no-fsync flush completes before peers submit into the same FILLING
+  window. Forcing coalescing would require a deliberate arrival-wait (adds
+  latency to every commit) and only helps at high writer counts where
+  FrankenSQLite ALREADY WINS (release artifact cod-fullquick-refresh-20260722:
+  4w 0.90x, 8w 0.42x; the only concurrent LOSS is 2w at 1.22x, the case with
+  the LEAST coalescing opportunity — 2 committers).
+- RETRY PREDICATE: only reconsider a group-commit coalescing lever if the
+  measured workload runs `synchronous=FULL`/`EXTRA` (WalCommitSyncPolicy::
+  PerCommit, real per-commit fsync) AND presents many small concurrent
+  transactions whose commits overlap in wall-clock time, AND a same-worker
+  null-controlled A/B shows the amortized-fsync throughput gain exceeds the
+  added arrival-wait latency at the target writer count with CV<5%. Under
+  NORMAL sync with few large txns, batch_size=1 is optimal, not a defect.
+- SEPARATE (not yet actioned) observation for future levers: every SOLO compat
+  flush still performs certificate-sidecar I/O inside the serialized region
+  (open+backward-scan read via `latest_authorized_durable_certificate_record`,
+  then open+append via `append_durable_certificate_record`, wal_adapter.rs).
+  This is per-commit overhead C SQLite lacks. NOT pursued here: it touches the
+  cross-process durability-publication chain finished today (bd-3wop3.1.3,
+  f190223a) and any in-memory caching of the "latest authorized certificate"
+  must preserve cross-process seed reconciliation (`reconcile_authorized_seed`).
+  Requires release-perf profiling to confirm it is not dwarfed by btree_insert
+  before it is worth the correctness risk.
+- Preflight: `sql_pipeline_candidate_preflight --operation
+  WalGroupCommitEngagement --direction other` => verdict "allowed", zero
+  matched no-retry records. concurrent_mode stays true (untouched).
+
+## 2026-07-23 - CONVERGENCE (no clean lever): comprehensive-bench worst-ratios are now the irreducible MVCC transaction tax on small-N single-threaded writes; the concurrent-writer lane is WON
+
+- Result type: lever-family REJECT + landscape finding. Fresh release-perf
+  `--quick` baseline (14 MB binary built today, `taskset -c 4-11`,
+  Threadripper 5975WX, under heavy shared-host load): the concurrent-writer
+  section — the project's raison d'être — is DECISIVELY WON at every writer
+  count: 2w 0.589x (F 56.2 / C 95.3 ms), 4w 0.562x (F 107 / C 190 ms), 8w
+  0.866x (F 308 / C 355 ms). The 2w 1.22x LOSS seen in the day-old artifact
+  cod-fullquick-refresh-20260722T1800Z is GONE; that artifact's C concurrent
+  medians were ~20x smaller and its 2w row is not reproducible (C concurrent CV
+  here is 15-40%, i.e. file-backed WAL disk noise under load — do NOT A/B the
+  concurrent rows on a loaded host).
+- The remaining worst-ratios are ALL small-N single-threaded `:memory:` write
+  rows, and every one shrinks monotonically as N grows (the fixed-cost
+  signature): DELETE 100/del-5 3.18x, 1000/del-50 1.91x, 10000/del-500 1.24x;
+  INSERT tiny/small 100-row ~1.20x, 10000-row ~1.01x. C wins these because it
+  pays no per-transaction MVCC/safety cost; the amortized-away gap IS that cost.
+- PROFILED both (release-perf, FSQLITE_BENCH_PROFILE_DML / _INSERT):
+  - DELETE 50/1000 (`:memory:`, `direct_delete` fast path): `delete_physical_ns=0`
+    (leaf delete already fully optimized — the ledger's delete_rowid_with_reason
+    micro-levers are all already rejected), the only sizeable delete sub-cost is
+    `delete_seek_ns` ~4.3us/50 = 86 ns/seek (shared B-tree descent, C does the
+    same), rest is begin (2.1us) + commit_roundtrip (3.2us) fixed tax.
+  - INSERT tiny_1col 100/single-txn (F~85 / C~71 us, 14us gap): the gap is the
+    MVCC/safety tax spread across `begin_ns`=2.5us (snapshot/concurrent setup),
+    per-row `change_tracking_ns`=3.1us (MVCC modified-page tracking — REQUIRED
+    for conflict detection), `schema_validation_ns`=3.8us, `memdb_apply_ns`=2.9us,
+    and part of `row_build_ns`=13.9us. No single fat component.
+- Why schema_validation is NOT a lever: `ensure_schema_unchanged*`
+  (connection.rs:5848/5905) is already a minimal cookie+generation integer
+  identity compare (`schema_cookie() != self.schema_cookie`), ~38 ns/insert, not
+  a re-derivation. It is a per-execute safety gate that must run to catch
+  concurrent schema changes; there is nothing to hoist.
+- VERDICT: no fat, un-mined, low-risk lever exists in the small-N write rows.
+  The costs are (a) already minimized, (b) fundamentally required for the
+  concurrent-writer safety guarantees, or (c) heavily mined and rejected (see
+  the 2026-07-10/07-11 prepared-DELETE and rowid-fusion entries, and the
+  2026-07-22 adaptive micro-sampling / prepared-DELETE-batch rejects). The
+  small-N MVCC transaction tax is the PRICE of the concurrent-writer advantage.
+- RETRY PREDICATE: only reopen small-N write optimization if a profiler
+  attributes >30% of a stable (CV<5%, absolute >50us) row to a SINGLE component
+  that is provably not required per-execute for MVCC/SSI correctness, with a
+  same-worker null-controlled A/B clearing the 5% CV gate on a QUIET host.
+  Chasing the 3-4us sub-components individually will not clear noise and risks
+  the concurrent-writer correctness guarantees. Do not A/B concurrent (file-WAL)
+  rows on a loaded host — the disk noise (C CV 15-40%) swamps any engine effect.
+
+## 2026-07-23 - BENCHMARK-INTEGRITY (not a perf lever): the concurrent-writer section compares C-SQLite at synchronous=FULL vs FrankenSQLite at NORMAL — a durability asymmetry that flatters FrankenSQLite; the win must be re-measured at matched sync
+
+- Result type: benchmark fairness finding + charter (bd filed). NOT a perf
+  lever; it corrects the comparison the concurrent-writer claim rests on.
+- OBSERVATION (comprehensive_bench.rs `bench_concurrent_writers`): the C-SQLite
+  writer connections execute only `PRAGMA journal_mode=WAL; PRAGMA
+  busy_timeout=5000;` (line ~3443) and NEVER set `synchronous`. The setup
+  connection sets NORMAL, but `synchronous` is per-connection and does not carry
+  to the writer connections. FrankenSQLite writers explicitly set NORMAL via
+  `apply_pragmas_fsqlite`.
+- EMPIRICAL (build-free, python sqlite3 3.46.1; SQLITE_DEFAULT_SYNCHRONOUS is
+  compile-time-stable at 2=FULL and the repo `.cargo/config` adds only
+  `-DSQLITE_ENABLE_MATH_FUNCTIONS`, no sync override, so rusqlite's bundled
+  libsqlite3-sys 0.38.1 build matches): a fresh connection reports
+  `synchronous=2 (FULL)`, and issuing `PRAGMA journal_mode=WAL` does NOT reduce
+  it. => the concurrent bench's C writers run at FULL = a real WAL fsync on
+  EVERY commit; FrankenSQLite's NORMAL maps to `WalCommitSyncPolicy::Deferred`
+  = NO per-commit fsync (independently confirmed: fsync_seq=0 across 204 traced
+  epochs). The two engines are NOT compared at matched durability.
+- MAGNITUDE (why it matters): in this workload each writer does one COMMIT, so
+  C pays N serialized WAL fsyncs (one per writer) that F pays zero of. On the
+  ext4 `/data/tmp` backing store an fsync is ~1-10 ms; at 8w that is up to tens
+  of ms of pure fsync on C's side alone. The 8w row (F 308 / C 355 ms) could
+  narrow substantially — possibly to parity — once C is set to NORMAL. So the
+  reported concurrent win (2w 0.59x / 4w 0.56x / 8w 0.87x) OVERSTATES the
+  MVCC-parallelism advantage by an unquantified sync-mode component.
+- INSTRUMENT ADDED (uncommitted, default-inert): `concurrent_sync_override()`
+  gated on `FSQLITE_BENCH_CONCURRENT_SYNC` (unset => exact historical baseline;
+  `normal`/`full` => force BOTH engines' writer connections to that identical
+  mode). This enables (a) the fair re-measurement at matched NORMAL and (b) a
+  matched-FULL probe of whether FrankenSQLite group commit amortizes fsyncs
+  across concurrent committers (the real MVCC value proposition, and the retry
+  predicate for the bd-6hgad group-commit lever above).
+- BLOCKER: the release-perf LTO relink was SIGTERM-killed on the rch fleet 3x
+  (exit 143 at the link stage on vmi1149989/vmi1153651/hz1), so the matched-sync
+  A/B could not be run at KEEP quality this session. The finding stands on the
+  code+python evidence; the quantification is filed as a bead.
+- RECOMMENDATION: set the C writer connections to `synchronous=NORMAL` to match
+  intent + FrankenSQLite + the SQLite-recommended WAL default, then RE-MEASURE
+  and honestly restate the concurrent-writer numbers. If FrankenSQLite still
+  wins at matched NORMAL, the claim is clean; if the win shrinks, the README's
+  concurrent-writer numbers need correction per the doc-invariant rules. Also
+  add a matched-FULL row so the durability-serious comparison is on record.
+  Do not "fix" this by lowering C to NORMAL silently and keeping the old
+  numbers — the corrected numbers must be published.
+- QUANTIFIED (debug binary via the `FSQLITE_BENCH_CONCURRENT_SYNC` instrument;
+  C arm is release-compiled bundled libsqlite3-sys so C times are VALID, F debug
+  times ignored). Three configs, `--filter concurrent`, `taskset -c 4-11`, under
+  shared-host load (4w/8w C-normal CV was 105%/20% — noise-wrecked, inconclusive;
+  only the 2w comparison is clean at CV 2.9/5.6/4.8%):
+    * 2w C-default(implicit FULL) 134.0 ms vs C-normal 86.1 ms vs C-full 100.4 ms
+      => C-NORMAL is ~36% faster than C-FULL (norm/def = 0.643). The per-commit
+      WAL fsync is a real, large cost for C at low writer counts, and C-default
+      tracks C-full (both FULL), proving the default is indeed FULL.
+    * Combined with the release baseline (2w F 56.2 / C-default 95.3 ms = 0.59x):
+      a fair 2w C-normal ~= 95.3 * 0.64 ~= 61 ms, so F 56 vs C 61 ~= 0.92x — the
+      headline 1.7x (0.59x) win COLLAPSES to ~1.09x (near parity) once C is set
+      to the same NORMAL durability. 4w/8w fair ratios are unquantified (noise)
+      but 8w was already only 0.87x, so matched sync could flip it to a LOSS.
+- COALESCING PROBE (config 3, both FULL, FSQLITE_TRACE_GROUP_COMMIT=1): real
+  fsyncs confirmed on the FrankenSQLite side (max fsync_seq=168, i.e. PerCommit
+  sync active), yet ALL 204 group-commit epochs are batch_size=1, members=[1].
+  => Even under FULL sync, where the fsync lengthens the flush window, the
+  group-commit consolidator NEVER coalesces for this workload. This closes the
+  bd-6hgad retry predicate's second leg: the batching lever cannot help the
+  concurrent bench regardless of sync mode, because each writer issues exactly
+  ONE commit (1 BEGIN CONCURRENT + 1000 INSERT + 1 COMMIT) so commits never
+  overlap in the FILLING window. Under matched FULL, FrankenSQLite therefore
+  pays N serialized SOLO fsyncs just like C, with no amortization edge, plus its
+  MVCC overhead — a likely LOSS or tie, not a win.
+- BOTTOM LINE: the reported concurrent-writer advantage is substantially a
+  synchronous-mode artifact (C-FULL vs F-NORMAL), not pure MVCC parallelism. The
+  MVCC-parallelism benefit is real but modest and must be re-measured at matched
+  sync on a QUIET host with a release-perf binary before any concurrent-writer
+  speed claim is published. Group-commit coalescing cannot widen the gap for the
+  current few-large-txns workload; a many-small-overlapping-txns workload (e.g.
+  OLTP: many short transactions per connection) is required to exercise it, and
+  is the correct shape for both the fsync-amortization claim and any future
+  group-commit lever. See bd-x5gzk (fairness) and bd-6hgad (group commit).
+- ALL-THREAD-COUNT QUANTIFICATION (2026-07-23, quieter host load ~14; debug
+  binary, C arm release-compiled => C times valid). C-side default(implicit
+  FULL) vs `FSQLITE_BENCH_CONCURRENT_SYNC=normal`: 2w 138.0->105.6 ms (0.765,
+  CV 1.9/6.8); 4w 183.6->132.4 ms (0.721, CV 9.1/16.0); 8w 267.3->215.2 ms
+  (0.805, CV 8.8/14.2). The per-commit WAL fsync inflates C's time ~20-28% at
+  every writer count. Applying these ratios to the release baseline C-default
+  (2w 95 / 4w 190 / 8w 355 ms) against release F (2w 56 / 4w 107 / 8w 308 ms)
+  gives the FAIR (matched-NORMAL) estimate: 2w 0.77x, 4w 0.78x, 8w 1.08x. So the
+  buggy-bench win (2w 0.59x / 4w 0.56x / 8w 0.87x) shrinks to ~1.3x at 2-4w and
+  the 8w row FLIPS from a 0.87x win to a ~1.08x LOSS. Fair concurrent geomean
+  ~0.87x (~1.15x faster) vs the buggy ~0.77x (README line 1230's "1.30x
+  faster"). This IS the correction README line 1230 needs; the mt-mvcc-bench
+  headline rows (README 1240-1253) are already fair and unaffected. Precise
+  release-quality fair F/C ratios still want a genuinely-quiet host (a 3-way
+  local release build storm and file-WAL disk noise cap the F-side precision
+  here); the qualitative conclusion (win shrinks ~20-28%, 8w -> parity/loss) is
+  robust and sufficient to act on the README correction.
+- HONESTY CORRECTION (2026-07-23, later): the definitive release-perf run on a
+  genuinely QUIET host (load 8, zero competing builds, taskset 8-23) REFUTES the
+  precision of the estimate above. Three concurrent runs: DEFAULT(C=FULL) F/C
+  2w 0.595 / 4w 0.694 / 8w 0.987; =NORMAL(fair) 2w 0.464 / 4w 0.805 / 8w 1.184;
+  DEFAULT#2 2w 0.531 / 4w 0.545 / 8w 0.723. The two DEFAULT runs disagree by
+  20-35%, 8w C-FULL hit CV=104%, and DECISIVELY the =NORMAL C-2w median
+  (124.8 ms) came out SLOWER than C-FULL-2w (95.2 ms) — impossible from sync
+  mode alone (NORMAL is strictly less work than FULL), which proves run-to-run
+  disk/scheduling noise (C median spread ~95-138 ms) SWAMPS the ~20-28% fsync
+  effect. So the comprehensive_bench concurrent (file-WAL) section CANNOT
+  cleanly quantify the sync magnitude on this shared host even at load 8; the
+  "~24% at 2w / fair estimate 0.77x/1.08x" above was a lucky-clean debug sample,
+  NOT reproducible — treat it as noise-level, not a measurement. F is stable
+  across runs (2w ~57 / 4w ~106 / 8w ~308 ms); it is C that is wildly variable.
+  WHAT SURVIVES: (a) the sync asymmetry is real (code + python, not a
+  measurement); (b) FIX = add `synchronous=NORMAL` to the C writer connections
+  to match mt_mvcc_bench; (c) do NOT publish any "fair number" from
+  comprehensive_bench concurrent — it is unreliable; cite mt_mvcc_bench (fair,
+  higher-iteration) for the honest concurrent-writer story; (d) README line 1230
+  ("1.30x faster in the full-quick mix") is both unfair AND unreliable — replace
+  it with a caveat that defers to the mt-mvcc-bench section rather than any
+  comprehensive_bench concurrent number.
+
+## 2026-07-23 - PROFILE + DIRECTION (bd-smxhz): concurrent-writer separate-tables scaling collapses under disk contention; root cause is a FrankenSQLite-specific per-commit file-open storm; lever = VFS fd caching
+
+- Result type: profiling finding + chartered lever direction (NOT a reject; a
+  high-value lever handed off because implementation is major + A/B-blocked).
+- SYMPTOM (mt-mvcc-bench at HEAD, release-perf, /data/tmp ext4 shared host with
+  competing builds): SEPARATE-TABLES (250 rows/thread) F/C throughput was 2.6x
+  (1w) / 2.0x (2-4w) / 3.0-3.3x (8w) across two runs, F wps ~23k->53k (nearly
+  FLAT with thread count) — vs README's quiet-dedicated-host 1w 0.42x / 4w 7.66x
+  / 8w 40.99x (F 264k->1022k wps). SHARED-TABLE 8w was CLOSE (mine 3.73x vs
+  README 3.42x). The parallelism advantage collapses 40x -> 3x under contention.
+- DISCRIMINATOR (rules out uniform slow hardware): at 8w separate-tables my C
+  (15.9k wps) is only ~1.5x below README C (24k), while my F (~30-53k) is
+  ~20-35x below README F (1022k). Slow hardware would scale C and F together;
+  it doesn't => the collapse is F-SPECIFIC.
+- ROOT CAUSE (strace openat, tiny 8w/200-row/1-iter separate-tables run, 843
+  total openat): FrankenSQLite does a per-commit/op FILE-OPEN STORM C SQLite
+  lacks — main DB reopened 270x (~17/commit), -wal 147x (~9/commit), -wal-cert
+  (durable certificate sidecar) 31x (~2/commit), plus -fsqlite-ns-gate /
+  -fsqlite-ns-use cross-process namespace lock files 95x each (BOOTSTRAP: begin()
+  is per-CONNECTION-open at pager.rs:8065, ~12 opens/conn across open-phases, not
+  per-commit — acceptable). Every openat/close is a metadata syscall: ~free on a
+  quiet fast disk (README => 40.99x) but serialized under contention, so all
+  writers block on file metadata ops regardless of separate tables.
+- LEVER (direction; NOT implemented — major + correctness-sensitive + A/B needs a
+  quiet host): VFS-level file-descriptor CACHING / persistent handles for the DB
+  + WAL + certificate sidecar across a connection's commits, eliminating the
+  per-commit open/close churn. Touches the unsafe fsqlite-vfs crate + pager;
+  file-locking + durability semantics may depend on some open/close cycles, so it
+  must preserve them (and the certificate read cache must preserve cross-process
+  reconcile_authorized_seed). Steps: (1) add flush-critical-section syscall
+  timing to attribute DB-reopen vs WAL vs sidecar; (2) design the fd cache; (3)
+  same-worker A/B on a genuinely quiet host.
+- IMPLICATION for README: the mt-mvcc-bench 40.99x is a BEST-CASE quiet-fast-disk
+  number; it should be caveated as disk-speed/contention-sensitive. The honest
+  concurrent-writer story is environment-dependent — big win on fast quiet
+  storage, ~3x under contention.
+- CANNOT distinguish "regression since README" from "environment" without the
+  README's exact host; the C-vs-F asymmetry strongly implicates F's commit-path
+  I/O regardless. Preflight ConcurrentCommitPathDiskIO=allowed. concurrent_mode
+  stays true.
+- PRECISE ROOT CAUSE (addendum): the 270 DB reopens are dominated by 222 opens
+  with flags `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC` — these are FILE-IDENTITY
+  PROBES, not I/O. `validate_path_identity` (namespace.rs:238) does
+  open_identity_probe -> open(O_NOFOLLOW|O_NONBLOCK) + FileIdentity::from_file
+  (fstat dev/inode) + close, to verify the DB file was not substituted. It runs
+  at EVERY operation boundary: `ensure_current_wal_path` (wal_adapter.rs:1598,
+  starting ~every WAL op) and `validate_namespace_binding` (pager.rs:6381, ~9
+  pager boundaries incl. commit 12762/13734). A commit doing N WAL ops re-probes
+  N times. This is a DELIBERATE TOCTOU security feature (commit 1136c171
+  "fix(vfs): bind native database namespaces to stable identities"), NOT
+  runtime-disable-able. C SQLite holds ONE fd per connection; the held inode
+  guarantees identity with zero per-op syscalls. FIX (preserves security): hold
+  the DB+WAL fd across a connection's operations — the held inode IS the identity
+  guarantee, so per-op path re-probing AND the reopen churn both vanish. Major
+  fsqlite-vfs change touching deliberately-added security machinery; needs design
+  review + quiet-host A/B. Cheaper interim (probe once/txn not once/op) weakens
+  the TOCTOU window and needs security sign-off — do not do it unilaterally.
+
+## 2026-07-23 - KEEP (conformance-gated, no perf A/B needed): extend DISTINCT loose/skip scan AND COUNT(DISTINCT) index walk to COMPOSITE indexes whose LEADING term is the target column
+
+- Result type: coverage-extension KEEP. Broadens two already-proven fast paths
+  — the `SELECT DISTINCT <col>` loose/skip scan (bd-distinct-loose-scan-c8nay,
+  23.5x vs sorter) and the `COUNT(DISTINCT <col>)` index walk
+  (bd-count-distinct-index-walk, vs full-scan dedup) — from single-column-only
+  to ANY index whose LEADING key term is the target column in ASC BINARY order.
+- CHANGE (codegen.rs): `distinct_loose_scan_plan` (~11282) and
+  `count_distinct_index_walk_plan` (~10529) previously gated on
+  `idx.key_term_count() == 1`. Relaxed to `>= 1` while keeping the term-0 checks
+  (leading column-name match, `!key_term_descending(0)`, `key_term_collation(0)`
+  BINARY), and switched `find(..)` -> `filter(..).min_by_key(key_term_count)` so
+  the NARROWEST qualifying index is chosen (preserves the historical
+  single-column pick when one exists).
+- WHY SAFE: both codegens read ONLY index Column 0, and the loose scan probes
+  with a 1-field prefix `[value]`, so entries sharing the leading value
+  (whatever the trailing terms) are cleared/counted identically to a
+  single-column index. `supports_direct_column_lookup()` (`where_clause.is_none()`
+  + `columns.len() == key_term_count()`) still excludes partial (WHERE) and
+  expression indexes => the chosen index has full plain-column coverage. Only
+  the leading term's ASC+BINARY governs; a trailing DESC term does NOT
+  disqualify (explicitly tested).
+- GATE (deterministic; no perf A/B because it extends already-proven fast
+  paths): byte-exact vs rusqlite. distinct_loose_scan_oracle +1 test
+  (composite int, composite text, `(a ASC, b DESC)`, both-single-and-composite
+  narrowest-pick); count_distinct_index_walk_oracle +1 test (composite-only
+  `(a,b)`/`(c,b)`, trailing-DESC `(a ASC,b DESC)`). All 8 tests in both oracles
+  PASS. EXPLAIN opcode gates confirm the FAST PATH fires: no `SorterOpen` for
+  the loose scan; the COMPOSITE index (not the base table) is walked for
+  COUNT(DISTINCT). No regression: the pre-existing "shadow schema" test still
+  picks the single-column index via min_by_key. fmt clean; `clippy -p
+  fsqlite-vdbe --lib -- -D warnings` clean.
+- PERF: composite-case magnitude NOT separately benched — the benefit is
+  INHERITED (composite DISTINCT/COUNT-DISTINCT now uses the loose scan / index
+  walk instead of the sorter / full-scan dedup, verified by the fast-path-fires
+  EXPLAIN assertions). Do NOT claim a specific N-x for composite without a
+  dedicated same-worker bench; the honest claim is "now served by the proven
+  fast path instead of the fallback."
+- Preflight DistinctLooseScanCompositeIndex=allowed. Files: codegen.rs,
+  distinct_loose_scan_oracle.rs, count_distinct_index_walk_oracle.rs.
+- ENV NOTE (unrelated to this change): `cargo clippy -p fsqlite -p fsqlite-vdbe
+  --all-targets` failed with `unresolved import io_uring` in fsqlite-vfs on the
+  rch worker (a target enabled by --all-targets pulls the io_uring feature which
+  did not resolve there); the normal `-p fsqlite` test build of the full stack
+  compiled cleanly and both oracles ran. Pre-existing/environmental, in a crate
+  this change does not touch.
+
+## 2026-07-23 - KEEP (conformance-gated): extend the DISTINCT loose/skip scan to MULTI-COLUMN `SELECT DISTINCT a, b, …` over a leading-prefix index
+
+- Result type: coverage-extension KEEP, building on the single-column composite
+  KEEP above. `SELECT DISTINCT a, b, …` (N plain BINARY columns in SELECT order)
+  is now served by the loose/skip scan whenever an index's LEADING N key terms
+  are exactly those columns in that order (each ASC BINARY) — instead of the
+  dedup sorter. Work scales with the number of distinct N-tuples, not rows.
+- CHANGE (codegen.rs): `distinct_loose_scan_plan` now collects all output column
+  names (each plain, non-generated, BINARY) and matches them to an index's
+  leading N terms via `(0..n).all(...)` (name-in-order + `!key_term_descending(i)`
+  + BINARY collation), still `min_by_key(key_term_count)` for the narrowest
+  index; `DistinctLooseScan` carries `key_col_count`. `codegen_select_distinct_
+  loose_scan` generalized from 1 to N: reads index columns 0..N-1 into
+  contiguous `out_regs`, `alloc_regs(n)` for the probe + cur blocks, N `Copy`s
+  BEFORE `ResultRow` (drain-safe), the adaptive Next probe does N `Column` reads
+  + N `Ne` checks (NULLEQ 0x80 + BINARY; a change on ANY column jumps back to
+  emit), and an N-field `MakeRecord` + `SeekGT` skips the whole leading-tuple
+  run. n=1 reproduces the original single-column emitter exactly.
+- WHY BYTE-EXACT (the risk that did NOT materialize): for `SELECT DISTINCT
+  <prefix cols>` over a covering index, C SQLite walks the same index and emits
+  the distinct tuples in index order; the skip scan emits the same tuples in the
+  same order (just skipping duplicates faster). Restricting to output-columns =
+  index-leading-prefix IN ORDER keeps the emit order identical; reversed /
+  non-prefix orders DECLINE to the sorter (verified). The N-field prefix probe
+  `[v0..vN-1]` clears all entries sharing that leading tuple via the same
+  UpperBound-bias shorter-prefix rule as the 1-field case.
+- GATE (deterministic): byte-exact vs rusqlite. distinct_loose_scan_oracle +1
+  test (2-col int with NULLs in each column; 2-col DISTINCT as a prefix of a
+  3-term index (a,b,c); TEXT+INT 2-col; `ORDER BY a,b` byte-exact) plus a
+  DECLINE control (`DISTINCT b, a` reversed => SorterOpen fires, set-equal). All
+  5 loose-scan oracle tests pass, no hang (1.04s), no regression (single-column
+  + composite tests still pass). fmt clean; `clippy -p fsqlite-vdbe --lib -D
+  warnings` clean.
+- PERF: multi-column magnitude NOT separately benched; benefit inherited (uses
+  the proven skip scan instead of the dedup sorter, verified by the no-SorterOpen
+  EXPLAIN gate). Common shape now accelerated: `CREATE INDEX ix ON t(a, b);
+  SELECT DISTINCT a, b`.
+- Preflight DistinctLooseScanCompositeIndex=allowed (same lane). Files:
+  codegen.rs, distinct_loose_scan_oracle.rs. See bd-azfqc.
+
+## 2026-07-23 - KEEP (conformance-gated): pure range on the LEADING term of a composite-only index now SEEKS instead of full-scanning (bd-bn45n)
+
+- Result type: full-scan -> index-seek KEEP. `WHERE a <range>` (pure range on
+  the leading key term, no equality prefix) over a composite-only `index(a, …)`
+  (no single-column `index(a)`) previously fell all the way back to a full table
+  scan; it now uses the composite index prefix-range seek. Equality
+  (`WHERE a = x`) already index-seeked — this closes the range gap.
+- EVIDENCE of the gap (EXPLAIN probe, idx_ab(a,b) only): `WHERE a < 5` emitted
+  `Init,Transaction,OpenRead,Rewind,Column,…,Ge,…,Next` — a full table scan (no
+  index OpenRead/SeekGE); `WHERE a = 5` emitted `MakeRecord,OpenRead,SeekGE,
+  IdxGT,IdxRowid` — an index seek. Root cause: the single-column range fast path
+  gates on `key_term_count()==1` (declines composite) AND
+  `composite_index_prefix_range_target` required a NON-empty equality prefix
+  (`if prefix_exprs.is_empty() { continue; }`), so a pure leading-term range
+  matched neither path.
+- CHANGE (codegen.rs, 2 edits): (1) `composite_index_prefix_range_target` now
+  allows an EMPTY equality prefix — the existing `else` branch computes the range
+  on `columns[0]`, the residual guard still rejects any conjunct that doesn't pin
+  the (empty) prefix or the leading range, and `index_range_fast_path_is_safe`
+  still gates affinity. (2) `codegen_select_composite_index_prefix_range_scan`
+  skips the prefix-change `IdxGT` when `prefix_len==0` (a zero-column IdxGT is a
+  degenerate no-op); the SeekGE lower anchor + the `Gt`/`Ge` range-upper check
+  alone terminate the walk. `IdxRowid` reads the rowid position-independently.
+- WHY SAFE: ORDER BY is AUTO-DECLINED for the empty-prefix shape —
+  `composite_order_by_satisfied` requires `prefix_len + 1 == key_term_count()`
+  (range on the LAST term), which `0 + 1 == 2` fails on a >=2-term index, so any
+  ORDER BY falls to the sorter (no order-divergence risk, unlike a naive range
+  extension). NULLs in the leading term are excluded by the no-lower-bound
+  `IsNull -> skip` path, matching C SQLite (`a <op> x` is false for NULL).
+  Composite-only (`key_terms >= 2`) so single-column indexes are untouched.
+- GATE (deterministic): byte-exact vs rusqlite (sorted set — no ORDER BY, so
+  emission order is implementation-defined). composite_prefix_range_residual_
+  oracle +1 test `composite_pure_leading_range_matches_sqlite`: `< <= > >=
+  BETWEEN` and two-sided ranges, a NULL run in `a`, covering (a,b) and
+  non-covering (id,c) output, and a non-key residual (`c=1`) that must decline to
+  a scan. EXPLAIN asserts SeekGE fires (not full scan) and NO prefix IdxGT for
+  the empty-prefix seek. All pass; the pre-existing equality-prefix residual test
+  still passes; golden_bytecode_snapshots 8/8 (no drift); clippy -p fsqlite-vdbe
+  --lib -D warnings clean; fmt clean.
+- PERF: magnitude not separately benched; the win is structural (full scan
+  O(rows) -> index seek O(log n + matches) for a selective leading-term range).
+  Common shape: `CREATE INDEX ix ON t(category, created_at); SELECT … WHERE
+  category < X` / `created_at BETWEEN …` on the leading term.
+- FOLLOW-UP (not done): the ORDER-BY-satisfying composite leading-range (stream
+  (a,b,rowid) satisfies `ORDER BY a` but not `ORDER BY a, rowid`) is left to the
+  sorter; wiring a sorter-eliding ordered form would need a stricter
+  order-satisfaction check for the empty-prefix case. Preflight
+  CompositeRangeIndexSeek=allowed. Files: codegen.rs,
+  composite_prefix_range_residual_oracle.rs. See bd-bn45n.
+## 2026-07-22 - BLOCKER: live B-epsilon/cell-delta DELETE bridge is not a one-lever edit
+
+- Target after the second consecutive DELETE rejection: the refreshed worst
+  raw ratio, `UPDATE/DELETE Throughput / 100 rows / delete 5 rows` at
+  `3.318815x`, and its stable large-row control, `10000 rows / delete 500
+  rows` at `1.847112x`. The raw worst row is not itself an admissible KEEP
+  baseline (`C/F CV=14.03%/35.91%`); the 10K/500 row is stable
+  (`C/F CV=1.48%/1.08%`). Both come from
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`.
+- Mandatory negative-evidence review blocked the next narrow candidate before
+  source editing. A dense first/last-key exact-slot predictor for
+  `TableLeafDeleteRun::search_table_leaf` is an exact repeat of the CLOSED
+  2026-05-12 candidate: it already reduced the 500-delete search bucket from
+  `39,571 ns` to `17,444 ns` and moved that row from `0.282699 ms` to
+  `0.236423 ms`, but worsened the full-quick primary score
+  `0.3676859704 -> 0.3732603712` and C-faster count `9 -> 10`. Its retry
+  predicate (same-window full-quick neutrality/better, or a broader logical
+  mutation operator) is not satisfied by another standalone search patch.
+- Profile-first evidence from the exact current 100-row/5-delete envelope
+  distributes time across `execute_body=4.659-5.620 us`, commit roundtrip
+  `1.493-2.214 us`, retained active probe `1.011-1.303 us`, seek
+  `0.742-1.133 us`, leaf flush `1.112-1.373 us`, and five memory-sync calls
+  totaling `0.331-0.551 us`. The immediately preceding prepared vector batch
+  proved that collapsing those five publications to two changes the median by
+  only `1.146%`; no remaining single micro-boundary dominates this envelope.
+- The different alien primitive selected was B-epsilon/Bw-tree logical DELETE
+  messages backed by the existing MVCC cell-delta substrate. Current source
+  inspection found a concrete integration blocker:
+  `MvccManager::read_page_with_cell_deltas` and cell-log savepoint/rollback support exist in
+  `crates/fsqlite-mvcc/src/lifecycle.rs`, but every call site is still an
+  inline MVCC test. The live B-tree adapter in
+  `crates/fsqlite-vdbe/src/engine.rs`
+  (`SharedTxnPageIo::{read_page,read_page_data,read_btree_page_data}`) reads
+  pager transaction page images;
+  its `ConcurrentContext` carries only `SharedConcurrentHandle`, lock table,
+  and commit index, with no `MvccManager`/`CellVisibilityLog` bridge. The core
+  direct DELETE path likewise records quotient-filter bookkeeping, not cell
+  deltas. A record-delete-only hook would therefore report an affected row
+  while point/scan reads still observe the physical row, violating
+  read-your-writes and behavior isomorphism.
+- Result: explicit integration blocker; no source patch was attempted and no
+  CLOSED lever was reopened. This is not a throughput-limit claim. The next
+  admissible attempt is a distinct representation change that first lands the
+  live adapter contract: route point and scan reads through the same
+  transaction-owned cell-delta view, bind logical DELETE messages to the live
+  concurrent handle and page witnesses, preserve duplicate/missing affected
+  counts plus index/FK/QF/count-cache effects, and prove savepoint, rollback,
+  structural fallback, commit/recovery, and concurrent visibility. Retry the
+  performance candidate only after that contract exists, then require an
+  interleaved same-worker null-controlled focused DELETE A/B with both CVs
+  below `5%`, at least `10%` median improvement on 100/5, no 1K/10K DELETE
+  regression, and a same-window full-quick primary score and C-faster count no
+  worse than control.
+
+## 2026-07-22 - REJECT + BLOCKER: thresholded borrowed flush for large owned INSERT page runs
+
+- Target: the worst stable, unowned INSERT frontier exposed by
+  `tests/artifacts/perf/cod-fullquick-refresh-20260722T1800Z/full-quick.json`:
+  `INSERT Throughput / Single Transaction / large_10col / 10000 rows` at
+  `9.789121 ms` versus C SQLite `8.664812 ms` (`1.129756x`, C/F CV
+  `0.628%/2.498%`). The adjacent record-size comparison was `9.751029 ms`
+  versus `8.532303 ms` (`1.142837x`) but its FSQLite CV was `5.605%`, so it
+  was a routing/profile row rather than an admissible KEEP baseline.
+- Negative-evidence review found the prior broad eager restore-clone removal
+  and owned-record borrowed-flush attempts CLOSED because large-row gains did
+  not survive the comprehensive matrix. Their retry predicate was newly met
+  only narrowly: this candidate activated exclusively for owned runs of at
+  least 4096 records, leaving small-row, write-single, and concurrent shapes
+  on the unchanged path. `sql_pipeline_candidate_preflight` for operation
+  `large_owned_page_run_borrowed_flush_threshold`, benchmark
+  `comprehensive-bench-insert-large-10col-10000`, and source surface
+  `flush_taken_pending_direct_insert_page_run_with_cursor` returned `allowed`
+  with zero matched no-retry records before editing.
+- Profile-first evidence on release-perf `hz1` showed the exact 10K row owned
+  run flushing once: `direct_insert=10000`, `fast=10000`, `slow=0`, one owned
+  page run containing 10,000 records / 7,218,308 bytes, direct flush
+  `2.609098 ms`, commit roundtrip `2.486255 ms`, and no arena/repeated run.
+  The candidate changed only `crates/fsqlite-core/src/connection.rs`: borrow
+  that large owned run through the existing empty-root/depth-2/fallback flush
+  sequence and avoid cloning it solely for error restoration. The original
+  run was still restored on error. Source was manually restored after the
+  rejection.
+- Same-worker release-perf A/B on `hz1` used identical candidate source and a
+  runtime disable control. On the 10K single-transaction row, control C/F was
+  `12.035619/11.858405 ms`, ratio `0.985276`, CV `1.636%/5.626%`; candidate
+  C/F was `12.211324/11.779788 ms`, ratio `0.964661`, CV
+  `19.528%/26.268%`. The FSQLite median moved only `0.663%`, below the
+  comparator/control drift, while candidate variance failed the mandatory
+  `<5%` gate by more than 5x. The record-size row was also inadmissible:
+  control C/F `14.400164/12.516506 ms` with CV `14.446%/7.783%`, candidate
+  `12.242411/11.834763 ms` with CV `18.738%/25.116%`. A further null arm was
+  not promoted into KEEP evidence because both candidate rows and the control
+  rows had already failed the stability gate; no performance claim is made.
+- Correctness evidence was likewise not admitted: the focused remote
+  release-perf page-run test compiled the edited crate but RCH failed closed
+  after its 1,800-second `ovh-a` SSH timeout (`RCH-E104`), with no local
+  fallback. Result: rejected and fully unwound. Do not retry threshold-only
+  borrowed flush or restore-clone elision. Reconsider only with a different
+  end-to-end ownership representation that profile-attributably removes at
+  least 10% of the large-row INSERT envelope (not just the error clone), plus
+  an interleaved same-worker candidate/control/null run where every C and
+  FSQLite CV is below 5%, at least 10% FSQLite median improvement remains
+  after null drift, the focused error-restoration/conformance test completes,
+  and the same-window full quick matrix is neutral or better.
+- Immediate next-lever routing did not reopen the packed/slab page-run family.
+  The ledger's 2026-05-10 fused empty-root page-builder rejection already
+  tested retaining large rows without one owned `Vec<u8>` each and made its
+  retry predicate a true fused record/body/page builder that removes both row
+  construction and page layout. A standalone packed record slab does not meet
+  that predicate, so no second source edit was made. The active measurement
+  blocker is explicit: the available same-worker window failed the CV gate and
+  the independent remote correctness worker timed out. Resume in a quiescent
+  remote window satisfying the predicate above, then choose a different alien
+  primitive if the ownership representation still lacks profile attribution.

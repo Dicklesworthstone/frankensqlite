@@ -921,6 +921,9 @@ fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static 
     for op in ops {
         match op.opcode {
             Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast => {
+                if op.p3 == 1 {
+                    return Some("temp_database_cursor");
+                }
                 storage_cursor_ids.insert(op.p1);
             }
             Opcode::SorterOpen => {
@@ -1075,6 +1078,40 @@ pub struct VdbeProgram {
 }
 
 impl VdbeProgram {
+    /// Route storage-root opens for connection-local TEMP objects through
+    /// SQLite's database-number 1 namespace.
+    ///
+    /// Code generation deliberately operates on schema metadata rather than
+    /// connection state, so it cannot know which otherwise ordinary table
+    /// roots belong to the TEMP database. The connection applies this final
+    /// annotation after codegen. Execution then uses the attached
+    /// [`MemDatabase`](crate::engine::MemDatabase) instead of ever consulting
+    /// or mutating pages in the main pager.
+    pub fn route_storage_roots_to_temp_database(
+        &mut self,
+        temp_roots: impl IntoIterator<Item = i32>,
+    ) {
+        let temp_roots: HashSet<i32> = temp_roots.into_iter().collect();
+        if temp_roots.is_empty() {
+            return;
+        }
+
+        let mut routed_any = false;
+        for op in &mut self.ops {
+            if matches!(
+                op.opcode,
+                Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast
+            ) && temp_roots.contains(&op.p2)
+            {
+                op.p3 = 1;
+                routed_any = true;
+            }
+        }
+        if routed_any {
+            self.requires_attached_memdb = true;
+        }
+    }
+
     fn verify_control_flow_targets(&self) -> Result<()> {
         let op_count = self.ops.len();
         for (pc, op) in self.ops.iter().enumerate() {
@@ -1440,6 +1477,27 @@ pub mod pragma {
         /// `PRAGMA case_sensitive_like` toggle. When `false` (the default) LIKE
         /// folds ASCII case; when `true` LIKE is byte-exact (case-sensitive).
         pub case_sensitive_like: bool,
+        /// `PRAGMA trusted_schema` toggle. Default ON (1), matching the C library
+        /// default (`SQLITE_TRUSTED_SCHEMA` unset). Set/readback surface only.
+        pub trusted_schema: bool,
+        /// `PRAGMA read_uncommitted` toggle (default OFF). Set/readback surface.
+        pub read_uncommitted: bool,
+        /// `PRAGMA cell_size_check` toggle (default OFF). Set/readback surface.
+        pub cell_size_check: bool,
+        /// `PRAGMA checkpoint_fullfsync` toggle (default OFF). Set/readback surface.
+        pub checkpoint_fullfsync: bool,
+        /// `PRAGMA automatic_index` toggle (default ON). Set/readback surface.
+        pub automatic_index: bool,
+        /// `PRAGMA locking_mode` (`normal` or `exclusive`; default `normal`).
+        /// Set/readback surface only.
+        pub locking_mode: String,
+        /// `PRAGMA secure_delete` tri-state: 0 = OFF, 1 = ON, 2 = FAST (default 0).
+        /// Set/readback surface only.
+        pub secure_delete: i64,
+        /// `PRAGMA threads` auxiliary worker-thread limit (default 0). Advisory:
+        /// FrankenSQLite does not spawn SQLite-style sort helper threads, so this
+        /// is a stored limit clamped to the stock maximum (8).
+        pub threads: i64,
     }
 
     impl Default for ConnectionPragmaState {
@@ -1466,6 +1524,14 @@ pub mod pragma {
                 mvcc_writer_lease_secs: 30,
                 writable_schema: false,
                 case_sensitive_like: false,
+                trusted_schema: true,
+                read_uncommitted: false,
+                cell_size_check: false,
+                checkpoint_fullfsync: false,
+                automatic_index: true,
+                locking_mode: "normal".to_owned(),
+                secure_delete: 0,
+                threads: 0,
             }
         }
     }
@@ -1565,6 +1631,30 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("case_sensitive_like") {
             return apply_case_sensitive_like(state, stmt);
         }
+        if name.eq_ignore_ascii_case("trusted_schema") {
+            return apply_bool_toggle(&mut state.trusted_schema, stmt);
+        }
+        if name.eq_ignore_ascii_case("read_uncommitted") {
+            return apply_bool_toggle(&mut state.read_uncommitted, stmt);
+        }
+        if name.eq_ignore_ascii_case("cell_size_check") {
+            return apply_bool_toggle(&mut state.cell_size_check, stmt);
+        }
+        if name.eq_ignore_ascii_case("checkpoint_fullfsync") {
+            return apply_bool_toggle(&mut state.checkpoint_fullfsync, stmt);
+        }
+        if name.eq_ignore_ascii_case("automatic_index") {
+            return apply_bool_toggle(&mut state.automatic_index, stmt);
+        }
+        if name.eq_ignore_ascii_case("locking_mode") {
+            return apply_locking_mode(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("secure_delete") {
+            return apply_secure_delete(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("threads") {
+            return apply_threads(state, stmt);
+        }
         if is_fsqlite_mvcc_max_chain_length(&stmt.name) {
             return apply_mvcc_max_chain_length(state, stmt);
         }
@@ -1584,6 +1674,101 @@ pub mod pragma {
                 let enabled = parse_bool(expr)?;
                 state.serializable = enabled;
                 Ok(PragmaOutput::Bool(enabled))
+            }
+        }
+    }
+
+    /// Generic boolean-toggle PRAGMA: a bare query echoes the current value and an
+    /// assignment stores and echoes the new value, matching C SQLite's integer
+    /// 0/1 readback. Used for the set/readback-only pragmas trusted_schema,
+    /// read_uncommitted, cell_size_check, checkpoint_fullfsync, and
+    /// automatic_index. (GH #282, #278, #262, #281, #283)
+    fn apply_bool_toggle(flag: &mut bool, stmt: &PragmaStatement) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Bool(*flag)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                *flag = enabled;
+                Ok(PragmaOutput::Bool(enabled))
+            }
+        }
+    }
+
+    /// `PRAGMA locking_mode [= NORMAL|EXCLUSIVE]`. A bare query echoes the current
+    /// mode; an assignment accepts NORMAL/EXCLUSIVE case-insensitively and echoes
+    /// the lowercased mode. Any other value is ignored and the current mode is
+    /// echoed unchanged, matching C SQLite. (GH #273)
+    fn apply_locking_mode(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Text(state.locking_mode.clone())),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let requested = parse_text_expr(expr)?.to_ascii_lowercase();
+                if requested == "normal" || requested == "exclusive" {
+                    state.locking_mode = requested;
+                }
+                Ok(PragmaOutput::Text(state.locking_mode.clone()))
+            }
+        }
+    }
+
+    /// `PRAGMA secure_delete [= OFF|ON|FAST|0|1|2]`. Tri-state: 0 = OFF, 1 = ON,
+    /// 2 = FAST. C SQLite reports the integer on readback and echoes the new value
+    /// on assignment. This is the set/readback surface only; the actual
+    /// zero-on-delete storage semantics are tracked separately. (GH #277)
+    fn apply_secure_delete(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.secure_delete)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let value = parse_secure_delete_value(expr)?;
+                state.secure_delete = value;
+                Ok(PragmaOutput::Int(value))
+            }
+        }
+    }
+
+    fn parse_secure_delete_value(expr: &Expr) -> Result<i64> {
+        if let Expr::Literal(Literal::Integer(n), _) = expr {
+            return match *n {
+                0..=2 => Ok(*n),
+                _ => Err(FrankenError::OutOfRange {
+                    what: "secure_delete".to_owned(),
+                    value: n.to_string(),
+                }),
+            };
+        }
+        if let Ok(text) = parse_text_expr(expr) {
+            if text.eq_ignore_ascii_case("fast") {
+                return Ok(2);
+            }
+        }
+        // OFF/ON/TRUE/FALSE map to 0/1.
+        Ok(i64::from(parse_bool(expr)?))
+    }
+
+    /// `PRAGMA threads [= N]`. A bare query reports the current limit; an
+    /// assignment with a non-negative N clamps to the stock maximum (8), stores
+    /// it, and echoes the effective value. A negative argument leaves the limit
+    /// unchanged and just reports it, matching C SQLite. (GH #279)
+    fn apply_threads(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        /// Stock `SQLITE_MAX_WORKER_THREADS`.
+        const MAX_WORKER_THREADS: i64 = 8;
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.threads)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let n = parse_integer_expr(expr)?;
+                if n >= 0 {
+                    state.threads = n.min(MAX_WORKER_THREADS);
+                }
+                Ok(PragmaOutput::Int(state.threads))
             }
         }
     }
@@ -2968,6 +3153,105 @@ mod tests {
             pragma::apply_connection_pragma(&mut state, &stmt),
             Err(FrankenError::TypeMismatch { .. })
         ));
+    }
+
+    fn apply_sql(state: &mut pragma::ConnectionPragmaState, sql: &str) -> pragma::PragmaOutput {
+        let stmt = parse_pragma(sql).expect("parse pragma");
+        pragma::apply_connection_pragma(state, &stmt).expect("apply pragma")
+    }
+
+    #[test]
+    fn test_connection_pragma_boolean_readbacks() {
+        // GH #282/#278/#262/#281/#283: set/readback surfaces for boolean pragmas.
+        use pragma::PragmaOutput::Bool;
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        // trusted_schema and automatic_index default ON; the rest default OFF.
+        assert_eq!(apply_sql(&mut state, "PRAGMA trusted_schema"), Bool(true));
+        assert_eq!(apply_sql(&mut state, "PRAGMA automatic_index"), Bool(true));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA read_uncommitted"),
+            Bool(false)
+        );
+        assert_eq!(apply_sql(&mut state, "PRAGMA cell_size_check"), Bool(false));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA checkpoint_fullfsync"),
+            Bool(false)
+        );
+
+        // Set then read back each toggle.
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA trusted_schema = OFF"),
+            Bool(false)
+        );
+        assert_eq!(apply_sql(&mut state, "PRAGMA trusted_schema"), Bool(false));
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA read_uncommitted = ON"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA cell_size_check = 1"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA checkpoint_fullfsync = TRUE"),
+            Bool(true)
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA automatic_index = 0"),
+            Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_connection_pragma_locking_mode_readback() {
+        // GH #273: locking_mode echoes normal/exclusive (lowercased).
+        use pragma::PragmaOutput::Text;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA locking_mode"),
+            Text("normal".to_owned())
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA locking_mode = EXCLUSIVE"),
+            Text("exclusive".to_owned())
+        );
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA locking_mode"),
+            Text("exclusive".to_owned())
+        );
+        // An unrecognized value is ignored; the current mode is echoed unchanged.
+        assert_eq!(
+            apply_sql(&mut state, "PRAGMA locking_mode = bogus"),
+            Text("exclusive".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_connection_pragma_secure_delete_tristate() {
+        // GH #277: secure_delete is a tri-state integer (0=OFF, 1=ON, 2=FAST).
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = ON"), Int(1));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = FAST"), Int(2));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = OFF"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA secure_delete = 2"), Int(2));
+    }
+
+    #[test]
+    fn test_connection_pragma_threads_readback() {
+        // GH #279: threads reports the stored limit; a set clamps to 8; a
+        // negative argument leaves the limit unchanged.
+        use pragma::PragmaOutput::Int;
+        let mut state = pragma::ConnectionPragmaState::default();
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(0));
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = 4"), Int(4));
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads"), Int(4));
+        // Clamps to the stock maximum of 8.
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = 100"), Int(8));
+        // A negative argument leaves the current limit unchanged.
+        assert_eq!(apply_sql(&mut state, "PRAGMA threads = -1"), Int(8));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "fsqlite-wal"
-version = "0.1.16"
+version = "0.1.19"
 description = "Write-ahead logging"
 edition.workspace = true
 license-file.workspace = true
@@ -16,7 +16,7 @@ fault-injection = []
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.16", default-features = false }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.19", default-features = false }
 xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }
@@ -26,6 +26,7 @@ serde = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 asupersync = { workspace = true }
 parking_lot = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

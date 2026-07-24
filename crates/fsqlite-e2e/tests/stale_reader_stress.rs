@@ -183,7 +183,7 @@ fn run_stale_reader_stress(max_steps_per_writer: u32) -> StressResult {
         reader_ticket.set_pinned_commit_seq(1);
         // Manager-side reader pin (holds a snapshot in the real pipeline).
         let mut reader_txn = mgr.begin(BeginKind::Concurrent).expect("reader begin");
-        let _ = mgr.read_page(&mut reader_txn, pages[0]);
+        let _ = mgr.read_page(&mut reader_txn, pages[0]).unwrap();
 
         assert!(
             !reader_ticket.is_force_aborted(),

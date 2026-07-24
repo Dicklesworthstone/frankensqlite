@@ -302,8 +302,10 @@ tmp_rch_probe/
 .beads/*.vacuum_test_*
 .beads/recovery*/
 
-# Remote compilation helper local cache
-.rch/
+# Remote compilation helper local cache. Keep the project transfer contract,
+# but ignore every other machine-local RCH file.
+.rch/*
+!.rch/config.toml
 .rch-target/
 # Suffixed rch target shards (correctness lane, retained-dml lane, per-job
 # job-id + nanos shards) — created by concurrent `rch` cargo invocations.

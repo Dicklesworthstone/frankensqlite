@@ -6882,7 +6882,7 @@ impl<'a> Fts5ShadowQuery<'a> {
     }
 
     /// Public entry point preserved for callers; the actual ranked-search
-    /// engine lives once on [`Fts5DoclistProvider::search_with_weights`].
+    /// engine lives once on `Fts5DoclistProvider::search_with_weights`.
     pub fn search_queries_with_weights(
         &self,
         queries: &[&str],
@@ -7024,7 +7024,7 @@ impl Fts5DoclistProvider for Fts5ShadowQuery<'_> {
 /// whole in-memory inverted index on every connection.
 ///
 /// It shares the entire ranked-search engine (boolean/phrase/NEAR evaluation,
-/// column filters, BM25) with [`Fts5ShadowQuery`] via [`Fts5DoclistProvider`],
+/// column filters, BM25) with [`Fts5ShadowQuery`] via `Fts5DoclistProvider`,
 /// so a reopened on-disk index returns IDENTICAL rowids, ordering, and scores to
 /// the in-memory path — only the doclist primitives differ (on-demand segment
 /// reads vs. an in-memory row set).
@@ -7757,6 +7757,34 @@ impl Fts5Table {
         self.lazy_on_disk
     }
 
+    /// Advance lazy-mode bookkeeping after the host durably appends documents.
+    ///
+    /// Lazy contentless tables keep their historical posting lists on disk and
+    /// only materialize the current INSERT delta in memory.  Once the host has
+    /// persisted that delta, the cached count and rowid allocator must advance
+    /// without clearing lazy mode or hydrating the historical corpus.
+    pub fn note_lazy_inserted_rows(&mut self, rowids: &[i64]) {
+        if !self.lazy_on_disk {
+            return;
+        }
+        self.lazy_doc_count = self.lazy_doc_count.saturating_add(rowids.len());
+        if let Some(max_rowid) = rowids.iter().copied().max() {
+            self.next_rowid = self.next_rowid.max(max_rowid.saturating_add(1));
+        }
+        // The host has made this statement's delta visible through the same
+        // on-disk reader used by MATCH. Drop the transient postings/content so
+        // repeated batches stay O(batch), not O(total corpus).
+        self.documents.clear();
+        self.shadow_rows = None;
+        self.row_locales.clear();
+        self.index = InvertedIndex::with_options_and_tokendata(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+            self.config.tokendata_enabled(),
+        );
+    }
+
     /// Leave lazy on-disk mode after the host materializes table rows.
     pub fn clear_lazy_on_disk(&mut self) {
         self.lazy_on_disk = false;
@@ -8074,7 +8102,7 @@ impl Fts5Table {
     ///
     /// `new_docs` are the `(rowid, post-rowid column args)` pairs for the rows
     /// the current INSERT added — the same `args[2..]` the vtable `update` saw,
-    /// decoded identically via [`Self::decode_column_values`]. Only those rows
+    /// decoded identically via `Self::decode_column_values`. Only those rows
     /// are tokenized, so the work is O(new rows) instead of the full
     /// re-encode's O(table); a batch rebuild is then O(table) overall instead
     /// of O(table^2), which is the root cause of the cass#301 `index --full`

@@ -153,6 +153,69 @@ fn count_distinct_index_walk_matches_sqlite() {
     );
 }
 
+/// COUNT(DISTINCT col) walks a COMPOSITE index whose LEADING key term is `col` when NO single-column
+/// index exists: the walk reads only index column 0 and counts leading-value changes, so trailing
+/// terms are irrelevant. Byte-identical to C SQLite, and the composite index (not the base table) is
+/// walked. A trailing-DESC term must not disqualify — only the ASC BINARY leading term governs.
+#[test]
+fn count_distinct_index_walk_composite_leading_term_matches_sqlite() {
+    for (label, ddl, a_idx, c_idx) in [
+        (
+            "composite-only (a,b)/(c,b)",
+            vec![
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
+                "CREATE INDEX idx_ab ON t(a, b);",
+                "CREATE INDEX idx_cb ON t(c, b);",
+            ],
+            "idx_ab",
+            "idx_cb",
+        ),
+        (
+            "composite trailing-DESC (a ASC, b DESC)/(c ASC, b DESC)",
+            vec![
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c TEXT, b INTEGER);",
+                "CREATE INDEX idx_ad ON t(a ASC, b DESC);",
+                "CREATE INDEX idx_cd ON t(c ASC, b DESC);",
+            ],
+            "idx_ad",
+            "idx_cd",
+        ),
+    ] {
+        let (f, r) = setup(&ddl);
+        for i in 1..=3000_i64 {
+            let a = if i % 13 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("{}", (i * 7) % 40)
+            };
+            let c = if i % 17 == 0 {
+                "NULL".to_owned()
+            } else {
+                format!("'k{}'", i % 25)
+            };
+            insert_both(
+                &f,
+                &r,
+                &format!("INSERT INTO t VALUES ({i}, {a}, {c}, {});", i % 100),
+            );
+        }
+        for (sql, idx) in [
+            ("SELECT COUNT(DISTINCT a) FROM t", a_idx),
+            ("SELECT COUNT(DISTINCT c) FROM t", c_idx),
+        ] {
+            cmp(&f, &r, sql, label);
+            assert!(
+                opens(&f, sql, idx),
+                "[{label}] COUNT(DISTINCT) must walk composite {idx}: `{sql}`"
+            );
+            assert!(
+                !opens(&f, sql, "t"),
+                "[{label}] composite COUNT(DISTINCT) walk must not open the table: `{sql}`"
+            );
+        }
+    }
+}
+
 #[test]
 fn count_distinct_index_walk_edge_cases() {
     // Empty, all-NULL, all-same, all-distinct, single-row — the walk's boundary conditions.

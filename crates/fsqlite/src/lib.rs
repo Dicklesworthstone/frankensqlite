@@ -4321,7 +4321,10 @@ mod tests {
             .execute("ALTER TABLE t DROP COLUMN id;")
             .expect_err("dropping a primary key column must fail");
         let msg = err.to_string();
-        assert!(msg.contains("cannot drop PRIMARY KEY column id"), "{msg}");
+        assert!(
+            msg.contains("cannot drop PRIMARY KEY column") && msg.contains("id"),
+            "{msg}"
+        );
     }
 
     /// Explicit column list omitting IPK should auto-generate rowid.

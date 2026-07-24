@@ -2855,6 +2855,108 @@ mod tests {
         page
     }
 
+    fn build_leaf_index_cell(key: &[u8]) -> Vec<u8> {
+        let mut cell = vec![0u8; key.len() + 9];
+        let varint_len = write_varint(&mut cell, key.len() as u64);
+        cell[varint_len..varint_len + key.len()].copy_from_slice(key);
+        cell.truncate(varint_len + key.len());
+        cell
+    }
+
+    fn build_leaf_index(keys: &[Vec<u8>]) -> Vec<u8> {
+        let cells: Vec<GatheredCell> = keys
+            .iter()
+            .map(|key| {
+                let data = build_leaf_index_cell(key);
+                GatheredCell {
+                    size: u16::try_from(data.len()).expect("test index cell fits in u16"),
+                    data,
+                }
+            })
+            .collect();
+        build_page(&cells, BtreePageType::LeafIndex, 0, USABLE, USABLE, None)
+            .expect("build leaf-index fixture")
+    }
+
+    fn build_interior_index(
+        dividers: &[(PageNumber, Vec<u8>)],
+        right_child: PageNumber,
+    ) -> Vec<u8> {
+        let cells: Vec<GatheredCell> = dividers
+            .iter()
+            .map(|(left_child, key)| {
+                let leaf_cell = build_leaf_index_cell(key);
+                let mut data = Vec::with_capacity(4 + leaf_cell.len());
+                data.extend_from_slice(&left_child.get().to_be_bytes());
+                data.extend_from_slice(&leaf_cell);
+                GatheredCell {
+                    size: u16::try_from(data.len()).expect("test divider cell fits in u16"),
+                    data,
+                }
+            })
+            .collect();
+        build_page(
+            &cells,
+            BtreePageType::InteriorIndex,
+            0,
+            USABLE,
+            USABLE,
+            Some(right_child),
+        )
+        .expect("build interior-index fixture")
+    }
+
+    fn index_page_cells(store: &MemPageStore, page_no: PageNumber) -> Vec<Vec<u8>> {
+        let page = store
+            .pages
+            .get(&page_no.get())
+            .expect("index fixture page exists");
+        let header = BtreePageHeader::parse(page, 0).expect("parse index fixture page");
+        assert_eq!(header.page_type, BtreePageType::LeafIndex);
+        read_cell_pointers(page, &header, 0)
+            .expect("read leaf-index pointers")
+            .into_iter()
+            .map(|ptr| {
+                let offset = usize::from(ptr);
+                let cell = CellRef::parse(page, offset, header.page_type, USABLE)
+                    .expect("parse leaf-index cell");
+                let end = offset + cell_on_page_size_from_ref(&cell, offset);
+                page[offset..end].to_vec()
+            })
+            .collect()
+    }
+
+    fn logical_index_cells(store: &MemPageStore, root_page_no: PageNumber) -> Vec<Vec<u8>> {
+        let root = store
+            .pages
+            .get(&root_page_no.get())
+            .expect("index root exists");
+        let header = BtreePageHeader::parse(root, 0).expect("parse index root");
+        assert_eq!(header.page_type, BtreePageType::InteriorIndex);
+        let pointers = read_cell_pointers(root, &header, 0).expect("read index-root pointers");
+        let mut cells = Vec::new();
+
+        for ptr in pointers {
+            let offset = usize::from(ptr);
+            let cell = CellRef::parse(root, offset, header.page_type, USABLE)
+                .expect("parse index divider");
+            let end = offset + cell_on_page_size_from_ref(&cell, offset);
+            let raw = &root[offset..end];
+            let child = PageNumber::new(u32::from_be_bytes(
+                raw[..4].try_into().expect("divider has child pointer"),
+            ))
+            .expect("nonzero child page");
+            cells.extend(index_page_cells(store, child));
+            cells.push(raw[4..].to_vec());
+        }
+
+        cells.extend(index_page_cells(
+            store,
+            header.right_child.expect("interior index has right child"),
+        ));
+        cells
+    }
+
     #[allow(clippy::cast_sign_loss)]
     fn build_interior_table_cell(left_child: PageNumber, rowid: i64) -> Vec<u8> {
         let mut cell_buf = [0u8; 64];
@@ -4065,6 +4167,82 @@ mod tests {
             root_header.cell_count, 4,
             "all leaf-table rows should be preserved after merge"
         );
+    }
+
+    #[test]
+    fn test_balance_nonroot_leaf_index_preserves_exact_cell_multiset_and_order() {
+        fn key(ordinal: u16) -> Vec<u8> {
+            let mut key = vec![0u8; 480];
+            key[..2].copy_from_slice(&ordinal.to_be_bytes());
+            for (index, byte) in key[2..].iter_mut().enumerate() {
+                *byte = ordinal
+                    .wrapping_mul(31)
+                    .wrapping_add(u16::try_from(index).expect("fixture index fits in u16"))
+                    as u8;
+            }
+            key
+        }
+
+        let base_ordinals: Vec<u16> = (1_u16..=26).map(|value| value * 10).collect();
+        let cases = [
+            (0usize, 0usize, 5u16),
+            (1usize, 4usize, 135u16),
+            (2usize, 8usize, 270u16),
+        ];
+
+        for (child_idx, insert_idx, inserted_ordinal) in cases {
+            let keys: Vec<Vec<u8>> = base_ordinals.iter().copied().map(key).collect();
+            let mut store = MemPageStore::new(20);
+            store.pages.insert(
+                2,
+                build_interior_index(
+                    &[(pn(3), keys[8].clone()), (pn(4), keys[17].clone())],
+                    pn(5),
+                ),
+            );
+            store.pages.insert(3, build_leaf_index(&keys[0..8]));
+            store.pages.insert(4, build_leaf_index(&keys[9..17]));
+            store.pages.insert(5, build_leaf_index(&keys[18..26]));
+            for page_no in 3_u32..=5 {
+                let page = store.pages.get(&page_no).expect("packed leaf exists");
+                let header = BtreePageHeader::parse(page, 0).expect("parse packed leaf");
+                let pointer_end = usize::from(header.page_type.header_size())
+                    + usize::from(header.cell_count) * usize::from(CELL_POINTER_SIZE);
+                let free_space = header.content_offset(USABLE).saturating_sub(pointer_end);
+                assert!(
+                    free_space < 256,
+                    "fixture leaf {page_no} must be at least 15/16 packed, free={free_space}"
+                );
+            }
+
+            let overflow_cell = build_leaf_index_cell(&key(inserted_ordinal));
+            balance_nonroot(
+                &Cx::new(),
+                &mut store,
+                pn(2),
+                child_idx,
+                std::slice::from_ref(&overflow_cell),
+                insert_idx,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .expect("leaf-index balance should succeed");
+
+            let mut expected: Vec<Vec<u8>> = keys
+                .iter()
+                .map(|value| build_leaf_index_cell(value))
+                .collect();
+            expected.push(overflow_cell);
+            expected.sort();
+
+            let actual = logical_index_cells(&store, pn(2));
+            assert_eq!(actual, expected, "insert ordinal {inserted_ordinal}");
+            assert!(
+                actual.windows(2).all(|pair| pair[0] < pair[1]),
+                "balanced index must stay strictly ordered without duplicates"
+            );
+        }
     }
 
     #[test]

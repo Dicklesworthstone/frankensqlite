@@ -209,6 +209,52 @@ pub struct WalSalts {
     pub salt2: u32,
 }
 
+impl WalSalts {
+    /// Fresh random salts for a brand-new WAL generation.
+    ///
+    /// Matching C SQLite (`walIndexRecover`/`walRestartHdr`), a new WAL must
+    /// carry unpredictable salts: frames from a stale or copied WAL of a
+    /// previous generation must fail salt validation instead of replaying
+    /// into the wrong database state. Deterministic salts (the old
+    /// `WalSalts::default()` = (0, 0) behavior, GH #201) let byte-identical
+    /// stale WALs validate across generations.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn generate() -> Self {
+        Self {
+            salt1: rand::random::<u32>(),
+            salt2: rand::random::<u32>(),
+        }
+    }
+
+    /// Wasm fallback: no durable WAL files exist on this target, so a
+    /// process-unique counter suffices to keep generations distinct.
+    #[cfg(target_arch = "wasm32")]
+    #[must_use]
+    pub fn generate() -> Self {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        Self {
+            salt1: n,
+            salt2: n.wrapping_mul(0x9E37_79B9),
+        }
+    }
+
+    /// Successor salts for a checkpoint RESTART/TRUNCATE of an existing WAL.
+    ///
+    /// C SQLite's `walRestartHdr` increments salt-1 (readers can detect the
+    /// generation change cheaply) and randomizes salt-2 (stale frames cannot
+    /// validate against the reset WAL).
+    #[must_use]
+    pub fn next_generation(self) -> Self {
+        Self {
+            salt1: self.salt1.wrapping_add(1),
+            salt2: Self::generate().salt2,
+        }
+    }
+}
+
 /// WAL magic number for little-endian checksum mode.
 pub const WAL_MAGIC_LE: u32 = 0x377F_0682;
 
@@ -1610,6 +1656,39 @@ fn ensure_frame_len(frame: &[u8], page_size: usize) -> Result<()> {
     ensure_valid_wal_page_size(page_size, "frame page_size")?;
     let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     ensure_min_len(frame, frame_size, "WAL frame")
+}
+
+/// GH #292: classify a 32-byte WAL header exactly the way stock SQLite's
+/// `walIndexRecover` does.
+///
+/// Returns `true` when the header is invalid in a way stock SQLite treats as
+/// "this WAL is empty" and silently proceeds without it: bad magic, invalid
+/// page size, or header-checksum mismatch (a torn or garbage sidecar, e.g.
+/// left behind by a killed process). Returns `false` both for a fully valid
+/// header and for the single hard-error case stock SQLite keeps: a
+/// checksum-valid header with an unsupported format version
+/// (`SQLITE_CANTOPEN` there, [`FrankenError::WalCorrupt`] here).
+///
+/// Check order mirrors `walIndexRecover`: magic → page size → checksum →
+/// (version left to the caller), so a torn header with a damaged version
+/// field still classifies as empty via its failed checksum.
+#[must_use]
+pub fn wal_header_treated_as_empty(header_buf: &[u8; WAL_HEADER_SIZE]) -> bool {
+    let magic = read_be_u32_at(header_buf, 0);
+    if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+        return true;
+    }
+    if ensure_valid_wal_header_page_size(read_be_u32_at(header_buf, 8)).is_err() {
+        return true;
+    }
+    let big_endian = magic == WAL_MAGIC_BE;
+    let (Ok(stored), Ok(expected)) = (
+        read_wal_header_checksum(header_buf),
+        wal_header_checksum(header_buf, big_endian),
+    ) else {
+        return true;
+    };
+    stored != expected
 }
 
 fn ensure_valid_wal_header_page_size(page_size: u32) -> Result<()> {

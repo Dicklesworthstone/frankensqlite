@@ -1,6 +1,6 @@
 //! Deterministic fault profile suite (`bd-mblr.2.3.1`).
 //!
-//! Named, categorized fault profiles that compose [`FaultSpec`](crate::fault_vfs::FaultSpec)
+//! Named, categorized fault profiles that compose [`FaultSpec`]
 //! sequences and bind them to expected invariant outcomes. Profiles are deterministic:
 //! same profile + same seed → same fault sequence → same expected behavior.
 //!

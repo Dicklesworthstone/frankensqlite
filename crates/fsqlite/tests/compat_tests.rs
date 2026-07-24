@@ -12,6 +12,48 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 use rusqlite::Connection as RusqliteConnection;
 
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[derive(Debug, PartialEq, Eq)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    modified: std::time::SystemTime,
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn snapshot_directory_files(
+    directory: &std::path::Path,
+) -> std::collections::BTreeMap<std::ffi::OsString, FileSnapshot> {
+    std::fs::read_dir(directory)
+        .expect("list artifact directory")
+        .map(|entry| {
+            let entry = entry.expect("read artifact entry");
+            let path = entry.path();
+            let metadata = entry.metadata().expect("read artifact metadata");
+            assert!(
+                metadata.is_file(),
+                "unexpected non-file artifact: {}",
+                path.display()
+            );
+            (
+                entry.file_name(),
+                FileSnapshot {
+                    bytes: std::fs::read(&path).expect("read artifact bytes"),
+                    modified: metadata
+                        .modified()
+                        .expect("read artifact modification time"),
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn suffixed_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut suffixed = path.as_os_str().to_owned();
+    suffixed.push(suffix);
+    std::path::PathBuf::from(suffixed)
+}
+
 // ===========================================================================
 // 1. PARAMS MACRO
 // ===========================================================================
@@ -666,6 +708,116 @@ fn open_with_flags_read_only_supports_datetime_builtin() {
         !value.is_empty(),
         "datetime('now') should return a non-empty timestamp on read-only compat connections"
     );
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn open_with_flags_read_only_query_preserves_every_database_artifact() {
+    use std::fs::{File, FileTimes};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("readonly_artifact_stability.db");
+    let path_str = path.to_str().unwrap();
+
+    let writable = open_with_flags(
+        path_str,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .expect("create FrankenSQLite generation");
+    writable
+        .execute_batch(
+            "CREATE TABLE artifact_probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO artifact_probe(value) VALUES ('preserved');",
+        )
+        .expect("seed WAL-backed row");
+    drop(writable);
+
+    let namespace_gate = suffixed_path(&path, "-fsqlite-ns-gate");
+    let namespace_use = suffixed_path(&path, "-fsqlite-ns-use");
+    let wal = suffixed_path(&path, "-wal");
+    assert!(
+        namespace_gate.exists(),
+        "writer must publish the namespace gate"
+    );
+    assert!(
+        namespace_use.exists(),
+        "writer must publish the namespace identity"
+    );
+    assert!(
+        wal.exists(),
+        "fixture must retain a WAL companion for readback"
+    );
+
+    let sentinel_modified = UNIX_EPOCH + Duration::from_secs(946_684_800);
+    File::options()
+        .write(true)
+        .open(&namespace_use)
+        .expect("open namespace identity for timestamp sentinel")
+        .set_times(FileTimes::new().set_modified(sentinel_modified))
+        .expect("set namespace identity timestamp sentinel");
+    let before = snapshot_directory_files(dir.path());
+
+    let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open existing generation read-only");
+    let row = readonly
+        .query_row("SELECT id, value FROM artifact_probe")
+        .expect("query the WAL-backed row");
+    assert_eq!(row.get(0), Some(&SqliteValue::Integer(1)));
+    assert_eq!(
+        row.get(1),
+        Some(&SqliteValue::Text("preserved".to_owned().into()))
+    );
+    drop(readonly);
+
+    assert_eq!(
+        snapshot_directory_files(dir.path()),
+        before,
+        "read-only open/query must preserve the complete DB, namespace, WAL, and companion file set byte-for-byte without touching modification times"
+    );
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn open_with_flags_read_only_opens_stock_database_without_touching_it() {
+    // GH #140 (partial): a stock SQLite database that FrankenSQLite has
+    // never opened carries no namespace records, so strictly read-only
+    // admission cannot join an existing generation. The open must still
+    // succeed (via the Shared-admission fallback) and must not modify the
+    // database file itself; the namespace sidecars it creates are the
+    // documented residual gap tracked in #140.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("readonly_missing_namespace.db");
+    let path_str = path.to_str().unwrap();
+    let external = RusqliteConnection::open(path_str).expect("create external SQLite database");
+    external
+        .execute_batch(
+            "CREATE TABLE external_probe(value INTEGER NOT NULL);
+             INSERT INTO external_probe VALUES (7);",
+        )
+        .expect("seed external SQLite database");
+    drop(external);
+    let db_bytes_before = std::fs::read(&path).expect("snapshot stock database bytes");
+
+    let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("stock database must remain openable read-only via fallback admission");
+    let row = readonly
+        .query_row("SELECT value FROM external_probe")
+        .expect("query the stock-database row");
+    assert_eq!(row.get(0), Some(&SqliteValue::Integer(7)));
+    drop(readonly);
+
+    assert_eq!(
+        std::fs::read(&path).expect("re-read stock database bytes"),
+        db_bytes_before,
+        "read-only open must not modify the stock database file"
+    );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(
+            !suffixed_path(&path, suffix).exists(),
+            "read-only open must not create a {suffix} companion"
+        );
+    }
 }
 
 #[test]

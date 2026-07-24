@@ -2025,7 +2025,7 @@ pub fn build_source_page_hashes(page_payloads: &[Vec<u8>]) -> Vec<Xxh3Checksum12
 /// Returns `K` recovered source pages on success.
 ///
 /// This function is the companion decoder for the `SystematicEncoder`-based
-/// encoding in [`generate_wal_fec_repair_symbols_inner`] and is intended as
+/// encoding in `generate_wal_fec_repair_symbols_inner` and is intended as
 /// the `decode` closure for [`recover_wal_fec_group_with_decoder`].
 pub fn wal_fec_raptorq_decode(
     meta: &WalFecGroupMeta,

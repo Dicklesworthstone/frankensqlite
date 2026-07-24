@@ -218,7 +218,7 @@ impl TxnEscalationTracker {
 
     /// Mark a page as escalated to page-level.
     ///
-    /// After this call, [`is_escalated`] returns true for this page.
+    /// After this call, [`Self::is_escalated`] returns true for this page.
     pub fn escalate(&mut self, page: PageNumber) {
         self.cell_level_pages.remove(&page);
         self.escalated_pages.insert(page);

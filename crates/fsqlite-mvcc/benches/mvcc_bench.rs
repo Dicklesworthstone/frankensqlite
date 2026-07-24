@@ -555,7 +555,7 @@ fn bench_range_scan_tracking_overhead(c: &mut Criterion) {
                     for raw_page in start_page..=end_page {
                         rows.push((
                             page(raw_page),
-                            manager.read_page(&mut reader, page(raw_page)),
+                            manager.read_page(&mut reader, page(raw_page)).unwrap(),
                         ));
                     }
                     black_box(consume_rows_like_oltp(&rows));
@@ -573,8 +573,9 @@ fn bench_range_scan_tracking_overhead(c: &mut Criterion) {
                     let mut reader = manager
                         .begin(BeginKind::Concurrent)
                         .expect("reader begin should succeed");
-                    let rows =
-                        manager.read_page_range(&mut reader, page(start_page), page(end_page));
+                    let rows = manager
+                        .read_page_range(&mut reader, page(start_page), page(end_page))
+                        .unwrap();
                     black_box(consume_rows_like_oltp(&rows));
                     manager.abort(&mut reader);
                 });

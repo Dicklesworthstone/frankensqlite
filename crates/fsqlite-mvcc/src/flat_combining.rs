@@ -403,7 +403,7 @@ pub struct FlatCombiningMetrics {
 }
 
 /// Read current flat combining metrics (global counters only).
-/// For HTM guard state, pass a `&FlatCombiner` to [`flat_combining_metrics_with_guard`].
+/// For HTM guard state, pass a `&FlatCombiner` to [`flat_combining_metrics_from`].
 #[must_use]
 pub fn flat_combining_metrics() -> FlatCombiningMetrics {
     flat_combining_metrics_with_htm("unavailable", 0.0, 0)

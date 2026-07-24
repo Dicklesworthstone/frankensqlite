@@ -408,8 +408,13 @@ mod tests {
         let conn = Connection::open_with_page_size(&source, 8192).unwrap();
         conn.execute("PRAGMA user_version = 777;").unwrap();
         conn.execute("PRAGMA application_id = 888;").unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE t(\
+                id INTEGER PRIMARY KEY,\
+                payload TEXT NOT NULL UNIQUE CHECK(length(payload) > 0)\
+            );",
+        )
+        .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');")
             .unwrap();
         conn.execute("DELETE FROM t WHERE id = 2;").unwrap();
@@ -421,6 +426,29 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+
+        let copied_fsqlite = Connection::open_schema_only(&target).unwrap();
+        let copied_rows = copied_fsqlite
+            .query("SELECT id, payload FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(copied_rows.len(), 2);
+        assert_eq!(copied_rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(
+            copied_rows[0].values()[1],
+            SqliteValue::Text("alpha".into())
+        );
+        assert_eq!(copied_rows[1].values()[0], SqliteValue::Integer(3));
+        assert_eq!(
+            copied_rows[1].values()[1],
+            SqliteValue::Text("gamma".into())
+        );
+        let copied_schema = copied_fsqlite
+            .query("SELECT sql FROM sqlite_master WHERE type='table' AND name='t';")
+            .unwrap();
+        let copied_ddl = copied_schema[0].values()[0].to_text().to_ascii_uppercase();
+        assert!(copied_ddl.contains("UNIQUE"), "{copied_ddl}");
+        assert!(copied_ddl.contains("CHECK"), "{copied_ddl}");
+        copied_fsqlite.close().unwrap();
 
         let copied = rusqlite::Connection::open(&target_path).unwrap();
         let page_size: i64 = copied
@@ -434,6 +462,12 @@ mod tests {
             .unwrap();
         let freelist_count: i64 = copied
             .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+            .unwrap();
+        let quick_check: String = copied
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        let integrity_check: String = copied
+            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
             .unwrap();
         let values: Vec<(i64, String)> = {
             let mut stmt = copied
@@ -449,9 +483,17 @@ mod tests {
         assert_eq!(user_version, 777);
         assert_eq!(application_id, 888);
         assert_eq!(freelist_count, 0);
+        assert_eq!(quick_check, "ok");
+        assert_eq!(integrity_check, "ok");
         assert_eq!(
             values,
             vec![(1, "alpha".to_owned()), (3, "gamma".to_owned())]
+        );
+        assert!(
+            copied
+                .execute("INSERT INTO t VALUES (4, 'alpha');", [])
+                .is_err(),
+            "the VACUUM INTO output must preserve the UNIQUE constraint"
         );
     }
 

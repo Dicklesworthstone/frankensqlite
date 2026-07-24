@@ -736,10 +736,13 @@ mod tests {
     fn test_bulkhead_bounds_parallelism() {
         // Set bulkhead limit to 4. Submit 10 tasks. At most 4 run concurrently.
         let bulkhead = background_bulkhead("encode_decode", 4);
+        // asupersync's Bulkhead::try_acquire takes an admission timestamp; this
+        // is a capacity (concurrency) test, so a fixed logical time is fine.
+        let now = Time::from_millis(0);
 
         let mut permits = Vec::new();
         for i in 0..4 {
-            let permit = bulkhead.try_acquire(1);
+            let permit = bulkhead.try_acquire(1, now);
             assert!(
                 permit.is_some(),
                 "bead_id={TEST_BEAD_ID} slot {} should be acquirable",
@@ -750,7 +753,7 @@ mod tests {
 
         // 5th through 10th should be rejected (no queue).
         for i in 4..10 {
-            let overflow = bulkhead.try_acquire(1);
+            let overflow = bulkhead.try_acquire(1, now);
             assert!(
                 overflow.is_none(),
                 "bead_id={TEST_BEAD_ID} slot {} should be rejected (bulkhead full)",
@@ -760,7 +763,7 @@ mod tests {
 
         // Release one permit, then one more should succeed.
         let _ = permits.pop();
-        let recovered = bulkhead.try_acquire(1);
+        let recovered = bulkhead.try_acquire(1, now);
         assert!(
             recovered.is_some(),
             "bead_id={TEST_BEAD_ID} should acquire after release"

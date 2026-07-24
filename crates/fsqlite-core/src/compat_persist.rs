@@ -47,7 +47,9 @@ use fsqlite_types::value::SqliteValue;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{eval_join_expr, is_sqlite_truthy};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
-use fsqlite_vdbe::codegen::{ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema};
+use fsqlite_vdbe::codegen::{
+    CheckConstraint, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
+};
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native", unix))]
 use fsqlite_vfs::UnixVfs as PlatformVfs;
@@ -752,7 +754,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         let indexes = extract_unique_constraint_indexes_from_sql(&create_sql, &name);
         let primary_key_constraints = extract_primary_key_constraints_from_sql(&create_sql);
         let foreign_keys = extract_foreign_keys_from_sql(&create_sql, &columns);
-        let check_constraints = extract_check_constraints_from_sql(&create_sql);
+        let check_constraints = extract_check_constraints_with_owners_from_sql(&create_sql);
         let num_columns = columns.len();
         let without_rowid = is_without_rowid_table_sql(&create_sql);
         let ipk_col_idx = columns.iter().position(|c| c.is_ipk);
@@ -1184,6 +1186,30 @@ fn quote_identifier(identifier: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn append_fk_reference_clause(sql: &mut String, fk: &FkDef) {
+    use std::fmt::Write as _;
+
+    let _ = write!(sql, " REFERENCES {}", quote_identifier(&fk.parent_table));
+    if !fk.parent_columns.is_empty() {
+        let parent_columns = fk
+            .parent_columns
+            .iter()
+            .map(|column_name| quote_identifier(column_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(sql, "({parent_columns})");
+    }
+    if fk.on_delete != FkActionType::NoAction {
+        let _ = write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete));
+    }
+    if fk.on_update != FkActionType::NoAction {
+        let _ = write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update));
+    }
+    if fk.deferred {
+        sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
+    }
+}
+
 /// Reconstruct a `CREATE TABLE` statement from a `TableSchema`.
 pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
     build_create_table_sql_with_implicit_index_predicate(table, |index| {
@@ -1250,6 +1276,21 @@ where
                 sql.push_str(" VIRTUAL");
             }
         }
+        for check in table.check_constraints.iter().filter(|check| {
+            check
+                .owner_column
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+        }) {
+            let _ = write!(sql, " CHECK({})", check.expr);
+        }
+        for fk in table.foreign_keys.iter().filter(|fk| {
+            fk.owner_column
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&col.name))
+        }) {
+            append_fk_reference_clause(&mut sql, fk);
+        }
     }
     // Emit PRIMARY KEY constraints BEFORE UNIQUE constraints.  Stock SQLite
     // assigns autoindex ordinals (sqlite_autoindex_T_N) in the order they
@@ -1303,7 +1344,11 @@ where
             .join(", ");
         let _ = write!(sql, ", UNIQUE ({cols})");
     }
-    for fk in &table.foreign_keys {
+    for fk in table
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.owner_column.is_none())
+    {
         let child_columns = fk
             .child_columns
             .iter()
@@ -1313,30 +1358,15 @@ where
         if child_columns.is_empty() {
             continue;
         }
-        let _ = write!(
-            sql,
-            ", FOREIGN KEY({}) REFERENCES {}",
-            child_columns.join(", "),
-            quote_identifier(&fk.parent_table)
-        );
-        if !fk.parent_columns.is_empty() {
-            let parent_columns = fk
-                .parent_columns
-                .iter()
-                .map(|column_name| quote_identifier(column_name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(sql, "({parent_columns})");
-        }
-        if fk.on_delete != FkActionType::NoAction {
-            let _ = write!(sql, " ON DELETE {}", fk_action_sql(fk.on_delete));
-        }
-        if fk.on_update != FkActionType::NoAction {
-            let _ = write!(sql, " ON UPDATE {}", fk_action_sql(fk.on_update));
-        }
+        let _ = write!(sql, ", FOREIGN KEY({})", child_columns.join(", "));
+        append_fk_reference_clause(&mut sql, fk);
     }
-    for check_expr in &table.check_constraints {
-        let _ = write!(sql, ", CHECK({check_expr})");
+    for check in table
+        .check_constraints
+        .iter()
+        .filter(|check| check.owner_column.is_none())
+    {
+        let _ = write!(sql, ", CHECK({})", check.expr);
     }
     sql.push(')');
     let mut table_options = Vec::new();
@@ -1530,9 +1560,9 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
     indexes
 }
 
-fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
+pub(crate) fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
     let Some(Statement::CreateTable(create)) = parse_single_statement(sql) else {
-        return Vec::new();
+        return extract_foreign_keys_sql_fallback(sql, columns);
     };
     let CreateTableBody::Columns {
         columns: column_defs,
@@ -1546,7 +1576,11 @@ fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef
     for (column_index, column) in column_defs.iter().enumerate() {
         for constraint in &column.constraints {
             if let ColumnConstraintKind::ForeignKey(clause) = &constraint.kind {
-                foreign_keys.push(fk_clause_to_def(&[column_index], clause));
+                foreign_keys.push(fk_clause_to_def(
+                    &[column_index],
+                    Some(column.name.clone()),
+                    clause,
+                ));
             }
         }
     }
@@ -1565,7 +1599,7 @@ fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef
                 })
                 .collect::<Vec<_>>();
             if !child_indices.is_empty() {
-                foreign_keys.push(fk_clause_to_def(&child_indices, clause));
+                foreign_keys.push(fk_clause_to_def(&child_indices, None, clause));
             }
         }
     }
@@ -1573,7 +1607,197 @@ fn extract_foreign_keys_from_sql(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef
     foreign_keys
 }
 
-fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
+fn extract_foreign_keys_sql_fallback(sql: &str, columns: &[ColumnInfo]) -> Vec<FkDef> {
+    let Some(open) = find_unquoted_sql_char(sql, '(') else {
+        return Vec::new();
+    };
+    let Some(close) = find_matching_sql_paren(sql, open) else {
+        return Vec::new();
+    };
+    let mut foreign_keys = Vec::new();
+
+    for definition in split_top_level_csv_items(&sql[open + 1..close]) {
+        if starts_with_unquoted_table_constraint(&definition) {
+            let Some(foreign_pos) = find_top_level_unquoted_sql_keyword(&definition, "FOREIGN")
+            else {
+                continue;
+            };
+            let after_foreign = &definition[foreign_pos + "FOREIGN".len()..];
+            let Some(key_pos) = find_top_level_unquoted_sql_keyword(after_foreign, "KEY") else {
+                continue;
+            };
+            let after_key = &after_foreign[key_pos + "KEY".len()..];
+            let child_list = trim_leading_sql_space_and_comments(after_key);
+            if !child_list.starts_with('(') {
+                continue;
+            }
+            let open_paren = definition.len() - child_list.len();
+            let Some(close_paren) = find_matching_sql_paren(&definition, open_paren) else {
+                continue;
+            };
+            let Some(child_names) =
+                parse_sql_identifier_list(&definition[open_paren + 1..close_paren])
+            else {
+                continue;
+            };
+            let Some(child_indices) = child_names
+                .iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(name))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if let Some(fk) =
+                parse_fk_reference_sql(&definition[close_paren + 1..], &child_indices, None)
+            {
+                foreign_keys.push(fk);
+            }
+            continue;
+        }
+
+        let Some((column_name, remainder)) = parse_column_name_and_remainder(&definition) else {
+            continue;
+        };
+        let Some(column_index) = columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(&column_name))
+        else {
+            continue;
+        };
+        if let Some(fk) = parse_fk_reference_sql(remainder, &[column_index], Some(column_name)) {
+            foreign_keys.push(fk);
+        }
+    }
+
+    foreign_keys
+}
+
+fn parse_sql_identifier_list(input: &str) -> Option<Vec<String>> {
+    split_top_level_csv_items(input)
+        .into_iter()
+        .map(|item| {
+            let (name, remainder) = parse_column_name_and_remainder(&item)?;
+            trim_leading_sql_space_and_comments(remainder)
+                .is_empty()
+                .then_some(name)
+        })
+        .collect()
+}
+
+fn parse_fk_reference_sql(
+    input: &str,
+    child_indices: &[usize],
+    owner_column: Option<String>,
+) -> Option<FkDef> {
+    let references_pos = find_top_level_unquoted_sql_keyword(input, "REFERENCES")?;
+    let after_references =
+        trim_leading_sql_space_and_comments(&input[references_pos + "REFERENCES".len()..]);
+    let (parent_table, after_parent_table) = parse_fk_parent_table(after_references)?;
+    let after_parent_table = trim_leading_sql_space_and_comments(after_parent_table);
+    let (parent_columns, action_sql) = if after_parent_table.starts_with('(') {
+        let open_paren = input.len() - after_parent_table.len();
+        let close_paren = find_matching_sql_paren(input, open_paren)?;
+        (
+            parse_sql_identifier_list(&input[open_paren + 1..close_paren])?,
+            &input[close_paren + 1..],
+        )
+    } else {
+        (Vec::new(), after_parent_table)
+    };
+    let tokens = collect_unquoted_sql_keyword_tokens(action_sql)
+        .into_iter()
+        .map(|(token, _)| token)
+        .collect::<Vec<_>>();
+    let mut on_delete = FkActionType::NoAction;
+    let mut on_update = FkActionType::NoAction;
+    for (index, token) in tokens.iter().enumerate() {
+        if token != "ON" || index + 2 >= tokens.len() {
+            continue;
+        }
+        let action = match tokens[index + 2].as_str() {
+            "CASCADE" => Some(FkActionType::Cascade),
+            "RESTRICT" => Some(FkActionType::Restrict),
+            "SET" if tokens.get(index + 3).is_some_and(|token| token == "NULL") => {
+                Some(FkActionType::SetNull)
+            }
+            "SET"
+                if tokens
+                    .get(index + 3)
+                    .is_some_and(|token| token == "DEFAULT") =>
+            {
+                Some(FkActionType::SetDefault)
+            }
+            "NO" if tokens.get(index + 3).is_some_and(|token| token == "ACTION") => {
+                Some(FkActionType::NoAction)
+            }
+            _ => None,
+        };
+        match (tokens[index + 1].as_str(), action) {
+            ("DELETE", Some(action)) => on_delete = action,
+            ("UPDATE", Some(action)) => on_update = action,
+            _ => {}
+        }
+    }
+    let deferred = tokens.windows(3).enumerate().any(|(index, window)| {
+        (index == 0 || tokens[index - 1] != "NOT")
+            && window[0] == "DEFERRABLE"
+            && window[1] == "INITIALLY"
+            && window[2] == "DEFERRED"
+    });
+
+    Some(FkDef {
+        child_columns: child_indices.to_vec(),
+        owner_column,
+        parent_table,
+        parent_columns,
+        on_delete,
+        on_update,
+        deferred,
+    })
+}
+
+fn parse_fk_parent_table(input: &str) -> Option<(String, &str)> {
+    let trimmed = trim_leading_sql_space_and_comments(input);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (name_raw, remainder) = match trimmed.as_bytes()[0] {
+        b'"' => parse_quoted_identifier(trimmed, b'"', b'"')?,
+        b'`' => parse_quoted_identifier(trimmed, b'`', b'`')?,
+        b'[' => parse_bracket_identifier(trimmed)?,
+        _ => {
+            let mut chars = trimmed.char_indices().peekable();
+            let mut end = trimmed.len();
+            while let Some((index, ch)) = chars.next() {
+                let starts_comment = matches!(ch, '-' | '/')
+                    && chars.peek().is_some_and(|(_, next)| {
+                        (ch == '-' && *next == '-') || (ch == '/' && *next == '*')
+                    });
+                if ch.is_whitespace() || ch == '(' || starts_comment {
+                    end = index;
+                    break;
+                }
+            }
+            (&trimmed[..end], &trimmed[end..])
+        }
+    };
+    (!name_raw.is_empty()).then(|| {
+        (
+            strip_identifier_quotes(name_raw),
+            trim_leading_sql_space_and_comments(remainder),
+        )
+    })
+}
+
+fn fk_clause_to_def(
+    child_indices: &[usize],
+    owner_column: Option<String>,
+    clause: &fsqlite_ast::ForeignKeyClause,
+) -> FkDef {
     let mut on_delete = FkActionType::NoAction;
     let mut on_update = FkActionType::NoAction;
     for action in &clause.actions {
@@ -1598,6 +1822,7 @@ fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyCla
     });
     FkDef {
         child_columns: child_indices.to_vec(),
+        owner_column,
         parent_table: clause.table.clone(),
         parent_columns: clause.columns.clone(),
         on_delete,
@@ -1724,15 +1949,12 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
     let is_strict = is_strict_table_sql(sql);
     let is_without_rowid = is_without_rowid_table_sql(sql);
     // Find the parenthesized column list.
-    let Some(open) = sql.find('(') else {
+    let Some(open) = find_unquoted_sql_char(sql, '(') else {
         return Vec::new();
     };
-    let Some(close) = sql.rfind(')') else {
+    let Some(close) = find_matching_sql_paren(sql, open) else {
         return Vec::new();
     };
-    if open >= close {
-        return Vec::new();
-    }
 
     let body = &sql[open + 1..close];
     split_top_level_csv_items(body)
@@ -1775,6 +1997,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             let default_value = extract_default_value(remainder);
 
             let collation = extract_collation_name(remainder);
+            let (generated_expr, generated_stored) = extract_generated_column_clause(remainder);
 
             Some(ColumnInfo {
                 name,
@@ -1785,8 +2008,8 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 unique: has_unique || has_primary_key,
                 default_value,
                 strict_type,
-                generated_expr: None,
-                generated_stored: None,
+                generated_expr,
+                generated_stored,
                 collation,
                 conflict_action: None,
             })
@@ -1973,52 +2196,57 @@ pub(crate) fn autoincrement_from_create_table_statement(create: &CreateTableStat
 /// expression text (inside the parentheses) for each one.
 #[must_use]
 pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
+    extract_check_constraints_with_owners_from_sql(sql)
+        .into_iter()
+        .map(|check| check.expr)
+        .collect()
+}
+
+pub(crate) fn extract_check_constraints_with_owners_from_sql(sql: &str) -> Vec<CheckConstraint> {
     if let Some(Statement::CreateTable(create)) = parse_single_statement(sql) {
         return check_constraints_from_create_table_statement(&create);
     }
 
-    let Some(open) = sql.find('(') else {
+    extract_check_constraints_with_owners_sql_fallback(sql)
+}
+
+fn extract_check_constraints_with_owners_sql_fallback(sql: &str) -> Vec<CheckConstraint> {
+    let Some(open) = find_unquoted_sql_char(sql, '(') else {
         return Vec::new();
     };
-    let Some(close) = sql.rfind(')') else {
+    let Some(close) = find_matching_sql_paren(sql, open) else {
         return Vec::new();
     };
-    if open >= close {
-        return Vec::new();
-    }
     let body = &sql[open + 1..close];
-    let upper = body.to_ascii_uppercase();
     let mut checks = Vec::new();
-    let mut search_from = 0;
-    while let Some(pos) = upper[search_from..].find("CHECK") {
-        let abs_pos = search_from + pos;
-        let after = &body[abs_pos + 5..].trim_start();
-        if after.starts_with('(') {
-            // Find matching closing paren.
-            let mut depth = 0_i32;
-            let mut end = None;
-            for (i, ch) in after.char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(end_idx) = end {
-                let expr = &after[1..end_idx];
-                checks.push(expr.trim().to_owned());
-                search_from = abs_pos + 5 + end_idx + 1;
-            } else {
-                search_from = abs_pos + 5;
-            }
+
+    for definition in split_top_level_csv_items(body) {
+        let owner_column = if starts_with_unquoted_table_constraint(&definition) {
+            None
         } else {
-            search_from = abs_pos + 5;
+            parse_column_name_and_remainder(&definition).map(|(name, _)| name)
+        };
+        let mut search_from = 0_usize;
+        while let Some(relative_check) =
+            find_unquoted_sql_keyword(&definition[search_from..], "CHECK")
+        {
+            let check_start = search_from + relative_check;
+            let after_keyword = &definition[check_start + "CHECK".len()..];
+            let after_space_and_comments = trim_leading_sql_space_and_comments(after_keyword);
+            let skipped = after_keyword.len() - after_space_and_comments.len();
+            let open_paren = check_start + "CHECK".len() + skipped;
+            if !after_space_and_comments.starts_with('(') {
+                search_from = check_start + "CHECK".len();
+                continue;
+            }
+            let Some(close_paren) = find_matching_sql_paren(&definition, open_paren) else {
+                break;
+            };
+            checks.push(CheckConstraint {
+                expr: definition[open_paren + 1..close_paren].trim().to_owned(),
+                owner_column: owner_column.clone(),
+            });
+            search_from = close_paren + 1;
         }
     }
     checks
@@ -2026,7 +2254,7 @@ pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
 
 pub(crate) fn check_constraints_from_create_table_statement(
     create: &CreateTableStatement,
-) -> Vec<String> {
+) -> Vec<CheckConstraint> {
     let CreateTableBody::Columns {
         columns,
         constraints,
@@ -2038,13 +2266,19 @@ pub(crate) fn check_constraints_from_create_table_statement(
     for column in columns {
         for constraint in &column.constraints {
             if let ColumnConstraintKind::Check(expr) = &constraint.kind {
-                checks.push(expr.to_string());
+                checks.push(CheckConstraint {
+                    expr: expr.to_string(),
+                    owner_column: Some(column.name.clone()),
+                });
             }
         }
     }
     for constraint in constraints {
         if let TableConstraintKind::Check(expr) = &constraint.kind {
-            checks.push(expr.to_string());
+            checks.push(CheckConstraint {
+                expr: expr.to_string(),
+                owner_column: None,
+            });
         }
     }
     checks
@@ -2484,8 +2718,6 @@ pub(crate) fn columns_from_create_table_statement(
         return None;
     };
 
-    let mut table_pk_cols = vec![false; columns.len()];
-    let mut table_unique_cols = vec![false; columns.len()];
     let mut table_pk_rowid_col_idx = None;
 
     if let CreateTableBody::Columns { constraints, .. } = &create.body {
@@ -2505,9 +2737,6 @@ pub(crate) fn columns_from_create_table_statement(
                         continue;
                     };
 
-                    table_pk_cols[index] = true;
-                    table_unique_cols[index] = true;
-
                     let is_integer = columns[index]
                         .type_name
                         .as_ref()
@@ -2515,21 +2744,6 @@ pub(crate) fn columns_from_create_table_statement(
                     if is_integer && !create.without_rowid {
                         table_pk_rowid_col_idx = Some(index);
                     }
-                }
-                TableConstraintKind::Unique {
-                    columns: unique_columns,
-                    ..
-                } if unique_columns.len() == 1 => {
-                    let Some(column_name) = indexed_column_name(&unique_columns[0]) else {
-                        continue;
-                    };
-                    let Some(index) = columns
-                        .iter()
-                        .position(|col| col.name.eq_ignore_ascii_case(column_name))
-                    else {
-                        continue;
-                    };
-                    table_unique_cols[index] = true;
                 }
                 _ => {}
             }
@@ -2581,8 +2795,6 @@ pub(crate) fn columns_from_create_table_statement(
                     matches!(&constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
                 });
                 let unique = (!is_ipk && has_primary_key)
-                    || table_pk_cols[index]
-                    || table_unique_cols[index]
                     || col.constraints.iter().any(|constraint| {
                         matches!(&constraint.kind, ColumnConstraintKind::Unique { .. })
                     });
@@ -2825,7 +3037,7 @@ fn find_unquoted_name_end(input: &str) -> usize {
 }
 
 fn starts_with_unquoted_table_constraint(def: &str) -> bool {
-    let trimmed = def.trim_start();
+    let trimmed = trim_leading_sql_space_and_comments(def);
     if trimmed.is_empty() {
         return false;
     }
@@ -2833,19 +3045,15 @@ fn starts_with_unquoted_table_constraint(def: &str) -> bool {
         b'"' | b'`' | b'[' => return false,
         _ => {}
     }
-    let upper = trimmed.to_ascii_uppercase();
-    upper.starts_with("CONSTRAINT ")
-        || upper.starts_with("PRIMARY KEY")
-        || upper == "PRIMARY"
-        || upper.starts_with("UNIQUE ")
-        || upper.starts_with("UNIQUE(")
-        || upper == "UNIQUE"
-        || upper.starts_with("CHECK ")
-        || upper.starts_with("CHECK(")
-        || upper == "CHECK"
-        || upper.starts_with("FOREIGN KEY")
-        || upper.starts_with("FOREIGN(")
-        || upper == "FOREIGN"
+    collect_unquoted_sql_keyword_tokens(trimmed)
+        .first()
+        .is_some_and(|(token, start)| {
+            *start == 0
+                && matches!(
+                    token.as_str(),
+                    "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+                )
+        })
 }
 
 type SqlCharIndices<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
@@ -2862,6 +3070,43 @@ fn find_unquoted_sql_keyword(input: &str, keyword: &str) -> Option<usize> {
     collect_unquoted_sql_keyword_tokens(input)
         .into_iter()
         .find_map(|(token, start)| (token == keyword).then_some(start))
+}
+
+fn find_top_level_unquoted_sql_keyword(input: &str, keyword: &str) -> Option<usize> {
+    let mut chars = input.char_indices().peekable();
+    let mut paren_depth = 0_usize;
+    let mut token_start = None;
+
+    while let Some((idx, ch)) = chars.next() {
+        let is_token_char = ch.is_ascii_alphanumeric() || ch == '_';
+        if paren_depth == 0 && is_token_char {
+            token_start.get_or_insert(idx);
+            continue;
+        }
+        if let Some(start) = token_start.take()
+            && input[start..idx].eq_ignore_ascii_case(keyword)
+        {
+            return Some(start);
+        }
+
+        match ch {
+            '\'' | '"' | '`' => skip_quoted_sql(&mut chars, ch),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                let _ = chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                let _ = chars.next();
+                skip_block_comment(&mut chars);
+            }
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    token_start.filter(|start| input[*start..].eq_ignore_ascii_case(keyword))
 }
 
 fn find_unquoted_sql_char(input: &str, target: char) -> Option<usize> {
@@ -3115,6 +3360,32 @@ fn extract_type_declaration(tokens: &[&str]) -> String {
         }
     }
     parts.join(" ")
+}
+
+fn extract_generated_column_clause(remainder: &str) -> (Option<String>, Option<bool>) {
+    let Some(as_pos) = find_top_level_unquoted_sql_keyword(remainder, "AS") else {
+        return (None, None);
+    };
+    let after_keyword = &remainder[as_pos + "AS".len()..];
+    let after_space_and_comments = trim_leading_sql_space_and_comments(after_keyword);
+    if !after_space_and_comments.starts_with('(') {
+        return (None, None);
+    }
+    let skipped = after_keyword.len() - after_space_and_comments.len();
+    let open_paren = as_pos + "AS".len() + skipped;
+    let Some(close_paren) = find_matching_sql_paren(remainder, open_paren) else {
+        return (None, None);
+    };
+
+    let tail = trim_leading_sql_space_and_comments(&remainder[close_paren + 1..]);
+    let is_stored = collect_unquoted_sql_keyword_tokens(tail)
+        .first()
+        .is_some_and(|(token, start)| *start == 0 && token == "STORED");
+
+    (
+        Some(remainder[open_paren + 1..close_paren].trim().to_owned()),
+        Some(is_stored),
+    )
 }
 
 /// Extract a DEFAULT value from a column definition remainder (the part after
@@ -3885,6 +4156,25 @@ PRAGMA integrity_check;
     }
 
     #[test]
+    fn test_parse_columns_distinguishes_column_and_table_unique_ownership() {
+        let column_owned = parse_columns_from_create_sql(
+            "CREATE TABLE column_owned (id INTEGER UNIQUE, body TEXT)",
+        );
+        assert!(column_owned[0].unique);
+
+        let table_owned = parse_columns_from_create_sql(
+            "CREATE TABLE table_owned (id INTEGER, body TEXT, UNIQUE(id))",
+        );
+        assert!(!table_owned[0].unique);
+        let indexes = extract_unique_constraint_indexes_from_sql(
+            "CREATE TABLE table_owned (id INTEGER, body TEXT, UNIQUE(id))",
+            "table_owned",
+        );
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].columns, vec!["id"]);
+    }
+
+    #[test]
     fn test_parse_columns_from_create_sql_table_level_integer_primary_key_desc_is_ipk() {
         let sql = "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id DESC))";
         let cols = parse_columns_from_create_sql(sql);
@@ -3995,6 +4285,23 @@ PRAGMA integrity_check;
         assert!(!cols[0].notnull);
         assert_eq!(cols[1].default_value, None);
         assert!(!cols[1].unique);
+    }
+
+    #[test]
+    fn test_parse_columns_fallback_preserves_generated_column_metadata() {
+        let sql = "CREATE TABLE t(a, c, b GENERATED ALWAYS AS(a * 2) STORED, CHECK(c > 0) ON CONFLICT FAIL)";
+        let cols = parse_columns_from_create_sql(sql);
+
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[2].name, "b");
+        assert_eq!(cols[2].generated_expr.as_deref(), Some("a * 2"));
+        assert_eq!(cols[2].generated_stored, Some(true));
+
+        let virtual_cols = parse_columns_from_create_sql(
+            "CREATE TABLE v(a, b GENERATED ALWAYS AS(a) REFERENCES stored, CHECK(a > 0) ON CONFLICT FAIL)",
+        );
+        assert_eq!(virtual_cols[1].generated_expr.as_deref(), Some("a"));
+        assert_eq!(virtual_cols[1].generated_stored, Some(false));
     }
 
     #[test]
@@ -4337,6 +4644,7 @@ PRAGMA integrity_check;
             primary_key_constraints: Vec::new(),
             foreign_keys: vec![FkDef {
                 child_columns: vec![1],
+                owner_column: None,
                 parent_table: "pa\"rent".to_owned(),
                 parent_columns: vec!["id\"x".to_owned()],
                 on_delete: FkActionType::Cascade,
@@ -4492,13 +4800,17 @@ PRAGMA integrity_check;
             primary_key_constraints: Vec::new(),
             foreign_keys: vec![FkDef {
                 child_columns: vec![0],
+                owner_column: None,
                 parent_table: "parent".to_owned(),
                 parent_columns: vec!["id".to_owned()],
                 on_delete: FkActionType::Cascade,
                 on_update: FkActionType::Restrict,
                 deferred: false,
             }],
-            check_constraints: vec!["length(slug) > 0".to_owned()],
+            check_constraints: vec![CheckConstraint {
+                expr: "length(slug) > 0".to_owned(),
+                owner_column: None,
+            }],
         };
 
         let sql = build_create_table_sql(&table);
@@ -4604,6 +4916,61 @@ PRAGMA integrity_check;
         let sql = "CREATE TABLE t (note TEXT DEFAULT 'CHECK(fake)', CHECK(length(note) > 0))";
         let checks = extract_check_constraints_from_sql(sql);
         assert_eq!(checks, vec!["length(note) > 0".to_owned()]);
+    }
+
+    #[test]
+    fn test_check_constraint_fallback_preserves_column_ownership() {
+        // SQLite accepts a conflict clause after a table CHECK, while the AST
+        // parser currently rejects that suffix. Exercise the fallback so a
+        // neighboring column CHECK does not get flattened into table scope.
+        let sql = r#"CREATE TABLE t(
+            "owned col" TEXT DEFAULT 'CHECK(fake)' CHECK(length("owned col") > 0),
+            b INTEGER,
+            CONSTRAINT/*name*/ table_check CHECK/*expr*/(b > 0) ON CONFLICT FAIL
+        )"#;
+        let checks = extract_check_constraints_with_owners_from_sql(sql);
+        assert_eq!(
+            checks,
+            vec![
+                CheckConstraint {
+                    expr: r#"length("owned col") > 0"#.to_owned(),
+                    owner_column: Some("owned col".to_owned()),
+                },
+                CheckConstraint {
+                    expr: "b > 0".to_owned(),
+                    owner_column: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_foreign_key_fallback_preserves_ownership_and_actions() {
+        // The trailing CHECK conflict clause is accepted by SQLite but is not
+        // yet accepted by the full AST parser, forcing the schema fallback.
+        let sql = r#"CREATE TABLE child(
+            "owned col" INTEGER REFERENCES parent(id)
+                ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+            keep INTEGER,
+            CONSTRAINT fk_keep FOREIGN KEY(keep) REFERENCES "parent table"("id col")
+                ON UPDATE RESTRICT NOT DEFERRABLE INITIALLY DEFERRED,
+            CHECK(keep > 0) ON CONFLICT FAIL
+        )"#;
+        let columns = parse_columns_from_create_sql(sql);
+        let foreign_keys = extract_foreign_keys_from_sql(sql, &columns);
+
+        assert_eq!(foreign_keys.len(), 2);
+        assert_eq!(foreign_keys[0].child_columns, vec![0]);
+        assert_eq!(foreign_keys[0].owner_column.as_deref(), Some("owned col"));
+        assert_eq!(foreign_keys[0].parent_table, "parent");
+        assert_eq!(foreign_keys[0].parent_columns, vec!["id"]);
+        assert_eq!(foreign_keys[0].on_delete, FkActionType::Cascade);
+        assert!(foreign_keys[0].deferred);
+
+        assert_eq!(foreign_keys[1].child_columns, vec![1]);
+        assert_eq!(foreign_keys[1].owner_column, None);
+        assert_eq!(foreign_keys[1].on_update, FkActionType::Restrict);
+        assert!(!foreign_keys[1].deferred);
     }
 
     #[test]

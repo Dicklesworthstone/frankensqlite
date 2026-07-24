@@ -461,7 +461,7 @@ pub fn canonical_sha256(source: &Path) -> E2eResult<String> {
 
 // ─── SHA-256 hashing + mismatch reporting (bd-1w6k.5.3) ──────────────
 
-/// Compute a full [`CorrectnessReport`] for a database file.
+/// Compute a full [`crate::report::CorrectnessReport`] for a database file.
 ///
 /// Fills in all three SHA-256 tiers (raw, canonical, logical) and the
 /// integrity check result.  If a particular tier cannot be computed (e.g.

@@ -3,7 +3,8 @@
 //! This module provides deterministic replay of real-world SQLite workloads
 //! against both C SQLite and FrankenSQLite, with:
 //!
-//! 1. **Deterministic replay**: reproducible execution via [`ExecutionEnvelope`]
+//! 1. **Deterministic replay**: reproducible execution via
+//!    [`crate::differential_v2::ExecutionEnvelope`]
 //!    seeds and fixed ordering.
 //! 2. **Drift detection**: BOCPD-inspired monitoring of mismatch rates over
 //!    sequential replay batches to detect regime shifts (new failure patterns

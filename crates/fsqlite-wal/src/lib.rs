@@ -42,6 +42,56 @@ pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::fmt::Debug;
+    use std::future::Future;
+
+    std::thread_local! {
+        static TEST_RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(1, 2)
+                .build()
+                .expect("WAL test runtime should build");
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        TEST_RUNTIME.with(|runtime| runtime.block_on(future))
+    }
+
+    pub(crate) trait FutureResultTestExt<T, E>:
+        Future<Output = Result<T, E>> + Sized
+    {
+        fn wait(self) -> Result<T, E> {
+            block_on(self)
+        }
+
+        fn expect(self, message: &str) -> T
+        where
+            E: Debug,
+        {
+            block_on(self).expect(message)
+        }
+
+        fn expect_err(self, message: &str) -> E
+        where
+            T: Debug,
+        {
+            block_on(self).expect_err(message)
+        }
+
+        fn is_ok(self) -> bool {
+            block_on(self).is_ok()
+        }
+
+        fn is_err(self) -> bool {
+            block_on(self).is_err()
+        }
+    }
+
+    impl<F, T, E> FutureResultTestExt<T, E> for F where F: Future<Output = Result<T, E>> + Sized {}
+}
+
 pub use cell_delta_commit::{
     CellDeltaDescriptor, FullPageFrame, MixedCommitStats, MixedFrameSubmission,
     build_cell_delta_frames, serialize_mixed_frames,
@@ -74,17 +124,18 @@ pub use checksum::{
     recovery_action_for_checksum_failure, sqlite_wal_checksum, supports_torn_write_sector_size,
     tier_for_algorithm, validate_wal_chain, validate_wal_header_checksum, verify_page_checksum,
     verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128, wal_frame_db_size,
-    wal_header_checksum, write_page_checksum, write_wal_frame_checksum, write_wal_frame_salts,
-    write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
+    wal_header_checksum, wal_header_treated_as_empty, write_page_checksum,
+    write_wal_frame_checksum, write_wal_frame_salts, write_wal_header_checksum,
+    write_wal_header_salts, zero_page_checksum_trailer,
 };
 pub use group_commit::{
     ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase, FrameSubmission,
     GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, PhaseHistogram,
-    PhasePercentiles, SubmitOutcome, SubmitReceipt, TransactionConflictSnapshot,
-    TransactionFrameBatch, TransactionFrameBatchContext, WakeReasonCounters, WakeReasonSnapshot,
-    commit_phase_timing_enabled, commit_phase_timing_forced_enabled,
-    detailed_consolidation_metrics_enabled, set_commit_phase_timing_enabled,
-    write_consolidated_frames,
+    PhasePercentiles, SubmitOutcome, SubmitReceipt, TransactionConflictPageBaseline,
+    TransactionConflictSnapshot, TransactionFrameBatch, TransactionFrameBatchContext,
+    WakeReasonCounters, WakeReasonSnapshot, commit_phase_timing_enabled,
+    commit_phase_timing_forced_enabled, detailed_consolidation_metrics_enabled,
+    set_commit_phase_timing_enabled, write_consolidated_frames,
 };
 pub use metrics::{
     GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS,
@@ -93,18 +144,25 @@ pub use metrics::{
     WalRecoveryCounters, WalRecoveryCountersSnapshot,
 };
 pub use parallel_wal::{
-    FsyncPolicy, PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
-    PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalBatch,
-    ParallelWalCommitCertificate, ParallelWalConfig, ParallelWalControlSurface,
+    FsyncPolicy, PARALLEL_WAL_COMMIT_CERTIFICATE_VERSION, PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+    PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC, PARALLEL_WAL_DURABLE_CERTIFICATE_RECORD_VERSION,
+    PARALLEL_WAL_FLUSH_SCENARIO_ID, PARALLEL_WAL_LANE_POLICY_VERSION,
+    PARALLEL_WAL_PUBLICATION_SCENARIO_ID, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalBatch,
+    ParallelWalCombinerError, ParallelWalCombinerMetricsSnapshot, ParallelWalCommitCertificate,
+    ParallelWalConfig, ParallelWalConservativeShadowEvidence, ParallelWalControlSurface,
     ParallelWalCoordinator, ParallelWalDecisionAction, ParallelWalDecisionRecord,
-    ParallelWalFallbackReason, ParallelWalFrame, ParallelWalLaneBatch, ParallelWalLaneStager,
-    ParallelWalOperatingMode, ParallelWalOrderedResidue, ParallelWalShadowVerdict,
-    ParallelWalTraceRecord, SegmentHeader, SegmentRecoveryOptions, SegmentRecoveryResult,
-    cleanup_segments, default_parallel_wal_lane_count, delete_segment, list_segments,
-    max_durable_epoch, parallel_wal_coordinator_for_path, parallel_wal_fallback_reason_name,
-    parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
-    read_segment, recover_and_apply_segments, recover_segments, remove_parallel_wal_coordinator,
-    resolve_parallel_wal_control_surface_from_env, segment_path, write_segment,
+    ParallelWalDurabilityCombiner, ParallelWalDurabilityReceipt, ParallelWalDurabilityRequest,
+    ParallelWalDurableCertificateRecord, ParallelWalFallbackReason, ParallelWalFrame,
+    ParallelWalLaneBatch, ParallelWalLaneStager, ParallelWalLookupMode, ParallelWalOperatingMode,
+    ParallelWalOrderedResidue, ParallelWalShadowVerdict, ParallelWalTraceRecord,
+    ParallelWalVisibilitySnapshot, SegmentHeader, SegmentRecoveryOptions, SegmentRecoveryResult,
+    cleanup_segments, decode_parallel_wal_durable_certificate_records,
+    default_parallel_wal_lane_count, delete_segment, list_segments, max_durable_epoch,
+    parallel_wal_coordinator_for_path, parallel_wal_fallback_reason_name,
+    parallel_wal_lookup_mode_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    parallel_wal_should_shadow_compare, read_segment, recover_and_apply_segments, recover_segments,
+    remove_parallel_wal_coordinator, resolve_parallel_wal_control_surface_from_env, segment_path,
+    write_segment,
 };
 pub use per_core_buffer::{
     AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,

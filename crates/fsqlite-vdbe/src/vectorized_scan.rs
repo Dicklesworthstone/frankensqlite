@@ -1,7 +1,7 @@
 //! Vectorized table-scan source operator.
 //!
 //! This module implements the `bd-14vp7.2` scan source that reads rows from a
-//! B-tree cursor, converts them into columnar [`Batch`](crate::vectorized::Batch)
+//! B-tree cursor, converts them into columnar [`Batch`]
 //! values, supports page-range morsels, and applies early filter pushdown via
 //! selection vectors.
 
