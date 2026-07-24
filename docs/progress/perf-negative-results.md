@@ -20207,3 +20207,23 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   2nd column, >2-col indexes, DESC/collation, ORDER BY streaming. Preflight
   SkipScanNonLeadingTerm=allowed. Files: codegen.rs, skip_scan_oracle.rs. Memory:
   [[vdbe-comparison-opcode-operand-order]].
+
+### 2026-07-24 addendum — skip scan extended (same KEEP, bd-nax2y): >2-column indexes + inclusive-lower RANGE
+
+- >2-COLUMN (commit bdb4a596): `WHERE b = <const>` on `idx(a, b, c, …)` (b the 2nd term) now fires,
+  not just 2-col. Probe fills trailing KEY terms with NULL (sorts before every value → lands on the
+  FIRST `(a, const, …)`; a MIN integer skips past `(…, NULL, …)` rows) and the rowid slot with
+  `i64::MIN`. Bug found+fixed: initially used MIN for trailing key cols → dropped every trailing-NULL
+  row. 2-col path byte-identical (empty trailing loop).
+- RANGE (commit f5138ff6): `WHERE b <range>` with an INCLUSIVE lower (optional upper) — `>=`,
+  `BETWEEN`, `>= AND <`. Separate `skip_scan_range_target` (residual-safe: EVERY conjunct must be a
+  bound on the target) + `codegen_select_skip_scan_range`, leaving the equality path untouched.
+  Per-entry classified by `emit_skip_scan_range_decision` (above upper → advance; in range → emit;
+  below/NULL → walk); seek anchors `(x, lo, NULL…, -inf)`. PASSED conformance first try (comparisons
+  grounded in the composite prefix+range operand order + [[vdbe-comparison-opcode-operand-order]]).
+- GATE: skip_scan_oracle 9 tests (2-col eq, >2-col eq, 3 range, decline controls); golden 8/8; clippy
+  clean; FULL 56-oracle sweep GREEN (batched --jobs 4 to dodge the parallel-link OOM,
+  [[rch-parallel-link-oom-bus-error]]).
+- STILL DEFERRED (fall to a correct scan, not this cycle): exclusive lower `>` (needs a post-seek skip
+  of the `==lo` run), no-lower `<`/`<=` (needs a NULL-run walk; seeking to NULL would loop), IN-list,
+  ORDER BY streaming, DESC/non-BINARY.
